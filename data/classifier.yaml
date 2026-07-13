@@ -1,0 +1,102 @@
+# Deterministic rule tables for the heuristic classifier.
+#
+# Each rule adds `weight` to `class` when any keyword matches the first
+# prompt (case-insensitive substring). The class with the highest total wins;
+# ties break by the fixed TaskClass declaration order. With no keyword hits
+# the class defaults to CodingGeneral.
+version: 1
+classes:
+  - class: UiTweak
+    weight: 2.0
+    keywords: [css, styling, style, padding, margin, color, colour, font, button label, copy change, tooltip, alignment, layout tweak, ui tweak, icon, spacing]
+  - class: BugFix
+    weight: 2.0
+    keywords: [bug, fix, broken, crash, error, exception, regression, doesn't work, does not work, failing test, stack trace, npe, panic]
+  - class: Feature
+    weight: 1.5
+    keywords: [add, implement, feature, support for, new endpoint, new page, new command, build a, create a]
+  - class: Refactor
+    weight: 2.0
+    keywords: [refactor, clean up, cleanup, restructure, rename, extract, simplify, tidy, dedupe, deduplicate, reorganize]
+  - class: Algorithms
+    weight: 2.0
+    keywords: [algorithm, complexity, big-o, optimize, optimise, performance, data structure, sort, search, dynamic programming, graph, tree traversal]
+  - class: Architecture
+    weight: 2.0
+    keywords: [architecture, design, schema, migration plan, system design, scalab, module boundaries, api design, protocol design, tradeoff, trade-off]
+  - class: Research
+    weight: 2.0
+    keywords: [research, investigate, investigation, compare, evaluate, survey, find out, look into, what are the options, pros and cons, analyze, analyse, summarize, summarise, status of, current state, review the, audit]
+  - class: Writing
+    weight: 2.0
+    keywords: [write docs, documentation, readme, blog post, changelog, release notes, comment, docstring, tutorial, guide]
+  - class: Ops
+    weight: 2.0
+    keywords: [deploy, ci, cd, pipeline, docker, kubernetes, k8s, terraform, infra, monitoring, alert, nginx, systemd, provision]
+  - class: CodingGeneral
+    weight: 0.5
+    keywords: [code, function, class, method, test]
+
+# Complexity features. The base is a length ramp; keyword groups add their
+# bump per matching keyword (capped at two hits per group); each mentioned
+# file path adds `per_file_bump` up to `max_file_bump`. The result is
+# clamped to [0, 1].
+complexity:
+  length_full_score_chars: 1200
+  length_max: 0.4
+  per_file_bump: 0.05
+  max_file_bump: 0.2
+  keyword_bumps:
+    - bump: 0.3
+      keywords: [architecture, redesign, migrate, migration, rewrite, distributed, concurren, security audit, refactor the whole, across the codebase, end-to-end]
+    - bump: 0.2
+      keywords: [multiple, several, all the, every, entire, whole project, complex, tricky, subtle, race condition, deadlock]
+    # Cross-system work (repos, tickets, PRs) and open-ended investigation
+    # are complex even when the prompt is short.
+    - bump: 0.15
+      keywords: [pull request, merge request, " pr ", ticket, issue, investigate, investigation, analyze, analyse, audit, remaining work, status of, current state, deep dive, root cause, thorough, comprehensive]
+    - bump: -0.25
+      keywords: [typo, one-line, one line, trivial, quick, tiny, small change, simple, just change, rename this]
+
+# Multi-step prompts ("do X and Y, then leave a comment") get a bump per
+# conjunction/sequencing token, capped.
+multi_step:
+  per_token_bump: 0.06
+  max_bump: 0.24
+  tokens: [" and ", " then ", " plus ", ", and", " + ", " also ", " after that", " as well as ", " followed by "]
+
+# Filename extensions to language names, used for language detection from
+# prompt mentions and cwd scans.
+languages:
+  rs: rust
+  py: python
+  ts: typescript
+  tsx: typescript
+  js: javascript
+  jsx: javascript
+  go: go
+  java: java
+  kt: kotlin
+  rb: ruby
+  php: php
+  cs: csharp
+  c: c
+  h: c
+  cc: cpp
+  cpp: cpp
+  hpp: cpp
+  swift: swift
+  m: objective-c
+  scala: scala
+  sh: shell
+  zsh: shell
+  bash: shell
+  sql: sql
+  html: html
+  css: css
+  scss: css
+  vue: vue
+  svelte: svelte
+  tf: terraform
+  yaml: yaml
+  yml: yaml

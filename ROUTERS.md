@@ -1,0 +1,305 @@
+# Routers
+
+router-acp picks one **candidate** — an `(agent, model)` pair like
+`claude/sonnet` — for each conversation, at the moment the first prompt
+arrives. The picker is called a *router* (or *strategy*). There are three.
+This document explains how each one thinks, in plain terms, and which knobs
+matter.
+
+Pick the default router with the top-level `router:` key; override it per
+session with the `router.strategy` session option (goose Desktop and other
+clients that show config selectors) — or, from any client, with a
+**prompt directive** on any line of the first prompt:
+`[router: strategy=pareto-code]`, `[router: candidate=claude/sonnet]`,
+`[router: prefer=codex/gpt-5.5]`, `[router: exclude=claude]` (stripped before
+the model sees it). Either way, changes land **before the first prompt**.
+
+After the first prompt the session is pinned to its candidate. Three things
+can still change the model:
+
+- **failover** — automatic, when the pinned model goes down or hits its token
+  limit before a turn produces output;
+- **`[router: switch=agent/model]`** — an explicit request, at any point, to
+  hand the conversation to a different model (see *Switching models
+  mid-session* below);
+- **auto-upgrade** — the router itself switches up to a more capable model
+  when a session's confidence drops (tunable; off with `auto_upgrade`).
+
+Whichever router runs, the decision is printed to your console and recorded
+in the state file, including the math, so you never have to guess why a
+model was chosen.
+
+---
+
+## What every router sees
+
+Before ranking, the router gets a filtered **pool** of candidates. A
+candidate is in the pool only if it is:
+
+- **verified** — its process is running and its model id passed startup
+  validation against the adapter's own model list;
+- **capable** — if your prompt contains an image, only image-capable agents
+  survive (same for audio and embedded resources);
+- **not cordoned** — an agent that hit its token/usage limit sits out until
+  the reset time it reported;
+- **not quarantined** — a candidate that repeatedly failed to open sessions
+  cools off for a while (`headroom.quarantine_*`).
+
+And for `auto`, each candidate carries three numbers:
+
+- **quality** — a 0–1 score *for the kind of task you asked*, from a data
+  table ([`data/scores.yaml`](data/scores.yaml), overridable with
+  `score_table:`). Patterns are first-match-wins, so specific patterns
+  (`*mini*`) must come before broad ones (`*gpt-5*`).
+- **cost rank** — your `models[].cost_rank` (1 = cheapest/least scarce).
+  With flat-rate seats this models *scarcity*, not dollars.
+- **headroom** — an estimate of how much seat budget the agent has left in
+  the current window (prompts used vs `budget_prompts_5h`).
+
+The kind of task comes from a **classifier** that reads your first prompt:
+it assigns a task class (BugFix, Research, Architecture, UiTweak, …) and a
+**complexity** score from 0 (trivial) to 1 (very hard), using keyword tables,
+multi-step structure ("do X and Y, then Z"), mentioned files, and a scan of
+your project's languages. Rules live in
+[`data/classifier.yaml`](data/classifier.yaml) (`classifier.rules_file` to
+override); an optional local-model backend (`classifier.backend:
+local-model`, e.g. Ollama) can replace the heuristics — it never uses your
+paid seats.
+
+---
+
+## `auto` — the general-purpose router (default)
+
+**In one sentence:** score every candidate by *quality for this task* versus
+*how cheap/plentiful it is*, and let difficulty tilt the balance toward
+quality.
+
+For each candidate:
+
+```
+utility = quality_weight × quality(task class)
+        + cost_weight × headroom × (1 − normalized cost rank)
+        + preference
+```
+
+The weights come from one dial, `cost_quality_tradeoff` (0–10):
+
+- `0` = pure quality (always the best model),
+- `10` = the cheapest candidate that survived the filters,
+- values between blend the two.
+
+Two behaviors make `auto` feel smart:
+
+1. **Complexity scales the dial** (`complexity_scales_tradeoff`, on by
+   default): the effective tradeoff is `tradeoff × (1 − complexity)`. A
+   "hello world" keeps your configured cost-consciousness; an hour-long
+   investigation drives the tradeoff toward 0 so frontier models win.
+2. **The complexity gate** (`complexity_floor`, default 0.7): when a prompt
+   classifies above the floor, candidates below the 75th-percentile quality
+   for that task class are dropped *before* scoring — cheap models can't
+   even compete for genuinely hard work.
+
+Ties break deterministically: higher utility, then lower effective cost,
+then config order.
+
+**Config that matters:**
+
+```yaml
+router: auto
+routers:
+  auto:
+    cost_quality_tradeoff: 3      # 7 is the OpenRouter-parity default;
+                                  # 3 suits flat-rate seats (quality-leaning)
+    complexity_floor: 0.7         # quality gate threshold
+    complexity_scales_tradeoff: true
+    allowed_candidates: ["*"]     # glob allowlist, e.g. ["claude/*"]
+
+agents:
+  - name: claude
+    preference: 0.05              # small additive bonus: prefer this agent
+                                  # when candidates are otherwise comparable
+```
+
+**When a choice looks wrong**, read the disclosure line — it shows every
+input:
+
+```
+[router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · utility 0.82 = 0.70×quality 0.80 (BugFix) + 0.30×quota (headroom 100%, cost rank 2) + pref 0.05 · tradeoff 3→2.0 (complexity-scaled)
+```
+
+- routed too cheap on a hard task → `complexity` was scored too low (tune
+  the classifier rules or lower `cost_quality_tradeoff`);
+- wrong family won → adjust `preference` or `cost_rank`s;
+- a model seems generally mis-rated → fix its entry in the score table.
+
+## `pareto-code` — coding tiers, cheapest first
+
+**In one sentence:** decide how good a *coding* model you need (a tier),
+then take the cheapest available model inside that tier.
+
+It is router-acp's own tiering scheme — loosely motivated by the
+price/quality-frontier idea behind OpenRouter's public model rankings, but
+**not** a documented OpenRouter algorithm — adapting the notion from API price
+to seat-quota pressure:
+
+1. `min_coding_score` maps to a tier: omitted or ≥ 0.66 → **high**,
+   ≥ 0.33 → **medium**, else **low**. Each candidate's tier comes from the
+   score table (`coding_tier`).
+2. Filter to that tier. If it's empty, step to the neighboring tier — and
+   say so in the disclosure.
+3. Within the tier, pick the lowest `effective_cost = cost_rank /
+   max(headroom, ε)` — so a nearly-exhausted seat looks expensive and the
+   router shifts load off it. The next two same-tier candidates are kept as
+   fallbacks in case the first fails to open. Ties break by `preference`,
+   then config order.
+
+Notice what it ignores: task class, complexity, per-class quality scores.
+It's a blunter, very predictable instrument — "give me a high-tier coder,
+whichever is most available" — best for uniformly-hard coding sessions.
+`auto` remains the better general router; don't use `pareto-code` for
+research/writing sessions.
+
+**Config that matters:**
+
+```yaml
+router: pareto-code
+routers:
+  pareto-code:
+    min_coding_score: 0.66   # high tier; 0.4 would mean "medium is fine"
+```
+
+## `static` — no routing at all
+
+**In one sentence:** always use the candidate you named.
+
+The session's explicit `router.candidate` selection wins; otherwise
+`routers.static.candidate` from config. If that candidate isn't routeable
+(unverified, cordoned, missing capability) you get an **actionable error**
+rather than a silent substitute — unless you opt into substitution with
+`allow_fallback: true`, which appends the remaining candidates in config
+order.
+
+**Config that matters:**
+
+```yaml
+router: static
+routers:
+  static:
+    candidate: claude/sonnet
+    allow_fallback: false
+```
+
+Tip: you rarely need `router: static` globally. Setting the
+`router.candidate` session option to a concrete candidate makes *that one
+session* static while everything else keeps routing.
+
+---
+
+## Switching models mid-session
+
+A pinned session can move to a different model without losing its thread. ACP
+does not transfer a live transcript between agents, so the router does the next
+best thing: it asks the **current** model to write a handoff summary (the task,
+decisions, files changed, what's left), opens a **fresh** downstream session on
+the target, seeds that session by prepending the summary to your next prompt,
+re-pins, and closes the old session. The summary turn is captured internally —
+you never see it — and the switch is disclosed like any other routing decision.
+
+**Fallback when the old model can't summarize.** If the outgoing model is
+offline, rate-limited, crashed, or refuses (so it can't produce a summary), the
+router doesn't give up the switch — it reconstructs a **truncated transcript of
+the prior conversation from its own SQLite logs** (`session_log`, each turn
+capped at ~500 chars) and seeds *that* into the new model instead, clearly
+labelled as a recovered transcript rather than a written summary. The
+disclosure says which path was used. This needs nothing from the dead model, so
+a switch (including an auto-upgrade triggered *because* the model is failing)
+still goes through.
+
+Three ways it happens:
+
+1. **You ask.** Put `[router: switch=agent/model]` on any line of a prompt in a
+   pinned session. The rest of that prompt continues the work on the new model.
+   (Before the pin, `switch=` just behaves like `candidate=`.)
+
+   ```
+   [router: switch=claude/opus[1m]]
+   This is getting hairy — take over and finish the refactor.
+   ```
+
+   Or the **`model:` shorthand** — begin a message with a model reference and a
+   colon. The reference can be a full id, a bare model id, a family, or a
+   suffix-less id, and resolves to the best eligible match:
+
+   ```
+   opus: take over and finish the refactor
+   gpt-5.5: review this
+   sonnet:                      # bare — switch and let the new model greet you
+   ```
+
+   A leading `word:` that names no candidate (e.g. `Note:`) is left as ordinary
+   prose. Pre-pin, the shorthand steers the initial pin instead of switching.
+
+2. **Auto-upgrade.** After each turn the router estimates the session's
+   **confidence** — the pinned model's quality for the task class minus an
+   accumulated **struggle** score (raised by hitting the token ceiling, refusing,
+   or repeated tool failures within a turn). When confidence falls below a
+   threshold, the router queues an upgrade to the best strictly-more-capable
+   eligible candidate and performs it on the next prompt. Tunable:
+
+   ```yaml
+   auto_upgrade:
+     enabled: true               # false disables auto-upgrade entirely
+     confidence_threshold: 0.55  # higher = upgrades more eagerly; 0 ≈ never
+   ```
+
+   Explicit `switch=` always works even with `auto_upgrade.enabled: false`.
+
+3. **A skill demands a model class.** Some skills should always run on capable
+   models. `skill_routing` maps a skill pattern to a preferred set of candidate
+   globs; when a prompt invokes that skill (as `/name` or a standalone token)
+   and the pinned model is not already in the set, the session switches to the
+   best available match. Before the pin it steers the initial routing instead.
+
+   ```yaml
+   skill_routing:
+     - pattern: ship-pr            # matches "/ship-pr" or the token "ship-pr"
+       candidates: ["*opus*", "*gpt-5.5*"]   # first eligible match wins
+   ```
+
+   Candidates are candidate globs (a *class*), tried in order; if none are
+   routeable (cordoned, down, excluded) the session keeps its current model and
+   says so, rather than blocking.
+
+All three degrade gracefully: if the target is unavailable the session stays
+put with a visible note. Each switch is recorded in the state file with its
+`from`, `to`, and reason.
+
+---
+
+## Things that apply to every router
+
+- **Pin once, switch deliberately.** The first prompt decides; later prompts
+  reuse the same downstream session. Pre-pin `router.*` options (candidate,
+  strategy, prefer, exclude) are ignored after the pin with a "session already
+  pinned" notice. To change models mid-session use `[router: switch=…]`, which
+  summarizes the work and re-pins onto a fresh downstream (see below) — ACP
+  can't hand a live transcript to a different agent, so the summary is the
+  bridge.
+- **Failover is the exception.** If the pinned model hits a token limit or
+  goes down before a turn produces output, the router announces it, cordons
+  or quarantines the culprit, re-runs *the session's router* over the
+  remaining pool, and continues on the winner — with a visible note that
+  conversation context does not transfer. See `failover.*` config.
+- **Cordons beat everything.** A token/usage-limited agent is out of every
+  pool until the reset time parsed from its own error message (or
+  `headroom.cordon_default_secs`). Even `static` won't route to it.
+- **Delegation reuses the session's router** over a pool restricted to
+  candidates strictly cheaper than the pinned one (a static session
+  delegates with `auto` semantics, since "the configured candidate" is never
+  in the cheaper pool).
+- **Determinism.** Identical inputs and state produce identical decisions —
+  ranking has no randomness, and all tie-breaks are stable.
+- **Every decision is disclosed** on the console
+  (`disclosure: chunk`, default) or in `_meta.router_acp`
+  (`disclosure: meta`), and recorded with its weights in the state file
+  (`state_file`, self-pruning per `retention.*`) for post-hoc diagnosis.

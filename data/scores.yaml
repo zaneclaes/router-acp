@@ -1,0 +1,130 @@
+# Versioned quality/score data for router-acp candidates.
+#
+# Keyed by candidate pattern (`agent/model`, `*` wildcards, case-insensitive,
+# first match wins). Contains per-class quality scores in [0, 1], a coding
+# tier + percentile band (router-acp's own coding-frontier scheme, not a
+# documented OpenRouter algorithm), context window, and optional tags.
+# Updating routing quality is a data edit, not a
+# code change. Override the whole file with the `score_table` config key.
+version: 1
+candidates:
+  # Order matters: the FIRST matching pattern wins, so specific patterns
+  # (e.g. `*mini*`) must precede broad family patterns (e.g. `*gpt-5*`).
+  - pattern: "*fable*"
+    coding_tier: high
+    coding_percentile: 0.97
+    context_window: 1000000
+    default_quality: 0.95
+    quality:
+      UiTweak: 0.9
+      BugFix: 0.95
+      Feature: 0.95
+      Refactor: 0.95
+      Algorithms: 0.97
+      Architecture: 0.97
+      Research: 0.95
+      Writing: 0.95
+      Ops: 0.9
+      CodingGeneral: 0.95
+
+  - pattern: "*opus*"
+    coding_tier: high
+    coding_percentile: 0.9
+    context_window: 200000
+    default_quality: 0.85
+    quality:
+      UiTweak: 0.85
+      BugFix: 0.9
+      Feature: 0.9
+      Refactor: 0.9
+      Algorithms: 0.92
+      Architecture: 0.95
+      Research: 0.9
+      Writing: 0.9
+      Ops: 0.85
+      CodingGeneral: 0.9
+
+  - pattern: "*sonnet*"
+    coding_tier: high
+    coding_percentile: 0.8
+    context_window: 200000
+    default_quality: 0.75
+    quality:
+      UiTweak: 0.8
+      BugFix: 0.8
+      Feature: 0.8
+      Refactor: 0.8
+      Algorithms: 0.78
+      Architecture: 0.75
+      Research: 0.75
+      Writing: 0.8
+      Ops: 0.75
+      CodingGeneral: 0.8
+
+  - pattern: "*haiku*"
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 200000
+    default_quality: 0.55
+    quality:
+      UiTweak: 0.7
+      BugFix: 0.55
+      Feature: 0.5
+      Refactor: 0.5
+      Algorithms: 0.45
+      Architecture: 0.4
+      Research: 0.5
+      Writing: 0.6
+      Ops: 0.55
+      CodingGeneral: 0.55
+
+  - pattern: "*mini*"
+    coding_tier: medium
+    coding_percentile: 0.45
+    default_quality: 0.5
+    quality:
+      UiTweak: 0.65
+      BugFix: 0.5
+      Feature: 0.45
+      Refactor: 0.45
+      Algorithms: 0.45
+      Architecture: 0.35
+      Research: 0.45
+      Writing: 0.55
+      Ops: 0.5
+      CodingGeneral: 0.5
+
+  - pattern: "*gpt-5*codex*"
+    coding_tier: high
+    coding_percentile: 0.85
+    context_window: 400000
+    default_quality: 0.8
+    quality:
+      UiTweak: 0.8
+      BugFix: 0.85
+      Feature: 0.82
+      Refactor: 0.82
+      Algorithms: 0.85
+      Architecture: 0.8
+      Research: 0.7
+      Writing: 0.7
+      Ops: 0.75
+      CodingGeneral: 0.82
+
+  - pattern: "*gpt-5*"
+    coding_tier: high
+    coding_percentile: 0.8
+    context_window: 400000
+    default_quality: 0.78
+
+  - pattern: "*gemini*pro*"
+    coding_tier: high
+    coding_percentile: 0.75
+    context_window: 1000000
+    default_quality: 0.75
+
+  - pattern: "*gemini*flash*"
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 1000000
+    default_quality: 0.55

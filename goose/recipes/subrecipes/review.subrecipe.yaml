@@ -1,0 +1,133 @@
+version: "1.0.0"
+title: "Cross-Lineage Reviewer"
+description: >
+  Independent verification of the orchestrated work on a DIFFERENT model
+  lineage than the planner: the prompt's [router: exclude=...] directive
+  removes the planner's whole agent from routing, so router-acp picks the
+  best remaining-lineage model (and cordons/failover still apply). The
+  reviewer re-derives success criteria from the ORIGINAL user prompt and
+  judges the net result, not just the subtasks.
+instructions: |
+  You are an INDEPENDENT REVIEWER in {{ repo_path }}, deliberately running
+  on a different model lineage than the agent that planned and orchestrated
+  this work. Neither the planner nor the executors are trustworthy sources —
+  the evidence is the working tree, the diff, and the checks you run.
+
+  Procedure:
+  1. RE-DERIVE the success criteria yourself from the ORIGINAL task quoted
+     below. Do this BEFORE reading the orchestrator's plan at {{ plan_path }}
+     so your interpretation is untainted. Then compare: if the plan's
+     criteria miss or distort part of the original ask, that is itself a
+     blocking issue.
+  2. INSPECT the net result: `git diff {{ base_ref }}` (plus the working
+     tree), the files touched, and how they interact. You are judging the
+     WHOLE, not the parts: three individually-correct fixes that conflict
+     with each other must be caught here.
+  3. VERIFY empirically. Build and run the project's test suite and the
+     plan's acceptance checks yourself. Reproduce at least one of the
+     original bugs' scenarios where feasible to confirm the fix. Record
+     actual commands and outputs as evidence.
+  4. JUDGE against YOUR criteria from step 1: correctness of each fix,
+     absence of regressions, completeness versus the original ask, and
+     conformance to repository conventions (.goosehints / CLAUDE.md).
+
+  Be specific and evidence-based. "Looks fine" is useless; "criterion (2)
+  unmet: the fix handles the null case in parse() but issue X also names the
+  CLI path, and bin/cli.rs:88 still panics — reproduced with `cargo run --
+  ...`" is useful. If you could not verify something, list it under
+  unverified rather than asserting it.
+
+  You are read-and-run only: run builds/tests freely, but do NOT edit files,
+  commit, push, or "fix things while you're in there".
+prompt: |
+  [router: prefer={{ reviewer_candidate }}, exclude={{ planner_lineage }}]
+  Review the orchestrated work in {{ repo_path }} (diff against
+  {{ base_ref }}; plan at {{ plan_path }}) against the ORIGINAL task below.
+  Re-derive the success criteria yourself from this original task, verify
+  the net result empirically, and return the structured verdict.
+
+  ORIGINAL TASK (verbatim):
+  {{ original_task }}
+parameters:
+  - key: original_task
+    input_type: string
+    requirement: required
+    description: "The user's original compound prompt, verbatim."
+  - key: plan_path
+    input_type: string
+    requirement: required
+    description: "Path to the orchestrator's plan file."
+  - key: repo_path
+    input_type: string
+    requirement: optional
+    default: "."
+    description: "Target checkout / working directory."
+  - key: base_ref
+    input_type: string
+    requirement: optional
+    default: "main"
+    description: "Git ref the work should be diffed against."
+  - key: planner_lineage
+    input_type: string
+    requirement: optional
+    default: "claude"
+    description: "Agent name of the planner's lineage; excluded from routing here."
+  - key: reviewer_candidate
+    input_type: string
+    requirement: optional
+    default: "codex/gpt-5.5"
+    description: >
+      Preferred reviewer candidate (agent/model). Soft preference: if it is
+      unavailable (cordoned by token limits, down, or excluded), the router
+      falls back to the best remaining non-planner-lineage candidate.
+settings:
+  # No goose_provider: stays on the router so the exclude directive is
+  # honored and headroom/cordons/failover still protect the review session.
+  # (Hard alternative without the router: goose_provider: codex-acp.)
+  max_turns: 80
+extensions:
+  - type: platform
+    name: developer
+    timeout: 600
+response:
+  json_schema:
+    type: object
+    properties:
+      verdict:
+        type: string
+        enum: ["approve", "revise", "block"]
+        description: "approve = net result meets the re-derived criteria; revise = fixable issues; block = fundamentally off-track."
+      confidence:
+        type: number
+        description: "0..1 confidence in the verdict given what was verifiable."
+      derived_criteria:
+        type: array
+        items: { type: string }
+        description: "The success criteria YOU derived from the original task."
+      summary:
+        type: string
+        description: "Two to four sentence overall assessment of the net result."
+      blocking_issues:
+        type: array
+        description: "Must be fixed before submission."
+        items:
+          type: object
+          properties:
+            criterion: { type: string }
+            issue: { type: string }
+            evidence: { type: string }
+            suggested_fix: { type: string }
+          required: ["issue", "evidence"]
+      verified:
+        type: array
+        items: { type: string }
+        description: "Criteria/checks you empirically verified, with the command and result."
+      unverified:
+        type: array
+        items: { type: string }
+        description: "What you could not verify, and why."
+      regressions:
+        type: array
+        items: { type: string }
+        description: "Anything that used to work and no longer does."
+    required: ["verdict", "confidence", "derived_criteria", "summary", "blocking_issues", "verified"]

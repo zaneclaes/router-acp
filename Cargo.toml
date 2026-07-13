@@ -1,0 +1,33 @@
+[package]
+name = "router-acp"
+version = "0.1.0"
+edition = "2024"
+description = "ACP session router over (agent, model) candidates, with bounded in-session delegation"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "router-acp"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-agent"
+path = "src/bin/mock_agent.rs"
+
+[dependencies]
+agent-client-protocol = { version = "1.2", features = ["unstable_end_turn_token_usage"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+regex = "1.13.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

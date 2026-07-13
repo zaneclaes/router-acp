@@ -1,0 +1,236 @@
+# AGENTS.md — context for coding agents working on router-acp
+
+router-acp is an ACP (Agent Client Protocol) session router: one terminal
+ACP **agent** upstream (the client — goose, Zed — connects to it over stdio)
+plus N ACP **client** connections downstream to seat-authenticated adapters
+(`claude-agent-acp`, `codex-acp`). It routes each new conversation to the
+best `(agent, model)` candidate, pins it, relays everything, and offers a
+`delegate_task` MCP tool for cheaper sub-sessions. Built against
+`agent-client-protocol` **1.2.0** (Rust SDK). The original build spec
+(HAI-6345) was completed and deleted; `PLAN.md` now holds the follow-on
+orchestration plan. User-facing docs: `README.md`, `ROUTERS.md`,
+`GOOSE.md`, `ORCHESTRATION.md`.
+
+## Build / test / install
+
+```sh
+cargo test                    # 113 tests: unit + tests/protocol.rs E2E
+cargo clippy --all-targets    # keep at zero warnings
+cargo fmt
+cargo install --path . --force   # the user's goose shim runs ~/.cargo/bin/router-acp
+```
+
+The protocol tests spawn real `mock-agent` subprocesses and complete in a
+few seconds. If a test hangs, something is genuinely deadlocked — see the
+SDK traps below, which were all discovered the hard way.
+
+## Module map
+
+| file | owns |
+| --- | --- |
+| `src/session.rs` | the hub: `Shared` state, upstream agent surface (all ACP handlers), pin/failover engine (`pin_session`, `send_prompt_with_failover`), downstream→upstream relay (`handle_downstream_dispatch`), disclosures (`notify_user`), failure accounting (`apply_failure`), respawn (`revive_dead_targets`) |
+| `src/downstream.rs` | process targets from config (`config-option` = 1 process/agent; `spawn-config` = 1 process/model with `${model_id}` templating), spawn+contain (`start_downstream`), probe/verify (`probe_target`, model-selector discovery, `verify_model_selected`) |
+| `src/transport.rs` | flushing stdio + child-process transports (replaces broken SDK ones) |
+| `src/strategies/` | `RouterStrategy` trait; `static_`, `auto`, `pareto_code`; each `RankedCandidate` carries `reason` (human) + `weights` (json) for disclosure/state |
+| `src/classifier.rs` | heuristic task class + complexity (data-driven), cwd language fingerprint, optional Ollama backend (own mini HTTP client; never uses seat agents) |
+| `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
+| `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
+| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (hard exclusion until token-limit reset) |
+| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`kind`/`run_label` + token counters) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; one-time `sessions.json` import. `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
+| `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
+| `src/delegate_mcp.rs` | delegate tool: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task`, `mcp-delegate` helper bridge |
+| `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment |
+| `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
+| `src/bin/mock_agent.rs` | scripted downstream for tests (below) |
+| `data/*.yaml` | score table + classifier rules, embedded via `include_str!`, overridable by config path |
+
+## SDK traps (agent-client-protocol 1.2.0) — do not relearn these
+
+1. **Built-in transports never flush.** `Stdio`, `AcpAgent`, `ByteStreams`
+   write lines without flushing, and their writers (`blocking::Unblock`,
+   `async_process::ChildStdin`) buffer — every small exchange deadlocks.
+   Always use `transport::{stdio_lines, lines_transport, ProcessTransport}`
+   (they flush per line, report reader EOF as a disconnect error so
+   connections actually terminate, and monitor child exit). If you bump the
+   SDK, re-test before touching this.
+2. **`forward_response_to` onto a downstream connection can strand the
+   upstream request.** Its consuming task runs on the *downstream's* task
+   actor; if that process dies, the task is dropped and the upstream request
+   hangs forever. Relay downstream-bound requests with
+   `session::relay_request_to_downstream` (or `block_task` in an
+   upstream-spawned task). `forward_response_to` is fine in the other
+   direction (downstream request → upstream), because if upstream dies
+   everything dies.
+3. **`Shared` uses non-reentrant `std::sync::Mutex`.** Never call another
+   `Shared` accessor while holding one of its locks (build_initialize_response
+   once self-deadlocked on exactly this), and never hold a lock across
+   `await`.
+4. **Ordering matters when registering session routes.** Register the
+   sid_map entry inside `SentRequest::on_receiving_result` of the
+   `session/new` call (the dispatch loop waits for that callback's ack, so
+   no `session/update` can race past), or before sending for load/resume
+   where the downstream sid is already known. `block_task` acks immediately
+   and does NOT give this guarantee.
+5. **Handler/`consume_with` callbacks must return `Ok`** — a returned `Err`
+   tears down the whole connection.
+6. **In `ProcessTransport`, side channels must not win the select.** The
+   stderr-drain future ends in `pending()`: on child death stderr EOFs too,
+   and if it completed the select with `Ok` the connection would linger
+   half-dead (was a real flaky test).
+7. **Schema structs are `#[non_exhaustive]`** — construct via `::new(...)` +
+   builder methods, never struct literals. Unhandled `Dispatch::Response`
+   must be returned as `Handled::No` so the SDK routes it to its awaiter;
+   unhandled requests get `method_not_found` automatically. Chained handlers
+   run in registration order — the untyped catch-all must be registered
+   last.
+
+## Architectural invariants (from PLAN.md; do not break casually)
+
+- Never call provider model APIs; everything goes through ACP adapters.
+- Model selection: `session/set_config_option` on the `category: model`
+  select option; the **response** is authoritative (silent no-ops must fail
+  the pin). No `session/set_model`. No assumed CLI model flags —
+  `spawn-config` exists for per-model argv/env.
+- Route once per session; pin for life. The deliberate exception (added at
+  user request, post-plan): failover when the pinned model is rate-limited
+  or down **and the turn has produced no output** (`turn_saw_output`) and
+  the client hasn't cancelled. Context loss is disclosed.
+- Relaying is raw-JSON with only `sessionId` rewritten; `_meta` is
+  preserved; router metadata lives under `_meta.router_acp` only.
+- Delegation: strictly lower `cost_rank` than the parent, depth capped at 1
+  (the delegate MCP server is stripped from sub-sessions), concurrency
+  bounded by a semaphore, parent cancel propagates.
+- **Every routing decision must be visible**: console line (chunk) with the
+  strategy math + skipped candidates + cordons, mirrored into
+  `_meta.router_acp` and persisted into the state file (`routing` field).
+  If you add a decision point, disclose it.
+- Deterministic routing: no randomness; tie-breaks are score → effective
+  cost → preference → config order.
+- Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
+  least one downstream supports them and the router implements the full
+  remap path.
+- **Prompt directives**
+  (`[router: candidate=…|prefer=…|switch=…|strategy=…|exclude=…|label=…]`)
+  are located anywhere in the first text block by finding `[router:` and
+  **bracket-matching** to the closing `]` (depth-tracked, so nested `[1m]`
+  model ids work) — NOT a per-line/ends-in-`]` parse, which broke on goose's
+  `<turn-context>` preamble, on inline `[router: …] task` (directive + task on
+  one line), and on goose appending text after the tag (all regression-tested
+  in `directive_tests`). Only the `[router:…]` span is stripped (surrounding
+  preamble + task preserved, outer whitespace trimmed); a bare directive with
+  no task is allowed (post-pin `on_prompt` synthesizes a continuation prompt so
+  the switched model responds; pre-pin it errors). Fail loudly when invalid.
+  `candidate`/`prefer`/`strategy`/`exclude`/`label` are pre-pin only
+  (ignored-with-notice post-pin); `exclude`/`label` persist on the session
+  (incl. failover). `prefer` is a *soft* candidate (front of the ranked chain
+  if eligible, else graceful fallback — see `pin_session`). `switch` is the
+  one **mid-session** directive: it re-pins a live session onto another model
+  via `switch_pin` (summarize on the current model → open fresh downstream →
+  seed the summary into the next prompt → close old). They exist because CLI
+  clients can't set ACP config options; the orchestration recipes
+  (`goose/recipes/`, `orchestrate` wrapper, see `ORCHESTRATION.md`) depend on them.
+- **`model:` shorthand** — a prompt beginning (after any `<turn-context>`
+  preamble) with `<ref>:` is sugar for `switch=`/`candidate=`.
+  `split_model_shorthand` extracts the leading token; `resolve_candidate_ref`
+  maps it to the best eligible candidate (exact `agent/model`, bare model id,
+  family/prefix glob, or suffix-less id → highest quality on ambiguity).
+  **Resolution is the gate**: an unresolved token (`Note:`, `http:`) is left as
+  prose, never stripped. Runs only when no `[router:]` directive is present
+  (mutually exclusive). Post-pin → `pending_switch`; pre-pin → `candidate_override`.
+  Regression-tested in `model_shorthand_switches_mid_session_…` and
+  `model_shorthand_splits_token_and_task`.
+- **Mid-session model switching** (`switch_pin`) has three triggers, all
+  going through the same summarize-and-re-pin primitive: the explicit `switch=`
+  directive; **auto-upgrade** (post-turn `update_confidence_and_maybe_upgrade`
+  computes `confidence = pinned_quality − struggle`; below
+  `auto_upgrade.confidence_threshold` it queues an upgrade to the best
+  strictly-more-capable eligible candidate, `auto_upgrade.enabled` gates it);
+  and **`skill_routing`** (a prompt invoking a configured skill pattern forces
+  the session onto that skill's candidate globs). Struggle accrues from
+  MaxTokens/Refusal stop reasons and ≥3 in-turn tool failures (counted in the
+  Primary relay). The summary turn is captured (`capturing_summary`) and not
+  relayed; the fully-framed handoff block is prepended once via
+  `pending_context` (the send side no longer wraps it). **Handoff fallback**:
+  `switch_pin` reads the pin directly (not `pinned_route`, so a dead old
+  process doesn't abort the switch); if the outgoing model has no live conn, or
+  the summary request errors / returns <20 chars, it falls back to
+  `transcript_from_logs` (reconstructs a truncated transcript from
+  `session_log` — user/agent turns only, recent-first budget) framed via
+  `frame_transcript`. The disclosure states which path was used. Regression-tested
+  in `switch_directive_hands_off_…`, `switch_falls_back_to_log_transcript_when_summary_fails`,
+  `low_confidence_pin_auto_upgrades_…`, `auto_upgrade_disabled_…`, `skill_routing_switches_…`.
+- goose sends `session/set_mode` immediately after `session/new` (pre-pin)
+  and treats an error as fatal: pre-pin modes are deferred and applied at
+  pin (via per-agent `mode_map` translation, then exact id match); post-pin
+  unknown modes are answered OK-with-warning, never errored.
+
+## Test infrastructure
+
+`tests/protocol.rs` drives the real router in-process (`serve_shared` over a
+`Channel::duplex()`) against `mock-agent` subprocesses; the harness
+(`run_test`) provides a scripted ACP client (auto-approves permissions,
+serves fs reads, collects `session/update`s). Mock behavior is env-driven:
+
+- `MOCK_NAME`, `MOCK_MODELS` (model-selector values; first = current)
+- `MOCK_AUTH_REQUIRED`, `MOCK_FAIL_NEW_AFTER=<n>`, `MOCK_IGNORE_SET_CONFIG`
+- `MOCK_EXIT_AFTER_INIT`, `MOCK_EXIT_ON_PROMPT`
+- `MOCK_FAIL_PROMPT_MSG` (+ `MOCK_FAIL_PROMPT_TIMES`, `MOCK_FAIL_PROMPT_AFTER=<n successes first>`)
+- `MOCK_CAPS_IMAGE`, `MOCK_SUPPORTS_LIFECYCLE`, `MOCK_SESSION_MODES`
+- `MOCK_LOG=<path>` — JSONL event log tests assert against
+
+Prompt-text directives the mock obeys: `PERM`, `READFILE:<path>`,
+`SLEEP:<ms>` (cancel-aware), `TITLE:<t>` (emits session_info_update),
+`DELEGATE:<task>` (spawns and drives the delegate MCP server),
+`CHUNK_THEN_EXIT` (output then crash — must NOT fail over). Delegation tests
+set `ROUTER_ACP_HELPER_EXE=env!("CARGO_BIN_EXE_router-acp")` because
+`current_exe()` is the test binary.
+
+Model ids in tests are chosen to hit score-table patterns (`haiku`,
+`sonnet`, `opus`, `claude-fable-5`, `gpt-5.4-mini`, `gpt-5.5`) — renaming
+them changes routing outcomes. When asserting on state timestamps remember
+they have **second** resolution; `StateFile::upsert` prunes against the real
+clock, so unit tests that backdate entries must insert into
+`state.sessions` directly.
+
+Handlers must stay thin (they block the connection's dispatch loop): spawn
+real work via `cx.spawn`, await with `block_task` only inside spawned
+tasks. Plain closures returning `async move` blocks satisfy the SDK's
+`AsyncFnMut` bounds; annotate the `cx` parameter's type when inference
+fails.
+
+## The user's live deployment (this machine)
+
+- goose ≥ 1.41 consumes the router through the **`pi-acp` provider slot**: a
+  shim at `~/.config/router-acp/bin/pi-acp` (found via `GOOSE_SEARCH_PATHS`
+  in `~/.config/goose/config.yaml`) execs
+  `~/.cargo/bin/router-acp serve --config ~/.config/router-acp/router.yaml`.
+  goose's ACP slots spawn fixed binary names; `pi-acp` takes no args (why it
+  was chosen), `codex-acp` takes `-c` flags (why it can't be shimmed).
+  `claude-acp`/`codex-acp` remain direct. After code changes run
+  `cargo install --path . --force` or goose keeps the old binary.
+- Real adapters live at `~/nvm/versions/node/v24.16.0/bin/{claude-agent-acp,codex-acp}`
+  (nvm-versioned paths — they move on node upgrades). Verified model ids
+  (July 2026): claude offers `default, haiku, sonnet, sonnet[1m], opus[1m],
+  claude-fable-5[1m]`; codex offers `gpt-5.4-mini, gpt-5.4, gpt-5.5`.
+  Claude modes: `auto, default, acceptEdits, plan, dontAsk,
+  bypassPermissions`; codex modes: `read-only, auto, full-access`. To
+  re-discover ids, declare a bogus model and read the `available=[…]`
+  warning under `RUST_LOG=router_acp=debug`.
+- The user prefers Claude (bigger plan): `preference: 0.05` on the claude
+  agent, `cost_quality_tradeoff: 3`. History: routing once sent an hour-long
+  investigation to `gpt-5.4-mini` because the broad `*gpt-5*` score pattern
+  shadowed `*mini*` — score-table patterns are first-match-wins; keep
+  specific before broad (regression-tested).
+
+## When you change behavior, update the docs
+
+- `README.md` — feature overview + config reference table
+- `ROUTERS.md` — user-facing strategy explanations
+- `GOOSE.md` — the user's actual install/runbook (mode handling, failover
+  visibility, tuning table)
+- `examples/router.yaml` — annotated config
+- `ORCHESTRATION.md` + `goose/recipes/*.yaml` — the goose orchestration layer
+  (validate recipe edits with `goose recipe validate <file>`)
+- `PLAN.md` — the active follow-on plan (the original build spec was
+  completed and removed); post-spec deviations (failover, complexity-scaled
+  tradeoff, preference, directives) are documented in README/AGENTS.
