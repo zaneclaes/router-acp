@@ -1,0 +1,125 @@
+# Example router-acp configuration: Claude + Codex seat adapters.
+#
+# Copy, adjust the model ids to what your adapters actually expose, and run:
+#   router-acp check-config --config router.yaml
+#   router-acp serve --config router.yaml
+
+router: auto                    # auto | pareto-code | escalation | static
+# SQLite state DB. The `sessions` table records the title and full routing
+# decision (router, weights, task class/complexity, skipped candidates) plus
+# parent links for delegated sub-agents and token counters; `session_log`
+# captures every ACP interaction with token usage. Inspect with
+# `router-acp sessions --config <file>`.
+state_file: ~/.local/state/router-acp/sessions.db
+# Keep sessions (and their logs) this long, then auto-prune. Duration string:
+# 30d / 12h / 90m / 3600s, or a bare number of days.
+history: 30d
+
+classifier:
+  backend: heuristic            # heuristic | local-model
+  local_model: null             # e.g. ollama:qwen3:4b; optional
+  timeout_ms: 1500
+
+delegation:
+  enabled: true
+  max_concurrent: 3
+
+# Graceful degradation. Rate/usage-limited agents are cordoned until the
+# reset time parsed from the model's error (or cordon_default_secs when the
+# model reported none); outages fail over to the next best candidate with a
+# visible notice and dead adapters are respawned automatically.
+headroom:
+  cordon_default_secs: 900
+failover:
+  enabled: true
+  respawn_cooldown_secs: 30
+  max_attempts: 3
+
+# Mid-session model switching. A pinned session can move to a more capable
+# model on its own when its confidence drops. Confidence = the pinned model's
+# quality for the task class minus accumulated "struggle" (token-ceiling hits,
+# refusals, repeated tool failures). Explicit `[router: switch=agent/model]`
+# always works regardless of this setting.
+auto_upgrade:
+  enabled: true                 # false disables automatic upgrades entirely
+  confidence_threshold: 0.55    # upgrade below this; higher = more eager
+
+# Force skills onto a class of models. When a prompt invokes `pattern`
+# (as `/name` or a standalone token) and the pinned model isn't already in
+# `candidates`, the session switches to the best available match (summarize +
+# re-pin). Candidates are candidate globs in preference order.
+skill_routing:
+  - pattern: ship-pr
+    candidates: ["*opus*", "*gpt-5.5*"]
+
+agents:
+  - name: claude
+    command:
+      type: stdio
+      command: npx
+      args: ["-y", "@agentclientprotocol/claude-agent-acp"]
+      env: []
+    model_selection:
+      type: config-option       # discover the category:model config option,
+                                # then session/set_config_option per session
+    budget_prompts_5h: 400
+    preference: 0.05            # prefer this agent when candidates are
+                                # otherwise comparable (bigger seat/plan)
+    models:
+      # ids must exactly match the downstream model selector's values;
+      # run with RUST_LOG=router_acp=debug to see what the adapter offers.
+      - id: sonnet
+        display_name: Claude Sonnet
+        cost_rank: 2            # 1 = cheapest/least scarce
+      - id: opus
+        display_name: Claude Opus
+        cost_rank: 3
+
+  - name: codex
+    command:
+      type: stdio
+      command: npx
+      # Use @agentclientprotocol/codex-acp (>= 1.1.2). It drives your installed
+      # `codex` CLI, so its model selector lists whatever your codex offers,
+      # including the newer gpt-5.6-* models. (The older @zed-industries build
+      # bundled a stale Codex core that couldn't run them.)
+      args: ["-y", "@agentclientprotocol/codex-acp"]
+      env: []
+    # config-option: discover codex-acp's model selector and set per session.
+    model_selection: { type: config-option }
+    budget_prompts_5h: 400
+    models:
+      - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
+      - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }
+      # Newer "sol / terra / luna" lines, scored via `*sol*`/`*terra*`/`*luna*`
+      # in data/scores.yaml (sol = frontier, terra = strong, luna = small).
+      # Available whenever your codex CLI + codex-acp expose them.
+      - { id: gpt-5.6-luna, display_name: GPT Luna, cost_rank: 2 }
+      - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4 }
+      - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5 }
+
+routers:
+  static:
+    candidate: claude/sonnet
+  auto:
+    cost_quality_tradeoff: 7    # 0 = pure quality, 10 = cheapest survivor
+    complexity_floor: 0.7
+    allowed_candidates: ["*"]
+  pareto-code:
+    min_coding_score: 0.66      # >= 0.66 high tier, >= 0.33 medium, else low
+  escalation:
+    # Start on the cheapest capable model; escalate only when observed
+    # execution reveals hidden difficulty (not from guessing the prompt).
+    escalation_path: ladder            # ladder (next tier up) | leap (strongest)
+    # initial_router: auto             # delegate the STARTING pick to another
+                                       # router instead of picking cheapest; escalation
+                                       # still applies from there (auto|pareto-code|static)
+    escalate_before_side_effects: true # mid-turn, while still investigating
+    escalate_after_reads: 6            # reads before a side effect → escalate (0=off)
+    escalate_after_tool_calls: 30      # total tool calls in one turn without finishing
+                                       # → escalate (the robust "grinding" signal; 0=off)
+    escalate_after_tool_failures: 3    # tool-failure churn → escalate mid-turn (0=off)
+    escalate_on_max_tokens: true
+    escalate_on_refusal: true
+    min_start_score: 0.0               # optional floor on the starting model
+    max_escalations: 3

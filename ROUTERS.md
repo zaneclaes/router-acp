@@ -2,7 +2,7 @@
 
 router-acp picks one **candidate** — an `(agent, model)` pair like
 `claude/sonnet` — for each conversation, at the moment the first prompt
-arrives. The picker is called a *router* (or *strategy*). There are three.
+arrives. The picker is called a *router* (or *strategy*). There are four.
 This document explains how each one thinks, in plain terms, and which knobs
 matter.
 
@@ -166,6 +166,72 @@ router: pareto-code
 routers:
   pareto-code:
     min_coding_score: 0.66   # high tier; 0.4 would mean "medium is fine"
+```
+
+## `escalation` — start cheap, escalate when the work proves hard
+
+**In one sentence:** begin on the cheapest capable model and hand off to a
+stronger one only when *observed execution* reveals the task was harder than it
+looked.
+
+`auto` and `pareto-code` decide up front, from the prompt. But some tasks read
+as one trivial sentence and only reveal their depth once a model starts digging
+through the code. `escalation` doesn't try to predict that — it **watches** and
+reacts:
+
+1. **Start cheap — or delegate the start.** By default the first prompt pins the
+   cheapest routeable candidate (scarcity-adjusted, like `pareto-code`),
+   optionally floored by `min_start_score`. Or set `initial_router: auto` (or
+   `pareto-code`/`static`) to delegate the *starting* pick to that router — so a
+   session begins on a *sensible* model and escalation only kicks in from there.
+2. **Escalate on observed difficulty**, never on a guess. Three mid-turn
+   triggers, each firing as soon as its threshold is crossed *during* the turn:
+   - **Read volume** — investigation reads (file reads *and* read-only shell like
+     `git status`/`grep`/`find`, and read-only MCP tools) crossing
+     `escalate_after_reads` *before any side effect*. This one fires while the
+     turn is still side-effect-free, so it's a clean pre-work handoff.
+   - **Tool-call volume** — `escalate_after_tool_calls` total tool calls in one
+     turn without finishing: the robust "grinding / in over its head" signal.
+     Unlike read volume it doesn't care about side-effect ordering, so it catches
+     the common edit-and-Bash-heavy tasks the read trigger misses.
+   - **Tool-failure churn** — `escalate_after_tool_failures` failed tool calls:
+     the model is thrashing.
+   Plus a **post-turn** trigger on a token-ceiling (`escalate_on_max_tokens`) or
+   refusal (`escalate_on_refusal`) stop. The volume and failure triggers fire
+   *after* side effects, so instead of replaying they hand off a **transcript**
+   and the stronger model *continues* from where the cheap one left off (no
+   double-application). `escalate_before_side_effects: false` disables the
+   pre-side-effect read trigger specifically.
+3. **How far it jumps** is `escalation_path`: `ladder` steps to the
+   next-more-capable model (re-evaluating at each step); `leap` goes straight to
+   the strongest. Escalations are one-way and capped by `max_escalations`.
+
+The handoff reuses the same summarize-and-re-pin machinery as `[router:
+switch=…]`, including the **log-transcript fallback** — so even a mid-turn
+escalation, where the cheap model was interrupted and can't summarize, carries
+the prior context forward from the state DB.
+
+The pay-off: genuinely trivial tasks finish on the cheap model at zero extra
+cost (nothing to escalate), while the "looks easy, turns out hard" tasks get
+frontier power the moment they earn it — without you having to predict which is
+which.
+
+**Config that matters:**
+
+```yaml
+router: escalation
+routers:
+  escalation:
+    escalation_path: ladder            # ladder | leap
+    # initial_router: auto             # delegate the starting pick (auto|pareto-code|static)
+    escalate_before_side_effects: true # enables the pre-side-effect read trigger
+    min_start_score: 0.0               # optional floor on the starting model
+    escalate_after_reads: 6            # investigation reads before a side effect (0 = off)
+    escalate_after_tool_calls: 30      # total tool calls in one turn without finishing (0 = off)
+    escalate_after_tool_failures: 3    # failed tool calls → escalate mid-turn (0 = off)
+    escalate_on_max_tokens: true
+    escalate_on_refusal: true
+    max_escalations: 3
 ```
 
 ## `static` — no routing at all

@@ -27,6 +27,65 @@ candidates:
       Ops: 0.9
       CodingGeneral: 0.95
 
+  # GPT "sol / terra / luna" lines (ids like `gpt-5.6-sol`). Kept above the
+  # `*gpt-5*` patterns so a `gpt-5.6-sol` id doesn't fall through to the generic
+  # gpt-5 entry (first match wins). The `sol`/`terra`/`luna` substrings don't
+  # collide with any other model id in play (sonnet/opus/haiku/mini/fable/gpt).
+  #
+  # Tier ordering is a PROVISIONAL guess (sol = frontier ≈ fable, terra = strong
+  # ≈ opus, luna = small/fast ≈ haiku). Re-benchmark and tune once the models are
+  # actually live — as of this writing codex only exposes gpt-5.4/5.4-mini/5.5.
+  - pattern: "*sol*"
+    coding_tier: high
+    coding_percentile: 0.96
+    context_window: 400000
+    default_quality: 0.95
+    quality:
+      UiTweak: 0.9
+      BugFix: 0.95
+      Feature: 0.95
+      Refactor: 0.95
+      Algorithms: 0.96
+      Architecture: 0.95
+      Research: 0.93
+      Writing: 0.9
+      Ops: 0.9
+      CodingGeneral: 0.95
+
+  - pattern: "*terra*"
+    coding_tier: high
+    coding_percentile: 0.9
+    context_window: 400000
+    default_quality: 0.85
+    quality:
+      UiTweak: 0.85
+      BugFix: 0.88
+      Feature: 0.88
+      Refactor: 0.88
+      Algorithms: 0.88
+      Architecture: 0.87
+      Research: 0.83
+      Writing: 0.83
+      Ops: 0.85
+      CodingGeneral: 0.88
+
+  - pattern: "*luna*"
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 400000
+    default_quality: 0.6
+    quality:
+      UiTweak: 0.7
+      BugFix: 0.6
+      Feature: 0.55
+      Refactor: 0.55
+      Algorithms: 0.5
+      Architecture: 0.45
+      Research: 0.55
+      Writing: 0.6
+      Ops: 0.6
+      CodingGeneral: 0.6
+
   - pattern: "*opus*"
     coding_tier: high
     coding_percentile: 0.9

@@ -1676,6 +1676,22 @@ async fn switch_directive_hands_off_to_new_model_mid_session() {
                 && t.contains("continue the work")),
             "new model got handoff + prompt: {prompts:?}"
         );
+        // The switch recorded its lineage: prior_session_id = the downstream
+        // session bound before the switch, distinct from the current one.
+        let row = open_state(&state).get(&sid).expect("session row");
+        let prior = row
+            .prior_session_id
+            .expect("prior_session_id set on switch");
+        assert!(
+            prior.starts_with("a-sess-"),
+            "prior points to old downstream: {prior}"
+        );
+        assert!(
+            row.downstream_session_id.starts_with("b-sess-"),
+            "current downstream is the new model's: {}",
+            row.downstream_session_id
+        );
+        assert_ne!(prior, row.downstream_session_id);
         Ok(())
     })
     .await;
@@ -1960,6 +1976,400 @@ async fn auto_upgrade_disabled_keeps_the_pinned_model() {
         let text = agent_text(&observed, &sid);
         assert!(!text.contains("switched"), "no upgrade happened: {text}");
         assert!(text.contains("echo:m1:second turn"), "stayed on m1: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+// ======================================================================
+// escalation router
+// ======================================================================
+
+/// Score table making `b/*` strong (0.90) and `a/*` weak (0.40), so `b` is a
+/// valid escalation target above `a`. Optionally a mid-tier `c/*` (0.70).
+fn escalation_scores(tag: &str, with_mid: bool) -> PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "router-acp-escscores-{tag}-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mid = if with_mid {
+        "  - { pattern: \"c/*\", default_quality: 0.70 }\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        &p,
+        format!(
+            "version: 1\ncandidates:\n\
+             \x20 - {{ pattern: \"b/*\", default_quality: 0.90 }}\n{mid}\
+             \x20 - {{ pattern: \"a/*\", default_quality: 0.40 }}\n"
+        ),
+    )
+    .unwrap();
+    p
+}
+
+#[tokio::test]
+async fn escalation_router_starts_on_the_cheapest_candidate() {
+    let state = temp_state_file("esc-start");
+    let yaml = format!(
+        "state_file: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]), // cheapest by cost rank
+        agent_yaml("b", &[("m2", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "just say hi").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("escalation → a/m1"),
+            "started cheapest: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:"),
+            "ran on the cheapest model: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// True when a mock log recorded at least one `prompt` event (the agent ran a
+/// real turn), i.e. the router actually forwarded a prompt to it.
+fn got_prompt(log: &PathBuf) -> bool {
+    read_log(log).iter().any(|e| e["event"] == "prompt")
+}
+
+#[tokio::test]
+async fn escalation_escalates_mid_turn_and_leap_skips_the_intermediate() {
+    let state = temp_state_file("esc-mid");
+    let scores = escalation_scores("mid", true); // a=0.4, c=0.7, b=0.9
+    let (logc, logb) = (temp_log("esc-mid-c"), temp_log("esc-mid-b"));
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n    escalate_after_reads: 3\n\
+         agents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml(
+            "c",
+            &[("m3", 2)],
+            &[("MOCK_LOG", &logc.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 3)],
+            &[("MOCK_LOG", &logb.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A task that looks simple but investigates heavily (5 reads > threshold
+        // 3) before producing any output → mid-turn escalation.
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "READFILE:/a\nREADFILE:/b\nREADFILE:/c\nREADFILE:/d\nREADFILE:/e\ninvestigate this",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("escalation → a/m1"), "started cheap: {text}");
+        // `leap` jumps straight to the strongest, skipping the mid tier.
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "leaped mid-turn to the strongest model: {text}"
+        );
+        assert!(got_prompt(&logb), "strongest model b/m2 ran the replay");
+        assert!(!got_prompt(&logc), "leap skipped the intermediate tier c");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_before_side_effects_false_disables_mid_turn() {
+    let state = temp_state_file("esc-noeff");
+    let scores = escalation_scores("noeff", false);
+    let (loga, logb) = (temp_log("esc-noeff-a"), temp_log("esc-noeff-b"));
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalate_before_side_effects: false\n    escalate_after_reads: 3\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &loga.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &logb.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "READFILE:/a\nREADFILE:/b\nREADFILE:/c\nREADFILE:/d\ninvestigate this",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        // Reads alone must NOT escalate when mid-turn is off; stays on cheap.
+        assert!(!text.contains("switched"), "no mid-turn escalation: {text}");
+        assert!(got_prompt(&loga), "cheap model a/m1 ran");
+        assert!(!got_prompt(&logb), "strong model b/m2 never ran");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_ladder_steps_one_tier_up() {
+    let state = temp_state_file("esc-ladder");
+    let scores = escalation_scores("ladder", true); // a=0.4, c=0.7, b=0.9
+    let (logc, logb) = (temp_log("esc-ladder-c"), temp_log("esc-ladder-b"));
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalation_path: ladder\n    escalate_after_reads: 3\n    max_escalations: 1\n\
+         agents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml(
+            "c",
+            &[("m3", 2)],
+            &[("MOCK_LOG", &logc.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 3)],
+            &[("MOCK_LOG", &logb.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "READFILE:/a\nREADFILE:/b\nREADFILE:/c\nREADFILE:/d\ninvestigate this",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        // Ladder goes to the NEXT tier up (c/0.70), not straight to b/0.90.
+        // Capped at one escalation so it stops at c (proving the single step).
+        assert!(
+            text.contains("switched a/m1 → c/m3"),
+            "ladder stepped one tier up: {text}"
+        );
+        assert!(got_prompt(&logc), "mid-tier c ran the replay");
+        assert!(
+            !got_prompt(&logb),
+            "ladder stepped to c, not straight to the top b"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_post_turn_on_max_tokens_stop() {
+    let state = temp_state_file("esc-post");
+    let scores = escalation_scores("post", false);
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n    escalate_before_side_effects: false\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // First turn ends with max-tokens on the cheap model → queues escalation.
+        let r1 = prompt_text(&cx, &sid, "MAXTOKENS do the thing").await?;
+        assert_eq!(r1.stop_reason, StopReason::MaxTokens);
+        // Next turn fires the queued escalation before forwarding.
+        let r2 = prompt_text(&cx, &sid, "continue").await?;
+        assert_eq!(r2.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "post-turn escalation happened: {text}"
+        );
+        assert!(text.contains("echo:m2:"), "ran on the strong model: {text}");
+        assert!(
+            text.contains("continue"),
+            "the continuation prompt was forwarded: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Build an escalation config that isolates one trigger (others disabled).
+fn esc_yaml(state: &std::path::Path, scores: &std::path::Path, body: &str, logb: &str) -> String {
+    format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n{body}\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[("MOCK_LOG", logb)]),
+    )
+}
+
+// These drive the REAL `session/update` tool_call path (via the mock's `TOOL:`
+// directive), the path claude-agent-acp actually uses — the coverage gap that
+// let the mid-turn bug ship.
+
+#[tokio::test]
+async fn escalation_mid_turn_on_tool_call_reads() {
+    let state = temp_state_file("esc-treads");
+    let scores = escalation_scores("treads", false);
+    let logb = temp_log("esc-treads-b");
+    // read-volume only: activity/failure off.
+    let body = "    escalate_after_reads: 3\n    escalate_after_tool_calls: 0\n    escalate_after_tool_failures: 0\n    escalate_on_max_tokens: false\n    escalate_on_refusal: false\n";
+    let yaml = esc_yaml(&state, &scores, body, &logb.display().to_string());
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // 8 genuine tool_call reads (no side effect) → escalate at 3.
+        let prompt = "TOOL:read\n".repeat(8) + "investigate";
+        let resp = prompt_text(&cx, &sid, &prompt).await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "read-volume escalated: {text}"
+        );
+        assert!(got_prompt(&logb), "strong model ran");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_read_only_bash_counts_as_investigation() {
+    // Regression for the hickory-ai6 bug: `ls … 2>/dev/null || echo` is
+    // read-only and must count toward the read trigger, not close the window.
+    let state = temp_state_file("esc-robash");
+    let scores = escalation_scores("robash", false);
+    let logb = temp_log("esc-robash-b");
+    let body = "    escalate_after_reads: 3\n    escalate_after_tool_calls: 0\n    escalate_after_tool_failures: 0\n    escalate_on_max_tokens: false\n    escalate_on_refusal: false\n";
+    let yaml = esc_yaml(&state, &scores, body, &logb.display().to_string());
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = "TOOL:exec:ls -la /tmp 2>/dev/null || echo nope\n".repeat(8) + "investigate";
+        let resp = prompt_text(&cx, &sid, &prompt).await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "read-only shell counted as investigation and escalated: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_mid_turn_on_tool_call_volume_despite_side_effects() {
+    // The hickory-ai6 case: a turn grinding through many tool calls (with
+    // edits/side effects) must escalate on total volume, not need pre-side-
+    // effect reads.
+    let state = temp_state_file("esc-vol");
+    let scores = escalation_scores("vol", false);
+    let logb = temp_log("esc-vol-b");
+    let body = "    escalate_after_tool_calls: 5\n    escalate_after_reads: 0\n    escalate_after_tool_failures: 0\n    escalate_on_max_tokens: false\n    escalate_on_refusal: false\n";
+    let yaml = esc_yaml(&state, &scores, body, &logb.display().to_string());
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // 12 edits (all side effects) → activity trigger fires at 5.
+        let prompt = "TOOL:edit\n".repeat(12) + "keep grinding";
+        let resp = prompt_text(&cx, &sid, &prompt).await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "tool-call volume escalated despite side effects: {text}"
+        );
+        assert!(got_prompt(&logb), "strong model ran");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_mid_turn_on_tool_failures() {
+    let state = temp_state_file("esc-fail");
+    let scores = escalation_scores("fail", false);
+    let logb = temp_log("esc-fail-b");
+    let body = "    escalate_after_tool_failures: 3\n    escalate_after_reads: 0\n    escalate_after_tool_calls: 0\n    escalate_on_max_tokens: false\n    escalate_on_refusal: false\n";
+    let yaml = esc_yaml(&state, &scores, body, &logb.display().to_string());
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = "TOOL:fail\n".repeat(6) + "thrash";
+        let resp = prompt_text(&cx, &sid, &prompt).await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "tool-failure churn escalated mid-turn: {text}"
+        );
+        assert!(got_prompt(&logb), "strong model ran");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_initial_router_delegates_the_start() {
+    // `initial_router: auto` starts on auto's pick (quality-weighted) instead
+    // of the cheapest, then escalation applies from there.
+    let state = temp_state_file("esc-init");
+    // auto with pure quality picks the highest-quality candidate.
+    let yaml = format!(
+        "state_file: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    initial_router: auto\n  auto: {{ cost_quality_tradeoff: 0 }}\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml("strong", &[("opus", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "hello").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        // Delegated to auto (pure quality) → starts on the STRONG model, not cheapest.
+        assert!(
+            text.contains("escalation → strong/opus"),
+            "delegated start to auto's pick: {text}"
+        );
+        assert!(
+            text.contains("delegated to `auto`"),
+            "disclosure notes delegation: {text}"
+        );
         Ok(())
     })
     .await;

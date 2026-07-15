@@ -23,11 +23,11 @@ you: "Fix the bugs with issue X: (1)… (2)… (3)…"
 │ re-derives criteria from the ORIGINAL prompt, diffs, runs tests,           │
 │ returns {verdict, blocking_issues, evidence, confidence}                   │
 │        ▼                                                                   │
-│ fix rounds (bounded) → on "approve": push branch / gh pr create            │
+│ fix rounds (bounded) → on approve: push / open PR / merge (gated)          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## What this is built from (verified against goose 1.41)
+## What this is built from
 
 Everything except one small router feature is **stock goose tooling**:
 
@@ -39,7 +39,7 @@ Everything except one small router feature is **stock goose tooling**:
 | Per-phase provider/model | subagent provider resolution: `params.provider` → subrecipe `settings.goose_provider` → `GOOSE_SUBAGENT_PROVIDER` env → **parent's provider**. Subtasks declare nothing, so they inherit the router |
 | Structured verdicts | subrecipe `response.json_schema` |
 | Bounded improve-loops | recipe instructions (the same draft→critique→adjudicate idiom as your `plan-with-qwen-critic` recipe) |
-| Submission tooling | the `developer` extension's shell (git, `gh pr create`) |
+| Submission tooling | the `developer` extension's shell (git, `gh pr create`, `gh pr merge` — the merge is deferred until the reviewer approves) |
 
 The one router-acp addition (Milestone 9 in `PLAN.md`, implemented and
 tested): **prompt routing directives**, because the goose CLI cannot set
@@ -104,19 +104,12 @@ cargo install --path . --force
 
 ## Running it
 
-**Interactive (the normal way).** Use the `orchestrate` wrapper (installed at
-`~/.local/bin/orchestrate`) — it runs the recipe through the router with `-s`
-so the session stays interactive:
 
 ```sh
-orchestrate
+exec env goose run -s --recipe "$HOME/.config/goose/recipes/orchestrate.yaml" "$@"
 ```
 
-Equivalent to `GOOSE_PROVIDER=pi-acp goose run -s --recipe
-~/.config/goose/recipes/orchestrate.yaml`. **The `-s` is required** — plain
-`goose run --recipe …` without it is one-shot and exits right after asking
-for the task (which looks like the orchestrator "dropping you back to the
-console"). The wrapper exists so you never forget it.
+> tip: set this as an alias, such as `alias go='exec env goose run -s --recipe "$HOME/.config/goose/recipes/orchestrate.yaml" "$@"'`
 
 - The orchestrator (already pinned to the planner model — the recipe's own
   first prompt carries the routing directive) introduces itself and asks
@@ -149,7 +142,7 @@ Optional params:
 | `reviewer_candidate` | `codex/gpt-5.5` | preferred reviewer (soft; falls back if unavailable) |
 | `run_label` | `orchestrate` | grouping label for every session of the run |
 | `max_fix_rounds` | `2` | review→fix→re-review budget |
-| `submit` | `branch` | `never` \| `branch` \| `pr` |
+| `submit` | `branch` | `never` \| `branch` \| `pr` \| `merge` (merge only after the reviewer approves; "ship/merge/land" in the task elevates to `merge`) |
 | `repo_path` | `.` | target checkout |
 
 You'll see the routing decisions inline — one `[router-acp] … → model ·

@@ -395,4 +395,57 @@ mod score_resolution_tests {
             "fable outranks opus"
         );
     }
+
+    #[test]
+    fn sol_line_scores_at_the_top_and_beats_generic_gpt5() {
+        let t = ScoreTable::builtin();
+        // Whatever the adapter names it, a "sol" id matches the frontier entry
+        // (not the generic `*gpt-5*` fallback), across id shapes.
+        for id in ["codex/sol", "codex/gpt-sol", "codex/gpt-5-sol"] {
+            let sol = t.lookup(&CandidateId::parse(id).unwrap());
+            assert_eq!(sol.coding_tier, CodingTier::High, "{id} is high tier");
+            assert!(
+                sol.quality(TaskClass::CodingGeneral) >= 0.95,
+                "{id} rated comparable to fable"
+            );
+        }
+        let sol = t.lookup(&CandidateId::parse("codex/gpt-5-sol").unwrap());
+        let gpt5 = t.lookup(&CandidateId::parse("codex/gpt-5.5").unwrap());
+        assert!(
+            sol.quality(TaskClass::CodingGeneral) > gpt5.quality(TaskClass::CodingGeneral),
+            "sol is not shadowed by the generic *gpt-5* pattern"
+        );
+        // Must not collide with sonnet (no "sol" substring).
+        let sonnet = t.lookup(&CandidateId::parse("claude/sonnet").unwrap());
+        assert!(
+            sonnet.quality(TaskClass::CodingGeneral) < 0.9,
+            "sonnet unaffected"
+        );
+    }
+
+    #[test]
+    fn sol_terra_luna_tier_ordering() {
+        let t = ScoreTable::builtin();
+        let q = |id: &str| {
+            t.lookup(&CandidateId::parse(id).unwrap())
+                .quality(TaskClass::CodingGeneral)
+        };
+        // Provisional ordering: sol (frontier) > terra (strong) > luna (small).
+        assert!(q("codex/gpt-5.6-sol") > q("codex/gpt-5.6-terra"));
+        assert!(q("codex/gpt-5.6-terra") > q("codex/gpt-5.6-luna"));
+        // terra is high tier; luna is medium; and none fall through to *gpt-5*.
+        assert_eq!(
+            t.lookup(&CandidateId::parse("codex/gpt-5.6-terra").unwrap())
+                .coding_tier,
+            CodingTier::High
+        );
+        assert_eq!(
+            t.lookup(&CandidateId::parse("codex/gpt-5.6-luna").unwrap())
+                .coding_tier,
+            CodingTier::Medium
+        );
+        // luna must not collide with any real id, and terra/luna beat the
+        // generic gpt-5 fallback only where intended (terra yes, luna no).
+        assert!(q("codex/gpt-5.6-terra") > q("codex/gpt-5.5"));
+    }
 }

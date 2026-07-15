@@ -1,0 +1,74 @@
+state_file: ~/.local/state/router-acp/sessions.db
+
+delegation:
+  enabled: true
+  max_concurrent: 3
+
+agents:
+  - name: claude
+    command:
+      type: stdio
+      command: ~/nvm/versions/node/v24.16.0/bin/claude-agent-acp
+    model_selection: { type: config-option }
+    budget_prompts_5h: 400
+    # Larger plan on claude: prefer it over codex when candidates are
+    # otherwise comparable (small additive utility bonus).
+    preference: 0.05
+    models:
+      - { id: haiku, display_name: Claude Haiku, cost_rank: 1 }
+      - { id: sonnet, display_name: Claude Sonnet, cost_rank: 2 }
+      - { id: "opus[1m]", display_name: Claude Opus 1M, cost_rank: 4 }
+      - { id: "claude-fable-5[1m]", display_name: Claude Fable 5 1M, cost_rank: 5 }
+
+  - name: codex
+    command:
+      type: stdio
+      command: ~/nvm/versions/node/v24.16.0/bin/codex-acp
+    model_selection: { type: config-option }
+    budget_prompts_5h: 400
+    models:
+      - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
+      - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }
+      - { id: gpt-5.6-luna, display_name: GPT Luna, cost_rank: 2 }
+      - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4 }
+      - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5 }
+
+router: escalation
+routers:
+  escalation:
+    initial_router: auto
+    escalation_path: ladder            # ladder | leap
+    escalate_before_side_effects: true # mid-turn default; false = post-turn only
+    min_start_score: 0.0               # optional floor on the starting model
+    escalate_after_reads: 6            # mid-turn read-volume trigger (0 = off)
+    escalate_after_tool_calls: 30      # mid-turn "grinding" trigger: escalate once
+                                       # one turn issues this many tool calls without
+                                       # finishing (robust to Bash/edit-heavy work; 0 = off)
+    escalate_after_tool_failures: 3    # mid-turn churn trigger (0 = off)
+    escalate_on_max_tokens: true
+    escalate_on_refusal: true
+    max_escalations: 3
+
+  auto:
+    # 0 = pure quality, 10 = cheapest survivor. Seats are flat-rate, so lean
+    # quality: trivial prompts still go cheap because the tradeoff scales
+    # down with classified complexity (complexity_scales_tradeoff, on by
+    # default) — hard prompts get frontier models.
+    cost_quality_tradeoff: 3
+
+# Mid-session model switching. A pinned session can move to a more capable
+# model on its own when its confidence drops. Confidence = the pinned model's
+# quality for the task class minus accumulated "struggle" (token-ceiling hits,
+# refusals, repeated tool failures). Explicit `[router: switch=agent/model]`
+# always works regardless of this setting.
+auto_upgrade:
+  enabled: true                 # false disables automatic upgrades entirely
+  confidence_threshold: 0.55    # upgrade below this; higher = more eager
+
+# Force skills onto a class of models. When a prompt invokes `pattern`
+# (as `/name` or a standalone token) and the pinned model isn't already in
+# `candidates`, the session switches to the best available match (summarize +
+# re-pin). Candidates are candidate globs in preference order.
+skill_routing:
+  - pattern: ship-pr
+    candidates: ["*opus*", "*gpt-5.5*"]

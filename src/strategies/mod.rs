@@ -5,10 +5,12 @@
 //! higher score, lower effective cost, config order.
 
 mod auto;
+mod escalation;
 mod pareto_code;
 mod static_;
 
 pub use auto::AutoStrategy;
+pub use escalation::EscalationStrategy;
 pub use pareto_code::ParetoCodeStrategy;
 pub use static_::StaticStrategy;
 
@@ -84,6 +86,17 @@ pub fn make_strategy(kind: StrategyKind, cfg: &Config) -> Box<dyn RouterStrategy
         StrategyKind::Auto => Box::new(AutoStrategy::new(cfg.routers.auto.clone())),
         StrategyKind::ParetoCode => {
             Box::new(ParetoCodeStrategy::new(cfg.routers.pareto_code.clone()))
+        }
+        StrategyKind::Escalation => {
+            let ecfg = cfg.routers.escalation.clone();
+            match ecfg.initial_router {
+                // Delegate the starting pick to another router (never to
+                // `escalation` itself — config validation forbids it).
+                Some(k) if k != StrategyKind::Escalation => Box::new(
+                    EscalationStrategy::with_initial(ecfg, make_strategy(k, cfg)),
+                ),
+                _ => Box::new(EscalationStrategy::new(ecfg)),
+            }
         }
     }
 }

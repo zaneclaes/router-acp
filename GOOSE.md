@@ -1,3 +1,13 @@
+# Installing goose
+
+Don't have goose yet?
+
+- `npm install -g @agentclientprotocol/claude-agent-acp`
+- `npm install -g @agentclientprotocol/codex-acp`
+- `curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash`
+
+Then run goose with `goose`. Go thru the config flow for claude and/or codex.
+
 # Using router-acp with goose
 
 Exact install steps for goose ≥ 1.41 on macOS, written for a machine that
@@ -41,7 +51,6 @@ Codex adapters downstream.
 ## 1. Install router-acp
 
 ```sh
-cd /Users/Zane/zdrive/zaneclaes/Programming/Hickory/router-acp
 cargo install --path .          # installs ~/.cargo/bin/router-acp
 router-acp --version
 ```
@@ -65,7 +74,7 @@ agents:
   - name: claude
     command:
       type: stdio
-      command: /Users/Zane/nvm/versions/node/v24.16.0/bin/claude-agent-acp
+      command: ~/nvm/versions/node/v24.16.0/bin/claude-agent-acp
     model_selection: { type: config-option }
     budget_prompts_5h: 400
     # Larger plan on claude: prefer it over codex when candidates are
@@ -80,7 +89,7 @@ agents:
   - name: codex
     command:
       type: stdio
-      command: /Users/Zane/nvm/versions/node/v24.16.0/bin/codex-acp
+      command: ~/nvm/versions/node/v24.16.0/bin/codex-acp
     model_selection: { type: config-option }
     budget_prompts_5h: 400
     models:
@@ -130,7 +139,9 @@ Notes on this file:
   After a node upgrade (`nvm install`), update the version in both paths, or
   switch to `command: npx` with
   `args: ["-y", "@agentclientprotocol/claude-agent-acp"]` (slower startup,
-  version-proof).
+  version-proof). A leading `~`/`~/` in `command` and `args` is expanded to
+  `$HOME` at config load — adapters are spawned without a shell, so this
+  expansion is the router's, not the shell's (a bare `~user` is left as-is).
 - The **model ids were verified against your installed adapters** (July 9,
   2026): claude-agent-acp offers `default`, `haiku`, `sonnet`, `sonnet[1m]`,
   `opus[1m]`, `claude-fable-5[1m]`; codex-acp offers `gpt-5.4-mini`,
@@ -172,22 +183,12 @@ the name `pi-acp` collides with nothing on your machine either way.
 
 ## 4. Register the slot with goose
 
-Two additions to `~/.config/goose/config.yaml`:
+One additions to `~/.config/goose/config.yaml`:
 
-**a) The search path** (top level, next to `GOOSE_MODE` etc.). Config search
-paths are consulted before the hardcoded dirs, npm bin, and `PATH`, so goose
-finds the shim:
-
-```yaml
-GOOSE_SEARCH_PATHS:
-  - /Users/Zane/.config/router-acp/bin
-```
-
-**b) Mark the provider configured**, mirroring the shape of your existing
+Mark the provider configured**, mirroring the shape of your existing
 `claude-acp` entry, plus the legacy flag goose's own setup instructions use:
 
 ```yaml
-pi-acp_configured: true
 providers:
   claude-acp:            # unchanged
     enabled: true
@@ -207,8 +208,8 @@ goose session                              # direct Claude, exactly as before
 GOOSE_PROVIDER=pi-acp goose session        # routed via router-acp
 ```
 
-To make routing the default instead, set `active_provider: pi-acp` (revert by
-setting it back).
+To make routing the default (so you can drop the `GOOSE_PROVIDER=pi-acp`
+prefix), see step 6.
 
 ## 5. Verify
 
@@ -243,6 +244,49 @@ That line is your proof the router is serving the session. Also sanity-check:
 - A plain `goose session` (no `GOOSE_PROVIDER`) must still start the real
   Claude adapter with **no** `[router-acp]` line — proving claude-acp was
   left alone.
+
+## 6. Make routing the default (drop the per-run flag)
+
+Once you've verified it works, you don't have to prefix every command with
+`GOOSE_PROVIDER=pi-acp`. goose resolves the active provider in this order:
+
+1. the **`GOOSE_PROVIDER` environment variable**,
+2. the **`active_provider:`** key in `config.yaml`,
+3. a legacy **`GOOSE_PROVIDER:` config key** (last-resort fallback only).
+
+Pick whichever fits:
+
+**a) Environment variable (recommended — most durable).** Add it to your shell
+profile so every `goose` invocation picks up the router:
+
+```sh
+# ~/.zshrc  (or ~/.bashrc)
+export GOOSE_PROVIDER=pi-acp
+```
+
+This is just the persistent form of the `GOOSE_PROVIDER=pi-acp` you tested. It's
+checked *first*, so it always wins — and because it lives in your shell, not in
+`config.yaml`, **goose can't reset it** (see the caveat below). Revert by
+removing the line; unset it for a one-off (`GOOSE_PROVIDER= goose session`) to
+drop back to plain Claude.
+
+**b) `active_provider` in `config.yaml`.** The goose-native way:
+
+```yaml
+active_provider: pi-acp
+```
+
+Works, but goose *manages* `config.yaml` — its `/model` command and provider
+picker rewrite the file, and can reset `active_provider` back to `claude-acp`.
+If you find routing silently reverting, that's why; use option (a) instead.
+
+> **Do NOT set `GOOSE_PROVIDER:` as a key in `config.yaml`.** It's only the
+> last-resort fallback (step 3 above) and is *not* the field goose's setup
+> check reads, so goose decides no provider is configured and drops you into
+> the onboarding flow. Use the environment variable or `active_provider`.
+
+You do **not** need to publish or register the router as a "real" goose
+provider — `pi-acp` is already a valid slot once steps 3–4 are done.
 
 ## Choosing candidates per session
 

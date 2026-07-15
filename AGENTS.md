@@ -30,13 +30,13 @@ SDK traps below, which were all discovered the hard way.
 | --- | --- |
 | `src/session.rs` | the hub: `Shared` state, upstream agent surface (all ACP handlers), pin/failover engine (`pin_session`, `send_prompt_with_failover`), downstream→upstream relay (`handle_downstream_dispatch`), disclosures (`notify_user`), failure accounting (`apply_failure`), respawn (`revive_dead_targets`) |
 | `src/downstream.rs` | process targets from config (`config-option` = 1 process/agent; `spawn-config` = 1 process/model with `${model_id}` templating), spawn+contain (`start_downstream`), probe/verify (`probe_target`, model-selector discovery, `verify_model_selected`) |
-| `src/transport.rs` | flushing stdio + child-process transports (replaces broken SDK ones) |
-| `src/strategies/` | `RouterStrategy` trait; `static_`, `auto`, `pareto_code`; each `RankedCandidate` carries `reason` (human) + `weights` (json) for disclosure/state |
+| `src/transport.rs` | flushing stdio + child-process transports (replaces broken SDK ones); **downstream teardown**: each agent process is spawned in its own process group (`process_group(0)`) and its PID tracked in a global registry; `kill_all_downstreams()` SIGKILLs every group (agent + grandchildren like a Bash mid-`git commit`). `serve` calls it on disconnect AND from a SIGINT/SIGTERM handler — because `kill_on_drop` does NOT run on signal-death or runtime teardown, which once let a Ctrl+C'd agent keep running and commit broken code to `main` |
+| `src/strategies/` | `RouterStrategy` trait; `static_`, `auto`, `pareto_code`, `escalation`; each `RankedCandidate` carries `reason` (human) + `weights` (json) for disclosure/state. `escalation::rank` only picks the cheap start + fallback chain; its escalation is runtime (`session::escalation_target`/`note_investigation`/`escalation_post_turn`) |
 | `src/classifier.rs` | heuristic task class + complexity (data-driven), cwd language fingerprint, optional Ollama backend (own mini HTTP client; never uses seat agents) |
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (hard exclusion until token-limit reset) |
-| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`kind`/`run_label` + token counters) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; one-time `sessions.json` import. `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
+| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tool: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task`, `mcp-delegate` helper bridge |
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment |
@@ -159,6 +159,35 @@ SDK traps below, which were all discovered the hard way.
   `frame_transcript`. The disclosure states which path was used. Regression-tested
   in `switch_directive_hands_off_…`, `switch_falls_back_to_log_transcript_when_summary_fails`,
   `low_confidence_pin_auto_upgrades_…`, `auto_upgrade_disabled_…`, `skill_routing_switches_…`.
+- **`escalation` router** (start cheap, escalate on *observed* difficulty — not
+  a prompt guess): `EscalationStrategy::rank` pins the cheapest capable candidate
+  (or, if `initial_router` is set, delegates the starting pick to that strategy —
+  built via `make_strategy` recursion in `mod.rs`, guarded against `escalation`
+  by config validation). Escalation is runtime via `switch_pin`. Relay-side
+  signals (all in `handle_downstream_dispatch`, deduped per turn by
+  `turn_counted_tools`/`turn_failed_tools`; `classify_tool` maps each tool frame
+  to Investigation/SideEffect/Defer using kind + `is_read_only_command`
+  (denylist; strips `2>/dev/null`-style redirects) + `is_read_only_mcp`):
+  **read-volume** (`note_investigation`, gated on `!turn_side_effect` — a clean
+  pre-side-effect replay), **tool-call volume** (`note_tool_activity` on
+  `turn_tool_calls ≥ escalate_after_tool_calls`, NOT side-effect-gated — the
+  robust signal for edit/Bash-heavy turns), **tool-failure churn**
+  (`note_tool_failure`, not gated). All three set `escalation_requested` + cancel
+  the in-flight turn; the failover loop `switch_pin`s and replays (transcript
+  handoff = *continue*, not blind replay, which is why the post-side-effect
+  triggers are safe). **post-turn** (`escalation_post_turn`) handles
+  max-tokens/refusal stops via `pending_switch`. `escalation_path` = `ladder`
+  (`min`-quality candidate above current) or `leap` (`max`); one-way, capped by
+  `max_escalations`; loop budget `max(failover.max_attempts, max_escalations+1)`.
+  **LESSON (a shipped bug):** the read-volume trigger under-fired in production
+  because real adapters do investigation via Bash (`execute`) and MCP (`other`),
+  not `read`-kind tools, and the first side-effecting tool latched the window.
+  The volume/failure triggers + read-only-command classification fix it. Tests
+  MUST drive the real `tool_call` `session/update` path (mock `TOOL:` directive),
+  not `fs/read_text_file` requests — an fs-only test passed while production
+  failed. Tests: `escalation_*` in `tests/protocol.rs` (incl.
+  `…on_tool_call_volume_despite_side_effects`, `…read_only_bash_counts…`) +
+  `escalation_signal_tests` + `strategies::escalation` units.
 - goose sends `session/set_mode` immediately after `session/new` (pre-pin)
   and treats an error as fatal: pre-pin modes are deferred and applied at
   pin (via per-agent `mode_map` translation, then exact id match); post-pin

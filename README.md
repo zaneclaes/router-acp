@@ -1,4 +1,25 @@
-# router-acp
+# What & Why
+
+You have a subscription account for claude, codex, etc... you want to get the most out of each model while keeping cost low.
+
+> Tools like `OpenRouter` would require pay-per-token API calls.
+
+This repo:
+
+- Automatically selects the best starting model
+- Hot-switches between models (even between different companies' models)
+- Changes models automatically (when out of tokens, during a downtime, or when a task is too complex)
+- Works right from the command line (delegating to your existing `claude` / `codex` CLI tools)
+
+# Installation
+
+- Start [`using this tool with goose`](GOOSE.md)
+- Copy the [`example config`](examples/router-preferred.yaml) to `~/.config/router-acp/router.yaml`
+- Let this tool auto-decide what model to use for any given task
+- Hot switch your model via a prompt, i.e., `gpt: continue this work`
+- Consider using the [orchestration recipe](ORCHESTRATION.md) for complex tasks
+
+# Router ACP
 
 An [ACP](https://agentclientprotocol.com/) session router over `(agent, model)`
 candidates, with bounded in-session delegation.
@@ -101,6 +122,20 @@ preference, config order.
   `effective_cost = cost_rank / max(headroom, ε)` with the next two same-tier
   candidates kept as pre-prompt fallbacks. Use it for coding sessions; `auto`
   is the general router.
+- **`escalation`** — start on the cheapest capable candidate and escalate to a
+  stronger one only when *observed execution* reveals hidden difficulty, rather
+  than guessing complexity from the prompt. Triggers are behavioral and fire
+  **mid-turn**: crossing `escalate_after_reads` investigation reads (file reads
+  and read-only shell/MCP calls) before a side effect; issuing
+  `escalate_after_tool_calls` total tool calls in one turn without finishing
+  (the robust "grinding" signal for edit/Bash-heavy work); or
+  `escalate_after_tool_failures` failed tool calls — plus post-turn on a
+  token-ceiling/refusal stop. Mid-turn it interrupts and hands off a transcript
+  so the stronger model continues. `escalation_path` is `ladder` (one tier up)
+  or `leap` (strongest); `initial_router` optionally delegates the *starting*
+  pick to another router instead of the cheapest. Best for "looks like one
+  sentence, turns out hard" work — trivial tasks finish cheap at no extra cost.
+  See [`ROUTERS.md`](ROUTERS.md).
 
 ### Token limits, outages, and failover
 
@@ -281,8 +316,8 @@ example.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `router` | `auto` | Default strategy: `auto`, `pareto-code`, `static`. |
-| `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` table: one row per router session (pin, cwd, title, routing decision + weights, `parent_session_id` for delegated sub-agents, `kind`, `run_label`, token/context counters). `session_log` table: every ACP interaction (user prompt, model response, tool call, permission/fs/terminal callback) with token counts. A legacy `sessions.json` beside it is imported once. Inspect with `router-acp sessions --config …`. |
+| `router` | `auto` | Default strategy: `auto`, `pareto-code`, `escalation`, `static`. |
+| `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` table: one row per router session (pin, cwd, title, routing decision + weights, `parent_session_id` for delegated sub-agents, `prior_session_id` (the downstream session bound before a mid-session model switch), `kind`, `run_label`, token/context counters). `session_log` table: every ACP interaction (user prompt, model response, tool call, permission/fs/terminal callback) with token counts. A legacy `sessions.json` beside it is imported once. Inspect with `router-acp sessions --config …`. |
 | `history` | `30d` | How long to keep sessions before auto-pruning (and their logs, by cascade). Duration string: `30d`, `12h`, `90m`, `3600s`, or a bare number of days. Pruned on open and after each write. |
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
@@ -316,6 +351,15 @@ example.
 | `routers.static.allow_fallback` | `false` | Fall back in config order if the static candidate is unavailable. |
 | `routers.auto.*` | see above | `cost_quality_tradeoff` (0–10), `complexity_floor`, `allowed_candidates` globs. |
 | `routers.pareto-code.min_coding_score` | high tier | Maps to a router-acp coding tier (≥0.66 high, ≥0.33 medium, else low). |
+| `routers.escalation.escalation_path` | `ladder` | `ladder` (next tier up) or `leap` (straight to the strongest) on each escalation. |
+| `routers.escalation.initial_router` | *(none)* | Delegate the *starting* candidate to another router (`auto`/`pareto-code`/`static`) instead of the cheapest; escalation still applies from there. Cannot be `escalation`. |
+| `routers.escalation.escalate_before_side_effects` | `true` | Escalate mid-turn while still investigating (before any output/edit); `false` = post-turn only. |
+| `routers.escalation.escalate_after_reads` | `6` | Mid-turn read-volume trigger; investigation events (incl. read-only shell/MCP) before a side effect (`0` = off). |
+| `routers.escalation.escalate_after_tool_calls` | `30` | Mid-turn "grinding" trigger: total tool calls in one turn without finishing (robust to edit/Bash-heavy work; `0` = off). |
+| `routers.escalation.escalate_after_tool_failures` | `3` | Post-turn: failed tool calls in a turn before escalating (`0` = off). |
+| `routers.escalation.escalate_on_max_tokens` / `escalate_on_refusal` | `true` | Post-turn escalation on a max-tokens / refusal stop. |
+| `routers.escalation.min_start_score` | `0` | Optional class-quality floor on the *starting* candidate. |
+| `routers.escalation.max_escalations` | `3` | Hard cap on escalations per session. |
 
 ## Session modes
 

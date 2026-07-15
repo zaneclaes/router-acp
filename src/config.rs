@@ -14,6 +14,7 @@ pub enum StrategyKind {
     Static,
     Auto,
     ParetoCode,
+    Escalation,
 }
 
 impl StrategyKind {
@@ -22,6 +23,7 @@ impl StrategyKind {
             StrategyKind::Static => "static",
             StrategyKind::Auto => "auto",
             StrategyKind::ParetoCode => "pareto-code",
+            StrategyKind::Escalation => "escalation",
         }
     }
 
@@ -30,9 +32,21 @@ impl StrategyKind {
             "static" => Some(StrategyKind::Static),
             "auto" => Some(StrategyKind::Auto),
             "pareto-code" => Some(StrategyKind::ParetoCode),
+            "escalation" => Some(StrategyKind::Escalation),
             _ => None,
         }
     }
+}
+
+/// How far the `escalation` router jumps when it escalates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EscalationPath {
+    /// Move to the next-higher-capability eligible candidate, one step at a time.
+    #[default]
+    Ladder,
+    /// Jump straight to the strongest eligible candidate.
+    Leap,
 }
 
 /// How the routing decision is disclosed to the client.
@@ -422,6 +436,91 @@ pub struct ParetoCodeRouterConfig {
     pub min_coding_score: Option<f64>,
 }
 
+/// `escalation` router: start on the cheapest capable candidate and escalate
+/// to a stronger one only when *observed execution* reveals hidden difficulty
+/// (heavy investigation, tool-failure churn, token exhaustion, refusals).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EscalationRouterConfig {
+    /// How far each escalation jumps (`ladder` = next tier up, `leap` =
+    /// straight to the strongest eligible candidate).
+    #[serde(default)]
+    pub escalation_path: EscalationPath,
+    /// Delegate the *starting* candidate choice to another router (`auto`,
+    /// `pareto-code`, `static`) instead of picking the cheapest. Escalation
+    /// still applies at runtime from whatever it picks. `None` = start cheapest.
+    /// (Must not be `escalation` itself.)
+    #[serde(default)]
+    pub initial_router: Option<StrategyKind>,
+    /// Escalate mid-turn — while the cheap model is still only *investigating*
+    /// (no output streamed and no write/exec tool call yet) — instead of only
+    /// after the turn completes. The post-turn triggers (below) always apply;
+    /// this adds the read-volume trigger inside the pre-side-effect window.
+    #[serde(default = "default_true")]
+    pub escalate_before_side_effects: bool,
+    /// Optional floor on the *starting* candidate's class quality (0 = none),
+    /// so the router won't begin on a model too weak to make any headway.
+    #[serde(default)]
+    pub min_start_score: f64,
+    /// Escalate after this many investigation events (file reads / searches)
+    /// in a turn. `0` disables the read-volume trigger.
+    #[serde(default = "default_escalate_after_reads")]
+    pub escalate_after_reads: u32,
+    /// Escalate mid-turn once a single turn has issued this many tool calls
+    /// without finishing — the "grinding / in over its head" signal, robust to
+    /// how the model interleaves reads and edits (unlike `escalate_after_reads`,
+    /// which only counts investigation before the first side effect). `0`
+    /// disables. Not gated on side effects: the handoff is a transcript
+    /// *continue*, so the stronger model picks up where the cheap one left off.
+    #[serde(default = "default_escalate_after_tool_calls")]
+    pub escalate_after_tool_calls: u32,
+    /// Escalate after this many *failed* tool calls in a turn. `0` disables.
+    #[serde(default = "default_escalate_after_tool_failures")]
+    pub escalate_after_tool_failures: u32,
+    /// Escalate when a turn ends with a max-tokens stop reason.
+    #[serde(default = "default_true")]
+    pub escalate_on_max_tokens: bool,
+    /// Escalate when a turn ends with a refusal stop reason.
+    #[serde(default = "default_true")]
+    pub escalate_on_refusal: bool,
+    /// Hard cap on escalations per session (bounds ladder thrash).
+    #[serde(default = "default_max_escalations")]
+    pub max_escalations: u32,
+}
+
+fn default_escalate_after_reads() -> u32 {
+    6
+}
+
+fn default_escalate_after_tool_calls() -> u32 {
+    30
+}
+
+fn default_escalate_after_tool_failures() -> u32 {
+    3
+}
+
+fn default_max_escalations() -> u32 {
+    3
+}
+
+impl Default for EscalationRouterConfig {
+    fn default() -> Self {
+        Self {
+            escalation_path: EscalationPath::default(),
+            initial_router: None,
+            escalate_before_side_effects: true,
+            min_start_score: 0.0,
+            escalate_after_reads: default_escalate_after_reads(),
+            escalate_after_tool_calls: default_escalate_after_tool_calls(),
+            escalate_after_tool_failures: default_escalate_after_tool_failures(),
+            escalate_on_max_tokens: true,
+            escalate_on_refusal: true,
+            max_escalations: default_max_escalations(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutersConfig {
@@ -431,6 +530,8 @@ pub struct RoutersConfig {
     pub auto: AutoRouterConfig,
     #[serde(rename = "pareto-code", default)]
     pub pareto_code: ParetoCodeRouterConfig,
+    #[serde(default)]
+    pub escalation: EscalationRouterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +632,28 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Expand a leading `~`/`~/` in a string that names a path. Unlike
+/// [`expand_tilde`], operates on strings (command paths and args) and only
+/// touches a `~` that is the whole value or is followed by a separator — a
+/// bare `~word` (e.g. another user's home, which we can't resolve) is left
+/// intact. Downstream commands are spawned via `Command::new`, which does NOT
+/// invoke a shell, so an unexpanded `~` would be treated as a literal path
+/// component and the spawn would fail.
+pub fn expand_tilde_str(s: &str) -> String {
+    if s == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return home.to_string_lossy().into_owned();
+        }
+        return s.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return format!("{}/{rest}", home.to_string_lossy());
+    }
+    s.to_string()
+}
+
 /// A configuration error with an actionable message.
 #[derive(Debug)]
 pub struct ConfigError(pub String);
@@ -551,6 +674,22 @@ impl Config {
         cfg.state_file = expand_tilde(&cfg.state_file);
         if let Some(p) = &cfg.delegation.socket_path {
             cfg.delegation.socket_path = Some(expand_tilde(p));
+        }
+        // Downstream adapters are spawned via `Command::new` (no shell), so a
+        // leading `~` in a command path or arg would never be expanded and the
+        // spawn would fail — expand it here the same way we do for state paths.
+        for agent in &mut cfg.agents {
+            agent.command.command = expand_tilde_str(&agent.command.command);
+            for arg in &mut agent.command.args {
+                *arg = expand_tilde_str(arg);
+            }
+            if let ModelSelectionConfig::SpawnConfig { process_template } =
+                &mut agent.model_selection
+            {
+                for arg in &mut process_template.args {
+                    *arg = expand_tilde_str(arg);
+                }
+            }
         }
         cfg.validate()?;
         Ok(cfg)
@@ -640,6 +779,13 @@ impl Config {
         if !(0.0..=10.0).contains(&self.routers.auto.cost_quality_tradeoff) {
             return Err(ConfigError(
                 "routers.auto.cost_quality_tradeoff must be between 0 and 10".into(),
+            ));
+        }
+        if self.routers.escalation.initial_router == Some(StrategyKind::Escalation) {
+            return Err(ConfigError(
+                "routers.escalation.initial_router cannot be `escalation` (it would recurse); \
+                 use auto, pareto-code, or static"
+                    .into(),
             ));
         }
         if let Some(candidate) = &self.routers.static_.candidate {
@@ -793,5 +939,45 @@ agents:
     fn interpolate_leaves_unknown_and_unterminated_intact() {
         let out = interpolate("a${missing}b${unterminated", &|_| None);
         assert_eq!(out, "a${missing}b${unterminated");
+    }
+
+    #[test]
+    fn expand_tilde_str_only_touches_leading_home() {
+        // SAFETY: test-local env mutation.
+        unsafe { std::env::set_var("HOME", "/home/zane") };
+        assert_eq!(expand_tilde_str("~"), "/home/zane");
+        assert_eq!(expand_tilde_str("~/bin/x"), "/home/zane/bin/x");
+        // A bare ~word (another user's home) is not ours to resolve.
+        assert_eq!(expand_tilde_str("~other/x"), "~other/x");
+        // Non-leading tildes are untouched.
+        assert_eq!(expand_tilde_str("/opt/~/x"), "/opt/~/x");
+        assert_eq!(expand_tilde_str("plain"), "plain");
+    }
+
+    #[test]
+    fn expands_tilde_in_command_path_and_args() {
+        // SAFETY: test-local env mutation.
+        unsafe { std::env::set_var("HOME", "/home/zane") };
+        let yaml = r#"
+agents:
+  - name: claude
+    command:
+      type: stdio
+      command: ~/nvm/bin/claude-agent-acp
+      args: ["--config", "~/cfg.yaml", "--flag"]
+    model_selection: { type: config-option }
+    models:
+      - id: sonnet
+        cost_rank: 1
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.agents[0].command.command,
+            "/home/zane/nvm/bin/claude-agent-acp"
+        );
+        assert_eq!(
+            cfg.agents[0].command.args,
+            vec!["--config", "/home/zane/cfg.yaml", "--flag"]
+        );
     }
 }

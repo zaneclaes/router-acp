@@ -1,7 +1,7 @@
 //! Router session state, pin map, id remapping, callback forwarding, and the
 //! upstream ACP agent surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,7 +30,7 @@ use agent_client_protocol::{
 
 use crate::candidate::{CandidateId, RequiredCaps, ScoreTable, TaskClass};
 use crate::classifier::{ClassifierRules, ClassifyInput, classify, cwd_language_fingerprint};
-use crate::config::{Config, DisclosureMode, SkillRoute, StrategyKind};
+use crate::config::{Config, DisclosureMode, EscalationPath, SkillRoute, StrategyKind};
 use crate::downstream::{
     ProcessKey, ProcessTargetSpec, SelectionKind, build_targets, is_auth_required, probe_target,
     start_downstream, verify_model_selected,
@@ -155,9 +155,31 @@ pub struct RouterSession {
     pub struggle: f64,
     /// Failed tool calls seen this turn (reset each turn).
     pub turn_tool_failures: u32,
+    /// Tool-call ids already counted as investigation this turn (a tool emits
+    /// several update frames; count it once). Reset each turn.
+    pub turn_counted_tools: HashSet<String>,
+    /// Tool-call ids already counted as failed this turn. Reset each turn.
+    pub turn_failed_tools: HashSet<String>,
+    /// Distinct tool calls issued this turn (any kind) — the `escalation`
+    /// router's "grinding without finishing" signal. Reset each turn.
+    pub turn_tool_calls: u32,
+    /// Investigation events (file reads / searches) seen this turn — the
+    /// `escalation` router's read-volume signal (reset each turn).
+    pub turn_reads: u32,
+    /// Set once this turn produces a side effect (output streamed, or a
+    /// write/exec tool call): the point past which mid-turn escalation is no
+    /// longer safe (reroute could double-apply). Reset each turn.
+    pub turn_side_effect: bool,
+    /// Number of escalations this session has already performed (bounds
+    /// ladder thrash against `escalation.max_escalations`).
+    pub escalations_done: u32,
     /// A model switch requested for the next prompt: explicit
     /// `[router: switch=...]`, a skill-class requirement, or an auto-upgrade.
     pub pending_switch: Option<SwitchRequest>,
+    /// A mid-turn escalation requested by the `escalation` router while the
+    /// current turn is still side-effect-free: the failover loop performs it
+    /// (switch + replay) as soon as the interrupted turn returns.
+    pub escalation_requested: Option<SwitchRequest>,
     /// Summary text from the previous model, prepended to the next prompt
     /// sent to the new model after a switch.
     pub pending_context: Option<String>,
@@ -205,7 +227,14 @@ impl RouterSession {
             task_class: None,
             struggle: 0.0,
             turn_tool_failures: 0,
+            turn_counted_tools: HashSet::new(),
+            turn_failed_tools: HashSet::new(),
+            turn_tool_calls: 0,
+            turn_reads: 0,
+            turn_side_effect: false,
+            escalations_done: 0,
             pending_switch: None,
+            escalation_requested: None,
             pending_context: None,
             capturing_summary: None,
         }
@@ -236,7 +265,14 @@ impl RouterSession {
             task_class: None,
             struggle: 0.0,
             turn_tool_failures: 0,
+            turn_counted_tools: HashSet::new(),
+            turn_failed_tools: HashSet::new(),
+            turn_tool_calls: 0,
+            turn_reads: 0,
+            turn_side_effect: false,
+            escalations_done: 0,
             pending_switch: None,
+            escalation_requested: None,
             pending_context: None,
             capturing_summary: None,
         }
@@ -780,6 +816,338 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
 }
 
 /// Handle one message arriving from a downstream agent connection.
+/// How a tool call bears on the escalation router's mid-turn window.
+enum ToolClass {
+    /// Pure investigation (file read, read-only shell, read-only MCP tool) —
+    /// counts toward the read-volume trigger and does NOT close the window.
+    Investigation,
+    /// A mutation / command / write — closes the mid-turn window.
+    SideEffect,
+    /// Not yet classifiable on this frame (e.g. an `execute` whose command
+    /// isn't populated until a later frame); neither count nor close.
+    Defer,
+}
+
+/// True when a shell command is (conservatively) read-only: its leading tool
+/// is a known reader and it contains no redirection or mutating token. Errs
+/// toward `false` (treat as a side effect) when unsure — the safe default.
+fn is_read_only_command(cmd: &str) -> bool {
+    let mut lc = cmd.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    // Strip harmless redirects (to /dev/null, stderr merges) so they don't trip
+    // the `>` mutator check — `ls … 2>/dev/null || echo x` is read-only.
+    for harmless in [
+        "2>/dev/null",
+        "2>>/dev/null",
+        ">/dev/null",
+        "1>/dev/null",
+        "&>/dev/null",
+        "2>&1",
+        "1>&2",
+    ] {
+        lc = lc.replace(harmless, " ");
+    }
+    const MUTATORS: &[&str] = &[
+        ">",
+        ">>",
+        " rm ",
+        "rm -",
+        "rmdir",
+        " mv ",
+        " cp ",
+        "mkdir",
+        "touch ",
+        "sed -i",
+        " tee ",
+        "|tee",
+        "install",
+        "chmod",
+        "chown",
+        " ln ",
+        " dd ",
+        "kill ",
+        "git commit",
+        "git push",
+        "git add",
+        "git checkout",
+        "git reset",
+        "git merge",
+        "git rebase",
+        "git stash",
+        "git apply",
+        "git restore",
+        "git switch",
+        "git clean",
+        "npm run",
+        "cargo build",
+        "cargo run",
+        "cargo test",
+        "cargo install",
+        "cargo fix",
+        "make ",
+        "docker ",
+        "curl -o",
+        "wget ",
+        "brew install",
+        "pip install",
+        "apply",
+        "delete",
+    ];
+    if MUTATORS.iter().any(|m| lc.contains(m)) {
+        return false;
+    }
+    const READERS: &[&str] = &[
+        "ls",
+        "cat",
+        "grep",
+        "rg",
+        "find",
+        "head",
+        "tail",
+        "pwd",
+        "echo",
+        "which",
+        "wc",
+        "stat",
+        "tree",
+        "file",
+        "du",
+        "df",
+        "env",
+        "date",
+        "whoami",
+        "hostname",
+        "ps",
+        "less",
+        "more",
+        "sed ",
+        "awk ",
+        "jq ",
+        "sort",
+        "uniq",
+        "diff",
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "git branch",
+        "git remote",
+        "git rev-parse",
+        "git ls-files",
+        "git blame",
+        "git describe",
+        "git config --get",
+    ];
+    READERS
+        .iter()
+        .any(|r| lc == *r || lc.starts_with(&format!("{r} ")))
+}
+
+/// True when an MCP / meta tool is (conservatively) read-only, judged by verbs
+/// in its name. Write verbs win; then read verbs; unknown → false.
+fn is_read_only_mcp(tool_name: &str) -> bool {
+    let n = tool_name.to_lowercase();
+    if n.contains("toolsearch") {
+        return true;
+    }
+    const WRITE_VERBS: &[&str] = &[
+        "send", "create", "update", "write", "delete", "post", "add", "remove", "schedule",
+        "apply", "label", "draft", "canvas", "set_", "put",
+    ];
+    if WRITE_VERBS.iter().any(|w| n.contains(w)) {
+        return false;
+    }
+    const READ_VERBS: &[&str] = &[
+        "search", "read", "list", "get", "view", "fetch", "find", "lookup", "query", "describe",
+    ];
+    READ_VERBS.iter().any(|r| n.contains(r))
+}
+
+/// Classify a tool-call update for the escalation router.
+fn classify_tool(update: &serde_json::Value) -> ToolClass {
+    match update.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+        "read" | "search" | "fetch" | "think" => ToolClass::Investigation,
+        "execute" => match update
+            .get("rawInput")
+            .and_then(|r| r.get("command"))
+            .and_then(|c| c.as_str())
+        {
+            Some(cmd) if is_read_only_command(cmd) => ToolClass::Investigation,
+            Some(_) => ToolClass::SideEffect,
+            None => ToolClass::Defer, // command not on this frame yet
+        },
+        "other" => {
+            let name = update
+                .get("_meta")
+                .and_then(|m| m.get("claudeCode"))
+                .and_then(|c| c.get("toolName"))
+                .and_then(|n| n.as_str())
+                .or_else(|| update.get("title").and_then(|t| t.as_str()))
+                .unwrap_or("");
+            if name.is_empty() {
+                ToolClass::Defer
+            } else if is_read_only_mcp(name) {
+                ToolClass::Investigation
+            } else {
+                ToolClass::SideEffect
+            }
+        }
+        "" => ToolClass::Defer,     // a status-only frame with no kind
+        _ => ToolClass::SideEffect, // edit / delete / move / switch_mode …
+    }
+}
+
+/// Count one tool call and, for an `escalation` session, request a mid-turn
+/// escalation once the turn's tool-call count crosses the threshold — the
+/// "grinding without finishing" signal. Robust to read/edit interleaving (it
+/// ignores `turn_side_effect`); the handoff is a transcript continue.
+fn note_tool_activity(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, router_sid: &str) {
+    let cfg = shared.cfg.routers.escalation.clone();
+    let cross = shared
+        .with_session(router_sid, |s| {
+            s.turn_tool_calls += 1;
+            s.strategy == StrategyKind::Escalation
+                && cfg.escalate_after_tool_calls > 0
+                && s.escalation_requested.is_none()
+                && s.escalations_done < cfg.max_escalations
+                && s.turn_tool_calls >= cfg.escalate_after_tool_calls
+        })
+        .unwrap_or(false);
+    if !cross {
+        return;
+    }
+    let Some(target) = escalation_target(shared, router_sid, cfg.escalation_path) else {
+        return;
+    };
+    let n = cfg.escalate_after_tool_calls;
+    shared.with_session(router_sid, |s| {
+        s.escalation_requested = Some(SwitchRequest {
+            target: target.clone(),
+            reason: format!("escalation: {n}+ tool calls in one turn without finishing"),
+        });
+    });
+    if let Some(conn) = shared.target_conn(key) {
+        let _ = conn.send_notification(CancelNotification::new(down_sid.to_string()));
+    }
+    tracing::info!(session = router_sid, %target, "mid-turn escalation requested (tool-call volume)");
+}
+
+/// Count one failed tool call and, for an `escalation` session, request a
+/// mid-turn escalation once failures reach the threshold — the "model is
+/// struggling" signal. Unlike the read trigger, this is NOT gated on
+/// `turn_side_effect`: failures happen mid-action, and the switch hands off a
+/// transcript (the new model continues, it does not blindly replay).
+fn note_tool_failure(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, router_sid: &str) {
+    let cfg = shared.cfg.routers.escalation.clone();
+    let cross = shared
+        .with_session(router_sid, |s| {
+            s.turn_tool_failures += 1;
+            s.strategy == StrategyKind::Escalation
+                && cfg.escalate_after_tool_failures > 0
+                && s.escalation_requested.is_none()
+                && s.escalations_done < cfg.max_escalations
+                && s.turn_tool_failures >= cfg.escalate_after_tool_failures
+        })
+        .unwrap_or(false);
+    if !cross {
+        return;
+    }
+    let Some(target) = escalation_target(shared, router_sid, cfg.escalation_path) else {
+        return;
+    };
+    let n = cfg.escalate_after_tool_failures;
+    shared.with_session(router_sid, |s| {
+        s.escalation_requested = Some(SwitchRequest {
+            target: target.clone(),
+            reason: format!("escalation: {n}+ tool failures mid-turn — the model is struggling"),
+        });
+    });
+    if let Some(conn) = shared.target_conn(key) {
+        let _ = conn.send_notification(CancelNotification::new(down_sid.to_string()));
+    }
+    tracing::info!(session = router_sid, %target, "mid-turn escalation requested (tool failures)");
+}
+
+/// The escalation target for a session under the `escalation` router, given
+/// the configured path. `ladder` = the next-higher-capability eligible
+/// candidate; `leap` = the strongest. `None` if nothing more capable is
+/// eligible.
+fn escalation_target(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    path: EscalationPath,
+) -> Option<CandidateId> {
+    let (class, current, current_q, excluded) = shared.with_session(router_sid, |s| {
+        (
+            s.task_class.unwrap_or(TaskClass::CodingGeneral),
+            s.pin.as_ref().map(|p| p.candidate.clone()),
+            s.pinned_quality,
+            s.excluded.clone(),
+        )
+    })?;
+    let current = current?;
+    let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
+    pool.retain(|v| {
+        v.id != current && !is_excluded(&v.id, &excluded) && v.quality > current_q + 0.05
+    });
+    let pick = match path {
+        EscalationPath::Leap => pool.into_iter().max_by(|a, b| {
+            a.quality
+                .partial_cmp(&b.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        EscalationPath::Ladder => pool.into_iter().min_by(|a, b| {
+            a.quality
+                .partial_cmp(&b.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+    };
+    pick.map(|v| v.id)
+}
+
+/// Count one investigation event for an `escalation` session and, if the
+/// read-volume threshold is crossed while the turn is still side-effect-free,
+/// request a mid-turn escalation: flag it and cancel the in-flight cheap turn
+/// so the failover loop escalates + replays.
+fn note_investigation(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, router_sid: &str) {
+    let cfg = shared.cfg.routers.escalation.clone();
+    let cross = shared
+        .with_session(router_sid, |s| {
+            s.turn_reads += 1;
+            s.strategy == StrategyKind::Escalation
+                && cfg.escalate_before_side_effects
+                && cfg.escalate_after_reads > 0
+                && !s.turn_side_effect
+                && s.escalation_requested.is_none()
+                && s.capturing_summary.is_none()
+                && s.escalations_done < cfg.max_escalations
+                && s.turn_reads >= cfg.escalate_after_reads
+        })
+        .unwrap_or(false);
+    if !cross {
+        return;
+    }
+    let Some(target) = escalation_target(shared, router_sid, cfg.escalation_path) else {
+        return;
+    };
+    let reads = cfg.escalate_after_reads;
+    shared.with_session(router_sid, |s| {
+        s.escalation_requested = Some(SwitchRequest {
+            target: target.clone(),
+            reason: format!(
+                "escalation: {reads}+ investigation reads before any output — deeper than it looked"
+            ),
+        });
+    });
+    // Interrupt the in-flight cheap turn; the failover loop takes over.
+    if let Some(conn) = shared.target_conn(key) {
+        let _ = conn.send_notification(CancelNotification::new(down_sid.to_string()));
+    }
+    tracing::info!(session = router_sid, %target, "mid-turn escalation requested");
+}
+
 pub fn handle_downstream_dispatch(
     shared: &Arc<Shared>,
     key: &ProcessKey,
@@ -831,14 +1199,59 @@ pub fn handle_downstream_dispatch(
                 }
                 let mut fwd = relay::with_session_id(&msg, &router_sid)?;
                 if msg.method() == "session/update" {
-                    // Count failed tool calls this turn: a struggle signal that
-                    // feeds confidence-based auto-upgrade.
-                    if let Some(update) = msg.params().get("update")
-                        && update.get("sessionUpdate").and_then(|k| k.as_str())
-                            == Some("tool_call_update")
-                        && update.get("status").and_then(|s| s.as_str()) == Some("failed")
-                    {
-                        shared.with_session(&router_sid, |s| s.turn_tool_failures += 1);
+                    // Escalation router: classify each tool-call frame and drive
+                    // mid-turn escalation. Investigation (file read, read-only
+                    // shell/MCP) feeds the read-volume trigger and keeps the
+                    // window open; anything mutating closes it; a failed tool
+                    // call feeds the "model is struggling" trigger. Both the
+                    // read count and the failure count feed struggle/auto-upgrade
+                    // too (via `turn_tool_failures`).
+                    if let Some(update) = msg.params().get("update") {
+                        let su = update
+                            .get("sessionUpdate")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("");
+                        if su == "tool_call" || su == "tool_call_update" {
+                            let tool_id = update
+                                .get("toolCallId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            // Total tool-call volume this turn: one increment
+                            // per distinct tool (on its initial announcement).
+                            if su == "tool_call" {
+                                note_tool_activity(shared, key, &down_sid, &router_sid);
+                            }
+                            match classify_tool(update) {
+                                ToolClass::SideEffect => {
+                                    shared.with_session(&router_sid, |s| s.turn_side_effect = true);
+                                }
+                                ToolClass::Investigation => {
+                                    // A tool emits several frames; count it once.
+                                    let fresh = tool_id.is_empty()
+                                        || shared
+                                            .with_session(&router_sid, |s| {
+                                                s.turn_counted_tools.insert(tool_id.clone())
+                                            })
+                                            .unwrap_or(true);
+                                    if fresh {
+                                        note_investigation(shared, key, &down_sid, &router_sid);
+                                    }
+                                }
+                                ToolClass::Defer => {}
+                            }
+                            if update.get("status").and_then(|s| s.as_str()) == Some("failed") {
+                                let fresh = tool_id.is_empty()
+                                    || shared
+                                        .with_session(&router_sid, |s| {
+                                            s.turn_failed_tools.insert(tool_id.clone())
+                                        })
+                                        .unwrap_or(true);
+                                if fresh {
+                                    note_tool_failure(shared, key, &down_sid, &router_sid);
+                                }
+                            }
+                        }
                     }
                     // Ride the queued router disclosure on the model's first
                     // text chunk this turn (embeds it in the model's own
@@ -866,6 +1279,9 @@ pub fn handle_downstream_dispatch(
                         s.turn_saw_output = true;
                         if let Some(t) = &chunk_text {
                             s.turn_output.push_str(t);
+                            // Streamed model output is a commit point: no more
+                            // mid-turn escalation for the escalation router.
+                            s.turn_side_effect = true;
                         }
                     });
                     // Adopt the downstream's conversation title when it
@@ -889,6 +1305,14 @@ pub fn handle_downstream_dispatch(
             Dispatch::Request(msg, responder) => {
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
+                // Escalation router: a file read is investigation; a write or
+                // a terminal command is a side effect that locks out mid-turn
+                // escalation.
+                if method == "fs/read_text_file" {
+                    note_investigation(shared, key, &down_sid, &router_sid);
+                } else if method == "fs/write_text_file" || method.starts_with("terminal/") {
+                    shared.with_session(&router_sid, |s| s.turn_side_effect = true);
+                }
                 if method.starts_with("fs/")
                     || method.starts_with("terminal/")
                     || method == "session/request_permission"
@@ -1935,33 +2359,27 @@ async fn send_prompt_with_failover(
         }
     }
 
-    // A pending handoff block (from a just-performed switch) is prepended to
-    // this prompt so the new model inherits the prior context. It is already
-    // fully framed by `switch_pin` (summary or log-transcript fallback), so we
-    // prepend it verbatim. Consumed once.
-    let effective_prompt = match shared
-        .with_session(&router_sid, |s| s.pending_context.take())
-        .flatten()
-    {
-        Some(ctx) => {
-            let mut blocks = vec![ContentBlock::from(ctx)];
-            blocks.extend(req.prompt.clone());
-            blocks
-        }
-        None => req.prompt.clone(),
-    };
-
+    // Loop budget covers both failover attempts and escalation replays.
     let max_attempts = shared.cfg.failover.max_attempts.max(1);
-    for attempt in 1..=max_attempts {
+    let max_iters = max_attempts.max(shared.cfg.routers.escalation.max_escalations + 1);
+    for attempt in 1..=max_iters {
         let Some((conn, down_sid, candidate)) = shared.pinned_route(&router_sid) else {
             return responder.respond_with_error(
                 AcpError::internal_error()
                     .data("session has no live downstream (its process may have died)"),
             );
         };
+        // Fresh per-turn state (also for the strong model after an escalation).
         shared.with_session(&router_sid, |s| {
             s.turn_saw_output = false;
             s.turn_output.clear();
+            s.turn_reads = 0;
+            s.turn_side_effect = false;
+            s.turn_tool_failures = 0;
+            s.turn_counted_tools.clear();
+            s.turn_failed_tools.clear();
+            s.turn_tool_calls = 0;
+            s.escalation_requested = None;
         });
         shared.state.lock().unwrap().touch(&router_sid);
         // Log the user prompt (once, on the first attempt).
@@ -1979,17 +2397,56 @@ async fn send_prompt_with_failover(
                 },
             );
         }
+        // A pending handoff block (from a switch performed just before this
+        // attempt — pre-loop pending_switch, or a mid-turn escalation on the
+        // previous iteration) is prepended, consumed once. It is already fully
+        // framed by `switch_pin` (summary or log-transcript fallback).
+        let effective_prompt = match shared
+            .with_session(&router_sid, |s| s.pending_context.take())
+            .flatten()
+        {
+            Some(ctx) => {
+                let mut blocks = vec![ContentBlock::from(ctx)];
+                blocks.extend(req.prompt.clone());
+                blocks
+            }
+            None => req.prompt.clone(),
+        };
         shared
             .headroom
             .lock()
             .unwrap()
             .record_prompt(&candidate.agent);
-        let fwd =
-            PromptRequest::new(down_sid.clone(), effective_prompt.clone()).meta(req.meta.clone());
+        let fwd = PromptRequest::new(down_sid.clone(), effective_prompt).meta(req.meta.clone());
         let sent = conn
             .send_request(fwd)
             .forward_cancellation_from(responder.cancellation());
-        match sent.block_task().await {
+        let result = sent.block_task().await;
+
+        // Mid-turn escalation: the relay flagged it (and interrupted this turn)
+        // because investigation revealed hidden depth while still side-effect
+        // free. Switch to the stronger model and replay the same prompt.
+        if let Some(esc) = shared
+            .with_session(&router_sid, |s| s.escalation_requested.take())
+            .flatten()
+        {
+            shared.with_session(&router_sid, |s| s.escalations_done += 1);
+            match switch_pin(&shared, &router_sid, &esc.target, &esc.reason).await {
+                Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
+                Ok(_) => {}
+                Err(e) => notify_user(
+                    &shared,
+                    &router_sid,
+                    format!(
+                        "router-acp · escalation to {} failed — {e}; continuing on the current model",
+                        esc.target
+                    ),
+                ),
+            }
+            continue; // replay on the new pin (or the old one if the switch failed)
+        }
+
+        match result {
             Ok(resp) => {
                 // If the model produced no text to carry the disclosure,
                 // flush it now as its own chunk so it still shows.
@@ -2328,6 +2785,16 @@ fn update_confidence_and_maybe_upgrade(
         });
     }
 
+    // The `escalation` router uses its own post-turn triggers instead of the
+    // confidence-threshold auto-upgrade.
+    let strategy = shared
+        .with_session(router_sid, |s| s.strategy)
+        .unwrap_or(StrategyKind::Auto);
+    if strategy == StrategyKind::Escalation {
+        escalation_post_turn(shared, router_sid, resp, tool_failures);
+        return;
+    }
+
     if !shared.cfg.auto_upgrade.enabled {
         return;
     }
@@ -2369,6 +2836,59 @@ fn update_confidence_and_maybe_upgrade(
             "auto-upgrade queued"
         );
     }
+}
+
+/// Post-turn escalation for the `escalation` router: if the completed turn's
+/// outcome trips a configured trigger (max-tokens/refusal stop, or tool-failure
+/// churn), queue an escalation to a stronger model for the next prompt. This
+/// complements the mid-turn read-volume trigger, which fires during the turn.
+fn escalation_post_turn(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    resp: &PromptResponse,
+    tool_failures: u32,
+) {
+    let cfg = shared.cfg.routers.escalation.clone();
+    let eligible = shared
+        .with_session(router_sid, |s| {
+            s.pin.is_some()
+                && s.pending_switch.is_none()
+                && s.escalations_done < cfg.max_escalations
+        })
+        .unwrap_or(false);
+    if !eligible {
+        return;
+    }
+    let mut reasons = Vec::new();
+    if cfg.escalate_on_max_tokens && matches!(resp.stop_reason, StopReason::MaxTokens) {
+        reasons.push("hit the token ceiling".to_string());
+    }
+    if cfg.escalate_on_refusal && matches!(resp.stop_reason, StopReason::Refusal) {
+        reasons.push("refused".to_string());
+    }
+    if cfg.escalate_after_tool_failures > 0 && tool_failures >= cfg.escalate_after_tool_failures {
+        reasons.push(format!("{tool_failures} tool failures"));
+    }
+    if reasons.is_empty() {
+        return;
+    }
+    let Some(target) = escalation_target(shared, router_sid, cfg.escalation_path) else {
+        return;
+    };
+    let reason = format!("escalation: {}", reasons.join(", "));
+    shared.with_session(router_sid, |s| {
+        s.pending_switch = Some(SwitchRequest {
+            target: target.clone(),
+            reason: reason.clone(),
+        });
+        s.escalations_done += 1;
+    });
+    notify_user(
+        shared,
+        router_sid,
+        format!("router-acp · escalating to {target} for the next turn — {reason}"),
+    );
+    tracing::info!(session = router_sid, %target, reason, "escalation queued (post-turn)");
 }
 
 /// The instruction sent to the outgoing model asking it to summarize the
@@ -2647,6 +3167,9 @@ async fn switch_pin(
             additional_directories: shared
                 .with_session(router_sid, |s| s.additional_directories.clone())
                 .unwrap_or_default(),
+            // Record the switch lineage: the downstream session this router
+            // session was pinned to before this switch.
+            prior_session_id: Some(old_down_sid.clone()),
             routing: Some(serde_json::json!({
                 "strategy": "switch",
                 "candidate": target.to_string(),
@@ -3731,6 +4254,100 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
             Ok(Handled::Yes)
         }
         Dispatch::Response(..) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod escalation_signal_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_commands_are_investigation() {
+        for cmd in [
+            "git status",
+            "git log --oneline -20",
+            "ls -la src",
+            "grep -rn foo src",
+            "rg 'fn main'",
+            "find . -type f -name '*.py' | grep profile | head -20",
+            "cat Cargo.toml",
+            "git diff HEAD~1",
+            // stderr / dev-null redirects are harmless (the hickory-ai6 bug):
+            "ls -la /some/dir 2>/dev/null || echo \"not found\"",
+            "grep -r foo . 2>/dev/null",
+            "cat missing 2>&1",
+        ] {
+            assert!(is_read_only_command(cmd), "should be read-only: {cmd}");
+        }
+    }
+
+    #[test]
+    fn mutating_commands_are_side_effects() {
+        for cmd in [
+            "rm -rf build",
+            "git commit -m x",
+            "git push",
+            "cargo build --release",
+            "echo hi > file.txt",
+            "sed -i 's/a/b/' f",
+            "mkdir out",
+            "npm run build",
+            "cat a > b",
+        ] {
+            assert!(!is_read_only_command(cmd), "should be a side effect: {cmd}");
+        }
+    }
+
+    #[test]
+    fn mcp_read_vs_write_tools() {
+        for t in [
+            "ToolSearch",
+            "mcp__slack__search_channels",
+            "mcp__gmail__get_thread",
+            "list_files",
+        ] {
+            assert!(is_read_only_mcp(t), "read-only MCP: {t}");
+        }
+        for t in [
+            "mcp__slack__send_message",
+            "create_draft",
+            "mcp__x__update_canvas",
+            "delete_label",
+        ] {
+            assert!(!is_read_only_mcp(t), "write MCP: {t}");
+        }
+    }
+
+    #[test]
+    fn classify_tool_covers_kinds_and_deferral() {
+        let inv = serde_json::json!({"kind": "read", "toolCallId": "t1"});
+        assert!(matches!(classify_tool(&inv), ToolClass::Investigation));
+
+        let ro_bash = serde_json::json!({
+            "kind": "execute", "rawInput": {"command": "grep -rn foo ."}, "toolCallId": "t2"
+        });
+        assert!(matches!(classify_tool(&ro_bash), ToolClass::Investigation));
+
+        let mut_bash = serde_json::json!({
+            "kind": "execute", "rawInput": {"command": "git commit -m x"}, "toolCallId": "t3"
+        });
+        assert!(matches!(classify_tool(&mut_bash), ToolClass::SideEffect));
+
+        // execute with no command yet (initial pending frame) → defer.
+        let pending = serde_json::json!({"kind": "execute", "rawInput": {}, "toolCallId": "t4"});
+        assert!(matches!(classify_tool(&pending), ToolClass::Defer));
+
+        let edit = serde_json::json!({"kind": "edit", "toolCallId": "t5"});
+        assert!(matches!(classify_tool(&edit), ToolClass::SideEffect));
+
+        let ro_mcp = serde_json::json!({
+            "kind": "other", "_meta": {"claudeCode": {"toolName": "ToolSearch"}}, "toolCallId": "t6"
+        });
+        assert!(matches!(classify_tool(&ro_mcp), ToolClass::Investigation));
+
+        // status-only frame (no kind) → defer, never a spurious side effect.
+        let status_only = serde_json::json!({"toolCallId": "t7", "status": "completed"});
+        assert!(matches!(classify_tool(&status_only), ToolClass::Defer));
     }
 }
 

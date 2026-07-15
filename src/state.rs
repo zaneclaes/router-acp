@@ -5,8 +5,10 @@
 //! * `sessions` — one row per router session with everything the JSON file
 //!   held (pin, cwd, title, routing decision + weights, timestamps) plus
 //!   `parent_session_id` (set for delegated sub-agent sessions so the
-//!   planning/sub-agent/review structure is a tree), an optional `run_label`
-//!   for grouping related sessions, and running token/context counters.
+//!   planning/sub-agent/review structure is a tree), `prior_session_id` (set
+//!   by a mid-session model switch to the downstream session bound before it,
+//!   tracing the switch lineage), an optional `run_label` for grouping related
+//!   sessions, and running token/context counters.
 //! * `session_log` — every ACP interaction (user prompt, model response,
 //!   tool call, permission/fs/terminal callback, router notice) with a token
 //!   count; each insert also increments the owning session's counters.
@@ -55,6 +57,10 @@ pub struct PersistedSession {
     pub routing: Option<serde_json::Value>,
     /// Router session id of the parent, for delegated sub-agent sessions.
     pub parent_session_id: Option<String>,
+    /// The downstream session id this router session was pinned to *before*
+    /// its most recent mid-session model switch (set by `switch_pin`). Traces
+    /// the switch lineage; `None` for sessions that never switched.
+    pub prior_session_id: Option<String>,
     /// `primary` (a normal pinned session) or `delegate` (a sub-agent
     /// spawned via `delegate_task`).
     pub kind: String,
@@ -140,6 +146,7 @@ impl StateFile {
             title                 TEXT,
             routing               TEXT,
             parent_session_id     TEXT,
+            prior_session_id      TEXT,
             kind                  TEXT NOT NULL DEFAULT 'primary',
             run_label             TEXT,
             created_at            INTEGER,
@@ -169,6 +176,16 @@ impl StateFile {
         "#;
         if let Err(err) = self.conn.execute_batch(sql) {
             tracing::error!(%err, "failed to initialize state schema");
+        }
+        // Migrations for DBs created by older versions: add columns that the
+        // `CREATE TABLE IF NOT EXISTS` above skips on an existing table. A
+        // duplicate-column error just means the migration already ran.
+        for stmt in ["ALTER TABLE sessions ADD COLUMN prior_session_id TEXT"] {
+            if let Err(err) = self.conn.execute(stmt, [])
+                && !err.to_string().contains("duplicate column")
+            {
+                tracing::error!(%err, stmt, "session state migration failed");
+            }
         }
     }
 
@@ -242,6 +259,7 @@ impl StateFile {
             title: row.get("title")?,
             routing: routing.and_then(|r| serde_json::from_str(&r).ok()),
             parent_session_id: row.get("parent_session_id")?,
+            prior_session_id: row.get("prior_session_id")?,
             kind: row.get("kind")?,
             run_label: row.get("run_label")?,
             created_at: row.get::<_, Option<i64>>("created_at")?.map(|v| v as u64),
@@ -315,6 +333,9 @@ impl StateFile {
             if session.parent_session_id.is_none() {
                 session.parent_session_id = existing.parent_session_id;
             }
+            if session.prior_session_id.is_none() {
+                session.prior_session_id = existing.prior_session_id;
+            }
             if session.run_label.is_none() {
                 session.run_label = existing.run_label;
             }
@@ -333,14 +354,16 @@ impl StateFile {
         let routing = session.routing.as_ref().map(|r| r.to_string());
         let res = self.conn.execute(
             "INSERT INTO sessions (router_session_id, agent, model, downstream_session_id, cwd,
-                additional_directories, title, routing, parent_session_id, kind, run_label,
-                created_at, updated_at, tokens_input, tokens_output, tokens_total, context_used)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                additional_directories, title, routing, parent_session_id, prior_session_id, kind,
+                run_label, created_at, updated_at, tokens_input, tokens_output, tokens_total,
+                context_used)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
              ON CONFLICT(router_session_id) DO UPDATE SET
                 agent=excluded.agent, model=excluded.model,
                 downstream_session_id=excluded.downstream_session_id, cwd=excluded.cwd,
                 additional_directories=excluded.additional_directories, title=excluded.title,
                 routing=excluded.routing, parent_session_id=excluded.parent_session_id,
+                prior_session_id=excluded.prior_session_id,
                 kind=excluded.kind, run_label=excluded.run_label,
                 created_at=excluded.created_at, updated_at=excluded.updated_at,
                 tokens_input=excluded.tokens_input, tokens_output=excluded.tokens_output,
@@ -355,6 +378,7 @@ impl StateFile {
                 session.title,
                 routing,
                 session.parent_session_id,
+                session.prior_session_id,
                 session.kind,
                 session.run_label,
                 session.created_at.map(|v| v as i64),
@@ -639,6 +663,33 @@ mod tests {
         s.remove("r1");
         assert!(s.get("r1").is_none());
         assert_eq!(s.log_for("r1", 10).len(), 0);
+    }
+
+    #[test]
+    fn prior_session_id_round_trips_and_survives_later_upserts() {
+        let (_d, s) = store();
+        // Initial pin: no prior session.
+        s.upsert("r1".into(), session("a"));
+        assert_eq!(s.get("r1").unwrap().prior_session_id, None);
+        // A switch records the old downstream session id as the prior session.
+        s.upsert(
+            "r1".into(),
+            PersistedSession {
+                prior_session_id: Some("downstream-old".into()),
+                ..session("b")
+            },
+        );
+        assert_eq!(
+            s.get("r1").unwrap().prior_session_id.as_deref(),
+            Some("downstream-old")
+        );
+        // A subsequent plain upsert (e.g. a token/touch update) must not wipe it.
+        s.upsert("r1".into(), session("b"));
+        assert_eq!(
+            s.get("r1").unwrap().prior_session_id.as_deref(),
+            Some("downstream-old"),
+            "prior_session_id preserved across later upserts"
+        );
     }
 
     #[test]

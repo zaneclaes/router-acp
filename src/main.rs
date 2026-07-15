@@ -67,7 +67,38 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr)
                 .init();
             let cfg = Config::from_file(&config)?;
-            match router_acp::session::serve(cfg, router_acp::transport::stdio_lines()).await {
+            // Downstream agents run with workspace write access; they must die
+            // when the router does. On a signal (goose's Ctrl+C) neither
+            // destructors nor `kill_on_drop` run, so an in-flight agent can keep
+            // going and even commit to the repo. Explicitly SIGKILL every
+            // downstream process group on SIGINT/SIGTERM before exiting.
+            #[cfg(unix)]
+            tokio::spawn(async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut term = signal(SignalKind::terminate()).ok();
+                let mut intr = signal(SignalKind::interrupt()).ok();
+                let wait_term = async {
+                    match term.as_mut() {
+                        Some(s) => s.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let wait_intr = async {
+                    match intr.as_mut() {
+                        Some(s) => s.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! { _ = wait_term => {}, _ = wait_intr => {} }
+                router_acp::transport::kill_all_downstreams();
+                std::process::exit(130);
+            });
+            let result =
+                router_acp::session::serve(cfg, router_acp::transport::stdio_lines()).await;
+            // Normal-exit / disconnect path: also a backstop against
+            // `kill_on_drop` not firing during runtime teardown.
+            router_acp::transport::kill_all_downstreams();
+            match result {
                 Ok(()) => Ok(()),
                 Err(e) if router_acp::transport::is_disconnect(&e) => {
                     tracing::info!("client disconnected; shutting down");
@@ -110,6 +141,9 @@ async fn main() -> anyhow::Result<()> {
                             .map(|p| format!(" (parent {p})"))
                             .unwrap_or_default()
                     );
+                    if let Some(prior) = &s.prior_session_id {
+                        println!("  switched  : from downstream session {prior}");
+                    }
                     if let Some(l) = &s.run_label {
                         println!("  run_label : {l}");
                     }

@@ -40,7 +40,7 @@ use agent_client_protocol::schema::v1::{
     ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCallUpdate,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
     Agent as AgentRole, Client as ClientRole, ConnectionTo, Responder, on_receive_notification,
@@ -329,10 +329,58 @@ async fn run_prompt(
     }
 
     let mut reply = Vec::new();
+    let mut tool_seq = 0u32;
 
     for line in text.lines() {
         let line = line.trim();
-        if line == "PERM" {
+        // Cancel-aware between steps (so a mid-turn escalation's session/cancel
+        // stops the investigation promptly, like a real adapter would).
+        if mock
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&session_id)
+            .map(|s| s.cancelled)
+            .unwrap_or(false)
+        {
+            return responder.respond(PromptResponse::new(StopReason::Cancelled));
+        }
+        if let Some(spec) = line.strip_prefix("TOOL:") {
+            // Emit a real `session/update` tool_call, the way claude-agent-acp
+            // does. Forms: `read` | `exec:<cmd>` | `edit` | `fail` | `mcp:<name>`.
+            tool_seq += 1;
+            let id = format!("tc-{tool_seq}");
+            let tc = if spec == "read" {
+                ToolCall::new(id, "Read")
+                    .kind(ToolKind::Read)
+                    .status(ToolCallStatus::Completed)
+            } else if spec == "edit" {
+                ToolCall::new(id, "Edit")
+                    .kind(ToolKind::Edit)
+                    .status(ToolCallStatus::Completed)
+            } else if spec == "fail" {
+                ToolCall::new(id, "Bash")
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::Failed)
+            } else if let Some(cmd) = spec.strip_prefix("exec:") {
+                ToolCall::new(id, "Bash")
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::Completed)
+                    .raw_input(serde_json::json!({ "command": cmd }))
+            } else if let Some(name) = spec.strip_prefix("mcp:") {
+                ToolCall::new(id, name.to_string())
+                    .kind(ToolKind::Other)
+                    .status(ToolCallStatus::Completed)
+            } else {
+                ToolCall::new(id, "tool").kind(ToolKind::Other)
+            };
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCall(tc),
+            ));
+            reply.push(format!("tool:{spec}"));
+        } else if line == "PERM" {
             let perm = RequestPermissionRequest::new(
                 session_id.clone(),
                 ToolCallUpdate::new("mock-tool-call", Default::default()),
@@ -448,7 +496,16 @@ async fn run_prompt(
     }
 
     let _ = cx.send_notification(chunk(&session_id, reply.join("\n")));
-    responder.respond(PromptResponse::new(StopReason::EndTurn))
+    // `MAXTOKENS` / `REFUSE` directives end the turn with that stop reason, so
+    // tests can exercise post-turn escalation triggers.
+    let stop = if text.contains("MAXTOKENS") {
+        StopReason::MaxTokens
+    } else if text.contains("REFUSE") {
+        StopReason::Refusal
+    } else {
+        StopReason::EndTurn
+    };
+    responder.respond(PromptResponse::new(stop))
 }
 
 #[tokio::main(flavor = "current_thread")]
