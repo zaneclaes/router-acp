@@ -1896,6 +1896,213 @@ async fn skill_routing_switches_pinned_session_to_required_class() {
 }
 
 #[tokio::test]
+async fn orchestration_pins_planner_and_injects_protocol_on_a_list() {
+    let state = temp_state_file("orch-pin");
+    let log = temp_log("orch-pin");
+    // Planner = b/m2. A multi-part list on a fresh session must pin the planner
+    // and prepend the orchestration protocol (visible in the mock's echo).
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    let state_path = state.clone();
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating a 3-part task"),
+            "orchestration disclosed: {text}"
+        );
+        assert!(text.contains("echo:m2:"), "pinned the planner b/m2: {text}");
+        assert!(
+            text.contains("you are the ORCHESTRATOR"),
+            "orchestration protocol injected into the prompt: {text}"
+        );
+        // Must forbid the model's built-in sub-agent tool (which stays in-lineage
+        // and is invisible to the router).
+        assert!(
+            text.contains("Do NOT use any built-in sub-agent"),
+            "protocol forbids the native Task tool: {text}"
+        );
+        // Must name a concrete cross-lineage reviewer (a/m1, lineage a ≠ planner b).
+        assert!(
+            text.contains("a/m1") && text.contains("DIFFERENT lineage"),
+            "protocol pins the review to a different lineage: {text}"
+        );
+        // The session is grouped under the orchestrate run label.
+        let db = open_state(&state_path);
+        let row = db.get(&sid).expect("session row");
+        assert_eq!(row.run_label.as_deref(), Some("orchestrate"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn orchestration_delegate_children_inherit_run_label_and_parent() {
+    // An orchestrating session that actually delegates gets a linked, labelled
+    // sub-session row — the observability the DB was missing when the planner
+    // used its built-in (router-invisible) sub-agent tool instead.
+    let state = temp_state_file("orch-deleg");
+    let log = temp_log("orch-deleg");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 3 }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*opus*\"]\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "cheap",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml("fancy", &[("opus", 3)], &[]),
+    );
+    let state_path = state.clone();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A list (orchestration triggers → pins fancy/opus planner) whose prompt
+        // also drives the mock to actually call delegate_task.
+        prompt_text(
+            &cx,
+            &sid,
+            "Handle these:\n1. first thing\n2. second thing\nDELEGATE:do the subtask",
+        )
+        .await?;
+        let db = open_state(&state_path);
+        let parent = db.get(&sid).expect("parent row");
+        assert_eq!(parent.run_label.as_deref(), Some("orchestrate"));
+        let children: Vec<_> = db
+            .all()
+            .into_iter()
+            .filter(|(_, s)| s.parent_session_id.as_deref() == Some(sid.as_str()))
+            .collect();
+        assert_eq!(children.len(), 1, "one delegate row linked to the parent");
+        let (_, child) = &children[0];
+        assert_eq!(child.kind, "delegate");
+        assert_eq!(
+            child.run_label.as_deref(),
+            Some("orchestrate"),
+            "delegate child inherits the run label"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_directive_suppresses_auto_orchestration() {
+    let state = temp_state_file("orch-suppress");
+    let log = temp_log("orch-suppress");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A list, but the user forces a candidate — orchestration must NOT fire.
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/m1]\nDo these:\n1. one\n2. two\n3. three",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:m1:"),
+            "honored explicit pin a/m1: {text}"
+        );
+        assert!(
+            !text.contains("you are the ORCHESTRATOR"),
+            "no orchestration protocol injected: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn orchestration_switches_pinned_session_on_a_list() {
+    let state = temp_state_file("orch-switch");
+    let log = temp_log("orch-switch");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Pin a/m1 with a plain (non-list) prompt.
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+        // A follow-up list must switch the live session onto the planner.
+        let resp = prompt_text(&cx, &sid, "Now: (1) refactor (2) add tests (3) ship").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating a 3-part task"),
+            "orchestration disclosed: {text}"
+        );
+        assert!(
+            text.contains("echo:m2:"),
+            "switched to the planner b/m2: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
     let state = temp_state_file("upgrade");
     // Score table: a/m1 is under-powered (0.40, below the 0.55 default

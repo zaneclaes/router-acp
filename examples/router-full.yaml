@@ -52,6 +52,26 @@ skill_routing:
   - pattern: ship-pr
     candidates: ["*opus*", "*gpt-5.5*"]
 
+# Auto-orchestration of multi-part task lists. When a prompt reads as a list
+# (markdown bullets/numbers, inline "(1)(2)", or "first… then… finally…") the
+# router treats it like the goose orchestrate recipe, but entirely in-process:
+# it steers/switches the session onto a `planner` frontier model and injects an
+# orchestration protocol telling that model to decompose the task, delegate each
+# part via `delegate_task` (each routed per-complexity in its own sub-session),
+# have a DIFFERENT-lineage `reviewer` verify the net result, adjudicate fixes,
+# and submit per `submit`. Orchestrating sessions may delegate to same-/higher-
+# tier peers (so the cross-lineage review is routeable), and the planner can
+# hold a sub-agent open across review→fix rounds (keep_open + delegate_followup).
+# An explicit `[router: …]` directive or `model:` shorthand suppresses it.
+# Disabled by default — turn it on here.
+orchestration:
+  enabled: false
+  min_items: 2                              # smallest list treated as multi-part
+  planner: ["*sol*", "*fable*", "*opus*", "*gpt-5.5*"]   # best first
+  reviewer: ["*gpt-5.5*", "*sol*", "*opus*"]             # prefer a different lineage
+  submit: branch                            # never | branch | pr | merge
+  max_fix_rounds: 2
+
 agents:
   - name: claude
     command:

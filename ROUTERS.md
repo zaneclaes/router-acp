@@ -342,6 +342,53 @@ put with a visible note. Each switch is recorded in the state file with its
 
 ---
 
+## Auto-orchestration of task lists
+
+This is orthogonal to the router choice — it works on top of `auto`,
+`pareto-code`, `escalation`, or `static`. When `orchestration.enabled` is set
+and a prompt reads as a **multi-part task list**, the router turns that session
+into an orchestrator instead of answering the list in one turn.
+
+What counts as a list (detection is permissive):
+
+- markdown numbers — `1. … 2. … 3. …`
+- markdown bullets — `- … / * … / + …`
+- inline numbering — `… (1) do this (2) do that …`
+- ordered prose — `First, … Then, … Finally, …`
+
+On a match of at least `min_items` parts, and with **no** explicit
+`[router: …]` directive or `model:` shorthand on the prompt (those suppress it):
+
+1. The session is steered (pre-pin) or **switched** (mid-session, via the same
+   summarize-and-re-pin machinery above) onto the best eligible **`planner`**
+   candidate.
+2. An orchestration protocol is prepended to the prompt telling the planner to
+   **plan → delegate each part (`delegate_task`, routed per-complexity) →
+   review on a different lineage (`reviewer`) → adjudicate fixes
+   (`max_fix_rounds`) → submit (`submit`)**.
+3. For that session, delegation is allowed to **same-/higher-tier peers**, not
+   just strictly-cheaper ones — this is what makes the cross-lineage reviewer
+   routeable. (Ordinary delegation stays cheaper-only.)
+
+```yaml
+orchestration:
+  enabled: true
+  min_items: 2
+  planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"]   # best first
+  reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]             # a different lineage than the planner
+  submit: branch                # never | branch | pr | merge (merge only after review approves)
+  max_fix_rounds: 2
+```
+
+The planner iterates on a subtask by keeping its sub-agent open
+(`delegate_task keep_open: true` → `delegate_followup` → `delegate_close`)
+rather than re-briefing a fresh session each round. Every trigger is disclosed
+(`router-acp · orchestrating a N-part task on …`). This is the same pipeline as
+the goose `orchestrate` recipe (see `ORCHESTRATION.md`), but it needs no recipe
+or `summon` extension — so it works from any ACP client and plain chat.
+
+---
+
 ## Things that apply to every router
 
 - **Pin once, switch deliberately.** The first prompt decides; later prompts

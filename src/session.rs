@@ -104,6 +104,20 @@ pub struct DelegateHandle {
     pub downstream_sid: String,
 }
 
+/// A delegate sub-session kept open across multiple turns so the orchestrator
+/// can send follow-up instructions to the same sub-agent (preserving its
+/// context) rather than re-briefing a fresh session each time.
+pub struct LiveDelegate {
+    pub parent_sid: String,
+    pub process_key: ProcessKey,
+    pub downstream_sid: String,
+    pub candidate: CandidateId,
+    /// The sub-agent's captured output buffer (cleared before each follow-up).
+    pub capture: Arc<Mutex<String>>,
+    /// State-DB row id for this delegate, for follow-up logging.
+    pub sub_sid: String,
+}
+
 pub struct RouterSession {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -186,6 +200,15 @@ pub struct RouterSession {
     /// When set, agent text on the pinned session is captured here instead
     /// of relayed (used to collect a summary during a switch).
     pub capturing_summary: Option<Arc<Mutex<String>>>,
+    // ---- auto-orchestration ----
+    /// Set once a prompt is detected as a multi-part task list and the session
+    /// is put into orchestration mode: relaxes delegation to allow same-/higher-
+    /// tier peers (for cross-lineage review), and marks the session as an
+    /// orchestrator in disclosures/state.
+    pub orchestrating: bool,
+    /// One-shot orchestration protocol instructions to prepend to the next
+    /// prompt (taken once, like `pending_context`).
+    pub pending_orchestration: Option<String>,
 }
 
 /// A requested mid-session model switch and why.
@@ -237,6 +260,8 @@ impl RouterSession {
             escalation_requested: None,
             pending_context: None,
             capturing_summary: None,
+            orchestrating: false,
+            pending_orchestration: None,
         }
     }
 
@@ -275,6 +300,8 @@ impl RouterSession {
             escalation_requested: None,
             pending_context: None,
             capturing_summary: None,
+            orchestrating: false,
+            pending_orchestration: None,
         }
     }
 }
@@ -292,6 +319,9 @@ pub struct Shared {
     pub candidates: Mutex<Vec<CandidateRuntime>>,
     sid_map: Mutex<HashMap<(ProcessKey, String), DownstreamRoute>>,
     pub delegate_tokens: Mutex<HashMap<String, String>>,
+    /// Delegate sub-sessions kept alive for follow-up turns (orchestration),
+    /// keyed by the short `delegate_id` returned to the orchestrator.
+    pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
     pub delegate_semaphore: Arc<tokio::sync::Semaphore>,
     pub delegate_socket: OnceLock<PathBuf>,
     upstream: OnceLock<ConnectionTo<ClientPeer>>,
@@ -377,6 +407,7 @@ impl Shared {
             candidates: Mutex::new(candidates),
             sid_map: Mutex::new(HashMap::new()),
             delegate_tokens: Mutex::new(HashMap::new()),
+            live_delegates: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             delegate_socket: OnceLock::new(),
             upstream: OnceLock::new(),
@@ -1564,6 +1595,23 @@ pub fn close_downstream_session(shared: &Arc<Shared>, key: &ProcessKey, downstre
     }
 }
 
+/// Close any delegate sub-sessions kept open (`keep_open`) under a parent
+/// session, when that parent is closed or deleted, so they don't leak.
+pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
+    let orphans: Vec<LiveDelegate> = {
+        let mut live = shared.live_delegates.lock().unwrap();
+        let ids: Vec<String> = live
+            .iter()
+            .filter(|(_, d)| d.parent_sid == router_sid)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter().filter_map(|id| live.remove(&id)).collect()
+    };
+    for d in orphans {
+        close_downstream_session(shared, &d.process_key, &d.downstream_sid);
+    }
+}
+
 // ----------------------------------------------------------------------
 // First-prompt routing (lazy pin)
 // ----------------------------------------------------------------------
@@ -2401,16 +2449,23 @@ async fn send_prompt_with_failover(
         // attempt — pre-loop pending_switch, or a mid-turn escalation on the
         // previous iteration) is prepended, consumed once. It is already fully
         // framed by `switch_pin` (summary or log-transcript fallback).
-        let effective_prompt = match shared
-            .with_session(&router_sid, |s| s.pending_context.take())
-            .flatten()
-        {
-            Some(ctx) => {
-                let mut blocks = vec![ContentBlock::from(ctx)];
-                blocks.extend(req.prompt.clone());
-                blocks
+        let (orchestration, handoff) = shared
+            .with_session(&router_sid, |s| {
+                (s.pending_orchestration.take(), s.pending_context.take())
+            })
+            .unwrap_or((None, None));
+        let effective_prompt = {
+            let mut blocks = Vec::new();
+            // Orchestration protocol first (role framing), then any switch
+            // handoff context, then the user's actual task.
+            if let Some(instr) = orchestration {
+                blocks.push(ContentBlock::from(instr));
             }
-            None => req.prompt.clone(),
+            if let Some(ctx) = handoff {
+                blocks.push(ContentBlock::from(ctx));
+            }
+            blocks.extend(req.prompt.clone());
+            blocks
         };
         shared
             .headroom
@@ -2720,6 +2775,252 @@ fn detect_skill_route<'a>(cfg: &'a Config, prompt: &[ContentBlock]) -> Option<&'
     cfg.skill_routing
         .iter()
         .find(|r| prompt_mentions_skill(&text, &r.pattern))
+}
+
+/// Resolve concrete reviewer candidates of a DIFFERENT lineage than the planner
+/// (preferring the configured `reviewer` globs, then any other-lineage
+/// candidate). Empty only when the planner's lineage is the sole one available.
+fn resolve_reviewers(
+    shared: &Arc<Shared>,
+    cfg: &crate::config::OrchestrationConfig,
+    planner: &CandidateId,
+    class: TaskClass,
+    excluded: &[String],
+) -> Vec<CandidateId> {
+    let views = shared.eligible_views(&RequiredCaps::default(), class);
+    let mut out: Vec<CandidateId> = Vec::new();
+    // 1. Configured reviewer globs, restricted to a different lineage.
+    for pat in &cfg.reviewer {
+        for v in &views {
+            if v.id.agent != planner.agent
+                && candidate_matches(pat, &v.id)
+                && !is_excluded(&v.id, excluded)
+                && !out.contains(&v.id)
+            {
+                out.push(v.id.clone());
+            }
+        }
+    }
+    // 2. Fallback: any eligible candidate of a different lineage.
+    if out.is_empty() {
+        for v in &views {
+            if v.id.agent != planner.agent && !is_excluded(&v.id, excluded) && !out.contains(&v.id)
+            {
+                out.push(v.id.clone());
+            }
+        }
+    }
+    out.truncate(3);
+    out
+}
+
+/// The orchestration protocol prepended to the planner model's prompt when a
+/// multi-part task list is auto-detected. This recreates the goose orchestrate
+/// recipe entirely in-process: the planner decomposes the task, drives
+/// `delegate_task` sub-sessions (each routed per-complexity), has a
+/// different-lineage peer review the net result, adjudicates fixes, and submits
+/// per the configured gate. It is guidance to the model, not a hard state
+/// machine — the delegation pool relaxation (peer/same-tier) is what makes the
+/// cross-lineage review routeable, and the explicit reviewer ids + the ban on
+/// the model's built-in sub-agent tool are what keep the review off the
+/// planner's own lineage.
+fn build_orchestration_instructions(
+    cfg: &Config,
+    parts: usize,
+    planner: &CandidateId,
+    reviewers: &[CandidateId],
+) -> String {
+    let o = &cfg.orchestration;
+    let lineage = &planner.agent;
+    let review_line = if reviewers.is_empty() {
+        format!(
+            "No candidate of a different lineage than your own (`{lineage}`) is currently \
+             available, so review on the most capable OTHER model you can reach via \
+             `delegate_task` (still not yourself). Note this constraint in your report."
+        )
+    } else {
+        let ids = reviewers
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "You are lineage `{lineage}`. The review MUST run on a DIFFERENT lineage — call \
+             `delegate_task` with `hints.candidate` set to one of: {ids}. Do NOT review on your \
+             own `{lineage}` lineage."
+        )
+    };
+    let submit_line = match o.submit.as_str() {
+        "never" => {
+            "Do NOT push, open a PR, or merge. Report the branch (if any) and the review verdict."
+        }
+        "branch" => {
+            "Once the review approves, commit the work on a fresh branch off HEAD (never commit to \
+             main/master). Do not open a PR or merge."
+        }
+        "pr" => {
+            "Once the review approves, commit on a fresh branch and open/update a PR with `gh pr \
+             create` (body: the success criteria, a subtask→model table, and the reviewer \
+             verdict). Do NOT merge."
+        }
+        "merge" => {
+            "Once — and only once — the review approves, commit on a fresh branch, open/update the \
+             PR, and as the FINAL action merge it (`gh pr merge`, honoring branch protection). \
+             Never merge before an approving review; never force-push; never push to main directly."
+        }
+        _ => "",
+    };
+    let rounds = o.max_fix_rounds;
+    format!(
+        "[router-acp orchestration — you are the ORCHESTRATOR]\n\
+         The user's message below is a multi-part task ({parts} parts detected). Do NOT implement \
+         it all yourself in one pass.\n\
+         CRITICAL — HOW TO DELEGATE: use the router's `delegate_task` tool for EVERY subtask and \
+         for the review. Do NOT use any built-in sub-agent tool (e.g. `Task`, `dispatch_agent`, \
+         `spawn`) for these: those run inside your own model lineage and are invisible to the \
+         router, which defeats both per-subtask model routing and the cross-lineage review. If \
+         `delegate_task` is not loaded yet, load it first, then use it. For a subtask you want to \
+         iterate on across review→fix rounds, call `delegate_task` with `keep_open: true` and \
+         reuse the returned `delegate_id` via `delegate_followup` (and `delegate_close` when done).\n\
+         Run this pipeline, disclosing your progress as you go:\n\
+         1. PLAN. Investigate just enough (read-only) to restate the task as concrete, verifiable \
+         success criteria and to split it into self-contained subtasks. Subtasks MUST NOT overlap \
+         in the files they edit — merge any that would.\n\
+         2. DELEGATE. Dispatch each subtask with `delegate_task`. Give each a fully self-contained \
+         `task` (file paths, current vs. desired behavior, constraints, and acceptance checks) — \
+         the router routes each subtask by reading its prompt, so describe difficulty honestly. \
+         Pass relevant paths in `context_files`. Independent subtasks may be delegated \
+         concurrently; respect dependencies. Do a piece yourself only if it genuinely needs your \
+         full context.\n\
+         3. REVIEW (independent, different lineage). After integrating, delegate a REVIEW via \
+         `delegate_task`. {review_line} Hand the reviewer the ORIGINAL task verbatim and have it \
+         re-derive the criteria itself, inspect the diff, and run the tests — returning a verdict \
+         plus any blocking issues.\n\
+         4. ADJUDICATE. For each blocking issue, delegate a targeted fix and re-review. At most \
+         {rounds} fix rounds; if still not approved, stop and report what remains.\n\
+         5. SUBMIT. {submit_line}\n\
+         Finally, report: the success criteria and how each is met; per-subtask outcomes (and \
+         which model the router chose for each); the review verdict history; and what was \
+         submitted (or why not).\n\
+         [end orchestration protocol — the user's task follows]"
+    )
+}
+
+/// If auto-orchestration is enabled and the prompt reads as a multi-part task
+/// list, put the session into orchestration mode: steer/switch it to a planner
+/// model and queue the orchestration protocol for the next prompt. A no-op when
+/// disabled, when the list is too small, or when no planner is eligible.
+fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentBlock]) {
+    let cfg = &shared.cfg.orchestration;
+    if !cfg.enabled {
+        return;
+    }
+    let text = prompt_display_text(prompt);
+    let Some(parts) = crate::tasklist::detect_task_list(&text) else {
+        return;
+    };
+    if parts < cfg.min_items {
+        return;
+    }
+
+    let (class, excluded, current) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None));
+
+    // A capable planner is required; if none is eligible, route normally.
+    let Some(planner) = first_eligible_candidate(shared, &cfg.planner, class, &excluded) else {
+        notify_user(
+            shared,
+            router_sid,
+            format!(
+                "router-acp · detected a {parts}-part task but no orchestration planner ({:?}) is \
+                 available; routing normally",
+                cfg.planner
+            ),
+        );
+        return;
+    };
+
+    let current_is_planner = current
+        .as_ref()
+        .map(|c| cfg.planner.iter().any(|g| candidate_matches(g, c)))
+        .unwrap_or(false);
+    let reviewers = resolve_reviewers(shared, cfg, &planner, class, &excluded);
+    if reviewers.is_empty() {
+        notify_user(
+            shared,
+            router_sid,
+            format!(
+                "router-acp · note: no candidate of a different lineage than the planner \
+                 ({}) is available for review; orchestrating anyway",
+                planner.agent
+            ),
+        );
+    }
+    let instructions = build_orchestration_instructions(&shared.cfg, parts, &planner, &reviewers);
+
+    shared.with_session(router_sid, |s| {
+        s.orchestrating = true;
+        s.pending_orchestration = Some(instructions);
+        // Group this run (planner + its delegated subtasks/review) under a
+        // shared label unless the caller already set one.
+        if s.run_label.is_none() {
+            s.run_label = Some("orchestrate".to_string());
+        }
+    });
+
+    match &current {
+        // Pre-pin: steer the imminent pin onto the planner.
+        None => {
+            let planner2 = planner.clone();
+            shared.with_session(router_sid, |s| {
+                if s.candidate_override.is_none() {
+                    s.candidate_override = Some(planner2);
+                }
+            });
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · orchestrating a {parts}-part task on {planner} (auto-detected list)"
+                ),
+            );
+        }
+        // Already on a planner-class model: orchestrate in place.
+        Some(cur) if current_is_planner => {
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · orchestrating a {parts}-part task on {cur} (auto-detected list)"
+                ),
+            );
+        }
+        // Post-pin on a weaker model: switch to the planner (summarize + hand off).
+        Some(_) => {
+            let planner2 = planner.clone();
+            shared.with_session(router_sid, |s| {
+                s.pending_switch = Some(SwitchRequest {
+                    target: planner2,
+                    reason: format!("auto-orchestration of a {parts}-part task list"),
+                });
+            });
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · orchestrating a {parts}-part task; switching to {planner} \
+                     (auto-detected list)"
+                ),
+            );
+        }
+    }
 }
 
 /// Estimate a session's confidence in [0, 1]: the pinned model's quality for
@@ -3897,6 +4198,11 @@ fn on_prompt(
         ));
     }
 
+    // Tracks whether the user steered routing explicitly (a `[router: …]`
+    // directive, a `model:` shorthand, or a skill invocation). Any of these
+    // suppresses auto-orchestration for this prompt.
+    let mut explicit_routing = false;
+
     // Routing directives: `[router: ...]` anywhere in the prompt. Always
     // stripped (the downstream model never sees them); only applied before
     // the pin.
@@ -3918,6 +4224,7 @@ fn on_prompt(
                     })
                     .unwrap_or((TaskClass::CodingGeneral, Vec::new(), false));
                 if let Some(target) = resolve_candidate_ref(&shared, &ref_str, class, &excluded) {
+                    explicit_routing = true;
                     req =
                         PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
                     if pinned {
@@ -3943,6 +4250,7 @@ fn on_prompt(
             }
         }
         Ok(Some((directives, stripped))) => {
+            explicit_routing = true;
             req = PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
             let pinned_now = shared
                 .with_session(&router_sid, |s| s.pin.is_some() || s.pinning)
@@ -4043,6 +4351,7 @@ fn on_prompt(
     // class. If the prompt invokes one, steer routing to its preferred
     // candidates — pre-pin via candidate_override, mid-session via a switch.
     if let Some(route) = detect_skill_route(&shared.cfg, &req.prompt) {
+        explicit_routing = true;
         let (class, excluded, current) = shared
             .with_session(&router_sid, |s| {
                 (
@@ -4088,6 +4397,13 @@ fn on_prompt(
                 ),
             }
         }
+    }
+
+    // Auto-orchestration: a multi-part task list (and no explicit routing) puts
+    // the session into orchestrator mode on a planner model. Fires on any prompt
+    // (pre- or post-pin) per config.
+    if !explicit_routing {
+        maybe_trigger_orchestration(&shared, &router_sid, &req.prompt);
     }
 
     enum Action {

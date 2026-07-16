@@ -33,6 +33,8 @@ use crate::strategies::{RouteContext, make_strategy};
 
 pub const DELEGATE_SERVER_NAME: &str = "router-delegate";
 pub const DELEGATE_TOOL_NAME: &str = "delegate_task";
+pub const DELEGATE_FOLLOWUP_TOOL_NAME: &str = "delegate_followup";
+pub const DELEGATE_CLOSE_TOOL_NAME: &str = "delegate_close";
 
 const TOOL_DESCRIPTION: &str = "Delegate a small, self-contained subtask to a lower-cost agent \
      running in its own ephemeral session. Delegate only subtasks that do not need this \
@@ -44,7 +46,31 @@ const TOOL_DESCRIPTION: &str = "Delegate a small, self-contained subtask to a lo
 // MCP wire types (minimal, hand-typed over the SDK's JSON-RPC layer)
 // ----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+/// Give a request/notification type a `Deserialize` that accepts `null`, a
+/// missing value, or `{}` (falling back to `Default`). Real MCP clients
+/// (claude-agent-acp, codex-acp) send `tools/list`, `ping`, and
+/// `notifications/initialized` with `params: null` or no params at all; serde's
+/// derived struct impl rejects `null` ("invalid type: null, expected struct"),
+/// which made the adapter's `tools/list` error out and see NONE of the delegate
+/// tools — so `delegate_task` never appeared. These handlers ignore their params
+/// anyway, so leniently mapping null → default is exactly right.
+macro_rules! lenient_params {
+    ($t:ty) => {
+        impl<'de> serde::Deserialize<'de> for $t {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                // IgnoredAny accepts any JSON value (including null); we discard
+                // it and construct defaults.
+                serde::de::IgnoredAny::deserialize(deserializer)?;
+                Ok(<$t>::default())
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Default, Serialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "initialize", response = McpInitializeResult)]
 pub struct McpInitializeRequest {
     #[serde(default, rename = "protocolVersion")]
@@ -54,6 +80,7 @@ pub struct McpInitializeRequest {
     #[serde(default, rename = "clientInfo")]
     pub client_info: Value,
 }
+lenient_params!(McpInitializeRequest);
 
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
 #[serde(rename_all = "camelCase")]
@@ -63,23 +90,26 @@ pub struct McpInitializeResult {
     pub server_info: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[derive(Debug, Clone, Default, Serialize, agent_client_protocol::JsonRpcNotification)]
 #[notification(method = "notifications/initialized")]
 pub struct McpInitializedNotification {}
+lenient_params!(McpInitializedNotification);
 
-#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[derive(Debug, Clone, Default, Serialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "ping", response = McpPingResult)]
 pub struct McpPingRequest {}
+lenient_params!(McpPingRequest);
 
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
 pub struct McpPingResult {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[derive(Debug, Clone, Default, Serialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "tools/list", response = McpToolsListResult)]
 pub struct McpToolsListRequest {
     #[serde(default)]
     pub cursor: Option<String>,
 }
+lenient_params!(McpToolsListRequest);
 
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
 pub struct McpToolsListResult {
@@ -109,6 +139,24 @@ pub struct DelegateTaskArgs {
     pub context_files: Vec<String>,
     #[serde(default)]
     pub hints: DelegateHints,
+    /// Keep the sub-session open after this turn so the orchestrator can send
+    /// follow-up instructions to the same sub-agent (context preserved) via
+    /// `delegate_followup`. Returns a `delegate_id` to reference it.
+    #[serde(default)]
+    pub keep_open: bool,
+}
+
+/// `delegate_followup` tool input.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DelegateFollowupArgs {
+    pub delegate_id: String,
+    pub message: String,
+}
+
+/// `delegate_close` tool input.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DelegateCloseArgs {
+    pub delegate_id: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -147,9 +195,54 @@ fn tool_definition() -> Value {
                             "description": "Preferred agent/model candidate id."
                         }
                     }
+                },
+                "keep_open": {
+                    "type": "boolean",
+                    "description": "Keep the sub-session open for follow-ups (returns a delegate_id)."
                 }
             },
             "required": ["task"]
+        }
+    })
+}
+
+fn followup_tool_definition() -> Value {
+    json!({
+        "name": DELEGATE_FOLLOWUP_TOOL_NAME,
+        "description": "Send a follow-up instruction to a sub-agent previously started with \
+             delegate_task(keep_open=true), preserving that sub-session's context. Use for \
+             review→fix→re-review loops. Returns the sub-agent's reply.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delegate_id": {
+                    "type": "string",
+                    "description": "The delegate_id returned by delegate_task."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The follow-up instruction for the sub-agent."
+                }
+            },
+            "required": ["delegate_id", "message"]
+        }
+    })
+}
+
+fn close_tool_definition() -> Value {
+    json!({
+        "name": DELEGATE_CLOSE_TOOL_NAME,
+        "description": "Close a sub-session opened with delegate_task(keep_open=true) once you are \
+             done sending it follow-ups. Frees the seat.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delegate_id": {
+                    "type": "string",
+                    "description": "The delegate_id to close."
+                }
+            },
+            "required": ["delegate_id"]
         }
     })
 }
@@ -175,7 +268,14 @@ pub fn delegate_server_entry(
         return None;
     }
     let parent_cost = routeable.iter().find(|c| &c.id == candidate)?.cost_rank;
-    if !routeable.iter().any(|c| c.cost_rank < parent_cost) {
+    // Ordinary sessions only get the tool when a strictly-cheaper candidate
+    // exists (delegation sheds cost). Orchestrating sessions get it whenever
+    // there is any other candidate, so the planner can delegate to same-/higher-
+    // tier peers (e.g. a cross-lineage reviewer).
+    let orchestrating = shared
+        .with_session(router_sid, |s| s.orchestrating)
+        .unwrap_or(false);
+    if !orchestrating && !routeable.iter().any(|c| c.cost_rank < parent_cost) {
         return None;
     }
 
@@ -321,7 +421,11 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
         .on_receive_request(
             |_req: McpToolsListRequest, responder: Responder<McpToolsListResult>, _cx| async move {
                 responder.respond(McpToolsListResult {
-                    tools: vec![tool_definition()],
+                    tools: vec![
+                        tool_definition(),
+                        followup_tool_definition(),
+                        close_tool_definition(),
+                    ],
                 })
             },
             on_receive_request!(),
@@ -333,31 +437,70 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                 let shared = call_shared.clone();
                 let router_sid = call_sid.clone();
                 async move {
-                    if req.name != DELEGATE_TOOL_NAME {
-                        return responder.respond_with_error(
-                            AcpError::invalid_params().data(format!("unknown tool `{}`", req.name)),
-                        );
-                    }
-                    let args: DelegateTaskArgs = match serde_json::from_value(req.arguments) {
-                        Ok(args) => args,
-                        Err(err) => {
-                            return responder.respond(text_result(
-                                format!("invalid delegate_task arguments: {err}"),
-                                true,
-                            ));
-                        }
-                    };
                     // Tool calls can take minutes; run them off the MCP
                     // dispatch loop so pings keep working.
-                    cx.spawn(async move {
-                        let result = run_delegate_task(&shared, &router_sid, args).await;
-                        let response = match result {
-                            Ok(text) => text_result(text, false),
-                            Err(msg) => text_result(msg, true),
-                        };
-                        let _ = responder.respond(response);
-                        Ok(())
-                    })
+                    match req.name.as_str() {
+                        DELEGATE_TOOL_NAME => {
+                            let args: DelegateTaskArgs = match serde_json::from_value(req.arguments) {
+                                Ok(args) => args,
+                                Err(err) => {
+                                    return responder.respond(text_result(
+                                        format!("invalid delegate_task arguments: {err}"),
+                                        true,
+                                    ));
+                                }
+                            };
+                            cx.spawn(async move {
+                                let result = run_delegate_task(&shared, &router_sid, args).await;
+                                let _ = responder.respond(match result {
+                                    Ok(text) => text_result(text, false),
+                                    Err(msg) => text_result(msg, true),
+                                });
+                                Ok(())
+                            })
+                        }
+                        DELEGATE_FOLLOWUP_TOOL_NAME => {
+                            let args: DelegateFollowupArgs =
+                                match serde_json::from_value(req.arguments) {
+                                    Ok(args) => args,
+                                    Err(err) => {
+                                        return responder.respond(text_result(
+                                            format!("invalid delegate_followup arguments: {err}"),
+                                            true,
+                                        ));
+                                    }
+                                };
+                            cx.spawn(async move {
+                                let result =
+                                    run_delegate_followup(&shared, &router_sid, args).await;
+                                let _ = responder.respond(match result {
+                                    Ok(text) => text_result(text, false),
+                                    Err(msg) => text_result(msg, true),
+                                });
+                                Ok(())
+                            })
+                        }
+                        DELEGATE_CLOSE_TOOL_NAME => {
+                            let args: DelegateCloseArgs = match serde_json::from_value(req.arguments)
+                            {
+                                Ok(args) => args,
+                                Err(err) => {
+                                    return responder.respond(text_result(
+                                        format!("invalid delegate_close arguments: {err}"),
+                                        true,
+                                    ));
+                                }
+                            };
+                            let result = run_delegate_close(&shared, &router_sid, args);
+                            responder.respond(match result {
+                                Ok(text) => text_result(text, false),
+                                Err(msg) => text_result(msg, true),
+                            })
+                        }
+                        other => responder.respond_with_error(
+                            AcpError::invalid_params().data(format!("unknown tool `{other}`")),
+                        ),
+                    }
                 }
             },
             on_receive_request!(),
@@ -428,9 +571,16 @@ pub async fn run_delegate_task(
         profile.class = class;
     }
 
-    // Scope the pool to candidates strictly cheaper than the parent.
+    // Scope the pool. Ordinary delegation is cheaper-than-parent only (cost
+    // shedding); an orchestrating session may delegate to any eligible peer,
+    // including same-/higher-tier, so cross-lineage review is routeable.
+    let orchestrating = shared
+        .with_session(router_sid, |s| s.orchestrating)
+        .unwrap_or(false);
     let mut pool = shared.eligible_views(&RequiredCaps::default(), profile.class);
-    pool.retain(|v| v.cost_rank < parent_cost);
+    if !orchestrating {
+        pool.retain(|v| v.cost_rank < parent_cost);
+    }
     if let Some(min_quality) = args.hints.min_quality {
         pool.retain(|v| v.quality >= min_quality);
     }
@@ -583,14 +733,17 @@ pub async fn run_delegate_task(
                 }
                 let result = opened.conn.send_request(prompt).block_task().await;
 
-                // Tear down: remove the handle, close the ephemeral session.
-                shared.with_session(router_sid, |s| {
-                    s.delegates.retain(|d| {
-                        d.downstream_sid != handle.downstream_sid
-                            || d.process_key != handle.process_key
+                // Tear down (remove the handle, close the session) — used on
+                // every path except a successful `keep_open` delegation.
+                let teardown = || {
+                    shared.with_session(router_sid, |s| {
+                        s.delegates.retain(|d| {
+                            d.downstream_sid != handle.downstream_sid
+                                || d.process_key != handle.process_key
+                        });
                     });
-                });
-                close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                };
 
                 return match result {
                     Ok(resp) => {
@@ -616,18 +769,53 @@ pub async fn run_delegate_task(
                         );
                         match resp.stop_reason {
                             StopReason::EndTurn | StopReason::MaxTurnRequests => {
-                                Ok(format!("[delegated to {candidate}]\n{text}"))
+                                if args.keep_open {
+                                    // Keep the sub-session alive for follow-ups.
+                                    // The handle stays in `s.delegates` so parent
+                                    // cancel still propagates to it.
+                                    let delegate_id = format!(
+                                        "d-{}",
+                                        &uuid::Uuid::new_v4().simple().to_string()[..8]
+                                    );
+                                    shared.live_delegates.lock().unwrap().insert(
+                                        delegate_id.clone(),
+                                        crate::session::LiveDelegate {
+                                            parent_sid: router_sid.to_string(),
+                                            process_key: opened.process_key.clone(),
+                                            downstream_sid: opened.downstream_sid.clone(),
+                                            candidate: candidate.clone(),
+                                            capture: capture.clone(),
+                                            sub_sid: sub_sid.clone(),
+                                        },
+                                    );
+                                    Ok(format!(
+                                        "[delegated to {candidate}] [delegate_id: {delegate_id} — \
+                                         send more instructions to this same sub-agent with \
+                                         `delegate_followup`, then `delegate_close` when done]\n\
+                                         {text}"
+                                    ))
+                                } else {
+                                    teardown();
+                                    Ok(format!("[delegated to {candidate}]\n{text}"))
+                                }
                             }
                             StopReason::Cancelled => {
+                                teardown();
                                 Err(format!("delegated subtask on {candidate} was cancelled"))
                             }
-                            other => Err(format!(
-                                "delegated subtask on {candidate} stopped early ({other:?}); \
-                                 partial output:\n{text}"
-                            )),
+                            other => {
+                                teardown();
+                                Err(format!(
+                                    "delegated subtask on {candidate} stopped early ({other:?}); \
+                                     partial output:\n{text}"
+                                ))
+                            }
                         }
                     }
-                    Err(err) => Err(format!("delegated prompt on {candidate} failed: {err}")),
+                    Err(err) => {
+                        teardown();
+                        Err(format!("delegated prompt on {candidate} failed: {err}"))
+                    }
                 };
             }
             Err(err) => {
@@ -647,6 +835,145 @@ pub async fn run_delegate_task(
         }
     }
     Err(last_err.unwrap_or_else(|| "no delegate candidate could open a session".to_string()))
+}
+
+/// Send a follow-up instruction to a delegate sub-session kept alive by an
+/// earlier `delegate_task(keep_open=true)`, preserving that sub-agent's context.
+pub async fn run_delegate_followup(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: DelegateFollowupArgs,
+) -> Result<String, String> {
+    let _permit = shared
+        .delegate_semaphore
+        .acquire()
+        .await
+        .map_err(|_| "router shutting down".to_string())?;
+
+    // Look up the live delegate and verify it belongs to this parent session.
+    let (process_key, downstream_sid, candidate, capture, sub_sid) = {
+        let live = shared.live_delegates.lock().unwrap();
+        let d = live.get(&args.delegate_id).ok_or_else(|| {
+            format!(
+                "unknown delegate_id `{}` (already closed?)",
+                args.delegate_id
+            )
+        })?;
+        if d.parent_sid != router_sid {
+            return Err("delegate_id does not belong to this session".to_string());
+        }
+        (
+            d.process_key.clone(),
+            d.downstream_sid.clone(),
+            d.candidate.clone(),
+            d.capture.clone(),
+            d.sub_sid.clone(),
+        )
+    };
+
+    if shared
+        .with_session(router_sid, |s| s.cancelled)
+        .unwrap_or(false)
+    {
+        return Err("parent session was cancelled".to_string());
+    }
+    let Some(conn) = shared.target_conn(&process_key) else {
+        return Err(format!(
+            "delegate sub-session on {candidate} is no longer reachable (process died)"
+        ));
+    };
+
+    // Reset the capture buffer so we collect only this turn's output.
+    capture.lock().unwrap().clear();
+
+    // Log the follow-up.
+    shared.state.lock().unwrap().log(
+        &sub_sid,
+        &crate::state::LogEntry {
+            kind: "delegate_followup".to_string(),
+            role: "user".to_string(),
+            summary: args.message.chars().take(200).collect(),
+            tokens_input: crate::state::estimate_tokens(&args.message),
+            tokens_estimated: true,
+            ..Default::default()
+        },
+    );
+    shared
+        .headroom
+        .lock()
+        .unwrap()
+        .record_prompt(&candidate.agent);
+
+    let prompt = PromptRequest::new(
+        downstream_sid.clone(),
+        vec![ContentBlock::from(args.message.clone())],
+    );
+    let result = conn.send_request(prompt).block_task().await;
+    match result {
+        Ok(resp) => {
+            let text = capture.lock().unwrap().clone();
+            let text = if text.trim().is_empty() {
+                "(delegate produced no text output)".to_string()
+            } else {
+                text
+            };
+            let (ti, to, est) = crate::session::turn_tokens(&resp, &text);
+            shared.state.lock().unwrap().log(
+                &sub_sid,
+                &crate::state::LogEntry {
+                    kind: "agent_response".to_string(),
+                    role: "agent".to_string(),
+                    summary: text.chars().take(200).collect(),
+                    tokens_input: ti,
+                    tokens_output: to,
+                    tokens_estimated: est,
+                    ..Default::default()
+                },
+            );
+            match resp.stop_reason {
+                StopReason::EndTurn | StopReason::MaxTurnRequests => Ok(format!(
+                    "[{candidate}, delegate {}]\n{text}",
+                    args.delegate_id
+                )),
+                StopReason::Cancelled => Err(format!("follow-up on {candidate} was cancelled")),
+                other => Err(format!(
+                    "follow-up on {candidate} stopped early ({other:?}); partial output:\n{text}"
+                )),
+            }
+        }
+        Err(err) => Err(format!("follow-up on {candidate} failed: {err}")),
+    }
+}
+
+/// Close a delegate sub-session opened with `keep_open=true`.
+pub fn run_delegate_close(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: DelegateCloseArgs,
+) -> Result<String, String> {
+    let removed = {
+        let mut live = shared.live_delegates.lock().unwrap();
+        match live.get(&args.delegate_id) {
+            Some(d) if d.parent_sid == router_sid => live.remove(&args.delegate_id),
+            Some(_) => return Err("delegate_id does not belong to this session".to_string()),
+            None => None,
+        }
+    };
+    let Some(d) = removed else {
+        return Err(format!(
+            "unknown delegate_id `{}` (already closed?)",
+            args.delegate_id
+        ));
+    };
+    shared.with_session(router_sid, |s| {
+        s.delegates
+            .retain(|h| h.downstream_sid != d.downstream_sid || h.process_key != d.process_key);
+    });
+    close_downstream_session(shared, &d.process_key, &d.downstream_sid);
+    Ok(format!(
+        "closed delegate {} ({})",
+        args.delegate_id, d.candidate
+    ))
 }
 
 // ----------------------------------------------------------------------
@@ -716,5 +1043,22 @@ mod tests {
         assert_eq!(def["name"], DELEGATE_TOOL_NAME);
         assert_eq!(def["inputSchema"]["required"][0], "task");
         assert!(def["inputSchema"]["properties"]["hints"]["properties"]["candidate"].is_object());
+    }
+
+    #[test]
+    fn mcp_request_params_accept_null_and_missing() {
+        // Real MCP clients (claude-agent-acp, codex-acp) send tools/list, ping,
+        // and notifications/initialized with `params: null` or no params. These
+        // must deserialize, or the adapter's tools/list errors and it sees NONE
+        // of the delegate tools (the bug that made delegation never work live).
+        use serde_json::{Value, json};
+        serde_json::from_value::<McpToolsListRequest>(Value::Null).unwrap();
+        serde_json::from_value::<McpPingRequest>(Value::Null).unwrap();
+        serde_json::from_value::<McpInitializedNotification>(Value::Null).unwrap();
+        serde_json::from_value::<McpInitializeRequest>(Value::Null).unwrap();
+        // Also from {} and from a populated object (fields ignored).
+        serde_json::from_value::<McpToolsListRequest>(json!({})).unwrap();
+        serde_json::from_value::<McpToolsListRequest>(json!({"cursor": "abc"})).unwrap();
+        serde_json::from_value::<McpInitializeRequest>(json!({"protocolVersion": "1"})).unwrap();
     }
 }

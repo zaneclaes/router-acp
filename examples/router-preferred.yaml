@@ -56,6 +56,14 @@ routers:
     # default) — hard prompts get frontier models.
     cost_quality_tradeoff: 3
 
+orchestration:
+  enabled: false
+  min_items: 2                              # smallest list treated as multi-part
+  planner: ["*sol*", "*fable*", "*opus*", "*gpt-5.5*"]   # best first
+  reviewer: ["*gpt-5.5*", "*sol*", "*opus*"]             # prefer a different lineage
+  submit: branch                            # never | branch | pr | merge
+  max_fix_rounds: 2
+
 # Mid-session model switching. A pinned session can move to a more capable
 # model on its own when its confidence drops. Confidence = the pinned model's
 # quality for the task class minus accumulated "struggle" (token-ceiling hits,

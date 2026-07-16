@@ -38,7 +38,8 @@ SDK traps below, which were all discovered the hard way.
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (hard exclusion until token-limit reset) |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
-| `src/delegate_mcp.rs` | delegate tool: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task`, `mcp-delegate` helper bridge |
+| `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
+| `src/tasklist.rs` | `detect_task_list(text) -> Option<usize>` — recognizes multi-part task lists (markdown numbers/bullets, inline `(1)(2)`, semantic "first…then…finally" ordering) for auto-orchestration; pure + unit-tested |
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment |
 | `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
 | `src/bin/mock_agent.rs` | scripted downstream for tests (below) |
@@ -83,6 +84,23 @@ SDK traps below, which were all discovered the hard way.
    unhandled requests get `method_not_found` automatically. Chained handlers
    run in registration order — the untyped catch-all must be registered
    last.
+8. **MCP request/notification params are often `null` or omitted.** The
+   hand-typed `delegate_mcp` wire structs (`McpToolsListRequest`, `McpPingRequest`,
+   `McpInitializedNotification`, `McpInitializeRequest`) must deserialize from
+   `null`/missing/`{}` — serde's derived struct impl rejects `null` ("invalid
+   type: null, expected struct"). Real adapters (claude-agent-acp) send
+   `tools/list`/`ping`/`notifications/initialized` with `params: null`; when
+   `tools/list` errored, the adapter saw **zero** delegate tools and
+   `delegate_task` silently never appeared — so **delegation never worked live at
+   all** (0 rows in the state DB, undetected until orchestration relied on it).
+   The mock's delegate path didn't exercise `tools/list`, so unit/protocol tests
+   were green while production was broken. Fix: `lenient_params!` macro impls a
+   `Deserialize` via `IgnoredAny` → `Default` for those types (handlers ignore
+   the params anyway). Regression: `mcp_request_params_accept_null_and_missing`.
+   **To verify MCP-exposure changes, drive the REAL adapter** (see
+   `scratchpad/probe_delegate.py` pattern) and watch for the
+   `delegate MCP helper connected` log with no `Handler errored … tools/list`;
+   the mock cannot catch this class of bug.
 
 ## Architectural invariants (from PLAN.md; do not break casually)
 
@@ -159,6 +177,41 @@ SDK traps below, which were all discovered the hard way.
   `frame_transcript`. The disclosure states which path was used. Regression-tested
   in `switch_directive_hands_off_…`, `switch_falls_back_to_log_transcript_when_summary_fails`,
   `low_confidence_pin_auto_upgrades_…`, `auto_upgrade_disabled_…`, `skill_routing_switches_…`.
+- **Auto-orchestration** (`orchestration.*`, off by default): `on_prompt` calls
+  `maybe_trigger_orchestration` when `!explicit_routing` (a `[router:]`
+  directive, `model:` shorthand, or skill invocation sets `explicit_routing` and
+  suppresses it). `tasklist::detect_task_list` recognizes a multi-part list;
+  above `min_items` it sets `s.orchestrating = true`, steers pre-pin
+  (`candidate_override`) or switches post-pin (`pending_switch`) to the best
+  eligible `planner` glob, and queues `build_orchestration_instructions` into
+  `s.pending_orchestration`. That one-shot block is prepended (before any switch
+  `pending_context` handoff) in `send_prompt_with_failover`'s `effective_prompt`.
+  `orchestrating` relaxes the delegate pool (`run_delegate_task` /
+  `delegate_server_entry`) from cheaper-only to any-eligible so the cross-lineage
+  reviewer is routeable — this is the ONLY router-level change; the pipeline
+  itself is the planner following the injected protocol with `delegate_task` +
+  the multi-turn `keep_open`/`delegate_followup`/`delegate_close` tools. It
+  recreates the goose `orchestrate.yaml` recipe in-process, working from any ACP
+  client. `close_live_delegates_for` reaps kept-open sub-sessions on
+  session/close|delete. `maybe_trigger_orchestration` also sets
+  `run_label = "orchestrate"` (so the planner + its delegate rows group) and
+  resolves explicit **different-lineage** reviewer candidate ids via
+  `resolve_reviewers` (configured `reviewer` globs restricted to `agent !=
+  planner.agent`, else any other-lineage candidate), injected into the protocol.
+  Tests: `orchestration_*` in `tests/protocol.rs` + `tasklist::tests`. Do NOT
+  `include_str!`-style couple this to goose — router-acp still has no notion of
+  recipes; it only detects lists and drives delegation.
+  **LESSON (shipped bug):** the first live run pinned the fable planner but it
+  used claude-agent-acp's **built-in `Task` sub-agent tool** (haiku subtasks,
+  opus review) instead of the router's `delegate_task` — so there were NO
+  `parent_session_id` rows, the review stayed on the planner's own lineage, and
+  nothing was `run_label`led. The native sub-agent tool spawns in-lineage and is
+  invisible to the router; router-acp cannot remove it (it's the adapter's, not an
+  MCP server). The only lever is the injected protocol, which now **explicitly
+  forbids** `Task`/`dispatch_agent`/`spawn` and **mandates** `delegate_task` with
+  the concrete cross-lineage reviewer id. This is inherent to the prose-instruction
+  approach: a model that ignores the ban silently degrades to same-lineage,
+  unobservable orchestration.
 - **`escalation` router** (start cheap, escalate on *observed* difficulty — not
   a prompt guess): `EscalationStrategy::rank` pins the cheapest capable candidate
   (or, if `initial_router` is set, delegates the starting pick to that strategy —

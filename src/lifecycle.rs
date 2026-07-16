@@ -248,6 +248,7 @@ pub fn on_session_delete(
     cx.spawn(async move {
         match conn.send_request(fwd).block_task().await {
             Ok(resp) => {
+                crate::session::close_live_delegates_for(&shared, &router_sid);
                 shared.unregister_route(&key, &persisted.downstream_session_id);
                 shared.sessions.lock().unwrap().remove(&router_sid);
                 shared.state.lock().unwrap().remove(&router_sid);
@@ -278,6 +279,7 @@ pub fn on_session_close(
             // Close the live downstream session when supported; state-file
             // entries survive so resume/load keep working if the downstream
             // persists sessions.
+            crate::session::close_live_delegates_for(&shared, &router_sid);
             close_downstream_session(&shared, &pin.process_key, &pin.downstream_sid);
             shared.sessions.lock().unwrap().remove(&router_sid);
             responder.respond(CloseSessionResponse::new())

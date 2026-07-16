@@ -283,6 +283,61 @@ parent — and never into delegated sessions themselves (depth is capped at 1).
 Concurrency is bounded by `delegation.max_concurrent`; `session/cancel` on the
 parent cancels the primary prompt and all active sub-sessions.
 
+For **review→fix→re-review** loops, a delegated sub-session can be kept alive:
+`delegate_task` with `keep_open: true` returns a `delegate_id`; the caller then
+sends more instructions to that same sub-agent (context preserved) with
+`delegate_followup`, and frees it with `delegate_close`. These are what let the
+orchestrator (below) iterate on a subtask without re-briefing a fresh session.
+
+## Auto-orchestration
+
+When a prompt reads as a **multi-part task list** — markdown bullets or numbers,
+inline `(1) … (2) …`, or ordered prose ("first … then … finally …") — the
+router can treat it like the goose *orchestrate* recipe, but recreated entirely
+in-process. It steers (pre-pin) or switches (mid-session) the session onto a
+**planner** frontier model and injects an orchestration protocol instructing
+that model to:
+
+1. **Plan** — restate the task as success criteria and split it into
+   file-disjoint, self-contained subtasks.
+2. **Delegate** — dispatch each subtask via `delegate_task`, each routed
+   per-complexity in its own sub-session (independent ones concurrently).
+3. **Review** — delegate an independent review to a candidate of a **different
+   lineage** than the planner (`reviewer` globs), handing it the original task
+   verbatim.
+4. **Adjudicate** — fix blocking issues and re-review, bounded by
+   `max_fix_rounds`.
+5. **Submit** — per the `submit` gate (`never | branch | pr | merge`); a merge
+   is only permitted after the review approves.
+
+The one thing this needs beyond ordinary delegation is **peer delegation**: an
+orchestrating session may delegate to *same-* or *higher*-tier candidates (not
+just strictly-cheaper ones), so the cross-lineage reviewer is actually
+routeable. Everything else — the decomposition, the review, the submission gate
+— is the planner model following the injected protocol with its own tools plus
+`delegate_task`/`delegate_followup`.
+
+Auto-orchestration is **off by default** (`orchestration.enabled`), fires on any
+prompt (pre- or post-pin), and is **suppressed by an explicit `[router: …]`
+directive or `model:` shorthand** — so you can always opt a specific prompt out.
+Each trigger is disclosed (`router-acp · orchestrating a N-part task on …`).
+
+Unlike the goose recipe, this works in **any** ACP client and plain chat
+session (no recipe, no `summon` extension) because the orchestration primitive
+is the router's own `delegate_task` tool. See [`ROUTERS.md`](ROUTERS.md) and
+[`ORCHESTRATION.md`](ORCHESTRATION.md).
+
+> **Caveat — the planner must use `delegate_task`.** Sub-session routing, the
+> cross-lineage review, and the `parent_session_id`/`run_label` rows all depend
+> on the planner calling `delegate_task`. Some adapters ship a *built-in*
+> sub-agent tool (Claude's `Task`) that spawns same-lineage sub-agents *inside*
+> the adapter — invisible to the router. The injected protocol explicitly forbids
+> that tool and mandates `delegate_task` with a concrete different-lineage
+> reviewer id, but the router cannot remove the adapter's own tool; a model that
+> ignores the instruction degrades to same-lineage, unobservable orchestration.
+> If you see no delegate rows in the state DB after an orchestrated run, the
+> planner used its native tool.
+
 ## Install and run
 
 ```sh
@@ -339,6 +394,12 @@ example.
 | `auto_upgrade.enabled` | `true` | Auto-switch a pinned session up to a more capable model when confidence drops. `false` disables it (explicit `[router: switch=…]` still works). |
 | `auto_upgrade.confidence_threshold` | `0.55` | Upgrade when confidence (pinned quality − struggle) falls below this. Higher = more eager; `0` ≈ never. |
 | `skill_routing[]` | `[]` | Rules forcing a skill onto a model class: `pattern` (skill name, matched as `/name` or a standalone token) → `candidates` (candidate globs in preference order). Mid-session it switches; pre-pin it steers routing. |
+| `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review→submit protocol. |
+| `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task. |
+| `orchestration.planner[]` | frontier globs | Planner/orchestrator candidate globs, best first (first eligible wins). |
+| `orchestration.reviewer[]` | frontier globs | Preferred cross-lineage reviewer globs handed to the orchestrator (it should pick a different lineage than the planner). |
+| `orchestration.submit` | `branch` | Submission gate given to the orchestrator: `never \| branch \| pr \| merge` (a merge is only permitted after the review approves). |
+| `orchestration.max_fix_rounds` | `2` | Max review → fix → re-review rounds. |
 | `agents[].name` | – | Unique, no `/`. Candidate ids are `name/model-id`. |
 | `agents[].command` | – | `type: stdio` command/args/env for the adapter. `${VAR}` in the whole file interpolates from the environment (unknown names are left intact). |
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |

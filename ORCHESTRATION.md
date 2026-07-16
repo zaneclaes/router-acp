@@ -27,6 +27,29 @@ you: "Fix the bugs with issue X: (1)… (2)… (3)…"
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Two ways to run this
+
+There are now **two** implementations of the same plan → subtasks → review →
+submit pipeline:
+
+1. **This goose recipe** (`orchestrate.yaml`) — explicit, richest version. Uses
+   goose subrecipes (`summon`) for isolated sessions, structured JSON verdicts,
+   and the `developer` shell for git/PR/merge. Run it deliberately with
+   `goose run --recipe orchestrate.yaml`. Everything below documents this path.
+2. **Router-native auto-orchestration** (`orchestration.enabled` in
+   `router.yaml`) — implicit. router-acp detects a multi-part **task list** in
+   any prompt and recreates the pipeline in-process: it switches the session to
+   a planner model and injects the protocol, and the planner drives the router's
+   own `delegate_task` / `delegate_followup` tools (with same-/higher-tier peer
+   delegation enabled so the cross-lineage review is routeable). No recipe, no
+   `summon` — it works from **any** ACP client and plain chat. See
+   [`ROUTERS.md`](ROUTERS.md) § *Auto-orchestration of task lists* and the
+   `orchestration.*` keys in [`README.md`](README.md).
+
+Use the recipe when you want the structured, submit-gated CI-grade run; rely on
+auto-orchestration for the everyday "here's a list of things" prompt. They share
+the router's delegation, routing, cordons, and disclosures.
+
 ## What this is built from
 
 Everything except one small router feature is **stock goose tooling**:

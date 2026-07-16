@@ -254,6 +254,89 @@ pub struct SkillRoute {
     pub candidates: Vec<String>,
 }
 
+/// Automatic orchestration. When a prompt reads as a multi-part task list
+/// (markdown list, inline `(1)(2)`, or "first … then … finally" ordering), the
+/// router treats it like the goose orchestrate recipe — but entirely in-process:
+/// it steers/switches the session to a `planner` model and injects an
+/// orchestration protocol instructing that model to decompose the task, delegate
+/// each part via `delegate_task` (routed per-complexity in isolated
+/// sub-sessions), have a different-lineage `reviewer` verify the net result, and
+/// submit per `submit`. Delegation in an orchestrating session is allowed to
+/// same-/higher-tier peers (so cross-lineage review works), unlike ordinary
+/// cost-shedding delegation. An explicit `[router: …]` directive or `model:`
+/// shorthand on the prompt suppresses auto-orchestration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationConfig {
+    /// Master switch. Off by default so it never surprises a plain session;
+    /// turn it on in your router.yaml to get automatic decomposition.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum number of detected parts before a prompt is treated as an
+    /// orchestratable list.
+    #[serde(default = "default_min_items")]
+    pub min_items: usize,
+    /// Candidate globs for the planner/orchestrator, best first. The first one
+    /// with an eligible candidate wins (like `skill_routing`).
+    #[serde(default = "default_planner")]
+    pub planner: Vec<String>,
+    /// Preferred cross-lineage reviewer candidate globs, best first. Passed to
+    /// the orchestrator as guidance; it should pick one of a *different* lineage
+    /// than the planner for the review pass.
+    #[serde(default = "default_reviewer")]
+    pub reviewer: Vec<String>,
+    /// Submission gate handed to the orchestrator: `never` | `branch` | `pr` |
+    /// `merge`. A merge is only permitted after the review pass approves.
+    #[serde(default = "default_submit")]
+    pub submit: String,
+    /// Maximum review → fix → re-review rounds.
+    #[serde(default = "default_max_fix_rounds")]
+    pub max_fix_rounds: u32,
+}
+
+fn default_min_items() -> usize {
+    2
+}
+
+fn default_planner() -> Vec<String> {
+    vec![
+        "*sol*".to_string(),
+        "*fable*".to_string(),
+        "*opus*".to_string(),
+        "*gpt-5.5*".to_string(),
+    ]
+}
+
+fn default_reviewer() -> Vec<String> {
+    vec![
+        "*gpt-5.5*".to_string(),
+        "*sol*".to_string(),
+        "*opus*".to_string(),
+        "*fable*".to_string(),
+    ]
+}
+
+fn default_submit() -> String {
+    "branch".to_string()
+}
+
+fn default_max_fix_rounds() -> u32 {
+    2
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_items: default_min_items(),
+            planner: default_planner(),
+            reviewer: default_reviewer(),
+            submit: default_submit(),
+            max_fix_rounds: default_max_fix_rounds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailoverConfig {
@@ -564,6 +647,9 @@ pub struct Config {
     /// Skill → model-class routing rules.
     #[serde(default)]
     pub skill_routing: Vec<SkillRoute>,
+    /// Automatic orchestration of multi-part task lists.
+    #[serde(default)]
+    pub orchestration: OrchestrationConfig,
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
     pub routers: RoutersConfig,
@@ -815,6 +901,27 @@ impl Config {
             return Err(ConfigError(
                 "classifier.backend is `local-model` but classifier.local_model is not set".into(),
             ));
+        }
+        if self.orchestration.enabled {
+            if self.orchestration.planner.is_empty() {
+                return Err(ConfigError(
+                    "orchestration.enabled is true but orchestration.planner is empty".into(),
+                ));
+            }
+            if self.orchestration.min_items < 2 {
+                return Err(ConfigError(
+                    "orchestration.min_items must be at least 2".into(),
+                ));
+            }
+            if !matches!(
+                self.orchestration.submit.as_str(),
+                "never" | "branch" | "pr" | "merge"
+            ) {
+                return Err(ConfigError(format!(
+                    "orchestration.submit must be never|branch|pr|merge, got `{}`",
+                    self.orchestration.submit
+                )));
+            }
         }
         Ok(())
     }
