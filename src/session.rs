@@ -2906,10 +2906,53 @@ fn build_orchestration_instructions(
     )
 }
 
+/// True when the previous agent turn appears to have asked the user
+/// question(s)/decisions — so a list in the user's reply is *answers*, not a new
+/// multi-part task, and must not trigger orchestration. Deliberately
+/// conservative (it only fires on clear solicitations) so genuine follow-up task
+/// lists still orchestrate.
+fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
+    let text = prev_agent_text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    // Phrases that clearly solicit a decision/answer, low false-positive.
+    const SOLICIT_PHRASES: &[&str] = &[
+        "open question",
+        "open decision",
+        "open item",
+        "please confirm",
+        "please decide",
+        "to decide",
+        "need to decide",
+        "decisions:",
+        "questions:",
+        "options:",
+        "your call",
+        "up to you",
+        "which of",
+        "do you want",
+        "do you prefer",
+        "would you like",
+        "would you prefer",
+        "how would you like",
+        "let me know which",
+        "let me know how",
+        "which would you",
+    ];
+    let has_phrase = SOLICIT_PHRASES.iter().any(|p| lower.contains(p));
+    let questions = text.matches('?').count();
+    // Did the agent itself enumerate the options/questions?
+    let enumerated = crate::tasklist::detect_task_list(text).is_some();
+    has_phrase || questions >= 2 || (questions >= 1 && enumerated)
+}
+
 /// If auto-orchestration is enabled and the prompt reads as a multi-part task
 /// list, put the session into orchestration mode: steer/switch it to a planner
 /// model and queue the orchestration protocol for the next prompt. A no-op when
-/// disabled, when the list is too small, or when no planner is eligible.
+/// disabled, when the list is too small, when no planner is eligible, or when the
+/// list is the user answering the model's own questions.
 fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentBlock]) {
     let cfg = &shared.cfg.orchestration;
     if !cfg.enabled {
@@ -2920,6 +2963,21 @@ fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &
         return;
     };
     if parts < cfg.min_items {
+        return;
+    }
+
+    // Exception: don't orchestrate a list that answers the model's questions.
+    // `turn_output` still holds the previous agent turn here (it is cleared
+    // later, inside `send_prompt_with_failover`); empty pre-pin, so a first
+    // prompt is never mistaken for an answer.
+    let prev_agent_turn = shared
+        .with_session(router_sid, |s| s.turn_output.clone())
+        .unwrap_or_default();
+    if previous_turn_solicited_answers(&prev_agent_turn) {
+        tracing::debug!(
+            session = router_sid,
+            "auto-orchestration skipped: prompt looks like answers to the model's questions"
+        );
         return;
     }
 
@@ -4664,6 +4722,49 @@ mod escalation_signal_tests {
         // status-only frame (no kind) → defer, never a spurious side effect.
         let status_only = serde_json::json!({"toolCallId": "t7", "status": "completed"});
         assert!(matches!(classify_tool(&status_only), ToolClass::Defer));
+    }
+}
+
+#[cfg(test)]
+mod orchestration_unit_tests {
+    use super::previous_turn_solicited_answers as solicited;
+
+    #[test]
+    fn detects_enumerated_decisions_from_the_agent() {
+        assert!(solicited(
+            "Open decisions: (1) which database? (2) which auth provider?"
+        ));
+        assert!(solicited(
+            "A few questions:\n1. DB choice\n2. deploy target?"
+        ));
+    }
+
+    #[test]
+    fn detects_multiple_questions() {
+        assert!(solicited(
+            "What database should we use? What about the auth provider?"
+        ));
+    }
+
+    #[test]
+    fn detects_solicit_phrases_without_question_marks() {
+        assert!(solicited(
+            "These are up to you: postgres or mysql, oauth or basic."
+        ));
+        assert!(solicited("Please confirm the plan before I proceed."));
+    }
+
+    #[test]
+    fn does_not_fire_on_a_plain_completion() {
+        assert!(!solicited(
+            "Done — I fixed the bug in auth.rs and the tests pass."
+        ));
+        // A single casual question is not a multi-answer solicitation.
+        assert!(!solicited(
+            "I refactored the handler. Does that look right?"
+        ));
+        // No prior turn (fresh session).
+        assert!(!solicited(""));
     }
 }
 

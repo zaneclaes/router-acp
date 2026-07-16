@@ -180,7 +180,11 @@ SDK traps below, which were all discovered the hard way.
 - **Auto-orchestration** (`orchestration.*`, off by default): `on_prompt` calls
   `maybe_trigger_orchestration` when `!explicit_routing` (a `[router:]`
   directive, `model:` shorthand, or skill invocation sets `explicit_routing` and
-  suppresses it). `tasklist::detect_task_list` recognizes a multi-part list;
+  suppresses it). It is ALSO suppressed when the list answers the model's own
+  questions: `previous_turn_solicited_answers` inspects the prior agent turn
+  (`s.turn_output`, still the previous turn at `on_prompt` time — cleared later in
+  `send_prompt_with_failover`) for question marks / decision phrases / an
+  enumerated agent list. `tasklist::detect_task_list` recognizes a multi-part list;
   above `min_items` it sets `s.orchestrating = true`, steers pre-pin
   (`candidate_override`) or switches post-pin (`pending_switch`) to the best
   eligible `planner` glob, and queues `build_orchestration_instructions` into

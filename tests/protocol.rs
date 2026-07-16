@@ -2103,6 +2103,55 @@ async fn orchestration_switches_pinned_session_on_a_list() {
 }
 
 #[tokio::test]
+async fn orchestration_skipped_when_list_answers_the_models_questions() {
+    let state = temp_state_file("orch-answer");
+    let log = temp_log("orch-answer");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Pin a/m1 (NOT the planner). The echoed turn carries the model's
+        // questions, so it lands in turn_output as the "previous agent turn".
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/m1]\nWhich database should we use? Which auth provider?",
+        )
+        .await?;
+        // The user answers with a list — this must NOT switch to the planner.
+        let resp = prompt_text(&cx, &sid, "1. postgres\n2. oauth\n3. fly.io").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("orchestrating"),
+            "answering the model's questions must not orchestrate: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:1. postgres"),
+            "stayed on the pinned model to relay the answer: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
     let state = temp_state_file("upgrade");
     // Score table: a/m1 is under-powered (0.40, below the 0.55 default

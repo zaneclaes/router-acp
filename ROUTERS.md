@@ -356,7 +356,10 @@ What counts as a list (detection is permissive):
 - inline numbering — `… (1) do this (2) do that …`
 - ordered prose — `First, … Then, … Finally, …`
 
-On a match of at least `min_items` parts, and with **no** explicit
+On a match of at least `min_items` parts — and only when the list is a *new*
+task, not you answering the model's own questions (if the previous agent turn
+posed questions/decisions, e.g. "Open decisions: (1)… (2)…", the router treats
+your enumerated reply as answers and relays normally), and with **no** explicit
 `[router: …]` directive or `model:` shorthand on the prompt (those suppress it):
 
 1. The session is steered (pre-pin) or **switched** (mid-session, via the same

@@ -318,9 +318,13 @@ routeable. Everything else — the decomposition, the review, the submission gat
 `delegate_task`/`delegate_followup`.
 
 Auto-orchestration is **off by default** (`orchestration.enabled`), fires on any
-prompt (pre- or post-pin), and is **suppressed by an explicit `[router: …]`
-directive or `model:` shorthand** — so you can always opt a specific prompt out.
-Each trigger is disclosed (`router-acp · orchestrating a N-part task on …`).
+prompt (pre- or post-pin), and is **suppressed** by an explicit `[router: …]`
+directive or `model:` shorthand (so you can always opt a prompt out), and also
+when the list is **you answering the model's own questions** (e.g. it asked
+"Open decisions: (1)… (2)…" and you reply with a matching list — the router sees
+that the previous agent turn solicited answers and relays normally instead of
+re-orchestrating). Each trigger is disclosed
+(`router-acp · orchestrating a N-part task on …`).
 
 Unlike the goose recipe, this works in **any** ACP client and plain chat
 session (no recipe, no `summon` extension) because the orchestration primitive
