@@ -373,6 +373,12 @@ your enumerated reply as answers and relays normally), and with **no** explicit
    just strictly-cheaper ones — this is what makes the cross-lineage reviewer
    routeable. (Ordinary delegation stays cheaper-only.)
 
+Orchestration **takes precedence over `skill_routing`**: a multi-part task list
+orchestrates even if it names a skill (e.g. `ship-pr`). Skill routing only fires
+for a skill invocation that is *not* a multi-part task. Inside orchestration the
+planner decides when to invoke a named skill — end-of-work skills (shipping,
+opening/merging a PR) run last, after the work is done and reviewed.
+
 ```yaml
 orchestration:
   enabled: true
@@ -386,9 +392,10 @@ orchestration:
 The planner iterates on a subtask by keeping its sub-agent open
 (`delegate_task keep_open: true` → `delegate_followup` → `delegate_close`)
 rather than re-briefing a fresh session each round. Every trigger is disclosed
-(`router-acp · orchestrating a N-part task on …`). This is the same pipeline as
-the goose `orchestrate` recipe (see `ORCHESTRATION.md`), but it needs no recipe
-or `summon` extension — so it works from any ACP client and plain chat.
+(`router-acp · orchestrating a N-part task on …`). The full pipeline, mechanism,
+and config are in [`ORCHESTRATION.md`](ORCHESTRATION.md); because it is built on
+the router's own `delegate_task` tool it needs no recipe or `summon` extension,
+so it works from any ACP client and plain chat.
 
 ---
 

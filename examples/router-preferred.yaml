@@ -57,7 +57,7 @@ routers:
     cost_quality_tradeoff: 3
 
 orchestration:
-  enabled: false
+  enabled: true
   min_items: 2                              # smallest list treated as multi-part
   planner: ["*sol*", "*fable*", "*opus*", "*gpt-5.5*"]   # best first
   reviewer: ["*gpt-5.5*", "*sol*", "*opus*"]             # prefer a different lineage

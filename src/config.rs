@@ -256,7 +256,7 @@ pub struct SkillRoute {
 
 /// Automatic orchestration. When a prompt reads as a multi-part task list
 /// (markdown list, inline `(1)(2)`, or "first … then … finally" ordering), the
-/// router treats it like the goose orchestrate recipe — but entirely in-process:
+/// router runs a plan → delegate → review → submit pipeline entirely in-process:
 /// it steers/switches the session to a `planner` model and injects an
 /// orchestration protocol instructing that model to decompose the task, delegate
 /// each part via `delegate_task` (routed per-complexity in isolated

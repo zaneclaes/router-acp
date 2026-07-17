@@ -2750,9 +2750,33 @@ fn split_model_shorthand(prompt: &[ContentBlock]) -> Option<(String, Vec<Content
     None
 }
 
+/// Remove inline code spans and fenced code blocks (anything between backtick
+/// runs) so a skill *named* in code/examples — e.g. describing an autocomplete
+/// for `` `/ship-pr` `` — isn't mistaken for *invoking* the skill. Balanced or
+/// not, everything inside backticks is dropped; each run becomes a separator so
+/// surrounding tokens don't merge.
+fn strip_code_spans(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            while chars.peek() == Some(&'`') {
+                chars.next();
+            }
+            in_code = !in_code;
+            out.push(' ');
+        } else if !in_code {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// True when the prompt invokes `pattern` — either as a `/slash-command` or as
 /// a standalone token (so "ship-pr" matches "run ship-pr" and "/ship-pr" but
-/// not "membership-provider").
+/// not "membership-provider"). The caller passes text with code spans already
+/// stripped, so a skill name mentioned inside backticks does not count.
 fn prompt_mentions_skill(text_lower: &str, pattern: &str) -> bool {
     let p = pattern.to_lowercase();
     if p.is_empty() {
@@ -2766,12 +2790,14 @@ fn prompt_mentions_skill(text_lower: &str, pattern: &str) -> bool {
         .any(|tok| tok == p)
 }
 
-/// The first configured skill route whose pattern the prompt invokes.
+/// The first configured skill route whose pattern the prompt invokes. Code spans
+/// are stripped first so a skill *mentioned* in code/examples (e.g. a UI prompt
+/// describing `` `/ship-pr` `` autocomplete) does not hijack routing.
 fn detect_skill_route<'a>(cfg: &'a Config, prompt: &[ContentBlock]) -> Option<&'a SkillRoute> {
     if cfg.skill_routing.is_empty() {
         return None;
     }
-    let text = prompt_display_text(prompt).to_lowercase();
+    let text = strip_code_spans(&prompt_display_text(prompt)).to_lowercase();
     cfg.skill_routing
         .iter()
         .find(|r| prompt_mentions_skill(&text, &r.pattern))
@@ -2898,7 +2924,9 @@ fn build_orchestration_instructions(
          plus any blocking issues.\n\
          4. ADJUDICATE. For each blocking issue, delegate a targeted fix and re-review. At most \
          {rounds} fix rounds; if still not approved, stop and report what remains.\n\
-         5. SUBMIT. {submit_line}\n\
+         5. SUBMIT. {submit_line} Any skill or command the task names for the END of the work \
+         (shipping, opening/merging a PR, deploying) runs ONLY here — after the work is done and \
+         the review approves — never up front; a half-done change is not shippable.\n\
          Finally, report: the success criteria and how each is met; per-subtask outcomes (and \
          which model the router chose for each); the review verdict history; and what was \
          submitted (or why not).\n\
@@ -2950,20 +2978,27 @@ fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
 
 /// If auto-orchestration is enabled and the prompt reads as a multi-part task
 /// list, put the session into orchestration mode: steer/switch it to a planner
-/// model and queue the orchestration protocol for the next prompt. A no-op when
-/// disabled, when the list is too small, when no planner is eligible, or when the
-/// list is the user answering the model's own questions.
-fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentBlock]) {
+/// model and queue the orchestration protocol for the next prompt. Returns
+/// `true` when it fired. A no-op (returns `false`) when disabled, when the list
+/// is too small, when no planner is eligible, or when the list is the user
+/// answering the model's own questions. Runs BEFORE `skill_routing`, so a
+/// multi-part task orchestrates even if it names a skill — the planner decides
+/// when to invoke that skill (end-of-work skills like shipping run last).
+fn maybe_trigger_orchestration(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    prompt: &[ContentBlock],
+) -> bool {
     let cfg = &shared.cfg.orchestration;
     if !cfg.enabled {
-        return;
+        return false;
     }
     let text = prompt_display_text(prompt);
     let Some(parts) = crate::tasklist::detect_task_list(&text) else {
-        return;
+        return false;
     };
     if parts < cfg.min_items {
-        return;
+        return false;
     }
 
     // Exception: don't orchestrate a list that answers the model's questions.
@@ -2978,7 +3013,7 @@ fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &
             session = router_sid,
             "auto-orchestration skipped: prompt looks like answers to the model's questions"
         );
-        return;
+        return false;
     }
 
     let (class, excluded, current) = shared
@@ -3002,7 +3037,7 @@ fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &
                 cfg.planner
             ),
         );
-        return;
+        return false;
     };
 
     let current_is_planner = current
@@ -3079,6 +3114,7 @@ fn maybe_trigger_orchestration(shared: &Arc<Shared>, router_sid: &str, prompt: &
             );
         }
     }
+    true
 }
 
 /// Estimate a session's confidence in [0, 1]: the pinned model's quality for
@@ -4405,11 +4441,21 @@ fn on_prompt(
         }
     }
 
-    // Skill routing: certain skills (e.g. ship-pr) demand a capable model
-    // class. If the prompt invokes one, steer routing to its preferred
-    // candidates — pre-pin via candidate_override, mid-session via a switch.
-    if let Some(route) = detect_skill_route(&shared.cfg, &req.prompt) {
-        explicit_routing = true;
+    // Auto-orchestration runs FIRST: a multi-part task list orchestrates even if
+    // it names a skill — the planner decides when to invoke that skill, and
+    // end-of-work skills (shipping, PRs) run last. Suppressed only by an explicit
+    // `[router: …]` directive or `model:` shorthand (they set explicit_routing).
+    let orchestrating_now = if !explicit_routing {
+        maybe_trigger_orchestration(&shared, &router_sid, &req.prompt)
+    } else {
+        false
+    };
+
+    // Skill routing: certain skills (e.g. ship-pr) demand a capable model class.
+    // Only when the prompt is NOT an orchestrated multi-part task: if it invokes
+    // a skill, steer routing to its preferred candidates — pre-pin via
+    // candidate_override, mid-session via a switch.
+    if !orchestrating_now && let Some(route) = detect_skill_route(&shared.cfg, &req.prompt) {
         let (class, excluded, current) = shared
             .with_session(&router_sid, |s| {
                 (
@@ -4441,6 +4487,13 @@ fn on_prompt(
                         shared.with_session(&router_sid, |s| {
                             s.candidate_override = Some(target.clone());
                         });
+                        notify_user(
+                            &shared,
+                            &router_sid,
+                            format!(
+                                "router-acp · skill `{pattern}` steering this session to {target}"
+                            ),
+                        );
                         tracing::info!(session = router_sid, skill = %pattern, %target, "skill pin steered");
                     }
                 }
@@ -4455,13 +4508,6 @@ fn on_prompt(
                 ),
             }
         }
-    }
-
-    // Auto-orchestration: a multi-part task list (and no explicit routing) puts
-    // the session into orchestrator mode on a planner model. Fires on any prompt
-    // (pre- or post-pin) per config.
-    if !explicit_routing {
-        maybe_trigger_orchestration(&shared, &router_sid, &req.prompt);
     }
 
     enum Action {
@@ -4981,5 +5027,28 @@ mod directive_tests {
         let miss = vec![ContentBlock::from("just refactor this".to_string())];
         assert!(detect_skill_route(&cfg, &hit).is_some());
         assert!(detect_skill_route(&cfg, &miss).is_none());
+
+        // A skill NAMED inside backticks (a UI/example mention) must NOT count
+        // as invoking it — this is the hickory-ai6 false positive.
+        let mention = vec![ContentBlock::from(
+            "Add an autocomplete: typing `/` should suggest skills like `/ship-pr`.".to_string(),
+        )];
+        assert!(
+            detect_skill_route(&cfg, &mention).is_none(),
+            "a backticked skill mention must not trigger skill routing"
+        );
+    }
+
+    #[test]
+    fn strip_code_spans_removes_inline_and_fenced() {
+        let s = strip_code_spans("a `code` b");
+        assert!(!s.contains("code") && s.contains('a') && s.contains('b'));
+        assert!(!strip_code_spans("see `/ship-pr` here").contains("ship-pr"));
+        assert!(
+            !strip_code_spans("```\n/ship-pr\n```\ndone").contains("ship-pr"),
+            "fenced blocks are stripped too"
+        );
+        // Text outside code is preserved.
+        assert!(strip_code_spans("run ship-pr now").contains("ship-pr"));
     }
 }

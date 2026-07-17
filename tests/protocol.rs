@@ -2014,6 +2014,60 @@ async fn orchestration_delegate_children_inherit_run_label_and_parent() {
 }
 
 #[tokio::test]
+async fn multi_part_task_orchestrates_over_a_genuine_skill_invocation() {
+    // A real skill token in a multi-part task must NOT hijack routing to the
+    // skill's model — orchestration wins, and the planner decides when/if to run
+    // the skill (end-of-work skills like shipping run last).
+    let state = temp_state_file("orch-vs-skill");
+    let log = temp_log("orch-vs-skill");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m1*\"]\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A genuine ship-pr invocation, but as part of a multi-part task.
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Do the work then ship-pr:\n1. add the feature\n2. write tests",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating a 2-part task"),
+            "orchestration wins over skill routing for a multi-part task: {text}"
+        );
+        assert!(
+            text.contains("echo:m2:"),
+            "pinned the planner b/m2, not the skill's a/m1: {text}"
+        );
+        assert!(
+            !text.contains("skill `ship-pr` steering"),
+            "skill routing did not fire: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn explicit_directive_suppresses_auto_orchestration() {
     let state = temp_state_file("orch-suppress");
     let log = temp_log("orch-suppress");
@@ -2145,6 +2199,61 @@ async fn orchestration_skipped_when_list_answers_the_models_questions() {
         assert!(
             text.contains("echo:m1:1. postgres"),
             "stayed on the pinned model to relay the answer: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn backticked_skill_mention_does_not_suppress_orchestration() {
+    // hickory-ai6 regression: a task list that merely *mentions* a skill name
+    // inside backticks (a UI example) must not trigger skill_routing and must
+    // still orchestrate.
+    let state = temp_state_file("orch-skillmention");
+    let log = temp_log("orch-skillmention");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m1*\"]\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Improve the UI:\n\
+             1. add an autocomplete so typing `/` suggests skills like `/ship-pr`\n\
+             2. fix the loading spinner",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating a 2-part task"),
+            "list orchestrates despite the backticked skill mention: {text}"
+        );
+        assert!(
+            text.contains("echo:m2:"),
+            "pinned the planner b/m2, not the skill's a/m1: {text}"
+        );
+        assert!(
+            !text.contains("skill `ship-pr`"),
+            "skill routing must not fire on a backticked mention: {text}"
         );
         Ok(())
     })

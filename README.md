@@ -17,7 +17,7 @@ This repo:
 - Copy the [`example config`](examples/router-preferred.yaml) to `~/.config/router-acp/router.yaml`
 - Let this tool auto-decide what model to use for any given task
 - Hot switch your model via a prompt, i.e., `gpt: continue this work`
-- Consider using the [orchestration recipe](ORCHESTRATION.md) for complex tasks
+- Enable [auto-orchestration](ORCHESTRATION.md) so multi-part task lists are decomposed, routed, and cross-lineage-reviewed automatically
 
 # Router ACP
 
@@ -214,9 +214,8 @@ candidate goes to the front of the ranked chain if it is eligible, otherwise
 routing falls back to the strategy's normal winner rather than erroring.
 
 `switch` is the exception that works **mid-session**: it hands the live
-conversation to a different model (see below). This directive set powers the
-plan → parallel subtasks → cross-lineage review workflow in
-[`ORCHESTRATION.md`](ORCHESTRATION.md) (recipes in [`goose/recipes/`](goose/recipes/)).
+conversation to a different model (see below). These directives let any CLI
+client steer routing even though it can't set ACP session config options.
 
 ## Switching models mid-session
 
@@ -293,10 +292,9 @@ orchestrator (below) iterate on a subtask without re-briefing a fresh session.
 
 When a prompt reads as a **multi-part task list** — markdown bullets or numbers,
 inline `(1) … (2) …`, or ordered prose ("first … then … finally …") — the
-router can treat it like the goose *orchestrate* recipe, but recreated entirely
-in-process. It steers (pre-pin) or switches (mid-session) the session onto a
-**planner** frontier model and injects an orchestration protocol instructing
-that model to:
+router runs a plan → subtasks → review → submit pipeline entirely in-process. It
+steers (pre-pin) or switches (mid-session) the session onto a **planner**
+frontier model and injects an orchestration protocol instructing that model to:
 
 1. **Plan** — restate the task as success criteria and split it into
    file-disjoint, self-contained subtasks.
@@ -318,17 +316,20 @@ routeable. Everything else — the decomposition, the review, the submission gat
 `delegate_task`/`delegate_followup`.
 
 Auto-orchestration is **off by default** (`orchestration.enabled`), fires on any
-prompt (pre- or post-pin), and is **suppressed** by an explicit `[router: …]`
-directive or `model:` shorthand (so you can always opt a prompt out), and also
-when the list is **you answering the model's own questions** (e.g. it asked
-"Open decisions: (1)… (2)…" and you reply with a matching list — the router sees
-that the previous agent turn solicited answers and relays normally instead of
-re-orchestrating). Each trigger is disclosed
+prompt (pre- or post-pin), and **takes precedence over `skill_routing`**: a
+multi-part task list orchestrates even if it names a skill (e.g. `ship-pr`) — the
+planner decides when to invoke that skill, and end-of-work skills like shipping
+run *after* the work is done and reviewed, never up front. It is **suppressed**
+only by an explicit `[router: …]` directive or `model:` shorthand (so you can
+always opt a prompt out), and also when the list is **you answering the model's
+own questions** (e.g. it asked "Open decisions: (1)… (2)…" and you reply with a
+matching list — the router sees that the previous agent turn solicited answers
+and relays normally). Each trigger is disclosed
 (`router-acp · orchestrating a N-part task on …`).
 
-Unlike the goose recipe, this works in **any** ACP client and plain chat
-session (no recipe, no `summon` extension) because the orchestration primitive
-is the router's own `delegate_task` tool. See [`ROUTERS.md`](ROUTERS.md) and
+Because the orchestration primitive is the router's own `delegate_task` tool,
+this works in **any** ACP client and plain chat session — no recipe, no `summon`
+extension, no wrapper. See [`ROUTERS.md`](ROUTERS.md) and
 [`ORCHESTRATION.md`](ORCHESTRATION.md).
 
 > **Caveat — the planner must use `delegate_task`.** Sub-session routing, the

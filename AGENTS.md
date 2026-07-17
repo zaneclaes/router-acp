@@ -145,8 +145,7 @@ SDK traps below, which were all discovered the hard way.
   one **mid-session** directive: it re-pins a live session onto another model
   via `switch_pin` (summarize on the current model → open fresh downstream →
   seed the summary into the next prompt → close old). They exist because CLI
-  clients can't set ACP config options; the orchestration recipes
-  (`goose/recipes/`, `orchestrate` wrapper, see `ORCHESTRATION.md`) depend on them.
+  clients can't set ACP config options.
 - **`model:` shorthand** — a prompt beginning (after any `<turn-context>`
   preamble) with `<ref>:` is sugar for `switch=`/`candidate=`.
   `split_model_shorthand` extracts the leading token; `resolve_candidate_ref`
@@ -164,7 +163,14 @@ SDK traps below, which were all discovered the hard way.
   `auto_upgrade.confidence_threshold` it queues an upgrade to the best
   strictly-more-capable eligible candidate, `auto_upgrade.enabled` gates it);
   and **`skill_routing`** (a prompt invoking a configured skill pattern forces
-  the session onto that skill's candidate globs). Struggle accrues from
+  the session onto that skill's candidate globs). `detect_skill_route` strips
+  code spans (`strip_code_spans`) before matching so a skill *named* in
+  backticks/examples doesn't count as invoking it — **LESSON (hickory-ai6):** a
+  feature-list prompt describing an autocomplete for `` `/ship-pr` `` matched the
+  raw substring, pinned opus via skill_routing, set `explicit_routing`, and thus
+  silently suppressed auto-orchestration (the disclosure only said "explicitly
+  selected via router.candidate", hiding that skill_routing did it — now a skill
+  steer emits its own `notify_user` line). Struggle accrues from
   MaxTokens/Refusal stop reasons and ≥3 in-turn tool failures (counted in the
   Primary relay). The summary turn is captured (`capturing_summary`) and not
   relayed; the fully-framed handoff block is prepended once via
@@ -178,10 +184,15 @@ SDK traps below, which were all discovered the hard way.
   in `switch_directive_hands_off_…`, `switch_falls_back_to_log_transcript_when_summary_fails`,
   `low_confidence_pin_auto_upgrades_…`, `auto_upgrade_disabled_…`, `skill_routing_switches_…`.
 - **Auto-orchestration** (`orchestration.*`, off by default): `on_prompt` calls
-  `maybe_trigger_orchestration` when `!explicit_routing` (a `[router:]`
-  directive, `model:` shorthand, or skill invocation sets `explicit_routing` and
-  suppresses it). It is ALSO suppressed when the list answers the model's own
-  questions: `previous_turn_solicited_answers` inspects the prior agent turn
+  `maybe_trigger_orchestration` (returns `bool`) when `!explicit_routing` (a
+  `[router:]` directive or `model:` shorthand sets `explicit_routing` and
+  suppresses it). **Precedence:** it runs BEFORE `skill_routing`, and
+  `skill_routing` is gated on `!orchestrating_now` — so a multi-part task list
+  *always* orchestrates even if it names a skill; the planner decides when to
+  invoke that skill (end-of-work skills like shipping run last, per the injected
+  protocol's step 5). Skill routing only fires for a skill invocation that is
+  NOT a multi-part task. It is ALSO suppressed when the list answers the model's
+  own questions: `previous_turn_solicited_answers` inspects the prior agent turn
   (`s.turn_output`, still the previous turn at `on_prompt` time — cleared later in
   `send_prompt_with_failover`) for question marks / decision phrases / an
   enumerated agent list. `tasklist::detect_task_list` recognizes a multi-part list;
@@ -195,8 +206,10 @@ SDK traps below, which were all discovered the hard way.
   reviewer is routeable — this is the ONLY router-level change; the pipeline
   itself is the planner following the injected protocol with `delegate_task` +
   the multi-turn `keep_open`/`delegate_followup`/`delegate_close` tools. It
-  recreates the goose `orchestrate.yaml` recipe in-process, working from any ACP
-  client. `close_live_delegates_for` reaps kept-open sub-sessions on
+  implements the plan → delegate → cross-lineage review → submit pipeline
+  in-process (the former goose `orchestrate.yaml` recipe was removed — the router
+  owns this now), working from any ACP client.
+  `close_live_delegates_for` reaps kept-open sub-sessions on
   session/close|delete. `maybe_trigger_orchestration` also sets
   `run_label = "orchestrate"` (so the planner + its delegate rows group) and
   resolves explicit **different-lineage** reviewer candidate ids via
@@ -314,9 +327,9 @@ fails.
 - `ROUTERS.md` — user-facing strategy explanations
 - `GOOSE.md` — the user's actual install/runbook (mode handling, failover
   visibility, tuning table)
-- `examples/router.yaml` — annotated config
-- `ORCHESTRATION.md` + `goose/recipes/*.yaml` — the goose orchestration layer
-  (validate recipe edits with `goose recipe validate <file>`)
+- `examples/router-full.yaml`, `examples/router-preferred.yaml` — annotated configs
+- `ORCHESTRATION.md` — the router-native auto-orchestration pipeline
+  (plan → delegate → cross-lineage review → submit; there is no longer a goose recipe)
 - `PLAN.md` — the active follow-on plan (the original build spec was
   completed and removed); post-spec deviations (failover, complexity-scaled
   tradeoff, preference, directives) are documented in README/AGENTS.

@@ -382,27 +382,30 @@ respawn_cooldown_secs}` and `headroom.cordon_default_secs` in `router.yaml`.
 
 ## Orchestrated workflows (plan → subtasks → cross-lineage review)
 
-For compound prompts, `goose/recipes/orchestrate.yaml` runs the full
-frontier-plans / cheap-routed-subtasks / different-lineage-review /
-gated-submission pipeline through this same pi-acp slot:
+Orchestration is now **built into router-acp** — there is no goose recipe or
+wrapper to install. Turn it on once in `router.yaml`:
 
-```sh
-orchestrate            # installed at ~/.local/bin/orchestrate
+```yaml
+orchestration:
+  enabled: true
+  planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"]
+  reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]
+  submit: branch        # never | branch | pr | merge (merge only after review approves)
 ```
 
-The `orchestrate` wrapper runs the recipe through the pi-acp slot **with
-`-s`** (interactive) so the session stays open: it asks for your task — type
-it like any goose prompt — runs the pipeline, then leaves you in the normal
-goose chat to keep amending the work. Extra args pass through, e.g.
-`orchestrate --params submit=pr`.
+Then just type a multi-part task in any goose session — a markdown list,
+`(1)…(2)…`, or "first… then… finally…". The router pins a planner frontier
+model, decomposes the task, fans the parts out to routed sub-sessions via its
+`delegate_task` tool, has a different-lineage model review the result, and
+submits per `submit`. You'll see `router-acp · orchestrating a N-part task on …`
+inline; the planner and every subtask are recorded (sharing `run_label
+= orchestrate`) in `~/.local/state/router-acp/sessions.db`.
 
-The `-s` matters: plain `goose run --recipe … ` (no `-s`) is one-shot — it
-would ask for the task and immediately exit. Always use the `orchestrate`
-wrapper (or add `-s` yourself). Fully scripted (no prompt, no interactive
-tail): `GOOSE_PROVIDER=pi-acp goose run --recipe ~/.config/goose/recipes/orchestrate.yaml --params task='…'`.
-
-See [`ORCHESTRATION.md`](ORCHESTRATION.md) for how it works and setup
-(symlink the recipes into `~/.config/goose/recipes/`).
+It fires on any prompt and is suppressed by an explicit `[router: …]` directive,
+a `model:` shorthand, or when your list is answering the model's own questions.
+See [`ORCHESTRATION.md`](ORCHESTRATION.md) for the full pipeline, the
+`orchestration.*` config, and caveats (notably: the planner must use
+`delegate_task`, not the adapter's built-in sub-agent tool).
 
 ## Notes and caveats
 
