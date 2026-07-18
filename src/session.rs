@@ -209,6 +209,10 @@ pub struct RouterSession {
     /// One-shot orchestration protocol instructions to prepend to the next
     /// prompt (taken once, like `pending_context`).
     pub pending_orchestration: Option<String>,
+    /// Whether the native-subagent-usage warning has fired this turn (an
+    /// orchestrating session using the adapter's built-in `Task` tool instead of
+    /// `delegate_task`). Reset each turn so it warns at most once per turn.
+    pub turn_native_subagent_warned: bool,
 }
 
 /// A requested mid-session model switch and why.
@@ -262,6 +266,7 @@ impl RouterSession {
             capturing_summary: None,
             orchestrating: false,
             pending_orchestration: None,
+            turn_native_subagent_warned: false,
         }
     }
 
@@ -302,6 +307,7 @@ impl RouterSession {
             capturing_summary: None,
             orchestrating: false,
             pending_orchestration: None,
+            turn_native_subagent_warned: false,
         }
     }
 }
@@ -830,12 +836,18 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
             })
         }
         "usage_update" => {
+            let st = shared.state.lock().unwrap();
             if let Some(used) = update.get("used").and_then(|u| u.as_u64()) {
-                shared
-                    .state
-                    .lock()
-                    .unwrap()
-                    .set_context_used(router_sid, used);
+                st.set_context_used(router_sid, used);
+            }
+            // The adapter reports authoritative cumulative cost in USD — capture
+            // it instead of relying on text-estimated tokens.
+            if let Some(cost) = update
+                .get("cost")
+                .and_then(|c| c.get("amount"))
+                .and_then(|a| a.as_f64())
+            {
+                st.set_cost_usd(router_sid, cost);
             }
             None
         }
@@ -1028,6 +1040,35 @@ fn classify_tool(update: &serde_json::Value) -> ToolClass {
         "" => ToolClass::Defer,     // a status-only frame with no kind
         _ => ToolClass::SideEffect, // edit / delete / move / switch_mode …
     }
+}
+
+/// True when a tool_call frame is the adapter's built-in sub-agent tool (e.g.
+/// Claude Code's `Task`) — as opposed to the router's own `delegate_task`. Uses
+/// the authoritative `_meta.claudeCode.toolName` when present, else the title.
+fn is_native_subagent_tool(update: &serde_json::Value) -> bool {
+    let name = update
+        .get("_meta")
+        .and_then(|m| m.get("claudeCode"))
+        .and_then(|c| c.get("toolName"))
+        .and_then(|n| n.as_str())
+        .or_else(|| update.get("title").and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    // The router's own tools must never match.
+    if name.contains("delegate_task")
+        || name.contains("delegate_followup")
+        || name.contains("delegate_close")
+    {
+        return false;
+    }
+    name == "task"
+        || name.starts_with("task ")
+        || name.starts_with("task:")
+        || name == "dispatch_agent"
+        || name.contains("subagent")
+        || name.contains("sub-agent")
+        || name.contains("spawn_agent")
 }
 
 /// Count one tool call and, for an `escalation` session, request a mid-turn
@@ -1252,6 +1293,45 @@ pub fn handle_downstream_dispatch(
                             // per distinct tool (on its initial announcement).
                             if su == "tool_call" {
                                 note_tool_activity(shared, key, &down_sid, &router_sid);
+                                // Orchestration degradation: an orchestrating
+                                // planner using the adapter's built-in sub-agent
+                                // tool (Claude's `Task`) instead of the router's
+                                // `delegate_task` — sub-work stays in-lineage and
+                                // invisible to routing (no cross-lineage review,
+                                // no per-subtask model selection). Record it and
+                                // warn once per turn.
+                                if is_native_subagent_tool(update)
+                                    && shared
+                                        .with_session(&router_sid, |s| s.orchestrating)
+                                        .unwrap_or(false)
+                                {
+                                    shared
+                                        .state
+                                        .lock()
+                                        .unwrap()
+                                        .note_native_subagent(&router_sid);
+                                    let warn = shared
+                                        .with_session(&router_sid, |s| {
+                                            if s.turn_native_subagent_warned {
+                                                false
+                                            } else {
+                                                s.turn_native_subagent_warned = true;
+                                                true
+                                            }
+                                        })
+                                        .unwrap_or(false);
+                                    if warn {
+                                        notify_user(
+                                            shared,
+                                            &router_sid,
+                                            "router-acp · orchestration degraded: the planner used \
+                                             its built-in sub-agent tool instead of `delegate_task` \
+                                             — sub-tasks stay in the planner's lineage and are \
+                                             invisible to the router (no cross-lineage review, no \
+                                             per-subtask model routing, no delegate rows recorded)",
+                                        );
+                                    }
+                                }
                             }
                             match classify_tool(update) {
                                 ToolClass::SideEffect => {
@@ -1372,10 +1452,29 @@ pub fn handle_downstream_dispatch(
             Dispatch::Notification(msg) => {
                 // Sub-agent transcript streaming is not interleaved into the
                 // parent transcript; capture agent text for the tool result.
-                if msg.method() == "session/update"
-                    && let Some(text) = agent_chunk_text(msg.params())
-                {
-                    capture.lock().unwrap().push_str(&text);
+                if msg.method() == "session/update" {
+                    if let Some(text) = agent_chunk_text(msg.params()) {
+                        capture.lock().unwrap().push_str(&text);
+                    }
+                    // Attribute the delegate's cost/context to its own state row
+                    // (id mirrors run_delegate_task's `sub_sid`).
+                    if let Some(update) = msg.params().get("update")
+                        && update.get("sessionUpdate").and_then(|k| k.as_str())
+                            == Some("usage_update")
+                    {
+                        let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
+                        let st = shared.state.lock().unwrap();
+                        if let Some(used) = update.get("used").and_then(|u| u.as_u64()) {
+                            st.set_context_used(&sub_sid, used);
+                        }
+                        if let Some(cost) = update
+                            .get("cost")
+                            .and_then(|c| c.get("amount"))
+                            .and_then(|a| a.as_f64())
+                        {
+                            st.set_cost_usd(&sub_sid, cost);
+                        }
+                    }
                 }
                 Ok(Handled::Yes)
             }
@@ -1593,6 +1692,28 @@ pub fn close_downstream_session(shared: &Arc<Shared>, key: &ProcessKey, downstre
                 .detach();
         }
     }
+}
+
+/// Best-effort `(branch, sha)` for a working directory that is a git repo.
+/// Returns `(None, None)` when git is unavailable or `cwd` isn't a repo.
+fn git_head(cwd: &std::path::Path) -> (Option<String>, Option<String>) {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    (
+        run(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        run(&["rev-parse", "HEAD"]),
+    )
 }
 
 /// Close any delegate sub-sessions kept open (`keep_open`) under a parent
@@ -2263,6 +2384,17 @@ async fn pin_session(
                     },
                 );
 
+                // Tag the run with its git branch/HEAD (best-effort) so it can be
+                // joined to a CI/merge outcome later.
+                let (branch, sha) = git_head(&cwd);
+                if branch.is_some() || sha.is_some() {
+                    shared.state.lock().unwrap().set_git(
+                        router_sid,
+                        branch.as_deref(),
+                        sha.as_deref(),
+                    );
+                }
+
                 let mut lines = vec![format!(
                     "router-acp · {}{} → {} · task {} (complexity {:.2})",
                     if is_failover { "failover: " } else { "" },
@@ -2428,6 +2560,7 @@ async fn send_prompt_with_failover(
             s.turn_failed_tools.clear();
             s.turn_tool_calls = 0;
             s.escalation_requested = None;
+            s.turn_native_subagent_warned = false;
         });
         shared.state.lock().unwrap().touch(&router_sid);
         // Log the user prompt (once, on the first attempt).
@@ -2476,7 +2609,15 @@ async fn send_prompt_with_failover(
         let sent = conn
             .send_request(fwd)
             .forward_cancellation_from(responder.cancellation());
+        // Compute-time = the model's actual turn (excludes user idle between
+        // turns, unlike updated_at − created_at).
+        let turn_start = std::time::Instant::now();
         let result = sent.block_task().await;
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .add_compute_ms(&router_sid, turn_start.elapsed().as_millis() as u64);
 
         // Mid-turn escalation: the relay flagged it (and interrupted this turn)
         // because investigation revealed hidden depth while still side-effect
@@ -4773,7 +4914,30 @@ mod escalation_signal_tests {
 
 #[cfg(test)]
 mod orchestration_unit_tests {
+    use super::is_native_subagent_tool;
     use super::previous_turn_solicited_answers as solicited;
+    use serde_json::json;
+
+    #[test]
+    fn native_subagent_tool_detected_by_name_not_delegate() {
+        // Claude's built-in Task tool (via _meta.claudeCode.toolName).
+        assert!(is_native_subagent_tool(
+            &json!({"_meta": {"claudeCode": {"toolName": "Task"}}})
+        ));
+        // Fallback to title.
+        assert!(is_native_subagent_tool(&json!({"title": "Task"})));
+        assert!(is_native_subagent_tool(&json!({"title": "dispatch_agent"})));
+        // The router's own tools must NOT match.
+        assert!(!is_native_subagent_tool(
+            &json!({"_meta": {"claudeCode": {"toolName": "delegate_task"}}})
+        ));
+        assert!(!is_native_subagent_tool(
+            &json!({"title": "delegate_followup"})
+        ));
+        // Ordinary tools don't match.
+        assert!(!is_native_subagent_tool(&json!({"title": "Read File"})));
+        assert!(!is_native_subagent_tool(&json!({"kind": "execute"})));
+    }
 
     #[test]
     fn detects_enumerated_decisions_from_the_agent() {

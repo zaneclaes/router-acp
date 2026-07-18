@@ -149,6 +149,37 @@ router sizes to each leg, in parallel; `budget_prompts_5h` headroom steering and
 cordons spread load automatically. The frontier bookends are the cheap part of
 the budget and prevent the expensive failure mode: redone work.
 
+> These are the *design intent*. Whether a given deployment realizes them is an
+> empirical question — measure it (below), don't assume it.
+
+## Evaluating a run (observability)
+
+```sh
+router-acp report --config ~/.config/router-acp/router.yaml
+```
+
+Per run it shows: planner vs. delegate **cost** (`cost_usd`, the adapter's own
+`usage_update.cost` in USD — authoritative, not a token estimate), **compute
+time** (`compute_ms`, the model's turn time excluding user idle), delegate count
+and models, whether a **cross-lineage review** ran, and the **degraded%** (runs
+where the planner used its built-in `Task` tool instead of `delegate_task`). Each
+run is tagged with `git_branch`/`git_sha` at pin.
+
+What each metric can and cannot tell you:
+
+- **Did delegation happen?** Certain — delegate rows (`parent_session_id`) and
+  the degraded count. If `delegates: 0` and `native-subagent > 0`, the planner
+  bypassed the router and none of the benefits below apply.
+- **Cost / speed impact?** `cost_usd` (planner vs. delegate split) and
+  `compute_ms` are now real, but proving orchestration is *cheaper/faster* needs
+  a baseline — run the same task single-model and compare, or watch the split
+  trend across many runs. The token *counters* (`tokens_*`) are text-estimates
+  and under-count badly; ignore them for cost.
+- **Accuracy impact?** Not answerable from the router alone. Join `git_sha` to
+  the outcome that matters — did the PR pass CI, merge without a revert, or need
+  follow-up fixes? That downstream signal is the only real accuracy measure; the
+  router just gives you the join key.
+
 ## Caveats & limits
 
 - **The planner must actually use `delegate_task`.** Sub-session routing, the

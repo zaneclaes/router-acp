@@ -404,8 +404,24 @@ inline; the planner and every subtask are recorded (sharing `run_label
 It fires on any prompt and is suppressed by an explicit `[router: …]` directive,
 a `model:` shorthand, or when your list is answering the model's own questions.
 See [`ORCHESTRATION.md`](ORCHESTRATION.md) for the full pipeline, the
-`orchestration.*` config, and caveats (notably: the planner must use
-`delegate_task`, not the adapter's built-in sub-agent tool).
+`orchestration.*` config, and caveats.
+
+**Watch for degradation.** The whole benefit depends on the planner using the
+router's `delegate_task` tool. If it uses its adapter's *built-in* sub-agent tool
+(Claude's `Task`) instead, sub-work stays in one lineage and is invisible to the
+router — you'll see `router-acp · orchestration degraded: the planner used its
+built-in sub-agent tool …` inline, and no delegate rows appear.
+
+**Review your runs** with the report:
+
+```sh
+router-acp report --config ~/.config/router-acp/router.yaml
+```
+
+It shows, per run: planner vs. delegate **cost** (the adapter's real USD, not an
+estimate), delegate count, whether a cross-lineage review ran, and the
+degraded% (native-subagent use). Each run is tagged with its git branch/HEAD so
+you can later join outcomes to CI/merge results.
 
 ## Notes and caveats
 

@@ -731,7 +731,13 @@ pub async fn run_delegate_task(
                     headroom.record_session(&candidate.agent);
                     headroom.record_prompt(&candidate.agent);
                 }
+                let turn_start = std::time::Instant::now();
                 let result = opened.conn.send_request(prompt).block_task().await;
+                shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .add_compute_ms(&sub_sid, turn_start.elapsed().as_millis() as u64);
 
                 // Tear down (remove the handle, close the session) — used on
                 // every path except a successful `keep_open` delegation.
@@ -908,7 +914,13 @@ pub async fn run_delegate_followup(
         downstream_sid.clone(),
         vec![ContentBlock::from(args.message.clone())],
     );
+    let turn_start = std::time::Instant::now();
     let result = conn.send_request(prompt).block_task().await;
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .add_compute_ms(&sub_sid, turn_start.elapsed().as_millis() as u64);
     match result {
         Ok(resp) => {
             let text = capture.lock().unwrap().clone();

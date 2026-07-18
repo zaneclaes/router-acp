@@ -51,6 +51,19 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Summarize orchestrated runs: planner vs delegate cost/compute, whether
+    /// sub-tasks were actually delegated, and whether orchestration degraded to
+    /// the adapter's built-in sub-agent tool.
+    Report {
+        #[arg(long)]
+        config: PathBuf,
+        /// Only runs with this run_label (default "orchestrate").
+        #[arg(long, default_value = "orchestrate")]
+        run_label: String,
+        /// Max runs to show (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -194,6 +207,138 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Command::Report {
+            config,
+            run_label,
+            limit,
+        } => {
+            let cfg = Config::from_file(&config)?;
+            let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
+            let all = state.all(); // newest first
+            // Index children by parent.
+            let mut children: std::collections::HashMap<String, Vec<_>> =
+                std::collections::HashMap::new();
+            for (id, s) in &all {
+                if let Some(p) = &s.parent_session_id {
+                    children
+                        .entry(p.clone())
+                        .or_default()
+                        .push((id.clone(), s.clone()));
+                }
+            }
+            let runs: Vec<_> = all
+                .iter()
+                .filter(|(_, s)| s.kind == "primary" && s.run_label.as_deref() == Some(&run_label))
+                .take(limit.max(1))
+                .collect();
+
+            println!(
+                "orchestration report — run_label='{run_label}' ({} runs)\n",
+                runs.len()
+            );
+            let (mut delegated_runs, mut degraded_runs) = (0usize, 0usize);
+            let (mut sum_planner_cost, mut sum_delegate_cost) = (0f64, 0f64);
+            for (id, s) in &runs {
+                let kids = children.get(id).cloned().unwrap_or_default();
+                let delegate_cost: f64 = kids.iter().map(|(_, c)| c.cost_usd).sum::<f64>() + 0.0;
+                let delegate_cost = if delegate_cost == 0.0 {
+                    0.0
+                } else {
+                    delegate_cost
+                };
+                let cross_lineage = kids.iter().any(|(_, c)| c.agent != s.agent);
+                if !kids.is_empty() {
+                    delegated_runs += 1;
+                }
+                if s.native_subagent_calls > 0 {
+                    degraded_runs += 1;
+                }
+                sum_planner_cost += s.cost_usd;
+                sum_delegate_cost += delegate_cost;
+
+                println!(
+                    "{}  planner {}/{}",
+                    &id[..id.len().min(20)],
+                    s.agent,
+                    s.model
+                );
+                println!(
+                    "    cost: planner ${:.4} + delegates ${:.4} = ${:.4}  | compute {}s | context {}",
+                    s.cost_usd,
+                    delegate_cost,
+                    s.cost_usd + delegate_cost,
+                    s.compute_ms / 1000,
+                    s.context_used
+                );
+                println!(
+                    "    delegates: {} | cross-lineage review: {} | native-subagent (degraded): {}{}",
+                    kids.len(),
+                    if cross_lineage { "yes" } else { "NO" },
+                    s.native_subagent_calls,
+                    if s.native_subagent_calls > 0 {
+                        "  ⚠ planner bypassed delegate_task"
+                    } else {
+                        ""
+                    }
+                );
+                for (_, c) in &kids {
+                    println!(
+                        "      └─ {}/{}  ${:.4}  {}s  {}",
+                        c.agent,
+                        c.model,
+                        c.cost_usd,
+                        c.compute_ms / 1000,
+                        c.title
+                            .as_deref()
+                            .unwrap_or("")
+                            .replace('\n', " ")
+                            .chars()
+                            .take(60)
+                            .collect::<String>()
+                    );
+                }
+                if let Some(sha) = &s.git_sha {
+                    println!(
+                        "    git: {}@{}",
+                        s.git_branch.as_deref().unwrap_or("?"),
+                        &sha[..sha.len().min(10)]
+                    );
+                }
+                println!();
+            }
+            println!("── summary ──");
+            println!("  runs analyzed          : {}", runs.len());
+            println!(
+                "  runs that delegated    : {} ({}%)",
+                delegated_runs,
+                if runs.is_empty() {
+                    0
+                } else {
+                    delegated_runs * 100 / runs.len()
+                }
+            );
+            println!(
+                "  runs degraded (native) : {} ({}%)",
+                degraded_runs,
+                if runs.is_empty() {
+                    0
+                } else {
+                    degraded_runs * 100 / runs.len()
+                }
+            );
+            println!(
+                "  cost: planner ${:.2} + delegates ${:.2} = ${:.2}",
+                sum_planner_cost,
+                sum_delegate_cost,
+                sum_planner_cost + sum_delegate_cost
+            );
+            println!(
+                "\nnote: cost is the adapter's own usage_update.cost (USD). \"degraded\" runs used\n\
+                 the built-in Task tool instead of delegate_task — their sub-work is not captured\n\
+                 here. Join git_sha/branch to CI/merge outcomes for accuracy signal."
+            );
             Ok(())
         }
     }

@@ -341,7 +341,16 @@ extension, no wrapper. See [`ROUTERS.md`](ROUTERS.md) and
 > reviewer id, but the router cannot remove the adapter's own tool; a model that
 > ignores the instruction degrades to same-lineage, unobservable orchestration.
 > If you see no delegate rows in the state DB after an orchestrated run, the
-> planner used its native tool.
+> planner used its native tool — the router now detects this, warns inline
+> (`orchestration degraded: …`), and records it (`native_subagent_calls`).
+
+Evaluate orchestrated runs — real per-run cost (from the adapter's own
+`usage_update.cost`), delegate split, cross-lineage-review presence, and
+degraded% — with:
+
+```sh
+router-acp report --config router.yaml
+```
 
 ## Install and run
 

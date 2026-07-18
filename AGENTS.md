@@ -36,7 +36,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (hard exclusion until token-limit reset) |
-| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
+| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
 | `src/tasklist.rs` | `detect_task_list(text) -> Option<usize>` — recognizes multi-part task lists (markdown numbers/bullets, inline `(1)(2)`, semantic "first…then…finally" ordering) for auto-orchestration; pure + unit-tested |
@@ -228,7 +228,23 @@ SDK traps below, which were all discovered the hard way.
   forbids** `Task`/`dispatch_agent`/`spawn` and **mandates** `delegate_task` with
   the concrete cross-lineage reviewer id. This is inherent to the prose-instruction
   approach: a model that ignores the ban silently degrades to same-lineage,
-  unobservable orchestration.
+  unobservable orchestration. (Confirmed unfixable at the transport layer:
+  ACP `NewSessionRequest` has no tool-suppression field, and `Task` is a native
+  adapter tool, not a router-injected MCP server — so the router *cannot* remove
+  it.) **Degradation is now detected + surfaced**: `is_native_subagent_tool`
+  (matches `_meta.claudeCode.toolName`/title against `Task`/`dispatch_agent`/…,
+  never `delegate_*`) fires in `handle_downstream_dispatch`; in an orchestrating
+  session it warns once/turn (`turn_native_subagent_warned`) and increments the
+  persisted `native_subagent_calls`. **Observability** (added because the first
+  evaluation couldn't answer "is this helping"): real `cost_usd` is captured from
+  `usage_update.cost` (primary in `log_downstream_event`; delegate in the
+  `DownstreamRoute::Delegate` arm, attributed to the `{parent}::delegate-{sid}`
+  row); `compute_ms` times each model turn; `git_head` tags the run at pin. The
+  `router-acp report` CLI summarizes runs (planner vs delegate cost, delegate
+  count, cross-lineage-review present, degraded%). Token *counters*
+  (`tokens_*`) remain text-estimates and under-count badly — prefer `cost_usd`
+  and `context_used` for cost, `compute_ms` for time (never `updated_at −
+  created_at`, which is dominated by user idle).
 - **`escalation` router** (start cheap, escalate on *observed* difficulty — not
   a prompt guess): `EscalationStrategy::rank` pins the cheapest capable candidate
   (or, if `initial_router` is set, delegates the starting pick to that strategy —

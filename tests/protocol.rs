@@ -2014,6 +2014,54 @@ async fn orchestration_delegate_children_inherit_run_label_and_parent() {
 }
 
 #[tokio::test]
+async fn orchestrating_planner_using_native_task_is_flagged() {
+    // When an orchestrating planner uses the adapter's built-in sub-agent tool
+    // (title "Task") instead of delegate_task, the router warns and records it.
+    let state = temp_state_file("orch-degraded");
+    let log = temp_log("orch-degraded");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    let state_path = state.clone();
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A list (orchestration fires → pins planner b/m2) whose turn also emits
+        // a native "Task" tool call.
+        let resp = prompt_text(&cx, &sid, "Do these:\n1. one\n2. two\nTOOL:mcp:Task").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestration degraded"),
+            "router warns when planner uses native sub-agent tool: {text}"
+        );
+        let db = open_state(&state_path);
+        let row = db.get(&sid).expect("session row");
+        assert!(
+            row.native_subagent_calls >= 1,
+            "native-subagent use recorded: {}",
+            row.native_subagent_calls
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn multi_part_task_orchestrates_over_a_genuine_skill_invocation() {
     // A real skill token in a multi-part task must NOT hijack routing to the
     // skill's model — orchestration wins, and the planner decides when/if to run

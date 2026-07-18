@@ -75,6 +75,20 @@ pub struct PersistedSession {
     pub tokens_total: u64,
     /// Latest reported context-window usage (from `usage_update`).
     pub context_used: u64,
+    /// Authoritative cumulative cost in USD, as reported by the adapter's
+    /// `usage_update.cost` (max seen). 0 if the adapter reports no cost.
+    pub cost_usd: f64,
+    /// Count of native (adapter built-in) sub-agent tool calls seen in an
+    /// orchestrating session — each one bypasses the router's `delegate_task`,
+    /// so a non-zero value means orchestration silently degraded.
+    pub native_subagent_calls: u64,
+    /// Accumulated model compute time (prompt-sent → response), in ms —
+    /// excludes user idle time between turns (unlike updated_at − created_at).
+    pub compute_ms: u64,
+    /// Git branch / HEAD sha of `cwd` at pin time, for joining a run to its CI
+    /// or merge outcome later. `None` when cwd isn't a git repo.
+    pub git_branch: Option<String>,
+    pub git_sha: Option<String>,
 }
 
 /// One `session_log` row: a single ACP interaction.
@@ -154,7 +168,12 @@ impl StateFile {
             tokens_input          INTEGER NOT NULL DEFAULT 0,
             tokens_output         INTEGER NOT NULL DEFAULT 0,
             tokens_total          INTEGER NOT NULL DEFAULT 0,
-            context_used          INTEGER NOT NULL DEFAULT 0
+            context_used          INTEGER NOT NULL DEFAULT 0,
+            cost_usd              REAL NOT NULL DEFAULT 0,
+            native_subagent_calls INTEGER NOT NULL DEFAULT 0,
+            compute_ms            INTEGER NOT NULL DEFAULT 0,
+            git_branch            TEXT,
+            git_sha               TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_parent  ON sessions(parent_session_id);
@@ -180,7 +199,14 @@ impl StateFile {
         // Migrations for DBs created by older versions: add columns that the
         // `CREATE TABLE IF NOT EXISTS` above skips on an existing table. A
         // duplicate-column error just means the migration already ran.
-        for stmt in ["ALTER TABLE sessions ADD COLUMN prior_session_id TEXT"] {
+        for stmt in [
+            "ALTER TABLE sessions ADD COLUMN prior_session_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN native_subagent_calls INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN compute_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN git_branch TEXT",
+            "ALTER TABLE sessions ADD COLUMN git_sha TEXT",
+        ] {
             if let Err(err) = self.conn.execute(stmt, [])
                 && !err.to_string().contains("duplicate column")
             {
@@ -268,6 +294,11 @@ impl StateFile {
             tokens_output: row.get::<_, i64>("tokens_output")? as u64,
             tokens_total: row.get::<_, i64>("tokens_total")? as u64,
             context_used: row.get::<_, i64>("context_used")? as u64,
+            cost_usd: row.get::<_, f64>("cost_usd").unwrap_or(0.0),
+            native_subagent_calls: row.get::<_, i64>("native_subagent_calls").unwrap_or(0) as u64,
+            compute_ms: row.get::<_, i64>("compute_ms").unwrap_or(0) as u64,
+            git_branch: row.get("git_branch").unwrap_or(None),
+            git_sha: row.get("git_sha").unwrap_or(None),
         })
     }
 
@@ -475,6 +506,39 @@ impl StateFile {
         let _ = self.conn.execute(
             "UPDATE sessions SET context_used=?2 WHERE router_session_id=?1",
             params![router_session_id, used as i64],
+        );
+    }
+
+    /// Record the adapter-reported cumulative cost (USD); keeps the max seen.
+    pub fn set_cost_usd(&self, router_session_id: &str, cost: f64) {
+        let _ = self.conn.execute(
+            "UPDATE sessions SET cost_usd=MAX(cost_usd, ?2) WHERE router_session_id=?1",
+            params![router_session_id, cost],
+        );
+    }
+
+    /// Increment the native-subagent-call counter (orchestration degradation).
+    pub fn note_native_subagent(&self, router_session_id: &str) {
+        let _ = self.conn.execute(
+            "UPDATE sessions SET native_subagent_calls=native_subagent_calls+1 \
+             WHERE router_session_id=?1",
+            params![router_session_id],
+        );
+    }
+
+    /// Add model compute time (ms) for a turn (excludes user idle).
+    pub fn add_compute_ms(&self, router_session_id: &str, ms: u64) {
+        let _ = self.conn.execute(
+            "UPDATE sessions SET compute_ms=compute_ms+?2 WHERE router_session_id=?1",
+            params![router_session_id, ms as i64],
+        );
+    }
+
+    /// Tag a session with the git branch/HEAD of its cwd (for CI/merge join).
+    pub fn set_git(&self, router_session_id: &str, branch: Option<&str>, sha: Option<&str>) {
+        let _ = self.conn.execute(
+            "UPDATE sessions SET git_branch=?2, git_sha=?3 WHERE router_session_id=?1",
+            params![router_session_id, branch, sha],
         );
     }
 
@@ -717,6 +781,26 @@ mod tests {
         assert_eq!(got.created_at, created);
         assert_eq!(got.title.as_deref(), Some("orig"));
         assert_eq!(got.tokens_output, 5, "token counters survive re-pin");
+    }
+
+    #[test]
+    fn cost_native_compute_and_git_setters_persist() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("claude"));
+        // cost keeps the max seen
+        s.set_cost_usd("r1", 0.10);
+        s.set_cost_usd("r1", 0.05);
+        s.note_native_subagent("r1");
+        s.note_native_subagent("r1");
+        s.add_compute_ms("r1", 1500);
+        s.add_compute_ms("r1", 500);
+        s.set_git("r1", Some("feature-x"), Some("abc123"));
+        let got = s.get("r1").unwrap();
+        assert!((got.cost_usd - 0.10).abs() < 1e-9, "keeps max cost");
+        assert_eq!(got.native_subagent_calls, 2);
+        assert_eq!(got.compute_ms, 2000);
+        assert_eq!(got.git_branch.as_deref(), Some("feature-x"));
+        assert_eq!(got.git_sha.as_deref(), Some("abc123"));
     }
 
     #[test]
