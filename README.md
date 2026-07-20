@@ -168,7 +168,11 @@ and it always tells the user what happened:
   soonest is used rather than failing the turn. Each candidate's cordon state
   is advertised on the `router.candidate` picker option
   (`_meta.router_acp.available/unavailable_reason/resets_at`) so a front-end can
-  show it disabled. Gate the whole mechanism with `cordon.enabled`.
+  show it disabled. That picker option is only sent at `session/new`, so the
+  full current cordon set also rides every turn's routing metadata as
+  `_meta.router_acp.usage_cordons` (`[{candidate,reason,resets_at}]`) — a client
+  that cached the candidate list can refresh availability mid-session as cordons
+  appear or lift. Gate the whole mechanism with `cordon.enabled`.
 - **Outage failover.** If the pinned model fails mid-session (process
   death, connection loss, provider overload) or hits a limit, the router
   fails the session over to the next best candidate: the failure and its

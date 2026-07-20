@@ -136,7 +136,12 @@ SDK traps below, which were all discovered the hard way.
   usage-cordoned, `eligible_views_relaxed` + soonest-`resets_at` picks the
   least-bad rather than failing (`all_cordoned_fallback`); `router_config_options`
   keeps cordoned candidates in the `router.candidate` picker but tags them
-  `_meta.router_acp.{available:false,unavailable_reason,resets_at}`. **Invariants:**
+  `_meta.router_acp.{available:false,unavailable_reason,resets_at}`; and every
+  turn's routing metadata carries `details.usage_cordons`
+  (`[{candidate,reason,resets_at}]`, the whole `active_usage_cordons()` set) so a
+  client that cached the candidate list at `session/new` can refresh
+  availability mid-session — the picker option is only re-advertised at
+  session creation, but cordons can appear/lift during a long session. **Invariants:**
   generic (models discovered from the API, never hardcoded — the cordon gate is
   a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*);
   **fail-open** (any poll/token/parse error → no cordon; the reactive per-agent

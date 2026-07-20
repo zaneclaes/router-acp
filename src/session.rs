@@ -2458,6 +2458,24 @@ async fn pin_session(
                         })
                     })
                     .collect();
+                // The full set of currently usage-cordoned candidates rides every
+                // turn's metadata (not just a redirect), so a client that cached
+                // the candidate list at session/new can refresh availability
+                // mid-session instead of offering a model the router will refuse.
+                let usage_cordons_json: Vec<serde_json::Value> = shared
+                    .headroom
+                    .lock()
+                    .unwrap()
+                    .active_usage_cordons()
+                    .into_iter()
+                    .map(|(id, c)| {
+                        json!({
+                            "candidate": id.to_string(),
+                            "reason": c.reason,
+                            "resets_at": c.resets_at_rfc3339,
+                        })
+                    })
+                    .collect();
                 let details = json!({
                     "strategy": strategy_kind.as_str(),
                     "candidate": candidate.to_string(),
@@ -2470,6 +2488,7 @@ async fn pin_session(
                     "failover": is_failover,
                     "skipped": skipped_json,
                     "cordoned": cordons_json,
+                    "usage_cordons": usage_cordons_json,
                     "excluded": excluded_patterns,
                     "cordon_redirect": cordon_redirect.as_ref().map(|(from, reason, resets)| json!({
                         "from": from.to_string(),

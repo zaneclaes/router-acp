@@ -3144,6 +3144,24 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
             "routed to non-cordoned b/sonnet: {text}"
         );
 
+        // (b') The turn's routing metadata carries the full active usage-cordon
+        // set (not just a redirect), so a client that cached the candidate list
+        // at session/new can refresh availability mid-session.
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|s| s.routing)
+            .expect("routing recorded");
+        let cordoned: Vec<String> = routing["usage_cordons"]
+            .as_array()
+            .expect("usage_cordons array in metadata")
+            .iter()
+            .map(|c| c["candidate"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            cordoned.iter().any(|c| c == "a/fable-5"),
+            "per-turn metadata lists the cordoned candidate: {routing}"
+        );
+
         // (c) Explicit pin to the cordoned candidate is refused → falls back to
         // b/sonnet with a cordon disclosure line in the failover format.
         let sid2 = new_session(&cx).await?.session_id.0.to_string();
