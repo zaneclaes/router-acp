@@ -35,7 +35,8 @@ SDK traps below, which were all discovered the hard way.
 | `src/classifier.rs` | heuristic task class + complexity (data-driven), cwd language fingerprint, optional Ollama backend (own mini HTTP client; never uses seat agents) |
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
-| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (hard exclusion until token-limit reset) |
+| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`) AND per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) |
+| `src/usage.rs` | proactive usage-cap poller: reads a provider usage API (`anthropic-oauth`: CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep), `anthropic_cordons` (pure, tested: overage-gated, `limits[].scope.model.display_name` match — never a hardcoded model list), `spawn_usage_poller` (interval loop, fails open) |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
@@ -124,6 +125,26 @@ SDK traps below, which were all discovered the hard way.
   If you add a decision point, disclose it.
 - Deterministic routing: no randomness; tie-breaks are score → effective
   cost → preference → config order.
+- **Proactive usage cordons** (`cordon.*` + per-agent `usage_source`;
+  `src/usage.rs`): a periodic poll (`spawn_usage_poller` in `serve_shared`,
+  aborted on return) reads the provider usage API and marks exhausted candidates
+  unroutable *before* they're tried. Enforcement seams: `eligible_views`
+  excludes them (so `auto`/failover never pick them); an explicit pin to a
+  cordoned candidate is refused in `pin_session` (`cordon_redirect` clears the
+  override → best non-cordoned candidate, disclosed in the failover-line format
+  + `details.cordon_redirect`); if the pool is empty ONLY because everything is
+  usage-cordoned, `eligible_views_relaxed` + soonest-`resets_at` picks the
+  least-bad rather than failing (`all_cordoned_fallback`); `router_config_options`
+  keeps cordoned candidates in the `router.candidate` picker but tags them
+  `_meta.router_acp.{available:false,unavailable_reason,resets_at}`. **Invariants:**
+  generic (models discovered from the API, never hardcoded — the cordon gate is
+  a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*);
+  **fail-open** (any poll/token/parse error → no cordon; the reactive per-agent
+  cordon is the safety net); self-lifts at absolute `resets_at`. Codex has no
+  out-of-band usage endpoint (rate limits arrive in response headers), so it
+  keeps only the reactive cordon. Tests: `usage::tests` (pure) +
+  `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
+  `run_test_shared`).
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
   least one downstream supports them and the router implements the full
   remap path.

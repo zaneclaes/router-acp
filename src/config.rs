@@ -177,6 +177,50 @@ impl Default for HeadroomConfig {
     }
 }
 
+/// Proactive cordoning driven by provider usage APIs: a periodic poll marks a
+/// candidate unroutable while the provider reports its usage cap exhausted (and
+/// no overage/credit headroom), before the router even tries it. Which agents
+/// are polled is set per-agent via `agents[].usage_source`; this only gates the
+/// whole mechanism and the poll cadence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CordonConfig {
+    /// Master switch (default on). When off, no usage polling happens and only
+    /// the reactive (error-driven) per-agent cordons remain.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Usage poll interval / cache TTL in seconds (default 300, ~5 min to match
+    /// the front-end's usage polling).
+    #[serde(default = "default_cordon_poll_secs")]
+    pub poll_secs: u64,
+}
+
+fn default_cordon_poll_secs() -> u64 {
+    5 * 60
+}
+
+impl Default for CordonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_secs: default_cordon_poll_secs(),
+        }
+    }
+}
+
+/// How to read a provider's usage/rate-limit data for an agent's candidates, so
+/// they can be cordoned before their cap is hit. Generic across providers; the
+/// specific model caps are discovered from the API response, never hardcoded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum UsageSourceConfig {
+    /// Anthropic subscription usage via the CLI OAuth token
+    /// (`GET https://api.anthropic.com/api/oauth/usage`). The token is read from
+    /// `~/.claude/.credentials.json` or the macOS Keychain
+    /// (`Claude Code-credentials`), the same credential the adapter uses.
+    AnthropicOauth,
+}
+
 /// Parse a duration string like `30d`, `12h`, `90m`, `3600s`, or a bare
 /// number (interpreted as days). Returns seconds.
 pub fn parse_history(spec: &str) -> Result<u64, String> {
@@ -450,6 +494,11 @@ pub struct AgentConfig {
     /// post-pin mode changes.
     #[serde(default)]
     pub mode_map: std::collections::HashMap<String, String>,
+    /// Optional provider usage source for proactive cordoning (see
+    /// `CordonConfig`). When set, the router periodically reads this provider's
+    /// usage caps and cordons this agent's candidates that are exhausted.
+    #[serde(default)]
+    pub usage_source: Option<UsageSourceConfig>,
 }
 
 fn default_budget() -> u32 {
@@ -640,6 +689,10 @@ pub struct Config {
     pub delegation: DelegationConfig,
     #[serde(default)]
     pub headroom: HeadroomConfig,
+    /// Proactive usage-cap cordoning (default on; inert unless an agent has a
+    /// `usage_source`).
+    #[serde(default)]
+    pub cordon: CordonConfig,
     #[serde(default)]
     pub failover: FailoverConfig,
     #[serde(default)]

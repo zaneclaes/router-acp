@@ -48,6 +48,19 @@ async fn run_test<F>(cfg_yaml: String, test_fn: F)
 where
     F: AsyncFnOnce(ConnectionTo<AgentPeer>, ObservedHandle) -> Result<(), AcpError>,
 {
+    run_test_shared(cfg_yaml, async |cx, obs, _shared| test_fn(cx, obs).await).await;
+}
+
+/// Like `run_test`, but also hands the test closure the router's `Arc<Shared>`
+/// so it can inspect/inject internal state (e.g. usage cordons).
+async fn run_test_shared<F>(cfg_yaml: String, test_fn: F)
+where
+    F: AsyncFnOnce(
+        ConnectionTo<AgentPeer>,
+        ObservedHandle,
+        std::sync::Arc<router_acp::session::Shared>,
+    ) -> Result<(), AcpError>,
+{
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -57,6 +70,7 @@ where
         .try_init();
     let cfg = Config::from_yaml(&cfg_yaml).expect("test config parses");
     let shared = Shared::new(cfg).expect("shared state builds");
+    let shared_for_test = shared.clone();
     let (channel_a, channel_b) = Channel::duplex();
     let router = tokio::spawn(serve_shared(shared, channel_a));
 
@@ -117,7 +131,9 @@ where
                 },
                 on_receive_request!(),
             )
-            .connect_with(channel_b, async |cx| test_fn(cx, observed.clone()).await),
+            .connect_with(channel_b, async |cx| {
+                test_fn(cx, observed.clone(), shared_for_test.clone()).await
+            }),
     )
     .await;
 
@@ -3049,6 +3065,116 @@ async fn mock_lifecycle_capabilities_not_advertised_when_unsupported() {
         // The mock advertises embedded_context: the union carries it.
         assert!(caps.prompt_capabilities.embedded_context);
         assert!(!caps.prompt_capabilities.image);
+        Ok(())
+    })
+    .await;
+}
+
+// ======================================================================
+// Provider usage-cap cordons
+// ======================================================================
+
+#[tokio::test]
+async fn usage_cordon_excludes_advertises_and_redirects() {
+    let state = temp_state_file("cordon");
+    let log = temp_log("cordon");
+    // cordon.enabled=false so the real poller never runs; the test injects the
+    // cordon it would have computed. Pure-quality routing (tradeoff 0) so
+    // a/fable-5 (higher quality) would win but for the cordon.
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("fable-5", 5)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+
+        // Compute the cordon from a real-shaped payload: Fable weekly-scoped at
+        // 100% critical, overage exhausted. Far-future reset so it stays active.
+        let payload = serde_json::json!({
+            "extra_usage": { "is_enabled": true, "utilization": 100.0 },
+            "spend": { "enabled": true, "percent": 100 },
+            "limits": [{
+                "kind": "weekly_scoped", "percent": 100, "severity": "critical",
+                "is_active": true, "resets_at": "2099-01-01T00:00:00+00:00",
+                "scope": { "model": { "id": serde_json::Value::Null, "display_name": "Fable" } }
+            }]
+        });
+        let cands = vec![
+            (
+                router_acp::candidate::CandidateId::new("a", "fable-5"),
+                "Fable".to_string(),
+            ),
+            (
+                router_acp::candidate::CandidateId::new("b", "sonnet"),
+                "Sonnet".to_string(),
+            ),
+        ];
+        let cordons =
+            router_acp::usage::anthropic_cordons(&payload, &cands, std::time::SystemTime::now());
+        assert!(!cordons.is_empty(), "payload should cordon fable");
+        shared.headroom.lock().unwrap().set_usage_cordons(cordons);
+
+        // (a) Advertised: a/fable-5 is marked available:false with a reason.
+        let sess = new_session(&cx).await?;
+        let opts = serde_json::to_string(&sess.config_options).unwrap();
+        assert!(
+            opts.contains("\"available\":false") && opts.contains("Weekly Fable limit reached"),
+            "cordoned candidate advertised unavailable: {opts}"
+        );
+
+        // (b) Auto excludes the cordoned candidate → routes to b/sonnet even
+        // though pure-quality routing would otherwise pick a/fable-5.
+        let sid = sess.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "do the thing").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:sonnet:"),
+            "routed to non-cordoned b/sonnet: {text}"
+        );
+
+        // (c) Explicit pin to the cordoned candidate is refused → falls back to
+        // b/sonnet with a cordon disclosure line in the failover format.
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        let resp2 = prompt_text(&cx, &sid2, "[router: candidate=a/fable-5]\ndo it").await?;
+        assert_eq!(resp2.stop_reason, StopReason::EndTurn);
+        let text2 = agent_text(&observed, &sid2);
+        assert!(
+            text2.contains("failover: cordon"),
+            "cordon redirect disclosed in failover format: {text2}"
+        );
+        assert!(
+            text2.contains("echo:sonnet:"),
+            "redirected to b/sonnet: {text2}"
+        );
+
+        // (d) Headroom payload → nothing cordoned → fable available again.
+        let ok_payload = serde_json::json!({
+            "extra_usage": { "is_enabled": true, "utilization": 40.0 },
+            "spend": { "enabled": true, "percent": 40 },
+            "limits": []
+        });
+        let ok =
+            router_acp::usage::anthropic_cordons(&ok_payload, &cands, std::time::SystemTime::now());
+        assert!(ok.is_empty(), "headroom → no cordons");
+        shared.headroom.lock().unwrap().set_usage_cordons(ok);
+        let sess3 = new_session(&cx).await?;
+        let opts3 = serde_json::to_string(&sess3.config_options).unwrap();
+        assert!(
+            !opts3.contains("\"available\":false"),
+            "no cordon advertised: {opts3}"
+        );
         Ok(())
     })
     .await;

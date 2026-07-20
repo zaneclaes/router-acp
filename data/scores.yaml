@@ -14,18 +14,26 @@ candidates:
     coding_tier: high
     coding_percentile: 0.97
     context_window: 1000000
-    default_quality: 0.95
+    # Fable and Opus are close-tier frontier models. The quality gap over Opus
+    # is deliberately kept NARROW (~0.02/class) so `auto` doesn't over-select
+    # Fable: since Opus is a notch cheaper (cost_rank 4 vs 5) it then wins the
+    # everyday/medium tasks on cost, while Fable stays marginally ahead so it
+    # still wins the hardest prompts (where the complexity-scaled tradeoff leans
+    # hard on quality). Widen this gap to send more traffic back to Fable;
+    # narrow it (toward Opus's numbers) to send even the hard tasks to Opus.
+    # These are still comfortably above Sonnet, so nothing skews down-tier.
+    default_quality: 0.87
     quality:
-      UiTweak: 0.9
-      BugFix: 0.95
-      Feature: 0.95
-      Refactor: 0.95
-      Algorithms: 0.97
+      UiTweak: 0.87
+      BugFix: 0.92
+      Feature: 0.92
+      Refactor: 0.92
+      Algorithms: 0.94
       Architecture: 0.97
-      Research: 0.95
-      Writing: 0.95
-      Ops: 0.9
-      CodingGeneral: 0.95
+      Research: 0.92
+      Writing: 0.92
+      Ops: 0.87
+      CodingGeneral: 0.92
 
   # GPT "sol / terra / luna" lines (ids like `gpt-5.6-sol`). Kept above the
   # `*gpt-5*` patterns so a `gpt-5.6-sol` id doesn't fall through to the generic

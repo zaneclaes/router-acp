@@ -35,6 +35,17 @@ failover:
   respawn_cooldown_secs: 30
   max_attempts: 3
 
+# Proactive usage-cap cordoning. On top of the reactive (error-driven) cordons
+# above, poll each agent's provider usage API and mark a candidate unroutable
+# BEFORE it's tried when its cap is exhausted with no overage/credit headroom.
+# Generic: which models are exhausted is read from the API, never hardcoded.
+# Enable per-agent with `usage_source` (see the claude agent below). Cordoned
+# candidates are excluded from auto, skipped by failover, refused (with a
+# fallback) on an explicit pin, and advertised to the client as unavailable.
+cordon:
+  enabled: true          # default true (inert unless an agent has a usage_source)
+  poll_secs: 300         # usage poll interval / cache TTL (~5 min)
+
 # Mid-session model switching. A pinned session can move to a more capable
 # model on its own when its confidence drops. Confidence = the pinned model's
 # quality for the task class minus accumulated "struggle" (token-ceiling hits,
@@ -83,6 +94,8 @@ agents:
       type: config-option       # discover the category:model config option,
                                 # then session/set_config_option per session
     budget_prompts_5h: 400
+    usage_source:               # proactive cordons from the Anthropic usage API
+      type: anthropic-oauth     # (reads the CLI OAuth token; see `cordon` above)
     preference: 0.05            # prefer this agent when candidates are
                                 # otherwise comparable (bigger seat/plan)
     models:

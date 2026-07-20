@@ -380,6 +380,18 @@ healthy. Failover never happens after the turn has already streamed output
 with a note explaining why. Tune with `failover.{enabled,max_attempts,
 respawn_cooldown_secs}` and `headroom.cordon_default_secs` in `router.yaml`.
 
+**Proactive cordons (no failed turn needed).** With `usage_source:
+{ type: anthropic-oauth }` on the claude agent (already in your config), the
+router polls your Anthropic subscription usage every ~5 min and cordons a model
+*before* it's tried once its weekly cap is exhausted **and** your credit/overage
+pool is also spent (credits cover you otherwise, so nothing is cordoned while
+they last). It reads the same CLI OAuth token the adapter uses (from the macOS
+Keychain here), never calls a model API, and fails open (a usage-endpoint hiccup
+can't make a model unroutable). A cordoned model is dropped from `auto`, skipped
+by failover, refused-with-fallback on an explicit `[router: candidate=…]`, and
+shown disabled (with reason + reset time) in a client's model picker. Turn the
+whole thing off with `cordon: { enabled: false }`.
+
 ## Orchestrated workflows (plan → subtasks → cross-lineage review)
 
 Orchestration is now **built into router-acp** — there is no goose recipe or

@@ -654,6 +654,26 @@ impl Shared {
     /// Candidates that are routeable, unquarantined, and satisfy the prompt's
     /// required capabilities, as strategy views.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
+        self.eligible_views_inner(required, class, false)
+    }
+
+    /// Like `eligible_views` but keeps usage-cordoned candidates in the pool.
+    /// Used only for the all-cordoned "least-bad" fallback, where every
+    /// candidate is usage-cordoned and the turn would otherwise fail.
+    pub fn eligible_views_relaxed(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+    ) -> Vec<CandidateView> {
+        self.eligible_views_inner(required, class, true)
+    }
+
+    fn eligible_views_inner(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+        ignore_usage_cordons: bool,
+    ) -> Vec<CandidateView> {
         let candidates = self.routeable_candidates();
         let mut headroom = self.headroom.lock().unwrap();
         let targets = self.targets.lock().unwrap();
@@ -675,6 +695,11 @@ impl Shared {
             }
             // Agents cordoned by a token/usage limit sit out until reset.
             if headroom.cordon_active(&c.id.agent).is_some() {
+                continue;
+            }
+            // Candidates proactively cordoned by the provider's usage API (cap
+            // exhausted, no overage headroom) sit out until their reset.
+            if !ignore_usage_cordons && headroom.usage_cordon(&c.id).is_some() {
                 continue;
             }
             let scores = self.scores.lookup(&c.id);
@@ -734,6 +759,16 @@ impl Shared {
                 "Auto (strategy decides)",
             )],
         )];
+        // Snapshot usage cordons so cordoned candidates can be advertised as
+        // unavailable (kept in the list, not dropped, so the client shows them
+        // disabled with a reason).
+        let usage_cordons: std::collections::HashMap<_, _> = self
+            .headroom
+            .lock()
+            .unwrap()
+            .active_usage_cordons()
+            .into_iter()
+            .collect();
         for agent in &self.cfg.agents {
             let options: Vec<SessionConfigSelectOption> = self
                 .candidates
@@ -741,7 +776,28 @@ impl Shared {
                 .unwrap()
                 .iter()
                 .filter(|c| c.id.agent == agent.name && c.status == CandidateStatus::Routeable)
-                .map(|c| SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone()))
+                .map(|c| {
+                    let opt =
+                        SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
+                    // available defaults to true/absent; a cordoned candidate is
+                    // advertised unavailable with a reason and reset time under
+                    // `_meta.router_acp`.
+                    match usage_cordons.get(&c.id) {
+                        Some(cordon) => {
+                            let mut meta = serde_json::Map::new();
+                            meta.insert(
+                                "router_acp".to_string(),
+                                json!({
+                                    "available": false,
+                                    "unavailable_reason": cordon.reason,
+                                    "resets_at": cordon.resets_at_rfc3339,
+                                }),
+                            );
+                            opt.meta(meta)
+                        }
+                        None => opt,
+                    }
+                })
                 .collect();
             if !options.is_empty() {
                 groups.push(SessionConfigSelectGroup::new(
@@ -2133,6 +2189,23 @@ async fn pin_session(
         (Some(o), Some(x)) if o == x => None,
         _ => override_,
     };
+    // An explicit pin to a usage-cordoned candidate is not honored: drop the
+    // override so routing picks the best non-cordoned candidate, and record the
+    // redirect for the disclosure.
+    let mut cordon_redirect: Option<(CandidateId, String, String)> = None;
+    let override_ = match override_ {
+        Some(cand) => {
+            let cordon = shared.headroom.lock().unwrap().usage_cordon(&cand).cloned();
+            match cordon {
+                Some(c) => {
+                    cordon_redirect = Some((cand, c.reason, c.resets_at_rfc3339));
+                    None
+                }
+                None => Some(cand),
+            }
+        }
+        None => None,
+    };
     let ctx = RouteContext {
         profile: profile.clone(),
         required_caps: required,
@@ -2153,6 +2226,39 @@ async fn pin_session(
     }
     if !excluded_patterns.is_empty() {
         pool.retain(|v| !is_excluded(&v.id, &excluded_patterns));
+    }
+    // All-cordoned "least-bad" fallback: if the pool is empty only because every
+    // candidate is usage-cordoned, route to the one whose cordon resets soonest
+    // rather than failing the turn.
+    let mut all_cordoned_fallback: Option<String> = None;
+    if pool.is_empty() {
+        let mut relaxed = shared.eligible_views_relaxed(&required, profile.class);
+        if let Some(exclude) = exclude {
+            relaxed.retain(|v| &v.id != exclude);
+        }
+        if !excluded_patterns.is_empty() {
+            relaxed.retain(|v| !is_excluded(&v.id, &excluded_patterns));
+        }
+        let soonest = {
+            let hr = shared.headroom.lock().unwrap();
+            relaxed
+                .into_iter()
+                .filter_map(|v| {
+                    hr.usage_cordon(&v.id).map(|c| {
+                        (
+                            c.resets_at,
+                            c.reason.clone(),
+                            c.resets_at_rfc3339.clone(),
+                            v,
+                        )
+                    })
+                })
+                .min_by_key(|(resets, ..)| *resets)
+        };
+        if let Some((_, reason, resets_str, view)) = soonest {
+            all_cordoned_fallback = Some(format!("{} ({reason}, resets {resets_str})", view.id));
+            pool = vec![view];
+        }
     }
     if pool.is_empty() {
         return Err(if shared.has_auth_pending() {
@@ -2365,6 +2471,12 @@ async fn pin_session(
                     "skipped": skipped_json,
                     "cordoned": cordons_json,
                     "excluded": excluded_patterns,
+                    "cordon_redirect": cordon_redirect.as_ref().map(|(from, reason, resets)| json!({
+                        "from": from.to_string(),
+                        "reason": reason,
+                        "resets_at": resets,
+                    })),
+                    "all_cordoned_fallback": all_cordoned_fallback,
                 });
 
                 shared.state.lock().unwrap().upsert(
@@ -2395,17 +2507,34 @@ async fn pin_session(
                     );
                 }
 
-                let mut lines = vec![format!(
-                    "router-acp · {}{} → {} · task {} (complexity {:.2})",
-                    if is_failover { "failover: " } else { "" },
-                    strategy_kind.as_str(),
-                    candidate,
-                    profile.class.as_str(),
-                    profile.complexity,
-                )];
+                // When an explicit pin was redirected off a cordoned candidate,
+                // lead with the failover-format line the spec mandates (so
+                // existing clients parse it unchanged); otherwise the normal
+                // routing line.
+                let mut lines = vec![match &cordon_redirect {
+                    Some((_from, reason, resets)) => format!(
+                        "router-acp · failover: cordon → {} · task {} ({reason}, resets {})",
+                        candidate,
+                        profile.class.as_str(),
+                        resets.split('T').next().unwrap_or(resets),
+                    ),
+                    None => format!(
+                        "router-acp · {}{} → {} · task {} (complexity {:.2})",
+                        if is_failover { "failover: " } else { "" },
+                        strategy_kind.as_str(),
+                        candidate,
+                        profile.class.as_str(),
+                        profile.complexity,
+                    ),
+                }];
                 lines.push(format!("why: {}", rc.reason));
                 if let Some(note) = &rc.note {
                     lines.push(format!("note: {note}"));
+                }
+                if let Some(fallback) = &all_cordoned_fallback {
+                    lines.push(format!(
+                        "note: all candidates usage-cordoned; using least-bad {fallback}"
+                    ));
                 }
                 for (skipped_candidate, why) in &skipped {
                     lines.push(format!("skipped {skipped_candidate}: {why}"));
@@ -2426,15 +2555,16 @@ async fn pin_session(
 
                 // Queue the human-readable disclosure to ride the model's
                 // first response chunk (Chunk mode). Metadata always rides
-                // under `_meta.router_acp` on that same chunk.
+                // under `_meta.router_acp` on that same chunk. A cordon
+                // redirect / all-cordoned fallback is always surfaced visibly.
+                let force_notice =
+                    is_failover || cordon_redirect.is_some() || all_cordoned_fallback.is_some();
                 match shared.cfg.disclosure {
                     DisclosureMode::Chunk => {
                         queue_notice(shared, router_sid, lines.clone());
                     }
                     DisclosureMode::Meta => {
-                        // Metadata-only, except failovers are always surfaced
-                        // visibly (the user must know a model swap happened).
-                        if is_failover {
+                        if force_notice {
                             queue_notice(shared, router_sid, lines.clone());
                         }
                     }
@@ -3951,9 +4081,16 @@ pub async fn serve_shared(
         None
     };
 
+    // Proactive usage-cap cordoning: poll each usage-source agent's provider
+    // usage API on an interval and cordon exhausted candidates.
+    let usage_task = crate::usage::spawn_usage_poller(&shared);
+
     let result = build_agent(shared).connect_to(transport).await;
 
     if let Some(task) = listener_task {
+        task.abort();
+    }
+    if let Some(task) = usage_task {
         task.abort();
     }
     result

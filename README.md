@@ -151,6 +151,24 @@ and it always tells the user what happened:
   cordoned off from routing until that reset (or
   `headroom.cordon_default_secs` when no time was reported), and later
   routing disclosures include the cordon and its remaining time.
+- **Proactive per-candidate usage cordons.** Beyond reacting to errors, the
+  router can poll a provider's own usage API and cordon an *exhausted model*
+  before it's ever tried. Enable per-agent with `usage_source` (e.g.
+  `anthropic-oauth`, which reads the CLI OAuth token and
+  `GET /api/oauth/usage`). A model-scoped weekly cap at 100% cordons just that
+  candidate; an all-models or session cap cordons the whole agent — but only
+  when the overage/credit pool has no headroom (credits cover you otherwise).
+  It's **generic** (which models are exhausted is read from the API, never
+  hardcoded), **fails open** (a usage-endpoint hiccup never makes a model
+  unroutable), and self-lifts at the reported reset. Cordoned candidates are
+  excluded from `auto`, skipped by failover, and an explicit pin to one is
+  refused with a fallback (disclosed in the failover format:
+  `router-acp · failover: cordon → claude/sonnet · task … (Weekly Fable limit
+  reached, resets …)`). If *every* candidate is cordoned, the one resetting
+  soonest is used rather than failing the turn. Each candidate's cordon state
+  is advertised on the `router.candidate` picker option
+  (`_meta.router_acp.available/unavailable_reason/resets_at`) so a front-end can
+  show it disabled. Gate the whole mechanism with `cordon.enabled`.
 - **Outage failover.** If the pinned model fails mid-session (process
   death, connection loss, provider overload) or hits a limit, the router
   fails the session over to the next best candidate: the failure and its
@@ -402,6 +420,9 @@ example.
 | `headroom.quarantine_failures` | `3` | Pre-prompt failures in the window before quarantine. |
 | `headroom.quarantine_cooloff_secs` | `600` | Quarantine cool-off. |
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
+| `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). |
+| `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
+| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. |
 | `failover.enabled` | `true` | Fail a pinned session over to the next best candidate on limit/outage (only before any output streamed this turn). |
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |

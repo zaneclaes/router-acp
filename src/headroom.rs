@@ -5,10 +5,23 @@
 //! failures over a sliding window, normalized against per-agent budgets.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::candidate::CandidateId;
 use crate::config::HeadroomConfig;
+
+/// A proactive per-candidate cordon derived from a provider usage API: the
+/// candidate is unroutable until `resets_at`. Unlike the reactive per-agent
+/// cordons (which use monotonic `Instant`), these carry an absolute wall-clock
+/// reset (the provider reports it) so they self-lift correctly and can be
+/// advertised to the client with a real timestamp.
+#[derive(Debug, Clone)]
+pub struct UsageCordon {
+    pub reason: String,
+    pub resets_at: SystemTime,
+    /// The provider's reset timestamp, verbatim (RFC 3339), for advertising.
+    pub resets_at_rfc3339: String,
+}
 
 #[derive(Debug, Default)]
 struct AgentWindow {
@@ -39,6 +52,10 @@ pub struct HeadroomTracker {
     /// Hard per-agent cordons (token/usage limits): the agent is excluded
     /// from routing until the stored instant, with a human-readable reason.
     cordons: HashMap<String, (Instant, String)>,
+    /// Proactive per-candidate cordons from provider usage APIs. Recomputed
+    /// wholesale by the usage poller each cycle (`set_usage_cordons`); each
+    /// entry self-lifts at its absolute `resets_at`.
+    usage_cordons: HashMap<CandidateId, UsageCordon>,
 }
 
 impl HeadroomTracker {
@@ -52,7 +69,35 @@ impl HeadroomTracker {
             agents: HashMap::new(),
             candidates: HashMap::new(),
             cordons: HashMap::new(),
+            usage_cordons: HashMap::new(),
         }
+    }
+
+    /// Replace the proactive per-candidate usage cordons wholesale (the poller
+    /// computes an authoritative snapshot each cycle). A candidate no longer
+    /// exhausted simply drops out of the map here and becomes routeable again.
+    pub fn set_usage_cordons(&mut self, cordons: HashMap<CandidateId, UsageCordon>) {
+        self.usage_cordons = cordons;
+    }
+
+    /// The active usage cordon for a candidate, if any (i.e. `now < resets_at`).
+    pub fn usage_cordon(&self, id: &CandidateId) -> Option<&UsageCordon> {
+        self.usage_cordon_at(id, SystemTime::now())
+    }
+
+    pub fn usage_cordon_at(&self, id: &CandidateId, now: SystemTime) -> Option<&UsageCordon> {
+        self.usage_cordons.get(id).filter(|c| c.resets_at > now)
+    }
+
+    /// All candidates currently usage-cordoned, for advertising and the
+    /// all-cordoned "least-bad" fallback.
+    pub fn active_usage_cordons(&self) -> Vec<(CandidateId, UsageCordon)> {
+        let now = SystemTime::now();
+        self.usage_cordons
+            .iter()
+            .filter(|(_, c)| c.resets_at > now)
+            .map(|(id, c)| (id.clone(), c.clone()))
+            .collect()
     }
 
     /// Cordon an agent off from routing for `duration` (the parsed
