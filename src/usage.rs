@@ -65,24 +65,30 @@ async fn poll_all(shared: &Arc<Shared>) -> HashMap<CandidateId, UsageCordon> {
         if candidates.is_empty() {
             continue;
         }
-        match source {
+        let cordons = match source {
             UsageSourceConfig::AnthropicOauth => match fetch_anthropic_usage().await {
-                Ok(payload) => {
-                    let cordons = anthropic_cordons(&payload, &candidates, SystemTime::now());
-                    if !cordons.is_empty() {
-                        tracing::info!(
-                            agent = %agent.name,
-                            count = cordons.len(),
-                            "usage-cordoned candidates (cap exhausted, no overage headroom)"
-                        );
-                    }
-                    out.extend(cordons);
-                }
+                Ok(payload) => anthropic_cordons(&payload, &candidates, SystemTime::now()),
                 Err(err) => {
                     tracing::debug!(agent = %agent.name, %err, "usage poll failed; failing open");
+                    continue;
                 }
             },
+            UsageSourceConfig::CodexRollout => match latest_codex_rate_limits() {
+                Some(rl) => codex_cordons(&rl, &candidates, SystemTime::now()),
+                None => {
+                    tracing::debug!(agent = %agent.name, "no codex rate-limit snapshot; failing open");
+                    continue;
+                }
+            },
+        };
+        if !cordons.is_empty() {
+            tracing::info!(
+                agent = %agent.name,
+                count = cordons.len(),
+                "usage-cordoned candidates (cap exhausted, no overage headroom)"
+            );
         }
+        out.extend(cordons);
     }
     out
 }
@@ -317,6 +323,149 @@ fn upsert_latest(
     }
 }
 
+// ----------------------------------------------------------------------
+// Codex rollout (on-disk snapshot)
+// ----------------------------------------------------------------------
+
+/// The most recent `rate_limits` object Codex wrote to its session rollouts.
+/// Codex has no pollable usage endpoint, but it records a rate-limit snapshot
+/// (from response headers) into `~/.codex/sessions/**/rollout-*.jsonl` on each
+/// turn; we read the newest one. `None` if nothing is found.
+fn latest_codex_rate_limits() -> Option<Value> {
+    let home = std::env::var_os("HOME")?;
+    let root = std::path::Path::new(&home).join(".codex/sessions");
+    // Collect rollout files (sessions/YYYY/MM/DD/rollout-*.jsonl), newest first.
+    let mut files: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
+    collect_rollouts(&root, 0, &mut files);
+    files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    // Use the newest file that actually contains a rate_limits snapshot.
+    for (_, path) in files.iter().take(8) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().rev() {
+            if !line.contains("rate_limits") {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(line)
+                && let Some(rl) = v
+                    .get("payload")
+                    .and_then(|p| p.get("rate_limits"))
+                    .filter(|rl| !rl.is_null())
+            {
+                return Some(rl.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Recursively collect `rollout-*.jsonl` files under `dir` (depth-bounded: the
+/// layout is sessions/YYYY/MM/DD/).
+fn collect_rollouts(
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<(SystemTime, std::path::PathBuf)>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            collect_rollouts(&path, depth + 1, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+        {
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            out.push((mtime, path));
+        }
+    }
+}
+
+/// Given a Codex `rate_limits` snapshot and an agent's candidates, decide which
+/// are cordoned. Codex caps are account-wide (not model-scoped), so a saturated
+/// window cordons every candidate — but only when credits can't cover it, and
+/// only while the window's `resets_at` is still in the future.
+pub fn codex_cordons(
+    rate_limits: &Value,
+    candidates: &[(CandidateId, String)],
+    now: SystemTime,
+) -> HashMap<CandidateId, UsageCordon> {
+    let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
+    // Credits cover plan limits (the overage equivalent).
+    let has_credits = rate_limits
+        .get("credits")
+        .and_then(|c| c.get("has_credits"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if has_credits {
+        return out;
+    }
+    for key in ["primary", "secondary"] {
+        let Some(win) = rate_limits.get(key).filter(|w| !w.is_null()) else {
+            continue;
+        };
+        let used = win
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if used < 100.0 {
+            continue;
+        }
+        let Some(epoch) = win.get("resets_at").and_then(Value::as_u64) else {
+            continue;
+        };
+        let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
+        if resets_at <= now {
+            continue; // already reset
+        }
+        let window_minutes = win
+            .get("window_minutes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reason = if window_minutes >= 1440 {
+            "Codex weekly usage limit reached".to_string()
+        } else {
+            "Codex 5-hour usage limit reached".to_string()
+        };
+        let rfc = epoch_to_rfc3339(epoch);
+        for (id, _) in candidates {
+            upsert_latest(&mut out, id, &reason, resets_at, &rfc);
+        }
+    }
+    out
+}
+
+/// Format a Unix epoch (seconds) as a UTC RFC-3339 timestamp, for advertising.
+/// Hand-rolled (no chrono dep); inverse of `limits::iso_to_epoch`'s civil math.
+fn epoch_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    // days_from_civil inverse (Howard Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +558,69 @@ mod tests {
             ]
         });
         assert!(anthropic_cordons(&p, &cands(), now).is_empty());
+    }
+
+    // ---- Codex rollout ----
+
+    fn codex_cands() -> Vec<(CandidateId, String)> {
+        vec![
+            (CandidateId::new("codex", "gpt-5.5"), "GPT-5.5".to_string()),
+            (
+                CandidateId::new("codex", "gpt-5.6-sol"),
+                "GPT Sol".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn codex_saturated_window_no_credits_cordons_all() {
+        let now = SystemTime::now();
+        let future = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        let rl = json!({
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future },
+            "secondary": serde_json::Value::Null,
+            "credits": { "has_credits": false }
+        });
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert_eq!(c.len(), 2, "both codex candidates cordoned: {c:?}");
+        assert!(c.values().all(|v| v.reason.contains("weekly")));
+    }
+
+    #[test]
+    fn codex_credits_available_cordons_nothing() {
+        let now = SystemTime::now();
+        let future = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        let rl = json!({
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future },
+            "credits": { "has_credits": true }
+        });
+        assert!(codex_cordons(&rl, &codex_cands(), now).is_empty());
+    }
+
+    #[test]
+    fn codex_past_reset_cordons_nothing() {
+        let now = SystemTime::now();
+        let rl = json!({
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1 },
+            "credits": { "has_credits": false }
+        });
+        assert!(
+            codex_cordons(&rl, &codex_cands(), now).is_empty(),
+            "past reset ignored"
+        );
+    }
+
+    #[test]
+    fn epoch_to_rfc3339_known_values() {
+        assert_eq!(epoch_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch_to_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
     }
 }

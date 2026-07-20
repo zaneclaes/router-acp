@@ -392,6 +392,13 @@ by failover, refused-with-fallback on an explicit `[router: candidate=…]`, and
 shown disabled (with reason + reset time) in a client's model picker. Turn the
 whole thing off with `cordon: { enabled: false }`.
 
+Codex gets the same treatment via `usage_source: { type: codex-rollout }`, but
+by a different route: Codex has no pollable usage endpoint (its limits arrive in
+response headers, and the ChatGPT backend 403s any non-Codex client), so the
+router reads Codex's *own* on-disk rate-limit snapshot from its rollout files
+(`~/.codex/sessions/**/rollout-*.jsonl`). That's "last-known as of Codex's most
+recent turn" rather than live — the reactive cordon still backstops it.
+
 ## Orchestrated workflows (plan → subtasks → cross-lineage review)
 
 Orchestration is now **built into router-acp** — there is no goose recipe or
@@ -415,6 +422,11 @@ inline; the planner and every subtask are recorded (sharing `run_label
 
 It fires on any prompt and is suppressed by an explicit `[router: …]` directive,
 a `model:` shorthand, or when your list is answering the model's own questions.
+Start a message with **`orchestrate:`** to force the pipeline on any task,
+list or not. And with `ticket_context` configured (your config loads `HAI-…`
+tickets via the linear CLI), **"Fix HAI-1234" pulls the ticket into the prompt
+first** — classification and orchestration run on the ticket's real content, so
+a ticket whose body is a work list orchestrates and delegates its parts.
 See [`ORCHESTRATION.md`](ORCHESTRATION.md) for the full pipeline, the
 `orchestration.*` config, and caveats.
 

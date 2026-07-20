@@ -219,6 +219,13 @@ pub enum UsageSourceConfig {
     /// `~/.claude/.credentials.json` or the macOS Keychain
     /// (`Claude Code-credentials`), the same credential the adapter uses.
     AnthropicOauth,
+    /// Codex/ChatGPT usage read from the Codex CLI's own on-disk rate-limit
+    /// snapshot (the newest `~/.codex/sessions/**/rollout-*.jsonl`). Codex has no
+    /// pollable usage endpoint (its limits arrive as response headers), so this
+    /// is the last-known snapshot as of Codex's most recent turn, not live — the
+    /// reactive per-agent cordon remains the backstop. Parses an undocumented
+    /// Codex format and fails open if it changes.
+    CodexRollout,
 }
 
 /// Parse a duration string like `30d`, `12h`, `90m`, `3600s`, or a bare
@@ -282,6 +289,25 @@ impl Default for AutoUpgradeConfig {
             confidence_threshold: default_confidence_threshold(),
         }
     }
+}
+
+/// Load ticket details into the prompt when a ticket id is referenced. When a
+/// prompt mentions `<prefix><digits>` (e.g. `HAI-1234`), the router runs
+/// `command` (with `$TICKET` substituted) and prepends its stdout to the prompt
+/// before classification and orchestration detection — so "Fix HAI-1234"
+/// becomes a rich prompt that routes (and possibly orchestrates) on the
+/// ticket's actual content. Fails open: a failed/slow fetch leaves the prompt
+/// unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketRule {
+    /// Ticket id prefix, matched at a word start and followed by digits
+    /// (e.g. `HAI-` matches `HAI-1234`).
+    pub prefix: String,
+    /// Command argv to print the ticket; every occurrence of `$TICKET` in any
+    /// argument is replaced with the full ticket id. Run without a shell.
+    /// e.g. `["linear", "issue", "view", "$TICKET"]`.
+    pub command: Vec<String>,
 }
 
 /// Force prompts that invoke a given skill onto a specific class of models.
@@ -700,6 +726,9 @@ pub struct Config {
     /// Skill → model-class routing rules.
     #[serde(default)]
     pub skill_routing: Vec<SkillRoute>,
+    /// Ticket-reference → context-loading rules (prefix + fetch command).
+    #[serde(default)]
+    pub ticket_context: Vec<TicketRule>,
     /// Automatic orchestration of multi-part task lists.
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
@@ -954,6 +983,26 @@ impl Config {
             return Err(ConfigError(
                 "classifier.backend is `local-model` but classifier.local_model is not set".into(),
             ));
+        }
+        for rule in &self.ticket_context {
+            if rule.prefix.trim().is_empty() {
+                return Err(ConfigError(
+                    "ticket_context: prefix must not be empty".into(),
+                ));
+            }
+            if rule.command.is_empty() {
+                return Err(ConfigError(format!(
+                    "ticket_context `{}`: command must not be empty",
+                    rule.prefix
+                )));
+            }
+            if !rule.command.iter().any(|a| a.contains("$TICKET")) {
+                return Err(ConfigError(format!(
+                    "ticket_context `{}`: command must reference $TICKET (else every ticket \
+                     fetches the same thing)",
+                    rule.prefix
+                )));
+            }
         }
         if self.orchestration.enabled {
             if self.orchestration.planner.is_empty() {

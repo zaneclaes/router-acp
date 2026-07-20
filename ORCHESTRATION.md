@@ -60,6 +60,18 @@ task wants at the end (shipping, opening/merging a PR) is the planner's to run �
 the protocol's step 5 tells it to do that only after the work is done and
 reviewed, never up front.
 
+Two ways to feed it more than the literal prompt:
+
+- **Force it** — start the message with `orchestrate:` / `orchestrator:`. This
+  overrides every auto-detection gate (list detection, `min_items`, the
+  answering-questions exception, even `orchestration.enabled`) and runs the
+  pipeline on whatever follows.
+- **Ticket context** — with `ticket_context` rules configured (pluggable:
+  `prefix` + a command for your ticketing system's CLI), "Fix HAI-1234" loads
+  the ticket body into the prompt *before* detection. A ticket whose
+  description is a work list orchestrates exactly as if you had pasted it, and
+  the planner delegates its parts.
+
 Every trigger is disclosed: `router-acp · orchestrating a N-part task on <model>`.
 
 ## The pipeline (what the injected protocol tells the planner)

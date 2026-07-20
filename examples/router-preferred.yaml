@@ -30,6 +30,9 @@ agents:
       command: ~/nvm/versions/node/v24.16.0/bin/codex-acp
     model_selection: { type: config-option }
     budget_prompts_5h: 400
+    # Proactive cordons from Codex's own on-disk rate-limit snapshot (last-known,
+    # since Codex has no pollable usage endpoint; reactive cordon backstops it).
+    usage_source: { type: codex-rollout }
     models:
       - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
       - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }
@@ -90,6 +93,24 @@ orchestration:
 auto_upgrade:
   enabled: true                 # false disables automatic upgrades entirely
   confidence_threshold: 0.55    # upgrade below this; higher = more eager
+
+# Ticket context (pluggable). When a prompt mentions <prefix><digits> (e.g.
+# "Fix HAI-1234"), the router runs `command` ($TICKET substituted) and prepends
+# its stdout to the prompt BEFORE classification and orchestration detection —
+# so a bare ticket reference routes (and, if the ticket is a work list,
+# orchestrates) on the ticket's real content, and the planner can delegate its
+# parts. Works with any ticketing system whose CLI can print an issue; the
+# command runs without a shell and fails open (a bad fetch never blocks the
+# turn). Each ticket is injected once per session.
+ticket_context:
+  - prefix: "HAI-"                                    # Linear (CLI keychain auth)
+    command: ["linear", "issue", "view", "$TICKET"]   # use an absolute path if
+                                                      # `linear` isn't on the
+                                                      # router's PATH
+  # - prefix: "PROJ-"                                 # Jira
+  #   command: ["jira", "issue", "view", "$TICKET", "--plain"]
+  # - prefix: "GH-"                                   # GitHub (GH-123 → issue 123;
+  #   command: ["/bin/sh", "-c", "gh issue view \"${1#GH-}\"", "sh", "$TICKET"]
 
 # Force skills onto a class of models. When a prompt invokes `pattern`
 # (as `/name` or a standalone token) and the pinned model isn't already in

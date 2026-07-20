@@ -55,6 +55,13 @@ auto_upgrade:
   enabled: true                 # false disables automatic upgrades entirely
   confidence_threshold: 0.55    # upgrade below this; higher = more eager
 
+# Ticket context (pluggable): load referenced tickets into the prompt before
+# routing. Any prefix + any command that prints the ticket ($TICKET
+# substituted, run without a shell); fails open; once per session per ticket.
+ticket_context:
+  - prefix: "HAI-"
+    command: ["linear", "issue", "view", "$TICKET"]
+
 # Force skills onto a class of models. When a prompt invokes `pattern`
 # (as `/name` or a standalone token) and the pinned model isn't already in
 # `candidates`, the session switches to the best available match (summarize +
@@ -121,6 +128,8 @@ agents:
     # config-option: discover codex-acp's model selector and set per session.
     model_selection: { type: config-option }
     budget_prompts_5h: 400
+    usage_source:               # proactive cordons from Codex's on-disk snapshot
+      type: codex-rollout       # (no pollable endpoint; last-known + reactive backstop)
     models:
       - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
       - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }

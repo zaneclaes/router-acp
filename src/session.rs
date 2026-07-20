@@ -213,6 +213,9 @@ pub struct RouterSession {
     /// orchestrating session using the adapter's built-in `Task` tool instead of
     /// `delegate_task`). Reset each turn so it warns at most once per turn.
     pub turn_native_subagent_warned: bool,
+    /// Ticket ids already injected into this session's context (a re-mention
+    /// doesn't re-inject the same ticket).
+    pub injected_tickets: HashSet<String>,
 }
 
 /// A requested mid-session model switch and why.
@@ -267,6 +270,7 @@ impl RouterSession {
             orchestrating: false,
             pending_orchestration: None,
             turn_native_subagent_warned: false,
+            injected_tickets: HashSet::new(),
         }
     }
 
@@ -308,6 +312,7 @@ impl RouterSession {
             orchestrating: false,
             pending_orchestration: None,
             turn_native_subagent_warned: false,
+            injected_tickets: HashSet::new(),
         }
     }
 }
@@ -328,6 +333,9 @@ pub struct Shared {
     /// Delegate sub-sessions kept alive for follow-up turns (orchestration),
     /// keyed by the short `delegate_id` returned to the orchestrator.
     pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
+    /// Short-TTL cache of fetched ticket content (ticket id → (fetched-at,
+    /// body)), so concurrent sessions share one fetch.
+    pub ticket_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
     pub delegate_semaphore: Arc<tokio::sync::Semaphore>,
     pub delegate_socket: OnceLock<PathBuf>,
     upstream: OnceLock<ConnectionTo<ClientPeer>>,
@@ -414,6 +422,7 @@ impl Shared {
             sid_map: Mutex::new(HashMap::new()),
             delegate_tokens: Mutex::new(HashMap::new()),
             live_delegates: Mutex::new(HashMap::new()),
+            ticket_cache: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             delegate_socket: OnceLock::new(),
             upstream: OnceLock::new(),
@@ -3143,11 +3152,17 @@ fn resolve_reviewers(
 fn build_orchestration_instructions(
     cfg: &Config,
     parts: usize,
+    forced: bool,
     planner: &CandidateId,
     reviewers: &[CandidateId],
 ) -> String {
     let o = &cfg.orchestration;
     let lineage = &planner.agent;
+    let intro = if forced && parts < 2 {
+        "The user explicitly requested orchestration for the task below.".to_string()
+    } else {
+        format!("The user's message below is a multi-part task ({parts} parts detected).")
+    };
     let review_line = if reviewers.is_empty() {
         format!(
             "No candidate of a different lineage than your own (`{lineage}`) is currently \
@@ -3189,7 +3204,7 @@ fn build_orchestration_instructions(
     let rounds = o.max_fix_rounds;
     format!(
         "[router-acp orchestration — you are the ORCHESTRATOR]\n\
-         The user's message below is a multi-part task ({parts} parts detected). Do NOT implement \
+         {intro} Do NOT implement \
          it all yourself in one pass.\n\
          CRITICAL — HOW TO DELEGATE: use the router's `delegate_task` tool for EVERY subtask and \
          for the review. Do NOT use any built-in sub-agent tool (e.g. `Task`, `dispatch_agent`, \
@@ -3278,32 +3293,34 @@ fn maybe_trigger_orchestration(
     shared: &Arc<Shared>,
     router_sid: &str,
     prompt: &[ContentBlock],
+    forced: bool,
 ) -> bool {
     let cfg = &shared.cfg.orchestration;
-    if !cfg.enabled {
+    // An explicit `orchestrate:` prefix overrides every auto-detection gate,
+    // including `enabled` — the user asked for it by name.
+    if !forced && !cfg.enabled {
         return false;
     }
     let text = prompt_display_text(prompt);
-    let Some(parts) = crate::tasklist::detect_task_list(&text) else {
-        return false;
-    };
-    if parts < cfg.min_items {
-        return false;
-    }
-
-    // Exception: don't orchestrate a list that answers the model's questions.
-    // `turn_output` still holds the previous agent turn here (it is cleared
-    // later, inside `send_prompt_with_failover`); empty pre-pin, so a first
-    // prompt is never mistaken for an answer.
-    let prev_agent_turn = shared
-        .with_session(router_sid, |s| s.turn_output.clone())
-        .unwrap_or_default();
-    if previous_turn_solicited_answers(&prev_agent_turn) {
-        tracing::debug!(
-            session = router_sid,
-            "auto-orchestration skipped: prompt looks like answers to the model's questions"
-        );
-        return false;
+    let parts = crate::tasklist::detect_task_list(&text).unwrap_or(1);
+    if !forced {
+        if parts < cfg.min_items.max(2) {
+            return false;
+        }
+        // Exception: don't orchestrate a list that answers the model's
+        // questions. `turn_output` still holds the previous agent turn here (it
+        // is cleared later, inside `send_prompt_with_failover`); empty pre-pin,
+        // so a first prompt is never mistaken for an answer.
+        let prev_agent_turn = shared
+            .with_session(router_sid, |s| s.turn_output.clone())
+            .unwrap_or_default();
+        if previous_turn_solicited_answers(&prev_agent_turn) {
+            tracing::debug!(
+                session = router_sid,
+                "auto-orchestration skipped: prompt looks like answers to the model's questions"
+            );
+            return false;
+        }
     }
 
     let (class, excluded, current) = shared
@@ -3346,7 +3363,8 @@ fn maybe_trigger_orchestration(
             ),
         );
     }
-    let instructions = build_orchestration_instructions(&shared.cfg, parts, &planner, &reviewers);
+    let instructions =
+        build_orchestration_instructions(&shared.cfg, parts, forced, &planner, &reviewers);
 
     shared.with_session(router_sid, |s| {
         s.orchestrating = true;
@@ -3358,6 +3376,13 @@ fn maybe_trigger_orchestration(
         }
     });
 
+    let (what, why) = if forced && parts < 2 {
+        ("the task".to_string(), "orchestrate: requested")
+    } else if forced {
+        (format!("a {parts}-part task"), "orchestrate: requested")
+    } else {
+        (format!("a {parts}-part task"), "auto-detected list")
+    };
     match &current {
         // Pre-pin: steer the imminent pin onto the planner.
         None => {
@@ -3370,9 +3395,7 @@ fn maybe_trigger_orchestration(
             notify_user(
                 shared,
                 router_sid,
-                format!(
-                    "router-acp · orchestrating a {parts}-part task on {planner} (auto-detected list)"
-                ),
+                format!("router-acp · orchestrating {what} on {planner} ({why})"),
             );
         }
         // Already on a planner-class model: orchestrate in place.
@@ -3380,9 +3403,7 @@ fn maybe_trigger_orchestration(
             notify_user(
                 shared,
                 router_sid,
-                format!(
-                    "router-acp · orchestrating a {parts}-part task on {cur} (auto-detected list)"
-                ),
+                format!("router-acp · orchestrating {what} on {cur} ({why})"),
             );
         }
         // Post-pin on a weaker model: switch to the planner (summarize + hand off).
@@ -3391,16 +3412,13 @@ fn maybe_trigger_orchestration(
             shared.with_session(router_sid, |s| {
                 s.pending_switch = Some(SwitchRequest {
                     target: planner2,
-                    reason: format!("auto-orchestration of a {parts}-part task list"),
+                    reason: format!("orchestration of {what} ({why})"),
                 });
             });
             notify_user(
                 shared,
                 router_sid,
-                format!(
-                    "router-acp · orchestrating a {parts}-part task; switching to {planner} \
-                     (auto-detected list)"
-                ),
+                format!("router-acp · orchestrating {what}; switching to {planner} ({why})"),
             );
         }
     }
@@ -4593,6 +4611,9 @@ fn on_prompt(
     // directive, a `model:` shorthand, or a skill invocation). Any of these
     // suppresses auto-orchestration for this prompt.
     let mut explicit_routing = false;
+    // Set by an `orchestrate:` / `orchestrator:` prefix — forces orchestration
+    // regardless of list detection.
+    let mut force_orchestrate = false;
 
     // Routing directives: `[router: ...]` anywhere in the prompt. Always
     // stripped (the downstream model never sees them); only applied before
@@ -4603,18 +4624,29 @@ fn on_prompt(
             // `codex/gpt-5.5:`, `sonnet: fix this`) is a switch (post-pin) or a
             // pin steer (pre-pin) to the referenced candidate. Resolution gates
             // it — a token that doesn't name an eligible candidate is left as
-            // ordinary prose.
+            // ordinary prose. The reserved tokens `orchestrate:`/`orchestrator:`
+            // instead force auto-orchestration on the rest of the prompt.
             if let Some((ref_str, stripped)) = split_model_shorthand(&req.prompt) {
-                let (class, excluded, pinned) = shared
-                    .with_session(&router_sid, |s| {
-                        (
-                            s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                            s.excluded.clone(),
-                            s.pin.is_some() || s.pinning,
-                        )
-                    })
-                    .unwrap_or((TaskClass::CodingGeneral, Vec::new(), false));
-                if let Some(target) = resolve_candidate_ref(&shared, &ref_str, class, &excluded) {
+                let lower_ref = ref_str.to_lowercase();
+                if lower_ref == "orchestrate" || lower_ref == "orchestrator" {
+                    force_orchestrate = true;
+                    req =
+                        PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
+                    tracing::info!(session = router_sid, "orchestration forced via prefix");
+                } else if let Some(target) = {
+                    let (class, excluded) = shared
+                        .with_session(&router_sid, |s| {
+                            (
+                                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                                s.excluded.clone(),
+                            )
+                        })
+                        .unwrap_or((TaskClass::CodingGeneral, Vec::new()));
+                    resolve_candidate_ref(&shared, &ref_str, class, &excluded)
+                } {
+                    let pinned = shared
+                        .with_session(&router_sid, |s| s.pin.is_some() || s.pinning)
+                        .unwrap_or(false);
                     explicit_routing = true;
                     req =
                         PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
@@ -4738,12 +4770,41 @@ fn on_prompt(
         }
     }
 
+    // The rest of prompt handling runs in a spawned task: ticket-context
+    // enrichment shells out (async), and orchestration/classification must see
+    // the ENRICHED prompt — "Fix HAI-1234" routes on the ticket's real content.
+    cx.spawn(async move {
+        let req = crate::tickets::enrich_prompt(&shared, &router_sid, req).await;
+        dispatch_prompt(
+            shared,
+            router_sid,
+            req,
+            responder,
+            explicit_routing,
+            force_orchestrate,
+        )
+        .await
+    })
+}
+
+/// Post-directive prompt handling: auto-orchestration, skill routing, and the
+/// relay/pin dispatch. Runs inside a spawned task (never on the dispatch loop);
+/// the prompt has already been ticket-enriched.
+async fn dispatch_prompt(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+    responder: Responder<PromptResponse>,
+    explicit_routing: bool,
+    force_orchestrate: bool,
+) -> Result<(), AcpError> {
     // Auto-orchestration runs FIRST: a multi-part task list orchestrates even if
     // it names a skill — the planner decides when to invoke that skill, and
     // end-of-work skills (shipping, PRs) run last. Suppressed only by an explicit
-    // `[router: …]` directive or `model:` shorthand (they set explicit_routing).
-    let orchestrating_now = if !explicit_routing {
-        maybe_trigger_orchestration(&shared, &router_sid, &req.prompt)
+    // `[router: …]` directive or `model:` shorthand (they set explicit_routing);
+    // FORCED unconditionally by the `orchestrate:` prefix.
+    let orchestrating_now = if force_orchestrate || !explicit_routing {
+        maybe_trigger_orchestration(&shared, &router_sid, &req.prompt, force_orchestrate)
     } else {
         false
     };
@@ -4843,14 +4904,9 @@ fn on_prompt(
             // cannot suppress failover for this prompt. Prompt accounting and
             // forwarding happen inside the failover-aware sender.
             shared.with_session(&router_sid, |s| s.cancelled = false);
-            cx.spawn(send_prompt_with_failover(
-                shared.clone(),
-                router_sid,
-                req,
-                responder,
-            ))
+            send_prompt_with_failover(shared.clone(), router_sid, req, responder).await
         }
-        Action::Pin => cx.spawn(route_and_pin(shared.clone(), router_sid, req, responder)),
+        Action::Pin => route_and_pin(shared.clone(), router_sid, req, responder).await,
         Action::Busy => responder.respond_with_error(AcpError::invalid_request().data(
             "a routing decision for this session is already in flight; await the first prompt's \
              response",

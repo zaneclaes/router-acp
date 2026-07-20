@@ -3197,3 +3197,144 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
     })
     .await;
 }
+
+// ======================================================================
+// Ticket-context loading
+// ======================================================================
+
+#[tokio::test]
+async fn ticket_reference_enriches_prompt_and_triggers_orchestration() {
+    let state = temp_state_file("ticket-orch");
+    let log = temp_log("ticket-orch");
+    // The fetch command emits a multi-part work list — so the bare prompt
+    // "Fix HAI-1234" becomes rich enough to trigger orchestration.
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         ticket_context:\n\
+         \x20 - prefix: \"HAI-\"\n\
+         \x20   command: [\"/bin/sh\", \"-c\", \"printf '# %s: upgrade pipeline\\n1. add extractor\\n2. wire routes\\n3. add tests\\n' $TICKET\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Bare mention — no list in the user's own text.
+        let resp = prompt_text(&cx, &sid, "Fix HAI-1234").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("loaded ticket HAI-1234"),
+            "ticket load disclosed: {text}"
+        );
+        assert!(
+            text.contains("HAI-1234: upgrade pipeline"),
+            "ticket content reached the downstream model: {text}"
+        );
+        assert!(
+            text.contains("orchestrating a 3-part task"),
+            "ticket's work list triggered orchestration: {text}"
+        );
+        assert!(text.contains("echo:m2:"), "pinned the planner: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ticket_fetch_failure_fails_open() {
+    let state = temp_state_file("ticket-fail");
+    let log = temp_log("ticket-fail");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         ticket_context:\n\
+         \x20 - prefix: \"HAI-\"\n\
+         \x20   command: [\"/bin/sh\", \"-c\", \"echo $TICKET >&2; exit 3\"]\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "Fix HAI-77 please").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn, "turn still succeeds");
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("could not load ticket HAI-77"),
+            "failure disclosed: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:Fix HAI-77 please"),
+            "original prompt passed through unchanged: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn orchestrate_prefix_forces_orchestration_without_a_list() {
+    let state = temp_state_file("orch-force");
+    let log = temp_log("orch-force");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A single-sentence task — no list — but the prefix forces it.
+        let resp = prompt_text(&cx, &sid, "orchestrate: fix the login bug").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrate: requested"),
+            "forced orchestration disclosed: {text}"
+        );
+        assert!(text.contains("echo:m2:"), "pinned the planner: {text}");
+        assert!(
+            text.contains("you are the ORCHESTRATOR"),
+            "protocol injected: {text}"
+        );
+        assert!(
+            text.contains("explicitly requested orchestration"),
+            "forced intro wording: {text}"
+        );
+        assert!(
+            !text.contains("echo:m2:orchestrate:"),
+            "prefix stripped from the model's prompt: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}

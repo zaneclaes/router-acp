@@ -36,11 +36,12 @@ SDK traps below, which were all discovered the hard way.
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`) AND per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) |
-| `src/usage.rs` | proactive usage-cap poller: reads a provider usage API (`anthropic-oauth`: CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep), `anthropic_cordons` (pure, tested: overage-gated, `limits[].scope.model.display_name` match — never a hardcoded model list), `spawn_usage_poller` (interval loop, fails open) |
+| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (reads Codex's own on-disk rate-limit snapshot from the newest `~/.codex/sessions/**/rollout-*.jsonl`; `codex_cordons` — credits-gated, account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. `spawn_usage_poller` (interval loop, fails open) |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
 | `src/tasklist.rs` | `detect_task_list(text) -> Option<usize>` — recognizes multi-part task lists (markdown numbers/bullets, inline `(1)(2)`, semantic "first…then…finally" ordering) for auto-orchestration; pure + unit-tested |
+| `src/tickets.rs` | ticket-context loading: `find_ticket_refs` (configured `prefix` at word start + digits), `fetch_ticket` (rule's argv with `$TICKET` substituted, no shell, 20s timeout, output capped), `enrich_prompt` (prepends framed ticket content BEFORE orchestration detection/classification; per-session dedup via `injected_tickets`, 5-min global `ticket_cache`, fail-open, disclosed). Pluggable across ticketing systems (linear/jira/gh CLIs) |
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment |
 | `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
 | `src/bin/mock_agent.rs` | scripted downstream for tests (below) |
@@ -146,8 +147,12 @@ SDK traps below, which were all discovered the hard way.
   a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*);
   **fail-open** (any poll/token/parse error → no cordon; the reactive per-agent
   cordon is the safety net); self-lifts at absolute `resets_at`. Codex has no
-  out-of-band usage endpoint (rate limits arrive in response headers), so it
-  keeps only the reactive cordon. Tests: `usage::tests` (pure) +
+  *pollable* usage endpoint (rate limits arrive in HTTP response headers, and
+  Cloudflare 403s any non-Codex client — even `/backend-api/me`), so
+  `codex-rollout` instead reads Codex's own on-disk snapshot from its rollout
+  JSONL (last-known as of Codex's most recent turn, undocumented format → parse
+  fails open; the reactive cordon backstops the staleness gap). Tests:
+  `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
@@ -209,10 +214,16 @@ SDK traps below, which were all discovered the hard way.
   `frame_transcript`. The disclosure states which path was used. Regression-tested
   in `switch_directive_hands_off_…`, `switch_falls_back_to_log_transcript_when_summary_fails`,
   `low_confidence_pin_auto_upgrades_…`, `auto_upgrade_disabled_…`, `skill_routing_switches_…`.
-- **Auto-orchestration** (`orchestration.*`, off by default): `on_prompt` calls
-  `maybe_trigger_orchestration` (returns `bool`) when `!explicit_routing` (a
-  `[router:]` directive or `model:` shorthand sets `explicit_routing` and
-  suppresses it). **Precedence:** it runs BEFORE `skill_routing`, and
+- **Auto-orchestration** (`orchestration.*`, off by default): the prompt tail
+  now runs in an async `dispatch_prompt` task (spawned from `on_prompt`) so
+  `tickets::enrich_prompt` executes FIRST — orchestration detection and
+  classification see the ticket-ENRICHED prompt ("Fix HAI-1234" routes on the
+  ticket's real content). `dispatch_prompt` calls `maybe_trigger_orchestration`
+  (returns `bool`) when `!explicit_routing` (a `[router:]` directive or `model:`
+  shorthand sets `explicit_routing` and suppresses it); an
+  `orchestrate:`/`orchestrator:` prompt prefix (reserved tokens in the shorthand
+  tokenizer) FORCES it, bypassing every gate including `enabled` and list
+  detection. **Precedence:** it runs BEFORE `skill_routing`, and
   `skill_routing` is gated on `!orchestrating_now` — so a multi-part task list
   *always* orchestrates even if it names a skill; the planner decides when to
   invoke that skill (end-of-work skills like shipping run last, per the injected

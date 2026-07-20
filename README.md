@@ -152,10 +152,13 @@ and it always tells the user what happened:
   `headroom.cordon_default_secs` when no time was reported), and later
   routing disclosures include the cordon and its remaining time.
 - **Proactive per-candidate usage cordons.** Beyond reacting to errors, the
-  router can poll a provider's own usage API and cordon an *exhausted model*
-  before it's ever tried. Enable per-agent with `usage_source` (e.g.
-  `anthropic-oauth`, which reads the CLI OAuth token and
-  `GET /api/oauth/usage`). A model-scoped weekly cap at 100% cordons just that
+  router can read a provider's own usage state and cordon an *exhausted model*
+  before it's ever tried. Enable per-agent with `usage_source`:
+  `anthropic-oauth` polls the Claude usage API (`GET /api/oauth/usage`);
+  `codex-rollout` reads Codex's on-disk rate-limit snapshot (Codex has no
+  pollable endpoint — its limits arrive as response headers, so this is the
+  last-known snapshot from its rollout files, with the reactive cordon as
+  backstop). A model-scoped weekly cap at 100% cordons just that
   candidate; an all-models or session cap cordons the whole agent — but only
   when the overage/credit pool has no headroom (credits cover you otherwise).
   It's **generic** (which models are exhausted is read from the API, never
@@ -354,6 +357,20 @@ this works in **any** ACP client and plain chat session — no recipe, no `summo
 extension, no wrapper. See [`ROUTERS.md`](ROUTERS.md) and
 [`ORCHESTRATION.md`](ORCHESTRATION.md).
 
+Two related prompt features:
+
+- **Force it**: start a message with `orchestrate:` (or `orchestrator:`) to run
+  the pipeline on any task, list or not — it overrides every auto-detection
+  gate (including `orchestration.enabled`).
+- **Ticket context** (`ticket_context`, pluggable): when a prompt references a
+  ticket id (e.g. "Fix HAI-1234"), the router runs the configured command
+  (`linear issue view $TICKET`, `jira …`, `gh issue view …` — any CLI that
+  prints the ticket) and prepends the ticket's content to the prompt **before**
+  classification and orchestration detection. A bare ticket mention thus routes
+  on the ticket's real scope, and a ticket whose body is a work list triggers
+  orchestration — with the planner delegating its parts. Fail-open (a bad fetch
+  never blocks the turn), once per ticket per session, fetches cached ~5 min.
+
 > **Caveat — the planner must use `delegate_task`.** Sub-session routing, the
 > cross-lineage review, and the `parent_session_id`/`run_label` rows all depend
 > on the planner calling `delegate_task`. Some adapters ship a *built-in*
@@ -426,13 +443,14 @@ example.
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
 | `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). |
 | `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
-| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. |
+| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshot (`~/.codex/sessions/**/rollout-*.jsonl`) — last-known (Codex has no pollable endpoint), reactive cordon backstops it. |
 | `failover.enabled` | `true` | Fail a pinned session over to the next best candidate on limit/outage (only before any output streamed this turn). |
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |
 | `auto_upgrade.enabled` | `true` | Auto-switch a pinned session up to a more capable model when confidence drops. `false` disables it (explicit `[router: switch=…]` still works). |
 | `auto_upgrade.confidence_threshold` | `0.55` | Upgrade when confidence (pinned quality − struggle) falls below this. Higher = more eager; `0` ≈ never. |
 | `skill_routing[]` | `[]` | Rules forcing a skill onto a model class: `pattern` (skill name, matched as `/name` or a standalone token) → `candidates` (candidate globs in preference order). Mid-session it switches; pre-pin it steers routing. |
+| `ticket_context[]` | `[]` | Ticket-loading rules: `prefix` (e.g. `HAI-`, matched at a word start + digits) → `command` (argv, `$TICKET` substituted, run without a shell) whose stdout is prepended to the prompt before routing. Pluggable across ticketing systems; fail-open. |
 | `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review→submit protocol. |
 | `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task. |
 | `orchestration.planner[]` | frontier globs | Planner/orchestrator candidate globs, best first (first eligible wins). |
