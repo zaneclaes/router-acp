@@ -2927,10 +2927,13 @@ fn candidate_matches(pattern: &str, candidate: &CandidateId) -> bool {
         || crate::candidate::glob_match(pattern, &candidate.to_string())
 }
 
-/// The best eligible candidate matching any of `patterns` (preference order) —
-/// not cordoned, quarantined, or excluded. Patterns are candidate globs, so a
-/// skill can name a model *class* (`*opus*`) rather than a specific id. Mirrors
-/// how `prefer` degrades gracefully: the router picks the best available match.
+/// The best eligible candidate matching any of `patterns` — not cordoned,
+/// quarantined, or excluded. Patterns are candidate globs, so a skill can name
+/// a model *class* (`*opus*`) rather than a specific id. The patterns define
+/// the POOL; the pick within it follows the deterministic-routing tie-break
+/// order (preference-adjusted quality → pattern order → config order), so
+/// `agents[].preference` actually biases planner/skill steering — pattern
+/// order alone used to win, which made `preference` a no-op here.
 fn first_eligible_candidate(
     shared: &Arc<Shared>,
     patterns: &[String],
@@ -2938,12 +2941,23 @@ fn first_eligible_candidate(
     excluded: &[String],
 ) -> Option<CandidateId> {
     let views = shared.eligible_views(&RequiredCaps::default(), class);
-    patterns.iter().find_map(|pat| {
-        views
-            .iter()
-            .find(|v| candidate_matches(pat, &v.id) && !is_excluded(&v.id, excluded))
-            .map(|v| v.id.clone())
-    })
+    views
+        .iter()
+        .filter(|v| !is_excluded(&v.id, excluded))
+        .filter_map(|v| {
+            patterns
+                .iter()
+                .position(|pat| candidate_matches(pat, &v.id))
+                .map(|pat_idx| (v, pat_idx))
+        })
+        .max_by(|(a, a_pat), (b, b_pat)| {
+            (a.quality + a.preference)
+                .partial_cmp(&(b.quality + b.preference))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b_pat.cmp(a_pat))
+                .then(b.config_index.cmp(&a.config_index))
+        })
+        .map(|(v, _)| v.id.clone())
 }
 
 /// Resolve a loose model reference (from the `model:` shorthand) to the best

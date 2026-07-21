@@ -1976,6 +1976,62 @@ async fn orchestration_pins_planner_and_injects_protocol_on_a_list() {
 }
 
 #[tokio::test]
+async fn orchestration_planner_pick_honors_agent_preference() {
+    let state = temp_state_file("orch-pref");
+    // Planner globs list b/m2 FIRST (like the live `["*sol*", "*fable*"]`
+    // config), and b/m2 has the higher raw quality (0.90 vs 0.87) — but agent
+    // `a` carries `preference: 0.15`, so a/m1's preference-adjusted quality
+    // (1.02) must win the planner seat. Pattern order alone used to decide,
+    // which made raising `preference` a no-op for orchestration.
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
+         \x20 - { pattern: \"a/*\", default_quality: 0.87 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\", \"*m1*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]).replace(
+            "    model_selection:",
+            "    preference: 0.15\n    model_selection:"
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating a 3-part task on a/m1"),
+            "preferred agent won the planner seat: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:"),
+            "ran on the preferred planner: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn orchestration_delegate_children_inherit_run_label_and_parent() {
     // An orchestrating session that actually delegates gets a linked, labelled
     // sub-session row — the observability the DB was missing when the planner
@@ -3344,8 +3400,20 @@ async fn reviewer_prefers_opposite_lineage_of_planner_symmetrically() {
     // With the SAME reviewer glob list, the resolved reviewer must be the
     // opposite lineage of whichever planner is chosen — enforced in code
     // (resolve_reviewers filters agent != planner.agent), not by prose.
+    // Both candidates share one quality score (custom table) and no
+    // preference, so glob order is the planner tie-break in each direction.
     // Direction 1: planner globs prefer *sol* → planner b/gpt-sol → the
     // injected protocol must pin the review to a/fable-5.
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"*\", default_quality: 0.90 }\n",
+    )
+    .unwrap();
     for (planner_globs, expect_planner_echo, expect_reviewer) in [
         ("[\"*sol*\", \"*fable*\"]", "echo:gpt-sol:", "a/fable-5"),
         ("[\"*fable*\", \"*sol*\"]", "echo:fable-5:", "b/gpt-sol"),
@@ -3353,13 +3421,14 @@ async fn reviewer_prefers_opposite_lineage_of_planner_symmetrically() {
         let state = temp_state_file("orch-symmetry");
         let log = temp_log("orch-symmetry");
         let yaml = format!(
-            "state_file: {}\ndelegation: {{ enabled: false }}\n\
+            "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
              auto_upgrade: {{ enabled: false }}\n\
              orchestration:\n  enabled: true\n  min_items: 2\n\
              \x20 planner: {planner_globs}\n\
              \x20 reviewer: [\"*sol*\", \"*fable*\"]\n\
              agents:\n{}{}",
             state.display(),
+            scores.display(),
             agent_yaml(
                 "a",
                 &[("fable-5", 5)],

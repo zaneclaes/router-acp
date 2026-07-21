@@ -73,13 +73,14 @@ async fn poll_all(shared: &Arc<Shared>) -> HashMap<CandidateId, UsageCordon> {
                     continue;
                 }
             },
-            UsageSourceConfig::CodexRollout => match latest_codex_rate_limits() {
-                Some(rl) => codex_cordons(&rl, &candidates, SystemTime::now()),
-                None => {
+            UsageSourceConfig::CodexRollout => {
+                let snapshots = latest_codex_rate_limits();
+                if snapshots.is_empty() {
                     tracing::debug!(agent = %agent.name, "no codex rate-limit snapshot; failing open");
                     continue;
                 }
-            },
+                codex_cordons(&snapshots, &candidates, SystemTime::now())
+            }
         };
         if !cordons.is_empty() {
             tracing::info!(
@@ -327,18 +328,27 @@ fn upsert_latest(
 // Codex rollout (on-disk snapshot)
 // ----------------------------------------------------------------------
 
-/// The most recent `rate_limits` object Codex wrote to its session rollouts.
-/// Codex has no pollable usage endpoint, but it records a rate-limit snapshot
-/// (from response headers) into `~/.codex/sessions/**/rollout-*.jsonl` on each
-/// turn; we read the newest one. `None` if nothing is found.
-fn latest_codex_rate_limits() -> Option<Value> {
-    let home = std::env::var_os("HOME")?;
+/// The most recent `rate_limits` snapshot PER LIMIT POOL that Codex wrote to
+/// its session rollouts. Codex has no pollable usage endpoint, but it records
+/// rate-limit snapshots (from response headers) into
+/// `~/.codex/sessions/**/rollout-*.jsonl` on each turn — one per limit pool,
+/// tagged `limit_id` ("codex", "premium", …). The pools must be kept separate:
+/// the newest line overall is often a pool with `primary: null` (no window
+/// data), which used to mask an exhausted sibling pool and let the router keep
+/// routing to a dead seat (observed live 2026-07-21: "premium" snapshots hid
+/// the "codex" pool sitting at 100% for the week). Empty if nothing is found.
+fn latest_codex_rate_limits() -> Vec<Value> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
     let root = std::path::Path::new(&home).join(".codex/sessions");
     // Collect rollout files (sessions/YYYY/MM/DD/rollout-*.jsonl), newest first.
     let mut files: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
     collect_rollouts(&root, 0, &mut files);
     files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
-    // Use the newest file that actually contains a rate_limits snapshot.
+    // Files newest-first, lines within each scanned newest-first — so the
+    // first snapshot seen for a pool is its most recent.
+    let mut pools: HashMap<String, Value> = HashMap::new();
     for (_, path) in files.iter().take(8) {
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
@@ -353,11 +363,16 @@ fn latest_codex_rate_limits() -> Option<Value> {
                     .and_then(|p| p.get("rate_limits"))
                     .filter(|rl| !rl.is_null())
             {
-                return Some(rl.clone());
+                let pool = rl
+                    .get("limit_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                pools.entry(pool).or_insert_with(|| rl.clone());
             }
         }
     }
-    None
+    pools.into_values().collect()
 }
 
 /// Recursively collect `rollout-*.jsonl` files under `dir` (depth-bounded: the
@@ -392,58 +407,75 @@ fn collect_rollouts(
     }
 }
 
-/// Given a Codex `rate_limits` snapshot and an agent's candidates, decide which
-/// are cordoned. Codex caps are account-wide (not model-scoped), so a saturated
-/// window cordons every candidate — but only when credits can't cover it, and
-/// only while the window's `resets_at` is still in the future.
+/// Given the newest Codex `rate_limits` snapshot of each limit pool and an
+/// agent's candidates, decide which are cordoned. Codex caps are account-wide
+/// (not model-scoped), so any pool's saturated window cordons every candidate —
+/// but only when credits can't cover it, and only while the window's
+/// `resets_at` is still in the future.
 pub fn codex_cordons(
-    rate_limits: &Value,
+    rate_limits: &[Value],
     candidates: &[(CandidateId, String)],
     now: SystemTime,
 ) -> HashMap<CandidateId, UsageCordon> {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
-    // Credits cover plan limits (the overage equivalent).
-    let has_credits = rate_limits
-        .get("credits")
-        .and_then(|c| c.get("has_credits"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    if has_credits {
-        return out;
-    }
-    for key in ["primary", "secondary"] {
-        let Some(win) = rate_limits.get(key).filter(|w| !w.is_null()) else {
-            continue;
-        };
-        let used = win
-            .get("used_percent")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if used < 100.0 {
+    for pool in rate_limits {
+        if codex_credits_usable(pool) {
             continue;
         }
-        let Some(epoch) = win.get("resets_at").and_then(Value::as_u64) else {
-            continue;
-        };
-        let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
-        if resets_at <= now {
-            continue; // already reset
-        }
-        let window_minutes = win
-            .get("window_minutes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let reason = if window_minutes >= 1440 {
-            "Codex weekly usage limit reached".to_string()
-        } else {
-            "Codex 5-hour usage limit reached".to_string()
-        };
-        let rfc = epoch_to_rfc3339(epoch);
-        for (id, _) in candidates {
-            upsert_latest(&mut out, id, &reason, resets_at, &rfc);
+        for key in ["primary", "secondary"] {
+            let Some(win) = pool.get(key).filter(|w| !w.is_null()) else {
+                continue;
+            };
+            let used = win
+                .get("used_percent")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if used < 100.0 {
+                continue;
+            }
+            let Some(epoch) = win.get("resets_at").and_then(Value::as_u64) else {
+                continue;
+            };
+            let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
+            if resets_at <= now {
+                continue; // already reset
+            }
+            let window_minutes = win
+                .get("window_minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let reason = if window_minutes >= 1440 {
+                "Codex weekly usage limit reached".to_string()
+            } else {
+                "Codex 5-hour usage limit reached".to_string()
+            };
+            let rfc = epoch_to_rfc3339(epoch);
+            for (id, _) in candidates {
+                upsert_latest(&mut out, id, &reason, resets_at, &rfc);
+            }
         }
     }
     out
+}
+
+/// True when the snapshot's credit pool can actually absorb usage past the
+/// plan window — `unlimited`, or a positive `balance`. A bare
+/// `has_credits: true` is NOT enough: team-plan snapshots report
+/// `has_credits: true, balance: null` while the seat is hard-blocked at 100%
+/// (observed live 2026-07-21 — Sol turns stalled for four consecutive
+/// conversations while this gate failed open on `has_credits`).
+fn codex_credits_usable(rate_limits: &Value) -> bool {
+    let Some(credits) = rate_limits.get("credits") else {
+        return false;
+    };
+    if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    credits.get("has_credits").and_then(Value::as_bool) == Some(true)
+        && credits
+            .get("balance")
+            .and_then(Value::as_f64)
+            .is_some_and(|b| b > 0.0)
 }
 
 /// Format a Unix epoch (seconds) as a UTC RFC-3339 timestamp, for advertising.
@@ -572,46 +604,94 @@ mod tests {
         ]
     }
 
+    fn future_epoch(now: SystemTime) -> u64 {
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400
+    }
+
     #[test]
     fn codex_saturated_window_no_credits_cordons_all() {
         let now = SystemTime::now();
-        let future = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 86_400;
-        let rl = json!({
-            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future },
+        let rl = vec![json!({
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
             "secondary": serde_json::Value::Null,
             "credits": { "has_credits": false }
-        });
+        })];
         let c = codex_cordons(&rl, &codex_cands(), now);
         assert_eq!(c.len(), 2, "both codex candidates cordoned: {c:?}");
         assert!(c.values().all(|v| v.reason.contains("weekly")));
     }
 
     #[test]
-    fn codex_credits_available_cordons_nothing() {
+    fn codex_usable_credits_cordon_nothing() {
         let now = SystemTime::now();
-        let future = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 86_400;
-        let rl = json!({
-            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future },
-            "credits": { "has_credits": true }
-        });
-        assert!(codex_cordons(&rl, &codex_cands(), now).is_empty());
+        for credits in [
+            json!({ "has_credits": true, "unlimited": true, "balance": serde_json::Value::Null }),
+            json!({ "has_credits": true, "unlimited": false, "balance": 12.5 }),
+        ] {
+            let rl = vec![json!({
+                "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
+                "credits": credits
+            })];
+            assert!(codex_cordons(&rl, &codex_cands(), now).is_empty());
+        }
+    }
+
+    // The live 2026-07-21 shape: team plan, weekly window at 100%,
+    // `has_credits: true` but no usable balance — the seat was hard-blocked,
+    // so a bare `has_credits` must NOT fail open.
+    #[test]
+    fn codex_has_credits_without_balance_still_cordons() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limit_id": "codex",
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
+            "secondary": serde_json::Value::Null,
+            "credits": { "has_credits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "plan_type": "team"
+        })];
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert_eq!(c.len(), 2, "both codex candidates cordoned: {c:?}");
+    }
+
+    // The other half of the live failure: the newest snapshot belongs to a
+    // different limit pool ("premium") with no window data at all. The
+    // exhausted "codex" pool must still cordon — pools are merged, not
+    // shadowed by whichever was written last.
+    #[test]
+    fn codex_windowless_pool_does_not_mask_exhausted_pool() {
+        let now = SystemTime::now();
+        let rl = vec![
+            json!({
+                "limit_id": "premium",
+                "primary": serde_json::Value::Null,
+                "secondary": serde_json::Value::Null,
+                "credits": { "has_credits": true, "unlimited": false, "balance": serde_json::Value::Null }
+            }),
+            json!({
+                "limit_id": "codex",
+                "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
+                "secondary": serde_json::Value::Null,
+                "credits": { "has_credits": true, "unlimited": false, "balance": serde_json::Value::Null }
+            }),
+        ];
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert_eq!(
+            c.len(),
+            2,
+            "exhausted pool cordons despite windowless sibling: {c:?}"
+        );
     }
 
     #[test]
     fn codex_past_reset_cordons_nothing() {
         let now = SystemTime::now();
-        let rl = json!({
+        let rl = vec![json!({
             "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1 },
             "credits": { "has_credits": false }
-        });
+        })];
         assert!(
             codex_cordons(&rl, &codex_cands(), now).is_empty(),
             "past reset ignored"

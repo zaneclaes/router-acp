@@ -155,12 +155,14 @@ and it always tells the user what happened:
   router can read a provider's own usage state and cordon an *exhausted model*
   before it's ever tried. Enable per-agent with `usage_source`:
   `anthropic-oauth` polls the Claude usage API (`GET /api/oauth/usage`);
-  `codex-rollout` reads Codex's on-disk rate-limit snapshot (Codex has no
-  pollable endpoint — its limits arrive as response headers, so this is the
-  last-known snapshot from its rollout files, with the reactive cordon as
-  backstop). A model-scoped weekly cap at 100% cordons just that
-  candidate; an all-models or session cap cordons the whole agent — but only
-  when the overage/credit pool has no headroom (credits cover you otherwise).
+  `codex-rollout` reads Codex's on-disk rate-limit snapshots (Codex has no
+  pollable endpoint — its limits arrive as response headers, so these are the
+  last-known snapshots from its rollout files, kept per limit pool, with the
+  reactive cordon as backstop). A model-scoped weekly cap at 100% cordons just
+  that candidate; an all-models or session cap cordons the whole agent — but
+  only when the overage/credit pool has no *usable* headroom (Anthropic:
+  overage/spend not exhausted; Codex: `unlimited` credits or a positive
+  `balance` — a bare `has_credits` flag doesn't count).
   It's **generic** (which models are exhausted is read from the API, never
   hardcoded), **fails open** (a usage-endpoint hiccup never makes a model
   unroutable), and self-lifts at the reported reset. Cordoned candidates are
@@ -443,7 +445,7 @@ example.
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
 | `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). |
 | `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
-| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshot (`~/.codex/sessions/**/rollout-*.jsonl`) — last-known (Codex has no pollable endpoint), reactive cordon backstops it. |
+| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
 | `failover.enabled` | `true` | Fail a pinned session over to the next best candidate on limit/outage (only before any output streamed this turn). |
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |
@@ -453,7 +455,7 @@ example.
 | `ticket_context[]` | `[]` | Ticket-loading rules: `prefix` (e.g. `HAI-`, matched at a word start + digits) → `command` (argv, `$TICKET` substituted, run without a shell) whose stdout is prepended to the prompt before routing. Pluggable across ticketing systems; fail-open. |
 | `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review→submit protocol. |
 | `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task. |
-| `orchestration.planner[]` | frontier globs | Planner/orchestrator candidate globs, best first (first eligible wins). |
+| `orchestration.planner[]` | frontier globs | Planner/orchestrator candidate globs — they define the pool; the pick is by preference-adjusted quality (`quality + agents[].preference`), glob order breaking ties. |
 | `orchestration.reviewer[]` | frontier globs | Preferred cross-lineage reviewer globs handed to the orchestrator (it should pick a different lineage than the planner). |
 | `orchestration.submit` | `branch` | Submission gate given to the orchestrator: `never \| branch \| pr \| merge` (a merge is only permitted after the review approves). |
 | `orchestration.max_fix_rounds` | `2` | Max review → fix → re-review rounds. |

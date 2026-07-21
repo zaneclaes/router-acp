@@ -122,8 +122,11 @@ orchestration:
   max_fix_rounds: 2
 ```
 
-- **`planner`** / **`reviewer`** are candidate globs in preference order, matched
-  against the routeable pool. The reviewer is always forced onto a lineage other
+- **`planner`** / **`reviewer`** are candidate globs matched against the
+  routeable pool. The globs define the *pool*; the planner pick within it is by
+  preference-adjusted quality (`quality + agents[].preference`), with glob
+  order and config order as tie-breaks — so a configured agent `preference`
+  biases the planner seat. The reviewer is always forced onto a lineage other
   than the planner's when one is available; if only the planner's lineage is
   routeable, the review runs on the most capable other model it can (disclosed).
 - **`submit: merge`** still gates the merge on an approving review — see the

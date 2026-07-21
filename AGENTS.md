@@ -36,7 +36,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`) AND per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) |
-| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (reads Codex's own on-disk rate-limit snapshot from the newest `~/.codex/sessions/**/rollout-*.jsonl`; `codex_cordons` — credits-gated, account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. `spawn_usage_poller` (interval loop, fails open) |
+| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (reads Codex's own on-disk rate-limit snapshots from `~/.codex/sessions/**/rollout-*.jsonl`, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. `spawn_usage_poller` (interval loop, fails open) |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
@@ -151,7 +151,14 @@ SDK traps below, which were all discovered the hard way.
   Cloudflare 403s any non-Codex client — even `/backend-api/me`), so
   `codex-rollout` instead reads Codex's own on-disk snapshot from its rollout
   JSONL (last-known as of Codex's most recent turn, undocumented format → parse
-  fails open; the reactive cordon backstops the staleness gap). Tests:
+  fails open; the reactive cordon backstops the staleness gap). Codex writes one
+  snapshot per limit pool (`limit_id`: "codex", "premium", …), so the reader
+  keeps the newest snapshot PER POOL — taking only the newest line let a
+  windowless "premium" snapshot mask the "codex" pool sitting at 100% (live
+  2026-07-21). Its credits gate requires *usable* credits (`unlimited` or a
+  positive `balance`) — a bare `has_credits: true` with `balance: null` is
+  reported on team plans whose seat is hard-blocked, and failing open on it
+  routed four consecutive conversations to a dead seat. Tests:
   `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
