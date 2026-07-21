@@ -15,9 +15,12 @@ agents:
     # token) and mark a candidate unroutable when its weekly cap is exhausted
     # with no overage/credit headroom — before the router even tries it.
     usage_source: { type: anthropic-oauth }
+    # lineage: anthropic  # company tag (default: agent name). Cross-lineage
+    #                     # review compares this — two agents on the same vendor
+    #                     # should share a lineage so one never reviews the other.
     # Larger plan on claude: prefer it over codex when candidates are
     # otherwise comparable (small additive utility bonus).
-    preference: 0.05
+    preference: 0.1
     models:
       - { id: haiku, display_name: Claude Haiku, cost_rank: 1 }
       - { id: sonnet, display_name: Claude Sonnet, cost_rank: 2 }
@@ -80,8 +83,8 @@ cordon:
 orchestration:
   enabled: true
   min_items: 2                              # smallest list treated as multi-part
-  planner: ["*sol*", "*fable*", "*opus*", "*gpt-5.5*"]   # best first
-  reviewer: ["*gpt-5.5*", "*sol*", "*opus*"]             # prefer a different lineage
+  planner: ["*fable*", "*sol*"]             # best first
+  reviewer: ["*sol*", "*fable*"]            # a different lineage will be preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
 

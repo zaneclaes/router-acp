@@ -250,8 +250,14 @@ SDK traps below, which were all discovered the hard way.
   session/close|delete. `maybe_trigger_orchestration` also sets
   `run_label = "orchestrate"` (so the planner + its delegate rows group) and
   resolves explicit **different-lineage** reviewer candidate ids via
-  `resolve_reviewers` (configured `reviewer` globs restricted to `agent !=
-  planner.agent`, else any other-lineage candidate), injected into the protocol.
+  `resolve_reviewers`. **Lineage = company, not agent name**: compared via
+  `agent_lineage` (the `agents[].lineage` config tag, defaulting to the agent
+  name) — so the same `reviewer` glob list yields the opposite company of
+  whoever planned, and two agents backed by one vendor (tagged with the same
+  `lineage`) are never each other's reviewer. Configured `reviewer` globs are
+  restricted to different-lineage candidates, else any other-lineage candidate;
+  injected into the protocol. Regression: `reviewer_prefers_opposite_lineage_…`
+  (symmetry) + `same_company_agents_share_a_lineage_for_review`.
   Tests: `orchestration_*` in `tests/protocol.rs` + `tasklist::tests`. Do NOT
   `include_str!`-style couple this to goose — router-acp still has no notion of
   recipes; it only detects lists and drives delegation.

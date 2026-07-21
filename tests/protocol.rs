@@ -3338,3 +3338,118 @@ async fn orchestrate_prefix_forces_orchestration_without_a_list() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn reviewer_prefers_opposite_lineage_of_planner_symmetrically() {
+    // With the SAME reviewer glob list, the resolved reviewer must be the
+    // opposite lineage of whichever planner is chosen — enforced in code
+    // (resolve_reviewers filters agent != planner.agent), not by prose.
+    // Direction 1: planner globs prefer *sol* → planner b/gpt-sol → the
+    // injected protocol must pin the review to a/fable-5.
+    for (planner_globs, expect_planner_echo, expect_reviewer) in [
+        ("[\"*sol*\", \"*fable*\"]", "echo:gpt-sol:", "a/fable-5"),
+        ("[\"*fable*\", \"*sol*\"]", "echo:fable-5:", "b/gpt-sol"),
+    ] {
+        let state = temp_state_file("orch-symmetry");
+        let log = temp_log("orch-symmetry");
+        let yaml = format!(
+            "state_file: {}\ndelegation: {{ enabled: false }}\n\
+             auto_upgrade: {{ enabled: false }}\n\
+             orchestration:\n  enabled: true\n  min_items: 2\n\
+             \x20 planner: {planner_globs}\n\
+             \x20 reviewer: [\"*sol*\", \"*fable*\"]\n\
+             agents:\n{}{}",
+            state.display(),
+            agent_yaml(
+                "a",
+                &[("fable-5", 5)],
+                &[("MOCK_LOG", &log.display().to_string())]
+            ),
+            agent_yaml(
+                "b",
+                &[("gpt-sol", 5)],
+                &[("MOCK_LOG", &log.display().to_string())]
+            ),
+        );
+        run_test(yaml, async |cx, observed| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            let resp = prompt_text(&cx, &sid, "Do these:\n1. one\n2. two").await?;
+            assert_eq!(resp.stop_reason, StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert!(
+                text.contains(expect_planner_echo),
+                "planner {expect_planner_echo} pinned (globs {planner_globs}): {text}"
+            );
+            assert!(
+                text.contains(&format!("set to one of: {expect_reviewer}")),
+                "review pinned to opposite lineage {expect_reviewer}: {text}"
+            );
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn same_company_agents_share_a_lineage_for_review() {
+    // Lineage = company, not agent name. Two agents both tagged
+    // `lineage: anthropic` (e.g. two Claude seats): a planner on one must NOT
+    // review on the other — even though the reviewer glob prefers its model and
+    // the agent NAME differs — and must land on the other company instead.
+    let state = temp_state_file("orch-lineage");
+    let log = temp_log("orch-lineage");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n\
+         \x20 planner: [\"*fable*\"]\n\
+         \x20 reviewer: [\"*opus*\", \"*sol*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "claude-a",
+            &[("fable-5", 5)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+        .replace(
+            "model_selection:",
+            "lineage: anthropic\n    model_selection:"
+        ),
+        agent_yaml(
+            "claude-b",
+            &[("opus-x", 4)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+        .replace(
+            "model_selection:",
+            "lineage: anthropic\n    model_selection:"
+        ),
+        agent_yaml(
+            "d",
+            &[("gpt-sol", 5)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "Do these:\n1. one\n2. two").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:fable-5:"),
+            "planner on claude-a/fable-5: {text}"
+        );
+        assert!(
+            text.contains("set to one of: d/gpt-sol"),
+            "review must skip same-company claude-b/opus-x and land on d/gpt-sol: {text}"
+        );
+        assert!(
+            !text.contains("one of: claude-b/opus-x"),
+            "same-lineage sibling must not be offered as reviewer: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}

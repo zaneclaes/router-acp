@@ -85,8 +85,8 @@ skill_routing:
 orchestration:
   enabled: false
   min_items: 2                              # smallest list treated as multi-part
-  planner: ["*sol*", "*fable*", "*opus*", "*gpt-5.5*"]   # best first
-  reviewer: ["*gpt-5.5*", "*sol*", "*opus*"]             # prefer a different lineage
+  planner: ["*fable*", "*sol*"]             # best first
+  reviewer: ["*sol*", "*fable*"]            # a different lineage will be preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
 
@@ -103,7 +103,7 @@ agents:
     budget_prompts_5h: 400
     usage_source:               # proactive cordons from the Anthropic usage API
       type: anthropic-oauth     # (reads the CLI OAuth token; see `cordon` above)
-    preference: 0.05            # prefer this agent when candidates are
+    preference: 0.1             # prefer this agent when candidates are
                                 # otherwise comparable (bigger seat/plan)
     models:
       # ids must exactly match the downstream model selector's values;

@@ -525,6 +525,13 @@ pub struct AgentConfig {
     /// usage caps and cordons this agent's candidates that are exhausted.
     #[serde(default)]
     pub usage_source: Option<UsageSourceConfig>,
+    /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
+    /// agent name. Orchestration's cross-lineage review compares THIS — the
+    /// point is a reviewer whose models come from a **different company** (and
+    /// thus behave differently), so two agents backed by the same vendor (e.g.
+    /// two Claude seats) should declare the same `lineage`.
+    #[serde(default)]
+    pub lineage: Option<String>,
 }
 
 fn default_budget() -> u32 {

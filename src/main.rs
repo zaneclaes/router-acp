@@ -248,7 +248,12 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     delegate_cost
                 };
-                let cross_lineage = kids.iter().any(|(_, c)| c.agent != s.agent);
+                // Lineage = company (agents[].lineage, default agent name):
+                // a delegate on a same-vendor sibling agent is NOT cross-lineage.
+                let cross_lineage = kids.iter().any(|(_, c)| {
+                    router_acp::session::agent_lineage(&cfg, &c.agent)
+                        != router_acp::session::agent_lineage(&cfg, &s.agent)
+                });
                 if !kids.is_empty() {
                     delegated_runs += 1;
                 }

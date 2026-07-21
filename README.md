@@ -463,6 +463,7 @@ example.
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
 | `agents[].models[]` | – | `id` (must exactly match the downstream selector's value for `config-option`), optional `display_name`, `cost_rank` (1 = cheapest/least scarce). |
 | `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). |
+| `agents[].lineage` | agent name | Model-company tag (e.g. `anthropic`, `openai`). Orchestration's cross-lineage review requires the reviewer's lineage to differ from the planner's — the intent is a different **company** with different failure modes — so two agents backed by the same vendor should declare the same `lineage`. |
 | `agents[].preference` | `0` | Additive utility tie-break for this agent (`auto`) and within-tier tie-break (`pareto-code`). Keep small, e.g. `0.05`. |
 | `routers.auto.complexity_scales_tradeoff` | `true` | Scale the tradeoff by `1 − complexity`: cost matters for trivial prompts, quality dominates hard ones. |
 | `routers.static.candidate` | – | `agent/model` default for `static`. |

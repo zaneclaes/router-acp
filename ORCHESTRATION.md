@@ -138,9 +138,16 @@ orchestration:
   trivial → haiku/mini; "rework the retry state machine" reads hard → frontier.
   This is why the protocol insists on honest subtask prompts.
 - **Reviewer** — a resolved, eligible candidate of a **different lineage** than
-  the planner. A single-session run can't catch bad decomposition (planner blind
-  spots) or bad integration (three individually-fine fixes that fight each
-  other); a different-lineage reviewer with different failure modes can.
+  the planner. Lineage means **company**, not agent name: it's the
+  `agents[].lineage` tag (default: the agent name), compared in code by
+  `resolve_reviewers` — the same `reviewer` glob list therefore yields the
+  *opposite* company of whoever planned (fable plans → sol reviews; sol plans →
+  fable reviews). Two agents backed by the same vendor (e.g. two Claude seats)
+  should declare the same `lineage` so a sibling seat is never mistaken for an
+  independent reviewer. Why company: a single-session run can't catch bad
+  decomposition (planner blind spots) or bad integration (three
+  individually-fine fixes that fight each other); only a model family with
+  genuinely **different failure modes** can.
 
 ## Why this raises quality while lowering usage
 

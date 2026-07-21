@@ -3102,9 +3102,22 @@ fn detect_skill_route<'a>(cfg: &'a Config, prompt: &[ContentBlock]) -> Option<&'
         .find(|r| prompt_mentions_skill(&text, &r.pattern))
 }
 
-/// Resolve concrete reviewer candidates of a DIFFERENT lineage than the planner
-/// (preferring the configured `reviewer` globs, then any other-lineage
-/// candidate). Empty only when the planner's lineage is the sole one available.
+/// The company lineage of an agent: the configured `agents[].lineage` tag, or
+/// the agent name when none is declared. Cross-lineage review compares THIS —
+/// the goal is a reviewer from a **different company** (different failure
+/// modes), so two agents backed by the same vendor share a lineage.
+pub fn agent_lineage(cfg: &Config, agent: &str) -> String {
+    cfg.agents
+        .iter()
+        .find(|a| a.name == agent)
+        .and_then(|a| a.lineage.clone())
+        .unwrap_or_else(|| agent.to_string())
+}
+
+/// Resolve concrete reviewer candidates of a DIFFERENT lineage (company) than
+/// the planner (preferring the configured `reviewer` globs, then any
+/// other-lineage candidate). Empty only when the planner's lineage is the sole
+/// one available.
 fn resolve_reviewers(
     shared: &Arc<Shared>,
     cfg: &crate::config::OrchestrationConfig,
@@ -3112,12 +3125,13 @@ fn resolve_reviewers(
     class: TaskClass,
     excluded: &[String],
 ) -> Vec<CandidateId> {
+    let planner_lineage = agent_lineage(&shared.cfg, &planner.agent);
     let views = shared.eligible_views(&RequiredCaps::default(), class);
     let mut out: Vec<CandidateId> = Vec::new();
     // 1. Configured reviewer globs, restricted to a different lineage.
     for pat in &cfg.reviewer {
         for v in &views {
-            if v.id.agent != planner.agent
+            if agent_lineage(&shared.cfg, &v.id.agent) != planner_lineage
                 && candidate_matches(pat, &v.id)
                 && !is_excluded(&v.id, excluded)
                 && !out.contains(&v.id)
@@ -3129,7 +3143,9 @@ fn resolve_reviewers(
     // 2. Fallback: any eligible candidate of a different lineage.
     if out.is_empty() {
         for v in &views {
-            if v.id.agent != planner.agent && !is_excluded(&v.id, excluded) && !out.contains(&v.id)
+            if agent_lineage(&shared.cfg, &v.id.agent) != planner_lineage
+                && !is_excluded(&v.id, excluded)
+                && !out.contains(&v.id)
             {
                 out.push(v.id.clone());
             }
@@ -3157,7 +3173,7 @@ fn build_orchestration_instructions(
     reviewers: &[CandidateId],
 ) -> String {
     let o = &cfg.orchestration;
-    let lineage = &planner.agent;
+    let lineage = agent_lineage(cfg, &planner.agent);
     let intro = if forced && parts < 2 {
         "The user explicitly requested orchestration for the task below.".to_string()
     } else {
@@ -3357,9 +3373,9 @@ fn maybe_trigger_orchestration(
             shared,
             router_sid,
             format!(
-                "router-acp · note: no candidate of a different lineage than the planner \
-                 ({}) is available for review; orchestrating anyway",
-                planner.agent
+                "router-acp · note: no candidate of a different lineage (company) than the \
+                 planner ({}) is available for review; orchestrating anyway",
+                agent_lineage(&shared.cfg, &planner.agent)
             ),
         );
     }
