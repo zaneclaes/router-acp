@@ -994,6 +994,41 @@ async fn delegate_task_routes_to_lower_cost_candidate() {
 }
 
 #[tokio::test]
+async fn delegate_without_required_auto_mode_fails_closed() {
+    let state = temp_state_file("delegate-mode-required");
+    let log = temp_log("delegate-mode-required");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 1 }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "cheap",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &log.display().to_string())],
+        ),
+        agent_yaml("fancy", &[("opus", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "hard integration work\nDELEGATE:fix button color",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("delegate-error:") && text.contains("no configured auto mode"),
+            "delegate must fail instead of prompting under a default mode: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn five_bug_acceptance_scenario() {
     // First prompt routes by auto to the high-quality parent; the parent
     // delegates three isolated fixes which run on the lower-cost candidate

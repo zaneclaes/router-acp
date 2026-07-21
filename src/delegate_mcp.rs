@@ -660,8 +660,17 @@ pub async fn run_delegate_task(
                                 parent = router_sid,
                                 candidate = %candidate,
                                 %err,
-                                "delegate session mode rejected; continuing in downstream default"
+                                "delegate session mode rejected; trying the next candidate"
                             );
+                            last_err = Some(format!(
+                                "delegate {candidate} rejected required auto mode: {err}"
+                            ));
+                            close_downstream_session(
+                                shared,
+                                &opened.process_key,
+                                &opened.downstream_sid,
+                            );
+                            continue;
                         } else {
                             tracing::info!(
                                 parent = router_sid,
@@ -671,12 +680,23 @@ pub async fn run_delegate_task(
                             );
                         }
                     }
-                    None => tracing::warn!(
-                        parent = router_sid,
-                        candidate = %candidate,
-                        ?available_modes,
-                        "delegate candidate has no mapping for auto mode; continuing in downstream default"
-                    ),
+                    None => {
+                        tracing::warn!(
+                            parent = router_sid,
+                            candidate = %candidate,
+                            ?available_modes,
+                            "delegate candidate has no required auto mode; trying the next candidate"
+                        );
+                        last_err = Some(format!(
+                            "delegate {candidate} has no configured auto mode among {available_modes:?}"
+                        ));
+                        close_downstream_session(
+                            shared,
+                            &opened.process_key,
+                            &opened.downstream_sid,
+                        );
+                        continue;
+                    }
                 }
                 tracing::info!(
                     parent = router_sid,

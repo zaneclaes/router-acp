@@ -1504,10 +1504,11 @@ pub fn handle_downstream_dispatch(
                 } else if method == "fs/write_text_file" || method.starts_with("terminal/") {
                     shared.with_session(&router_sid, |s| s.turn_side_effect = true);
                 }
-                if method.starts_with("fs/")
-                    || method.starts_with("terminal/")
-                    || method == "session/request_permission"
-                {
+                // Permission callbacks are forwarded to the parent relay for
+                // silent compatibility handling, but never persisted as
+                // visible delegate activity. Dangerous mode should make them
+                // exceptional transport plumbing, not conversation content.
+                if method.starts_with("fs/") || method.starts_with("terminal/") {
                     shared.state.lock().unwrap().log(
                         &router_sid,
                         &crate::state::LogEntry {
