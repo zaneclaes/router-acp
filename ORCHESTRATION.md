@@ -107,7 +107,7 @@ observable:
 | Cross-lineage review is *routeable* | in an orchestrating session the delegate pool is **not** cheaper-only — it may reach same-/higher-tier peers, so a frontier reviewer of another lineage can be delegated to |
 | Concrete reviewer ids | `resolve_reviewers` picks eligible candidates whose lineage ≠ the planner's (from `orchestration.reviewer` globs, else any other lineage) and injects them into the protocol |
 | Iterating on a subtask | `delegate_task keep_open: true` returns a `delegate_id`; `delegate_followup` sends more turns to that same sub-agent (context preserved); `delegate_close` frees it |
-| Observability | the planner and every delegate get state-DB rows sharing `run_label = "orchestrate"`; delegate rows link to the parent via `parent_session_id`; each routing decision is disclosed and recorded |
+| Observability | the planner and every delegate get state-DB rows sharing `run_label = "orchestrate"`; delegate rows link to the parent via `parent_session_id`; full prompts/responses plus live text/tool activity and each routing decision are recorded |
 | Planner selection | steered pre-pin (`candidate_override`) or switched mid-session (`switch_pin`) to the best eligible `orchestration.planner` glob |
 
 ## Configuration

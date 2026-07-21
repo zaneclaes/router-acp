@@ -1535,7 +1535,19 @@ pub fn handle_downstream_dispatch(
                 if msg.method() == "session/update" {
                     if let Some(text) = agent_chunk_text(msg.params()) {
                         capture.lock().unwrap().push_str(&text);
+                        let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
+                        shared.state.lock().unwrap().log(
+                            &sub_sid,
+                            &crate::state::LogEntry {
+                                kind: "agent_progress".to_string(),
+                                role: "agent".to_string(),
+                                summary: text,
+                                ..Default::default()
+                            },
+                        );
                     }
+                    let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
+                    log_downstream_event(shared, &sub_sid, msg.params());
                     // Attribute the delegate's cost/context to its own state row
                     // (id mirrors run_delegate_task's `sub_sid`).
                     if let Some(update) = msg.params().get("update")
@@ -1561,6 +1573,24 @@ pub fn handle_downstream_dispatch(
             Dispatch::Request(msg, responder) => {
                 // Permission/fs/terminal callbacks go live to the client
                 // under the parent router session id.
+                let method = msg.method().to_string();
+                if method.starts_with("fs/")
+                    || method.starts_with("terminal/")
+                    || method == "session/request_permission"
+                {
+                    let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
+                    shared.state.lock().unwrap().log(
+                        &sub_sid,
+                        &crate::state::LogEntry {
+                            kind: method.replace('/', "_"),
+                            role: "tool".to_string(),
+                            summary: method,
+                            detail: Some(msg.params().clone()),
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                    );
+                }
                 let fwd = relay::with_session_id(&msg, &parent_router_sid)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;
                 Ok(Handled::Yes)
@@ -1604,7 +1634,7 @@ where
 /// Resolve a client-requested mode id against a downstream's advertised
 /// modes: the agent's configured `mode_map` wins, then an exact id match.
 /// `None` means the downstream has no equivalent mode.
-fn resolve_mode_id(
+pub(crate) fn resolve_mode_id(
     shared: &Arc<Shared>,
     agent_name: &str,
     requested: &str,
