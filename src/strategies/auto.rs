@@ -122,8 +122,12 @@ impl RouterStrategy for AutoStrategy {
         Ok(to_ranked(
             scored,
             move |utility, view| {
+                // Effective (availability-scaled) preference; negative means
+                // the seat is past its plan cap and burning paid overage.
                 let pref = if view.preference > 0.0 {
                     format!(" + pref {:.2}", view.preference)
+                } else if view.preference < 0.0 {
+                    format!(" - pref {:.2} (seat on paid overage)", -view.preference)
                 } else {
                     String::new()
                 };
@@ -257,6 +261,35 @@ mod tests {
             ranked[0].reason.contains("pref 0.05"),
             "{}",
             ranked[0].reason
+        );
+    }
+
+    #[test]
+    fn overage_penalty_prefers_the_free_seat() {
+        // The availability-scaled preference arrives here already folded into
+        // `view.preference`: claude's 0.1 bonus became a −0.25 penalty (seat
+        // on paid overage) while codex still has free plan budget. The free
+        // seat must win despite claude's static preference — and the reason
+        // string must say why.
+        let s = AutoStrategy::new(cfg(3.0));
+        let mut p = vec![
+            view("claude", "fable", 5, 0, 0.95, CodingTier::High, 1.0),
+            view("codex", "sol", 5, 1, 0.93, CodingTier::High, 1.0),
+        ];
+        p[0].preference = 0.1;
+        let ranked = s.rank(&ctx(), &p).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "claude");
+        p[0].preference = -0.25;
+        let ranked = s.rank(&ctx(), &p).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "codex");
+        let claude = ranked
+            .iter()
+            .find(|r| r.candidate.agent == "claude")
+            .unwrap();
+        assert!(
+            claude.reason.contains("- pref 0.25 (seat on paid overage)"),
+            "{}",
+            claude.reason
         );
     }
 

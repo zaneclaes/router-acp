@@ -35,8 +35,8 @@ SDK traps below, which were all discovered the hard way.
 | `src/classifier.rs` | heuristic task class + complexity (data-driven), cwd language fingerprint, optional Ollama backend (own mini HTTP client; never uses seat agents) |
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
-| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`) AND per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) |
-| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (reads Codex's own on-disk rate-limit snapshots from `~/.codex/sessions/**/rollout-*.jsonl`, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. `spawn_usage_poller` (interval loop, fails open) |
+| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
+| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (reads Codex's own on-disk rate-limit snapshots from `~/.codex/sessions/**/rollout-*.jsonl`, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. Also computes graded **seat availability** for dynamic preference scaling (`anthropic_availability`/`codex_availability`/`availability_from_windows`) and ingests client hints (`apply_availability_hint`, ext notification `router-acp/availability_hint`, consumed session-less in `on_catch_all`). `spawn_usage_poller` (interval loop, fails open, installs cordons + availability) |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
@@ -162,6 +162,22 @@ SDK traps below, which were all discovered the hard way.
   `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
+- **Dynamic preference scaling** (`availability_preference.*`; same poll +
+  client hints): `agents[].preference` is the *static* base — `eligible_views`
+  computes the effective preference as `preference × plan_headroom`, minus
+  `overage_penalty` when the seat is past its cap but routable via
+  overage/credits (spending real money). That keeps the router on whichever
+  seat still has FREE plan budget among comparable candidates; a saturated
+  seat with no overage headroom is a cordon, never a penalty. Availability
+  sources: the usage poller (`set_polled_availability`, wholesale per cycle)
+  and the `router-acp/availability_hint` extension notification
+  (`apply_availability_hint` — session-less, consumed in `on_catch_all`,
+  per-agent TTL `hint_ttl_secs`; a fresh hint outranks the poll, e.g. Kory
+  Code's live per-minute view). Disclosure: signed `pref` term in the `auto`
+  reason string and `details.availability`
+  (`[{candidate,plan_headroom,on_overage,source}]`) on the pin metadata.
+  Tests: `usage::tests` (availability + hints), `headroom::tests`
+  (hint TTL/fallback), `auto::tests::overage_penalty_prefers_the_free_seat`.
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
   least one downstream supports them and the router implements the full
   remap path.

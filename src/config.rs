@@ -208,6 +208,52 @@ impl Default for CordonConfig {
     }
 }
 
+/// Dynamic preference scaling from seat availability. The static
+/// `agents[].preference` is a *plan-size* tie-break; this section makes it
+/// track reality: the bonus fades as the seat's free plan budget is consumed
+/// (`preference × plan_headroom`), and a seat whose cap is exhausted but still
+/// routable via overage/credits takes a utility *penalty* — so when one seat
+/// still has free team-plan budget and the other is burning paid overage, the
+/// free seat wins among candidates of comparable quality. Availability comes
+/// from the usage poller (`agents[].usage_source`) and from client
+/// `availability_hint` extension notifications (see README).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvailabilityPreferenceConfig {
+    /// Master switch (default on). When off, `agents[].preference` applies
+    /// statically and availability hints are ignored.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Utility penalty for a candidate whose seat is past its plan cap and
+    /// spending overage/credit budget. Sized like `preference` (same additive
+    /// utility scale): large enough to outweigh any static preference bonus,
+    /// small enough not to override real quality differences.
+    #[serde(default = "default_overage_penalty")]
+    pub overage_penalty: f64,
+    /// How long a client availability hint stays authoritative before the
+    /// router falls back to its own poll, in seconds.
+    #[serde(default = "default_hint_ttl_secs")]
+    pub hint_ttl_secs: u64,
+}
+
+fn default_overage_penalty() -> f64 {
+    0.25
+}
+
+fn default_hint_ttl_secs() -> u64 {
+    10 * 60
+}
+
+impl Default for AvailabilityPreferenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            overage_penalty: default_overage_penalty(),
+            hint_ttl_secs: default_hint_ttl_secs(),
+        }
+    }
+}
+
 /// How to read a provider's usage/rate-limit data for an agent's candidates, so
 /// they can be cordoned before their cap is hit. Generic across providers; the
 /// specific model caps are discovered from the API response, never hardcoded.
@@ -726,6 +772,10 @@ pub struct Config {
     /// `usage_source`).
     #[serde(default)]
     pub cordon: CordonConfig,
+    /// Dynamic preference scaling from seat availability (default on; inert
+    /// until a usage poll or a client hint reports availability).
+    #[serde(default)]
+    pub availability_preference: AvailabilityPreferenceConfig,
     #[serde(default)]
     pub failover: FailoverConfig,
     #[serde(default)]
@@ -947,6 +997,11 @@ impl Config {
                     agent.name
                 )));
             }
+        }
+        if !(0.0..=1.0).contains(&self.availability_preference.overage_penalty) {
+            return Err(ConfigError(
+                "availability_preference.overage_penalty must be between 0 and 1".into(),
+            ));
         }
         if self.delegation.max_concurrent == 0 {
             return Err(ConfigError("delegation.max_concurrent must be >= 1".into()));

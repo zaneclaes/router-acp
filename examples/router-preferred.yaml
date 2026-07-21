@@ -19,7 +19,10 @@ agents:
     #                     # review compares this — two agents on the same vendor
     #                     # should share a lineage so one never reviews the other.
     # Larger plan on claude: prefer it over codex when candidates are
-    # otherwise comparable (small additive utility bonus).
+    # otherwise comparable (small additive utility bonus). This is the STATIC
+    # base — `availability_preference` (below) scales it with the seat's free
+    # plan budget and flips it into a penalty when the seat is burning paid
+    # overage, so the "free" seat wins while this one is spending money.
     preference: 0.1
     models:
       - { id: haiku, display_name: Claude Haiku, cost_rank: 1 }
@@ -79,6 +82,21 @@ routers:
 cordon:
   enabled: true
   poll_secs: 300
+
+# Dynamic preference scaling (on by default). The static `agents[].preference`
+# tie-break tracks seat availability: the bonus fades as the seat's free plan
+# budget is consumed (preference × plan_headroom), and a seat past its cap but
+# still routable via overage/credits takes `overage_penalty` off its utility —
+# so the router always favors the seat with free team-plan budget among
+# candidates of comparable quality. Availability comes from the same usage
+# polls as `cordon` plus optional client hints (the `router-acp/
+# availability_hint` extension notification; e.g. Kory Code pushes its own
+# per-minute seat-usage view). A fresh hint outranks the poll for
+# `hint_ttl_secs`, then the poll rules again.
+availability_preference:
+  enabled: true
+  overage_penalty: 0.25   # utility penalty while a seat spends overage budget
+  hint_ttl_secs: 600      # how long a client hint stays authoritative
 
 orchestration:
   enabled: true

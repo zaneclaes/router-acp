@@ -23,6 +23,24 @@ pub struct UsageCordon {
     pub resets_at_rfc3339: String,
 }
 
+/// Graded seat availability for one candidate — the input to dynamic
+/// preference scaling. Unlike a [`UsageCordon`] (binary: unroutable), this
+/// describes how much *free* plan budget the candidate's seat still has and
+/// whether the seat has tipped into paid overage. Produced by the usage
+/// poller and by client `availability_hint` extension notifications.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeatAvailability {
+    /// Fraction of the seat's plan budget still free for this candidate, in
+    /// [0, 1] (min across the plan windows that cover it).
+    pub plan_headroom: f64,
+    /// The plan cap is exhausted and overage/credits are absorbing usage:
+    /// still routable, but every turn now spends real money.
+    pub on_overage: bool,
+    /// Who reported it: `"poll"` (the router's own usage poller) or `"hint"`
+    /// (a client availability hint).
+    pub source: &'static str,
+}
+
 #[derive(Debug, Default)]
 struct AgentWindow {
     prompts: VecDeque<Instant>,
@@ -56,6 +74,13 @@ pub struct HeadroomTracker {
     /// wholesale by the usage poller each cycle (`set_usage_cordons`); each
     /// entry self-lifts at its absolute `resets_at`.
     usage_cordons: HashMap<CandidateId, UsageCordon>,
+    /// Seat availability from the router's own usage poller. Recomputed
+    /// wholesale each poll cycle.
+    availability_poll: HashMap<CandidateId, SeatAvailability>,
+    /// Seat availability hinted by the client, per agent, with an absolute
+    /// expiry — a fresh hint wins over the poll for that agent's candidates;
+    /// an expired one is ignored (the poll remains the floor).
+    availability_hints: HashMap<String, (HashMap<CandidateId, SeatAvailability>, SystemTime)>,
 }
 
 impl HeadroomTracker {
@@ -70,6 +95,8 @@ impl HeadroomTracker {
             candidates: HashMap::new(),
             cordons: HashMap::new(),
             usage_cordons: HashMap::new(),
+            availability_poll: HashMap::new(),
+            availability_hints: HashMap::new(),
         }
     }
 
@@ -98,6 +125,61 @@ impl HeadroomTracker {
             .filter(|(_, c)| c.resets_at > now)
             .map(|(id, c)| (id.clone(), c.clone()))
             .collect()
+    }
+
+    /// Replace the poller's seat-availability snapshot wholesale (like
+    /// `set_usage_cordons`, the poller computes an authoritative set each
+    /// cycle).
+    pub fn set_polled_availability(
+        &mut self,
+        availability: HashMap<CandidateId, SeatAvailability>,
+    ) {
+        self.availability_poll = availability;
+    }
+
+    /// Install a client availability hint for one agent's candidates, valid
+    /// until `expires_at`. Replaces any previous hint for that agent.
+    pub fn set_hinted_availability(
+        &mut self,
+        agent: &str,
+        availability: HashMap<CandidateId, SeatAvailability>,
+        expires_at: SystemTime,
+    ) {
+        self.availability_hints
+            .insert(agent.to_string(), (availability, expires_at));
+    }
+
+    /// Seat availability for a candidate: the client hint while fresh (the
+    /// client's view is typically newer than the poll), else the poller's.
+    /// `None` means no source has data — the candidate's static preference
+    /// applies unscaled.
+    pub fn availability(&self, id: &CandidateId) -> Option<SeatAvailability> {
+        self.availability_at(id, SystemTime::now())
+    }
+
+    pub fn availability_at(&self, id: &CandidateId, now: SystemTime) -> Option<SeatAvailability> {
+        if let Some((map, expires_at)) = self.availability_hints.get(&id.agent)
+            && *expires_at > now
+            && let Some(a) = map.get(id)
+        {
+            return Some(a.clone());
+        }
+        self.availability_poll.get(id).cloned()
+    }
+
+    /// All candidates with known seat availability (hint-fresh over poll),
+    /// for the routing disclosure.
+    pub fn availabilities(&self) -> Vec<(CandidateId, SeatAvailability)> {
+        let now = SystemTime::now();
+        let mut out: HashMap<CandidateId, SeatAvailability> = self.availability_poll.clone();
+        for (map, expires_at) in self.availability_hints.values() {
+            if *expires_at > now {
+                out.extend(map.iter().map(|(id, a)| (id.clone(), a.clone())));
+            }
+        }
+        let mut list: Vec<_> = out.into_iter().collect();
+        list.sort_by_key(|(id, _)| id.to_string());
+        list
     }
 
     /// Cordon an agent off from routing for `duration` (the parsed
@@ -392,5 +474,39 @@ mod tests {
     fn unknown_agent_defaults_to_full_headroom() {
         let mut t = tracker(10);
         assert_eq!(t.headroom("codex"), 1.0);
+    }
+
+    #[test]
+    fn availability_prefers_fresh_hint_and_expires_to_poll() {
+        let mut t = tracker(10);
+        let id = CandidateId::new("claude", "sonnet");
+        let now = SystemTime::now();
+        assert!(t.availability_at(&id, now).is_none());
+
+        let polled = SeatAvailability {
+            plan_headroom: 0.6,
+            on_overage: false,
+            source: "poll",
+        };
+        t.set_polled_availability(HashMap::from([(id.clone(), polled.clone())]));
+        assert_eq!(t.availability_at(&id, now), Some(polled.clone()));
+
+        let hinted = SeatAvailability {
+            plan_headroom: 0.0,
+            on_overage: true,
+            source: "hint",
+        };
+        t.set_hinted_availability(
+            "claude",
+            HashMap::from([(id.clone(), hinted.clone())]),
+            now + Duration::from_secs(60),
+        );
+        assert_eq!(t.availability_at(&id, now), Some(hinted));
+        // Hint expired: back to the poll's view.
+        let later = now + Duration::from_secs(61);
+        assert_eq!(t.availability_at(&id, later), Some(polled));
+        // A hint for one agent never affects another's candidates.
+        let other = CandidateId::new("codex", "gpt-5.5");
+        assert!(t.availability_at(&other, now).is_none());
     }
 }

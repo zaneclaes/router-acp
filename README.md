@@ -203,6 +203,60 @@ prompt zeroes an agent's headroom and the router walks the fallback chain; a
 candidate that keeps failing pre-prompt is quarantined for a cool-off. Errors
 after a session is pinned are surfaced, never rerouted.
 
+### Dynamic preference: route to the free seat
+
+`agents[].preference` is a static tie-break ("this seat has the bigger
+plan"). With `availability_preference` (on by default) it tracks reality
+instead of staying frozen:
+
+- **The bonus fades with the seat's free plan budget** — effective
+  preference is `preference × plan_headroom`, where `plan_headroom` is the
+  minimum free fraction across the plan windows that cover the candidate
+  (model-scoped weekly caps count only for their model).
+- **A seat burning paid overage takes a penalty.** When a candidate's cap is
+  exhausted but it stays routable because the overage/credit pool absorbs
+  usage, its utility drops by `availability_preference.overage_penalty`
+  (default 0.25) — so among candidates of comparable quality the router
+  always picks the seat that still has *free* team-plan budget, and only
+  spends overage money when nothing comparable is free. (A saturated seat
+  with *no* overage headroom is a cordon, not a penalty — see above.)
+
+Availability comes from two sources:
+
+- the same provider usage polls that drive proactive cordons
+  (`agents[].usage_source` + `cordon.enabled`), and
+- **client availability hints**: the `router-acp/availability_hint`
+  extension notification. A client that watches seat usage itself (Kory Code
+  polls both providers every minute, including a live Codex
+  `account/rateLimits/read` that beats the router's on-disk snapshots) can
+  push its view:
+
+  ```json
+  {
+    "method": "router-acp/availability_hint",
+    "params": {
+      "ttl_secs": 300,
+      "agents": [
+        { "agent": "claude",
+          "windows": [ { "percent": 72, "scope": null, "active": false },
+                       { "percent": 100, "scope": "Fable", "active": true } ],
+          "overage": { "enabled": true, "percent": 40 } },
+        { "agent": "codex",
+          "windows": [ { "percent": 35, "scope": null } ] }
+      ]
+    }
+  }
+  ```
+
+  A fresh hint outranks the router's own poll for that agent until it
+  expires (`ttl_secs`, default `availability_preference.hint_ttl_secs`);
+  unknown agents and windowless entries are ignored, and hints are
+  session-less (send once per connection, not per session). Effective
+  preferences show up in the routing disclosure (`+ pref 0.07` /
+  `- pref 0.25 (seat on paid overage)`) and the known availability set rides
+  the pin metadata as `_meta.router_acp.availability`
+  (`[{candidate, plan_headroom, on_overage, source}]`).
+
 ### Quality data
 
 Per-class quality scores, coding tiers/percentiles, and context windows live
@@ -443,8 +497,11 @@ example.
 | `headroom.quarantine_failures` | `3` | Pre-prompt failures in the window before quarantine. |
 | `headroom.quarantine_cooloff_secs` | `600` | Quarantine cool-off. |
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
-| `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). |
+| `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). Also gates the usage polling that feeds `availability_preference`. |
 | `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
+| `availability_preference.enabled` | `true` | Dynamic preference scaling: effective preference = `agents[].preference × plan_headroom`, minus `overage_penalty` while the seat spends overage/credit budget. Off = static preference, hints ignored. |
+| `availability_preference.overage_penalty` | `0.25` | Utility penalty for a candidate whose seat is past its plan cap and burning paid overage. Same additive scale as `agents[].preference`. |
+| `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
 | `failover.enabled` | `true` | Fail a pinned session over to the next best candidate on limit/outage (only before any output streamed this turn). |
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
@@ -466,7 +523,7 @@ example.
 | `agents[].models[]` | – | `id` (must exactly match the downstream selector's value for `config-option`), optional `display_name`, `cost_rank` (1 = cheapest/least scarce). |
 | `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). |
 | `agents[].lineage` | agent name | Model-company tag (e.g. `anthropic`, `openai`). Orchestration's cross-lineage review requires the reviewer's lineage to differ from the planner's — the intent is a different **company** with different failure modes — so two agents backed by the same vendor should declare the same `lineage`. |
-| `agents[].preference` | `0` | Additive utility tie-break for this agent (`auto`) and within-tier tie-break (`pareto-code`). Keep small, e.g. `0.05`. |
+| `agents[].preference` | `0` | Additive utility tie-break for this agent (`auto`) and within-tier tie-break (`pareto-code`). Keep small, e.g. `0.05`. Scaled dynamically by seat availability unless `availability_preference.enabled: false`. |
 | `routers.auto.complexity_scales_tradeoff` | `true` | Scale the tradeoff by `1 − complexity`: cost matters for trivial prompts, quality dominates hard ones. |
 | `routers.static.candidate` | – | `agent/model` default for `static`. |
 | `routers.static.allow_fallback` | `false` | Fall back in config order if the static candidate is unavailable. |

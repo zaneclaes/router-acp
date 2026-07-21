@@ -3255,6 +3255,107 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
 }
 
 // ======================================================================
+// Availability hints → dynamic preference
+// ======================================================================
+
+#[tokio::test]
+async fn availability_hint_penalizes_overage_seat() {
+    let state = temp_state_file("avail-hint");
+    let log = temp_log("avail-hint");
+    // Pure-quality routing: a/fable-5 (0.92) beats b/sonnet (0.8) — until a
+    // client hint reports agent `a`'s seat past its cap and burning paid
+    // overage, whose penalty (default 0.25) hands the win to the free seat.
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("fable-5", 5)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+
+        // Baseline: quality routing picks a/fable-5.
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "do the thing").await?;
+        assert!(
+            agent_text(&observed, &sid).contains("echo:fable-5:"),
+            "baseline routes to the higher-quality candidate"
+        );
+
+        // Client hint: agent `a` weekly cap saturated, overage absorbing.
+        let hint = agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({
+                "ttl_secs": 300,
+                "agents": [{
+                    "agent": "a",
+                    "windows": [{ "percent": 100, "scope": serde_json::Value::Null, "active": true }],
+                    "overage": { "enabled": true, "percent": 40 }
+                }]
+            }),
+        )?;
+        cx.send_notification(hint)?;
+
+        // The notification is processed asynchronously; wait for it to land.
+        let fable = router_acp::candidate::CandidateId::new("a", "fable-5");
+        for _ in 0..50 {
+            if shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&fable)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let avail = shared
+            .headroom
+            .lock()
+            .unwrap()
+            .availability(&fable)
+            .expect("hint applied");
+        assert!(avail.on_overage && avail.source == "hint", "{avail:?}");
+
+        // New sessions now route to the free seat despite the quality gap.
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid2, "do the thing").await?;
+        assert!(
+            agent_text(&observed, &sid2).contains("echo:sonnet:"),
+            "overage-penalized seat loses to the free seat: {}",
+            agent_text(&observed, &sid2)
+        );
+
+        // The pin metadata discloses the availability inputs.
+        let routing = open_state(&state)
+            .get(&sid2)
+            .and_then(|s| s.routing)
+            .expect("routing recorded");
+        let availability = routing["availability"]
+            .as_array()
+            .expect("availability array in metadata");
+        assert!(
+            availability.iter().any(|a| a["candidate"] == "a/fable-5"
+                && a["on_overage"] == true
+                && a["source"] == "hint"),
+            "availability disclosed: {routing}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+// ======================================================================
 // Ticket-context loading
 // ======================================================================
 

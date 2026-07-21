@@ -23,10 +23,14 @@ use serde_json::Value;
 
 use crate::candidate::CandidateId;
 use crate::config::UsageSourceConfig;
-use crate::headroom::UsageCordon;
+use crate::headroom::{SeatAvailability, UsageCordon};
 use crate::session::Shared;
 
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+/// Extension notification a client may send to share its own (often fresher)
+/// view of seat availability — see [`apply_availability_hint`] for the shape.
+pub const AVAILABILITY_HINT_METHOD: &str = "router-acp/availability_hint";
 
 /// Spawn the periodic usage poller, or `None` when cordoning is disabled or no
 /// agent declares a `usage_source`. The task recomputes the whole per-candidate
@@ -45,18 +49,34 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
         // `interval` fires immediately, so the first poll happens at startup.
         loop {
             tick.tick().await;
-            let cordons = poll_all(&shared).await;
+            let (cordons, availability) = poll_all(&shared).await;
             let n = cordons.len();
-            shared.headroom.lock().unwrap().set_usage_cordons(cordons);
-            tracing::debug!(cordoned_candidates = n, "usage cordons refreshed");
+            let a = availability.len();
+            {
+                let mut headroom = shared.headroom.lock().unwrap();
+                headroom.set_usage_cordons(cordons);
+                headroom.set_polled_availability(availability);
+            }
+            tracing::debug!(
+                cordoned_candidates = n,
+                availability_candidates = a,
+                "usage cordons refreshed"
+            );
         }
     }))
 }
 
-/// Poll every agent that has a usage source and merge the results. Agents whose
-/// poll errors contribute nothing (fail open).
-async fn poll_all(shared: &Arc<Shared>) -> HashMap<CandidateId, UsageCordon> {
+/// Poll every agent that has a usage source and merge the results: proactive
+/// cordons (unroutable) plus graded seat availability (preference scaling).
+/// Agents whose poll errors contribute nothing (fail open).
+async fn poll_all(
+    shared: &Arc<Shared>,
+) -> (
+    HashMap<CandidateId, UsageCordon>,
+    HashMap<CandidateId, SeatAvailability>,
+) {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
+    let mut avail: HashMap<CandidateId, SeatAvailability> = HashMap::new();
     for agent in &shared.cfg.agents {
         let Some(source) = &agent.usage_source else {
             continue;
@@ -65,9 +85,12 @@ async fn poll_all(shared: &Arc<Shared>) -> HashMap<CandidateId, UsageCordon> {
         if candidates.is_empty() {
             continue;
         }
-        let cordons = match source {
+        let (cordons, availability) = match source {
             UsageSourceConfig::AnthropicOauth => match fetch_anthropic_usage().await {
-                Ok(payload) => anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                Ok(payload) => (
+                    anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                    anthropic_availability(&payload, &candidates),
+                ),
                 Err(err) => {
                     tracing::debug!(agent = %agent.name, %err, "usage poll failed; failing open");
                     continue;
@@ -79,7 +102,10 @@ async fn poll_all(shared: &Arc<Shared>) -> HashMap<CandidateId, UsageCordon> {
                     tracing::debug!(agent = %agent.name, "no codex rate-limit snapshot; failing open");
                     continue;
                 }
-                codex_cordons(&snapshots, &candidates, SystemTime::now())
+                (
+                    codex_cordons(&snapshots, &candidates, SystemTime::now()),
+                    codex_availability(&snapshots, &candidates, SystemTime::now()),
+                )
             }
         };
         if !cordons.is_empty() {
@@ -90,8 +116,9 @@ async fn poll_all(shared: &Arc<Shared>) -> HashMap<CandidateId, UsageCordon> {
             );
         }
         out.extend(cordons);
+        avail.extend(availability);
     }
-    out
+    (out, avail)
 }
 
 /// `(candidate id, display name)` for every candidate of `agent`.
@@ -322,6 +349,253 @@ fn upsert_latest(
             },
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// Seat availability (pure — the unit-tested core)
+// ----------------------------------------------------------------------
+
+/// One plan window as it feeds availability: how full it is, whether it has
+/// hit its cap, and which model it covers (`None` = the whole seat).
+#[derive(Debug, Clone)]
+pub struct AvailWindow {
+    pub percent: f64,
+    pub scope: Option<String>,
+    pub saturated: bool,
+}
+
+/// Fold plan windows into per-candidate seat availability. A candidate's
+/// `plan_headroom` is the minimum free fraction across the windows that cover
+/// it; it is `on_overage` when any covering window is saturated AND the
+/// overage/credit pool can absorb the excess (without that pool the candidate
+/// is cordon territory, not preference territory). Candidates covered by no
+/// window get no entry — their static preference applies unscaled.
+pub fn availability_from_windows(
+    windows: &[AvailWindow],
+    overage_available: bool,
+    candidates: &[(CandidateId, String)],
+    source: &'static str,
+) -> HashMap<CandidateId, SeatAvailability> {
+    let mut out = HashMap::new();
+    for (id, display) in candidates {
+        let mut headroom: Option<f64> = None;
+        let mut saturated = false;
+        for w in windows {
+            let covers = match &w.scope {
+                Some(scope) => model_matches(scope, id, display),
+                None => true,
+            };
+            if !covers {
+                continue;
+            }
+            let free = (1.0 - w.percent / 100.0).clamp(0.0, 1.0);
+            headroom = Some(headroom.map_or(free, |h: f64| h.min(free)));
+            saturated |= w.saturated;
+        }
+        if let Some(plan_headroom) = headroom {
+            out.insert(
+                id.clone(),
+                SeatAvailability {
+                    plan_headroom,
+                    on_overage: saturated && overage_available,
+                    source,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Merge availability maps pessimistically (codex reports several limit
+/// pools; the tightest one governs).
+fn merge_worst(
+    into: &mut HashMap<CandidateId, SeatAvailability>,
+    from: HashMap<CandidateId, SeatAvailability>,
+) {
+    for (id, a) in from {
+        into.entry(id)
+            .and_modify(|e| {
+                e.plan_headroom = e.plan_headroom.min(a.plan_headroom);
+                e.on_overage |= a.on_overage;
+            })
+            .or_insert(a);
+    }
+}
+
+/// Seat availability from an Anthropic usage payload: every reported limit is
+/// a window (model-scoped ones cover only their candidate), and overage
+/// headroom decides whether a saturated window means "paying" or "cordoned".
+pub fn anthropic_availability(
+    payload: &Value,
+    candidates: &[(CandidateId, String)],
+) -> HashMap<CandidateId, SeatAvailability> {
+    let Some(limits) = payload.get("limits").and_then(|l| l.as_array()) else {
+        return HashMap::new();
+    };
+    let windows: Vec<AvailWindow> = limits
+        .iter()
+        .filter_map(|lim| {
+            let percent = lim.get("percent").and_then(Value::as_f64)?;
+            let severity = lim.get("severity").and_then(Value::as_str).unwrap_or("");
+            let is_active = lim
+                .get("is_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let scope = lim
+                .get("scope")
+                .and_then(|s| s.get("model"))
+                .and_then(|m| {
+                    m.get("display_name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| m.get("id").and_then(Value::as_str))
+                })
+                .map(str::to_string);
+            Some(AvailWindow {
+                percent,
+                scope,
+                saturated: percent >= 100.0 || (severity == "critical" && is_active),
+            })
+        })
+        .collect();
+    availability_from_windows(&windows, overage_has_headroom(payload), candidates, "poll")
+}
+
+/// Seat availability from Codex's per-pool rate-limit snapshots. Codex caps
+/// are account-wide, so every window covers every candidate; a window whose
+/// reset already passed is stale (fresh budget) and contributes nothing.
+pub fn codex_availability(
+    rate_limits: &[Value],
+    candidates: &[(CandidateId, String)],
+    now: SystemTime,
+) -> HashMap<CandidateId, SeatAvailability> {
+    let mut out = HashMap::new();
+    for pool in rate_limits {
+        let mut windows = Vec::new();
+        for key in ["primary", "secondary"] {
+            let Some(win) = pool.get(key).filter(|w| !w.is_null()) else {
+                continue;
+            };
+            let Some(used) = win.get("used_percent").and_then(Value::as_f64) else {
+                continue;
+            };
+            if let Some(epoch) = win.get("resets_at").and_then(Value::as_u64)
+                && SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now
+            {
+                continue; // already reset
+            }
+            windows.push(AvailWindow {
+                percent: used,
+                scope: None,
+                saturated: used >= 100.0,
+            });
+        }
+        merge_worst(
+            &mut out,
+            availability_from_windows(&windows, codex_credits_usable(pool), candidates, "poll"),
+        );
+    }
+    out
+}
+
+// ----------------------------------------------------------------------
+// Client availability hints
+// ----------------------------------------------------------------------
+
+/// Ingest a client `router-acp/availability_hint` extension notification.
+/// Clients that watch seat usage themselves (e.g. Kory Code polls both
+/// providers every minute) push their view here; a fresh hint outranks the
+/// router's own poll for that agent until it expires. Expected params:
+///
+/// ```json
+/// {
+///   "ttl_secs": 300,
+///   "agents": [
+///     { "agent": "claude",
+///       "windows": [ { "percent": 72, "scope": null, "active": false },
+///                    { "percent": 100, "scope": "Fable", "active": true } ],
+///       "overage": { "enabled": true, "percent": 40 } }
+///   ]
+/// }
+/// ```
+///
+/// Tolerant by design: unknown agents and windowless entries are skipped, and
+/// `ttl_secs` falls back to `availability_preference.hint_ttl_secs`. An
+/// entry's `windows` express plan-window fullness (`scope` names a
+/// model-scoped cap, `active` marks a limit the provider reports as biting);
+/// `overage` describes the paid pool that absorbs usage past the cap.
+pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
+    if !shared.cfg.availability_preference.enabled {
+        return;
+    }
+    let Some(agents) = params.get("agents").and_then(Value::as_array) else {
+        return;
+    };
+    let ttl = params
+        .get("ttl_secs")
+        .or_else(|| params.get("ttlSecs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(shared.cfg.availability_preference.hint_ttl_secs);
+    let now = SystemTime::now();
+    for entry in agents {
+        let Some(agent) = entry.get("agent").and_then(Value::as_str) else {
+            continue;
+        };
+        let candidates = agent_candidates(shared, agent);
+        if candidates.is_empty() {
+            continue;
+        }
+        let availability = hint_agent_availability(entry, &candidates);
+        tracing::debug!(
+            agent,
+            candidates = availability.len(),
+            ttl_secs = ttl,
+            "availability hint applied"
+        );
+        shared.headroom.lock().unwrap().set_hinted_availability(
+            agent,
+            availability,
+            now + Duration::from_secs(ttl),
+        );
+    }
+}
+
+/// Per-candidate availability from one hint agent entry (pure core of
+/// [`apply_availability_hint`]).
+pub fn hint_agent_availability(
+    entry: &Value,
+    candidates: &[(CandidateId, String)],
+) -> HashMap<CandidateId, SeatAvailability> {
+    let windows: Vec<AvailWindow> = entry
+        .get("windows")
+        .and_then(Value::as_array)
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    let percent = w.get("percent").and_then(Value::as_f64)?;
+                    let active = w.get("active").and_then(Value::as_bool).unwrap_or(false);
+                    let scope = w
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    Some(AvailWindow {
+                        percent,
+                        scope,
+                        saturated: percent >= 100.0 || active,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let overage_available = entry
+        .get("overage")
+        .map(|o| {
+            o.get("enabled").and_then(Value::as_bool) == Some(true)
+                && o.get("percent").and_then(Value::as_f64).unwrap_or(100.0) < 100.0
+        })
+        .unwrap_or(false);
+    availability_from_windows(&windows, overage_available, candidates, "hint")
 }
 
 // ----------------------------------------------------------------------
@@ -702,5 +976,116 @@ mod tests {
     fn epoch_to_rfc3339_known_values() {
         assert_eq!(epoch_to_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(epoch_to_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
+    }
+
+    // ---- Seat availability ----
+
+    #[test]
+    fn anthropic_availability_scales_and_scopes() {
+        // Fable's scoped cap is saturated; overage still has headroom, so the
+        // Fable candidate is on paid overage while Sonnet keeps the free
+        // budget implied by the seat-wide windows (min of 72% / 78% used).
+        let mut p = exhausted_payload();
+        p["extra_usage"]["utilization"] = json!(40.0);
+        p["spend"]["percent"] = json!(40);
+        let a = anthropic_availability(&p, &cands());
+        let f = &a[&fable()];
+        assert!(f.on_overage, "fable saturated + overage headroom: {f:?}");
+        assert!(f.plan_headroom.abs() < 1e-9, "fable min window is 100%");
+        let s = &a[&sonnet()];
+        assert!(!s.on_overage);
+        assert!(
+            (s.plan_headroom - 0.22).abs() < 1e-9,
+            "min(28%, 22%) free: {s:?}"
+        );
+        assert!(a.values().all(|v| v.source == "poll"));
+    }
+
+    #[test]
+    fn anthropic_availability_without_overage_is_not_on_overage() {
+        // Saturated with NO overage headroom is cordon territory, not a
+        // preference penalty.
+        let a = anthropic_availability(&exhausted_payload(), &cands());
+        assert!(!a[&fable()].on_overage);
+    }
+
+    #[test]
+    fn codex_availability_accounts_for_credits_and_reset() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limit_id": "codex",
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
+            "secondary": serde_json::Value::Null,
+            "credits": { "has_credits": true, "unlimited": false, "balance": 12.5 }
+        })];
+        let a = codex_availability(&rl, &codex_cands(), now);
+        assert_eq!(a.len(), 2, "account-wide: every candidate covered");
+        assert!(
+            a.values()
+                .all(|v| v.on_overage && v.plan_headroom.abs() < 1e-9)
+        );
+
+        // Past-reset windows are stale — no availability data at all.
+        let stale = vec![json!({
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1 },
+            "credits": { "has_credits": false }
+        })];
+        assert!(codex_availability(&stale, &codex_cands(), now).is_empty());
+    }
+
+    #[test]
+    fn codex_availability_merges_pools_pessimistically() {
+        let now = SystemTime::now();
+        let rl = vec![
+            json!({
+                "limit_id": "premium",
+                "primary": { "used_percent": 20.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
+                "credits": { "has_credits": false }
+            }),
+            json!({
+                "limit_id": "codex",
+                "primary": { "used_percent": 90.0, "window_minutes": 10080, "resets_at": future_epoch(now) },
+                "credits": { "has_credits": false }
+            }),
+        ];
+        let a = codex_availability(&rl, &codex_cands(), now);
+        assert!(
+            a.values().all(|v| (v.plan_headroom - 0.10).abs() < 1e-9),
+            "tightest pool governs: {a:?}"
+        );
+    }
+
+    #[test]
+    fn hint_availability_parses_windows_and_overage() {
+        let entry = json!({
+            "agent": "claude",
+            "windows": [
+                { "percent": 72, "scope": serde_json::Value::Null },
+                { "percent": 100, "scope": "Fable", "active": true }
+            ],
+            "overage": { "enabled": true, "percent": 40 }
+        });
+        let a = hint_agent_availability(&entry, &cands());
+        let f = &a[&fable()];
+        assert!(f.on_overage && f.plan_headroom.abs() < 1e-9);
+        let s = &a[&sonnet()];
+        assert!(!s.on_overage);
+        assert!((s.plan_headroom - 0.28).abs() < 1e-9);
+        assert!(a.values().all(|v| v.source == "hint"));
+
+        // No windows → no data → nothing to scale.
+        let empty = json!({ "agent": "claude", "overage": { "enabled": true, "percent": 0 } });
+        assert!(hint_agent_availability(&empty, &cands()).is_empty());
+
+        // Overage disabled (or absent): a saturated seat is not "paying".
+        let no_overage = json!({
+            "agent": "claude",
+            "windows": [ { "percent": 100 } ]
+        });
+        let a = hint_agent_availability(&no_overage, &cands());
+        assert!(
+            a.values()
+                .all(|v| !v.on_overage && v.plan_headroom.abs() < 1e-9)
+        );
     }
 }

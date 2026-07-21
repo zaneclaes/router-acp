@@ -712,13 +712,28 @@ impl Shared {
                 continue;
             }
             let scores = self.scores.lookup(&c.id);
-            let preference = self
+            let static_preference = self
                 .cfg
                 .agents
                 .iter()
                 .find(|a| a.name == c.id.agent)
                 .map(|a| a.preference)
                 .unwrap_or(0.0);
+            // Dynamic preference scaling: the configured bonus fades with the
+            // seat's free plan budget, and a seat running on paid overage
+            // takes a penalty — so the "free" seat wins among comparable
+            // candidates.
+            let preference = match headroom.availability(&c.id) {
+                Some(a) if self.cfg.availability_preference.enabled => {
+                    static_preference * a.plan_headroom.clamp(0.0, 1.0)
+                        - if a.on_overage {
+                            self.cfg.availability_preference.overage_penalty
+                        } else {
+                            0.0
+                        }
+                }
+                _ => static_preference,
+            };
             views.push(CandidateView {
                 headroom: headroom.headroom(&c.id.agent),
                 quality: scores.quality(class),
@@ -2485,6 +2500,23 @@ async fn pin_session(
                         })
                     })
                     .collect();
+                // Known seat availability (poll or client hint) — the inputs
+                // behind any dynamic preference scaling in `weights`.
+                let availability_json: Vec<serde_json::Value> = shared
+                    .headroom
+                    .lock()
+                    .unwrap()
+                    .availabilities()
+                    .into_iter()
+                    .map(|(id, a)| {
+                        json!({
+                            "candidate": id.to_string(),
+                            "plan_headroom": (a.plan_headroom * 100.0).round() / 100.0,
+                            "on_overage": a.on_overage,
+                            "source": a.source,
+                        })
+                    })
+                    .collect();
                 let details = json!({
                     "strategy": strategy_kind.as_str(),
                     "candidate": candidate.to_string(),
@@ -2498,6 +2530,7 @@ async fn pin_session(
                     "skipped": skipped_json,
                     "cordoned": cordons_json,
                     "usage_cordons": usage_cordons_json,
+                    "availability": availability_json,
                     "excluded": excluded_patterns,
                     "cordon_redirect": cordon_redirect.as_ref().map(|(from, reason, resets)| json!({
                         "from": from.to_string(),
@@ -5032,6 +5065,14 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
             message,
             retry: false,
         });
+    }
+    // Router-owned extension: a client's seat-availability hint (session-less;
+    // consumed here, never relayed downstream).
+    if let Dispatch::Notification(msg) = &message
+        && msg.method() == crate::usage::AVAILABILITY_HINT_METHOD
+    {
+        crate::usage::apply_availability_hint(&shared, msg.params());
+        return Ok(Handled::Yes);
     }
     let Some(router_sid) = message.message().and_then(relay::session_id_of) else {
         return Ok(Handled::No {
