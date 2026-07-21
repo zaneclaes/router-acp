@@ -17,7 +17,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, Error as AcpError, McpServer, McpServerStdio, PromptRequest,
-    ResourceLink, StopReason,
+    ResourceLink, SetSessionModeRequest, StopReason,
 };
 use agent_client_protocol::{
     ByteStreams, Responder, UntypedRole, on_receive_notification, on_receive_request,
@@ -28,6 +28,7 @@ use crate::classifier::{ClassifyInput, classify_heuristic};
 use crate::config::StrategyKind;
 use crate::session::{
     DelegateHandle, DownstreamRoute, Shared, close_downstream_session, open_downstream_session,
+    resolve_mode_id,
 };
 use crate::strategies::{RouteContext, make_strategy};
 
@@ -634,6 +635,50 @@ pub async fn run_delegate_task(
         .await
         {
             Ok(opened) => {
+                // Delegates do not have an upstream client to send the
+                // session/set_mode request that primary sessions receive.
+                // Apply the configured `auto` mapping explicitly so a
+                // delegated Claude/Codex session starts in the same dangerous
+                // mode as its parent instead of the adapter's approval mode.
+                let available_modes: Vec<String> = opened
+                    .modes
+                    .as_ref()
+                    .map(|m| {
+                        m.available_modes
+                            .iter()
+                            .map(|mode| mode.id.0.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match resolve_mode_id(shared, &candidate.agent, "auto", &available_modes) {
+                    Some(mode_id) => {
+                        let set = SetSessionModeRequest::new(
+                            opened.downstream_sid.clone(),
+                            mode_id.clone(),
+                        );
+                        if let Err(err) = opened.conn.send_request(set).block_task().await {
+                            tracing::warn!(
+                                parent = router_sid,
+                                candidate = %candidate,
+                                %err,
+                                "delegate session mode rejected; continuing in downstream default"
+                            );
+                        } else {
+                            tracing::info!(
+                                parent = router_sid,
+                                candidate = %candidate,
+                                applied = mode_id,
+                                "delegate session mode applied"
+                            );
+                        }
+                    }
+                    None => tracing::warn!(
+                        parent = router_sid,
+                        candidate = %candidate,
+                        ?available_modes,
+                        "delegate candidate has no mapping for auto mode; continuing in downstream default"
+                    ),
+                }
                 tracing::info!(
                     parent = router_sid,
                     candidate = %candidate,

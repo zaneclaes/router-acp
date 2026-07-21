@@ -895,12 +895,15 @@ fn delegation_yaml(
 ) -> String {
     format!(
         "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: {max_concurrent} }}\n\
-         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}    mode_map: {{ auto: bypassPermissions }}\n{}",
         state.display(),
         agent_yaml(
             "cheap",
             &[("haiku", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_SESSION_MODES", "default,bypassPermissions"),
+            ]
         ),
         agent_yaml("fancy", &[("opus", 3)], &[])
     )
@@ -952,6 +955,14 @@ async fn delegate_task_routes_to_lower_cost_candidate() {
         assert!(
             !servers.contains(&"router-delegate".to_string()),
             "no recursive delegate injection: {servers:?}"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e["event"] == "set_mode"
+                    && e["sessionId"] == delegate_new["sessionId"]
+                    && e["modeId"] == "bypassPermissions"
+            }),
+            "delegate session receives the configured auto-mode mapping: {events:?}"
         );
         Ok(())
     })

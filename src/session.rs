@@ -1589,7 +1589,7 @@ where
 /// Resolve a client-requested mode id against a downstream's advertised
 /// modes: the agent's configured `mode_map` wins, then an exact id match.
 /// `None` means the downstream has no equivalent mode.
-fn resolve_mode_id(
+pub(crate) fn resolve_mode_id(
     shared: &Arc<Shared>,
     agent_name: &str,
     requested: &str,
