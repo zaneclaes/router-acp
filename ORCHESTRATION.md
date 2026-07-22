@@ -123,7 +123,7 @@ observable:
 | Concrete reviewer ids | `resolve_reviewers` picks eligible candidates whose lineage ≠ the planner's (from `orchestration.reviewer` globs, else any other lineage) and injects them into the protocol |
 | Iterating on a subtask | `delegate_task keep_open: true` returns a `delegate_id`; `delegate_followup` sends more turns to that same sub-agent (context preserved); `delegate_close` frees it |
 | True parallelism despite serial tool calls | `delegate_task background: true` returns a `b-…` id immediately and runs the subtask on its own task (bounded by `delegation.max_concurrent`); `delegate_await` collects finished results exactly once and reports still-running jobs, so the planner polls with short calls instead of holding one tool call open past client idle timeouts |
-| Observability | the planner and every delegate get state-DB rows sharing `run_label = "orchestrate"`; delegate rows link to the parent via `parent_session_id`; each routing decision is disclosed and recorded |
+| Observability | the planner and every delegate get state-DB rows sharing `run_label = "orchestrate"`; delegate rows link to the parent via `parent_session_id`; full prompts/responses plus live text/tool activity and each routing decision are disclosed and recorded |
 | Planner selection | steered pre-pin (`candidate_override`) or switched mid-session (`switch_pin`) to the best eligible `orchestration.planner` glob |
 
 ## Configuration

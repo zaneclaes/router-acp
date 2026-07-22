@@ -49,21 +49,52 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
         // `interval` fires immediately, so the first poll happens at startup.
         loop {
             tick.tick().await;
-            let (cordons, availability) = poll_all(&shared).await;
-            let n = cordons.len();
-            let a = availability.len();
-            {
-                let mut headroom = shared.headroom.lock().unwrap();
-                headroom.set_usage_cordons(cordons);
-                headroom.set_polled_availability(availability);
-            }
-            tracing::debug!(
-                cordoned_candidates = n,
-                availability_candidates = a,
-                "usage cordons refreshed"
-            );
+            refresh_and_install(&shared).await;
         }
     }))
+}
+
+/// One poll cycle: recompute the whole per-candidate usage-cordon and
+/// availability sets and install them on `shared.headroom`. Shared by the
+/// periodic poller tick and the turn-end refresh ([`refresh_after_turn`]).
+pub async fn refresh_and_install(shared: &Arc<Shared>) {
+    let (cordons, availability) = poll_all(shared).await;
+    let n = cordons.len();
+    let a = availability.len();
+    {
+        let mut headroom = shared.headroom.lock().unwrap();
+        headroom.set_usage_cordons(cordons);
+        headroom.set_polled_availability(availability);
+    }
+    tracing::debug!(
+        cordoned_candidates = n,
+        availability_candidates = a,
+        "usage cordons refreshed"
+    );
+}
+
+/// Fire-and-forget usage refresh when a prompt turn completes on an agent
+/// that has a usage source — the moment the shared snapshot actually went
+/// stale. The cache self-throttles (min-refresh interval + cross-process
+/// lock), so this stays at most one upstream read per interval box-wide; and
+/// it must never delay or fail the turn itself, so it spawns and swallows
+/// every error inside (`poll_all` already fails open).
+pub fn refresh_after_turn(shared: &Arc<Shared>, agent: &str) {
+    if !shared.cfg.cordon.enabled {
+        return;
+    }
+    let has_source = shared
+        .cfg
+        .agents
+        .iter()
+        .any(|a| a.name == agent && a.usage_source.is_some());
+    if !has_source {
+        return;
+    }
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        refresh_and_install(&shared).await;
+    });
 }
 
 /// Poll every agent that has a usage source and merge the results: proactive
@@ -86,18 +117,36 @@ async fn poll_all(
             continue;
         }
         let (cordons, availability) = match source {
-            UsageSourceConfig::AnthropicOauth => match fetch_anthropic_usage().await {
-                Ok(payload) => (
-                    anthropic_cordons(&payload, &candidates, SystemTime::now()),
-                    anthropic_availability(&payload, &candidates),
-                ),
-                Err(err) => {
-                    tracing::debug!(agent = %agent.name, %err, "usage poll failed; failing open");
-                    continue;
+            UsageSourceConfig::AnthropicOauth => {
+                let cached =
+                    crate::usage_cache::cached_anthropic_usage(shared.cfg.cordon.min_refresh_secs)
+                        .await;
+                match cached {
+                    Some(payload) => (
+                        anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                        anthropic_availability(&payload, &candidates),
+                    ),
+                    None => {
+                        tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
+                        continue;
+                    }
                 }
-            },
+            }
             UsageSourceConfig::CodexRollout => {
-                let snapshots = latest_codex_rate_limits();
+                // Live RPC through the shared cache first; the rollout-file
+                // scrape stays as the fallback (an RPC failure or a missing
+                // `codex` binary must not lose the passive signal we had).
+                let mut snapshots = match crate::usage_cache::cached_codex_usage(
+                    shared.cfg.cordon.min_refresh_secs,
+                )
+                .await
+                {
+                    Some(payload) => codex_pools_from_payload(&payload),
+                    None => Vec::new(),
+                };
+                if snapshots.is_empty() {
+                    snapshots = latest_codex_rate_limits();
+                }
                 if snapshots.is_empty() {
                     tracing::debug!(agent = %agent.name, "no codex rate-limit snapshot; failing open");
                     continue;
@@ -137,8 +186,7 @@ fn agent_candidates(shared: &Arc<Shared>, agent: &str) -> Vec<(CandidateId, Stri
 // Anthropic OAuth usage
 // ----------------------------------------------------------------------
 
-async fn fetch_anthropic_usage() -> Result<Value, String> {
-    let token = anthropic_oauth_token().ok_or("no Claude OAuth token found")?;
+pub(crate) async fn fetch_anthropic_usage(token: &str) -> Result<Value, String> {
     // Pass URL + headers via a curl config on stdin so the bearer token never
     // appears in argv (visible via `ps`).
     let config = format!(
@@ -159,6 +207,10 @@ async fn curl_with_config(config: &str) -> Result<String, String> {
     let mut child = tokio::process::Command::new("curl")
         .arg("-K")
         .arg("-")
+        // The caller can be aborted mid-fetch (turn-end refresh task, process
+        // shutdown); an orphaned curl would outlive the released fetch lock
+        // and hit the endpoint concurrently with the next lock holder.
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -185,15 +237,23 @@ async fn curl_with_config(config: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Read the Claude CLI OAuth access token: first `~/.claude/.credentials.json`
+/// The Claude CLI OAuth credentials: the access token authenticates the usage
+/// fetch; the refresh token (stable across access-token rotations) is the
+/// preferred account-fingerprint input for the shared usage cache.
+pub(crate) struct OauthCredentials {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+
+/// Read the Claude CLI OAuth credentials: first `~/.claude/.credentials.json`
 /// (Linux), else the macOS Keychain (`Claude Code-credentials`).
-fn anthropic_oauth_token() -> Option<String> {
+pub(crate) fn anthropic_oauth_credentials() -> Option<OauthCredentials> {
     if let Some(home) = std::env::var_os("HOME") {
         let path = std::path::Path::new(&home).join(".claude/.credentials.json");
         if let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(tok) = token_from_credentials_json(&text)
+            && let Some(creds) = credentials_from_json(&text)
         {
-            return Some(tok);
+            return Some(creds);
         }
     }
     #[cfg(target_os = "macos")]
@@ -207,20 +267,27 @@ fn anthropic_oauth_token() -> Option<String> {
             ])
             .output()
             && out.status.success()
-            && let Some(tok) = token_from_credentials_json(&String::from_utf8_lossy(&out.stdout))
+            && let Some(creds) = credentials_from_json(&String::from_utf8_lossy(&out.stdout))
         {
-            return Some(tok);
+            return Some(creds);
         }
     }
     None
 }
 
-fn token_from_credentials_json(text: &str) -> Option<String> {
+fn credentials_from_json(text: &str) -> Option<OauthCredentials> {
     let v: Value = serde_json::from_str(text.trim()).ok()?;
-    v.get("claudeAiOauth")?
-        .get("accessToken")?
-        .as_str()
-        .map(str::to_string)
+    let oauth = v.get("claudeAiOauth")?;
+    Some(OauthCredentials {
+        access_token: oauth.get("accessToken")?.as_str()?.to_string(),
+        // Node's reader does `refreshToken || accessToken` — an empty string
+        // is falsy there, so treat it as absent to keep fingerprints aligned.
+        refresh_token: oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -461,9 +528,19 @@ pub fn anthropic_availability(
     availability_from_windows(&windows, overage_has_headroom(payload), candidates, "poll")
 }
 
+/// Codex pool objects arrive in two spellings: snake_case from rollout-file
+/// scrapes, camelCase from the app-server RPC. Read either; `null` is absent.
+fn field<'a>(v: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
+    v.get(snake)
+        .filter(|x| !x.is_null())
+        .or_else(|| v.get(camel).filter(|x| !x.is_null()))
+}
+
 /// Seat availability from Codex's per-pool rate-limit snapshots. Codex caps
 /// are account-wide, so every window covers every candidate; a window whose
-/// reset already passed is stale (fresh budget) and contributes nothing.
+/// reset already passed is stale (fresh budget) and contributes nothing. The
+/// per-member spend limit (`individual_limit`) is one more account-wide
+/// window: it drains the seat like any plan window as it fills.
 pub fn codex_availability(
     rate_limits: &[Value],
     candidates: &[(CandidateId, String)],
@@ -476,10 +553,11 @@ pub fn codex_availability(
             let Some(win) = pool.get(key).filter(|w| !w.is_null()) else {
                 continue;
             };
-            let Some(used) = win.get("used_percent").and_then(Value::as_f64) else {
+            let Some(used) = field(win, "used_percent", "usedPercent").and_then(Value::as_f64)
+            else {
                 continue;
             };
-            if let Some(epoch) = win.get("resets_at").and_then(Value::as_u64)
+            if let Some(epoch) = field(win, "resets_at", "resetsAt").and_then(Value::as_u64)
                 && SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now
             {
                 continue; // already reset
@@ -488,6 +566,19 @@ pub fn codex_availability(
                 percent: used,
                 scope: None,
                 saturated: used >= 100.0,
+            });
+        }
+        if let Some(il) = field(pool, "individual_limit", "individualLimit")
+            && let Some(remaining) =
+                field(il, "remaining_percent", "remainingPercent").and_then(Value::as_f64)
+            && !field(il, "resets_at", "resetsAt")
+                .and_then(Value::as_u64)
+                .is_some_and(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now)
+        {
+            windows.push(AvailWindow {
+                percent: (100.0 - remaining).clamp(0.0, 100.0),
+                scope: None,
+                saturated: remaining <= 0.0,
             });
         }
         merge_worst(
@@ -599,8 +690,123 @@ pub fn hint_agent_availability(
 }
 
 // ----------------------------------------------------------------------
-// Codex rollout (on-disk snapshot)
+// Codex usage (app-server RPC, rollout files as fallback)
 // ----------------------------------------------------------------------
+
+/// Account fingerprint for the Codex seat, byte-matching the Kory Code
+/// relay's recipe: sha256 of `tokens.account_id` (stable across token
+/// refreshes), else `tokens.refresh_token`, else `OPENAI_API_KEY`, else the
+/// raw `auth.json` text. `None` when signed out (no readable auth.json).
+pub(crate) fn codex_account_fingerprint() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let raw = std::fs::read_to_string(std::path::Path::new(&home).join(".codex/auth.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let pick = |v: &Value, path: &[&str]| -> Option<String> {
+        let mut cur = v.clone();
+        for p in path {
+            cur = cur.get(p)?.clone();
+        }
+        cur.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    let key = pick(&v, &["tokens", "account_id"])
+        .or_else(|| pick(&v, &["tokens", "refresh_token"]))
+        .or_else(|| pick(&v, &["OPENAI_API_KEY"]))
+        .unwrap_or(raw);
+    Some(crate::usage_cache::fingerprint(&key))
+}
+
+/// Live Codex usage: one JSON-RPC round-trip over `codex app-server` stdio
+/// (newline-delimited) — initialize, then `account/rateLimits/read`;
+/// notifications are skipped. Returns the raw camelCase result
+/// (`{rateLimits, rateLimitsByLimitId, rateLimitResetCredits}`). The child is
+/// killed when the answer (or the 20s deadline) lands.
+pub(crate) async fn fetch_codex_usage() -> Result<Value, String> {
+    tokio::time::timeout(Duration::from_secs(20), codex_rate_limits_rpc())
+        .await
+        .map_err(|_| "codex app-server timed out".to_string())?
+}
+
+async fn codex_rate_limits_rpc() -> Result<Value, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut child = tokio::process::Command::new("codex")
+        .arg("app-server")
+        // The caller can be aborted mid-RPC (timeout, turn-end refresh task,
+        // shutdown); an orphaned app-server would linger forever.
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot spawn codex: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("no codex stdin")?;
+    let stdout = child.stdout.take().ok_or("no codex stdout")?;
+    let init = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": {
+            "name": "router-acp", "title": "router-acp",
+            "version": env!("CARGO_PKG_VERSION"),
+        } },
+    });
+    stdin
+        .write_all(format!("{init}\n").as_bytes())
+        .await
+        .map_err(|e| format!("codex stdin: {e}"))?;
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("codex stdout: {e}"))?
+    {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match msg.get("id").and_then(Value::as_u64) {
+            Some(1) => {
+                if let Some(err) = msg.get("error") {
+                    return Err(format!("codex initialize failed: {err}"));
+                }
+                let req = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2,
+                    "method": "account/rateLimits/read", "params": {},
+                });
+                stdin
+                    .write_all(format!("{req}\n").as_bytes())
+                    .await
+                    .map_err(|e| format!("codex stdin: {e}"))?;
+            }
+            Some(2) => {
+                if let Some(err) = msg.get("error") {
+                    return Err(format!("codex rate-limit read failed: {err}"));
+                }
+                return msg
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| "codex rate-limit read returned no result".to_string());
+            }
+            _ => {}
+        }
+    }
+    Err("codex app-server exited early".to_string())
+}
+
+/// The per-pool rate-limit objects inside an `account/rateLimits/read`
+/// payload: every pool in `rateLimitsByLimitId`, or the top-level
+/// `rateLimits` for older shapes that lack the per-pool map. Pool objects
+/// pass through raw (camelCase) — the cordon/availability readers accept
+/// both spellings via [`field`].
+pub fn codex_pools_from_payload(payload: &Value) -> Vec<Value> {
+    let mut pools: Vec<Value> = payload
+        .get("rateLimitsByLimitId")
+        .and_then(Value::as_object)
+        .map(|m| m.values().filter(|v| !v.is_null()).cloned().collect())
+        .unwrap_or_default();
+    if pools.is_empty()
+        && let Some(rl) = payload.get("rateLimits").filter(|v| !v.is_null())
+    {
+        pools.push(rl.clone());
+    }
+    pools
+}
 
 /// The most recent `rate_limits` snapshot PER LIMIT POOL that Codex wrote to
 /// its session rollouts. Codex has no pollable usage endpoint, but it records
@@ -685,7 +891,12 @@ fn collect_rollouts(
 /// agent's candidates, decide which are cordoned. Codex caps are account-wide
 /// (not model-scoped), so any pool's saturated window cordons every candidate —
 /// but only when credits can't cover it, and only while the window's
-/// `resets_at` is still in the future.
+/// `resets_at` is still in the future. An exhausted per-member spend limit
+/// (`individual_limit`) is a hard block that credits never cover — observed
+/// live 2026-07-22: `rate_limit_reached_type:
+/// "workspace_member_usage_limit_reached"` with the weekly window resetting
+/// days BEFORE the member limit; without this cordon the router would resume
+/// routing to the still-dead seat the moment the weekly window cleared.
 pub fn codex_cordons(
     rate_limits: &[Value],
     candidates: &[(CandidateId, String)],
@@ -693,6 +904,26 @@ pub fn codex_cordons(
 ) -> HashMap<CandidateId, UsageCordon> {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
     for pool in rate_limits {
+        if let Some(il) = field(pool, "individual_limit", "individualLimit")
+            && field(il, "remaining_percent", "remainingPercent")
+                .and_then(Value::as_f64)
+                .is_some_and(|r| r <= 0.0)
+            && let Some(epoch) = field(il, "resets_at", "resetsAt").and_then(Value::as_u64)
+        {
+            let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
+            if resets_at > now {
+                let rfc = epoch_to_rfc3339(epoch);
+                for (id, _) in candidates {
+                    upsert_latest(
+                        &mut out,
+                        id,
+                        "Codex member usage limit reached",
+                        resets_at,
+                        &rfc,
+                    );
+                }
+            }
+        }
         if codex_credits_usable(pool) {
             continue;
         }
@@ -700,22 +931,20 @@ pub fn codex_cordons(
             let Some(win) = pool.get(key).filter(|w| !w.is_null()) else {
                 continue;
             };
-            let used = win
-                .get("used_percent")
+            let used = field(win, "used_percent", "usedPercent")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
             if used < 100.0 {
                 continue;
             }
-            let Some(epoch) = win.get("resets_at").and_then(Value::as_u64) else {
+            let Some(epoch) = field(win, "resets_at", "resetsAt").and_then(Value::as_u64) else {
                 continue;
             };
             let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
             if resets_at <= now {
                 continue; // already reset
             }
-            let window_minutes = win
-                .get("window_minutes")
+            let window_minutes = field(win, "window_minutes", "windowDurationMins")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let reason = if window_minutes >= 1440 {
@@ -737,15 +966,21 @@ pub fn codex_cordons(
 /// `has_credits: true` is NOT enough: team-plan snapshots report
 /// `has_credits: true, balance: null` while the seat is hard-blocked at 100%
 /// (observed live 2026-07-21 — Sol turns stalled for four consecutive
-/// conversations while this gate failed open on `has_credits`).
+/// conversations while this gate failed open on `has_credits`). A reached
+/// spend control is a per-member hard block that no credit pool covers.
 fn codex_credits_usable(rate_limits: &Value) -> bool {
-    let Some(credits) = rate_limits.get("credits") else {
+    if field(rate_limits, "spend_control_reached", "spendControlReached").and_then(Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
+    let Some(credits) = rate_limits.get("credits").filter(|c| !c.is_null()) else {
         return false;
     };
     if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
         return true;
     }
-    credits.get("has_credits").and_then(Value::as_bool) == Some(true)
+    field(credits, "has_credits", "hasCredits").and_then(Value::as_bool) == Some(true)
         && credits
             .get("balance")
             .and_then(Value::as_f64)
@@ -776,6 +1011,31 @@ fn epoch_to_rfc3339(secs: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn empty_refresh_token_fingerprints_like_missing() {
+        let with_empty = credentials_from_json(
+            r#"{"claudeAiOauth": {"accessToken": "acc-tok", "refreshToken": ""}}"#,
+        )
+        .unwrap();
+        let without =
+            credentials_from_json(r#"{"claudeAiOauth": {"accessToken": "acc-tok"}}"#).unwrap();
+        assert!(
+            with_empty.refresh_token.is_none(),
+            "empty string is falsy in Node's refreshToken || accessToken"
+        );
+        let fp = |c: &OauthCredentials| {
+            crate::usage_cache::fingerprint(c.refresh_token.as_deref().unwrap_or(&c.access_token))
+        };
+        assert_eq!(fp(&with_empty), fp(&without));
+        // A real refresh token still wins over the access token.
+        let real = credentials_from_json(
+            r#"{"claudeAiOauth": {"accessToken": "acc-tok", "refreshToken": "ref-tok"}}"#,
+        )
+        .unwrap();
+        assert_eq!(real.refresh_token.as_deref(), Some("ref-tok"));
+        assert_ne!(fp(&real), fp(&without));
+    }
 
     fn cands() -> Vec<(CandidateId, String)> {
         vec![
@@ -956,6 +1216,110 @@ mod tests {
             c.len(),
             2,
             "exhausted pool cordons despite windowless sibling: {c:?}"
+        );
+    }
+
+    // The live 2026-07-22 RPC shape (camelCase): weekly window saturated AND
+    // the per-member spend limit exhausted — but the member limit resets DAYS
+    // AFTER the weekly window. The cordon must outlast the weekly reset.
+    fn live_rpc_payload(now: SystemTime) -> Value {
+        let week = future_epoch(now); // +1 day
+        let member = future_epoch(now) + 4 * 86_400; // +5 days
+        json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": week },
+                "secondary": serde_json::Value::Null,
+                "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+                "individualLimit": { "limit": "1000", "used": "1021.6", "remainingPercent": 0, "resetsAt": member },
+                "spendControlReached": true,
+                "planType": "team",
+                "rateLimitReachedType": "workspace_member_usage_limit_reached"
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": week },
+                    "secondary": serde_json::Value::Null,
+                    "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+                    "individualLimit": { "limit": "1000", "used": "1021.6", "remainingPercent": 0, "resetsAt": member },
+                    "spendControlReached": true,
+                    "planType": "team"
+                }
+            },
+            "rateLimitResetCredits": { "availableCount": 3 }
+        })
+    }
+
+    #[test]
+    fn codex_pools_prefer_by_limit_id_and_fall_back_to_top_level() {
+        let now = SystemTime::now();
+        let payload = live_rpc_payload(now);
+        let pools = codex_pools_from_payload(&payload);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0]["limitId"], "codex");
+
+        // Older shape: no per-pool map → the top-level object is the pool.
+        let top_only = json!({ "rateLimits": { "limitId": "codex", "primary": null } });
+        assert_eq!(codex_pools_from_payload(&top_only).len(), 1);
+        assert!(codex_pools_from_payload(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn codex_camelcase_rpc_windows_cordon_like_snake_case() {
+        let now = SystemTime::now();
+        let pools = codex_pools_from_payload(&live_rpc_payload(now));
+        let c = codex_cordons(&pools, &codex_cands(), now);
+        assert_eq!(c.len(), 2, "both candidates cordoned: {c:?}");
+        // The member limit resets later than the weekly window and must win
+        // the upsert — otherwise routing resumes into a still-dead seat when
+        // the weekly window clears.
+        for v in c.values() {
+            assert_eq!(v.reason, "Codex member usage limit reached");
+            assert!(v.resets_at > now + Duration::from_secs(4 * 86_400));
+        }
+    }
+
+    #[test]
+    fn codex_member_limit_cordons_even_below_weekly_cap() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 40.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": 50.0 },
+            "individualLimit": { "remainingPercent": 0.0, "resetsAt": future_epoch(now) },
+            "spendControlReached": true
+        })];
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert_eq!(c.len(), 2, "member hard block ignores window slack: {c:?}");
+        assert!(c.values().all(|v| v.reason.contains("member")));
+    }
+
+    #[test]
+    fn codex_spend_control_reached_blocks_credit_headroom() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": 25.0 },
+            "spendControlReached": true
+        })];
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert_eq!(c.len(), 2, "positive balance can't cover a spend control");
+    }
+
+    #[test]
+    fn codex_availability_counts_member_limit_as_window() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 20.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": false },
+            "individualLimit": { "remainingPercent": 25.0, "resetsAt": future_epoch(now) }
+        })];
+        let a = codex_availability(&rl, &codex_cands(), now);
+        assert!(
+            a.values().all(|v| (v.plan_headroom - 0.25).abs() < 1e-9),
+            "member limit is the tightest window: {a:?}"
         );
     }
 
