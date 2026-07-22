@@ -193,10 +193,20 @@ pub struct CordonConfig {
     /// the front-end's usage polling).
     #[serde(default = "default_cordon_poll_secs")]
     pub poll_secs: u64,
+    /// Box-wide floor between upstream usage-endpoint fetches, in seconds
+    /// (default 60). Enforced through the shared snapshot cache
+    /// (`usage_cache`), so ALL router-acp processes on the box together make
+    /// at most one usage fetch per interval.
+    #[serde(default = "default_usage_min_refresh_secs")]
+    pub min_refresh_secs: u64,
 }
 
 fn default_cordon_poll_secs() -> u64 {
     5 * 60
+}
+
+fn default_usage_min_refresh_secs() -> u64 {
+    crate::usage_cache::DEFAULT_MIN_REFRESH_SECS
 }
 
 impl Default for CordonConfig {
@@ -204,6 +214,7 @@ impl Default for CordonConfig {
         Self {
             enabled: true,
             poll_secs: default_cordon_poll_secs(),
+            min_refresh_secs: default_usage_min_refresh_secs(),
         }
     }
 }

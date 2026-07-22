@@ -17,7 +17,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, Error as AcpError, McpServer, McpServerStdio, PromptRequest,
-    ResourceLink, StopReason,
+    ResourceLink, SetSessionModeRequest, StopReason,
 };
 use agent_client_protocol::{
     ByteStreams, Responder, UntypedRole, on_receive_notification, on_receive_request,
@@ -28,6 +28,7 @@ use crate::classifier::{ClassifyInput, classify_heuristic};
 use crate::config::StrategyKind;
 use crate::session::{
     DelegateHandle, DownstreamRoute, Shared, close_downstream_session, open_downstream_session,
+    resolve_mode_id,
 };
 use crate::strategies::{RouteContext, make_strategy};
 
@@ -877,6 +878,69 @@ pub async fn run_delegate_task(
         .await
         {
             Ok(opened) => {
+                // Delegates have no upstream client to send the set_mode that
+                // primary sessions receive. Apply the same configured `auto`
+                // mapping explicitly so Claude/Codex delegates inherit the
+                // parent's dangerous, non-interactive permission behavior.
+                let available_modes: Vec<String> = opened
+                    .modes
+                    .as_ref()
+                    .map(|m| {
+                        m.available_modes
+                            .iter()
+                            .map(|mode| mode.id.0.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match resolve_mode_id(shared, &candidate.agent, "auto", &available_modes) {
+                    Some(mode_id) => {
+                        let set = SetSessionModeRequest::new(
+                            opened.downstream_sid.clone(),
+                            mode_id.clone(),
+                        );
+                        if let Err(err) = opened.conn.send_request(set).block_task().await {
+                            tracing::warn!(
+                                parent = router_sid,
+                                candidate = %candidate,
+                                %err,
+                                "delegate session mode rejected; trying the next candidate"
+                            );
+                            last_err = Some(format!(
+                                "delegate {candidate} rejected required auto mode: {err}"
+                            ));
+                            close_downstream_session(
+                                shared,
+                                &opened.process_key,
+                                &opened.downstream_sid,
+                            );
+                            continue;
+                        } else {
+                            tracing::info!(
+                                parent = router_sid,
+                                candidate = %candidate,
+                                applied = mode_id,
+                                "delegate session mode applied"
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            parent = router_sid,
+                            candidate = %candidate,
+                            ?available_modes,
+                            "delegate candidate has no required auto mode; trying the next candidate"
+                        );
+                        last_err = Some(format!(
+                            "delegate {candidate} has no configured auto mode among {available_modes:?}"
+                        ));
+                        close_downstream_session(
+                            shared,
+                            &opened.process_key,
+                            &opened.downstream_sid,
+                        );
+                        continue;
+                    }
+                }
                 tracing::info!(
                     parent = router_sid,
                     candidate = %candidate,
@@ -940,7 +1004,10 @@ pub async fn run_delegate_task(
                         kind: "delegate_task".to_string(),
                         role: "user".to_string(),
                         summary: task_summary.clone(),
-                        detail: Some(serde_json::json!({"context_files": args.context_files})),
+                        detail: Some(serde_json::json!({
+                            "task": args.task,
+                            "context_files": args.context_files,
+                        })),
                         tokens_input: crate::state::estimate_tokens(&args.task),
                         tokens_estimated: true,
                         ..Default::default()
@@ -1010,10 +1077,10 @@ pub async fn run_delegate_task(
                                 kind: "agent_response".to_string(),
                                 role: "agent".to_string(),
                                 summary: text.chars().take(200).collect(),
+                                detail: Some(serde_json::json!({"text": text})),
                                 tokens_input: ti,
                                 tokens_output: to,
                                 tokens_estimated: est,
-                                ..Default::default()
                             },
                         );
                         match resp.stop_reason {
@@ -1142,6 +1209,7 @@ pub async fn run_delegate_followup(
             kind: "delegate_followup".to_string(),
             role: "user".to_string(),
             summary: args.message.chars().take(200).collect(),
+            detail: Some(serde_json::json!({"message": args.message})),
             tokens_input: crate::state::estimate_tokens(&args.message),
             tokens_estimated: true,
             ..Default::default()
@@ -1179,10 +1247,10 @@ pub async fn run_delegate_followup(
                     kind: "agent_response".to_string(),
                     role: "agent".to_string(),
                     summary: text.chars().take(200).collect(),
+                    detail: Some(serde_json::json!({"text": text})),
                     tokens_input: ti,
                     tokens_output: to,
                     tokens_estimated: est,
-                    ..Default::default()
                 },
             );
             match resp.stop_reason {

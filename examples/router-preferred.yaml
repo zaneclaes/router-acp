@@ -15,6 +15,7 @@ agents:
     # token) and mark a candidate unroutable when its weekly cap is exhausted
     # with no overage/credit headroom — before the router even tries it.
     usage_source: { type: anthropic-oauth }
+    mode_map: { auto: bypassPermissions, approve: default, chat: plan }
     # lineage: anthropic  # company tag (default: agent name). Cross-lineage
     #                     # review compares this — two agents on the same vendor
     #                     # should share a lineage so one never reviews the other.
@@ -39,6 +40,7 @@ agents:
     # Proactive cordons from Codex's own on-disk rate-limit snapshot (last-known,
     # since Codex has no pollable usage endpoint; reactive cordon backstops it).
     usage_source: { type: codex-rollout }
+    mode_map: { auto: full-access, approve: auto, chat: read-only }
     models:
       - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
       - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }

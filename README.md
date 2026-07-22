@@ -349,7 +349,11 @@ downstream session on a strictly lower-`cost_rank` candidate**, returns the
 sub-agent's output as the tool result, and forwards the sub-session's
 permission/fs/terminal callbacks to the original client under the parent
 session id — permission UX stays intact while sub-agent transcript streaming
-is not interleaved into the parent transcript.
+is not interleaved into the parent transcript. Delegates have no upstream
+client of their own, so the router explicitly applies each candidate's `auto`
+`mode_map` entry at session creation (for example Claude `bypassPermissions`
+or Codex `full-access`). Their full task/final response, streamed progress,
+and tool activity are recorded in the delegate's `session_log` row for UIs.
 
 Because ACP `mcpServers` entries must be concrete transports, the tool is a
 real stdio helper: the router appends
@@ -566,6 +570,8 @@ translation wins, then an exact id match against the modes the downstream
 advertised; with no equivalent the mode is skipped with a warning and the
 downstream stays in its default mode. Post-pin mode changes relay with the
 same translation, and are likewise lenient when no equivalent exists.
+Delegated sessions explicitly apply the candidate's `auto` mapping because
+there is no separate upstream client to send them a mode request.
 
 ## First-run authentication
 

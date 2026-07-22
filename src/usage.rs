@@ -49,21 +49,50 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
         // `interval` fires immediately, so the first poll happens at startup.
         loop {
             tick.tick().await;
-            let (cordons, availability) = poll_all(&shared).await;
-            let n = cordons.len();
-            let a = availability.len();
-            {
-                let mut headroom = shared.headroom.lock().unwrap();
-                headroom.set_usage_cordons(cordons);
-                headroom.set_polled_availability(availability);
-            }
-            tracing::debug!(
-                cordoned_candidates = n,
-                availability_candidates = a,
-                "usage cordons refreshed"
-            );
+            refresh_and_install(&shared).await;
         }
     }))
+}
+
+/// One poll cycle: recompute the whole per-candidate usage-cordon and
+/// availability sets and install them on `shared.headroom`. Shared by the
+/// periodic poller tick and the turn-end refresh ([`refresh_after_turn`]).
+pub async fn refresh_and_install(shared: &Arc<Shared>) {
+    let (cordons, availability) = poll_all(shared).await;
+    let n = cordons.len();
+    let a = availability.len();
+    {
+        let mut headroom = shared.headroom.lock().unwrap();
+        headroom.set_usage_cordons(cordons);
+        headroom.set_polled_availability(availability);
+    }
+    tracing::debug!(
+        cordoned_candidates = n,
+        availability_candidates = a,
+        "usage cordons refreshed"
+    );
+}
+
+/// Fire-and-forget usage refresh when a prompt turn completes on an agent
+/// whose usage comes from the Anthropic OAuth endpoint — the moment the
+/// shared snapshot actually went stale. The cache self-throttles (min-refresh
+/// interval + cross-process lock), so this stays at most one upstream read
+/// per interval box-wide; and it must never delay or fail the turn itself, so
+/// it spawns and swallows every error inside (`poll_all` already fails open).
+pub fn refresh_after_turn(shared: &Arc<Shared>, agent: &str) {
+    if !shared.cfg.cordon.enabled {
+        return;
+    }
+    let oauth = shared.cfg.agents.iter().any(|a| {
+        a.name == agent && matches!(a.usage_source, Some(UsageSourceConfig::AnthropicOauth))
+    });
+    if !oauth {
+        return;
+    }
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        refresh_and_install(&shared).await;
+    });
 }
 
 /// Poll every agent that has a usage source and merge the results: proactive
@@ -86,16 +115,21 @@ async fn poll_all(
             continue;
         }
         let (cordons, availability) = match source {
-            UsageSourceConfig::AnthropicOauth => match fetch_anthropic_usage().await {
-                Ok(payload) => (
-                    anthropic_cordons(&payload, &candidates, SystemTime::now()),
-                    anthropic_availability(&payload, &candidates),
-                ),
-                Err(err) => {
-                    tracing::debug!(agent = %agent.name, %err, "usage poll failed; failing open");
-                    continue;
+            UsageSourceConfig::AnthropicOauth => {
+                let cached =
+                    crate::usage_cache::cached_anthropic_usage(shared.cfg.cordon.min_refresh_secs)
+                        .await;
+                match cached {
+                    Some(payload) => (
+                        anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                        anthropic_availability(&payload, &candidates),
+                    ),
+                    None => {
+                        tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
+                        continue;
+                    }
                 }
-            },
+            }
             UsageSourceConfig::CodexRollout => {
                 let snapshots = latest_codex_rate_limits();
                 if snapshots.is_empty() {
@@ -137,8 +171,7 @@ fn agent_candidates(shared: &Arc<Shared>, agent: &str) -> Vec<(CandidateId, Stri
 // Anthropic OAuth usage
 // ----------------------------------------------------------------------
 
-async fn fetch_anthropic_usage() -> Result<Value, String> {
-    let token = anthropic_oauth_token().ok_or("no Claude OAuth token found")?;
+pub(crate) async fn fetch_anthropic_usage(token: &str) -> Result<Value, String> {
     // Pass URL + headers via a curl config on stdin so the bearer token never
     // appears in argv (visible via `ps`).
     let config = format!(
@@ -159,6 +192,10 @@ async fn curl_with_config(config: &str) -> Result<String, String> {
     let mut child = tokio::process::Command::new("curl")
         .arg("-K")
         .arg("-")
+        // The caller can be aborted mid-fetch (turn-end refresh task, process
+        // shutdown); an orphaned curl would outlive the released fetch lock
+        // and hit the endpoint concurrently with the next lock holder.
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -185,15 +222,23 @@ async fn curl_with_config(config: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Read the Claude CLI OAuth access token: first `~/.claude/.credentials.json`
+/// The Claude CLI OAuth credentials: the access token authenticates the usage
+/// fetch; the refresh token (stable across access-token rotations) is the
+/// preferred account-fingerprint input for the shared usage cache.
+pub(crate) struct OauthCredentials {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+
+/// Read the Claude CLI OAuth credentials: first `~/.claude/.credentials.json`
 /// (Linux), else the macOS Keychain (`Claude Code-credentials`).
-fn anthropic_oauth_token() -> Option<String> {
+pub(crate) fn anthropic_oauth_credentials() -> Option<OauthCredentials> {
     if let Some(home) = std::env::var_os("HOME") {
         let path = std::path::Path::new(&home).join(".claude/.credentials.json");
         if let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(tok) = token_from_credentials_json(&text)
+            && let Some(creds) = credentials_from_json(&text)
         {
-            return Some(tok);
+            return Some(creds);
         }
     }
     #[cfg(target_os = "macos")]
@@ -207,20 +252,27 @@ fn anthropic_oauth_token() -> Option<String> {
             ])
             .output()
             && out.status.success()
-            && let Some(tok) = token_from_credentials_json(&String::from_utf8_lossy(&out.stdout))
+            && let Some(creds) = credentials_from_json(&String::from_utf8_lossy(&out.stdout))
         {
-            return Some(tok);
+            return Some(creds);
         }
     }
     None
 }
 
-fn token_from_credentials_json(text: &str) -> Option<String> {
+fn credentials_from_json(text: &str) -> Option<OauthCredentials> {
     let v: Value = serde_json::from_str(text.trim()).ok()?;
-    v.get("claudeAiOauth")?
-        .get("accessToken")?
-        .as_str()
-        .map(str::to_string)
+    let oauth = v.get("claudeAiOauth")?;
+    Some(OauthCredentials {
+        access_token: oauth.get("accessToken")?.as_str()?.to_string(),
+        // Node's reader does `refreshToken || accessToken` — an empty string
+        // is falsy there, so treat it as absent to keep fingerprints aligned.
+        refresh_token: oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -776,6 +828,31 @@ fn epoch_to_rfc3339(secs: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn empty_refresh_token_fingerprints_like_missing() {
+        let with_empty = credentials_from_json(
+            r#"{"claudeAiOauth": {"accessToken": "acc-tok", "refreshToken": ""}}"#,
+        )
+        .unwrap();
+        let without =
+            credentials_from_json(r#"{"claudeAiOauth": {"accessToken": "acc-tok"}}"#).unwrap();
+        assert!(
+            with_empty.refresh_token.is_none(),
+            "empty string is falsy in Node's refreshToken || accessToken"
+        );
+        let fp = |c: &OauthCredentials| {
+            crate::usage_cache::fingerprint(c.refresh_token.as_deref().unwrap_or(&c.access_token))
+        };
+        assert_eq!(fp(&with_empty), fp(&without));
+        // A real refresh token still wins over the access token.
+        let real = credentials_from_json(
+            r#"{"claudeAiOauth": {"accessToken": "acc-tok", "refreshToken": "ref-tok"}}"#,
+        )
+        .unwrap();
+        assert_eq!(real.refresh_token.as_deref(), Some("ref-tok"));
+        assert_ne!(fp(&real), fp(&without));
+    }
 
     fn cands() -> Vec<(CandidateId, String)> {
         vec![
