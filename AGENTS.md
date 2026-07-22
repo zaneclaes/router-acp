@@ -3,7 +3,9 @@
 router-acp is an ACP (Agent Client Protocol) session router: one terminal
 ACP **agent** upstream (the client — goose, Zed — connects to it over stdio)
 plus N ACP **client** connections downstream to seat-authenticated adapters
-(`claude-agent-acp`, `codex-acp`). It routes each new conversation to the
+(`claude-agent-acp`, `codex-acp`, and xAI's `@xai-official/grok` — whose CLI is
+itself an ACP agent via `grok agent stdio`, wired as a `spawn-config` agent with
+`--model ${model_id}`, `lineage: xai`; `grok login` for auth). It routes each new conversation to the
 best `(agent, model)` candidate, pins it, relays everything, and offers a
 `delegate_task` MCP tool for cheaper sub-sessions. Built against
 `agent-client-protocol` **1.2.0** (Rust SDK). The original build spec
@@ -162,6 +164,22 @@ SDK traps below, which were all discovered the hard way.
   `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
+- **Grok subscription-gate cordon** (`note_xai_gate`/`xai_gate_reason` in
+  `src/session.rs`): xAI Grok has NO numeric usage meter — a live-frame capture
+  (July 2026) found no used-percent/reset/quota anywhere in its ACP stream
+  (methods are `_x.ai/{announcements,models,settings,session_notification,
+  sessions}/update`; the prompt-response `_meta.usage` carries per-turn *tokens*
+  only). Its only limit signal is a **binary access gate** in the session-less
+  `_x.ai/settings/update` notification (`allow_access: false` and/or a populated
+  `gate_message`). So there's no `codex-rollout`-style `usage_source` to poll;
+  instead `handle_downstream_dispatch` taps that frame *before* the sessionId
+  lookup (it has no sessionId → would otherwise drop unseen), resolves the
+  owning agent via `target_spec(key)`, and `headroom.cordon`s it (per-agent
+  reactive cordon; `cordon_default_secs` since grok reports no reset time),
+  gated on `cordon.enabled`. Fail-open: a `true`/absent flag with empty
+  `gate_message` never cordons. Grok therefore needs **no** `usage_source` in
+  config — the cordon is automatic. Pure decision is `xai_gate_reason` (tested,
+  `xai_gate_tests`).
 - **Dynamic preference scaling** (`availability_preference.*`; same poll +
   client hints): `agents[].preference` is the *static* base — `eligible_views`
   computes the effective preference as `preference × plan_headroom`, minus
@@ -389,10 +407,19 @@ fails.
   was chosen), `codex-acp` takes `-c` flags (why it can't be shimmed).
   `claude-acp`/`codex-acp` remain direct. After code changes run
   `cargo install --path . --force` or goose keeps the old binary.
-- Real adapters live at `~/nvm/versions/node/v24.16.0/bin/{claude-agent-acp,codex-acp}`
+- Real adapters live at `~/nvm/versions/node/v24.16.0/bin/{claude-agent-acp,codex-acp,grok}`
   (nvm-versioned paths — they move on node upgrades). Verified model ids
   (July 2026): claude offers `default, haiku, sonnet, sonnet[1m], opus[1m],
-  claude-fable-5[1m]`; codex offers `gpt-5.4-mini, gpt-5.4, gpt-5.5`.
+  claude-fable-5[1m]`; codex offers `gpt-5.4-mini, gpt-5.4, gpt-5.5`. **grok**
+  (`@xai-official/grok` v0.2.106): `grok agent stdio` is a native ACP agent
+  (verified — returns a valid `initialize` result with `authMethods:[grok.com]`);
+  model fixed per process via `grok agent --model <id> stdio` (spawn-config, args
+  `["agent"]` + template `["--model","${model_id}","stdio"]`). NOT logged in on
+  this box yet → `grok login` required before it leaves auth-pending; `grok
+  models` (post-login) lists real ids — only `grok-4.5` (default) is confirmed,
+  score-table `*grok*code*`/`*grok*` globs cover the rest. No usage_source (no
+  pollable/on-disk usage snapshot known) → reactive cordon only. Score estimates
+  in `data/scores.yaml` are BEST-GUESS (grok-4.5 ≈ opus/sol tier).
   Claude modes: `auto, default, acceptEdits, plan, dontAsk,
   bypassPermissions`; codex modes: `read-only, auto, full-access`. To
   re-discover ids, declare a bogus model and read the `available=[…]`

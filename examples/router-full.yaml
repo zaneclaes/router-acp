@@ -146,6 +146,26 @@ agents:
       - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4 }
       - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5 }
 
+  # xAI Grok — the official CLI (`@xai-official/grok`) is itself an ACP agent
+  # (`grok agent stdio`); no separate adapter needed. Own company/lineage, so it
+  # can review (and be reviewed by) claude and codex. `grok login` is separate.
+  # No `usage_source`: Grok has no usage meter, so the router auto-cordons it off
+  # its own subscription access gate when you're over your plan (via `cordon:`).
+  - name: grok
+    command:
+      type: stdio
+      command: grok
+      args: ["agent"]
+    lineage: xai
+    budget_prompts_5h: 400
+    model_selection:
+      type: spawn-config              # model fixed per process via --model
+      process_template:
+        args: ["--model", "${model_id}", "stdio"]
+    models:
+      - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5 }
+      # confirm ids with `grok models` after login; router-acp drops unknown ids
+
 routers:
   static:
     candidate: claude/sonnet

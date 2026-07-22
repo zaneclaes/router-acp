@@ -1320,6 +1320,60 @@ fn note_investigation(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, ro
     tracing::info!(session = router_sid, %target, "mid-turn escalation requested");
 }
 
+/// Cordon an agent when its xAI `_x.ai/settings/update` frame reports the
+/// subscription access gate closed. This is grok's only limit signal (it has
+/// no numeric usage meter), so it plays the role a `usage_source` poll plays
+/// for claude/codex. Fail-open: an absent/`true` `allow_access` with no
+/// `gate_message` never cordons, and a gate with no reset time falls back to
+/// `cordon_default_secs`.
+/// Pure gate decision: `Some(reason)` when the `_x.ai/settings/update` params
+/// report the subscription access gate closed, else `None`. An explicitly
+/// `false` `allow_access` OR a non-empty `gate_message` closes it; anything
+/// else (true/absent flag, null/empty message) is routable.
+fn xai_gate_reason(params: &serde_json::Value) -> Option<String> {
+    let allow = params.get("allow_access").and_then(|v| v.as_bool());
+    let gate_msg = params
+        .get("gate_message")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if allow != Some(false) && gate_msg.is_none() {
+        return None;
+    }
+    Some(match gate_msg {
+        Some(m) => {
+            let mut r = format!("xAI subscription gate: {m}");
+            r.truncate(160);
+            r
+        }
+        None => "xAI subscription access gate closed (usage limit reached; no reset time reported)"
+            .to_string(),
+    })
+}
+
+fn note_xai_gate(shared: &Arc<Shared>, key: &ProcessKey, params: &serde_json::Value) {
+    if !shared.cfg.cordon.enabled {
+        return;
+    }
+    let Some(reason) = xai_gate_reason(params) else {
+        return;
+    };
+    let Some(agent) = shared.target_spec(key).map(|t| t.agent_name) else {
+        return;
+    };
+    let dur = shared
+        .headroom
+        .lock()
+        .unwrap()
+        .cordon(&agent, None, reason.clone());
+    tracing::warn!(
+        agent = agent,
+        cordon_secs = dur.as_secs(),
+        reason = reason,
+        "agent cordoned by xAI subscription access gate"
+    );
+}
+
 pub fn handle_downstream_dispatch(
     shared: &Arc<Shared>,
     key: &ProcessKey,
@@ -1331,6 +1385,21 @@ pub fn handle_downstream_dispatch(
             message,
             retry: false,
         });
+    }
+    // xAI Grok surfaces its subscription access gate as a *session-less*
+    // `_x.ai/settings/update` notification. Grok exposes no numeric usage meter
+    // (no used-percent, no reset time — see the frame capture in
+    // grok-adapter notes), so a pollable `usage_source` is impossible; this
+    // binary gate is its only limit signal. When grok reports the gate closed
+    // (`allow_access: false` or a populated `gate_message`), proactively cordon
+    // the owning agent — the grok analog of the anthropic-oauth / codex-rollout
+    // usage cordons. Handled here (before the sessionId lookup) because the
+    // frame carries no sessionId and would otherwise be dropped unseen.
+    if let Dispatch::Notification(msg) = &message
+        && msg.method() == "_x.ai/settings/update"
+    {
+        note_xai_gate(shared, key, msg.params());
+        return Ok(Handled::Yes);
     }
     let Some(down_sid) = message.message().and_then(relay::session_id_of) else {
         return Ok(Handled::No {
@@ -5199,6 +5268,44 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
             Ok(Handled::Yes)
         }
         Dispatch::Response(..) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod xai_gate_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn open_gate_is_routable() {
+        // The normal frame grok emits at session start: access allowed.
+        assert!(xai_gate_reason(&json!({
+            "allow_access": true,
+            "gate_message": null,
+            "subscription_tier_display": "Free"
+        }))
+        .is_none());
+        // Absent fields (a settings frame that isn't about access) → routable.
+        assert!(xai_gate_reason(&json!({"show_resolved_model": false})).is_none());
+        // Empty gate message with allow true → routable.
+        assert!(xai_gate_reason(&json!({"allow_access": true, "gate_message": "  "})).is_none());
+    }
+
+    #[test]
+    fn closed_gate_cordons_with_reason() {
+        // allow_access:false with no message → default reason.
+        let r = xai_gate_reason(&json!({"allow_access": false, "gate_message": null})).unwrap();
+        assert!(r.contains("access gate closed"), "{r}");
+        // A populated gate message is surfaced (and bounded).
+        let r = xai_gate_reason(&json!({
+            "allow_access": false,
+            "gate_message": "You've reached your Grok usage limit. Upgrade to continue."
+        }))
+        .unwrap();
+        assert!(r.starts_with("xAI subscription gate: You've reached"), "{r}");
+        // A gate_message alone (allow_access absent) still closes the gate.
+        let r = xai_gate_reason(&json!({"gate_message": "rate limited"})).unwrap();
+        assert!(r.contains("rate limited"), "{r}");
     }
 }
 

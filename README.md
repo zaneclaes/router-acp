@@ -27,15 +27,19 @@ candidates, with bounded in-session delegation.
 `router-acp` is a single ACP-compatible agent process. Your ACP client (goose,
 Zed, …) connects to it as if it were any coding agent; the router connects
 downstream to one or more seat-authenticated ACP agent adapters such as
-[`@agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp)
-and [`@agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp),
+[`@agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp),
+[`@agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp),
+and xAI's own CLI [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok)
+(which speaks ACP natively via `grok agent stdio` — no separate adapter),
 and provides OpenRouter-*inspired* selection semantics over them (a local
 heuristic, not a port of OpenRouter's proprietary router — see below):
 
 ```
-goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp   (claude/sonnet, claude/opus)
+goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp     (claude/sonnet, claude/opus)
                           │
-                          └──────ACP──▶ codex-acp           (codex/gpt-5.1-codex)
+                          ├──────ACP──▶ codex-acp             (codex/gpt-5.5, codex/gpt-5.6-sol)
+                          │
+                          └──────ACP──▶ grok agent stdio      (grok/grok-4.5)
 ```
 
 Every new conversation is pinned to the best **candidate**, where a candidate
@@ -165,7 +169,12 @@ and it always tells the user what happened:
   `balance` — a bare `has_credits` flag doesn't count).
   It's **generic** (which models are exhausted is read from the API, never
   hardcoded), **fails open** (a usage-endpoint hiccup never makes a model
-  unroutable), and self-lifts at the reported reset. Cordoned candidates are
+  unroutable), and self-lifts at the reported reset. **Grok** exposes no usage
+  meter at all (nothing to poll), so it needs no `usage_source`: instead the
+  router watches Grok's own subscription **access gate** in its ACP stream and
+  cordons the agent the moment Grok reports the gate closed (over-limit) — the
+  same effect, driven by the only signal Grok provides (no reset time, so it
+  uses `cordon_default_secs`). Cordoned candidates are
   excluded from `auto`, skipped by failover, and an explicit pin to one is
   refused with a fallback (disclosed in the failover format:
   `router-acp · failover: cordon → claude/sonnet · task … (Weekly Fable limit
@@ -661,6 +670,7 @@ Manual matrix for real seats:
 | goose | claude-agent-acp | `router-acp serve` as a claude-acp-style provider command. |
 | Zed | claude-agent-acp | `agent_servers` entry as above; model picker shows `router.candidate`. |
 | goose / Zed | codex-acp | Use `spawn-config` with `CODEX_CONFIG` per model. |
+| goose / Zed | grok (`@xai-official/grok`) | Native ACP: `command: grok`, `args: ["agent"]`, `spawn-config` template `["--model", "${model_id}", "stdio"]`. Auth via `grok login`; confirm ids with `grok models`. |
 | any | mixed Claude + Codex, auth-pending at startup | Authenticate via the namespaced method ids. |
 | any | single-candidate config | Passthrough; startup logs "routing and delegation are inert". |
 

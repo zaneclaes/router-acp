@@ -157,6 +157,21 @@ Notes on this file:
 
   (Quote ids containing `[`/`]` in YAML, e.g. `"opus[1m]"`.)
 
+- **xAI Grok** is wired in as a third agent (`lineage: xai`), giving
+  orchestration a third company for cross-lineage review. Its CLI is itself an
+  ACP agent, so no separate adapter:
+
+  ```sh
+  npm i -g @xai-official/grok    # provides `grok`; `grok agent stdio` speaks ACP
+  grok login                     # auth is separate from claude/codex
+  grok models                    # confirm the model ids your plan exposes
+  ```
+
+  It's configured as `spawn-config` (`grok agent --model <id> stdio`), so the
+  model is fixed per process. Until you `grok login`, grok sits auth-pending and
+  is simply skipped by routing (no error). Only `grok-4.5` is pre-configured;
+  add others once `grok models` shows them.
+
 Validate:
 
 ```sh
@@ -398,6 +413,15 @@ response headers, and the ChatGPT backend 403s any non-Codex client), so the
 router reads Codex's *own* on-disk rate-limit snapshot from its rollout files
 (`~/.codex/sessions/**/rollout-*.jsonl`). That's "last-known as of Codex's most
 recent turn" rather than live — the reactive cordon still backstops it.
+
+Grok needs **no** `usage_source` and has none in your config: xAI exposes no
+usage numbers anywhere in Grok's ACP stream (no percent-used, no reset time —
+only per-turn token counts). What it *does* send is a subscription **access
+gate**, and the router watches for it — the moment Grok reports the gate closed
+(you're over your plan limit), the router cordons the grok agent exactly like a
+usage cap (auto/failover skip it, an explicit pin falls back). Because Grok
+gives no reset time, that cordon lasts `headroom.cordon_default_secs` and then
+re-tries. Same `cordon: { enabled: false }` switch turns it off.
 
 ## Orchestrated workflows (plan → subtasks → cross-lineage review)
 

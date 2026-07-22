@@ -195,3 +195,41 @@ candidates:
     coding_percentile: 0.5
     context_window: 1000000
     default_quality: 0.55
+
+  # xAI Grok — BEST-GUESS estimates (no seat-benchmark data yet). grok-4.5 is
+  # xAI's current frontier ≈ opus/sol tier; grok-code-fast is a cheap, fast,
+  # coding-tuned model ≈ sonnet-tier coding at haiku-ish cost. `*grok*code*`
+  # MUST precede `*grok*` (first-match-wins). Tune once you've run real tasks.
+  - pattern: "*grok*code*"           # grok-code-fast-* (cheap fast coder)
+    coding_tier: medium
+    coding_percentile: 0.62
+    context_window: 256000
+    default_quality: 0.72
+    quality:
+      UiTweak: 0.78
+      BugFix: 0.8
+      Feature: 0.76
+      Refactor: 0.78
+      Algorithms: 0.74
+      Architecture: 0.66
+      Research: 0.66
+      Writing: 0.68
+      Ops: 0.72
+      CodingGeneral: 0.8
+
+  - pattern: "*grok*"                # grok-4.5 and future frontier grok
+    coding_tier: high
+    coding_percentile: 0.88
+    context_window: 256000
+    default_quality: 0.86
+    quality:
+      UiTweak: 0.85
+      BugFix: 0.9
+      Feature: 0.88
+      Refactor: 0.88
+      Algorithms: 0.9
+      Architecture: 0.88
+      Research: 0.88
+      Writing: 0.86
+      Ops: 0.84
+      CodingGeneral: 0.9

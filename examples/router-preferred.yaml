@@ -48,6 +48,29 @@ agents:
       - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4 }
       - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5 }
 
+  # xAI Grok. The official CLI (`npm i -g @xai-official/grok`) is itself an ACP
+  # agent — `grok agent stdio` — so no separate adapter is needed. Its own
+  # company, so it's a valid cross-lineage reviewer for claude AND codex.
+  # Auth is separate: run `grok login` once, then `grok models` to confirm the
+  # exact model ids your plan exposes (router-acp drops unknown ids at startup).
+  # No `usage_source`: Grok exposes no usage meter, so the router instead watches
+  # Grok's own subscription access gate and cordons it automatically when you're
+  # over your plan limit (governed by the `cordon:` block below).
+  - name: grok
+    command:
+      type: stdio
+      command: grok               # or an absolute path if not on the router's PATH
+      args: ["agent"]             # + template below → `grok agent --model <id> stdio`
+    lineage: xai
+    budget_prompts_5h: 400
+    model_selection:
+      type: spawn-config          # grok fixes the model per process via --model
+      process_template:
+        args: ["--model", "${model_id}", "stdio"]
+    models:
+      - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5 }   # current frontier
+      # - { id: grok-code-fast-1, display_name: Grok Code Fast, cost_rank: 2 }
+
 router: escalation
 routers:
   escalation:
