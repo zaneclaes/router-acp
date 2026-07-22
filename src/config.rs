@@ -276,12 +276,14 @@ pub enum UsageSourceConfig {
     /// `~/.claude/.credentials.json` or the macOS Keychain
     /// (`Claude Code-credentials`), the same credential the adapter uses.
     AnthropicOauth,
-    /// Codex/ChatGPT usage read from the Codex CLI's own on-disk rate-limit
-    /// snapshot (the newest `~/.codex/sessions/**/rollout-*.jsonl`). Codex has no
-    /// pollable usage endpoint (its limits arrive as response headers), so this
-    /// is the last-known snapshot as of Codex's most recent turn, not live — the
-    /// reactive per-agent cordon remains the backstop. Parses an undocumented
-    /// Codex format and fails open if it changes.
+    /// Codex/ChatGPT usage polled live via one `codex app-server` JSON-RPC
+    /// round-trip (`account/rateLimits/read`), shared box-wide through the
+    /// usage snapshot cache (`usage/codex.json`). When the RPC fails (no
+    /// binary, signed out), falls back to the Codex CLI's own on-disk
+    /// rate-limit snapshots (the newest `~/.codex/sessions/**/rollout-*.jsonl`
+    /// — last-known as of Codex's most recent turn, not live). Parses an
+    /// undocumented Codex format and fails open if it changes; the reactive
+    /// per-agent cordon remains the backstop.
     CodexRollout,
 }
 

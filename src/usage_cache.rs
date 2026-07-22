@@ -1,14 +1,15 @@
-//! Cross-process shared cache of the Anthropic plan-usage snapshot.
+//! Cross-process shared cache of the provider plan-usage snapshots.
 //!
 //! Every Kory Code conversation spawns its own `router-acp serve`, and each
 //! process used to poll `api.anthropic.com/api/oauth/usage` independently —
 //! four-plus pollers (plus the relay's own poll) against one per-account
 //! budget is exactly how that endpoint starts returning 429. This module makes
-//! the snapshot a box-wide resource: one JSON file under the state directory
-//! that every process reads, refreshed by whichever process gets there first,
-//! at most once per `cordon.min_refresh_secs` (default 60s) box-wide. The file
-//! is a published contract — the Kory Code relay reads it instead of fetching
-//! upstream itself — so its schema and semantics must stay stable:
+//! each provider's snapshot a box-wide resource: one JSON file per provider
+//! under the state directory that every process reads, refreshed by whichever
+//! process gets there first, at most once per `cordon.min_refresh_secs`
+//! (default 60s) box-wide. The files are a published contract — the Kory Code
+//! relay reads them instead of fetching upstream itself — so schema and
+//! semantics must stay stable:
 //!
 //! ```json
 //! {
@@ -24,8 +25,16 @@
 //!
 //! `fetched_at` is the unix time of the last SUCCESSFUL fetch (which produced
 //! `payload`); `attempted_at` covers any outcome; `last_error` is e.g.
-//! "HTTP 429" or a curl error, null on success; `payload` is the raw
-//! usage-endpoint JSON, null if never fetched.
+//! "HTTP 429" or a curl error, null on success; `payload` is the raw provider
+//! response, null if never fetched.
+//!
+//! Two snapshots exist today. `anthropic-oauth.json`: `payload` is the raw
+//! `oauth/usage` endpoint JSON, `account` fingerprints the Claude CLI OAuth
+//! refresh (or access) token. `codex.json`: `payload` is the raw
+//! `account/rateLimits/read` result from a `codex app-server` JSON-RPC
+//! round-trip (`{rateLimits, rateLimitsByLimitId, rateLimitResetCredits}`,
+//! camelCase), `account` fingerprints `~/.codex/auth.json`'s account id (or
+//! refresh token / API key) — both recipes byte-match the Kory Code relay's.
 //!
 //! Coordination is deliberately primitive (no daemon, no IPC): atomic
 //! write-temp-then-rename for the snapshot, an `O_EXCL` lockfile as the
@@ -49,7 +58,8 @@ const MAX_BACKOFF_SECS: u64 = 900;
 /// A lockfile older than this is a leak from a dead process — break it.
 const LOCK_STALE_SECS: u64 = 60;
 
-const SOURCE: &str = "anthropic-oauth";
+const ANTHROPIC_SOURCE: &str = "anthropic-oauth";
+const CODEX_SOURCE: &str = "codex";
 
 /// The on-disk snapshot — see the module doc for field semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,9 +110,9 @@ pub fn should_fetch(
 }
 
 /// Snapshot after a successful fetch: fresh payload, failure state cleared.
-pub fn on_success(fingerprint: &str, now: u64, payload: Value) -> Snapshot {
+pub fn on_success(source: &str, fingerprint: &str, now: u64, payload: Value) -> Snapshot {
     Snapshot {
-        source: SOURCE.to_string(),
+        source: source.to_string(),
         account: fingerprint.to_string(),
         fetched_at: now,
         attempted_at: now,
@@ -116,7 +126,13 @@ pub fn on_success(fingerprint: &str, now: u64, payload: Value) -> Snapshot {
 /// but the last-good `payload`/`fetched_at` are preserved (same account). A
 /// failure right after an account swap starts a fresh record — the old
 /// account's payload must not be served under the new fingerprint.
-pub fn on_failure(prev: Option<Snapshot>, fingerprint: &str, now: u64, error: String) -> Snapshot {
+pub fn on_failure(
+    source: &str,
+    prev: Option<Snapshot>,
+    fingerprint: &str,
+    now: u64,
+    error: String,
+) -> Snapshot {
     match prev {
         Some(p) if p.account == fingerprint => Snapshot {
             attempted_at: now,
@@ -125,7 +141,7 @@ pub fn on_failure(prev: Option<Snapshot>, fingerprint: &str, now: u64, error: St
             ..p
         },
         _ => Snapshot {
-            source: SOURCE.to_string(),
+            source: source.to_string(),
             account: fingerprint.to_string(),
             fetched_at: 0,
             attempted_at: now,
@@ -158,10 +174,14 @@ pub fn fingerprint(secret: &str) -> String {
 
 /// The published snapshot location: `~/.local/state/router-acp/usage/…` —
 /// alongside `sessions.db`. Fixed (not derived from `state_file`) because the
-/// relay reads this exact path regardless of any per-process router config.
-fn snapshot_path() -> Option<PathBuf> {
+/// relay reads these exact paths regardless of any per-process router config.
+fn snapshot_path(file_name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".local/state/router-acp/usage/anthropic-oauth.json"))
+    Some(
+        Path::new(&home)
+            .join(".local/state/router-acp/usage")
+            .join(file_name),
+    )
 }
 
 pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
@@ -294,9 +314,45 @@ pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> Option<Value> {
             .as_deref()
             .unwrap_or(&creds.access_token),
     );
-    let path = snapshot_path()?;
+    cached_usage(
+        ANTHROPIC_SOURCE,
+        "anthropic-oauth.json",
+        &fp,
+        min_refresh_secs,
+        || crate::usage::fetch_anthropic_usage(&creds.access_token),
+    )
+    .await
+}
+
+/// Codex counterpart of [`cached_anthropic_usage`]: the payload is the raw
+/// `account/rateLimits/read` result from one `codex app-server` round-trip.
+/// The RPC is local process spawn + one backend read, but it still deserves
+/// the shared cache — every serve process polling it independently is wasted
+/// work, and the snapshot is what the relay reads.
+pub async fn cached_codex_usage(min_refresh_secs: u64) -> Option<Value> {
+    let fp = crate::usage::codex_account_fingerprint()?;
+    cached_usage(CODEX_SOURCE, "codex.json", &fp, min_refresh_secs, || {
+        crate::usage::fetch_codex_usage()
+    })
+    .await
+}
+
+/// Shared cache-mediated fetch. `fetch` runs only under the cross-process
+/// lock, after the under-lock re-read still says a refresh is due.
+async fn cached_usage<F, Fut>(
+    source: &'static str,
+    file_name: &str,
+    fp: &str,
+    min_refresh_secs: u64,
+    fetch: F,
+) -> Option<Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let path = snapshot_path(file_name)?;
     let snap = read_snapshot(&path);
-    if !should_fetch(snap.as_ref(), unix_now(), &fp, min_refresh_secs) {
+    if !should_fetch(snap.as_ref(), unix_now(), fp, min_refresh_secs) {
         return snap.and_then(|s| s.payload);
     }
     let lock_path = path.with_extension("json.lock");
@@ -308,7 +364,10 @@ pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> Option<Value> {
         // Someone else is fetching; whatever the cache holds (even stale)
         // beats a second concurrent hit on the shared budget. A cached
         // payload for a *different* account is never served, though.
-        tracing::debug!("usage fetch lock held by another process; using cached snapshot");
+        tracing::debug!(
+            source,
+            "usage fetch lock held by another process; using cached snapshot"
+        );
         return snap.filter(|s| s.account == fp).and_then(|s| s.payload);
     };
     // Re-read under the lock: another process may have completed its own
@@ -317,20 +376,20 @@ pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> Option<Value> {
     // merge must run against; otherwise we'd fetch redundantly, and a failure
     // here could overwrite a sibling's fresher success.
     let snap = read_snapshot(&path);
-    if !should_fetch(snap.as_ref(), unix_now(), &fp, min_refresh_secs) {
+    if !should_fetch(snap.as_ref(), unix_now(), fp, min_refresh_secs) {
         return snap.and_then(|s| s.payload);
     }
-    match crate::usage::fetch_anthropic_usage(&creds.access_token).await {
+    match fetch().await {
         Ok(payload) => {
-            let s = on_success(&fp, unix_now(), payload);
+            let s = on_success(source, fp, unix_now(), payload);
             if let Err(e) = write_snapshot(&path, &s) {
                 tracing::debug!(error = %e, "cannot persist usage snapshot");
             }
             s.payload
         }
         Err(err) => {
-            tracing::debug!(%err, "usage fetch failed; keeping last-good snapshot");
-            let s = on_failure(snap, &fp, unix_now(), classify_error(&err));
+            tracing::debug!(source, %err, "usage fetch failed; keeping last-good snapshot");
+            let s = on_failure(source, snap, fp, unix_now(), classify_error(&err));
             if let Err(e) = write_snapshot(&path, &s) {
                 tracing::debug!(error = %e, "cannot persist usage snapshot");
             }
@@ -346,7 +405,7 @@ mod tests {
 
     fn snap(account: &str, attempted_at: u64, failures: u32) -> Snapshot {
         Snapshot {
-            source: SOURCE.to_string(),
+            source: ANTHROPIC_SOURCE.to_string(),
             account: account.to_string(),
             fetched_at: attempted_at,
             attempted_at,
@@ -424,19 +483,25 @@ mod tests {
 
     #[test]
     fn failure_preserves_last_good_payload() {
-        let good = on_success("fp", 1000, json!({"limits": [1]}));
-        let failed = on_failure(Some(good), "fp", 1060, "HTTP 429".into());
+        let good = on_success(ANTHROPIC_SOURCE, "fp", 1000, json!({"limits": [1]}));
+        let failed = on_failure(ANTHROPIC_SOURCE, Some(good), "fp", 1060, "HTTP 429".into());
         assert_eq!(failed.payload, Some(json!({"limits": [1]})), "payload kept");
         assert_eq!(failed.fetched_at, 1000, "success time kept");
         assert_eq!(failed.attempted_at, 1060);
         assert_eq!(failed.consecutive_failures, 1);
         assert_eq!(failed.last_error.as_deref(), Some("HTTP 429"));
 
-        let failed2 = on_failure(Some(failed), "fp", 1180, "curl: timeout".into());
+        let failed2 = on_failure(
+            ANTHROPIC_SOURCE,
+            Some(failed),
+            "fp",
+            1180,
+            "curl: timeout".into(),
+        );
         assert_eq!(failed2.consecutive_failures, 2);
         assert_eq!(failed2.payload, Some(json!({"limits": [1]})));
 
-        let recovered = on_success("fp", 1300, json!({"limits": [2]}));
+        let recovered = on_success(ANTHROPIC_SOURCE, "fp", 1300, json!({"limits": [2]}));
         assert_eq!(recovered.consecutive_failures, 0);
         assert!(recovered.last_error.is_none());
     }
@@ -449,7 +514,13 @@ mod tests {
         assert!(should_fetch(Some(&s), 1000, "new-account", 60));
         // And a failure under the new account does not inherit the old
         // payload or failure count.
-        let f = on_failure(Some(s), "new-account", 1000, "boom".into());
+        let f = on_failure(
+            ANTHROPIC_SOURCE,
+            Some(s),
+            "new-account",
+            1000,
+            "boom".into(),
+        );
         assert_eq!(f.account, "new-account");
         assert_eq!(f.consecutive_failures, 1);
         assert!(f.payload.is_none());
@@ -463,11 +534,17 @@ mod tests {
         assert!(should_fetch(Some(&stale), 2000, "fp", 60));
         // …but another process refreshed while we waited for the lock; the
         // decision recomputed against the re-read snapshot flips to no-fetch.
-        let refreshed = on_success("fp", 1995, json!({"limits": [9]}));
+        let refreshed = on_success(ANTHROPIC_SOURCE, "fp", 1995, json!({"limits": [9]}));
         assert!(!should_fetch(Some(&refreshed), 2000, "fp", 60));
         // And a failure merged against the re-read state preserves the
         // sibling's fresh success, not the pre-lock stale view.
-        let failed = on_failure(Some(refreshed), "fp", 2100, "HTTP 429".into());
+        let failed = on_failure(
+            ANTHROPIC_SOURCE,
+            Some(refreshed),
+            "fp",
+            2100,
+            "HTTP 429".into(),
+        );
         assert_eq!(failed.payload, Some(json!({"limits": [9]})));
         assert_eq!(failed.fetched_at, 1995, "sibling's success time kept");
     }
