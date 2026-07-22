@@ -408,6 +408,12 @@ pub struct OrchestrationConfig {
     /// Maximum review → fix → re-review rounds.
     #[serde(default = "default_max_fix_rounds")]
     pub max_fix_rounds: u32,
+    /// Planner self-confidence bar for skipping the review pass. After
+    /// integrating, the planner states its confidence (0.0–1.0) that the
+    /// implementation is correct; strictly above this bar the review is
+    /// skipped with a note. `submit: merge` always reviews regardless.
+    #[serde(default = "default_review_confidence")]
+    pub review_confidence: f64,
 }
 
 fn default_min_items() -> usize {
@@ -440,6 +446,10 @@ fn default_max_fix_rounds() -> u32 {
     2
 }
 
+fn default_review_confidence() -> f64 {
+    0.8
+}
+
 impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
@@ -449,6 +459,7 @@ impl Default for OrchestrationConfig {
             reviewer: default_reviewer(),
             submit: default_submit(),
             max_fix_rounds: default_max_fix_rounds(),
+            review_confidence: default_review_confidence(),
         }
     }
 }
@@ -1086,6 +1097,12 @@ impl Config {
                     self.orchestration.submit
                 )));
             }
+            if !(0.0..=1.0).contains(&self.orchestration.review_confidence) {
+                return Err(ConfigError(format!(
+                    "orchestration.review_confidence must be within 0.0..=1.0, got `{}`",
+                    self.orchestration.review_confidence
+                )));
+            }
         }
         Ok(())
     }
@@ -1139,6 +1156,27 @@ agents:
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
+        assert_eq!(cfg.orchestration.review_confidence, 0.8);
+    }
+
+    #[test]
+    fn parses_review_confidence_override() {
+        let yaml = format!(
+            "orchestration:\n  enabled: true\n  review_confidence: 0.95\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.orchestration.review_confidence, 0.95);
+    }
+
+    #[test]
+    fn rejects_review_confidence_out_of_range() {
+        let yaml = format!(
+            "orchestration:\n  enabled: true\n  review_confidence: 1.5\n{}",
+            minimal_yaml()
+        );
+        let err = Config::from_yaml(&yaml).unwrap_err();
+        assert!(err.0.contains("review_confidence"), "{}", err.0);
     }
 
     #[test]

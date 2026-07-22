@@ -24,6 +24,10 @@
 //! - `DELEGATE:<task>` — call the `delegate_task` tool on the MCP server
 //!   named `router-delegate` passed in session/new (may repeat; all
 //!   delegations run concurrently)
+//! - `DELEGATE_BG:<task>` — call `delegate_task` with `background: true`
+//!   (returns the immediate `b-…` ack; may repeat)
+//! - `AWAIT_DELEGATES` — call `delegate_await` (all pending jobs); an
+//!   optional `:<secs>` suffix sets `timeout_seconds`
 //! - otherwise — echo `echo:<model>:<text>`
 
 use std::collections::HashMap;
@@ -488,6 +492,84 @@ async fn run_prompt(
                 }
             }
             None => reply.push("delegate-error:no router-delegate MCP server".to_string()),
+        }
+    }
+
+    // Background delegation + collection: fire every DELEGATE_BG (immediate
+    // acks), then AWAIT_DELEGATES to gather the results — one prompt exercises
+    // the whole parallel flow.
+    let bg_tasks: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("DELEGATE_BG:"))
+        .collect();
+    let await_spec = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("AWAIT_DELEGATES").map(str::to_string));
+    if !bg_tasks.is_empty() || await_spec.is_some() {
+        let delegate_server = mcp_servers
+            .iter()
+            .find(|s| matches!(s, McpServer::Stdio(stdio) if stdio.name == "router-delegate"));
+        match delegate_server {
+            Some(server) => {
+                for task in &bg_tasks {
+                    let result = async {
+                        let mut client = McpClient::spawn(server).await?;
+                        let result = client
+                            .request(
+                                "tools/call",
+                                json!({
+                                    "name": "delegate_task",
+                                    "arguments": {"task": task, "background": true},
+                                }),
+                            )
+                            .await;
+                        client.shutdown().await;
+                        result
+                    }
+                    .await;
+                    match result {
+                        Ok(value) => {
+                            let text = value["content"][0]["text"].as_str().unwrap_or("");
+                            let is_error = value["isError"].as_bool().unwrap_or(false);
+                            reply.push(format!(
+                                "delegate-bg{}:{text}",
+                                if is_error { "-error" } else { "" }
+                            ));
+                        }
+                        Err(err) => reply.push(format!("delegate-bg-error:{err}")),
+                    }
+                }
+                if let Some(spec) = await_spec {
+                    let mut arguments = json!({});
+                    if let Some(secs) = spec.strip_prefix(':').and_then(|s| s.parse::<u64>().ok()) {
+                        arguments["timeout_seconds"] = json!(secs);
+                    }
+                    let result = async {
+                        let mut client = McpClient::spawn(server).await?;
+                        let result = client
+                            .request(
+                                "tools/call",
+                                json!({"name": "delegate_await", "arguments": arguments}),
+                            )
+                            .await;
+                        client.shutdown().await;
+                        result
+                    }
+                    .await;
+                    match result {
+                        Ok(value) => {
+                            let text = value["content"][0]["text"].as_str().unwrap_or("");
+                            let is_error = value["isError"].as_bool().unwrap_or(false);
+                            reply.push(format!(
+                                "await{}:{text}",
+                                if is_error { "-error" } else { "" }
+                            ));
+                        }
+                        Err(err) => reply.push(format!("await-error:{err}")),
+                    }
+                }
+            }
+            None => reply.push("delegate-bg-error:no router-delegate MCP server".to_string()),
         }
     }
 

@@ -3,9 +3,11 @@
 router-acp orchestrates compound tasks **itself**, in-process. When a prompt
 reads as a multi-part task list, the router pins a frontier **planner** model and
 injects an orchestration protocol; the planner decomposes the work, fans it out
-to router-routed sub-sessions via the `delegate_task` tool, has a
-**different-lineage** model review the result, adjudicates fixes, and submits per
-a gate. No goose recipe, no `summon` extension, no wrapper script — it works from
+**in parallel** to router-routed sub-sessions via the `delegate_task` tool
+(`background: true` + `delegate_await`), has a **different-lineage** model review
+the result — or skips the review, with a note, when no other lineage is
+routeable or its own confidence clears the configured bar — adjudicates fixes,
+and submits per a gate. No goose recipe, no `summon` extension, no wrapper script — it works from
 any ACP client (goose, Zed, a plain script) and even a plain chat turn.
 
 > This replaces the old goose `orchestrate.yaml` recipe (removed). The recipe
@@ -77,19 +79,32 @@ Every trigger is disclosed: `router-acp · orchestrating a N-part task on <model
 ## The pipeline (what the injected protocol tells the planner)
 
 1. **Plan.** Investigate read-only, restate the task as concrete success
-   criteria, and split it into self-contained, **file-disjoint** subtasks.
-2. **Delegate.** Dispatch each subtask with `delegate_task`, giving each a fully
-   self-contained prompt (paths, current vs. desired behavior, constraints,
-   acceptance checks) — the router routes each subtask by reading *its* prompt,
-   so the planner is told to describe difficulty honestly. Independent subtasks
-   go concurrently.
-3. **Review (different lineage).** Delegate a review via `delegate_task`, passing
-   `hints.candidate` set to a concrete candidate of a **different lineage** than
-   the planner (the router resolves and injects those ids — see below). The
-   reviewer gets the ORIGINAL task verbatim and re-derives the criteria itself.
-4. **Adjudicate.** Fix blocking issues (a targeted `delegate_task`, or
-   `delegate_followup` to iterate on a kept-open sub-agent) and re-review, up to
-   `max_fix_rounds`.
+   criteria, split it into self-contained, **file-disjoint** subtasks, and
+   state a confidence (0.0–1.0) that the plan will satisfy the criteria (step 3
+   uses it).
+2. **Delegate — in parallel.** MCP clients execute tool calls one at a time, so
+   plain `delegate_task` calls would serialize the subtasks. The protocol
+   therefore mandates `background: true` for every independent subtask (each
+   call returns a `b-…` id immediately and the subtask runs concurrently) and
+   `delegate_await` to collect the results, polling until none remain. Each
+   subtask gets a fully self-contained prompt (paths, current vs. desired
+   behavior, constraints, acceptance checks) — the router routes each subtask
+   by reading *its* prompt, so the planner is told to describe difficulty
+   honestly. Dependent subtasks start only after their prerequisites are
+   collected.
+3. **Review (different lineage) — after all implementation subtasks are
+   collected.** Delegate a review via `delegate_task`, passing `hints.candidate`
+   set to a concrete candidate of a **different lineage** than the planner (the
+   router resolves and injects those ids — see below). The reviewer gets the
+   ORIGINAL task verbatim and re-derives the criteria itself. The planner
+   **skips the review — noting the reason in its report** — when no
+   cross-lineage reviewer is routeable, or when its stated confidence
+   (re-assessed after integration) is strictly greater than
+   `orchestration.review_confidence`. Under `submit: merge` the review is never
+   skipped.
+4. **Adjudicate** (only if a review ran). Fix blocking issues (a targeted
+   `delegate_task`, or `delegate_followup` to iterate on a kept-open sub-agent)
+   and re-review, up to `max_fix_rounds`.
 5. **Submit.** Per `orchestration.submit` — `never | branch | pr | merge`. A
    merge is only permitted **after** an approving review. Any end-of-work skill
    the task named (shipping, opening/merging a PR, deploying) runs here — last,
@@ -107,6 +122,7 @@ observable:
 | Cross-lineage review is *routeable* | in an orchestrating session the delegate pool is **not** cheaper-only — it may reach same-/higher-tier peers, so a frontier reviewer of another lineage can be delegated to |
 | Concrete reviewer ids | `resolve_reviewers` picks eligible candidates whose lineage ≠ the planner's (from `orchestration.reviewer` globs, else any other lineage) and injects them into the protocol |
 | Iterating on a subtask | `delegate_task keep_open: true` returns a `delegate_id`; `delegate_followup` sends more turns to that same sub-agent (context preserved); `delegate_close` frees it |
+| True parallelism despite serial tool calls | `delegate_task background: true` returns a `b-…` id immediately and runs the subtask on its own task (bounded by `delegation.max_concurrent`); `delegate_await` collects finished results exactly once and reports still-running jobs, so the planner polls with short calls instead of holding one tool call open past client idle timeouts |
 | Observability | the planner and every delegate get state-DB rows sharing `run_label = "orchestrate"`; delegate rows link to the parent via `parent_session_id`; each routing decision is disclosed and recorded |
 | Planner selection | steered pre-pin (`candidate_override`) or switched mid-session (`switch_pin`) to the best eligible `orchestration.planner` glob |
 
@@ -120,6 +136,7 @@ orchestration:
   reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]          # preferred; a DIFFERENT lineage is enforced
   submit: branch                                      # never | branch | pr | merge
   max_fix_rounds: 2
+  review_confidence: 0.8                              # skip the review above this planner confidence
 ```
 
 - **`planner`** / **`reviewer`** are candidate globs matched against the
@@ -128,9 +145,18 @@ orchestration:
   order and config order as tie-breaks — so a configured agent `preference`
   biases the planner seat. The reviewer is always forced onto a lineage other
   than the planner's when one is available; if only the planner's lineage is
-  routeable, the review runs on the most capable other model it can (disclosed).
-- **`submit: merge`** still gates the merge on an approving review — see the
-  protocol's step 5. Set `never` to keep everything local.
+  routeable, the review is skipped with a note (a same-lineage review shares
+  the planner's failure modes) — except under `submit: merge`, where it runs on
+  the most capable other model instead (disclosed).
+- **`review_confidence`** (default `0.8`) is the planner-confidence bar for
+  skipping the review: the planner states a 0.0–1.0 confidence at plan time,
+  re-assesses it after integrating the subtask results, and skips the review —
+  noting the skip and the number in its report — when it is strictly above the
+  bar. Set it to `1.0` to make the review effectively unconditional, or low to
+  review only shaky work. Ignored under `submit: merge`.
+- **`submit: merge`** always gates the merge on an approving review — the
+  confidence skip and the no-other-lineage skip both disable themselves. Set
+  `never` to keep everything local.
 
 ## Why each model ends up where it does
 
