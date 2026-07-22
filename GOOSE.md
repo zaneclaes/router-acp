@@ -172,6 +172,23 @@ Notes on this file:
   is simply skipped by routing (no error). Only `grok-4.5` is pre-configured;
   add others once `grok models` shows them.
 
+- **Moonshot Kimi** is wired in as a fourth agent (`lineage: moonshot`), a fourth
+  company for cross-lineage review. Its CLI is itself an ACP agent too:
+
+  ```sh
+  uv tool install kimi-cli       # provides `kimi`; `kimi acp` speaks ACP
+  kimi login                     # browser OAuth; auto-configures your model ids
+  ```
+
+  Configured as `spawn-config`, but note `--model` is a **global** flag so it
+  precedes the subcommand — the template is `["--model", "${model_id}", "acp"]`
+  with no base args, yielding `kimi --model kimi-k2 acp`. Until you `kimi login`,
+  kimi sits auth-pending and is skipped by routing. Only `kimi-k2` is
+  pre-configured; add others (`kimi-k2-thinking`, `kimi-latest`, …) once login
+  shows what your account exposes. Kimi has no usage endpoint, so it relies on
+  the reactive cordon (no proactive usage cordon like claude/codex, and no
+  access-gate frame like grok).
+
 Validate:
 
 ```sh

@@ -71,6 +71,27 @@ agents:
       - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5 }   # current frontier
       # - { id: grok-code-fast-1, display_name: Grok Code Fast, cost_rank: 2 }
 
+  # Moonshot Kimi. The CLI (`uv tool install kimi-cli`, executable `kimi`) is
+  # itself an ACP agent — `kimi acp` — so no separate adapter is needed. Its own
+  # company, so it's a valid cross-lineage reviewer for claude, codex AND grok.
+  # Auth is separate: run `kimi login` once (browser OAuth) — it also
+  # auto-configures the model ids your account exposes; confirm them (config
+  # file / `/model`) and list them below. No `usage_source` (Moonshot exposes no
+  # pollable usage endpoint) → the reactive cordon covers it.
+  - name: kimi
+    command:
+      type: stdio
+      command: kimi               # or an absolute path if not on the router's PATH
+    lineage: moonshot
+    budget_prompts_5h: 400
+    model_selection:
+      type: spawn-config          # kimi fixes the model per process via --model,
+      process_template:           # which is a GLOBAL flag → it precedes `acp`
+        args: ["--model", "${model_id}", "acp"]
+    models:
+      - { id: kimi-k2, display_name: Kimi K2, cost_rank: 2 }
+      # - { id: kimi-k2-thinking, display_name: Kimi K2 Thinking, cost_rank: 3 }
+
 router: escalation
 routers:
   escalation:

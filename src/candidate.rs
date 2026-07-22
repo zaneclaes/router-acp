@@ -448,4 +448,25 @@ mod score_resolution_tests {
         // generic gpt-5 fallback only where intended (terra yes, luna no).
         assert!(q("codex/gpt-5.6-terra") > q("codex/gpt-5.5"));
     }
+
+    #[test]
+    fn kimi_thinking_outranks_base_and_neither_falls_through() {
+        let t = ScoreTable::builtin();
+        let base = t.lookup(&CandidateId::parse("kimi/kimi-k2").unwrap());
+        let thinking = t.lookup(&CandidateId::parse("kimi/kimi-k2-thinking").unwrap());
+        // Both kimi entries are real (not the generic default fallback) and high
+        // coding tier; the reasoning variant scores strictly higher.
+        assert_eq!(base.coding_tier, CodingTier::High);
+        assert_eq!(thinking.coding_tier, CodingTier::High);
+        assert!(
+            thinking.quality(TaskClass::Algorithms) > base.quality(TaskClass::Algorithms),
+            "`*kimi*k2*thinking*` must win over the broad `*kimi*` (first-match order)"
+        );
+        // A plain kimi id and kimi-latest both resolve to the base kimi entry.
+        let latest = t.lookup(&CandidateId::parse("kimi/kimi-latest").unwrap());
+        assert_eq!(
+            latest.quality(TaskClass::CodingGeneral),
+            base.quality(TaskClass::CodingGeneral)
+        );
+    }
 }

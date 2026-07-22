@@ -233,3 +233,42 @@ candidates:
       Writing: 0.86
       Ops: 0.84
       CodingGeneral: 0.9
+
+  # Moonshot Kimi K2 — BEST-GUESS estimates (no seat-benchmark data yet). K2 is
+  # an open-weight MoE that's strong on agentic/coding tasks (≈ sonnet-tier
+  # coding) at cheap API cost; general reasoning/writing a notch below frontier.
+  # `*kimi*k2*thinking*` (the reasoning variant) is stronger, so it MUST precede
+  # the broad `*kimi*` (first-match-wins). Tune once you've run real tasks.
+  - pattern: "*kimi*k2*thinking*"    # Kimi K2 Thinking (reasoning-tuned)
+    coding_tier: high
+    coding_percentile: 0.85
+    context_window: 256000
+    default_quality: 0.82
+    quality:
+      UiTweak: 0.8
+      BugFix: 0.86
+      Feature: 0.84
+      Refactor: 0.84
+      Algorithms: 0.86
+      Architecture: 0.82
+      Research: 0.82
+      Writing: 0.78
+      Ops: 0.8
+      CodingGeneral: 0.86
+
+  - pattern: "*kimi*"                # kimi-k2 / kimi-latest and other kimi models
+    coding_tier: high
+    coding_percentile: 0.78
+    context_window: 256000
+    default_quality: 0.76
+    quality:
+      UiTweak: 0.78
+      BugFix: 0.82
+      Feature: 0.8
+      Refactor: 0.8
+      Algorithms: 0.8
+      Architecture: 0.76
+      Research: 0.72
+      Writing: 0.74
+      Ops: 0.76
+      CodingGeneral: 0.84

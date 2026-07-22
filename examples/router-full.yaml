@@ -166,6 +166,26 @@ agents:
       - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5 }
       # confirm ids with `grok models` after login; router-acp drops unknown ids
 
+  # Moonshot Kimi — the CLI (`uv tool install kimi-cli`) is itself an ACP agent
+  # (`kimi acp`); no separate adapter needed. Own company/lineage, so it can
+  # review (and be reviewed by) claude, codex and grok. `kimi login` is separate
+  # (browser OAuth) and auto-configures your account's model ids. `--model` is a
+  # global flag, so it precedes the `acp` subcommand. No `usage_source` (no
+  # pollable Moonshot usage endpoint) → reactive cordon only.
+  - name: kimi
+    command:
+      type: stdio
+      command: kimi
+    lineage: moonshot
+    budget_prompts_5h: 400
+    model_selection:
+      type: spawn-config              # model fixed per process via --model
+      process_template:
+        args: ["--model", "${model_id}", "acp"]
+    models:
+      - { id: kimi-k2, display_name: Kimi K2, cost_rank: 2 }
+      # - { id: kimi-k2-thinking, display_name: Kimi K2 Thinking, cost_rank: 3 }
+
 routers:
   static:
     candidate: claude/sonnet

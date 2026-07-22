@@ -3,9 +3,11 @@
 router-acp is an ACP (Agent Client Protocol) session router: one terminal
 ACP **agent** upstream (the client — goose, Zed — connects to it over stdio)
 plus N ACP **client** connections downstream to seat-authenticated adapters
-(`claude-agent-acp`, `codex-acp`, and xAI's `@xai-official/grok` — whose CLI is
-itself an ACP agent via `grok agent stdio`, wired as a `spawn-config` agent with
-`--model ${model_id}`, `lineage: xai`; `grok login` for auth). It routes each new conversation to the
+(`claude-agent-acp`, `codex-acp`, xAI's `@xai-official/grok`, and Moonshot's
+`kimi-cli` — the last two are CLIs that are themselves ACP agents via `grok
+agent stdio` / `kimi acp`, both wired as `spawn-config` agents with
+`--model ${model_id}` (`lineage: xai` / `lineage: moonshot`; `grok login` /
+`kimi login` for auth). It routes each new conversation to the
 best `(agent, model)` candidate, pins it, relays everything, and offers a
 `delegate_task` MCP tool for cheaper sub-sessions. Built against
 `agent-client-protocol` **1.2.0** (Rust SDK). The original build spec
@@ -408,22 +410,29 @@ fails.
   `claude-acp`/`codex-acp` remain direct. After code changes run
   `cargo install --path . --force` or goose keeps the old binary.
 - Real adapters live at `~/nvm/versions/node/v24.16.0/bin/{claude-agent-acp,codex-acp,grok}`
-  (nvm-versioned paths — they move on node upgrades). Verified model ids
-  (July 2026): claude offers `default, haiku, sonnet, sonnet[1m], opus[1m],
-  claude-fable-5[1m]`; codex offers `gpt-5.4-mini, gpt-5.4, gpt-5.5`. **grok**
-  (`@xai-official/grok` v0.2.106): `grok agent stdio` is a native ACP agent
-  (verified — returns a valid `initialize` result with `authMethods:[grok.com]`);
+  (nvm-versioned paths — they move on node upgrades) and `~/.local/bin/kimi`
+  (uv tool). Verified model ids (July 2026): claude offers `default, haiku,
+  sonnet, sonnet[1m], opus[1m], claude-fable-5[1m]`; codex offers `gpt-5.4-mini,
+  gpt-5.4, gpt-5.5`. **grok** (`@xai-official/grok` v0.2.106): `grok agent stdio`
+  is a native ACP agent (verified — valid `initialize`, `authMethods:[grok.com]`);
   model fixed per process via `grok agent --model <id> stdio` (spawn-config, args
-  `["agent"]` + template `["--model","${model_id}","stdio"]`). NOT logged in on
-  this box yet → `grok login` required before it leaves auth-pending; `grok
-  models` (post-login) lists real ids — only `grok-4.5` (default) is confirmed,
-  score-table `*grok*code*`/`*grok*` globs cover the rest. No usage_source (no
-  pollable/on-disk usage snapshot known) → reactive cordon only. Score estimates
-  in `data/scores.yaml` are BEST-GUESS (grok-4.5 ≈ opus/sol tier).
-  Claude modes: `auto, default, acceptEdits, plan, dontAsk,
-  bypassPermissions`; codex modes: `read-only, auto, full-access`. To
-  re-discover ids, declare a bogus model and read the `available=[…]`
-  warning under `RUST_LOG=router_acp=debug`.
+  `["agent"]` + template `["--model","${model_id}","stdio"]`); `grok login`, only
+  `grok-4.5` confirmed. grok has no usage_source (no pollable/on-disk snapshot) —
+  its subscription **access gate** drives a cordon instead (see the grok-gate
+  invariant above). **kimi** (Moonshot `kimi-cli` v1.49.0, `uv tool install
+  kimi-cli` → `~/.local/bin/kimi`): `kimi acp` is a native ACP agent (verified —
+  valid `initialize` `{name:"Kimi Code CLI"}`, `sessionCapabilities:{list,resume}`,
+  `authMethods:[login]`; `session/new` → "Authentication required" until `kimi
+  login` (browser OAuth, auto-configures account model ids). `--model` is a
+  **global** flag so it precedes the subcommand: `kimi --model <id> acp`
+  (spawn-config, NO base args + template `["--model","${model_id}","acp"]`).
+  `lineage: moonshot`; only `kimi-k2` configured (best-guess), score-table
+  `*kimi*k2*thinking*`/`*kimi*` globs cover variants. No usage_source → reactive
+  cordon only. Score estimates in `data/scores.yaml` are BEST-GUESS (grok-4.5 ≈
+  opus/sol tier; kimi-k2 ≈ sonnet coding tier, cheaper). Claude modes: `auto,
+  default, acceptEdits, plan, dontAsk, bypassPermissions`; codex modes:
+  `read-only, auto, full-access`. To re-discover ids, declare a bogus model and
+  read the `available=[…]` warning under `RUST_LOG=router_acp=debug`.
 - The user prefers Claude (bigger plan): `preference: 0.05` on the claude
   agent, `cost_quality_tradeoff: 3`. History: routing once sent an hour-long
   investigation to `gpt-5.4-mini` because the broad `*gpt-5*` score pattern

@@ -29,17 +29,20 @@ Zed, …) connects to it as if it were any coding agent; the router connects
 downstream to one or more seat-authenticated ACP agent adapters such as
 [`@agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp),
 [`@agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp),
-and xAI's own CLI [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok)
-(which speaks ACP natively via `grok agent stdio` — no separate adapter),
-and provides OpenRouter-*inspired* selection semantics over them (a local
-heuristic, not a port of OpenRouter's proprietary router — see below):
+xAI's own CLI [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok)
+(which speaks ACP natively via `grok agent stdio` — no separate adapter), and
+Moonshot's [`kimi-cli`](https://github.com/MoonshotAI/kimi-cli) (likewise native
+ACP via `kimi acp`), and provides OpenRouter-*inspired* selection semantics over
+them (a local heuristic, not a port of OpenRouter's proprietary router — see below):
 
 ```
 goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp     (claude/sonnet, claude/opus)
                           │
                           ├──────ACP──▶ codex-acp             (codex/gpt-5.5, codex/gpt-5.6-sol)
                           │
-                          └──────ACP──▶ grok agent stdio      (grok/grok-4.5)
+                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.5)
+                          │
+                          └──────ACP──▶ kimi acp              (kimi/kimi-k2)
 ```
 
 Every new conversation is pinned to the best **candidate**, where a candidate
@@ -671,6 +674,7 @@ Manual matrix for real seats:
 | Zed | claude-agent-acp | `agent_servers` entry as above; model picker shows `router.candidate`. |
 | goose / Zed | codex-acp | Use `spawn-config` with `CODEX_CONFIG` per model. |
 | goose / Zed | grok (`@xai-official/grok`) | Native ACP: `command: grok`, `args: ["agent"]`, `spawn-config` template `["--model", "${model_id}", "stdio"]`. Auth via `grok login`; confirm ids with `grok models`. |
+| goose / Zed | kimi (Moonshot `kimi-cli`) | Native ACP: `command: kimi`, no base args, `spawn-config` template `["--model", "${model_id}", "acp"]` (`--model` is a global flag, so it precedes `acp`). Auth via `kimi login` (browser OAuth, auto-configures model ids). |
 | any | mixed Claude + Codex, auth-pending at startup | Authenticate via the namespaced method ids. |
 | any | single-candidate config | Passthrough; startup logs "routing and delegation are inert". |
 
