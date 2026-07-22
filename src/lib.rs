@@ -17,3 +17,4 @@ pub mod tasklist;
 pub mod tickets;
 pub mod transport;
 pub mod usage;
+pub mod usage_cache;

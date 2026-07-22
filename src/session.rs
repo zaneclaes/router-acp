@@ -2892,6 +2892,10 @@ async fn send_prompt_with_failover(
                 // if it has fallen below the configured threshold, queue an
                 // auto-upgrade to a more capable model for the next prompt.
                 update_confidence_and_maybe_upgrade(&shared, &router_sid, &resp);
+                // The turn just changed real usage — nudge the shared usage
+                // snapshot (self-throttled and fire-and-forget; never delays
+                // the turn).
+                crate::usage::refresh_after_turn(&shared, &candidate.agent);
                 return responder.respond(resp);
             }
             Err(err) => {
