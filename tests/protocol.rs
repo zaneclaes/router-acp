@@ -2176,7 +2176,14 @@ async fn orchestration_delegate_children_inherit_run_label_and_parent() {
         agent_yaml(
             "cheap",
             &[("haiku", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_SESSION_MODES", "default,bypassPermissions"),
+            ]
+        )
+        .replace(
+            "    models:\n",
+            "    mode_map: { auto: bypassPermissions }\n    models:\n",
         ),
         agent_yaml("fancy", &[("opus", 3)], &[]),
     );
