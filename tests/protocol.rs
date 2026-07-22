@@ -1001,6 +1001,64 @@ async fn five_bug_acceptance_scenario() {
     .await;
 }
 
+#[tokio::test]
+async fn background_delegates_run_in_parallel_and_await_collects() {
+    // Two `background: true` delegations return immediately and execute
+    // CONCURRENTLY (each sub-agent sleeps ~900ms; a serial run would take
+    // ≥1800ms just sleeping), then one `delegate_await` collects both results.
+    let state = temp_state_file("delegate-bg");
+    let log = temp_log("delegate-bg");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test(delegation_yaml(&state, &log, 3), async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let started = std::time::Instant::now();
+        let prompt = "parallel work\n\
+                      DELEGATE_BG:SLEEP:900\n\
+                      DELEGATE_BG:SLEEP:901\n\
+                      AWAIT_DELEGATES";
+        let resp = prompt_text(&cx, &sid, prompt).await?;
+        let elapsed = started.elapsed();
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+        let text = agent_text(&observed, &sid);
+        assert_eq!(
+            text.matches("delegate-bg:[background delegate b-").count(),
+            2,
+            "both background starts acked immediately: {text}"
+        );
+        for slept in ["slept:900", "slept:901"] {
+            assert!(
+                text.contains(&format!("— done ===\n[delegated to cheap/haiku]\n{slept}")),
+                "await collected `{slept}`: {text}"
+            );
+        }
+        assert!(
+            text.contains("All requested background delegates have completed"),
+            "{text}"
+        );
+        // The parallelism assertion proper: two ~900ms subtasks plus overhead
+        // must finish well under the ≥1800ms a serial execution needs.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1650),
+            "background delegates must overlap (took {elapsed:?})"
+        );
+
+        // Everything was consumed — a bare await now reports the misuse.
+        let resp = prompt_text(&cx, &sid, "AWAIT_DELEGATES").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("await-error:no background delegates are pending"),
+            "{text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 // ======================================================================
 // Token limits, outages, failover, disclosures
 // ======================================================================

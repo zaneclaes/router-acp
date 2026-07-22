@@ -35,12 +35,22 @@ pub const DELEGATE_SERVER_NAME: &str = "router-delegate";
 pub const DELEGATE_TOOL_NAME: &str = "delegate_task";
 pub const DELEGATE_FOLLOWUP_TOOL_NAME: &str = "delegate_followup";
 pub const DELEGATE_CLOSE_TOOL_NAME: &str = "delegate_close";
+pub const DELEGATE_AWAIT_TOOL_NAME: &str = "delegate_await";
 
 const TOOL_DESCRIPTION: &str = "Delegate a small, self-contained subtask to a lower-cost agent \
      running in its own ephemeral session. Delegate only subtasks that do not need this \
      session's full hidden context: simple UI tweaks, mechanical edits, isolated bug fixes, \
      and focused research. Do not delegate integration decisions or tasks requiring the \
-     parent conversation's context. Returns the sub-agent's final answer as text.";
+     parent conversation's context. Returns the sub-agent's final answer as text — unless \
+     `background: true`, which returns a `b-…` id immediately so independent subtasks run in \
+     PARALLEL (clients execute tool calls serially, so plain calls serialize the subtasks); \
+     collect background results with `delegate_await`.";
+
+const AWAIT_TOOL_DESCRIPTION: &str = "Collect the results of background delegate_task jobs \
+     (`background: true`). Waits up to `timeout_seconds` (default 600) for the given \
+     `delegate_ids` (default: all of this session's pending jobs); returns every finished \
+     job's output and lists the ones still running — call again until none remain. Finished \
+     results are consumed: each is returned exactly once.";
 
 // ----------------------------------------------------------------------
 // MCP wire types (minimal, hand-typed over the SDK's JSON-RPC layer)
@@ -144,6 +154,27 @@ pub struct DelegateTaskArgs {
     /// `delegate_followup`. Returns a `delegate_id` to reference it.
     #[serde(default)]
     pub keep_open: bool,
+    /// Run the subtask as a background job: the call returns a `b-…` id
+    /// immediately and the result is collected later via `delegate_await`.
+    /// This is how independent subtasks actually run in parallel — MCP
+    /// clients execute tool calls one at a time, so foreground calls
+    /// serialize. Composes with `keep_open` (the collected result carries the
+    /// `delegate_id`).
+    #[serde(default)]
+    pub background: bool,
+}
+
+/// `delegate_await` tool input.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DelegateAwaitArgs {
+    /// Background job ids to wait for; empty means all of this session's
+    /// pending jobs.
+    #[serde(default)]
+    pub delegate_ids: Vec<String>,
+    /// How long to wait before returning a partial status (finished results
+    /// so far + still-running list). Clamped to 5..=1500 seconds.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// `delegate_followup` tool input.
@@ -199,9 +230,37 @@ fn tool_definition() -> Value {
                 "keep_open": {
                     "type": "boolean",
                     "description": "Keep the sub-session open for follow-ups (returns a delegate_id)."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Return a b-… id immediately and run the subtask concurrently; \
+                         collect the result with delegate_await. Use for every independent \
+                         subtask so they run in parallel."
                 }
             },
             "required": ["task"]
+        }
+    })
+}
+
+fn await_tool_definition() -> Value {
+    json!({
+        "name": DELEGATE_AWAIT_TOOL_NAME,
+        "description": AWAIT_TOOL_DESCRIPTION,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delegate_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Background job ids to wait for (default: all pending)."
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "description": "Max seconds to wait before returning a partial status \
+                         (default 600, clamped to 5..=1500)."
+                }
+            }
         }
     })
 }
@@ -423,6 +482,7 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                 responder.respond(McpToolsListResult {
                     tools: vec![
                         tool_definition(),
+                        await_tool_definition(),
                         followup_tool_definition(),
                         close_tool_definition(),
                     ],
@@ -450,8 +510,39 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                                     ));
                                 }
                             };
+                            if args.background {
+                                // Start the job and ack immediately — the
+                                // subtask runs on its own tokio task so
+                                // serially-executed tool calls still yield
+                                // parallel subtasks.
+                                let result = start_background_delegate(&shared, &router_sid, args);
+                                return responder.respond(match result {
+                                    Ok(text) => text_result(text, false),
+                                    Err(msg) => text_result(msg, true),
+                                });
+                            }
                             cx.spawn(async move {
                                 let result = run_delegate_task(&shared, &router_sid, args).await;
+                                let _ = responder.respond(match result {
+                                    Ok(text) => text_result(text, false),
+                                    Err(msg) => text_result(msg, true),
+                                });
+                                Ok(())
+                            })
+                        }
+                        DELEGATE_AWAIT_TOOL_NAME => {
+                            let args: DelegateAwaitArgs = match serde_json::from_value(req.arguments)
+                            {
+                                Ok(args) => args,
+                                Err(err) => {
+                                    return responder.respond(text_result(
+                                        format!("invalid delegate_await arguments: {err}"),
+                                        true,
+                                    ));
+                                }
+                            };
+                            cx.spawn(async move {
+                                let result = run_delegate_await(&shared, &router_sid, args).await;
                                 let _ = responder.respond(match result {
                                     Ok(text) => text_result(text, false),
                                     Err(msg) => text_result(msg, true),
@@ -520,6 +611,158 @@ fn text_result(text: String, is_error: bool) -> McpToolsCallResult {
 // ----------------------------------------------------------------------
 // Delegate orchestration
 // ----------------------------------------------------------------------
+
+/// Start a `background: true` delegate job: register it, spawn
+/// `run_delegate_task` on its own tokio task, and return the `b-…` id
+/// immediately. The `delegate_semaphore` inside `run_delegate_task` still
+/// bounds how many jobs actually execute at once.
+fn start_background_delegate(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: DelegateTaskArgs,
+) -> Result<String, String> {
+    if shared.with_session(router_sid, |_| ()).is_none() {
+        return Err("parent session no longer exists".to_string());
+    }
+    let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let mut summary = args.task.replace('\n', " ");
+    if summary.len() > 60 {
+        summary.truncate(57);
+        summary.push_str("...");
+    }
+    shared.background_delegates.lock().unwrap().insert(
+        job_id.clone(),
+        crate::session::BackgroundDelegate {
+            parent_sid: router_sid.to_string(),
+            summary: summary.clone(),
+            started: std::time::Instant::now(),
+            result: None,
+        },
+    );
+    let task_shared = shared.clone();
+    let task_sid = router_sid.to_string();
+    let task_job_id = job_id.clone();
+    tokio::spawn(async move {
+        let result = run_delegate_task(&task_shared, &task_sid, args).await;
+        // The parent may have closed while we ran (its jobs are dropped from
+        // the registry) — only record a result somebody can still collect.
+        let mut jobs = task_shared.background_delegates.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&task_job_id) {
+            job.result = Some(result);
+        }
+        drop(jobs);
+        task_shared.background_notify.notify_waiters();
+    });
+    Ok(format!(
+        "[background delegate {job_id} started — \"{summary}\"]\n\
+         The subtask is running concurrently. Collect its result with `delegate_await`; do NOT \
+         assume or invent an outcome before collecting it."
+    ))
+}
+
+/// Wait for background delegate jobs and return their results. Finished
+/// results are consumed (returned exactly once); on timeout a partial status
+/// is returned so the caller can keep polling without ever holding a tool
+/// call open long enough to trip client idle timeouts.
+pub async fn run_delegate_await(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: DelegateAwaitArgs,
+) -> Result<String, String> {
+    // Validate explicit ids up front: they must exist and belong to us.
+    {
+        let jobs = shared.background_delegates.lock().unwrap();
+        for id in &args.delegate_ids {
+            match jobs.get(id) {
+                Some(j) if j.parent_sid == router_sid => {}
+                Some(_) => {
+                    return Err(format!("delegate `{id}` does not belong to this session"));
+                }
+                None => {
+                    return Err(format!(
+                        "unknown background delegate `{id}` (already collected, or never started?)"
+                    ));
+                }
+            }
+        }
+        if args.delegate_ids.is_empty() && !jobs.values().any(|j| j.parent_sid == router_sid) {
+            return Err("no background delegates are pending for this session".to_string());
+        }
+    }
+    let timeout =
+        std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(600).clamp(5, 1500));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut collected: Vec<(String, Result<String, String>)> = Vec::new();
+    loop {
+        // Arm the wakeup BEFORE inspecting state so a completion between the
+        // check and the await can't be missed.
+        let notified = shared.background_notify.notified();
+        tokio::pin!(notified);
+        let mut running: Vec<(String, String, u64)> = Vec::new();
+        {
+            let mut jobs = shared.background_delegates.lock().unwrap();
+            let targets: Vec<String> = jobs
+                .iter()
+                .filter(|(id, j)| {
+                    j.parent_sid == router_sid
+                        && (args.delegate_ids.is_empty() || args.delegate_ids.contains(id))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in targets {
+                let done = jobs.get(&id).is_some_and(|j| j.result.is_some());
+                if done {
+                    if let Some(job) = jobs.remove(&id) {
+                        collected.push((id, job.result.expect("checked above")));
+                    }
+                } else if let Some(job) = jobs.get(&id) {
+                    running.push((id, job.summary.clone(), job.started.elapsed().as_secs()));
+                }
+            }
+        }
+        if running.is_empty() {
+            return Ok(render_await(&collected, &[]));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(render_await(&collected, &running));
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
+fn render_await(
+    collected: &[(String, Result<String, String>)],
+    running: &[(String, String, u64)],
+) -> String {
+    let mut out = String::new();
+    for (id, result) in collected {
+        match result {
+            Ok(text) => out.push_str(&format!("=== delegate {id} — done ===\n{text}\n\n")),
+            Err(msg) => out.push_str(&format!("=== delegate {id} — FAILED ===\n{msg}\n\n")),
+        }
+    }
+    if running.is_empty() {
+        if collected.is_empty() {
+            out.push_str("No pending background delegates.");
+        } else {
+            out.push_str("All requested background delegates have completed.");
+        }
+    } else {
+        let list = running
+            .iter()
+            .map(|(id, summary, secs)| format!("{id} (\"{summary}\", {secs}s elapsed)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "Still running: {list}. Call `delegate_await` again to collect them; do NOT assume \
+             their outcomes."
+        ));
+    }
+    out.trim_end().to_string()
+}
 
 /// Run one delegated subtask in an ephemeral downstream session on a
 /// lower-cost eligible candidate. Returns the sub-agent's collected output.
@@ -1055,6 +1298,55 @@ mod tests {
         assert_eq!(def["name"], DELEGATE_TOOL_NAME);
         assert_eq!(def["inputSchema"]["required"][0], "task");
         assert!(def["inputSchema"]["properties"]["hints"]["properties"]["candidate"].is_object());
+        assert!(def["inputSchema"]["properties"]["background"].is_object());
+    }
+
+    #[test]
+    fn await_tool_definition_shape() {
+        let def = await_tool_definition();
+        assert_eq!(def["name"], DELEGATE_AWAIT_TOOL_NAME);
+        assert!(def["inputSchema"]["properties"]["delegate_ids"].is_object());
+        assert!(def["inputSchema"]["properties"]["timeout_seconds"].is_object());
+    }
+
+    #[test]
+    fn delegate_args_background_defaults_off() {
+        use serde_json::json;
+        let args: DelegateTaskArgs = serde_json::from_value(json!({"task": "do a thing"})).unwrap();
+        assert!(!args.background);
+        let args: DelegateTaskArgs =
+            serde_json::from_value(json!({"task": "do a thing", "background": true})).unwrap();
+        assert!(args.background);
+        let await_args: DelegateAwaitArgs = serde_json::from_value(json!({})).unwrap();
+        assert!(await_args.delegate_ids.is_empty());
+        assert!(await_args.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn render_await_reports_done_failed_and_running() {
+        let collected = vec![
+            ("b-1".to_string(), Ok("all good".to_string())),
+            ("b-2".to_string(), Err("it broke".to_string())),
+        ];
+        let running = vec![("b-3".to_string(), "slow task".to_string(), 42u64)];
+        let text = render_await(&collected, &running);
+        assert!(
+            text.contains("=== delegate b-1 — done ===\nall good"),
+            "{text}"
+        );
+        assert!(
+            text.contains("=== delegate b-2 — FAILED ===\nit broke"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Still running: b-3 (\"slow task\", 42s elapsed)"),
+            "{text}"
+        );
+        let done = render_await(&collected, &[]);
+        assert!(
+            done.contains("All requested background delegates have completed"),
+            "{done}"
+        );
     }
 
     #[test]

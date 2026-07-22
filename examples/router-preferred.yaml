@@ -105,6 +105,7 @@ orchestration:
   reviewer: ["*sol*", "*fable*"]            # a different lineage will be preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
+  review_confidence: 0.8                    # planner confidence above this skips the review
 
 # Mid-session model switching. A pinned session can move to a more capable
 # model on its own when its confidence drops. Confidence = the pinned model's

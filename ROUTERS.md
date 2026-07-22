@@ -366,8 +366,11 @@ your enumerated reply as answers and relays normally), and with **no** explicit
    summarize-and-re-pin machinery above) onto the best eligible **`planner`**
    candidate.
 2. An orchestration protocol is prepended to the prompt telling the planner to
-   **plan → delegate each part (`delegate_task`, routed per-complexity) →
-   review on a different lineage (`reviewer`) → adjudicate fixes
+   **plan → delegate the independent parts in parallel (`delegate_task
+   background: true` + `delegate_await`, each routed per-complexity) →
+   review on a different lineage (`reviewer`) after all parts are collected —
+   skipped with a note when no other lineage is available or the planner's
+   stated confidence clears `review_confidence` → adjudicate fixes
    (`max_fix_rounds`) → submit (`submit`)**.
 3. For that session, delegation is allowed to **same-/higher-tier peers**, not
    just strictly-cheaper ones — this is what makes the cross-lineage reviewer
@@ -387,6 +390,7 @@ orchestration:
   reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]             # a different lineage than the planner
   submit: branch                # never | branch | pr | merge (merge only after review approves)
   max_fix_rounds: 2
+  review_confidence: 0.8        # planner confidence above this skips the review (never under merge)
 ```
 
 The planner iterates on a subtask by keeping its sub-agent open

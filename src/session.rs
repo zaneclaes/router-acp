@@ -118,6 +118,18 @@ pub struct LiveDelegate {
     pub sub_sid: String,
 }
 
+/// A `delegate_task background: true` job. The subtask runs on its own tokio
+/// task; the orchestrator collects the outcome later via `delegate_await`.
+/// `result` stays `None` while running and is consumed (entry removed) when an
+/// await returns it.
+pub struct BackgroundDelegate {
+    pub parent_sid: String,
+    /// First line of the task, for status lines while the job runs.
+    pub summary: String,
+    pub started: std::time::Instant,
+    pub result: Option<Result<String, String>>,
+}
+
 pub struct RouterSession {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -333,6 +345,12 @@ pub struct Shared {
     /// Delegate sub-sessions kept alive for follow-up turns (orchestration),
     /// keyed by the short `delegate_id` returned to the orchestrator.
     pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
+    /// Background delegate jobs keyed by the short `b-…` id returned to the
+    /// orchestrator; results are collected (and consumed) via `delegate_await`.
+    pub background_delegates: Mutex<HashMap<String, BackgroundDelegate>>,
+    /// Signaled whenever any background delegate finishes, waking waiters in
+    /// `delegate_await`.
+    pub background_notify: tokio::sync::Notify,
     /// Short-TTL cache of fetched ticket content (ticket id → (fetched-at,
     /// body)), so concurrent sessions share one fetch.
     pub ticket_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
@@ -422,6 +440,8 @@ impl Shared {
             sid_map: Mutex::new(HashMap::new()),
             delegate_tokens: Mutex::new(HashMap::new()),
             live_delegates: Mutex::new(HashMap::new()),
+            background_delegates: Mutex::new(HashMap::new()),
+            background_notify: tokio::sync::Notify::new(),
             ticket_cache: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             delegate_socket: OnceLock::new(),
@@ -1811,6 +1831,14 @@ pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
     for d in orphans {
         close_downstream_session(shared, &d.process_key, &d.downstream_sid);
     }
+    // Drop the session's background jobs too: finished results nobody will
+    // collect, and completion markers for still-running jobs (which notice the
+    // deleted/cancelled parent themselves and tear their sub-session down).
+    shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .retain(|_, j| j.parent_sid != router_sid);
 }
 
 // ----------------------------------------------------------------------
@@ -3226,12 +3254,37 @@ fn build_orchestration_instructions(
     } else {
         format!("The user's message below is a multi-part task ({parts} parts detected).")
     };
-    let review_line = if reviewers.is_empty() {
+    // The review pass is skippable in two ways — no cross-lineage reviewer
+    // exists, or the planner's stated confidence clears the configured bar —
+    // EXCEPT under `submit: merge`, where an approving review is the merge
+    // gate and is therefore never skipped.
+    let merging = o.submit == "merge";
+    let confidence_line = if merging {
+        "The review is MANDATORY here (submit: merge) — never skip it, regardless of confidence."
+            .to_string()
+    } else {
         format!(
-            "No candidate of a different lineage than your own (`{lineage}`) is currently \
-             available, so review on the most capable OTHER model you can reach via \
-             `delegate_task` (still not yourself). Note this constraint in your report."
+            "EXCEPTION — confidence skip: if your stated confidence from step 1 (re-assessed \
+             after integration) is strictly greater than {:.2}, SKIP the review pass and say so \
+             in your final report (\"review skipped: confidence X > {:.2}\"); otherwise run it.",
+            o.review_confidence, o.review_confidence
         )
+    };
+    let review_line = if reviewers.is_empty() {
+        if merging {
+            format!(
+                "No candidate of a different lineage than your own (`{lineage}`) is currently \
+                 available, so review on the most capable OTHER model you can reach via \
+                 `delegate_task` (still not yourself). Note this constraint in your report. \
+                 {confidence_line}"
+            )
+        } else {
+            format!(
+                "No candidate of a different lineage than your own (`{lineage}`) is currently \
+                 available: SKIP the review pass entirely and note in your final report that it \
+                 was skipped for lack of a cross-lineage reviewer."
+            )
+        }
     } else {
         let ids = reviewers
             .iter()
@@ -3241,7 +3294,7 @@ fn build_orchestration_instructions(
         format!(
             "You are lineage `{lineage}`. The review MUST run on a DIFFERENT lineage — call \
              `delegate_task` with `hints.candidate` set to one of: {ids}. Do NOT review on your \
-             own `{lineage}` lineage."
+             own `{lineage}` lineage. {confidence_line}"
         )
     };
     let submit_line = match o.submit.as_str() {
@@ -3249,13 +3302,14 @@ fn build_orchestration_instructions(
             "Do NOT push, open a PR, or merge. Report the branch (if any) and the review verdict."
         }
         "branch" => {
-            "Once the review approves, commit the work on a fresh branch off HEAD (never commit to \
-             main/master). Do not open a PR or merge."
+            "Once the review approves (or was legitimately skipped per step 3), commit the work \
+             on a fresh branch off HEAD (never commit to main/master). Do not open a PR or merge."
         }
         "pr" => {
-            "Once the review approves, commit on a fresh branch and open/update a PR with `gh pr \
-             create` (body: the success criteria, a subtask→model table, and the reviewer \
-             verdict). Do NOT merge."
+            "Once the review approves (or was legitimately skipped per step 3), commit on a fresh \
+             branch and open/update a PR with `gh pr create` (body: the success criteria, a \
+             subtask→model table, and the reviewer verdict — or the review-skip reason). Do NOT \
+             merge."
         }
         "merge" => {
             "Once — and only once — the review approves, commit on a fresh branch, open/update the \
@@ -3273,31 +3327,43 @@ fn build_orchestration_instructions(
          for the review. Do NOT use any built-in sub-agent tool (e.g. `Task`, `dispatch_agent`, \
          `spawn`) for these: those run inside your own model lineage and are invisible to the \
          router, which defeats both per-subtask model routing and the cross-lineage review. If \
-         `delegate_task` is not loaded yet, load it first, then use it. For a subtask you want to \
-         iterate on across review→fix rounds, call `delegate_task` with `keep_open: true` and \
-         reuse the returned `delegate_id` via `delegate_followup` (and `delegate_close` when done).\n\
+         `delegate_task` is not loaded yet, load it first, then use it.\n\
+         CRITICAL — RUN INDEPENDENT SUBTASKS IN PARALLEL: your client executes tool calls one at \
+         a time, so N plain `delegate_task` calls run the subtasks serially. Instead, dispatch \
+         every independent subtask with `background: true` — each call returns a `b-…` id \
+         immediately and the subtask runs concurrently — then collect them with `delegate_await` \
+         (it returns finished results and lists still-running jobs; call it again until none \
+         remain). Never fabricate a pending job's result; results only come from `delegate_await`. \
+         Use a plain (foreground) `delegate_task` only for a single subtask whose result you need \
+         before you can even phrase the next step. A subtask that depends on another's output \
+         must not start until that prerequisite has been collected. For a subtask you want to \
+         iterate on across review→fix rounds, add `keep_open: true` — the collected result \
+         carries a `delegate_id` for `delegate_followup` (and `delegate_close` when done).\n\
          Run this pipeline, disclosing your progress as you go:\n\
          1. PLAN. Investigate just enough (read-only) to restate the task as concrete, verifiable \
          success criteria and to split it into self-contained subtasks. Subtasks MUST NOT overlap \
-         in the files they edit — merge any that would.\n\
-         2. DELEGATE. Dispatch each subtask with `delegate_task`. Give each a fully self-contained \
-         `task` (file paths, current vs. desired behavior, constraints, and acceptance checks) — \
-         the router routes each subtask by reading its prompt, so describe difficulty honestly. \
-         Pass relevant paths in `context_files`. Independent subtasks may be delegated \
-         concurrently; respect dependencies. Do a piece yourself only if it genuinely needs your \
-         full context.\n\
-         3. REVIEW (independent, different lineage). After integrating, delegate a REVIEW via \
-         `delegate_task`. {review_line} Hand the reviewer the ORIGINAL task verbatim and have it \
-         re-derive the criteria itself, inspect the diff, and run the tests — returning a verdict \
-         plus any blocking issues.\n\
-         4. ADJUDICATE. For each blocking issue, delegate a targeted fix and re-review. At most \
-         {rounds} fix rounds; if still not approved, stop and report what remains.\n\
+         in the files they edit — merge any that would (parallel sub-sessions editing the same \
+         file race). State your confidence (0.0–1.0) that your plan, once implemented by the \
+         subtasks, will fully satisfy the criteria — step 3 uses it.\n\
+         2. DELEGATE. Dispatch the independent subtasks in parallel (`background: true`, then \
+         `delegate_await` — see above). Give each a fully self-contained `task` (file paths, \
+         current vs. desired behavior, constraints, and acceptance checks) — the router routes \
+         each subtask by reading its prompt, so describe difficulty honestly. Pass relevant paths \
+         in `context_files`. Do a piece yourself only if it genuinely needs your full context.\n\
+         3. REVIEW (independent, different lineage) — only AFTER every implementation subtask has \
+         been collected and integrated. {review_line} When the review runs, hand the reviewer the \
+         ORIGINAL task verbatim and have it re-derive the criteria itself, inspect the diff, and \
+         run the tests — returning a verdict plus any blocking issues.\n\
+         4. ADJUDICATE (only if a review ran). For each blocking issue, delegate a targeted fix \
+         and re-review. At most {rounds} fix rounds; if still not approved, stop and report what \
+         remains.\n\
          5. SUBMIT. {submit_line} Any skill or command the task names for the END of the work \
          (shipping, opening/merging a PR, deploying) runs ONLY here — after the work is done and \
          the review approves — never up front; a half-done change is not shippable.\n\
          Finally, report: the success criteria and how each is met; per-subtask outcomes (and \
-         which model the router chose for each); the review verdict history; and what was \
-         submitted (or why not).\n\
+         which model the router chose for each); the review verdict history — or the exact reason \
+         the review was skipped (no cross-lineage reviewer, or your confidence vs. the bar) — and \
+         what was submitted (or why not).\n\
          [end orchestration protocol — the user's task follows]"
     )
 }
@@ -5197,9 +5263,88 @@ mod escalation_signal_tests {
 
 #[cfg(test)]
 mod orchestration_unit_tests {
+    use super::build_orchestration_instructions;
     use super::is_native_subagent_tool;
     use super::previous_turn_solicited_answers as solicited;
+    use crate::candidate::CandidateId;
+    use crate::config::Config;
     use serde_json::json;
+
+    fn cfg_with(orchestration: &str) -> Config {
+        let yaml = format!(
+            "orchestration:\n{orchestration}\n\
+             agents:\n\
+             \x20 - name: claude\n\
+             \x20   command: {{ type: stdio, command: mock-agent }}\n\
+             \x20   model_selection: {{ type: config-option }}\n\
+             \x20   models:\n\
+             \x20     - id: sonnet\n\
+             \x20       cost_rank: 2\n"
+        );
+        Config::from_yaml(&yaml).unwrap()
+    }
+
+    #[test]
+    fn protocol_mandates_parallel_background_delegation() {
+        let cfg = cfg_with("  enabled: true");
+        let planner = CandidateId::new("claude", "sonnet");
+        let reviewer = CandidateId::new("codex", "gpt-5.5");
+        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
+        assert!(text.contains("background: true"), "{text}");
+        assert!(text.contains("delegate_await"), "{text}");
+        assert!(
+            text.contains("only AFTER every implementation subtask"),
+            "review must be ordered after implementation: {text}"
+        );
+    }
+
+    #[test]
+    fn review_skippable_by_confidence_with_configured_bar() {
+        let cfg = cfg_with("  enabled: true\n  review_confidence: 0.9");
+        let planner = CandidateId::new("claude", "sonnet");
+        let reviewer = CandidateId::new("codex", "gpt-5.5");
+        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
+        assert!(text.contains("strictly greater than 0.90"), "{text}");
+        assert!(text.contains("SKIP the review pass"), "{text}");
+        // The cross-lineage mandate still stands when the review does run.
+        assert!(text.contains("codex/gpt-5.5"), "{text}");
+    }
+
+    #[test]
+    fn review_skipped_entirely_without_cross_lineage_reviewer() {
+        let cfg = cfg_with("  enabled: true");
+        let planner = CandidateId::new("claude", "sonnet");
+        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[]);
+        assert!(
+            text.contains("SKIP the review pass entirely"),
+            "no-lineage case must skip, not same-lineage review: {text}"
+        );
+        assert!(text.contains("lack of a cross-lineage reviewer"), "{text}");
+    }
+
+    #[test]
+    fn merge_submit_never_skips_the_review() {
+        let cfg = cfg_with("  enabled: true\n  submit: merge\n  review_confidence: 0.1");
+        let planner = CandidateId::new("claude", "sonnet");
+        let reviewer = CandidateId::new("codex", "gpt-5.5");
+        let with_reviewer = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
+        assert!(with_reviewer.contains("MANDATORY"), "{with_reviewer}");
+        assert!(
+            !with_reviewer.contains("SKIP the review pass and say so"),
+            "{with_reviewer}"
+        );
+        // Even with no cross-lineage reviewer, a merge submit reviews on the
+        // most capable other model rather than skipping.
+        let no_reviewer = build_orchestration_instructions(&cfg, 3, false, &planner, &[]);
+        assert!(
+            no_reviewer.contains("most capable OTHER model"),
+            "{no_reviewer}"
+        );
+        assert!(
+            !no_reviewer.contains("SKIP the review pass entirely"),
+            "{no_reviewer}"
+        );
+    }
 
     #[test]
     fn native_subagent_tool_detected_by_name_not_delegate() {

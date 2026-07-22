@@ -369,6 +369,18 @@ sends more instructions to that same sub-agent (context preserved) with
 `delegate_followup`, and frees it with `delegate_close`. These are what let the
 orchestrator (below) iterate on a subtask without re-briefing a fresh session.
 
+For **parallel** subtasks there is a background mode: MCP clients execute tool
+calls one at a time, so N plain `delegate_task` calls run the subtasks
+serially no matter what the router allows. `delegate_task` with
+`background: true` instead returns a `b-…` job id immediately and runs the
+subtask on its own task; `delegate_await` collects results — it waits up to
+`timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default:
+all pending), returns every finished job's output exactly once, and lists the
+ones still running so the caller polls with short, idle-timeout-safe calls.
+`background` composes with `keep_open` (the collected result carries the
+`delegate_id`), and `delegation.max_concurrent` still bounds how many jobs
+execute at once.
+
 ## Auto-orchestration
 
 When a prompt reads as a **multi-part task list** — markdown bullets or numbers,
@@ -377,17 +389,22 @@ router runs a plan → subtasks → review → submit pipeline entirely in-proce
 steers (pre-pin) or switches (mid-session) the session onto a **planner**
 frontier model and injects an orchestration protocol instructing that model to:
 
-1. **Plan** — restate the task as success criteria and split it into
-   file-disjoint, self-contained subtasks.
-2. **Delegate** — dispatch each subtask via `delegate_task`, each routed
-   per-complexity in its own sub-session (independent ones concurrently).
-3. **Review** — delegate an independent review to a candidate of a **different
-   lineage** than the planner (`reviewer` globs), handing it the original task
-   verbatim.
+1. **Plan** — restate the task as success criteria, split it into
+   file-disjoint, self-contained subtasks, and state a confidence (0.0–1.0)
+   that the plan will satisfy the criteria.
+2. **Delegate** — dispatch independent subtasks **in parallel** via
+   `delegate_task background: true` + `delegate_await`, each routed
+   per-complexity in its own sub-session.
+3. **Review** — after every implementation subtask is collected, delegate an
+   independent review to a candidate of a **different lineage** than the
+   planner (`reviewer` globs), handing it the original task verbatim. The
+   planner skips the review — with a note in its report — when no
+   cross-lineage reviewer is available or when its stated confidence exceeds
+   `review_confidence`; under `submit: merge` the review is never skipped.
 4. **Adjudicate** — fix blocking issues and re-review, bounded by
    `max_fix_rounds`.
 5. **Submit** — per the `submit` gate (`never | branch | pr | merge`); a merge
-   is only permitted after the review approves.
+   is only permitted after an approving review.
 
 The one thing this needs beyond ordinary delegation is **peer delegation**: an
 orchestrating session may delegate to *same-* or *higher*-tier candidates (not
@@ -516,6 +533,7 @@ example.
 | `orchestration.reviewer[]` | frontier globs | Preferred cross-lineage reviewer globs handed to the orchestrator (it should pick a different lineage than the planner). |
 | `orchestration.submit` | `branch` | Submission gate given to the orchestrator: `never \| branch \| pr \| merge` (a merge is only permitted after the review approves). |
 | `orchestration.max_fix_rounds` | `2` | Max review → fix → re-review rounds. |
+| `orchestration.review_confidence` | `0.8` | Planner self-confidence bar (0.0–1.0) for skipping the review pass: strictly above it, the review is skipped with a note. Ignored under `submit: merge` (a merge always requires an approving review). |
 | `agents[].name` | – | Unique, no `/`. Candidate ids are `name/model-id`. |
 | `agents[].command` | – | `type: stdio` command/args/env for the adapter. `${VAR}` in the whole file interpolates from the environment (unknown names are left intact). |
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
