@@ -583,7 +583,7 @@ pub fn codex_availability(
         }
         merge_worst(
             &mut out,
-            availability_from_windows(&windows, codex_credits_usable(pool), candidates, "poll"),
+            availability_from_windows(&windows, codex_overage_usable(pool), candidates, "poll"),
         );
     }
     out
@@ -924,7 +924,7 @@ pub fn codex_cordons(
                 }
             }
         }
-        if codex_credits_usable(pool) {
+        if codex_overage_usable(pool) {
             continue;
         }
         for key in ["primary", "secondary"] {
@@ -961,18 +961,30 @@ pub fn codex_cordons(
     out
 }
 
-/// True when the snapshot's credit pool can actually absorb usage past the
-/// plan window — `unlimited`, or a positive `balance`. A bare
-/// `has_credits: true` is NOT enough: team-plan snapshots report
-/// `has_credits: true, balance: null` while the seat is hard-blocked at 100%
-/// (observed live 2026-07-21 — Sol turns stalled for four consecutive
-/// conversations while this gate failed open on `has_credits`). A reached
-/// spend control is a per-member hard block that no credit pool covers.
-fn codex_credits_usable(rate_limits: &Value) -> bool {
+/// True when the snapshot's overage pool can actually absorb usage past the
+/// plan window. A reached spend control is a per-member hard block that no
+/// pool covers. On team plans the per-member spend limit (`individual_limit`)
+/// IS the overage pool: positive headroom there keeps the seat working past a
+/// saturated plan window — observed live 2026-07-23: weekly window at 100%
+/// with `spendControlReached: false` and 66% of the member limit remaining,
+/// seat confirmed serving requests; without this the router cordoned a usable
+/// seat for days. Absent a member limit, credits decide — `unlimited`, or a
+/// positive `balance`. A bare `has_credits: true` is NOT enough: team-plan
+/// snapshots report `has_credits: true, balance: null` while the seat is
+/// hard-blocked at 100% (observed live 2026-07-21 — Sol turns stalled for
+/// four consecutive conversations while this gate failed open on
+/// `has_credits`).
+fn codex_overage_usable(rate_limits: &Value) -> bool {
     if field(rate_limits, "spend_control_reached", "spendControlReached").and_then(Value::as_bool)
         == Some(true)
     {
         return false;
+    }
+    if let Some(il) = field(rate_limits, "individual_limit", "individualLimit")
+        && let Some(remaining) =
+            field(il, "remaining_percent", "remainingPercent").and_then(Value::as_f64)
+    {
+        return remaining > 0.0;
     }
     let Some(credits) = rate_limits.get("credits").filter(|c| !c.is_null()) else {
         return false;
@@ -1305,6 +1317,52 @@ mod tests {
         })];
         let c = codex_cordons(&rl, &codex_cands(), now);
         assert_eq!(c.len(), 2, "positive balance can't cover a spend control");
+    }
+
+    // The live 2026-07-23 shape: team plan, weekly window at 100%, no usable
+    // credit balance — but the per-member spend limit has 66% headroom and no
+    // spend control reached. The member limit is the overage pool: the seat
+    // keeps serving, so nothing is cordoned and availability shows overage.
+    #[test]
+    fn codex_member_limit_headroom_overrides_saturated_weekly() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "secondary": serde_json::Value::Null,
+            "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "individualLimit": { "limit": "3000", "used": "1028.08", "remainingPercent": 66.0, "resetsAt": future_epoch(now) },
+            "spendControlReached": false,
+            "planType": "team",
+            "rateLimitReachedType": serde_json::Value::Null
+        })];
+        assert!(
+            codex_cordons(&rl, &codex_cands(), now).is_empty(),
+            "member headroom absorbs the saturated weekly window"
+        );
+        let a = codex_availability(&rl, &codex_cands(), now);
+        assert_eq!(a.len(), 2);
+        assert!(
+            a.values()
+                .all(|v| v.on_overage && v.plan_headroom.abs() < 1e-9),
+            "saturated weekly window spends into the member limit: {a:?}"
+        );
+    }
+
+    #[test]
+    fn codex_member_limit_exhausted_without_spend_control_still_cordons() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "individualLimit": { "remainingPercent": 0.0, "resetsAt": future_epoch(now) + 4 * 86_400 },
+            "spendControlReached": false,
+            "planType": "team"
+        })];
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert_eq!(c.len(), 2, "exhausted member limit cordons: {c:?}");
+        assert!(c.values().all(|v| v.reason.contains("member")));
     }
 
     #[test]
