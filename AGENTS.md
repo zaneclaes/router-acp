@@ -215,6 +215,35 @@ SDK traps below, which were all discovered the hard way.
   otherwise pass through unchanged. Listener bind failure leaves environments
   untouched. Provider calls live in `llm_requests`; in-flight tools and their
   selected model live in the `active_tool_calls` SQLite view.
+  **LESSON (cross-provider, shipped bug):** routine/difficulty detection in
+  `inspect_request` originally scanned only the **last 24 KB of the serialized
+  request**. That worked for Codex's Responses shape but silently defeated the
+  policy for **Claude/Anthropic**: an Anthropic `/v1/messages` request carries a
+  large `system` + `tools` prelude and the *entire* conversation history in
+  `messages`, so the current turn's `tool_result` routinely falls outside any
+  fixed tail — `has_tool_result`/`routine_tool` read false and NOTHING ever
+  demoted (every request logged `routing_event=steady`; confirmed live — a
+  Fable-pinned goose session produced 8 real `/v1/messages` rows, all steady,
+  never demoting despite routine reads). Fix: `latest_tool_context` walks the
+  body structurally (like `test_fingerprint`) for the most-recent tool-result
+  content + the invoking tool name, and difficulty is scoped to that latest
+  block (a stale historical `is_error` no longer pins escalation forever now
+  that the whole history is resent each turn). Regressions:
+  `routine_detection_survives_large_anthropic_tools_prelude` (asserts the
+  tool_result is NOT in the 24 KB tail yet still reads routine),
+  `routine_detection_uses_tool_name_when_output_has_no_marker`,
+  `stale_history_failure_does_not_pin_difficulty_on_the_current_turn`. The
+  mock-driven end-to-end test (`proxy_streams_rewrites_preserves_auth_and_accounts_requests`,
+  `protocol: anthropic`) proves demotion+rewrite+accounting+fallback on the
+  Anthropic wire; the demotion-target `api_model` ids (`claude-sonnet-5`,
+  `claude-opus-4-8`) are valid on the subscription OAuth `/v1/messages` endpoint.
+  **Anthropic cache caveat:** prompt caching is per-model, so a mid-session
+  demotion forfeits the cache and the switch turn pays cache-*write* (12.5× the
+  read rate) to re-prime the whole prefix — per-request demotion only nets a
+  session-wide win once the demoted stretch is long enough to amortize that
+  re-prime. Report savings **session-wide** (whole-session cost delta), never as
+  the ratio on the demoted tool-use turns alone, which ignores both the
+  non-demotable turns and the re-prime cost and massively overstates.
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
   least one downstream supports them and the router implements the full
   remap path.

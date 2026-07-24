@@ -133,15 +133,23 @@ agents:
     models:
       # ids must exactly match the downstream model selector's values;
       # run with RUST_LOG=router_acp=debug to see what the adapter offers.
+      # `api_model` is what the proxy writes into the /v1/messages body when it
+      # demotes — it must be a real Anthropic model id (the ACP `id` above is
+      # only a selector alias). These three are verified valid on the Claude
+      # Code subscription OAuth endpoint. Include cache_read/cache_write pricing:
+      # on the Anthropic wire a mid-session demotion forfeits the per-model
+      # prompt cache and re-primes the prefix at cache_write on the switch turn,
+      # so accurate cache pricing is what keeps session-wide savings honest.
       - id: sonnet
         display_name: Claude Sonnet
+        api_model: claude-sonnet-5
         cost_rank: 2            # 1 = cheapest/least scarce
-        pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+        pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00, cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 }
       - id: opus
         display_name: Claude Opus
-        # api_model: claude-opus-...  # set when `opus` is only an ACP alias
+        api_model: claude-opus-4-8
         cost_rank: 3
-        pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00 }
+        pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }
 
   - name: codex
     command:

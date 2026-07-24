@@ -1,0 +1,8 @@
+{
+  "name": "router-acp-state-machine-benchmark",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

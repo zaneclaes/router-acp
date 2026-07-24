@@ -976,18 +976,29 @@ fn inspect_request(body: &Value) -> RequestSignals {
     let serialized = serde_json::to_string(body).unwrap_or_default();
     let estimated_input =
         estimate_request_tokens(serialized.as_bytes()) + max_output_tokens(body).unwrap_or(0);
-    let lower_tail = serialized
-        .chars()
-        .rev()
-        .take(24_000)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let structural_error = contains_true_key(body, "is_error")
-        || contains_string_value(body, "status", &["failed", "error"])
-        || contains_nonzero_exit(body);
+    // Classify from the LATEST tool-result block (and the tool that produced it),
+    // located structurally. A flat character-tail of the serialized body is not
+    // reliable across wire formats: on the Anthropic wire the request carries a
+    // large `system`/`tools` prelude and the whole conversation history in
+    // `messages`, so the current turn's tool_result routinely falls outside any
+    // fixed-size tail — which silently defeated routine/difficulty detection for
+    // Claude while it worked for Codex's Responses shape. When no structured tool
+    // block is present (e.g. a plain prompt), fall back to a character tail.
+    let latest = latest_tool_context(body);
+    let lower_tail = || {
+        serialized
+            .chars()
+            .rev()
+            .take(24_000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let recent = latest.content.clone().unwrap_or_else(lower_tail);
+    let recent_name = latest.tool_name.clone().unwrap_or_default();
+    let structural_error = latest.error;
     let failure_markers = [
         "test failed",
         "tests failed",
@@ -1005,29 +1016,39 @@ fn inspect_request(body: &Value) -> RequestSignals {
     } else {
         failure_markers
             .iter()
-            .find(|marker| lower_tail.contains(**marker))
+            .find(|marker| recent.contains(**marker))
             .map(|marker| format!("execution trace contains `{marker}`"))
     };
-    let has_tool_result = lower_tail.contains("\"tool_result\"")
-        || lower_tail.contains("\"function_call_output\"")
-        || lower_tail.contains("\"tool\":")
-        || lower_tail.contains("\"type\":\"computer_");
-    let routine_tool = [
-        "\"read",
-        "\"grep",
-        "\"find",
-        "\"list",
-        "\"write",
-        "\"edit",
-        "\"apply_patch",
+    let has_tool_result = latest.any_tool_result;
+    // Routine when the producing tool is a read/search/edit-class tool, or its
+    // output carries a benign completion marker.
+    let name_markers = [
+        "read",
+        "grep",
+        "find",
+        "glob",
+        "list",
+        "ls",
+        "cat",
+        "view",
+        "search",
+        "write",
+        "edit",
+        "apply_patch",
+    ];
+    let content_markers = [
         "git status",
         "ci still running",
         "checks pending",
+        "nothing to commit",
+        "working tree clean",
         "\"status\":\"completed\"",
         "\"exit_code\":0",
-    ]
-    .iter()
-    .any(|marker| lower_tail.contains(marker));
+    ];
+    let routine_tool = name_markers
+        .iter()
+        .any(|marker| recent_name.contains(marker))
+        || content_markers.iter().any(|marker| recent.contains(marker));
     RequestSignals {
         original_model: body
             .get("model")
@@ -1038,6 +1059,78 @@ fn inspect_request(body: &Value) -> RequestSignals {
         difficulty,
         test_fingerprint: test_fingerprint(body),
     }
+}
+
+#[derive(Default)]
+struct LatestTool {
+    /// Lowercased content of the most recent tool-result-like block.
+    content: Option<String>,
+    /// Lowercased name of the most recent tool invocation (tool_use / function_call).
+    tool_name: Option<String>,
+    /// Whether the request contains any tool-result-like block at all.
+    any_tool_result: bool,
+    /// Whether the most recent tool-result block reported a structural failure
+    /// (`is_error`, a failed/error status, or a non-zero exit code).
+    error: bool,
+}
+
+/// Locate, in document order, the latest tool invocation name and the latest
+/// tool-result content anywhere in the request — independent of wire format
+/// (Anthropic `tool_use`/`tool_result`, OpenAI `function_call`/
+/// `function_call_output`, or a `role: "tool"` message). Used instead of a
+/// character tail so detection is robust to large `system`/`tools` preludes.
+fn latest_tool_context(body: &Value) -> LatestTool {
+    fn visit(value: &Value, out: &mut LatestTool) {
+        match value {
+            Value::Object(object) => {
+                let kind = object
+                    .get("type")
+                    .or_else(|| object.get("role"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match kind {
+                    "tool_use" | "function_call" | "tool_call" => {
+                        if let Some(name) = object
+                            .get("name")
+                            .or_else(|| object.get("function").and_then(|f| f.get("name")))
+                            .and_then(Value::as_str)
+                        {
+                            out.tool_name = Some(name.to_ascii_lowercase());
+                        }
+                    }
+                    "tool_result" | "function_call_output" | "tool" | "computer_output" => {
+                        out.any_tool_result = true;
+                        let content = object
+                            .get("content")
+                            .or_else(|| object.get("output"))
+                            .map(|value| match value {
+                                Value::String(text) => text.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            })
+                            .unwrap_or_default();
+                        out.content = Some(content.to_ascii_lowercase());
+                        out.error = contains_true_key(value, "is_error")
+                            || contains_string_value(value, "status", &["failed", "error"])
+                            || contains_nonzero_exit(value);
+                    }
+                    _ => {}
+                }
+                for nested in object.values() {
+                    visit(nested, out);
+                }
+            }
+            Value::Array(values) => {
+                for nested in values {
+                    visit(nested, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = LatestTool::default();
+    visit(body, &mut out);
+    out
 }
 
 fn estimate_request_tokens(body: &[u8]) -> u64 {
@@ -1542,6 +1635,74 @@ agents:
             "input": [{"type":"function_call_output","exit_code":1,"output":"tests failed"}]
         });
         assert!(inspect_request(&failed).difficulty.is_some());
+    }
+
+    #[test]
+    fn routine_detection_survives_large_anthropic_tools_prelude() {
+        // Reproduces the Claude/Anthropic wire shape: the current turn's
+        // tool_result sits inside `messages`, ahead of a large `system` and
+        // `tools` prelude. A fixed character-tail of the serialized body lands
+        // in the tool schemas and misses the tool_result entirely; structural
+        // detection must still classify it as routine.
+        let big_tool_schema: String = (0..4000)
+            .map(|i| format!("{{\"name\":\"synthetic_field_{i}\",\"desc\":\"padding schema entry\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = json!({
+            "model": "claude-fable-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "$ git status\nnothing to commit, working tree clean"
+                }]
+            }],
+            "system": [{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],
+            // Big enough that the serialized tail is entirely tool schemas.
+            "tools": serde_json::from_str::<Value>(&format!("[{big_tool_schema}]")).unwrap(),
+        });
+        // The tool_result is nowhere near the serialized tail.
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized[serialized.len() - 24_000..].contains("git status"));
+
+        let signal = inspect_request(&body);
+        assert!(signal.routine, "buried tool_result must still read as routine");
+        assert!(signal.difficulty.is_none());
+        assert!(inspect_request(&body).original_model.as_deref() == Some("claude-fable-5"));
+    }
+
+    #[test]
+    fn routine_detection_uses_tool_name_when_output_has_no_marker() {
+        // A Read tool result whose content carries no textual marker: routine
+        // must be inferred from the invoking tool's name (the assistant's
+        // tool_use), which structural detection tracks across the turn.
+        let body = json!({
+            "messages": [
+                {"role":"assistant","content":[{"type":"tool_use","name":"Read","id":"toolu_2","input":{"path":"a.txt"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"note 1\nowner: team-1\npriority: 2"}]}
+            ]
+        });
+        let signal = inspect_request(&body);
+        assert!(signal.routine, "a Read tool call must read as routine");
+        assert!(signal.difficulty.is_none());
+    }
+
+    #[test]
+    fn stale_history_failure_does_not_pin_difficulty_on_the_current_turn() {
+        // The whole conversation is resent each turn on the Anthropic wire; a
+        // failure from an earlier turn must not keep escalating once the latest
+        // tool result is clean.
+        let body = json!({
+            "messages": [
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"tests failed","is_error":true}]},
+                {"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"t2","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"$ git status\nworking tree clean"}]}
+            ]
+        });
+        let signal = inspect_request(&body);
+        assert!(signal.difficulty.is_none(), "recovered turn must not stay escalated");
+        assert!(signal.routine);
     }
 
     #[test]

@@ -1,0 +1,8 @@
+name: frontend
+on:
+  workflow_call:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo frontend

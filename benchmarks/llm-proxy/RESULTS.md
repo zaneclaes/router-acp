@@ -65,6 +65,17 @@ in the trace:
 `active_tool_calls` contained zero rows after completion in both databases, as
 expected. During the runs it exposed the current tool and selected model.
 
+The tool attribution above is diagnostic, not the headline. **The 19.7472%
+saving is session-wide**: it is the delta between the baseline and treatment
+totals over *every* inference request in the session (`SUM(cost_usd)` across all
+rows), including the turns that stayed on GPT-5.5 and never demoted. It is not
+the (larger) ratio you would get by looking only at the demoted tool-use turns.
+Always report the whole-session number — the per-tool ratio ignores the
+non-demotable turns and overstates the benefit. (On the Anthropic wire there is
+a second reason to insist on the session-wide number: a mid-session demotion
+forfeits the per-model prompt cache and pays a one-time re-prime, which the
+per-tool view also hides — see `fable-sample/RESULTS.md`.)
+
 ## Method
 
 The laptop's existing history was used to choose representative traces. It had

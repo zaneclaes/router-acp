@@ -1,0 +1,8 @@
+{
+  "services": {
+    "database": {"depends_on": [], "paths": ["db/"]},
+    "backend": {"depends_on": ["database"], "paths": ["backend/"]},
+    "frontend": {"depends_on": ["backend"], "paths": ["frontend/"]},
+    "alerts": {"depends_on": ["backend"], "paths": ["alerts/"]}
+  }
+}
