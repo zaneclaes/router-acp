@@ -579,14 +579,17 @@ pub struct ModelConfig {
     pub id: String,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Optional provider API model id for per-request proxy rewrites. This is
+    /// needed when an ACP selector exposes an adapter alias such as
+    /// `opus[1m]` that the provider HTTP API does not accept verbatim.
+    /// Defaults to `id`.
+    #[serde(default)]
+    pub api_model: Option<String>,
     /// 1 = cheapest/least scarce; larger = more expensive/scarce.
     pub cost_rank: u32,
-    /// Optional API-equivalent pricing, used to SYNTHESIZE `cost_usd` for a
-    /// session whose adapter reports no cost of its own (only the claude
-    /// adapter reports authoritative cost via `usage_update.cost`; codex,
-    /// grok, and kimi sessions otherwise record 0 forever). Leave unset for
-    /// models whose adapter reports real cost — synthesized and reported
-    /// figures must not mix.
+    /// Optional API-equivalent pricing. It prices every interposed provider
+    /// request and synthesizes ACP-turn `cost_usd` only when the adapter
+    /// reports no authoritative cost of its own.
     #[serde(default)]
     pub pricing: Option<PricingConfig>,
 }
@@ -640,6 +643,12 @@ pub struct AgentConfig {
     /// two Claude seats) should declare the same `lineage`.
     #[serde(default)]
     pub lineage: Option<String>,
+    /// Optional per-request LLM proxy interposition for this adapter. The
+    /// global `llm_proxy.enabled` switch must also be on. The upstream is
+    /// explicit because subscription/OAuth endpoints often differ from the
+    /// providers' public API endpoints.
+    #[serde(default)]
+    pub llm_proxy: Option<AgentLlmProxyConfig>,
 }
 
 fn default_budget() -> u32 {
@@ -869,12 +878,121 @@ pub struct Config {
     /// demote back to a cheaper candidate after a run of quiet turns.
     #[serde(default)]
     pub demotion: DemotionConfig,
+    /// Per-LLM-request routing proxy. Disabled by default until each adapter's
+    /// base-URL override and upstream endpoint are explicitly configured.
+    #[serde(default)]
+    pub llm_proxy: LlmProxyConfig,
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
     pub routers: RoutersConfig,
     /// Timeout for downstream initialize/probe calls, in milliseconds.
     #[serde(default = "default_probe_timeout_ms")]
     pub probe_timeout_ms: u64,
+}
+
+/// HTTP wire shape used by an interposed adapter. Both OpenAI Responses and
+/// Chat Completions are covered by `openai`; endpoint paths are passed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlmWireProtocol {
+    Anthropic,
+    Openai,
+}
+
+/// Process-level interposition details for one ACP adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLlmProxyConfig {
+    pub protocol: LlmWireProtocol,
+    /// Environment variable the adapter reads for its inference base URL
+    /// (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `KIMI_BASE_URL`, ...).
+    pub base_url_env: String,
+    /// The real provider/subscription endpoint. Its origin and path are
+    /// preserved; only the request body's top-level `model` field may change.
+    pub upstream_base_url: String,
+}
+
+/// Policy and listener settings for per-request routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Must resolve to a loopback socket. Port 0 asks the OS for a free port.
+    #[serde(default = "default_llm_proxy_listen")]
+    pub listen: String,
+    /// Consecutive routine tool-result requests before demotion is considered.
+    #[serde(default = "default_llm_routine_streak")]
+    pub routine_streak: u32,
+    /// Requests a selected model must serve before a non-emergency switch.
+    #[serde(default = "default_llm_minimum_dwell_requests")]
+    pub minimum_dwell_requests: u32,
+    /// Number of subsequent requests for which a difficulty verdict remains
+    /// elevated. Zero disables request-count expiry.
+    #[serde(default = "default_llm_verdict_ttl_requests")]
+    pub verdict_ttl_requests: u32,
+    /// Wall-clock expiry for a difficulty verdict. Zero disables time expiry.
+    #[serde(default = "default_llm_verdict_ttl_secs")]
+    pub verdict_ttl_secs: u64,
+    /// Fraction of a target model's configured context window that a request
+    /// may occupy. Demotion is refused when the target window is unknown.
+    #[serde(default = "default_llm_context_window_fraction")]
+    pub context_window_fraction: f64,
+    /// Maximum buffered JSON request size. Responses remain streamed.
+    #[serde(default = "default_llm_max_request_bytes")]
+    pub max_request_bytes: usize,
+    /// Maximum response bytes retained for usage/stop-reason inspection while
+    /// the complete response continues streaming to the adapter.
+    #[serde(default = "default_llm_max_capture_bytes")]
+    pub max_capture_bytes: usize,
+}
+
+fn default_llm_proxy_listen() -> String {
+    "127.0.0.1:0".to_string()
+}
+
+fn default_llm_routine_streak() -> u32 {
+    3
+}
+
+fn default_llm_minimum_dwell_requests() -> u32 {
+    12
+}
+
+fn default_llm_verdict_ttl_requests() -> u32 {
+    6
+}
+
+fn default_llm_verdict_ttl_secs() -> u64 {
+    15 * 60
+}
+
+fn default_llm_context_window_fraction() -> f64 {
+    0.9
+}
+
+fn default_llm_max_request_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_llm_max_capture_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+impl Default for LlmProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_llm_proxy_listen(),
+            routine_streak: default_llm_routine_streak(),
+            minimum_dwell_requests: default_llm_minimum_dwell_requests(),
+            verdict_ttl_requests: default_llm_verdict_ttl_requests(),
+            verdict_ttl_secs: default_llm_verdict_ttl_secs(),
+            context_window_fraction: default_llm_context_window_fraction(),
+            max_request_bytes: default_llm_max_request_bytes(),
+            max_capture_bytes: default_llm_max_capture_bytes(),
+        }
+    }
 }
 
 fn default_router() -> StrategyKind {
@@ -1119,8 +1237,75 @@ impl Config {
                 "delegation.complexity_cap must be between 0 and 1".into(),
             ));
         }
+        if self.llm_proxy.enabled {
+            let listen: std::net::SocketAddr = self.llm_proxy.listen.parse().map_err(|_| {
+                ConfigError(format!(
+                    "llm_proxy.listen `{}` must be an IP socket address",
+                    self.llm_proxy.listen
+                ))
+            })?;
+            if !listen.ip().is_loopback() {
+                return Err(ConfigError(
+                    "llm_proxy.listen must use a loopback address; provider credentials pass \
+                     through this listener"
+                        .into(),
+                ));
+            }
+            if self.llm_proxy.routine_streak == 0 {
+                return Err(ConfigError(
+                    "llm_proxy.routine_streak must be at least 1".into(),
+                ));
+            }
+            if !(0.1..=1.0).contains(&self.llm_proxy.context_window_fraction) {
+                return Err(ConfigError(
+                    "llm_proxy.context_window_fraction must be between 0.1 and 1".into(),
+                ));
+            }
+            if self.llm_proxy.max_request_bytes == 0 || self.llm_proxy.max_capture_bytes == 0 {
+                return Err(ConfigError(
+                    "llm_proxy max_request_bytes/max_capture_bytes must be greater than zero"
+                        .into(),
+                ));
+            }
+            if !self.agents.iter().any(|a| a.llm_proxy.is_some()) {
+                return Err(ConfigError(
+                    "llm_proxy.enabled is true but no agent has agents[].llm_proxy configured"
+                        .into(),
+                ));
+            }
+        }
         for agent in &self.agents {
+            if let Some(proxy) = &agent.llm_proxy {
+                if proxy.base_url_env.trim().is_empty() {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: llm_proxy.base_url_env must not be empty",
+                        agent.name
+                    )));
+                }
+                let url = reqwest::Url::parse(&proxy.upstream_base_url).map_err(|e| {
+                    ConfigError(format!(
+                        "agent `{}`: invalid llm_proxy.upstream_base_url: {e}",
+                        agent.name
+                    ))
+                })?;
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: llm_proxy.upstream_base_url must be an absolute HTTP(S) URL",
+                        agent.name
+                    )));
+                }
+            }
             for model in &agent.models {
+                if model
+                    .api_model
+                    .as_ref()
+                    .is_some_and(|id| id.trim().is_empty())
+                {
+                    return Err(ConfigError(format!(
+                        "agents.{}.models.{}.api_model must not be empty",
+                        agent.name, model.id
+                    )));
+                }
                 if let Some(pricing) = &model.pricing
                     && (pricing.input_per_mtok < 0.0
                         || pricing.output_per_mtok < 0.0
@@ -1269,6 +1454,8 @@ agents:
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
         assert_eq!(cfg.orchestration.review_confidence, 0.8);
+        assert!(!cfg.llm_proxy.enabled);
+        assert_eq!(cfg.llm_proxy.minimum_dwell_requests, 12);
     }
 
     #[test]
@@ -1295,6 +1482,36 @@ agents:
     fn rejects_zero_agents() {
         let err = Config::from_yaml("agents: []").unwrap_err();
         assert!(err.0.contains("no agents"));
+    }
+
+    #[test]
+    fn parses_and_validates_llm_proxy_config() {
+        let yaml = r#"
+llm_proxy:
+  enabled: true
+  listen: 127.0.0.1:0
+agents:
+  - name: claude
+    command: { type: stdio, command: mock-agent }
+    model_selection: { type: config-option }
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: https://api.anthropic.com
+    models:
+      - id: opus
+        api_model: claude-opus-api-id
+        cost_rank: 3
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.agents[0].models[0].api_model.as_deref(),
+            Some("claude-opus-api-id")
+        );
+
+        let invalid = yaml.replace("127.0.0.1:0", "0.0.0.0:8080");
+        let err = Config::from_yaml(&invalid).unwrap_err();
+        assert!(err.0.contains("loopback"), "{}", err.0);
     }
 
     #[test]

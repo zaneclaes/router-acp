@@ -1084,13 +1084,11 @@ async fn background_delegates_run_in_parallel_and_await_collects() {
         let session = new_session(&cx).await?;
         let sid = session.session_id.0.to_string();
 
-        let started = std::time::Instant::now();
         let prompt = "parallel work\n\
                       DELEGATE_BG:SLEEP:900\n\
                       DELEGATE_BG:SLEEP:901\n\
                       AWAIT_DELEGATES";
         let resp = prompt_text(&cx, &sid, prompt).await?;
-        let elapsed = started.elapsed();
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
 
         let text = agent_text(&observed, &sid);
@@ -1109,11 +1107,25 @@ async fn background_delegates_run_in_parallel_and_await_collects() {
             text.contains("All requested background delegates have completed"),
             "{text}"
         );
-        // The parallelism assertion proper: two ~900ms subtasks plus overhead
-        // must finish well under the ≥1800ms a serial execution needs.
+        // The parallelism assertion proper: both delegate prompts begin
+        // together. This excludes debug helper-process startup from the
+        // measurement while still failing a serial implementation (~900ms
+        // between starts).
+        let delegate_starts: Vec<u64> = read_log(&log)
+            .iter()
+            .filter(|entry| {
+                entry["event"] == "prompt"
+                    && entry["text"]
+                        .as_str()
+                        .is_some_and(|text| text == "SLEEP:900" || text == "SLEEP:901")
+            })
+            .filter_map(|entry| entry["startedAtMs"].as_u64())
+            .collect();
+        assert_eq!(delegate_starts.len(), 2, "{delegate_starts:?}");
+        let start_gap = delegate_starts[0].abs_diff(delegate_starts[1]);
         assert!(
-            elapsed < std::time::Duration::from_millis(1650),
-            "background delegates must overlap (took {elapsed:?})"
+            start_gap < 300,
+            "background delegates must overlap (start gap {start_gap}ms)"
         );
 
         // Everything was consumed — a bare await now reports the misuse.

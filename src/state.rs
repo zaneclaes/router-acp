@@ -88,6 +88,10 @@ pub struct PersistedSession {
     /// `pricing` (adapters other than claude report no cost of their own)
     /// rather than reported by the adapter.
     pub cost_estimated: bool,
+    /// API-equivalent cost accumulated from interposed provider requests.
+    /// Separate from adapter turn cost to avoid mixing granularities.
+    pub llm_request_cost_usd: f64,
+    pub llm_requests_total: u64,
     /// Count of native (adapter built-in) sub-agent tool calls seen in an
     /// orchestrating session — each one bypasses the router's `delegate_task`,
     /// so a non-zero value means orchestration silently degraded.
@@ -125,6 +129,34 @@ pub struct LogEntry {
     /// model attribution across mid-session switches (set on
     /// `agent_response` rows).
     pub model: Option<String>,
+}
+
+/// Insert payload for one interposed provider request.
+#[derive(Debug, Clone)]
+pub struct LlmRequestStart {
+    pub request_id: String,
+    pub router_session_id: String,
+    pub parent_router_session_id: Option<String>,
+    pub agent: String,
+    pub protocol: String,
+    pub endpoint: String,
+    pub pinned_model: String,
+    pub model: String,
+    pub routing_reason: String,
+    pub routing_event: String,
+    pub estimated_input_tokens: u64,
+}
+
+/// Provider-reported usage extracted from JSON or SSE.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmRequestUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// OpenAI input counts include cached tokens; Anthropic reports cache
+    /// buckets separately. This flag prevents cost double-counting.
+    pub input_includes_cache: bool,
 }
 
 /// SQLite-backed store. Kept behind a `Mutex` in `Shared` (rusqlite
@@ -191,6 +223,8 @@ impl StateFile {
             context_used          INTEGER NOT NULL DEFAULT 0,
             cost_usd              REAL NOT NULL DEFAULT 0,
             cost_estimated        INTEGER NOT NULL DEFAULT 0,
+            llm_request_cost_usd  REAL NOT NULL DEFAULT 0,
+            llm_requests_total    INTEGER NOT NULL DEFAULT 0,
             native_subagent_calls INTEGER NOT NULL DEFAULT 0,
             compute_ms            INTEGER NOT NULL DEFAULT 0,
             git_branch            TEXT,
@@ -216,6 +250,54 @@ impl StateFile {
             FOREIGN KEY(router_session_id) REFERENCES sessions(router_session_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_log_session ON session_log(router_session_id, id);
+        CREATE TABLE IF NOT EXISTS llm_requests (
+            request_id               TEXT PRIMARY KEY,
+            router_session_id        TEXT NOT NULL,
+            parent_router_session_id TEXT,
+            agent                    TEXT NOT NULL,
+            protocol                 TEXT NOT NULL,
+            endpoint                 TEXT NOT NULL,
+            pinned_model             TEXT NOT NULL,
+            model                    TEXT NOT NULL,
+            routing_reason           TEXT NOT NULL,
+            routing_event            TEXT NOT NULL,
+            started_at               INTEGER NOT NULL,
+            finished_at              INTEGER,
+            duration_ms              INTEGER,
+            status                   INTEGER,
+            estimated_input_tokens   INTEGER NOT NULL DEFAULT 0,
+            tokens_input             INTEGER NOT NULL DEFAULT 0,
+            tokens_output            INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_read        INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write       INTEGER NOT NULL DEFAULT 0,
+            cost_usd                 REAL NOT NULL DEFAULT 0,
+            error                    TEXT,
+            FOREIGN KEY(router_session_id) REFERENCES sessions(router_session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_requests_session
+            ON llm_requests(router_session_id, started_at);
+        CREATE INDEX IF NOT EXISTS idx_llm_requests_model
+            ON llm_requests(model, started_at);
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            router_session_id TEXT NOT NULL,
+            tool_call_id      TEXT NOT NULL,
+            title             TEXT NOT NULL,
+            status            TEXT NOT NULL,
+            model             TEXT,
+            started_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            completed_at      INTEGER,
+            detail            TEXT,
+            PRIMARY KEY(router_session_id, tool_call_id),
+            FOREIGN KEY(router_session_id) REFERENCES sessions(router_session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_active
+            ON tool_calls(completed_at, router_session_id);
+        CREATE VIEW IF NOT EXISTS active_tool_calls AS
+            SELECT router_session_id, tool_call_id, title, status, model,
+                   started_at, updated_at, detail
+            FROM tool_calls
+            WHERE completed_at IS NULL;
         "#;
         if let Err(err) = self.conn.execute_batch(sql) {
             tracing::error!(%err, "failed to initialize state schema");
@@ -233,6 +315,8 @@ impl StateFile {
             "ALTER TABLE sessions ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN llm_request_cost_usd REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN llm_requests_total INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_log ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_log ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_log ADD COLUMN model TEXT",
@@ -328,6 +412,8 @@ impl StateFile {
             tokens_cache_write: row.get::<_, i64>("tokens_cache_write").unwrap_or(0) as u64,
             cost_usd: row.get::<_, f64>("cost_usd").unwrap_or(0.0),
             cost_estimated: row.get::<_, i64>("cost_estimated").unwrap_or(0) != 0,
+            llm_request_cost_usd: row.get("llm_request_cost_usd").unwrap_or(0.0),
+            llm_requests_total: row.get::<_, i64>("llm_requests_total").unwrap_or(0) as u64,
             native_subagent_calls: row.get::<_, i64>("native_subagent_calls").unwrap_or(0) as u64,
             compute_ms: row.get::<_, i64>("compute_ms").unwrap_or(0) as u64,
             git_branch: row.get("git_branch").unwrap_or(None),
@@ -566,6 +652,138 @@ impl StateFile {
         let _ = self.conn.execute(
             "UPDATE sessions SET cost_usd = cost_usd + ?2, cost_estimated = 1              WHERE router_session_id=?1",
             params![router_session_id, delta],
+        );
+    }
+
+    /// Start a provider-level request record. Probe/auth traffic has no owning
+    /// session and is intentionally not passed here.
+    pub fn start_llm_request(&self, request: &LlmRequestStart) {
+        let now = now_epoch() as i64;
+        let result = self.conn.execute(
+            "INSERT INTO llm_requests
+                (request_id, router_session_id, parent_router_session_id, agent,
+                 protocol, endpoint, pinned_model, model, routing_reason,
+                 routing_event, started_at, estimated_input_tokens)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                request.request_id,
+                request.router_session_id,
+                request.parent_router_session_id,
+                request.agent,
+                request.protocol,
+                request.endpoint,
+                request.pinned_model,
+                request.model,
+                request.routing_reason,
+                request.routing_event,
+                now,
+                request.estimated_input_tokens as i64,
+            ],
+        );
+        if let Err(err) = result {
+            tracing::debug!(%err, request = request.request_id, "LLM request insert skipped");
+            return;
+        }
+        let _ = self.conn.execute(
+            "UPDATE sessions
+             SET llm_requests_total=llm_requests_total+1, updated_at=?2
+             WHERE router_session_id=?1",
+            params![request.router_session_id, now],
+        );
+    }
+
+    /// Finish an interposed request and accumulate API-equivalent request cost.
+    /// ACP turn token totals are not incremented a second time.
+    pub fn finish_llm_request(
+        &self,
+        request_id: &str,
+        status: u16,
+        duration_ms: u64,
+        usage: &LlmRequestUsage,
+        cost_usd: f64,
+        error: Option<&str>,
+    ) {
+        let now = now_epoch() as i64;
+        let session_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT router_session_id FROM llm_requests WHERE request_id=?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        let _ = self.conn.execute(
+            "UPDATE llm_requests SET
+                finished_at=?2, duration_ms=?3, status=?4,
+                tokens_input=?5, tokens_output=?6, tokens_cache_read=?7,
+                tokens_cache_write=?8, cost_usd=?9, error=?10
+             WHERE request_id=?1",
+            params![
+                request_id,
+                now,
+                duration_ms as i64,
+                i64::from(status),
+                usage.input as i64,
+                usage.output as i64,
+                usage.cache_read as i64,
+                usage.cache_write as i64,
+                cost_usd,
+                error,
+            ],
+        );
+        if let Some(session_id) = session_id {
+            let _ = self.conn.execute(
+                "UPDATE sessions
+                 SET llm_request_cost_usd=llm_request_cost_usd+?2, updated_at=?3
+                 WHERE router_session_id=?1",
+                params![session_id, cost_usd, now],
+            );
+        }
+    }
+
+    /// Upsert one tool's lifecycle. `active_tool_calls` exposes rows without a
+    /// terminal completion timestamp.
+    pub fn record_tool_call(
+        &self,
+        router_session_id: &str,
+        tool_call_id: &str,
+        title: &str,
+        status: &str,
+        model: Option<&str>,
+        detail: &serde_json::Value,
+    ) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        let now = now_epoch() as i64;
+        let terminal = matches!(
+            status.to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled" | "canceled" | "rejected"
+        );
+        let completed_at = terminal.then_some(now);
+        let _ = self.conn.execute(
+            "INSERT INTO tool_calls
+                (router_session_id, tool_call_id, title, status, model,
+                 started_at, updated_at, completed_at, detail)
+             VALUES (?1,?2,?3,?4,?5,?6,?6,?7,?8)
+             ON CONFLICT(router_session_id, tool_call_id) DO UPDATE SET
+                title=excluded.title,
+                status=excluded.status,
+                model=COALESCE(tool_calls.model, excluded.model),
+                updated_at=excluded.updated_at,
+                completed_at=COALESCE(excluded.completed_at, tool_calls.completed_at),
+                detail=excluded.detail",
+            params![
+                router_session_id,
+                tool_call_id,
+                title,
+                status,
+                model,
+                now,
+                completed_at,
+                detail.to_string(),
+            ],
         );
     }
 
@@ -893,12 +1111,93 @@ mod tests {
         s.add_estimated_cost("r1", 0.02);
         s.add_estimated_cost("r1", 0.03);
         let got = s.get("r1").unwrap();
-        assert!((got.cost_usd - 0.05).abs() < 1e-9, "estimated cost accumulates");
+        assert!(
+            (got.cost_usd - 0.05).abs() < 1e-9,
+            "estimated cost accumulates"
+        );
         assert!(got.cost_estimated);
         // Adapter-reported cost keeps max semantics independently.
         s.upsert("r2".into(), session("claude"));
         s.set_cost_usd("r2", 0.10);
         assert!(!s.get("r2").unwrap().cost_estimated);
+    }
+
+    #[test]
+    fn llm_requests_and_active_tools_are_queryable() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("claude"));
+        s.start_llm_request(&LlmRequestStart {
+            request_id: "q1".into(),
+            router_session_id: "r1".into(),
+            parent_router_session_id: None,
+            agent: "claude".into(),
+            protocol: "anthropic".into(),
+            endpoint: "/v1/messages".into(),
+            pinned_model: "claude/opus".into(),
+            model: "claude/haiku".into(),
+            routing_reason: "routine streak".into(),
+            routing_event: "demotion".into(),
+            estimated_input_tokens: 1000,
+        });
+        s.finish_llm_request(
+            "q1",
+            200,
+            25,
+            &LlmRequestUsage {
+                input: 900,
+                output: 100,
+                cache_read: 800,
+                cache_write: 0,
+                input_includes_cache: false,
+            },
+            0.01,
+            None,
+        );
+        let got = s.get("r1").unwrap();
+        assert_eq!(got.llm_requests_total, 1);
+        assert!((got.llm_request_cost_usd - 0.01).abs() < 1e-9);
+
+        s.record_tool_call(
+            "r1",
+            "tool-1",
+            "cargo test",
+            "running",
+            Some("claude/haiku"),
+            &serde_json::json!({"toolCallId":"tool-1"}),
+        );
+        let active: (String, String) = s
+            .conn
+            .query_row(
+                "SELECT tool_call_id, model FROM active_tool_calls",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active, ("tool-1".into(), "claude/haiku".into()));
+        s.record_tool_call(
+            "r1",
+            "tool-1",
+            "cargo test",
+            "completed",
+            Some("claude/opus"),
+            &serde_json::json!({"toolCallId":"tool-1","status":"completed"}),
+        );
+        let active_count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM active_tool_calls", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active_count, 0);
+        let tool_model: String = s
+            .conn
+            .query_row(
+                "SELECT model FROM tool_calls WHERE tool_call_id='tool-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_model, "claude/haiku");
     }
 
     #[test]

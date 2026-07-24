@@ -167,6 +167,12 @@ async fn main() -> anyhow::Result<()> {
                         "  tokens    : in {} / out {} / total {} · context {}",
                         s.tokens_input, s.tokens_output, s.tokens_total, s.context_used
                     );
+                    if s.llm_requests_total > 0 {
+                        println!(
+                            "  requests  : {} LLM calls · API-equivalent cost ${:.6}",
+                            s.llm_requests_total, s.llm_request_cost_usd
+                        );
+                    }
                     if let Some(r) = &s.routing {
                         println!(
                             "  why       : {}",
@@ -242,7 +248,16 @@ async fn main() -> anyhow::Result<()> {
             let (mut sum_planner_cost, mut sum_delegate_cost) = (0f64, 0f64);
             for (id, s) in &runs {
                 let kids = children.get(id).cloned().unwrap_or_default();
-                let delegate_cost: f64 = kids.iter().map(|(_, c)| c.cost_usd).sum::<f64>() + 0.0;
+                let effective_cost = |session: &router_acp::state::PersistedSession| {
+                    if session.llm_requests_total > 0 && session.llm_request_cost_usd > 0.0 {
+                        session.llm_request_cost_usd
+                    } else {
+                        session.cost_usd
+                    }
+                };
+                let planner_cost = effective_cost(s);
+                let delegate_cost: f64 =
+                    kids.iter().map(|(_, c)| effective_cost(c)).sum::<f64>() + 0.0;
                 let delegate_cost = if delegate_cost == 0.0 {
                     0.0
                 } else {
@@ -260,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
                 if s.native_subagent_calls > 0 {
                     degraded_runs += 1;
                 }
-                sum_planner_cost += s.cost_usd;
+                sum_planner_cost += planner_cost;
                 sum_delegate_cost += delegate_cost;
 
                 println!(
@@ -271,9 +286,9 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!(
                     "    cost: planner ${:.4} + delegates ${:.4} = ${:.4}  | compute {}s | context {}",
-                    s.cost_usd,
+                    planner_cost,
                     delegate_cost,
-                    s.cost_usd + delegate_cost,
+                    planner_cost + delegate_cost,
                     s.compute_ms / 1000,
                     s.context_used
                 );
@@ -293,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
                         "      └─ {}/{}  ${:.4}  {}s  {}",
                         c.agent,
                         c.model,
-                        c.cost_usd,
+                        effective_cost(c),
                         c.compute_ms / 1000,
                         c.title
                             .as_deref()

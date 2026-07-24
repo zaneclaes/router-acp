@@ -29,6 +29,27 @@ Whichever router runs, the decision is printed to your console and recorded
 in the state file, including the math, so you never have to guess why a
 model was chosen.
 
+With the optional **per-request LLM proxy**, the candidate remains the
+session's default and failover owner, but it is no longer necessarily the model
+for every provider call inside a turn. The loopback proxy observes the live
+tool-result trace and may:
+
+- demote to the cheapest same-agent model after `llm_proxy.routine_streak`
+  routine requests;
+- escalate immediately to the highest-quality same-agent model on failures,
+  unchanged test output, refusal, or token/context ceilings;
+- return from an escalation when its request/time verdict expires; and
+- hold a model for `minimum_dwell_requests` to avoid repeatedly paying cold
+  cache costs.
+
+Context-window guards, cordons, and quarantines constrain this pool. An
+automation hint (`_meta.router_acp.request_hint = "ci-poll"`, `"ship-nudge"`,
+or `"automation"`) goes directly to the cheap compatible model. Every
+attributed decision is disclosed as `router-acp · request …`, stored in
+`session_log`, and recorded with exact model/token/cache/cost fields in
+`llm_requests`. The proxy is orthogonal to the four ACP routers below: they
+still choose the pinned default.
+
 ---
 
 ## What every router sees

@@ -354,6 +354,7 @@ pub struct Shared {
     pub scores: ScoreTable,
     pub rules: ClassifierRules,
     pub state: Mutex<StateFile>,
+    pub llm_proxy: Arc<crate::llm_proxy::LlmProxyRuntime>,
     pub headroom: Mutex<HeadroomTracker>,
     pub sessions: Mutex<HashMap<String, RouterSession>>,
     pub targets: Mutex<HashMap<ProcessKey, TargetRuntime>>,
@@ -403,6 +404,8 @@ impl Shared {
         let state = StateFile::load(&cfg.state_file, cfg.retention());
 
         let specs = build_targets(&cfg);
+        let llm_proxy = crate::llm_proxy::LlmProxyRuntime::new(&cfg, &specs)
+            .map_err(|e| AcpError::invalid_params().data(e))?;
         let mut targets = HashMap::new();
         let mut candidates = Vec::new();
         let mut config_index = 0usize;
@@ -451,6 +454,7 @@ impl Shared {
             scores,
             rules,
             state: Mutex::new(state),
+            llm_proxy,
             headroom: Mutex::new(headroom),
             sessions: Mutex::new(HashMap::new()),
             targets: Mutex::new(targets),
@@ -933,13 +937,36 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         .unwrap_or("");
     let entry = match kind {
         "tool_call" | "tool_call_update" => {
+            let tool_call_id = update
+                .get("toolCallId")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             let title = update
                 .get("title")
                 .and_then(|t| t.as_str())
-                .or_else(|| update.get("toolCallId").and_then(|t| t.as_str()))
+                .or_else(|| (!tool_call_id.is_empty()).then_some(tool_call_id))
                 .unwrap_or("tool")
                 .to_string();
-            let status = update.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let status = update
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("running");
+            let persisted = shared.state.lock().unwrap().get(router_sid);
+            let model = persisted.map(|session| {
+                let selected = shared
+                    .llm_proxy
+                    .current_model(router_sid)
+                    .unwrap_or(session.model);
+                format!("{}/{selected}", session.agent)
+            });
+            shared.state.lock().unwrap().record_tool_call(
+                router_sid,
+                tool_call_id,
+                &title,
+                status,
+                model.as_deref(),
+                update,
+            );
             Some(crate::state::LogEntry {
                 kind: "tool_call".to_string(),
                 role: "tool".to_string(),
@@ -950,6 +977,7 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
                 },
                 detail: Some(update.clone()),
                 tokens_estimated: true,
+                model,
                 ..Default::default()
             })
         }
@@ -3012,6 +3040,23 @@ async fn send_prompt_with_failover(
             .unwrap()
             .record_prompt(&candidate.agent);
         let fwd = PromptRequest::new(down_sid.clone(), effective_prompt).meta(req.meta.clone());
+        let process_key = shared
+            .candidate_runtime(&candidate)
+            .map(|runtime| runtime.process_key)
+            .unwrap_or_else(|| ProcessKey(candidate.agent.clone()));
+        let class = shared
+            .with_session(&router_sid, |session| session.task_class)
+            .flatten()
+            .unwrap_or(TaskClass::CodingGeneral);
+        let _llm_turn = shared.llm_proxy.begin_turn(
+            process_key,
+            router_sid.clone(),
+            router_sid.clone(),
+            down_sid.clone(),
+            candidate.clone(),
+            class,
+            req.meta.as_ref(),
+        );
         let sent = conn
             .send_request(fwd)
             .forward_cancellation_from(responder.cancellation());
@@ -3871,8 +3916,7 @@ fn maybe_demote(shared: &Arc<Shared>, router_sid: &str) {
         .with_session(router_sid, |s| s.elevation.clone())
         .flatten()
         .unwrap_or_else(|| "elevation".to_string());
-    let reason =
-        format!("demotion: {quiet_needed} quiet turns since {cause} — verdict expired");
+    let reason = format!("demotion: {quiet_needed} quiet turns since {cause} — verdict expired");
     shared.with_session(router_sid, |s| {
         s.pending_switch = Some(SwitchRequest {
             target: target.clone(),
@@ -4186,6 +4230,19 @@ async fn switch_pin(
             old_down_sid.clone(),
             vec![ContentBlock::from(HANDOFF_SUMMARY_INSTRUCTION.to_string())],
         );
+        let class = shared
+            .with_session(router_sid, |session| session.task_class)
+            .flatten()
+            .unwrap_or(TaskClass::CodingGeneral);
+        let _llm_turn = shared.llm_proxy.begin_turn(
+            old_process_key.clone(),
+            router_sid.to_string(),
+            router_sid.to_string(),
+            old_down_sid.clone(),
+            old_candidate.clone(),
+            class,
+            None,
+        );
         let result = conn.send_request(summary_prompt).block_task().await;
         shared.with_session(router_sid, |s| s.capturing_summary = None);
         let captured = buffer.lock().unwrap().clone();
@@ -4395,6 +4452,15 @@ async fn handle_meta_prompt(
         {
             Ok(opened) => {
                 let fwd = PromptRequest::new(opened.downstream_sid.clone(), req.prompt.clone());
+                let _llm_turn = shared.llm_proxy.begin_turn(
+                    opened.process_key.clone(),
+                    router_sid.clone(),
+                    router_sid.clone(),
+                    opened.downstream_sid.clone(),
+                    view.id.clone(),
+                    TaskClass::Writing,
+                    req.meta.as_ref(),
+                );
                 let result = opened.conn.send_request(fwd).block_task().await;
                 close_downstream_session(&shared, &opened.process_key, &opened.downstream_sid);
                 tracing::debug!(
@@ -4551,6 +4617,21 @@ pub async fn serve_shared(
     shared: Arc<Shared>,
     transport: impl ConnectTo<AgentPeer> + 'static,
 ) -> Result<(), AcpError> {
+    // Bind before downstream adapters spawn so their base-URL environment can
+    // point at the actual ephemeral port. Failure is transparent: no env is
+    // changed and ACP-turn routing continues.
+    let llm_proxy_task = if shared.llm_proxy.enabled() {
+        match shared.llm_proxy.bind(shared.clone()).await {
+            Ok(task) => Some(task),
+            Err(err) => {
+                tracing::warn!(%err, "per-request LLM proxy disabled; using adapter upstreams");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Delegate MCP listener (Unix socket) runs independently of the ACP
     // connection; aborted when serve returns.
     let listener_task = if shared.cfg.delegation.enabled {
@@ -4575,6 +4656,9 @@ pub async fn serve_shared(
         task.abort();
     }
     if let Some(task) = usage_task {
+        task.abort();
+    }
+    if let Some(task) = llm_proxy_task {
         task.abort();
     }
     result
@@ -5497,12 +5581,14 @@ mod xai_gate_tests {
     #[test]
     fn open_gate_is_routable() {
         // The normal frame grok emits at session start: access allowed.
-        assert!(xai_gate_reason(&json!({
-            "allow_access": true,
-            "gate_message": null,
-            "subscription_tier_display": "Free"
-        }))
-        .is_none());
+        assert!(
+            xai_gate_reason(&json!({
+                "allow_access": true,
+                "gate_message": null,
+                "subscription_tier_display": "Free"
+            }))
+            .is_none()
+        );
         // Absent fields (a settings frame that isn't about access) → routable.
         assert!(xai_gate_reason(&json!({"show_resolved_model": false})).is_none());
         // Empty gate message with allow true → routable.
@@ -5520,7 +5606,10 @@ mod xai_gate_tests {
             "gate_message": "You've reached your Grok usage limit. Upgrade to continue."
         }))
         .unwrap();
-        assert!(r.starts_with("xAI subscription gate: You've reached"), "{r}");
+        assert!(
+            r.starts_with("xAI subscription gate: You've reached"),
+            "{r}"
+        );
         // A gate_message alone (allow_access absent) still closes the gate.
         let r = xai_gate_reason(&json!({"gate_message": "rate limited"})).unwrap();
         assert!(r.contains("rate limited"), "{r}");

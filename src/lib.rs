@@ -9,6 +9,7 @@ pub mod downstream;
 pub mod headroom;
 pub mod lifecycle;
 pub mod limits;
+pub mod llm_proxy;
 pub mod relay;
 pub mod session;
 pub mod state;

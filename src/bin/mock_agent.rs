@@ -297,7 +297,17 @@ async fn run_prompt(
             }
         }
     };
-    mock.log(json!({"event": "prompt", "sessionId": session_id, "text": text, "model": model}));
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    mock.log(json!({
+        "event": "prompt",
+        "sessionId": session_id,
+        "text": text,
+        "model": model,
+        "startedAtMs": started_at_ms,
+    }));
 
     if mock.exit_on_prompt {
         // Simulate a crash mid-turn.
@@ -511,22 +521,23 @@ async fn run_prompt(
             .find(|s| matches!(s, McpServer::Stdio(stdio) if stdio.name == "router-delegate"));
         match delegate_server {
             Some(server) => {
-                for task in &bg_tasks {
-                    let result = async {
-                        let mut client = McpClient::spawn(server).await?;
-                        let result = client
-                            .request(
-                                "tools/call",
-                                json!({
-                                    "name": "delegate_task",
-                                    "arguments": {"task": task, "background": true},
-                                }),
-                            )
-                            .await;
-                        client.shutdown().await;
-                        result
+                let mut client = match McpClient::spawn(server).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        reply.push(format!("delegate-bg-error:{err}"));
+                        return finish_prompt(&text, model, session_id, reply, &cx, responder);
                     }
-                    .await;
+                };
+                for task in &bg_tasks {
+                    let result = client
+                        .request(
+                            "tools/call",
+                            json!({
+                                "name": "delegate_task",
+                                "arguments": {"task": task, "background": true},
+                            }),
+                        )
+                        .await;
                     match result {
                         Ok(value) => {
                             let text = value["content"][0]["text"].as_str().unwrap_or("");
@@ -544,18 +555,12 @@ async fn run_prompt(
                     if let Some(secs) = spec.strip_prefix(':').and_then(|s| s.parse::<u64>().ok()) {
                         arguments["timeout_seconds"] = json!(secs);
                     }
-                    let result = async {
-                        let mut client = McpClient::spawn(server).await?;
-                        let result = client
-                            .request(
-                                "tools/call",
-                                json!({"name": "delegate_await", "arguments": arguments}),
-                            )
-                            .await;
-                        client.shutdown().await;
-                        result
-                    }
-                    .await;
+                    let result = client
+                        .request(
+                            "tools/call",
+                            json!({"name": "delegate_await", "arguments": arguments}),
+                        )
+                        .await;
                     match result {
                         Ok(value) => {
                             let text = value["content"][0]["text"].as_str().unwrap_or("");
@@ -568,11 +573,23 @@ async fn run_prompt(
                         Err(err) => reply.push(format!("await-error:{err}")),
                     }
                 }
+                client.shutdown().await;
             }
             None => reply.push("delegate-bg-error:no router-delegate MCP server".to_string()),
         }
     }
 
+    finish_prompt(&text, model, session_id, reply, &cx, responder)
+}
+
+fn finish_prompt(
+    text: &str,
+    model: String,
+    session_id: String,
+    mut reply: Vec<String>,
+    cx: &ConnectionTo<ClientRole>,
+    responder: Responder<PromptResponse>,
+) -> Result<(), AcpError> {
     if reply.is_empty() {
         reply.push(format!("echo:{model}:{text}"));
     }

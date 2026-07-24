@@ -374,6 +374,7 @@ mod score_resolution_tests {
         let t = ScoreTable::builtin();
         let mini = t.lookup(&CandidateId::parse("codex/gpt-5.4-mini").unwrap());
         assert_eq!(mini.coding_tier, CodingTier::Medium);
+        assert_eq!(mini.context_window, Some(400_000));
         assert!(
             mini.quality(TaskClass::Research) <= 0.5,
             "mini is not opus-grade"

@@ -1105,6 +1105,15 @@ pub async fn run_delegate_task(
                     headroom.record_prompt(&candidate.agent);
                 }
                 let turn_start = std::time::Instant::now();
+                let _llm_turn = shared.llm_proxy.begin_turn(
+                    opened.process_key.clone(),
+                    router_sid.to_string(),
+                    sub_sid.clone(),
+                    opened.downstream_sid.clone(),
+                    candidate.clone(),
+                    profile.class,
+                    None,
+                );
                 let result = opened.conn.send_request(prompt).block_task().await;
                 shared
                     .state
@@ -1293,6 +1302,15 @@ pub async fn run_delegate_followup(
         vec![ContentBlock::from(args.message.clone())],
     );
     let turn_start = std::time::Instant::now();
+    let _llm_turn = shared.llm_proxy.begin_turn(
+        process_key.clone(),
+        router_sid.to_string(),
+        sub_sid.clone(),
+        downstream_sid.clone(),
+        candidate.clone(),
+        TaskClass::CodingGeneral,
+        None,
+    );
     let result = conn.send_request(prompt).block_task().await;
     shared
         .state
