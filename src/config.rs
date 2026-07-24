@@ -112,6 +112,20 @@ pub struct DelegationConfig {
     /// Defaults to a per-process path under the state directory.
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
+    /// Ceiling on a delegated subtask's classified complexity. The parent
+    /// (often a frontier planner) has already decomposed the work into a
+    /// fully-specified brief, but the heuristic classifier reads long,
+    /// detailed briefs as *maximum* complexity — which both zeroes the
+    /// `auto` strategy's complexity-scaled cost term and trips its p75
+    /// quality gate, so every subtask routes to the most expensive
+    /// candidate. Capping restores cost-aware routing for spec'd subtasks.
+    /// 1.0 disables the cap.
+    #[serde(default = "default_delegate_complexity_cap")]
+    pub complexity_cap: f64,
+}
+
+fn default_delegate_complexity_cap() -> f64 {
+    0.6
 }
 
 fn default_true() -> bool {
@@ -128,6 +142,7 @@ impl Default for DelegationConfig {
             enabled: true,
             max_concurrent: default_max_concurrent(),
             socket_path: None,
+            complexity_cap: default_delegate_complexity_cap(),
         }
     }
 }
@@ -566,6 +581,29 @@ pub struct ModelConfig {
     pub display_name: Option<String>,
     /// 1 = cheapest/least scarce; larger = more expensive/scarce.
     pub cost_rank: u32,
+    /// Optional API-equivalent pricing, used to SYNTHESIZE `cost_usd` for a
+    /// session whose adapter reports no cost of its own (only the claude
+    /// adapter reports authoritative cost via `usage_update.cost`; codex,
+    /// grok, and kimi sessions otherwise record 0 forever). Leave unset for
+    /// models whose adapter reports real cost — synthesized and reported
+    /// figures must not mix.
+    #[serde(default)]
+    pub pricing: Option<PricingConfig>,
+}
+
+/// USD per million tokens, mirroring the provider's published API rates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricingConfig {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    /// Cache-read rate; defaults to `0.1 × input_per_mtok` (the common
+    /// provider discount) when unset.
+    #[serde(default)]
+    pub cache_read_per_mtok: Option<f64>,
+    /// Cache-write rate; defaults to `1.25 × input_per_mtok` when unset.
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -636,6 +674,19 @@ pub struct AutoRouterConfig {
     /// for trivial prompts, quality dominates hard ones. Default on.
     #[serde(default = "default_true")]
     pub complexity_scales_tradeoff: bool,
+    /// Floor on the cost weight (0..1 share of the utility) after complexity
+    /// scaling. Without it, a complexity-1.0 classification zeroes the cost
+    /// term entirely and routing degenerates to pure quality-max — every
+    /// prompt lands on the most expensive candidate. The floor keeps a
+    /// minimum of cost-awareness in play; it never raises the weight above
+    /// the configured `cost_quality_tradeoff`, and 0 disables it (legacy
+    /// behavior). Only applies when `complexity_scales_tradeoff` is on.
+    #[serde(default = "default_min_cost_weight")]
+    pub min_cost_weight: f64,
+}
+
+fn default_min_cost_weight() -> f64 {
+    0.15
 }
 
 fn default_tradeoff() -> f64 {
@@ -657,6 +708,7 @@ impl Default for AutoRouterConfig {
             complexity_floor: default_complexity_floor(),
             allowed_candidates: default_allowed(),
             complexity_scales_tradeoff: true,
+            min_cost_weight: default_min_cost_weight(),
         }
     }
 }
@@ -813,6 +865,10 @@ pub struct Config {
     /// Automatic orchestration of multi-part task lists.
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+    /// Expiry of elevated pins (escalations, auto-upgrades, skill pins):
+    /// demote back to a cheaper candidate after a run of quiet turns.
+    #[serde(default)]
+    pub demotion: DemotionConfig,
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
     pub routers: RoutersConfig,
@@ -823,6 +879,24 @@ pub struct Config {
 
 fn default_router() -> StrategyKind {
     StrategyKind::Auto
+}
+
+/// Demotion is the counterpart of escalation/auto-upgrade: an *elevated* pin
+/// (one the router raised for a skill, an escalation, or an auto-upgrade —
+/// never an explicit user pick) expires after enough quiet turns, and the
+/// session steps back down to the strongest cheaper candidate. Without it,
+/// one hard patch pins a long session (e.g. a ship watcher's CI-poll loop)
+/// to frontier pricing forever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemotionConfig {
+    /// Demote after this many consecutive turns with no struggle signals
+    /// (no tool failures, token-ceiling hits, or refusals). 0 disables
+    /// demotion (the default). The switch uses the normal handoff-summary
+    /// machinery and is disclosed like any other switch; re-escalation on
+    /// fresh difficulty still applies (bounded by `max_escalations`).
+    #[serde(default)]
+    pub after_quiet_turns: u32,
 }
 
 fn default_state_file() -> PathBuf {
@@ -1034,6 +1108,31 @@ impl Config {
             return Err(ConfigError(
                 "routers.auto.cost_quality_tradeoff must be between 0 and 10".into(),
             ));
+        }
+        if !(0.0..=1.0).contains(&self.routers.auto.min_cost_weight) {
+            return Err(ConfigError(
+                "routers.auto.min_cost_weight must be between 0 and 1".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.delegation.complexity_cap) {
+            return Err(ConfigError(
+                "delegation.complexity_cap must be between 0 and 1".into(),
+            ));
+        }
+        for agent in &self.agents {
+            for model in &agent.models {
+                if let Some(pricing) = &model.pricing
+                    && (pricing.input_per_mtok < 0.0
+                        || pricing.output_per_mtok < 0.0
+                        || pricing.cache_read_per_mtok.is_some_and(|v| v < 0.0)
+                        || pricing.cache_write_per_mtok.is_some_and(|v| v < 0.0))
+                {
+                    return Err(ConfigError(format!(
+                        "agents.{}.models.{}.pricing rates must be non-negative",
+                        agent.name, model.id
+                    )));
+                }
+            }
         }
         if self.routers.escalation.initial_router == Some(StrategyKind::Escalation) {
             return Err(ConfigError(

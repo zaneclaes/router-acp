@@ -2841,6 +2841,90 @@ async fn escalation_post_turn_on_max_tokens_stop() {
     .await;
 }
 
+#[tokio::test]
+async fn demotion_expires_an_escalated_pin_after_quiet_turns() {
+    let state = temp_state_file("demote");
+    let scores = escalation_scores("demote", false);
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         demotion: {{ after_quiet_turns: 2 }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n    escalate_before_side_effects: false\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Turn 1: max-tokens on the cheap model → queues an escalation.
+        let r1 = prompt_text(&cx, &sid, "MAXTOKENS do the thing").await?;
+        assert_eq!(r1.stop_reason, StopReason::MaxTokens);
+        // Turn 2: the escalation fires; a clean turn on the strong model
+        // (quiet 1 of 2).
+        let r2 = prompt_text(&cx, &sid, "continue").await?;
+        assert_eq!(r2.stop_reason, StopReason::EndTurn);
+        // Turn 3: second clean turn — the demotion clock expires the verdict.
+        let r3 = prompt_text(&cx, &sid, "keep going").await?;
+        assert_eq!(r3.stop_reason, StopReason::EndTurn);
+        // Turn 4: the queued demotion fires before forwarding; the prompt
+        // lands back on the cheap model.
+        let r4 = prompt_text(&cx, &sid, "poll status").await?;
+        assert_eq!(r4.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "escalation happened first: {text}"
+        );
+        assert!(
+            text.contains("demoting to a/m1"),
+            "demotion was disclosed: {text}"
+        );
+        assert!(
+            text.contains("switched b/m2 → a/m1"),
+            "demotion switch happened: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:") && text.contains("poll status"),
+            "the post-demotion prompt ran on the cheap model: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn demotion_disabled_by_default_keeps_the_escalated_pin() {
+    let state = temp_state_file("demote-off");
+    let scores = escalation_scores("demote-off", false);
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n    escalate_before_side_effects: false\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let _ = prompt_text(&cx, &sid, "MAXTOKENS do the thing").await?;
+        for p in ["continue", "keep going", "poll status", "one more"] {
+            let r = prompt_text(&cx, &sid, p).await?;
+            assert_eq!(r.stop_reason, StopReason::EndTurn);
+        }
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("demoting to"),
+            "no demotion without `demotion.after_quiet_turns`: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// Build an escalation config that isolates one trigger (others disabled).
 fn esc_yaml(state: &std::path::Path, scores: &std::path::Path, body: &str, logb: &str) -> String {
     format!(

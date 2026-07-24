@@ -89,7 +89,13 @@ impl RouterStrategy for AutoStrategy {
         let max_cost = pool.iter().map(|c| c.cost_rank).max().unwrap_or(1) as f64;
         let base_tradeoff = self.cfg.cost_quality_tradeoff.clamp(0.0, 10.0);
         let tradeoff = if self.cfg.complexity_scales_tradeoff {
-            base_tradeoff * (1.0 - ctx.profile.complexity.clamp(0.0, 1.0))
+            let scaled = base_tradeoff * (1.0 - ctx.profile.complexity.clamp(0.0, 1.0));
+            // Floor the scaled tradeoff so a complexity-1.0 classification
+            // can't zero the cost term (pure quality-max routes everything
+            // to the most expensive candidate). Never raise it above the
+            // configured tradeoff.
+            let floor = (self.cfg.min_cost_weight.clamp(0.0, 1.0) * 10.0).min(base_tradeoff);
+            scaled.max(floor)
         } else {
             base_tradeoff
         };
@@ -176,6 +182,7 @@ mod tests {
             // Tests set complexity explicitly; keep scoring independent of
             // it unless a test opts in.
             complexity_scales_tradeoff: false,
+            min_cost_weight: 0.0,
         }
     }
 
@@ -317,6 +324,42 @@ mod tests {
             "{}",
             ranked[0].reason
         );
+    }
+
+    #[test]
+    fn min_cost_weight_floors_the_scaled_tradeoff() {
+        // Complexity 1.0 would scale the tradeoff to 0.0 (pure quality-max);
+        // the floor keeps 0.15 of the utility on the cost term, so a
+        // near-equal-quality cheaper candidate can still win.
+        let s = AutoStrategy::new(AutoRouterConfig {
+            complexity_scales_tradeoff: true,
+            complexity_floor: 2.0, // keep the p75 gate out of the picture
+            min_cost_weight: 0.15,
+            ..cfg(3.0)
+        });
+        let p = vec![
+            view("claude", "fable", 5, 0, 0.90, CodingTier::High, 1.0),
+            view("claude", "sonnet", 2, 1, 0.88, CodingTier::High, 1.0),
+        ];
+        let mut context = ctx();
+        context.profile.complexity = 1.0;
+        let ranked = s.rank(&context, &p).unwrap();
+        // quality gap 0.85×0.02 = 0.017 < cost-term gap 0.15×1.0 = 0.15.
+        assert_eq!(ranked[0].candidate.to_string(), "claude/sonnet");
+        assert!(
+            ranked[0].reason.contains("complexity-scaled"),
+            "{}",
+            ranked[0].reason
+        );
+        // Without the floor, fable wins on pure quality — the legacy failure.
+        let legacy = AutoStrategy::new(AutoRouterConfig {
+            complexity_scales_tradeoff: true,
+            complexity_floor: 2.0,
+            min_cost_weight: 0.0,
+            ..cfg(3.0)
+        });
+        let ranked = legacy.rank(&context, &p).unwrap();
+        assert_eq!(ranked[0].candidate.to_string(), "claude/fable");
     }
 
     #[test]

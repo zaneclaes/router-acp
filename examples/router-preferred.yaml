@@ -3,6 +3,12 @@ state_file: ~/.local/state/router-acp/sessions.db
 delegation:
   enabled: true
   max_concurrent: 3
+  # The parent has already decomposed the work into a fully-specified brief;
+  # long, detailed briefs otherwise classify as max complexity, which zeroes
+  # the auto strategy's cost term (and trips its quality gate) so every
+  # subtask lands on the most expensive candidate. Cap restores cost-aware
+  # worker routing; 1.0 disables.
+  complexity_cap: 0.6
 
 agents:
   - name: claude
@@ -41,12 +47,22 @@ agents:
     # since Codex has no pollable usage endpoint; reactive cordon backstops it).
     usage_source: { type: codex-rollout }
     mode_map: { auto: full-access, approve: auto, chat: read-only }
+    # `pricing` (USD per Mtok, published API rates as of 2026-07) synthesizes
+    # `cost_usd` for these sessions — the codex adapter reports no cost of its
+    # own, so without it every codex session records $0 and cross-seat cost
+    # comparisons are blind. Omit pricing on agents whose adapter reports real
+    # cost (claude): synthesized and reported figures must not mix.
     models:
-      - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
-      - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }
-      - { id: gpt-5.6-luna, display_name: GPT Luna, cost_rank: 2 }
-      - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4 }
-      - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5 }
+      - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1,
+          pricing: { input_per_mtok: 0.75, output_per_mtok: 4.50 } }
+      - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3,
+          pricing: { input_per_mtok: 5.00, output_per_mtok: 30.00 } }
+      - { id: gpt-5.6-luna, display_name: GPT Luna, cost_rank: 2,
+          pricing: { input_per_mtok: 1.00, output_per_mtok: 6.00 } }
+      - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4,
+          pricing: { input_per_mtok: 2.50, output_per_mtok: 15.00 } }
+      - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5,
+          pricing: { input_per_mtok: 5.00, output_per_mtok: 30.00 } }
 
   # xAI Grok. The official CLI (`npm i -g @xai-official/grok`) is itself an ACP
   # agent — `grok agent stdio` — so no separate adapter is needed. Its own
@@ -68,7 +84,9 @@ agents:
       process_template:
         args: ["--model", "${model_id}", "stdio"]
     models:
-      - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5 }   # current frontier
+      - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5,    # current frontier
+          pricing: { input_per_mtok: 2.00, output_per_mtok: 6.00,
+                     cache_read_per_mtok: 0.50 } }
       # - { id: grok-code-fast-1, display_name: Grok Code Fast, cost_rank: 2 }
 
   # Moonshot Kimi. The CLI (`uv tool install kimi-cli`, executable `kimi`) is
@@ -89,7 +107,8 @@ agents:
       process_template:           # which is a GLOBAL flag → it precedes `acp`
         args: ["--model", "${model_id}", "acp"]
     models:
-      - { id: kimi-k2, display_name: Kimi K2, cost_rank: 2 }
+      - { id: kimi-k2, display_name: Kimi K2, cost_rank: 2,
+          pricing: { input_per_mtok: 0.55, output_per_mtok: 2.20 } }
       # - { id: kimi-k2-thinking, display_name: Kimi K2 Thinking, cost_rank: 3 }
 
 router: escalation
@@ -118,6 +137,11 @@ routers:
     # more Fable traffic to Opus) tune their quality gap in the score table, not
     # this knob (Fable's built-in scores already sit just above Opus for that).
     cost_quality_tradeoff: 3
+    # Floor on the effective cost weight after complexity scaling. Without
+    # it, a complexity-1.0 classification zeroes the cost term entirely and
+    # routing becomes pure quality-max — observed as 96% of delegate spend
+    # landing on the top-rank model. 0 disables (legacy behavior).
+    min_cost_weight: 0.15
 
 # Proactive usage-cap cordoning (on by default; inert unless an agent declares a
 # `usage_source` above). Polls the provider usage API and marks a model
@@ -152,6 +176,17 @@ orchestration:
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
+
+# Demotion — the counterpart of escalation/auto-upgrade. An ELEVATED pin (one
+# the router raised for an escalation, an auto-upgrade, or a skill_routing
+# rule — never an explicit user pick) expires after this many consecutive
+# quiet turns (no tool failures, token-ceiling hits, or refusals), and the
+# session steps back down to the strongest cheaper candidate. Without it, one
+# hard patch — or one `/ship-pr` turn — pins a long session (e.g. a ship
+# watcher's CI-poll loop) to frontier pricing for every routine turn that
+# follows. Re-escalation on fresh difficulty still applies.
+demotion:
+  after_quiet_turns: 3
 
 # Mid-session model switching. A pinned session can move to a more capable
 # model on its own when its confidence drops. Confidence = the pinned model's

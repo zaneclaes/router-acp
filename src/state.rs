@@ -75,9 +75,19 @@ pub struct PersistedSession {
     pub tokens_total: u64,
     /// Latest reported context-window usage (from `usage_update`).
     pub context_used: u64,
+    /// Cache-read / cache-write token counters (populated only when the
+    /// adapter reports them via `unstable_end_turn_token_usage`; 0 otherwise).
+    /// Cache reads dominate the real cost of long sessions, so hiding them
+    /// made `tokens_input` useless for cost analysis.
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
     /// Authoritative cumulative cost in USD, as reported by the adapter's
     /// `usage_update.cost` (max seen). 0 if the adapter reports no cost.
     pub cost_usd: f64,
+    /// True when `cost_usd` was synthesized from token counts and configured
+    /// `pricing` (adapters other than claude report no cost of their own)
+    /// rather than reported by the adapter.
+    pub cost_estimated: bool,
     /// Count of native (adapter built-in) sub-agent tool calls seen in an
     /// orchestrating session — each one bypasses the router's `delegate_task`,
     /// so a non-zero value means orchestration silently degraded.
@@ -105,8 +115,16 @@ pub struct LogEntry {
     pub detail: Option<serde_json::Value>,
     pub tokens_input: u64,
     pub tokens_output: u64,
+    /// Cache-read / cache-write tokens for this turn (0 when the adapter
+    /// doesn't report them).
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
     /// True when token counts are estimated (protocol gave none).
     pub tokens_estimated: bool,
+    /// The candidate (`agent/model`) that produced this row, for per-turn
+    /// model attribution across mid-session switches (set on
+    /// `agent_response` rows).
+    pub model: Option<String>,
 }
 
 /// SQLite-backed store. Kept behind a `Mutex` in `Shared` (rusqlite
@@ -168,8 +186,11 @@ impl StateFile {
             tokens_input          INTEGER NOT NULL DEFAULT 0,
             tokens_output         INTEGER NOT NULL DEFAULT 0,
             tokens_total          INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_read     INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write    INTEGER NOT NULL DEFAULT 0,
             context_used          INTEGER NOT NULL DEFAULT 0,
             cost_usd              REAL NOT NULL DEFAULT 0,
+            cost_estimated        INTEGER NOT NULL DEFAULT 0,
             native_subagent_calls INTEGER NOT NULL DEFAULT 0,
             compute_ms            INTEGER NOT NULL DEFAULT 0,
             git_branch            TEXT,
@@ -188,7 +209,10 @@ impl StateFile {
             detail            TEXT,
             tokens_input      INTEGER NOT NULL DEFAULT 0,
             tokens_output     INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write INTEGER NOT NULL DEFAULT 0,
             tokens_estimated  INTEGER NOT NULL DEFAULT 0,
+            model             TEXT,
             FOREIGN KEY(router_session_id) REFERENCES sessions(router_session_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_log_session ON session_log(router_session_id, id);
@@ -206,6 +230,12 @@ impl StateFile {
             "ALTER TABLE sessions ADD COLUMN compute_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN git_branch TEXT",
             "ALTER TABLE sessions ADD COLUMN git_sha TEXT",
+            "ALTER TABLE sessions ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE session_log ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE session_log ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE session_log ADD COLUMN model TEXT",
         ] {
             if let Err(err) = self.conn.execute(stmt, [])
                 && !err.to_string().contains("duplicate column")
@@ -294,7 +324,10 @@ impl StateFile {
             tokens_output: row.get::<_, i64>("tokens_output")? as u64,
             tokens_total: row.get::<_, i64>("tokens_total")? as u64,
             context_used: row.get::<_, i64>("context_used")? as u64,
+            tokens_cache_read: row.get::<_, i64>("tokens_cache_read").unwrap_or(0) as u64,
+            tokens_cache_write: row.get::<_, i64>("tokens_cache_write").unwrap_or(0) as u64,
             cost_usd: row.get::<_, f64>("cost_usd").unwrap_or(0.0),
+            cost_estimated: row.get::<_, i64>("cost_estimated").unwrap_or(0) != 0,
             native_subagent_calls: row.get::<_, i64>("native_subagent_calls").unwrap_or(0) as u64,
             compute_ms: row.get::<_, i64>("compute_ms").unwrap_or(0) as u64,
             git_branch: row.get("git_branch").unwrap_or(None),
@@ -465,8 +498,9 @@ impl StateFile {
         let res = self.conn.execute(
             "INSERT INTO session_log
                 (router_session_id, ts, kind, role, summary, detail,
-                 tokens_input, tokens_output, tokens_estimated)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 tokens_input, tokens_output, tokens_cache_read,
+                 tokens_cache_write, tokens_estimated, model)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 router_session_id,
                 now,
@@ -476,7 +510,10 @@ impl StateFile {
                 detail,
                 entry.tokens_input as i64,
                 entry.tokens_output as i64,
+                entry.tokens_cache_read as i64,
+                entry.tokens_cache_write as i64,
                 entry.tokens_estimated as i64,
+                entry.model,
             ],
         );
         if let Err(err) = res {
@@ -489,13 +526,17 @@ impl StateFile {
                 tokens_input = tokens_input + ?2,
                 tokens_output = tokens_output + ?3,
                 tokens_total = tokens_total + ?4,
-                updated_at = ?5
+                tokens_cache_read = tokens_cache_read + ?5,
+                tokens_cache_write = tokens_cache_write + ?6,
+                updated_at = ?7
              WHERE router_session_id = ?1",
             params![
                 router_session_id,
                 entry.tokens_input as i64,
                 entry.tokens_output as i64,
                 (entry.tokens_input + entry.tokens_output) as i64,
+                entry.tokens_cache_read as i64,
+                entry.tokens_cache_write as i64,
                 now,
             ],
         );
@@ -514,6 +555,17 @@ impl StateFile {
         let _ = self.conn.execute(
             "UPDATE sessions SET cost_usd=MAX(cost_usd, ?2) WHERE router_session_id=?1",
             params![router_session_id, cost],
+        );
+    }
+
+    /// Accumulate a synthesized per-turn cost (from token counts × configured
+    /// `pricing`) for a session whose adapter reports no cost of its own, and
+    /// mark the row estimated. Never mixed with adapter-reported cost — the
+    /// caller only synthesizes when no `usage_update.cost` was ever seen.
+    pub fn add_estimated_cost(&self, router_session_id: &str, delta: f64) {
+        let _ = self.conn.execute(
+            "UPDATE sessions SET cost_usd = cost_usd + ?2, cost_estimated = 1              WHERE router_session_id=?1",
+            params![router_session_id, delta],
         );
     }
 
@@ -546,7 +598,8 @@ impl StateFile {
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
         let mut out = Vec::new();
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT kind, role, summary, detail, tokens_input, tokens_output, tokens_estimated
+            "SELECT kind, role, summary, detail, tokens_input, tokens_output,
+                    tokens_cache_read, tokens_cache_write, tokens_estimated, model
              FROM session_log WHERE router_session_id=?1 ORDER BY id DESC LIMIT ?2",
         ) else {
             return out;
@@ -560,7 +613,10 @@ impl StateFile {
                 detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
                 tokens_input: row.get::<_, i64>("tokens_input")? as u64,
                 tokens_output: row.get::<_, i64>("tokens_output")? as u64,
+                tokens_cache_read: row.get::<_, i64>("tokens_cache_read").unwrap_or(0) as u64,
+                tokens_cache_write: row.get::<_, i64>("tokens_cache_write").unwrap_or(0) as u64,
                 tokens_estimated: row.get::<_, i64>("tokens_estimated")? != 0,
+                model: row.get("model").unwrap_or(None),
             })
         });
         if let Ok(rows) = rows {
@@ -801,6 +857,48 @@ mod tests {
         assert_eq!(got.compute_ms, 2000);
         assert_eq!(got.git_branch.as_deref(), Some("feature-x"));
         assert_eq!(got.git_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn cache_tokens_and_model_attribution_round_trip() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("codex"));
+        s.log(
+            "r1",
+            &LogEntry {
+                kind: "agent_response".into(),
+                role: "agent".into(),
+                summary: "done".into(),
+                tokens_input: 100,
+                tokens_output: 50,
+                tokens_cache_read: 4000,
+                tokens_cache_write: 200,
+                model: Some("codex/gpt-5.5".into()),
+                ..Default::default()
+            },
+        );
+        let got = s.get("r1").unwrap();
+        assert_eq!(got.tokens_cache_read, 4000);
+        assert_eq!(got.tokens_cache_write, 200);
+        let entries = s.log_for("r1", 10);
+        assert_eq!(entries[0].tokens_cache_read, 4000);
+        assert_eq!(entries[0].model.as_deref(), Some("codex/gpt-5.5"));
+    }
+
+    #[test]
+    fn estimated_cost_accumulates_and_flags_the_row() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("codex"));
+        assert!(!s.get("r1").unwrap().cost_estimated);
+        s.add_estimated_cost("r1", 0.02);
+        s.add_estimated_cost("r1", 0.03);
+        let got = s.get("r1").unwrap();
+        assert!((got.cost_usd - 0.05).abs() < 1e-9, "estimated cost accumulates");
+        assert!(got.cost_estimated);
+        // Adapter-reported cost keeps max semantics independently.
+        s.upsert("r2".into(), session("claude"));
+        s.set_cost_usd("r2", 0.10);
+        assert!(!s.get("r2").unwrap().cost_estimated);
     }
 
     #[test]
