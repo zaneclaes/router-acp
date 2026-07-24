@@ -201,8 +201,8 @@ availability_preference:
 orchestration:
   enabled: true
   min_items: 2                              # smallest list treated as multi-part
-  planner: ["*fable*", "*sol*"]             # best first
-  reviewer: ["*sol*", "*fable*"]            # a different lineage will be preferred
+  planner: ["*fable*", "*sol*", "*grok-4.5*"] # best first
+  reviewer: ["*sol*", "*fable*", "*grok-4.5*"] # a different lineage will be preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
@@ -251,4 +251,4 @@ ticket_context:
 # re-pin). Candidates are candidate globs in preference order.
 skill_routing:
   - pattern: ship-pr
-    candidates: ["*opus*", "*gpt-5.5*"]
+    candidates: ["*grok*", "*opus*", "*gpt-5.5*"]
