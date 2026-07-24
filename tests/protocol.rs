@@ -998,6 +998,10 @@ async fn delegate_without_required_auto_mode_fails_closed() {
     let state = temp_state_file("delegate-mode-required");
     let log = temp_log("delegate-mode-required");
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    // Cheap advertises modes but none resolve to a non-interactive `auto`
+    // (no mode_map, no exact "auto" id). That is the hang risk: the agent
+    // would prompt for approval. Agents that advertise *no* modes at all
+    // (Grok) are allowed through — there is no permission gate to arm.
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 1 }}\n\
          routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
@@ -1005,7 +1009,10 @@ async fn delegate_without_required_auto_mode_fails_closed() {
         agent_yaml(
             "cheap",
             &[("haiku", 1)],
-            &[("MOCK_LOG", &log.display().to_string())],
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_SESSION_MODES", "default,plan"),
+            ],
         ),
         agent_yaml("fancy", &[("opus", 3)], &[]),
     );
@@ -2046,6 +2053,124 @@ async fn skill_routing_switches_pinned_session_to_required_class() {
             "skill forced the switch: {text}"
         );
         assert!(text.contains("echo:m2:"), "ran on required class: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// Live bug: ship-pr candidates include both the current pin (`*opus*`) and a
+/// fallback (`*grok*`). When the pin is usage-cordoned (plan at 100%, no
+/// overage), skill_routing used to treat the pin as already-ok because the
+/// id still matched the skill globs — and stayed on the dead seat. It must
+/// switch to the next still-eligible skill candidate.
+#[tokio::test]
+async fn skill_routing_switches_off_usage_cordoned_pin() {
+    let state = temp_state_file("skill-cordon");
+    let log = temp_log("skill-cordon");
+    // Both m1 and m2 are in the skill class (m2 preferred when free). Poller
+    // disabled so we inject the cordon ourselves.
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m2*\", \"*m1*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Pin to a/m1 (in the skill class).
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+
+        // Cordon a/m1 as if its plan hit 100% with no overage headroom.
+        let mut cordons = std::collections::HashMap::new();
+        cordons.insert(
+            router_acp::candidate::CandidateId::new("a", "m1"),
+            router_acp::headroom::UsageCordon {
+                reason: "5-hour usage limit reached".to_string(),
+                resets_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+            },
+        );
+        shared.headroom.lock().unwrap().set_usage_cordons(cordons);
+
+        // ship-pr must leave the dead m1 pin for the still-eligible m2.
+        let resp = prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2") || text.contains("echo:m2:"),
+            "skill must leave cordoned pin for eligible skill candidate: {text}"
+        );
+        assert!(
+            !text.contains("echo:m1:please run ship-pr"),
+            "must not stay on usage-cordoned m1 for ship-pr: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// A pin that becomes usage-cordoned mid-session is proactively switched off
+/// even when the prompt does not invoke a skill (no waiting for a rate-limit
+/// error to trip reactive failover).
+#[tokio::test]
+async fn usage_cordoned_pin_switches_proactively() {
+    let state = temp_state_file("proactive-cordon");
+    let log = temp_log("proactive-cordon");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+
+        let mut cordons = std::collections::HashMap::new();
+        cordons.insert(
+            router_acp::candidate::CandidateId::new("a", "m1"),
+            router_acp::headroom::UsageCordon {
+                reason: "Weekly usage limit reached".to_string(),
+                resets_at: std::time::SystemTime::now() + std::time::Duration::from_secs(7200),
+                resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+            },
+        );
+        shared.headroom.lock().unwrap().set_usage_cordons(cordons);
+
+        let resp = prompt_text(&cx, &sid, "continue the work").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("usage cordon") || text.contains("switched a/m1 → b/m2"),
+            "proactive switch disclosed: {text}"
+        );
+        assert!(
+            text.contains("echo:m2:"),
+            "turn must land on non-cordoned b/m2: {text}"
+        );
         Ok(())
     })
     .await;

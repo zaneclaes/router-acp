@@ -945,6 +945,13 @@ pub async fn run_delegate_task(
                 // primary sessions receive. Apply the same configured `auto`
                 // mapping explicitly so Claude/Codex delegates inherit the
                 // parent's dangerous, non-interactive permission behavior.
+                //
+                // Agents that advertise *no* session modes (Grok today — empty
+                // `available_modes`) have no permission gate to arm; requiring
+                // `auto` there hard-fails every delegate onto that seat and
+                // strands the parent when Claude/Codex are usage-cordoned.
+                // Fail closed only when the agent *does* advertise modes but
+                // none resolve to a non-interactive auto equivalent.
                 let available_modes: Vec<String> = opened
                     .modes
                     .as_ref()
@@ -955,21 +962,53 @@ pub async fn run_delegate_task(
                             .collect()
                     })
                     .unwrap_or_default();
-                match resolve_mode_id(shared, &candidate.agent, "auto", &available_modes) {
-                    Some(mode_id) => {
-                        let set = SetSessionModeRequest::new(
-                            opened.downstream_sid.clone(),
-                            mode_id.clone(),
-                        );
-                        if let Err(err) = opened.conn.send_request(set).block_task().await {
+                if available_modes.is_empty() {
+                    tracing::info!(
+                        parent = router_sid,
+                        candidate = %candidate,
+                        "delegate candidate advertises no session modes; proceeding without set_mode"
+                    );
+                } else {
+                    match resolve_mode_id(shared, &candidate.agent, "auto", &available_modes) {
+                        Some(mode_id) => {
+                            let set = SetSessionModeRequest::new(
+                                opened.downstream_sid.clone(),
+                                mode_id.clone(),
+                            );
+                            if let Err(err) = opened.conn.send_request(set).block_task().await {
+                                tracing::warn!(
+                                    parent = router_sid,
+                                    candidate = %candidate,
+                                    %err,
+                                    "delegate session mode rejected; trying the next candidate"
+                                );
+                                last_err = Some(format!(
+                                    "delegate {candidate} rejected required auto mode: {err}"
+                                ));
+                                close_downstream_session(
+                                    shared,
+                                    &opened.process_key,
+                                    &opened.downstream_sid,
+                                );
+                                continue;
+                            } else {
+                                tracing::info!(
+                                    parent = router_sid,
+                                    candidate = %candidate,
+                                    applied = mode_id,
+                                    "delegate session mode applied"
+                                );
+                            }
+                        }
+                        None => {
                             tracing::warn!(
                                 parent = router_sid,
                                 candidate = %candidate,
-                                %err,
-                                "delegate session mode rejected; trying the next candidate"
+                                ?available_modes,
+                                "delegate candidate has no required auto mode; trying the next candidate"
                             );
                             last_err = Some(format!(
-                                "delegate {candidate} rejected required auto mode: {err}"
+                                "delegate {candidate} has no configured auto mode among {available_modes:?}"
                             ));
                             close_downstream_session(
                                 shared,
@@ -977,31 +1016,7 @@ pub async fn run_delegate_task(
                                 &opened.downstream_sid,
                             );
                             continue;
-                        } else {
-                            tracing::info!(
-                                parent = router_sid,
-                                candidate = %candidate,
-                                applied = mode_id,
-                                "delegate session mode applied"
-                            );
                         }
-                    }
-                    None => {
-                        tracing::warn!(
-                            parent = router_sid,
-                            candidate = %candidate,
-                            ?available_modes,
-                            "delegate candidate has no required auto mode; trying the next candidate"
-                        );
-                        last_err = Some(format!(
-                            "delegate {candidate} has no configured auto mode among {available_modes:?}"
-                        ));
-                        close_downstream_session(
-                            shared,
-                            &opened.process_key,
-                            &opened.downstream_sid,
-                        );
-                        continue;
                     }
                 }
                 tracing::info!(

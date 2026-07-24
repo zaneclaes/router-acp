@@ -5344,6 +5344,11 @@ async fn dispatch_prompt(
     // Only when the prompt is NOT an orchestrated multi-part task: if it invokes
     // a skill, steer routing to its preferred candidates — pre-pin via
     // candidate_override, mid-session via a switch.
+    //
+    // "Already ok" requires the pin to still be *routeable*, not just glob-
+    // matching. A pin that matches `*opus*` but is usage-cordoned (plan at
+    // 100%, no overage) must fall through to the next eligible skill
+    // candidate (e.g. grok) instead of staying on the dead seat.
     if !orchestrating_now && let Some(route) = detect_skill_route(&shared.cfg, &req.prompt) {
         let (class, excluded, current) = shared
             .with_session(&router_sid, |s| {
@@ -5354,15 +5359,23 @@ async fn dispatch_prompt(
                 )
             })
             .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None));
-        let already_ok = current
-            .as_ref()
-            .map(|c| route.candidates.iter().any(|rc| candidate_matches(rc, c)))
-            .unwrap_or(false);
+        let already_ok = current.as_ref().is_some_and(|c| {
+            route.candidates.iter().any(|rc| candidate_matches(rc, c))
+                && !is_excluded(c, &excluded)
+                && shared
+                    .eligible_views(&RequiredCaps::default(), class)
+                    .iter()
+                    .any(|v| &v.id == c)
+        });
         if !already_ok {
             match first_eligible_candidate(&shared, &route.candidates, class, &excluded) {
                 Some(target) => {
                     let pattern = route.pattern.clone();
-                    if current.is_some() {
+                    // No-op if somehow already on the picked target (e.g. pin
+                    // was outside the skill set but equal by coincidence).
+                    if current.as_ref() == Some(&target) {
+                        // leave pin alone
+                    } else if current.is_some() {
                         shared.with_session(&router_sid, |s| {
                             s.pending_switch = Some(SwitchRequest {
                                 target: target.clone(),
@@ -5399,6 +5412,61 @@ async fn dispatch_prompt(
                         route.pattern, route.candidates
                     ),
                 ),
+            }
+        }
+    }
+
+    // Proactive re-route: if the pin became usage-cordoned mid-session (cap
+    // hit after the pin was chosen) and nothing else has queued a switch,
+    // move to the best still-eligible candidate before this turn runs. Without
+    // this, a long session stuck on opus at 100% keeps burning failed turns
+    // until reactive rate-limit failover kicks in.
+    {
+        let (class, excluded, current, has_pending) = shared
+            .with_session(&router_sid, |s| {
+                (
+                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                    s.excluded.clone(),
+                    s.pin.as_ref().map(|p| p.candidate.clone()),
+                    s.pending_switch.is_some() || s.escalation_requested.is_some(),
+                )
+            })
+            .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None, true));
+        if !has_pending
+            && let Some(cur) = current.as_ref()
+        {
+            let cordon = shared.headroom.lock().unwrap().usage_cordon(cur).cloned();
+            if let Some(c) = cordon {
+                // Prefer any eligible candidate (not limited to a skill class).
+                let target = first_eligible_candidate(&shared, &["*".to_string()], class, &excluded)
+                    .filter(|t| t != cur);
+                if let Some(target) = target {
+                    let reason = format!(
+                        "usage cordon: {} (resets {}) — switching off {}",
+                        c.reason, c.resets_at_rfc3339, cur
+                    );
+                    shared.with_session(&router_sid, |s| {
+                        s.pending_switch = Some(SwitchRequest {
+                            target: target.clone(),
+                            reason: reason.clone(),
+                        });
+                        // Not an elevation: this is escaping a dead seat, not
+                        // climbing the capability ladder.
+                        s.quiet_turns = 0;
+                    });
+                    notify_user(
+                        &shared,
+                        &router_sid,
+                        format!("router-acp · {reason}; next turn on {target}"),
+                    );
+                    tracing::info!(
+                        session = router_sid,
+                        from = %cur,
+                        %target,
+                        cordon = %c.reason,
+                        "proactive switch off usage-cordoned pin"
+                    );
+                }
             }
         }
     }
