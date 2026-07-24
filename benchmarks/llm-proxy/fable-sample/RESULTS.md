@@ -133,6 +133,19 @@ session-wide win on the long, routine-heavy sessions that dominate Fable spend,
 and roughly break-even on short ones. Reporting it per-tool would hide both
 effects.
 
+**Mitigation shipped (cache-reprime gate).** A single cache write cannot be made
+cheaper — Anthropic fixes it at 1.25×/2× base input — so the only lever is not
+*wasting* writes. The break-even is turn-count-driven (both the switch penalty
+and the per-turn saving scale with the prefix): ⌈(target_write − pinned_read) /
+(pinned_read − target_read)⌉, ≈ 4 turns for Fable→Sonnet, ≈ 11 for Fable→Opus.
+The router now gates the routine-demotion branch on
+`routine_streak ≥ max(routine_streak, break_even)`: a routine run too short to
+amortize the re-prime holds on the warm pinned model (`routing_event=cache-hold`)
+instead of demoting and escalating right back (thrash pays the write twice). Set
+`minimum_dwell_requests ≥ break_even` so a demotion, once taken, stays warm long
+enough to bank the read-rate savings. This converts the ~18% short-session floor
+toward the ~56% ceiling by only paying re-primes that pay for themselves.
+
 ## Expensive samples
 
 Two high-cost sessions were selected to represent the dominant implementation

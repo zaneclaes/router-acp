@@ -590,7 +590,7 @@ fn start_request_record(
             ..Default::default()
         },
     );
-    if event != "steady" && event != "pass-through" && event != "dwell" {
+    if event != "steady" && event != "pass-through" && event != "dwell" && event != "cache-hold" {
         state
             .shared
             .with_session(&active.parent_router_sid, |session| {
@@ -852,12 +852,45 @@ fn select_request_model(
             )
         } else if state.routine_streak >= shared.cfg.llm_proxy.routine_streak {
             let cheap = cheapest_model(&compatible).unwrap_or_else(|| active.candidate.clone());
-            (
-                cheap,
-                format!("routine tool-result streak {}", state.routine_streak),
-                "demotion".to_string(),
-                false,
-            )
+            // Cache-aware gate: demoting mid-session forfeits the incumbent's
+            // warm prompt cache and re-primes the prefix on the cheaper model at
+            // its (much higher) cache-write rate. Only pay that once the routine
+            // run is long enough for the per-turn read-rate savings to recoup it
+            // — otherwise a short routine blip that escalates right back is a net
+            // loss (and thrash pays the write twice). No-op when cache pricing is
+            // absent (OpenAI/Responses wire).
+            let break_even =
+                cache_reprime_break_even(shared, &active.candidate, &cheap).unwrap_or(0) as u32;
+            let required = shared.cfg.llm_proxy.routine_streak.max(break_even);
+            if cheap == active.candidate {
+                (
+                    active.candidate.clone(),
+                    "session-pinned model (no cheaper compatible candidate)".to_string(),
+                    "steady".to_string(),
+                    false,
+                )
+            } else if state.routine_streak < required {
+                (
+                    active.candidate.clone(),
+                    format!(
+                        "routine streak {} < cache re-prime break-even {} — holding the warm \
+                         pinned model (demoting to {} would not amortize its cache write)",
+                        state.routine_streak, required, cheap.model
+                    ),
+                    "cache-hold".to_string(),
+                    false,
+                )
+            } else {
+                (
+                    cheap,
+                    format!(
+                        "routine tool-result streak {} ≥ cache-amortized threshold {}",
+                        state.routine_streak, required
+                    ),
+                    "demotion".to_string(),
+                    false,
+                )
+            }
         } else {
             (
                 active.candidate.clone(),
@@ -1527,6 +1560,46 @@ fn response_difficulty(body: &[u8], status: u16) -> Option<String> {
     }
 }
 
+/// How many warm cache-read turns the cheaper model must serve before its
+/// one-time prompt-cache re-prime pays for itself. Prompt caching is keyed per
+/// model, so demoting mid-session forfeits the incumbent's warm cache: the
+/// switch turn re-primes the whole prefix on the target at its cache-WRITE rate
+/// (instead of the incumbent's cache-READ rate), and only later warm turns bank
+/// the read-rate difference. break-even ≈ (target_write − pinned_read) /
+/// (pinned_read − target_read), turns. Returns `None` when either model lacks
+/// explicit cache pricing (e.g. the OpenAI/Responses wire, where cached input is
+/// auto-discounted with no separate write cost) — the gate then does not apply,
+/// so Codex/Grok/Kimi behavior is unchanged.
+fn cache_reprime_break_even(
+    shared: &Shared,
+    pinned: &CandidateId,
+    target: &CandidateId,
+) -> Option<u64> {
+    if pinned == target {
+        return Some(0);
+    }
+    let pricing = |candidate: &CandidateId| {
+        shared
+            .cfg
+            .agents
+            .iter()
+            .find(|agent| agent.name == candidate.agent)
+            .and_then(|agent| agent.models.iter().find(|model| model.id == candidate.model))
+            .and_then(|model| model.pricing.clone())
+    };
+    let pinned = pricing(pinned)?;
+    let target = pricing(target)?;
+    let pinned_read = pinned.cache_read_per_mtok?;
+    let target_read = target.cache_read_per_mtok?;
+    let target_write = target.cache_write_per_mtok?;
+    let extra_on_switch = target_write - pinned_read;
+    let saved_per_warm_turn = pinned_read - target_read;
+    if extra_on_switch <= 0.0 || saved_per_warm_turn <= 0.0 {
+        return Some(0);
+    }
+    Some((extra_on_switch / saved_per_warm_turn).ceil() as u64)
+}
+
 fn request_cost(
     shared: &Arc<Shared>,
     candidate: &CandidateId,
@@ -1602,6 +1675,46 @@ agents:
         shared.set_models_routeable(
             &ProcessKey("mock".to_string()),
             vec!["haiku".into(), "sonnet".into(), "opus".into()],
+        );
+        (dir, shared)
+    }
+
+    /// Same harness with Anthropic-style cache pricing (Fable→Sonnet rates on
+    /// opus→haiku) so the cache re-prime gate is active.
+    fn policy_shared_priced(minimum_dwell_requests: u32) -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 1
+  minimum_dwell_requests: {minimum_dwell_requests}
+  verdict_ttl_requests: 1
+  verdict_ttl_secs: 0
+agents:
+  - name: mock
+    command: {{ type: stdio, command: mock-agent }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: MOCK_BASE_URL
+      upstream_base_url: http://127.0.0.1:9
+    models:
+      - id: haiku
+        cost_rank: 1
+        pricing: {{ input_per_mtok: 1.0, output_per_mtok: 5.0, cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 }}
+      - id: opus
+        cost_rank: 3
+        pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }}
+"#,
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("mock".to_string()),
+            vec!["haiku".into(), "opus".into()],
         );
         (dir, shared)
     }
@@ -1831,6 +1944,55 @@ agents:
         let decision = select_request_model(&shared, &active, &failed);
         assert_eq!(decision.model, "opus");
         assert_eq!(decision.event, "escalation");
+    }
+
+    #[test]
+    fn cache_reprime_break_even_matches_configured_rates() {
+        let (_d, shared) = policy_shared_priced(0);
+        // (target_write 3.75 − pinned_read 1.00) / (pinned_read 1.00 − target_read 0.30)
+        // = 2.75 / 0.70 = 3.93 → 4 warm turns.
+        assert_eq!(
+            cache_reprime_break_even(
+                &shared,
+                &CandidateId::new("mock", "opus"),
+                &CandidateId::new("mock", "haiku"),
+            ),
+            Some(4)
+        );
+        // The OpenAI-style harness has no cache pricing → gate disabled.
+        let (_d2, plain) = policy_shared(0);
+        assert_eq!(
+            cache_reprime_break_even(
+                &plain,
+                &CandidateId::new("mock", "opus"),
+                &CandidateId::new("mock", "haiku"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn demotion_waits_for_cache_reprime_break_even_then_demotes() {
+        let (_d, shared) = policy_shared_priced(0);
+        let active = active("opus");
+        let routine = json!({
+            "model": "opus",
+            "messages": [{"role":"user","content":[{
+                "type":"tool_result","content":"git status clean","status":"completed"
+            }]}]
+        });
+        // routine_streak config is 1, but the Fable-like re-prime break-even is 4:
+        // the first three routine turns hold on the warm pinned model, and only the
+        // fourth — once the run is long enough to amortize haiku's cache write —
+        // demotes.
+        for _ in 0..3 {
+            let decision = select_request_model(&shared, &active, &routine);
+            assert_eq!(decision.model, "opus");
+            assert_eq!(decision.event, "cache-hold");
+        }
+        let decision = select_request_model(&shared, &active, &routine);
+        assert_eq!(decision.model, "haiku");
+        assert_eq!(decision.event, "demotion");
     }
 
     #[test]

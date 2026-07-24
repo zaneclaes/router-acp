@@ -45,7 +45,14 @@ failover:
 llm_proxy:
   enabled: false
   listen: 127.0.0.1:0
-  routine_streak: 3
+  routine_streak: 3            # consecutive routine tool-result turns before demoting
+  # Anthropic prompt caching is per-model, so a mid-session demotion re-primes
+  # the whole prefix on the cheaper model at its cache-WRITE rate (a one-time
+  # cost). The router won't demote until the routine streak also clears the
+  # per-pair break-even (⌈(target_write−pinned_read)/(pinned_read−target_read)⌉:
+  # Fable→Sonnet ≈ 4 turns, Fable→Opus ≈ 11); below it you'll see `cache-hold`
+  # rows. To guarantee a demotion stays warm long enough to actually amortize,
+  # keep minimum_dwell_requests at/above that break-even (12 covers all pairs).
   minimum_dwell_requests: 12
   verdict_ttl_requests: 6
   verdict_ttl_secs: 900

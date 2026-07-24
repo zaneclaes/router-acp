@@ -237,13 +237,29 @@ SDK traps below, which were all discovered the hard way.
   `protocol: anthropic`) proves demotion+rewrite+accounting+fallback on the
   Anthropic wire; the demotion-target `api_model` ids (`claude-sonnet-5`,
   `claude-opus-4-8`) are valid on the subscription OAuth `/v1/messages` endpoint.
-  **Anthropic cache caveat:** prompt caching is per-model, so a mid-session
-  demotion forfeits the cache and the switch turn pays cache-*write* (12.5× the
-  read rate) to re-prime the whole prefix — per-request demotion only nets a
-  session-wide win once the demoted stretch is long enough to amortize that
-  re-prime. Report savings **session-wide** (whole-session cost delta), never as
-  the ratio on the demoted tool-use turns alone, which ignores both the
-  non-demotable turns and the re-prime cost and massively overstates.
+  **Anthropic cache caveat + the cache-reprime gate:** prompt caching is
+  per-model, so a mid-session demotion forfeits the incumbent's warm cache and
+  the switch turn pays the cheaper model's cache-*write* rate to re-prime the
+  whole prefix (instead of the incumbent's cache-*read* rate); only later warm
+  turns bank the read-rate difference. Break-even is *turn-count-driven, not
+  prefix-size-driven* (both the switch penalty and the per-turn saving scale
+  with the prefix): `cache_reprime_break_even` = ⌈(target_write − pinned_read) /
+  (pinned_read − target_read)⌉ — for Fable→Sonnet ≈ 4 turns, Fable→Opus ≈ 11.
+  So the routine-demotion branch now **gates** on
+  `routine_streak ≥ max(cfg.routine_streak, break_even)`: below it, it emits a
+  `cache-hold` (stays on the warm pinned model, no per-turn disclosure) rather
+  than demoting a short routine blip that would escalate right back and waste
+  the write (thrash pays the write twice). The gate no-ops when cache pricing is
+  absent (the OpenAI/Responses wire has no separate write cost), so
+  Codex/Grok/Kimi are unchanged. There is no way to make a single cache-write
+  cheaper (Anthropic fixes it at 1.25×/2× base input); the only lever is not
+  wasting writes — hence the gate, plus config guidance to set
+  `minimum_dwell_requests ≥ break_even` so a demotion, once taken, stays warm
+  long enough to amortize. Report savings **session-wide** (whole-session cost
+  delta), never as the ratio on the demoted tool-use turns alone, which ignores
+  the non-demotable turns AND the re-prime cost and massively overstates. Tests:
+  `cache_reprime_break_even_matches_configured_rates`,
+  `demotion_waits_for_cache_reprime_break_even_then_demotes`.
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
   least one downstream supports them and the router implements the full
   remap path.
