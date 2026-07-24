@@ -4,7 +4,7 @@ state_file: ~/.local/state/router-acp/sessions.db
 # have been verified. This moves routing from one decision per ACP turn to one
 # decision per provider inference request while preserving auth and SSE.
 llm_proxy:
-  enabled: false
+  enabled: true
   listen: 127.0.0.1:0
   routine_streak: 3
   minimum_dwell_requests: 12

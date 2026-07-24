@@ -43,7 +43,7 @@ failover:
 # Keep disabled until `api_model` values and upstream OAuth/API endpoints have
 # been verified for your installed adapters.
 llm_proxy:
-  enabled: false
+  enabled: true
   listen: 127.0.0.1:0
   routine_streak: 3            # consecutive routine tool-result turns before demoting
   # Anthropic prompt caching is per-model, so a mid-session demotion re-primes
