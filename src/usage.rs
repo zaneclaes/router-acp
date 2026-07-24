@@ -314,13 +314,15 @@ pub fn anthropic_cordons(
     };
     for lim in limits {
         let percent = lim.get("percent").and_then(Value::as_f64).unwrap_or(0.0);
-        let severity = lim.get("severity").and_then(Value::as_str).unwrap_or("");
-        let is_active = lim
-            .get("is_active")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let saturated = percent >= 100.0 || (severity == "critical" && is_active);
-        if !saturated {
+        // Saturation is TRUE exhaustion only (`percent >= 100`). The API's
+        // `is_active` merely marks the window currently metering — the running
+        // 5-hour window is `is_active` at *any* utilization — and `severity` is
+        // advisory color; neither means the cap is reached. Keying on them
+        // cordoned healthy seats: a 97%/`is_active` session window with 63%
+        // weekly headroom (and overage exhausted, so the early return above
+        // didn't fire) read as maxed and locked every candidate out — including
+        // Fable, whose binding weekly cap was nowhere near full.
+        if percent < 100.0 {
             continue;
         }
         let Some(resets_str) = lim.get("resets_at").and_then(Value::as_str) else {
@@ -503,11 +505,6 @@ pub fn anthropic_availability(
         .iter()
         .filter_map(|lim| {
             let percent = lim.get("percent").and_then(Value::as_f64)?;
-            let severity = lim.get("severity").and_then(Value::as_str).unwrap_or("");
-            let is_active = lim
-                .get("is_active")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             let scope = lim
                 .get("scope")
                 .and_then(|s| s.get("model"))
@@ -521,7 +518,9 @@ pub fn anthropic_availability(
             Some(AvailWindow {
                 percent,
                 scope,
-                saturated: percent >= 100.0 || (severity == "critical" && is_active),
+                // True exhaustion only — see `anthropic_cordons` on why
+                // `is_active`/`severity` must not gate this.
+                saturated: percent >= 100.0,
             })
         })
         .collect();
@@ -1136,6 +1135,45 @@ mod tests {
             ]
         });
         assert!(anthropic_cordons(&p, &cands(), now).is_empty());
+    }
+
+    // The reported outage: session window at 97% is `is_active` (it's the
+    // window currently metering) and severity `critical`, weekly at 63%, and
+    // overage exhausted (so the early return does NOT fire). No cap is actually
+    // reached — nothing may be cordoned, and both candidates keep full plan
+    // headroom for preference scaling. Before the fix `severity=="critical" &&
+    // is_active` marked the 97% session saturated and, being all-models scope,
+    // locked out every candidate including Fable.
+    fn near_cap_active_payload() -> Value {
+        json!({
+            "extra_usage": { "is_enabled": true, "utilization": 100.0 },
+            "spend": { "enabled": true, "percent": 100 },
+            "limits": [
+                { "kind": "session", "percent": 97, "severity": "critical",
+                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": true },
+                { "kind": "weekly_all", "percent": 63, "severity": "normal",
+                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": false }
+            ]
+        })
+    }
+
+    #[test]
+    fn active_window_below_cap_never_cordons() {
+        let now = SystemTime::now();
+        let c = anthropic_cordons(&near_cap_active_payload(), &cands(), now);
+        assert!(
+            c.is_empty(),
+            "an active/critical window below 100% is not exhaustion: {c:?}"
+        );
+    }
+
+    #[test]
+    fn active_window_below_cap_keeps_plan_headroom() {
+        let a = anthropic_availability(&near_cap_active_payload(), &cands());
+        // Binding window is the 97% session (min free across windows = 3%).
+        let f = a.get(&fable()).expect("fable has availability");
+        assert!((f.plan_headroom - 0.03).abs() < 1e-6, "{f:?}");
+        assert!(!f.on_overage, "not saturated → not flagged as paying");
     }
 
     // ---- Codex rollout ----
