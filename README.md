@@ -280,6 +280,107 @@ a data edit, not a code change. The heuristic classifier's rule tables work
 the same way ([`data/classifier.yaml`](data/classifier.yaml),
 `classifier.rules_file`).
 
+## Per-request LLM routing
+
+ACP routing normally sees one `session/prompt`; a coding agent may make
+hundreds of provider calls while executing it. The optional `llm_proxy`
+interposes those calls. router-acp binds a loopback-only HTTP listener before
+spawning adapters, replaces each configured adapter's inference base URL, and
+forwards the original method, path, application headers (including
+authorization), body, and streamed response. It requests an identity-encoded
+upstream response so usage can be accounted while streaming; only an inference
+request's top-level `model` field may change.
+
+The request policy is deliberately stateful:
+
+- begin on the ACP session's pinned candidate;
+- demote to the cheapest routeable model from the same agent after a sustained
+  streak of successful routine tool results (reads, searches, mechanical
+  edits, status/CI checks);
+- escalate immediately to that agent's highest-quality compatible model after
+  a tool failure, repeated unchanged test output, refusal, HTTP failure, or
+  token/context ceiling;
+- expire difficulty verdicts by request count and wall time; and
+- enforce a minimum dwell before ordinary switches to bound cold-cache churn.
+  Difficulty and explicit automation hints bypass dwell.
+
+Demotion is rejected when the estimated request plus requested output exceeds
+`context_window_fraction` of the target's context window. An alternate whose
+window is unknown is never selected. Cordons and quarantines also apply.
+`api_model` maps an ACP selector alias such as `opus[1m]` to the exact provider
+API model id used for rewrites.
+
+```yaml
+llm_proxy:
+  enabled: true
+  listen: 127.0.0.1:0
+  routine_streak: 3
+  minimum_dwell_requests: 12
+  verdict_ttl_requests: 6
+  verdict_ttl_secs: 900
+  context_window_fraction: 0.9
+
+agents:
+  - name: claude
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: https://api.anthropic.com
+    models:
+      - id: opus
+        api_model: claude-opus-4-6  # only if the ACP id is an API-invalid alias
+        cost_rank: 3
+      - { id: sonnet, cost_rank: 2 }
+```
+
+The explicit upstream must match the adapter's authentication mode:
+
+| Adapter/auth | Override | Upstream | Wire |
+| --- | --- | --- | --- |
+| claude-agent-acp | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic Messages |
+| codex-acp, ChatGPT OAuth | `OPENAI_BASE_URL` | `https://chatgpt.com/backend-api/codex` | OpenAI Responses |
+| codex-acp, API key | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI Responses |
+| grok, browser login | `GROK_CLI_CHAT_PROXY_BASE_URL` | `https://cli-chat-proxy.grok.com/v1` | OpenAI Chat |
+| grok, API key/custom catalog | `GROK_MODELS_BASE_URL` | `https://api.x.ai/v1` (or custom) | OpenAI Chat |
+| kimi, browser login | `KIMI_BASE_URL` | `https://api.kimi.com/coding/v1` | OpenAI Chat |
+
+This routes among models accepted by the same adapter/upstream/auth seat; it
+does not translate wire formats or credentials across providers. Future agents
+only need a base-URL environment variable, an explicit upstream, and either
+the `anthropic` or `openai` wire setting.
+
+Attribution is exact for `spawn-config` processes and for a process with one
+active ACP prompt. If a shared `config-option` process serves concurrent
+prompts, an adapter session marker (`prompt_cache_key`, `session_id`, or
+equivalent) resolves the owner; otherwise the request passes through unchanged
+rather than risking a cross-session rewrite. Invalid JSON, non-inference
+endpoints, ambiguous traffic, or listener bind failure likewise degrade to
+transparent ACP-turn routing.
+
+Relay-generated automation can bypass the routine streak by attaching this to
+the ACP prompt:
+
+```json
+{"_meta":{"router_acp":{"request_hint":"ci-poll"}}}
+```
+
+Accepted hints are `ci-poll`, `ship-nudge`, and `automation`.
+
+Every attributed call is written to `llm_requests`, including pinned and
+selected model, reason/event, endpoint, latency, HTTP status, exact usage,
+cache read/write tokens, and API-equivalent cost. `tool_calls` tracks tool
+lifecycle and the `active_tool_calls` view exposes the model currently serving
+in-flight tools:
+
+```sql
+SELECT router_session_id, tool_call_id, title, model, started_at
+FROM active_tool_calls;
+
+SELECT model, routing_event, count(*) AS requests, sum(cost_usd) AS cost
+FROM llm_requests
+GROUP BY model, routing_event;
+```
+
 ## Prompt routing directives
 
 Recipes and scripts (or any client that can't set ACP session config
@@ -508,13 +609,13 @@ Logging goes to stderr (stdout carries the protocol): `RUST_LOG=router_acp=debug
 
 ## Configuration reference
 
-See [`examples/router.yaml`](examples/router.yaml) for a complete annotated
+See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete annotated
 example.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `router` | `auto` | Default strategy: `auto`, `pareto-code`, `escalation`, `static`. |
-| `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` table: one row per router session (pin, cwd, title, routing decision + weights, `parent_session_id` for delegated sub-agents, `prior_session_id` (the downstream session bound before a mid-session model switch), `kind`, `run_label`, token/context counters). `session_log` table: every ACP interaction (user prompt, model response, tool call, permission/fs/terminal callback) with token counts. A legacy `sessions.json` beside it is imported once. Inspect with `router-acp sessions --config …`. |
+| `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` records pins, lineage, token/context totals, and per-request aggregate cost/count. `session_log` records ACP and proxy events. `llm_requests` records each attributed provider request's model, policy event, latency, exact/cache tokens, and cost. `tool_calls` plus `active_tool_calls` expose tool/model lifecycle. A legacy `sessions.json` beside it is imported once. |
 | `history` | `30d` | How long to keep sessions before auto-pruning (and their logs, by cascade). Duration string: `30d`, `12h`, `90m`, `3600s`, or a bare number of days. Pruned on open and after each write. |
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
@@ -536,6 +637,14 @@ example.
 | `availability_preference.overage_penalty` | `0.25` | Utility penalty for a candidate whose seat is past its plan cap and burning paid overage. Same additive scale as `agents[].preference`. |
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
+| `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
+| `llm_proxy.listen` | `127.0.0.1:0` | Loopback listener; port `0` selects a free port. Non-loopback addresses are rejected because provider credentials pass through it. |
+| `llm_proxy.routine_streak` | `3` | Consecutive successful routine tool-result requests required before demotion. |
+| `llm_proxy.minimum_dwell_requests` | `12` | Requests a selected model serves before an ordinary switch; difficulty and automation bypass it. |
+| `llm_proxy.verdict_ttl_requests` / `verdict_ttl_secs` | `6` / `900` | Request-count and wall-clock expiry for a difficulty escalation verdict; `0` disables that expiry dimension. |
+| `llm_proxy.context_window_fraction` | `0.9` | Maximum fraction of an alternate model's known context window that an estimated request may occupy. |
+| `llm_proxy.max_request_bytes` / `max_capture_bytes` | `32 MiB` / `4 MiB` | Request buffering limit and head/tail response capture limit. Responses still stream in full. |
+| `agents[].llm_proxy` | – | Adapter interposition: `protocol` (`anthropic` or `openai`), `base_url_env`, and the real `upstream_base_url`. |
 | `failover.enabled` | `true` | Fail a pinned session over to the next best candidate on limit/outage (only before any output streamed this turn). |
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |
@@ -554,7 +663,7 @@ example.
 | `agents[].command` | – | `type: stdio` command/args/env for the adapter. `${VAR}` in the whole file interpolates from the environment (unknown names are left intact). |
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
-| `agents[].models[]` | – | `id` (must exactly match the downstream selector's value for `config-option`), optional `display_name`, `cost_rank` (1 = cheapest/least scarce). |
+| `agents[].models[]` | – | `id` (must exactly match the downstream selector's value for `config-option`), optional `display_name`, `api_model` (provider model id for proxy rewrites; defaults to `id`), `cost_rank` (1 = cheapest/least scarce), and optional API-equivalent `pricing`. |
 | `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). |
 | `agents[].lineage` | agent name | Model-company tag (e.g. `anthropic`, `openai`). Orchestration's cross-lineage review requires the reviewer's lineage to differ from the planner's — the intent is a different **company** with different failure modes — so two agents backed by the same vendor should declare the same `lineage`. |
 | `agents[].preference` | `0` | Additive utility tie-break for this agent (`auto`) and within-tier tie-break (`pareto-code`). Keep small, e.g. `0.05`. Scaled dynamically by seat availability unless `availability_preference.enabled: false`. |

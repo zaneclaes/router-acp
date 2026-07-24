@@ -35,6 +35,29 @@ failover:
   respawn_cooldown_secs: 30
   max_attempts: 3
 
+# Per-LLM-request routing. When enabled, router-acp binds one loopback HTTP
+# listener and injects each configured adapter's base-URL override. It keeps
+# auth and request/response bodies intact except for the top-level `model`,
+# streams responses, starts from the ACP-pinned model, demotes after a routine
+# streak, and immediately escalates on failures/stagnation/token ceilings.
+# Keep disabled until `api_model` values and upstream OAuth/API endpoints have
+# been verified for your installed adapters.
+llm_proxy:
+  enabled: false
+  listen: 127.0.0.1:0
+  routine_streak: 3            # consecutive routine tool-result turns before demoting
+  # Anthropic prompt caching is per-model, so a mid-session demotion re-primes
+  # the whole prefix on the cheaper model at its cache-WRITE rate (a one-time
+  # cost). The router won't demote until the routine streak also clears the
+  # per-pair break-even (⌈(target_write−pinned_read)/(pinned_read−target_read)⌉:
+  # Fable→Sonnet ≈ 4 turns, Fable→Opus ≈ 11); below it you'll see `cache-hold`
+  # rows. To guarantee a demotion stays warm long enough to actually amortize,
+  # keep minimum_dwell_requests at/above that break-even (12 covers all pairs).
+  minimum_dwell_requests: 12
+  verdict_ttl_requests: 6
+  verdict_ttl_secs: 900
+  context_window_fraction: 0.9
+
 # Proactive usage-cap cordoning. On top of the reactive (error-driven) cordons
 # above, poll each agent's provider usage API and mark a candidate unroutable
 # BEFORE it's tried when its cap is exhausted with no overage/credit headroom.
@@ -107,18 +130,33 @@ agents:
     budget_prompts_5h: 400
     usage_source:               # proactive cordons from the Anthropic usage API
       type: anthropic-oauth     # (reads the CLI OAuth token; see `cordon` above)
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: https://api.anthropic.com
     mode_map: { auto: bypassPermissions, approve: default, chat: plan }
     preference: 0.1             # prefer this agent when candidates are
                                 # otherwise comparable (bigger seat/plan)
     models:
       # ids must exactly match the downstream model selector's values;
       # run with RUST_LOG=router_acp=debug to see what the adapter offers.
+      # `api_model` is what the proxy writes into the /v1/messages body when it
+      # demotes — it must be a real Anthropic model id (the ACP `id` above is
+      # only a selector alias). These three are verified valid on the Claude
+      # Code subscription OAuth endpoint. Include cache_read/cache_write pricing:
+      # on the Anthropic wire a mid-session demotion forfeits the per-model
+      # prompt cache and re-primes the prefix at cache_write on the switch turn,
+      # so accurate cache pricing is what keeps session-wide savings honest.
       - id: sonnet
         display_name: Claude Sonnet
+        api_model: claude-sonnet-5
         cost_rank: 2            # 1 = cheapest/least scarce
+        pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00, cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 }
       - id: opus
         display_name: Claude Opus
+        api_model: claude-opus-4-8
         cost_rank: 3
+        pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }
 
   - name: codex
     command:
@@ -135,6 +173,12 @@ agents:
     budget_prompts_5h: 400
     usage_source:               # proactive cordons from Codex's on-disk snapshot
       type: codex-rollout       # (no pollable endpoint; last-known + reactive backstop)
+    # ChatGPT OAuth endpoint. For API-key auth use
+    # `upstream_base_url: https://api.openai.com/v1`.
+    llm_proxy:
+      protocol: openai
+      base_url_env: OPENAI_BASE_URL
+      upstream_base_url: https://chatgpt.com/backend-api/codex
     mode_map: { auto: full-access, approve: auto, chat: read-only }
     models:
       - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
@@ -158,6 +202,12 @@ agents:
       args: ["agent"]
     lineage: xai
     budget_prompts_5h: 400
+    # Browser-login/OAuth endpoint. With XAI_API_KEY use GROK_MODELS_BASE_URL
+    # and https://api.x.ai/v1 instead.
+    llm_proxy:
+      protocol: openai
+      base_url_env: GROK_CLI_CHAT_PROXY_BASE_URL
+      upstream_base_url: https://cli-chat-proxy.grok.com/v1
     model_selection:
       type: spawn-config              # model fixed per process via --model
       process_template:
@@ -178,6 +228,10 @@ agents:
       command: kimi
     lineage: moonshot
     budget_prompts_5h: 400
+    llm_proxy:
+      protocol: openai
+      base_url_env: KIMI_BASE_URL
+      upstream_base_url: https://api.kimi.com/coding/v1
     model_selection:
       type: spawn-config              # model fixed per process via --model
       process_template:

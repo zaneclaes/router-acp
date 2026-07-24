@@ -228,6 +228,18 @@ pub struct RouterSession {
     /// Ticket ids already injected into this session's context (a re-mention
     /// doesn't re-inject the same ticket).
     pub injected_tickets: HashSet<String>,
+    /// Why the current pin is *elevated* above what plain routing would pick
+    /// ("escalation", "auto-upgrade", "skill `ship-pr`"), or `None` for an
+    /// un-elevated pin. Explicit user picks never set this. Demotion
+    /// (`demotion.after_quiet_turns`) only ever expires elevated pins.
+    pub elevation: Option<String>,
+    /// Consecutive turns without struggle signals since the last elevation —
+    /// the demotion clock (reset by any struggle).
+    pub quiet_turns: u32,
+    /// True once the downstream adapter reported real cost via
+    /// `usage_update.cost` — turn-end pricing synthesis then stays out of
+    /// the way (synthesized and reported figures must not mix).
+    pub saw_adapter_cost: bool,
 }
 
 /// A requested mid-session model switch and why.
@@ -283,6 +295,9 @@ impl RouterSession {
             pending_orchestration: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
+            elevation: None,
+            quiet_turns: 0,
+            saw_adapter_cost: false,
         }
     }
 
@@ -325,6 +340,9 @@ impl RouterSession {
             pending_orchestration: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
+            elevation: None,
+            quiet_turns: 0,
+            saw_adapter_cost: false,
         }
     }
 }
@@ -336,6 +354,7 @@ pub struct Shared {
     pub scores: ScoreTable,
     pub rules: ClassifierRules,
     pub state: Mutex<StateFile>,
+    pub llm_proxy: Arc<crate::llm_proxy::LlmProxyRuntime>,
     pub headroom: Mutex<HeadroomTracker>,
     pub sessions: Mutex<HashMap<String, RouterSession>>,
     pub targets: Mutex<HashMap<ProcessKey, TargetRuntime>>,
@@ -385,6 +404,8 @@ impl Shared {
         let state = StateFile::load(&cfg.state_file, cfg.retention());
 
         let specs = build_targets(&cfg);
+        let llm_proxy = crate::llm_proxy::LlmProxyRuntime::new(&cfg, &specs)
+            .map_err(|e| AcpError::invalid_params().data(e))?;
         let mut targets = HashMap::new();
         let mut candidates = Vec::new();
         let mut config_index = 0usize;
@@ -433,6 +454,7 @@ impl Shared {
             scores,
             rules,
             state: Mutex::new(state),
+            llm_proxy,
             headroom: Mutex::new(headroom),
             sessions: Mutex::new(HashMap::new()),
             targets: Mutex::new(targets),
@@ -915,13 +937,36 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         .unwrap_or("");
     let entry = match kind {
         "tool_call" | "tool_call_update" => {
+            let tool_call_id = update
+                .get("toolCallId")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             let title = update
                 .get("title")
                 .and_then(|t| t.as_str())
-                .or_else(|| update.get("toolCallId").and_then(|t| t.as_str()))
+                .or_else(|| (!tool_call_id.is_empty()).then_some(tool_call_id))
                 .unwrap_or("tool")
                 .to_string();
-            let status = update.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let status = update
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("running");
+            let persisted = shared.state.lock().unwrap().get(router_sid);
+            let model = persisted.map(|session| {
+                let selected = shared
+                    .llm_proxy
+                    .current_model(router_sid)
+                    .unwrap_or(session.model);
+                format!("{}/{selected}", session.agent)
+            });
+            shared.state.lock().unwrap().record_tool_call(
+                router_sid,
+                tool_call_id,
+                &title,
+                status,
+                model.as_deref(),
+                update,
+            );
             Some(crate::state::LogEntry {
                 kind: "tool_call".to_string(),
                 role: "tool".to_string(),
@@ -932,21 +977,29 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
                 },
                 detail: Some(update.clone()),
                 tokens_estimated: true,
+                model,
                 ..Default::default()
             })
         }
         "usage_update" => {
-            let st = shared.state.lock().unwrap();
-            if let Some(used) = update.get("used").and_then(|u| u.as_u64()) {
-                st.set_context_used(router_sid, used);
-            }
+            let used = update.get("used").and_then(|u| u.as_u64());
             // The adapter reports authoritative cumulative cost in USD — capture
             // it instead of relying on text-estimated tokens.
-            if let Some(cost) = update
+            let cost = update
                 .get("cost")
                 .and_then(|c| c.get("amount"))
-                .and_then(|a| a.as_f64())
-            {
+                .and_then(|a| a.as_f64());
+            if cost.is_some() {
+                // Remember that this adapter reports real cost, so turn-end
+                // pricing synthesis stays out of the way. (Sessions lock taken
+                // before the state lock, never while holding it.)
+                shared.with_session(router_sid, |s| s.saw_adapter_cost = true);
+            }
+            let st = shared.state.lock().unwrap();
+            if let Some(used) = used {
+                st.set_context_used(router_sid, used);
+            }
+            if let Some(cost) = cost {
                 st.set_cost_usd(router_sid, cost);
             }
             None
@@ -2161,16 +2214,78 @@ pub fn queue_notice(shared: &Arc<Shared>, router_sid: &str, lines: Vec<String>) 
     shared.with_session(router_sid, |s| s.pending_disclosure.extend(lines));
 }
 
-/// Derive `(input, output, estimated)` token counts for a completed turn.
-/// Uses the downstream's reported `usage` when present (the
-/// `unstable_end_turn_token_usage` ACP capability); otherwise estimates the
-/// output from the collected text (input unknown → 0, flagged estimated).
-pub fn turn_tokens(resp: &PromptResponse, output_text: &str) -> (u64, u64, bool) {
+/// Token usage for one completed turn.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnUsage {
+    pub input: u64,
+    pub output: u64,
+    /// Cache-read / cache-write tokens (0 when the adapter doesn't report
+    /// them). Cache reads dominate the real cost of long sessions.
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// True when counts are estimated from text (protocol gave none).
+    pub estimated: bool,
+}
+
+/// Derive token counts for a completed turn. Uses the downstream's reported
+/// `usage` when present (the `unstable_end_turn_token_usage` ACP capability);
+/// otherwise estimates the output from the collected text (input unknown →
+/// 0, flagged estimated).
+pub fn turn_tokens(resp: &PromptResponse, output_text: &str) -> TurnUsage {
     if let Some(usage) = &resp.usage {
-        (usage.input_tokens, usage.output_tokens, false)
+        TurnUsage {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cached_read_tokens.unwrap_or(0),
+            cache_write: usage.cached_write_tokens.unwrap_or(0),
+            estimated: false,
+        }
     } else {
-        (0, crate::state::estimate_tokens(output_text), true)
+        TurnUsage {
+            output: crate::state::estimate_tokens(output_text),
+            estimated: true,
+            ..Default::default()
+        }
     }
+}
+
+/// Configured API-equivalent pricing for a candidate's model, if any.
+fn model_pricing<'a>(
+    cfg: &'a crate::config::Config,
+    candidate: &CandidateId,
+) -> Option<&'a crate::config::PricingConfig> {
+    cfg.agents
+        .iter()
+        .find(|a| a.name == candidate.agent)?
+        .models
+        .iter()
+        .find(|m| m.id == candidate.model)?
+        .pricing
+        .as_ref()
+}
+
+/// Synthesize the USD cost of one turn from configured `pricing`. `None`
+/// when no pricing is configured for the model, or when the counts are
+/// text-estimates (garbage in, garbage out). Cache rates default to the
+/// common provider discounts (reads 0.1×, writes 1.25× the input rate).
+pub(crate) fn synth_turn_cost(
+    cfg: &crate::config::Config,
+    candidate: &CandidateId,
+    usage: &TurnUsage,
+) -> Option<f64> {
+    if usage.estimated {
+        return None;
+    }
+    let p = model_pricing(cfg, candidate)?;
+    let cache_read = p.cache_read_per_mtok.unwrap_or(p.input_per_mtok * 0.1);
+    let cache_write = p.cache_write_per_mtok.unwrap_or(p.input_per_mtok * 1.25);
+    Some(
+        (usage.input as f64 * p.input_per_mtok
+            + usage.output as f64 * p.output_per_mtok
+            + usage.cache_read as f64 * cache_read
+            + usage.cache_write as f64 * cache_write)
+            / 1_000_000.0,
+    )
 }
 
 /// Emit the queued router disclosure as a trailing `agent_message_chunk`
@@ -2925,6 +3040,23 @@ async fn send_prompt_with_failover(
             .unwrap()
             .record_prompt(&candidate.agent);
         let fwd = PromptRequest::new(down_sid.clone(), effective_prompt).meta(req.meta.clone());
+        let process_key = shared
+            .candidate_runtime(&candidate)
+            .map(|runtime| runtime.process_key)
+            .unwrap_or_else(|| ProcessKey(candidate.agent.clone()));
+        let class = shared
+            .with_session(&router_sid, |session| session.task_class)
+            .flatten()
+            .unwrap_or(TaskClass::CodingGeneral);
+        let _llm_turn = shared.llm_proxy.begin_turn(
+            process_key,
+            router_sid.clone(),
+            router_sid.clone(),
+            down_sid.clone(),
+            candidate.clone(),
+            class,
+            req.meta.as_ref(),
+        );
         let sent = conn
             .send_request(fwd)
             .forward_cancellation_from(responder.cancellation());
@@ -2945,7 +3077,11 @@ async fn send_prompt_with_failover(
             .with_session(&router_sid, |s| s.escalation_requested.take())
             .flatten()
         {
-            shared.with_session(&router_sid, |s| s.escalations_done += 1);
+            shared.with_session(&router_sid, |s| {
+                s.escalations_done += 1;
+                s.elevation = Some("escalation".to_string());
+                s.quiet_turns = 0;
+            });
             match switch_pin(&shared, &router_sid, &esc.target, &esc.reason).await {
                 Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
                 Ok(_) => {}
@@ -2970,7 +3106,7 @@ async fn send_prompt_with_failover(
                 let output = shared
                     .with_session(&router_sid, |s| s.turn_output.clone())
                     .unwrap_or_default();
-                let (ti, to, est) = turn_tokens(&resp, &output);
+                let tu = turn_tokens(&resp, &output);
                 shared.state.lock().unwrap().log(
                     &router_sid,
                     &crate::state::LogEntry {
@@ -2980,11 +3116,30 @@ async fn send_prompt_with_failover(
                         detail: Some(
                             serde_json::json!({"stop_reason": format!("{:?}", resp.stop_reason)}),
                         ),
-                        tokens_input: ti,
-                        tokens_output: to,
-                        tokens_estimated: est,
+                        tokens_input: tu.input,
+                        tokens_output: tu.output,
+                        tokens_cache_read: tu.cache_read,
+                        tokens_cache_write: tu.cache_write,
+                        tokens_estimated: tu.estimated,
+                        model: Some(candidate.to_string()),
                     },
                 );
+                // Synthesize cost for adapters that report none of their own
+                // (only claude reports `usage_update.cost`; codex/grok/kimi
+                // sessions otherwise record 0 forever).
+                let saw_cost = shared
+                    .with_session(&router_sid, |s| s.saw_adapter_cost)
+                    .unwrap_or(false);
+                if !saw_cost
+                    && let Some(delta) = synth_turn_cost(&shared.cfg, &candidate, &tu)
+                    && delta > 0.0
+                {
+                    shared
+                        .state
+                        .lock()
+                        .unwrap()
+                        .add_estimated_cost(&router_sid, delta);
+                }
                 // Update the session's confidence from how this turn went and,
                 // if it has fallen below the configured threshold, queue an
                 // auto-upgrade to a more capable model for the next prompt.
@@ -3693,6 +3848,91 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
         .map(|v| v.id)
 }
 
+/// The strongest eligible candidate strictly cheaper than the current pin —
+/// the demotion target. Guarded so the landing spot won't immediately
+/// re-trigger an auto-upgrade: when auto-upgrade is enabled, the target's
+/// quality (minus current struggle) must clear the upgrade threshold.
+fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
+    let (class, current, excluded, struggle, strategy) = shared.with_session(router_sid, |s| {
+        (
+            s.task_class.unwrap_or(TaskClass::CodingGeneral),
+            s.pin.as_ref().map(|p| p.candidate.clone()),
+            s.excluded.clone(),
+            s.struggle,
+            s.strategy,
+        )
+    })?;
+    let current = current?;
+    let current_cost = shared.candidate_runtime(&current).map(|c| c.cost_rank)?;
+    let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
+    pool.retain(|v| {
+        v.id != current && !is_excluded(&v.id, &excluded) && v.cost_rank < current_cost
+    });
+    // Escalation sessions re-escalate only on fresh struggle signals, so a
+    // quiet-turn demotion can't ping-pong there; the threshold guard applies
+    // only where the confidence-based auto-upgrade could immediately undo
+    // the demotion.
+    if shared.cfg.auto_upgrade.enabled && strategy != StrategyKind::Escalation {
+        let threshold = shared.cfg.auto_upgrade.confidence_threshold;
+        pool.retain(|v| v.quality - struggle >= threshold);
+    }
+    pool.into_iter()
+        .max_by(|a, b| {
+            a.quality
+                .partial_cmp(&b.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|v| v.id)
+}
+
+/// Expire an elevated pin (escalation / auto-upgrade / skill pin) after the
+/// configured run of quiet turns: queue a switch down to the strongest
+/// cheaper candidate — the counterpart of escalation, so one hard patch (or
+/// one ship-skill turn) doesn't pin a long session to frontier pricing
+/// forever. Explicit user picks never set `elevation`, so they are never
+/// demoted; re-escalation on fresh difficulty still applies (bounded by
+/// `max_escalations`).
+fn maybe_demote(shared: &Arc<Shared>, router_sid: &str) {
+    let quiet_needed = shared.cfg.demotion.after_quiet_turns;
+    if quiet_needed == 0 {
+        return;
+    }
+    let ready = shared
+        .with_session(router_sid, |s| {
+            s.pin.is_some()
+                && s.pending_switch.is_none()
+                && s.escalation_requested.is_none()
+                && s.elevation.is_some()
+                && s.quiet_turns >= quiet_needed
+        })
+        .unwrap_or(false);
+    if !ready {
+        return;
+    }
+    let Some(target) = demotion_target(shared, router_sid) else {
+        return;
+    };
+    let cause = shared
+        .with_session(router_sid, |s| s.elevation.clone())
+        .flatten()
+        .unwrap_or_else(|| "elevation".to_string());
+    let reason = format!("demotion: {quiet_needed} quiet turns since {cause} — verdict expired");
+    shared.with_session(router_sid, |s| {
+        s.pending_switch = Some(SwitchRequest {
+            target: target.clone(),
+            reason: reason.clone(),
+        });
+        s.elevation = None;
+        s.quiet_turns = 0;
+    });
+    notify_user(
+        shared,
+        router_sid,
+        format!("router-acp · demoting to {target} for the next turn — {reason}"),
+    );
+    tracing::info!(session = router_sid, %target, reason, "demotion queued (verdict expired)");
+}
+
 /// After a turn, fold its outcome into the session's `struggle` score and, if
 /// auto-upgrade is enabled and confidence has dropped below the configured
 /// threshold, queue a switch to the best more-capable candidate for the next
@@ -3715,11 +3955,25 @@ fn update_confidence_and_maybe_upgrade(
     if tool_failures >= 3 {
         delta += 0.2;
     }
-    if delta > 0.0 {
-        shared.with_session(router_sid, |s| {
+    let struggled = delta > 0.0 || tool_failures > 0;
+    shared.with_session(router_sid, |s| {
+        if delta > 0.0 {
             s.struggle = (s.struggle + delta).min(1.0);
-        });
-    }
+        }
+        // Quiet-turn bookkeeping for demotion: an elevated pin expires after
+        // enough turns without struggle signals. Struggle itself decays on
+        // quiet turns, so one hard patch stops holding confidence down (and
+        // re-triggering upgrades) long after the work turned routine.
+        if s.elevation.is_some() {
+            if struggled {
+                s.quiet_turns = 0;
+            } else {
+                s.quiet_turns += 1;
+                s.struggle = (s.struggle - 0.05).max(0.0);
+            }
+        }
+    });
+    maybe_demote(shared, router_sid);
 
     // The `escalation` router uses its own post-turn triggers instead of the
     // confidence-threshold auto-upgrade.
@@ -3756,6 +4010,8 @@ fn update_confidence_and_maybe_upgrade(
                     "auto-upgrade: confidence {confidence:.2} below threshold {threshold:.2}"
                 ),
             });
+            s.elevation = Some("auto-upgrade".to_string());
+            s.quiet_turns = 0;
         });
         notify_user(
             shared,
@@ -3818,6 +4074,8 @@ fn escalation_post_turn(
             reason: reason.clone(),
         });
         s.escalations_done += 1;
+        s.elevation = Some("escalation".to_string());
+        s.quiet_turns = 0;
     });
     notify_user(
         shared,
@@ -3971,6 +4229,19 @@ async fn switch_pin(
         let summary_prompt = PromptRequest::new(
             old_down_sid.clone(),
             vec![ContentBlock::from(HANDOFF_SUMMARY_INSTRUCTION.to_string())],
+        );
+        let class = shared
+            .with_session(router_sid, |session| session.task_class)
+            .flatten()
+            .unwrap_or(TaskClass::CodingGeneral);
+        let _llm_turn = shared.llm_proxy.begin_turn(
+            old_process_key.clone(),
+            router_sid.to_string(),
+            router_sid.to_string(),
+            old_down_sid.clone(),
+            old_candidate.clone(),
+            class,
+            None,
         );
         let result = conn.send_request(summary_prompt).block_task().await;
         shared.with_session(router_sid, |s| s.capturing_summary = None);
@@ -4181,6 +4452,15 @@ async fn handle_meta_prompt(
         {
             Ok(opened) => {
                 let fwd = PromptRequest::new(opened.downstream_sid.clone(), req.prompt.clone());
+                let _llm_turn = shared.llm_proxy.begin_turn(
+                    opened.process_key.clone(),
+                    router_sid.clone(),
+                    router_sid.clone(),
+                    opened.downstream_sid.clone(),
+                    view.id.clone(),
+                    TaskClass::Writing,
+                    req.meta.as_ref(),
+                );
                 let result = opened.conn.send_request(fwd).block_task().await;
                 close_downstream_session(&shared, &opened.process_key, &opened.downstream_sid);
                 tracing::debug!(
@@ -4337,6 +4617,21 @@ pub async fn serve_shared(
     shared: Arc<Shared>,
     transport: impl ConnectTo<AgentPeer> + 'static,
 ) -> Result<(), AcpError> {
+    // Bind before downstream adapters spawn so their base-URL environment can
+    // point at the actual ephemeral port. Failure is transparent: no env is
+    // changed and ACP-turn routing continues.
+    let llm_proxy_task = if shared.llm_proxy.enabled() {
+        match shared.llm_proxy.bind(shared.clone()).await {
+            Ok(task) => Some(task),
+            Err(err) => {
+                tracing::warn!(%err, "per-request LLM proxy disabled; using adapter upstreams");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Delegate MCP listener (Unix socket) runs independently of the ACP
     // connection; aborted when serve returns.
     let listener_task = if shared.cfg.delegation.enabled {
@@ -4361,6 +4656,9 @@ pub async fn serve_shared(
         task.abort();
     }
     if let Some(task) = usage_task {
+        task.abort();
+    }
+    if let Some(task) = llm_proxy_task {
         task.abort();
     }
     result
@@ -5072,11 +5370,15 @@ async fn dispatch_prompt(
                                     "skill `{pattern}` requires a {target}-class model"
                                 ),
                             });
+                            s.elevation = Some(format!("skill `{pattern}`"));
+                            s.quiet_turns = 0;
                         });
                         tracing::info!(session = router_sid, skill = %pattern, %target, "skill switch queued");
                     } else {
                         shared.with_session(&router_sid, |s| {
                             s.candidate_override = Some(target.clone());
+                            s.elevation = Some(format!("skill `{pattern}`"));
+                            s.quiet_turns = 0;
                         });
                         notify_user(
                             &shared,
@@ -5279,12 +5581,14 @@ mod xai_gate_tests {
     #[test]
     fn open_gate_is_routable() {
         // The normal frame grok emits at session start: access allowed.
-        assert!(xai_gate_reason(&json!({
-            "allow_access": true,
-            "gate_message": null,
-            "subscription_tier_display": "Free"
-        }))
-        .is_none());
+        assert!(
+            xai_gate_reason(&json!({
+                "allow_access": true,
+                "gate_message": null,
+                "subscription_tier_display": "Free"
+            }))
+            .is_none()
+        );
         // Absent fields (a settings frame that isn't about access) → routable.
         assert!(xai_gate_reason(&json!({"show_resolved_model": false})).is_none());
         // Empty gate message with allow true → routable.
@@ -5302,7 +5606,10 @@ mod xai_gate_tests {
             "gate_message": "You've reached your Grok usage limit. Upgrade to continue."
         }))
         .unwrap();
-        assert!(r.starts_with("xAI subscription gate: You've reached"), "{r}");
+        assert!(
+            r.starts_with("xAI subscription gate: You've reached"),
+            "{r}"
+        );
         // A gate_message alone (allow_access absent) still closes the gate.
         let r = xai_gate_reason(&json!({"gate_message": "rate limited"})).unwrap();
         assert!(r.contains("rate limited"), "{r}");

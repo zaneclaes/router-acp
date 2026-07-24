@@ -1,0 +1,13 @@
+name: deploy-production
+jobs:
+  backend:
+    uses: ./workflows/deploy-backend.yml
+  database:
+    uses: ./workflows/deploy-database.yml
+    needs: backend
+  frontend:
+    uses: ./workflows/deploy-frontend.yml
+    needs: backend
+  alerts:
+    uses: ./workflows/deploy-alerts.yml
+    needs: backend

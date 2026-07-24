@@ -148,6 +148,7 @@ candidates:
   - pattern: "*mini*"
     coding_tier: medium
     coding_percentile: 0.45
+    context_window: 400000
     default_quality: 0.5
     quality:
       UiTweak: 0.65

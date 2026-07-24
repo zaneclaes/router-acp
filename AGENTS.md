@@ -41,6 +41,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
 | `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl** with the token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (reads Codex's own on-disk rate-limit snapshots from `~/.codex/sessions/**/rollout-*.jsonl`, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. Also computes graded **seat availability** for dynamic preference scaling (`anthropic_availability`/`codex_availability`/`availability_from_windows`) and ingests client hints (`apply_availability_hint`, ext notification `router-acp/availability_hint`, consumed session-less in `on_catch_all`). `spawn_usage_poller` (interval loop, fails open, installs cordons + availability) |
+| `src/llm_proxy.rs` | optional loopback provider proxy: process base-URL injection, Anthropic Messages + OpenAI Responses/Chat forwarding, auth/SSE pass-through, per-active-prompt attribution, same-agent request policy (routine demotion, difficulty/stagnation escalation, verdict expiry, dwell, context guards), request disclosure, usage/cache/cost capture |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
@@ -198,6 +199,67 @@ SDK traps below, which were all discovered the hard way.
   (`[{candidate,plan_headroom,on_overage,source}]`) on the pin metadata.
   Tests: `usage::tests` (availability + hints), `headroom::tests`
   (hint TTL/fallback), `auto::tests::overage_penalty_prefers_the_free_seat`.
+- **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by
+  default): bind the loopback listener before spawning adapters, then inject
+  their process-level base URL. Forward auth, paths, query strings, and SSE;
+  normalize upstream `Accept-Encoding` to `identity` so usage can be accounted;
+  only rewrite the inference body's top-level `model`. `models[].
+  api_model` maps ACP aliases to provider ids. Request routing stays within the
+  same agent/auth/wire: routine streak → cheapest compatible candidate;
+  failure/stagnation/refusal/token ceiling → strongest compatible candidate;
+  verdict expiry + minimum dwell bound frontier/cache residence; known context
+  windows, cordons, and quarantines constrain alternates. Register EVERY
+  downstream `session/prompt` path with `LlmProxyRuntime::begin_turn`.
+  Process-scoped base URLs make attribution ambiguous when one config-option
+  process serves concurrent prompts: use adapter session hints when present,
+  otherwise pass through unchanged. Listener bind failure leaves environments
+  untouched. Provider calls live in `llm_requests`; in-flight tools and their
+  selected model live in the `active_tool_calls` SQLite view.
+  **LESSON (cross-provider, shipped bug):** routine/difficulty detection in
+  `inspect_request` originally scanned only the **last 24 KB of the serialized
+  request**. That worked for Codex's Responses shape but silently defeated the
+  policy for **Claude/Anthropic**: an Anthropic `/v1/messages` request carries a
+  large `system` + `tools` prelude and the *entire* conversation history in
+  `messages`, so the current turn's `tool_result` routinely falls outside any
+  fixed tail — `has_tool_result`/`routine_tool` read false and NOTHING ever
+  demoted (every request logged `routing_event=steady`; confirmed live — a
+  Fable-pinned goose session produced 8 real `/v1/messages` rows, all steady,
+  never demoting despite routine reads). Fix: `latest_tool_context` walks the
+  body structurally (like `test_fingerprint`) for the most-recent tool-result
+  content + the invoking tool name, and difficulty is scoped to that latest
+  block (a stale historical `is_error` no longer pins escalation forever now
+  that the whole history is resent each turn). Regressions:
+  `routine_detection_survives_large_anthropic_tools_prelude` (asserts the
+  tool_result is NOT in the 24 KB tail yet still reads routine),
+  `routine_detection_uses_tool_name_when_output_has_no_marker`,
+  `stale_history_failure_does_not_pin_difficulty_on_the_current_turn`. The
+  mock-driven end-to-end test (`proxy_streams_rewrites_preserves_auth_and_accounts_requests`,
+  `protocol: anthropic`) proves demotion+rewrite+accounting+fallback on the
+  Anthropic wire; the demotion-target `api_model` ids (`claude-sonnet-5`,
+  `claude-opus-4-8`) are valid on the subscription OAuth `/v1/messages` endpoint.
+  **Anthropic cache caveat + the cache-reprime gate:** prompt caching is
+  per-model, so a mid-session demotion forfeits the incumbent's warm cache and
+  the switch turn pays the cheaper model's cache-*write* rate to re-prime the
+  whole prefix (instead of the incumbent's cache-*read* rate); only later warm
+  turns bank the read-rate difference. Break-even is *turn-count-driven, not
+  prefix-size-driven* (both the switch penalty and the per-turn saving scale
+  with the prefix): `cache_reprime_break_even` = ⌈(target_write − pinned_read) /
+  (pinned_read − target_read)⌉ — for Fable→Sonnet ≈ 4 turns, Fable→Opus ≈ 11.
+  So the routine-demotion branch now **gates** on
+  `routine_streak ≥ max(cfg.routine_streak, break_even)`: below it, it emits a
+  `cache-hold` (stays on the warm pinned model, no per-turn disclosure) rather
+  than demoting a short routine blip that would escalate right back and waste
+  the write (thrash pays the write twice). The gate no-ops when cache pricing is
+  absent (the OpenAI/Responses wire has no separate write cost), so
+  Codex/Grok/Kimi are unchanged. There is no way to make a single cache-write
+  cheaper (Anthropic fixes it at 1.25×/2× base input); the only lever is not
+  wasting writes — hence the gate, plus config guidance to set
+  `minimum_dwell_requests ≥ break_even` so a demotion, once taken, stays warm
+  long enough to amortize. Report savings **session-wide** (whole-session cost
+  delta), never as the ratio on the demoted tool-use turns alone, which ignores
+  the non-demotable turns AND the re-prime cost and massively overstates. Tests:
+  `cache_reprime_break_even_matches_configured_rates`,
+  `demotion_waits_for_cache_reprime_break_even_then_demotes`.
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
   least one downstream supports them and the router implements the full
   remap path.

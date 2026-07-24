@@ -30,7 +30,7 @@ use crate::session::{
     DelegateHandle, DownstreamRoute, Shared, close_downstream_session, open_downstream_session,
     resolve_mode_id,
 };
-use crate::strategies::{RouteContext, make_strategy};
+use crate::strategies::{CandidateView, RouteContext, make_strategy};
 
 pub const DELEGATE_SERVER_NAME: &str = "router-delegate";
 pub const DELEGATE_TOOL_NAME: &str = "delegate_task";
@@ -765,6 +765,60 @@ fn render_await(
     out.trim_end().to_string()
 }
 
+/// Scope a delegate candidate pool by cost. Ordinary delegation is strictly
+/// cheaper-than-parent (cost shedding; an empty result is the caller's
+/// "do the subtask yourself" error). An orchestrating session's HINT-LESS
+/// (worker) delegations are also cheaper-only — the planner already runs on
+/// a frontier model, and same-tier fan-out buys parallelism at zero cost
+/// savings — falling back to the full pool only when the parent is already
+/// the cheapest tier (never break the pipeline). An explicit
+/// `hints.candidate` keeps the full pool: that is how the planner addresses
+/// its same-/higher-tier cross-lineage reviewer.
+fn scope_delegate_pool(
+    pool: Vec<CandidateView>,
+    parent_cost: u32,
+    orchestrating: bool,
+    hinted: bool,
+) -> Vec<CandidateView> {
+    if orchestrating && hinted {
+        return pool;
+    }
+    let cheaper: Vec<CandidateView> = pool
+        .iter()
+        .filter(|v| v.cost_rank < parent_cost)
+        .cloned()
+        .collect();
+    if orchestrating && cheaper.is_empty() {
+        return pool;
+    }
+    cheaper
+}
+
+/// Synthesize a delegate turn's cost from configured `pricing` when the
+/// adapter reported none of its own. Delegate sub-sessions have no in-memory
+/// `RouterSession` to carry a saw-adapter-cost flag, so the guard is the
+/// state row itself: an adapter that reports cost (claude) streams
+/// `usage_update.cost` during the turn, so the row is non-zero by the time
+/// the response lands; a zero row means no adapter cost exists to mix with.
+fn synth_delegate_cost(
+    shared: &Arc<Shared>,
+    sub_sid: &str,
+    candidate: &CandidateId,
+    usage: &crate::session::TurnUsage,
+) {
+    let Some(delta) = crate::session::synth_turn_cost(&shared.cfg, candidate, usage) else {
+        return;
+    };
+    if delta <= 0.0 {
+        return;
+    }
+    let st = shared.state.lock().unwrap();
+    let reported = st.get(sub_sid).map(|p| p.cost_usd).unwrap_or(0.0);
+    if reported == 0.0 {
+        st.add_estimated_cost(sub_sid, delta);
+    }
+}
+
 /// Run one delegated subtask in an ephemeral downstream session on a
 /// lower-cost eligible candidate. Returns the sub-agent's collected output.
 pub async fn run_delegate_task(
@@ -814,22 +868,31 @@ pub async fn run_delegate_task(
     if let Some(class) = args.hints.task_class.as_deref().and_then(TaskClass::parse) {
         profile.class = class;
     }
+    // The parent (often a frontier planner) has already decomposed the work
+    // into a fully-specified brief, and the classifier reads long, detailed
+    // briefs as maximum complexity — which zeroes the cost term and trips the
+    // p75 quality gate, routing every subtask to the most expensive
+    // candidate. Cap it so spec'd subtasks route on cost again.
+    profile.complexity = profile
+        .complexity
+        .min(shared.cfg.delegation.complexity_cap.clamp(0.0, 1.0));
 
-    // Scope the pool. Ordinary delegation is cheaper-than-parent only (cost
-    // shedding); an orchestrating session may delegate to any eligible peer,
-    // including same-/higher-tier, so cross-lineage review is routeable.
+    // Scope the pool by cost (see `scope_delegate_pool`).
     let orchestrating = shared
         .with_session(router_sid, |s| s.orchestrating)
         .unwrap_or(false);
-    let mut pool = shared.eligible_views(&RequiredCaps::default(), profile.class);
-    if !orchestrating {
-        pool.retain(|v| v.cost_rank < parent_cost);
-    }
+    let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
+    let mut pool = scope_delegate_pool(
+        shared.eligible_views(&RequiredCaps::default(), profile.class),
+        parent_cost,
+        orchestrating,
+        hinted.is_some(),
+    );
     if let Some(min_quality) = args.hints.min_quality {
         pool.retain(|v| v.quality >= min_quality);
     }
-    if let Some(hinted) = args.hints.candidate.as_deref().and_then(CandidateId::parse) {
-        // Honor the hint only when it is a valid lower-cost candidate.
+    if let Some(hinted) = hinted {
+        // Honor the hint only when it survives the cost scoping.
         if pool.iter().any(|v| v.id == hinted) {
             pool.retain(|v| v.id == hinted);
         }
@@ -1042,6 +1105,15 @@ pub async fn run_delegate_task(
                     headroom.record_prompt(&candidate.agent);
                 }
                 let turn_start = std::time::Instant::now();
+                let _llm_turn = shared.llm_proxy.begin_turn(
+                    opened.process_key.clone(),
+                    router_sid.to_string(),
+                    sub_sid.clone(),
+                    opened.downstream_sid.clone(),
+                    candidate.clone(),
+                    profile.class,
+                    None,
+                );
                 let result = opened.conn.send_request(prompt).block_task().await;
                 shared
                     .state
@@ -1070,7 +1142,7 @@ pub async fn run_delegate_task(
                             text
                         };
                         // Log the sub-agent's response with token usage.
-                        let (ti, to, est) = crate::session::turn_tokens(&resp, &text);
+                        let tu = crate::session::turn_tokens(&resp, &text);
                         shared.state.lock().unwrap().log(
                             &sub_sid,
                             &crate::state::LogEntry {
@@ -1078,11 +1150,15 @@ pub async fn run_delegate_task(
                                 role: "agent".to_string(),
                                 summary: text.chars().take(200).collect(),
                                 detail: Some(serde_json::json!({"text": text})),
-                                tokens_input: ti,
-                                tokens_output: to,
-                                tokens_estimated: est,
+                                tokens_input: tu.input,
+                                tokens_output: tu.output,
+                                tokens_cache_read: tu.cache_read,
+                                tokens_cache_write: tu.cache_write,
+                                tokens_estimated: tu.estimated,
+                                model: Some(candidate.to_string()),
                             },
                         );
+                        synth_delegate_cost(shared, &sub_sid, &candidate, &tu);
                         match resp.stop_reason {
                             StopReason::EndTurn | StopReason::MaxTurnRequests => {
                                 if args.keep_open {
@@ -1226,6 +1302,15 @@ pub async fn run_delegate_followup(
         vec![ContentBlock::from(args.message.clone())],
     );
     let turn_start = std::time::Instant::now();
+    let _llm_turn = shared.llm_proxy.begin_turn(
+        process_key.clone(),
+        router_sid.to_string(),
+        sub_sid.clone(),
+        downstream_sid.clone(),
+        candidate.clone(),
+        TaskClass::CodingGeneral,
+        None,
+    );
     let result = conn.send_request(prompt).block_task().await;
     shared
         .state
@@ -1240,7 +1325,7 @@ pub async fn run_delegate_followup(
             } else {
                 text
             };
-            let (ti, to, est) = crate::session::turn_tokens(&resp, &text);
+            let tu = crate::session::turn_tokens(&resp, &text);
             shared.state.lock().unwrap().log(
                 &sub_sid,
                 &crate::state::LogEntry {
@@ -1248,11 +1333,15 @@ pub async fn run_delegate_followup(
                     role: "agent".to_string(),
                     summary: text.chars().take(200).collect(),
                     detail: Some(serde_json::json!({"text": text})),
-                    tokens_input: ti,
-                    tokens_output: to,
-                    tokens_estimated: est,
+                    tokens_input: tu.input,
+                    tokens_output: tu.output,
+                    tokens_cache_read: tu.cache_read,
+                    tokens_cache_write: tu.cache_write,
+                    tokens_estimated: tu.estimated,
+                    model: Some(candidate.to_string()),
                 },
             );
+            synth_delegate_cost(shared, &sub_sid, &candidate, &tu);
             match resp.stop_reason {
                 StopReason::EndTurn | StopReason::MaxTurnRequests => Ok(format!(
                     "[{candidate}, delegate {}]\n{text}",
@@ -1432,5 +1521,61 @@ mod tests {
         serde_json::from_value::<McpToolsListRequest>(json!({})).unwrap();
         serde_json::from_value::<McpToolsListRequest>(json!({"cursor": "abc"})).unwrap();
         serde_json::from_value::<McpInitializeRequest>(json!({"protocolVersion": "1"})).unwrap();
+    }
+
+    fn pool3() -> Vec<crate::strategies::CandidateView> {
+        use crate::candidate::CodingTier;
+        let view = |agent: &str, model: &str, cost_rank: u32, idx: usize| {
+            crate::strategies::CandidateView {
+                id: CandidateId::new(agent, model),
+                cost_rank,
+                config_index: idx,
+                quality: 0.8,
+                coding_tier: CodingTier::High,
+                headroom: 1.0,
+                preference: 0.0,
+            }
+        };
+        vec![
+            view("claude", "haiku", 1, 0),
+            view("claude", "sonnet", 2, 1),
+            view("claude", "fable", 5, 2),
+        ]
+    }
+
+    #[test]
+    fn ordinary_delegation_is_strictly_cheaper() {
+        let scoped = scope_delegate_pool(pool3(), 5, false, false);
+        assert!(scoped.iter().all(|v| v.cost_rank < 5));
+        assert_eq!(scoped.len(), 2);
+        // Parent already cheapest → empty pool → the caller's error path.
+        assert!(scope_delegate_pool(pool3(), 1, false, false).is_empty());
+    }
+
+    #[test]
+    fn orchestration_workers_are_cheaper_only_without_a_hint() {
+        // A hint-less (worker) delegation from an orchestrating frontier
+        // planner must not land back on the frontier tier.
+        let scoped = scope_delegate_pool(pool3(), 5, true, false);
+        assert!(
+            scoped.iter().all(|v| v.cost_rank < 5),
+            "same-tier candidate survived a hint-less orchestration delegation"
+        );
+        assert_eq!(scoped.len(), 2);
+    }
+
+    #[test]
+    fn orchestration_hinted_delegation_keeps_the_full_pool() {
+        // The planner addresses its cross-lineage reviewer by explicit
+        // `hints.candidate` — same-/higher-tier must stay routeable.
+        let scoped = scope_delegate_pool(pool3(), 5, true, true);
+        assert_eq!(scoped.len(), 3);
+    }
+
+    #[test]
+    fn orchestration_from_the_cheapest_tier_falls_back_to_full_pool() {
+        // Never break the pipeline when the planner is already cheapest.
+        let scoped = scope_delegate_pool(pool3(), 1, true, false);
+        assert_eq!(scoped.len(), 3);
     }
 }

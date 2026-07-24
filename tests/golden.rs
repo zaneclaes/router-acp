@@ -41,6 +41,7 @@ fn auto_cfg() -> AutoRouterConfig {
         complexity_floor: 0.7,
         allowed_candidates: vec!["*".to_string()],
         complexity_scales_tradeoff: true,
+        min_cost_weight: 0.15,
     }
 }
 
@@ -148,7 +149,7 @@ const GOLDEN: &[Golden] = &[
         class: TaskClass::Architecture,
         complexity: 0.72,
         winner: "claude/opus[1m]",
-        utility: 1.00,
+        utility: 1.01,
     },
     Golden {
         prompt: "investigate why the integration suite is flaky: there's a race between the \

@@ -1084,13 +1084,11 @@ async fn background_delegates_run_in_parallel_and_await_collects() {
         let session = new_session(&cx).await?;
         let sid = session.session_id.0.to_string();
 
-        let started = std::time::Instant::now();
         let prompt = "parallel work\n\
                       DELEGATE_BG:SLEEP:900\n\
                       DELEGATE_BG:SLEEP:901\n\
                       AWAIT_DELEGATES";
         let resp = prompt_text(&cx, &sid, prompt).await?;
-        let elapsed = started.elapsed();
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
 
         let text = agent_text(&observed, &sid);
@@ -1109,11 +1107,25 @@ async fn background_delegates_run_in_parallel_and_await_collects() {
             text.contains("All requested background delegates have completed"),
             "{text}"
         );
-        // The parallelism assertion proper: two ~900ms subtasks plus overhead
-        // must finish well under the ≥1800ms a serial execution needs.
+        // The parallelism assertion proper: both delegate prompts begin
+        // together. This excludes debug helper-process startup from the
+        // measurement while still failing a serial implementation (~900ms
+        // between starts).
+        let delegate_starts: Vec<u64> = read_log(&log)
+            .iter()
+            .filter(|entry| {
+                entry["event"] == "prompt"
+                    && entry["text"]
+                        .as_str()
+                        .is_some_and(|text| text == "SLEEP:900" || text == "SLEEP:901")
+            })
+            .filter_map(|entry| entry["startedAtMs"].as_u64())
+            .collect();
+        assert_eq!(delegate_starts.len(), 2, "{delegate_starts:?}");
+        let start_gap = delegate_starts[0].abs_diff(delegate_starts[1]);
         assert!(
-            elapsed < std::time::Duration::from_millis(1650),
-            "background delegates must overlap (took {elapsed:?})"
+            start_gap < 300,
+            "background delegates must overlap (start gap {start_gap}ms)"
         );
 
         // Everything was consumed — a bare await now reports the misuse.
@@ -2835,6 +2847,90 @@ async fn escalation_post_turn_on_max_tokens_stop() {
         assert!(
             text.contains("continue"),
             "the continuation prompt was forwarded: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn demotion_expires_an_escalated_pin_after_quiet_turns() {
+    let state = temp_state_file("demote");
+    let scores = escalation_scores("demote", false);
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         demotion: {{ after_quiet_turns: 2 }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n    escalate_before_side_effects: false\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Turn 1: max-tokens on the cheap model → queues an escalation.
+        let r1 = prompt_text(&cx, &sid, "MAXTOKENS do the thing").await?;
+        assert_eq!(r1.stop_reason, StopReason::MaxTokens);
+        // Turn 2: the escalation fires; a clean turn on the strong model
+        // (quiet 1 of 2).
+        let r2 = prompt_text(&cx, &sid, "continue").await?;
+        assert_eq!(r2.stop_reason, StopReason::EndTurn);
+        // Turn 3: second clean turn — the demotion clock expires the verdict.
+        let r3 = prompt_text(&cx, &sid, "keep going").await?;
+        assert_eq!(r3.stop_reason, StopReason::EndTurn);
+        // Turn 4: the queued demotion fires before forwarding; the prompt
+        // lands back on the cheap model.
+        let r4 = prompt_text(&cx, &sid, "poll status").await?;
+        assert_eq!(r4.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "escalation happened first: {text}"
+        );
+        assert!(
+            text.contains("demoting to a/m1"),
+            "demotion was disclosed: {text}"
+        );
+        assert!(
+            text.contains("switched b/m2 → a/m1"),
+            "demotion switch happened: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:") && text.contains("poll status"),
+            "the post-demotion prompt ran on the cheap model: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn demotion_disabled_by_default_keeps_the_escalated_pin() {
+    let state = temp_state_file("demote-off");
+    let scores = escalation_scores("demote-off", false);
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\nrouter: escalation\ndelegation: {{ enabled: false }}\n\
+         routers:\n  escalation:\n    escalation_path: leap\n    escalate_before_side_effects: false\n\
+         agents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let _ = prompt_text(&cx, &sid, "MAXTOKENS do the thing").await?;
+        for p in ["continue", "keep going", "poll status", "one more"] {
+            let r = prompt_text(&cx, &sid, p).await?;
+            assert_eq!(r.stop_reason, StopReason::EndTurn);
+        }
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("demoting to"),
+            "no demotion without `demotion.after_quiet_turns`: {text}"
         );
         Ok(())
     })

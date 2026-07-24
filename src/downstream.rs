@@ -112,12 +112,12 @@ pub fn build_targets(cfg: &Config) -> Vec<ProcessTargetSpec> {
 }
 
 /// Build the spawnable process transport for a target.
-pub fn make_process_transport(spec: &ProcessTargetSpec) -> ProcessTransport {
+pub fn make_process_transport(shared: &Arc<Shared>, spec: &ProcessTargetSpec) -> ProcessTransport {
     ProcessTransport {
         name: spec.key.0.clone(),
         command: spec.command.clone(),
         args: spec.args.clone(),
-        env: spec.env.clone(),
+        env: shared.llm_proxy.process_env(spec),
     }
 }
 
@@ -131,7 +131,7 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     let upstream = shared
         .upstream()
         .ok_or_else(|| AcpError::internal_error().data("upstream not connected"))?;
-    let acp_agent = make_process_transport(&spec);
+    let acp_agent = make_process_transport(shared, &spec);
 
     let relay_shared = shared.clone();
     let relay_key = key.clone();
