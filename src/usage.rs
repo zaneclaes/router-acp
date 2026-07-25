@@ -537,9 +537,12 @@ fn field<'a>(v: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
 
 /// Seat availability from Codex's per-pool rate-limit snapshots. Codex caps
 /// are account-wide, so every window covers every candidate; a window whose
-/// reset already passed is stale (fresh budget) and contributes nothing. The
-/// per-member spend limit (`individual_limit`) is one more account-wide
-/// window: it drains the seat like any plan window as it fills.
+/// reset already passed is stale (fresh budget) and contributes nothing.
+///
+/// The per-member spend limit is the *overage* meter on team plans: it only
+/// counts against `plan_headroom` once the team plan window is saturated.
+/// Including it while weekly usage is 0% would mark the seat as empty and
+/// preference-scale codex away even though the team quota is free.
 pub fn codex_availability(
     rate_limits: &[Value],
     candidates: &[(CandidateId, String)],
@@ -567,7 +570,11 @@ pub fn codex_availability(
                 saturated: used >= 100.0,
             });
         }
-        if let Some(il) = field(pool, "individual_limit", "individualLimit")
+        let plan_headroom = codex_plan_has_headroom(pool, now);
+        // Member spend only tightens availability once the plan seat is gone
+        // (then it is the overage pool that may still keep the seat alive).
+        if !plan_headroom
+            && let Some(il) = field(pool, "individual_limit", "individualLimit")
             && let Some(remaining) =
                 field(il, "remaining_percent", "remainingPercent").and_then(Value::as_f64)
             && !field(il, "resets_at", "resetsAt")
@@ -663,7 +670,16 @@ pub fn hint_agent_availability(
             ws.iter()
                 .filter_map(|w| {
                     let percent = w.get("percent").and_then(Value::as_f64)?;
-                    let active = w.get("active").and_then(Value::as_bool).unwrap_or(false);
+                    let active = w.get("active").and_then(Value::as_bool);
+                    // Explicit active:false on a full meter is overage accounting
+                    // (e.g. Codex member spend maxed while the team weekly window
+                    // still has quota). Including it would zero plan_headroom
+                    // and preference-scale a usable seat away. Absent `active`
+                    // still treats percent>=100 as saturated (fail closed).
+                    if percent >= 100.0 && active == Some(false) {
+                        return None;
+                    }
+                    let active = active.unwrap_or(false);
                     let scope = w
                         .get("scope")
                         .and_then(Value::as_str)
@@ -886,16 +902,46 @@ fn collect_rollouts(
     }
 }
 
+/// True when the team's plan windows (primary/secondary) still have usable
+/// quota right now. A window whose `resets_at` has passed is already free.
+/// No reported window ⇒ treat as having headroom (fail open).
+fn codex_plan_has_headroom(pool: &Value, now: SystemTime) -> bool {
+    for key in ["primary", "secondary"] {
+        let Some(win) = pool.get(key).filter(|w| !w.is_null()) else {
+            continue;
+        };
+        let used = field(win, "used_percent", "usedPercent")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if let Some(epoch) = field(win, "resets_at", "resetsAt").and_then(Value::as_u64) {
+            let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
+            if resets_at <= now {
+                continue; // already reset → free budget
+            }
+        }
+        if used >= 100.0 {
+            return false;
+        }
+    }
+    // No live windows, or every live window is under 100%.
+    true
+}
+
 /// Given the newest Codex `rate_limits` snapshot of each limit pool and an
 /// agent's candidates, decide which are cordoned. Codex caps are account-wide
-/// (not model-scoped), so any pool's saturated window cordons every candidate —
-/// but only when credits can't cover it, and only while the window's
-/// `resets_at` is still in the future. An exhausted per-member spend limit
-/// (`individual_limit`) is a hard block that credits never cover — observed
-/// live 2026-07-22: `rate_limit_reached_type:
-/// "workspace_member_usage_limit_reached"` with the weekly window resetting
-/// days BEFORE the member limit; without this cordon the router would resume
-/// routing to the still-dead seat the moment the weekly window cleared.
+/// (not model-scoped), so any pool's saturated plan window cordons every
+/// candidate — but only when credits / member overage can't cover it, and only
+/// while the window's `resets_at` is still in the future.
+///
+/// Per-member spend limit (`individual_limit`) is the *overage* pool on team
+/// plans, not a second independent hard block when the team seat still has
+/// quota. Observed 2026-07-25: weekly `usedPercent: 0` (reset) with member
+/// `remainingPercent: 0` / `spendControlReached: true` and
+/// `rateLimitReachedType: null` — the seat is usable; cordoning every codex
+/// candidate left Kory showing the whole agent unavailable. Member limit only
+/// hard-cordons when the plan window is ALSO exhausted (so when the weekly
+/// resets first, the member cordon still holds until its own reset — the
+/// 2026-07-22 case).
 pub fn codex_cordons(
     rate_limits: &[Value],
     candidates: &[(CandidateId, String)],
@@ -903,7 +949,10 @@ pub fn codex_cordons(
 ) -> HashMap<CandidateId, UsageCordon> {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
     for pool in rate_limits {
-        if let Some(il) = field(pool, "individual_limit", "individualLimit")
+        let plan_headroom = codex_plan_has_headroom(pool, now);
+        // Member limit: hard-block only once the team plan seat is also gone.
+        if !plan_headroom
+            && let Some(il) = field(pool, "individual_limit", "individualLimit")
             && field(il, "remaining_percent", "remainingPercent")
                 .and_then(Value::as_f64)
                 .is_some_and(|r| r <= 0.0)
@@ -1331,18 +1380,50 @@ mod tests {
     }
 
     #[test]
-    fn codex_member_limit_cordons_even_below_weekly_cap() {
+    fn codex_member_limit_does_not_cordon_when_plan_has_headroom() {
+        // Live 2026-07-25: weekly reset to 0%, member spend still maxed /
+        // spendControlReached — rateLimitReachedType null, seat is usable.
         let now = SystemTime::now();
         let rl = vec![json!({
             "limitId": "codex",
-            "primary": { "usedPercent": 40.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
-            "credits": { "hasCredits": true, "unlimited": false, "balance": 50.0 },
-            "individualLimit": { "remainingPercent": 0.0, "resetsAt": future_epoch(now) },
+            "primary": { "usedPercent": 0.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "individualLimit": { "limit": "3000", "used": "3000.58", "remainingPercent": 0.0, "resetsAt": future_epoch(now) },
+            "spendControlReached": true,
+            "planType": "team",
+            "rateLimitReachedType": serde_json::Value::Null
+        })];
+        let c = codex_cordons(&rl, &codex_cands(), now);
+        assert!(
+            c.is_empty(),
+            "team seat free ⇒ member spend alone must not cordon: {c:?}"
+        );
+        let a = codex_availability(&rl, &codex_cands(), now);
+        assert!(
+            a.values().all(|s| s.plan_headroom >= 0.99),
+            "availability must track the free weekly window, not maxed member spend: {a:?}"
+        );
+    }
+
+    #[test]
+    fn codex_member_limit_cordons_when_plan_also_exhausted() {
+        // Weekly at 100% AND member spent out — hard block; member reset may
+        // outlast weekly so keep the member reason when it wins upsert.
+        let now = SystemTime::now();
+        let week = future_epoch(now);
+        let member = future_epoch(now) + 4 * 86_400;
+        let rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": week },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "individualLimit": { "remainingPercent": 0.0, "resetsAt": member },
             "spendControlReached": true
         })];
         let c = codex_cordons(&rl, &codex_cands(), now);
-        assert_eq!(c.len(), 2, "member hard block ignores window slack: {c:?}");
-        assert!(c.values().all(|v| v.reason.contains("member")));
+        assert_eq!(c.len(), 2, "plan+member exhausted must cordon: {c:?}");
+        assert!(c.values().all(|v| {
+            v.reason.contains("member") || v.reason.contains("weekly")
+        }));
     }
 
     #[test]
@@ -1404,7 +1485,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_availability_counts_member_limit_as_window() {
+    fn codex_availability_ignores_member_while_plan_has_headroom() {
+        // Member remaining is the overage meter — it must not shrink
+        // plan_headroom while the weekly/session window still has quota.
         let now = SystemTime::now();
         let rl = vec![json!({
             "limitId": "codex",
@@ -1414,8 +1497,28 @@ mod tests {
         })];
         let a = codex_availability(&rl, &codex_cands(), now);
         assert!(
-            a.values().all(|v| (v.plan_headroom - 0.25).abs() < 1e-9),
-            "member limit is the tightest window: {a:?}"
+            a.values().all(|v| (v.plan_headroom - 0.80).abs() < 1e-9),
+            "plan window alone sets headroom while free: {a:?}"
+        );
+    }
+
+    #[test]
+    fn codex_availability_uses_member_when_plan_saturated() {
+        // Plan at 100% with member remaining → seat is on overage (usable);
+        // plan_headroom stays 0 because the plan window is saturated.
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": false },
+            "individualLimit": { "remainingPercent": 25.0, "resetsAt": future_epoch(now) },
+            "spendControlReached": false
+        })];
+        let a = codex_availability(&rl, &codex_cands(), now);
+        assert!(
+            a.values()
+                .all(|v| v.on_overage && v.plan_headroom.abs() < 1e-9),
+            "member remaining keeps on_overage once plan is gone: {a:?}"
         );
     }
 
@@ -1620,6 +1723,21 @@ mod tests {
         assert!(
             a.values()
                 .all(|v| !v.on_overage && v.plan_headroom.abs() < 1e-9)
+        );
+
+        // Full non-binding meter (active:false) must not zero headroom when a
+        // free plan window is also present — live Codex member-limit shape.
+        let member_not_binding = json!({
+            "agent": "codex",
+            "windows": [
+                { "percent": 0, "active": false },
+                { "percent": 100, "active": false }
+            ]
+        });
+        let a = hint_agent_availability(&member_not_binding, &codex_cands());
+        assert!(
+            a.values().all(|v| (v.plan_headroom - 1.0).abs() < 1e-9),
+            "inactive full meter ignored: {a:?}"
         );
     }
 }

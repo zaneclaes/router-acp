@@ -221,6 +221,12 @@ pub struct RouterSession {
     /// One-shot orchestration protocol instructions to prepend to the next
     /// prompt (taken once, like `pending_context`).
     pub pending_orchestration: Option<String>,
+    /// One-shot host injects from the pre-classifier (e.g. ui_planning guidance),
+    /// prepended after the orchestration protocol when both fire.
+    pub pending_injects: Vec<String>,
+    /// Pre-classifier has already run once for this session (v1: first eligible
+    /// turn only).
+    pub preclass_done: bool,
     /// Whether the native-subagent-usage warning has fired this turn (an
     /// orchestrating session using the adapter's built-in `Task` tool instead of
     /// `delegate_task`). Reset each turn so it warns at most once per turn.
@@ -293,6 +299,8 @@ impl RouterSession {
             capturing_summary: None,
             orchestrating: false,
             pending_orchestration: None,
+            pending_injects: Vec::new(),
+            preclass_done: false,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             elevation: None,
@@ -338,6 +346,8 @@ impl RouterSession {
             capturing_summary: None,
             orchestrating: false,
             pending_orchestration: None,
+            pending_injects: Vec::new(),
+            preclass_done: false,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             elevation: None,
@@ -921,7 +931,7 @@ fn agent_chunk_text(params: &serde_json::Value) -> Option<String> {
 }
 
 /// Concatenate the text of a prompt for logging/estimation.
-fn prompt_display_text(prompt: &[ContentBlock]) -> String {
+pub(crate) fn prompt_display_text(prompt: &[ContentBlock]) -> String {
     let mut out = String::new();
     for b in prompt {
         if let ContentBlock::Text(t) = b {
@@ -3128,17 +3138,25 @@ async fn send_prompt_with_failover(
         // attempt — pre-loop pending_switch, or a mid-turn escalation on the
         // previous iteration) is prepended, consumed once. It is already fully
         // framed by `switch_pin` (summary or log-transcript fallback).
-        let (orchestration, handoff) = shared
+        let (orchestration, injects, handoff) = shared
             .with_session(&router_sid, |s| {
-                (s.pending_orchestration.take(), s.pending_context.take())
+                (
+                    s.pending_orchestration.take(),
+                    std::mem::take(&mut s.pending_injects),
+                    s.pending_context.take(),
+                )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, Vec::new(), None));
         let effective_prompt = {
             let mut blocks = Vec::new();
-            // Orchestration protocol first (role framing), then any switch
-            // handoff context, then the user's actual task.
+            // Orchestration protocol first (role framing), then host pre-class
+            // injects (e.g. ui_planning), then any switch handoff context, then
+            // the user's actual task.
             if let Some(instr) = orchestration {
                 blocks.push(ContentBlock::from(instr));
+            }
+            for inj in injects {
+                blocks.push(ContentBlock::from(inj));
             }
             if let Some(ctx) = handoff {
                 blocks.push(ContentBlock::from(ctx));
@@ -3400,7 +3418,7 @@ fn candidate_matches(pattern: &str, candidate: &CandidateId) -> bool {
 /// order (preference-adjusted quality → pattern order → config order), so
 /// `agents[].preference` actually biases planner/skill steering — pattern
 /// order alone used to win, which made `preference` a no-op here.
-fn first_eligible_candidate(
+pub(crate) fn first_eligible_candidate(
     shared: &Arc<Shared>,
     patterns: &[String],
     class: TaskClass,
@@ -3815,19 +3833,24 @@ fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
     has_phrase || questions >= 2 || (questions >= 1 && enumerated)
 }
 
-/// If auto-orchestration is enabled and the prompt reads as a multi-part task
-/// list, put the session into orchestration mode: steer/switch it to a planner
-/// model and queue the orchestration protocol for the next prompt. Returns
-/// `true` when it fired. A no-op (returns `false`) when disabled, when the list
-/// is too small, when no planner is eligible, or when the list is the user
-/// answering the model's own questions. Runs BEFORE `skill_routing`, so a
-/// multi-part task orchestrates even if it names a skill — the planner decides
-/// when to invoke that skill (end-of-work skills like shipping run last).
+/// If auto-orchestration is enabled and the prompt warrants multi-track work,
+/// put the session into orchestration mode: steer/switch it to a planner model
+/// and queue the orchestration protocol for the next prompt. Returns `true`
+/// when it fired.
+///
+/// Authority for the auto path:
+/// - `pre_classifier.enabled` → LLM pre-class `orchestrate` decision (fail-open
+///   means no auto-orchestrate). Legacy `tasklist::detect_task_list` is not used.
+/// - pre-classifier off → `tasklist::detect_task_list` + `min_items` (legacy).
+///
+/// An explicit `orchestrate:` prefix overrides every auto gate (including
+/// `enabled`). Runs BEFORE `skill_routing`.
 fn maybe_trigger_orchestration(
     shared: &Arc<Shared>,
     router_sid: &str,
     prompt: &[ContentBlock],
     forced: bool,
+    preclass: Option<&crate::pre_classifier::PreClassResult>,
 ) -> bool {
     let cfg = &shared.cfg.orchestration;
     // An explicit `orchestrate:` prefix overrides every auto-detection gate,
@@ -3836,8 +3859,32 @@ fn maybe_trigger_orchestration(
         return false;
     }
     let text = prompt_display_text(prompt);
-    let parts = crate::tasklist::detect_task_list(&text).unwrap_or(1);
-    if !forced {
+    let (parts, why_auto) = if forced {
+        let parts = crate::tasklist::detect_task_list(&text).unwrap_or(1);
+        (parts, "orchestrate: requested")
+    } else if shared.cfg.pre_classifier.enabled {
+        // Pre-class is authority when enabled. No result / fail-open / below
+        // threshold → do not auto-orchestrate.
+        let Some(pre) = preclass else {
+            return false;
+        };
+        let Some(dec) = pre.orchestrate.as_ref() else {
+            return false;
+        };
+        let thr = shared.cfg.pre_classifier.orchestrate_min_confidence;
+        if !dec.warranted || dec.confidence < thr {
+            tracing::debug!(
+                session = router_sid,
+                warranted = dec.warranted,
+                confidence = dec.confidence,
+                thr,
+                "auto-orchestration skipped: pre-class did not warrant it"
+            );
+            return false;
+        }
+        (dec.estimated_parts.max(2), "pre-class")
+    } else {
+        let parts = crate::tasklist::detect_task_list(&text).unwrap_or(1);
         if parts < cfg.min_items.max(2) {
             return false;
         }
@@ -3855,7 +3902,8 @@ fn maybe_trigger_orchestration(
             );
             return false;
         }
-    }
+        (parts, "auto-detected list")
+    };
 
     let (class, excluded, current) = shared
         .with_session(router_sid, |s| {
@@ -3915,7 +3963,7 @@ fn maybe_trigger_orchestration(
     } else if forced {
         (format!("a {parts}-part task"), "orchestrate: requested")
     } else {
-        (format!("a {parts}-part task"), "auto-detected list")
+        (format!("a {parts}-part task"), why_auto)
     };
     match &current {
         // Pre-pin: steer the imminent pin onto the planner.
@@ -5465,9 +5513,9 @@ fn on_prompt(
     })
 }
 
-/// Post-directive prompt handling: auto-orchestration, skill routing, and the
-/// relay/pin dispatch. Runs inside a spawned task (never on the dispatch loop);
-/// the prompt has already been ticket-enriched.
+/// Post-directive prompt handling: pre-classifier, auto-orchestration, skill
+/// routing, and the relay/pin dispatch. Runs inside a spawned task (never on the
+/// dispatch loop); the prompt has already been ticket-enriched.
 async fn dispatch_prompt(
     shared: Arc<Shared>,
     router_sid: String,
@@ -5476,13 +5524,59 @@ async fn dispatch_prompt(
     explicit_routing: bool,
     force_orchestrate: bool,
 ) -> Result<(), AcpError> {
-    // Auto-orchestration runs FIRST: a multi-part task list orchestrates even if
-    // it names a skill — the planner decides when to invoke that skill, and
-    // end-of-work skills (shipping, PRs) run last. Suppressed only by an explicit
-    // `[router: …]` directive or `model:` shorthand (they set explicit_routing);
+    // Pre-classifier (when enabled): one cheap ACP evaluation covering
+    // orchestrate + host dimensions. v1 = first eligible turn per session.
+    // Fail-open. Explicit `[router:…]` / `model:` suppress the auto path;
+    // `orchestrate:` force still allows dimensions to inject on first run.
+    let eligible_preclass = force_orchestrate || !explicit_routing;
+    let already = shared
+        .with_session(&router_sid, |s| s.preclass_done)
+        .unwrap_or(true);
+    let preclass = if crate::pre_classifier::should_run(
+        &shared.cfg.pre_classifier,
+        already,
+        eligible_preclass,
+    ) {
+        if shared.cfg.pre_classifier.disclose {
+            notify_user(
+                &shared,
+                &router_sid,
+                "router-acp · pre-class start · evaluating prompt…",
+            );
+        }
+        let result = crate::pre_classifier::evaluate(&shared, &router_sid, &req.prompt).await;
+        // Authoritative decision note MUST reach the model — UI disclosures are
+        // peeled into a classify tool card and never enter the agent prompt, so
+        // without this inject the agent re-runs tasklist heuristics and wrongly
+        // tells the user "orchestration will fire; override with orchestrate:".
+        let decision_note =
+            crate::pre_classifier::agent_decision_note(&shared.cfg, &result);
+        shared.with_session(&router_sid, |s| {
+            s.preclass_done = true;
+            s.pending_injects.push(decision_note);
+            if !result.injects.is_empty() {
+                s.pending_injects.extend(result.injects.iter().cloned());
+            }
+        });
+        crate::pre_classifier::disclose(&shared, &router_sid, &result);
+        Some(result)
+    } else {
+        None
+    };
+
+    // Auto-orchestration runs next: a multi-part / pre-class-warranted task
+    // orchestrates even if it names a skill — the planner decides when to invoke
+    // that skill, and end-of-work skills (shipping, PRs) run last. Suppressed
+    // only by an explicit `[router: …]` directive or `model:` shorthand;
     // FORCED unconditionally by the `orchestrate:` prefix.
     let orchestrating_now = if force_orchestrate || !explicit_routing {
-        maybe_trigger_orchestration(&shared, &router_sid, &req.prompt, force_orchestrate)
+        maybe_trigger_orchestration(
+            &shared,
+            &router_sid,
+            &req.prompt,
+            force_orchestrate,
+            preclass.as_ref(),
+        )
     } else {
         false
     };

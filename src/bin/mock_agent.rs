@@ -16,6 +16,8 @@
 //! - `MOCK_CAPS_IMAGE=1`: advertise the image prompt capability
 //! - `MOCK_LOG`: append JSONL events (initialize/authenticate/new/
 //!   set_config/prompt/cancel) for test assertions
+//! - `MOCK_PRECLASS_JSON`: when a prompt contains `[router-acp pre-classifier]`,
+//!   reply with this JSON body (pre-classifier evaluator tests)
 //!
 //! Prompt text directives:
 //! - `PERM` — request permission from the client, echo the outcome
@@ -340,6 +342,20 @@ async fn run_prompt(
         let _ = cx.send_notification(chunk(&session_id, "partial output before crash".into()));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         std::process::exit(1);
+    }
+
+    // Pre-classifier evaluator: return scripted JSON (no echo: wrapper so the
+    // router's parser can consume it directly).
+    if text.contains("[router-acp pre-classifier]") {
+        if let Ok(body) = std::env::var("MOCK_PRECLASS_JSON") {
+            let _ = cx.send_notification(chunk(&session_id, body));
+            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        }
+        // Default fail-open-friendly reply when tests forget the env: no
+        // orchestration, no dimensions.
+        let default = r#"{"orchestrate":{"warranted":false,"confidence":0.95,"estimated_parts":1,"reason":"mock default"}}"#;
+        let _ = cx.send_notification(chunk(&session_id, default.to_string()));
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }
 
     let mut reply = Vec::new();
