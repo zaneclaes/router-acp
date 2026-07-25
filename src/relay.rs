@@ -43,6 +43,19 @@ pub fn with_router_meta(msg: &UntypedMessage, details: Value) -> Result<UntypedM
     UntypedMessage::new(msg.method(), params)
 }
 
+/// True when `msg` is a tool-call frame (`tool_call` or its later updates).
+/// These are the frames a client attributes to a model, so they carry the
+/// per-request routing metadata.
+pub fn is_tool_call_update(msg: &UntypedMessage) -> bool {
+    matches!(
+        msg.params()
+            .get("update")
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(|kind| kind.as_str()),
+        Some("tool_call") | Some("tool_call_update")
+    )
+}
+
 /// True when `msg` is an `agent_message_chunk` carrying text.
 pub fn is_agent_text_chunk(msg: &UntypedMessage) -> bool {
     let Some(update) = msg.params().get("update") else {

@@ -7,7 +7,16 @@ llm_proxy:
   enabled: true
   listen: 127.0.0.1:0
   routine_streak: 3
-  minimum_dwell_requests: 12
+  # Small on purpose. This is a FIXED request count, so on real traffic it never
+  # prevents a bad switch — it just delays every good one: measured over the
+  # recorded history, 0 of 7 sessions ran shorter than 12 requests (median 124),
+  # so a dwell of 12 taxed 12% of all traffic onto the pinned model and blocked
+  # nothing. It also delays DE-escalation, since returning to the pin after a
+  # difficulty verdict expires is not an emergency switch and so has to wait it
+  # out on the more expensive model. Real hysteresis comes from the cache
+  # re-prime break-even (see the per-model cache rates below), which is
+  # economically exact; this only damps single-request flapping.
+  minimum_dwell_requests: 2
   verdict_ttl_requests: 6
   verdict_ttl_secs: 900
   context_window_fraction: 0.9
@@ -54,18 +63,31 @@ agents:
     # gets a 404 from api.anthropic.com. Values below verified against the ids
     # claude-agent-acp actually puts on the wire for each alias.
     models:
+    # Cache rates are load-bearing, not decoration: without them
+    # `cache_reprime_break_even` returns 0 and the cache-aware demotion gate is
+    # inert, leaving `minimum_dwell_requests` as the only (blunt) thrash guard.
+    # Anthropic's rates are a fixed ratio of the input rate — read 0.1x,
+    # write 1.25x — so a mid-session switch forfeits the warm cache and re-primes
+    # at the target's write rate. At a 200k context that is ~$0.75 on Sonnet vs
+    # ~$0.06 for a warm read, i.e. one switch costs ~12 warm turns. Those numbers
+    # are what make the break-even the correct hysteresis.
+    models:
       - { id: haiku, display_name: Claude Haiku, cost_rank: 1,
           api_model: claude-haiku-4-5,
-          pricing: { input_per_mtok: 1.00, output_per_mtok: 5.00 } }
+          pricing: { input_per_mtok: 1.00, output_per_mtok: 5.00,
+                     cache_read_per_mtok: 0.10, cache_write_per_mtok: 1.25 } }
       - { id: sonnet, display_name: Claude Sonnet, cost_rank: 2,
           api_model: claude-sonnet-5,
-          pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00 } }
+          pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00,
+                     cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 } }
       - { id: "opus[1m]", display_name: Claude Opus 1M, cost_rank: 4,
           api_model: claude-opus-5,
-          pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00 } }
+          pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
+                     cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
       - { id: "claude-fable-5[1m]", display_name: Claude Fable 5 1M, cost_rank: 5,
           api_model: claude-fable-5,
-          pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00 } }
+          pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
+                     cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 } }
 
   - name: codex
     command:

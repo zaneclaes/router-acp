@@ -1605,6 +1605,20 @@ pub fn handle_downstream_dispatch(
                             fwd = relay::with_router_meta(&fwd, details)?;
                         }
                     }
+                    // Attribute each tool call to the model that produced it, as
+                    // structured metadata on the frame the client already renders
+                    // as a card. This is where per-request routing belongs — it
+                    // used to be announced as chat prose, which put a router
+                    // block between every pair of messages for a whole session.
+                    if relay::is_tool_call_update(&fwd)
+                        && let Some((candidate, reason)) =
+                            shared.llm_proxy.last_attribution(&router_sid)
+                    {
+                        fwd = relay::with_router_meta(
+                            &fwd,
+                            json!({ "candidate": candidate, "reason": reason }),
+                        )?;
+                    }
                     // Downstream output reached the client this turn: from
                     // here on a failover could duplicate side effects.
                     let chunk_text = agent_chunk_text(msg.params());

@@ -68,6 +68,12 @@ struct RequestPolicyState {
     /// `{event}:{model}` pairs already disclosed to the user this session, so an
     /// anomaly is surfaced once rather than on every request that hits it.
     disclosed_events: std::collections::HashSet<String>,
+    /// Candidate (`agent/model`) and reason of the most recent decision, read by
+    /// the relay path to attribute each tool call to the model that produced it.
+    /// This is the structured replacement for the per-request prose disclosure:
+    /// the client renders it inside the tool-call card instead of as chat text.
+    last_candidate: Option<String>,
+    last_reason: Option<String>,
 }
 
 /// Shared proxy runtime. Constructed with `Shared`, bound when `serve_shared`
@@ -246,6 +252,17 @@ impl LlmProxyRuntime {
             process_key,
             registration_id,
         }
+    }
+
+    /// Candidate (`agent/model`) and reason of the most recent routing decision
+    /// for a session, for attributing a tool call to the model that produced it.
+    /// `None` before the first inference request, which the client renders as a
+    /// pending state rather than a wrong model.
+    pub fn last_attribution(&self, state_sid: &str) -> Option<(String, String)> {
+        let policy = self.policy.lock().unwrap();
+        let state = policy.get(state_sid)?;
+        let candidate = state.last_candidate.clone()?;
+        Some((candidate, state.last_reason.clone().unwrap_or_default()))
     }
 
     pub fn current_model(&self, state_sid: &str) -> Option<String> {
@@ -1089,6 +1106,9 @@ fn select_request_model(
         state.requests_on_model = state.requests_on_model.saturating_add(1);
         selected
     };
+    // Record the decision for per-tool-call attribution in the client.
+    state.last_candidate = Some(selected.to_string());
+    state.last_reason = Some(reason.clone());
     let upstream_model = if selected == active.candidate {
         signals
             .original_model
@@ -2200,6 +2220,28 @@ agents:
         assert_eq!(decision.event, "escalation");
         assert_eq!(decision.selected_model, "opus");
         assert!(decision.reason.contains("stagnated"));
+    }
+
+    #[test]
+    fn last_attribution_reports_the_model_that_served_the_request() {
+        // The structured per-tool-call attribution the client renders in the
+        // call's own card. Absent before the first request (rendered as pending,
+        // never as a wrong model), and it follows the selection — not the pin —
+        // so a demoted call is attributed to the model that actually served it.
+        let (_dir, shared) = kory_code_shared();
+        let turn = claude_active("claude-fable-5[1m]");
+        assert!(shared.llm_proxy.last_attribution("r1").is_none());
+
+        let body = kory_code_request(120, "$ ls\nsrc/main.rs");
+        let mut last = None;
+        for _ in 0..4 {
+            let decision = select_request_model(&shared, &turn, &body);
+            last = Some(decision.event);
+        }
+        assert_eq!(last.as_deref(), Some("demotion"));
+        let (candidate, reason) = shared.llm_proxy.last_attribution("r1").unwrap();
+        assert_eq!(candidate, "claude/sonnet");
+        assert!(reason.contains("routine tool-result streak"), "{reason}");
     }
 
     #[test]
