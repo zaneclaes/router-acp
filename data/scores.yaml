@@ -3,7 +3,10 @@
 # Keyed by candidate pattern (`agent/model`, `*` wildcards, case-insensitive,
 # first match wins). Contains per-class quality scores in [0, 1], a coding
 # tier + percentile band (router-acp's own coding-frontier scheme, not a
-# documented OpenRouter algorithm), context window, and optional tags.
+# documented OpenRouter algorithm), context window, the wire features the model
+# accepts (`max_output_tokens`, `adaptive_thinking`, `effort` — consulted by the
+# per-request proxy, which forwards every request byte but the model name, so a
+# reroute target has to accept the incoming request's shape), and optional tags.
 # Updating routing quality is a data edit, not a
 # code change. Override the whole file with the `score_table` config key.
 version: 1
@@ -14,6 +17,7 @@ candidates:
     coding_tier: high
     coding_percentile: 0.97
     context_window: 1000000
+    max_output_tokens: 128000
     # Fable and Opus are close-tier frontier models. The quality gap over Opus
     # is deliberately kept NARROW (~0.02/class) so `auto` doesn't over-select
     # Fable: since Opus is a notch cheaper (cost_rank 4 vs 5) it then wins the
@@ -97,7 +101,8 @@ candidates:
   - pattern: "*opus*"
     coding_tier: high
     coding_percentile: 0.9
-    context_window: 200000
+    context_window: 1000000
+    max_output_tokens: 128000
     default_quality: 0.85
     quality:
       UiTweak: 0.85
@@ -114,7 +119,8 @@ candidates:
   - pattern: "*sonnet*"
     coding_tier: high
     coding_percentile: 0.8
-    context_window: 200000
+    context_window: 1000000
+    max_output_tokens: 128000
     default_quality: 0.75
     quality:
       UiTweak: 0.8
@@ -128,10 +134,18 @@ candidates:
       Ops: 0.75
       CodingGeneral: 0.8
 
+  # Haiku 4.5 predates adaptive thinking and the effort parameter: a request
+  # carrying `thinking: {type: adaptive}` or `output_config.effort` is rejected
+  # outright. Since the per-request proxy rewrites only the model field and
+  # forwards every other byte, Haiku cannot serve a request shaped by a newer
+  # model — the wire flags below keep it out of that demotion set.
   - pattern: "*haiku*"
     coding_tier: medium
     coding_percentile: 0.5
     context_window: 200000
+    max_output_tokens: 64000
+    adaptive_thinking: false
+    effort: false
     default_quality: 0.55
     quality:
       UiTweak: 0.7

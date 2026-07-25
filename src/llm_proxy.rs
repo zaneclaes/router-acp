@@ -57,6 +57,17 @@ struct RequestPolicyState {
     pending_difficulty: Option<String>,
     last_test_fingerprint: Option<String>,
     repeated_test_output: u32,
+    /// Tool-result count seen on the previous request, so a repeated fingerprint
+    /// is only judged "stuck" when the agent actually acted again.
+    last_tool_result_count: usize,
+    /// Upstream api model values the provider rejected outright (a 404 means the
+    /// configured `api_model` is not a model id it serves). Remembered so the
+    /// rewrite is not re-attempted every request — each attempt costs a wasted
+    /// round trip and is logged as a non-delegation, making it invisible.
+    rejected_api_models: std::collections::HashSet<String>,
+    /// `{event}:{model}` pairs already disclosed to the user this session, so an
+    /// anomaly is surfaced once rather than on every request that hits it.
+    disclosed_events: std::collections::HashSet<String>,
 }
 
 /// Shared proxy runtime. Constructed with `Shared`, bound when `serve_shared`
@@ -412,6 +423,30 @@ async fn proxy_request(
         let retry_pinned = decision.as_ref().is_some_and(|decision| decision.rewrite);
         if retry_pinned {
             let failed_status = upstream.status();
+            // 404/400 on a rewritten request means this target cannot serve it —
+            // an api model id the provider doesn't recognise, or a parameter it
+            // rejects. Remember it so the next request routes around it instead of
+            // paying another failed round trip. Transient codes (429, 5xx) say
+            // nothing about the target's suitability and are not recorded.
+            if let (StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST, Some(active), Some(decision)) =
+                (failed_status, attributed.as_ref(), decision.as_ref())
+            {
+                tracing::warn!(
+                    target = %target.key,
+                    model = decision.model,
+                    %failed_status,
+                    "alternate model rejected; routing around it for this session"
+                );
+                state
+                    .runtime
+                    .policy
+                    .lock()
+                    .unwrap()
+                    .entry(active.state_sid.clone())
+                    .or_default()
+                    .rejected_api_models
+                    .insert(decision.model.clone());
+            }
             let retry = build_upstream_request(
                 &state.runtime.client,
                 &parts.method,
@@ -428,6 +463,14 @@ async fn proxy_request(
                             .as_ref()
                             .map(|decision| decision.estimated_input)
                             .unwrap_or_else(|| estimate_request_tokens(&body));
+                        // Name the model that was rejected. Without it the record
+                        // read "alternate model returned HTTP 404" with from and to
+                        // both showing the pinned model — true but useless for
+                        // finding the misconfigured `api_model`.
+                        let attempted = decision
+                            .as_ref()
+                            .map(|decision| decision.model.clone())
+                            .unwrap_or_else(|| "<unknown>".to_string());
                         decision = Some(RequestDecision {
                             model: parsed
                                 .as_ref()
@@ -440,8 +483,9 @@ async fn proxy_request(
                             selected_model: active.candidate.model.clone(),
                             rewrite: false,
                             reason: format!(
-                                "alternate model returned HTTP {failed_status}; retried unchanged \
-                                 on the pinned model"
+                                "alternate model `{attempted}` returned HTTP {failed_status}; \
+                                 retried unchanged on {} (not retried again this session)",
+                                active.candidate
                             ),
                             event: "proxy-fallback".to_string(),
                             estimated_input,
@@ -590,15 +634,38 @@ fn start_request_record(
             ..Default::default()
         },
     );
-    if event != "steady" && event != "pass-through" && event != "dwell" && event != "cache-hold" {
-        state
-            .shared
-            .with_session(&active.parent_router_sid, |session| {
-                session.pending_disclosure.push(format!(
-                    "router-acp · request {event}: {} → {model_id} — {reason}",
-                    active.candidate
-                ));
-            });
+    // Per-request routing does NOT belong in the model's prose. There is one
+    // inference request per tool-call turn, so disclosing each one put a router
+    // block between every pair of messages for a whole session — and the same
+    // information is already carried per tool call (each call records the model
+    // that served it) and in full in the `llm_requests` table behind the
+    // analytics page. Routine events (demotion / escalation / verdict) are
+    // therefore silent here.
+    //
+    // An alternate the provider REJECTED is different: it is an anomaly the
+    // operator should see. Disclose it once per (event, model) per session — the
+    // rejection is also recorded so the model is not retried, but the dedup
+    // keeps a pre-fix binary or a transient rejection from flooding the
+    // transcript regardless.
+    if event == "proxy-fallback" {
+        let first_time = state
+            .runtime
+            .policy
+            .lock()
+            .unwrap()
+            .entry(active.state_sid.clone())
+            .or_default()
+            .disclosed_events
+            .insert(format!("{event}:{model_id}"));
+        if first_time {
+            state
+                .shared
+                .with_session(&active.parent_router_sid, |session| {
+                    session
+                        .pending_disclosure
+                        .push(format!("router-acp · {reason}"));
+                });
+        }
     }
     Some(CompletionContext {
         request_id: request_id.to_string(),
@@ -694,6 +761,35 @@ struct RequestSignals {
     routine: bool,
     difficulty: Option<String>,
     test_fingerprint: Option<String>,
+    tool_result_count: usize,
+    wire: WireShape,
+}
+
+/// Request features a reroute target must accept. Only the top-level `model` is
+/// rewritten, so every other byte — the thinking config, `output_config.effort`,
+/// `max_tokens` — reaches whichever model is named. A model that rejects one of
+/// them (Haiku 4.5 takes neither adaptive thinking nor `effort`) turns a demotion
+/// into a 400, so these gate the candidate set alongside the context window.
+#[derive(Debug, Default, Clone, Copy)]
+struct WireShape {
+    adaptive_thinking: bool,
+    effort: bool,
+    max_output: u64,
+}
+
+fn request_wire_shape(body: &Value) -> WireShape {
+    WireShape {
+        adaptive_thinking: body
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("adaptive")),
+        effort: body
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .is_some(),
+        max_output: max_output_tokens(body).unwrap_or(0),
+    }
 }
 
 #[derive(Debug)]
@@ -715,6 +811,30 @@ struct ModelOption {
     cost_rank: u32,
     quality: f64,
     context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    adaptive_thinking: bool,
+    effort: bool,
+}
+
+impl ModelOption {
+    /// Whether this model accepts the request as it stands. The proxy forwards
+    /// every byte but the model name, so an unsupported parameter is a 400.
+    fn accepts(&self, wire: &WireShape) -> bool {
+        if wire.adaptive_thinking && !self.adaptive_thinking {
+            return false;
+        }
+        if wire.effort && !self.effort {
+            return false;
+        }
+        if wire.max_output > 0
+            && self
+                .max_output_tokens
+                .is_some_and(|limit| wire.max_output > limit)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 fn select_request_model(
@@ -742,6 +862,9 @@ fn select_request_model(
                 cost_rank: candidate.cost_rank,
                 quality: scores.quality(active.class),
                 context_window: scores.context_window,
+                max_output_tokens: scores.max_output_tokens,
+                adaptive_thinking: scores.adaptive_thinking,
+                effort: scores.effort,
             }
         })
         .collect();
@@ -758,44 +881,72 @@ fn select_request_model(
             cost_rank,
             quality: scores.quality(active.class),
             context_window: scores.context_window,
+            max_output_tokens: scores.max_output_tokens,
+            adaptive_thinking: scores.adaptive_thinking,
+            effort: scores.effort,
         });
     }
-    let compatible: Vec<ModelOption> = models
-        .iter()
-        .filter(|model| {
-            model.id == active.candidate
-                || model.context_window.is_some_and(|window| {
-                    signals.estimated_input
-                        <= (window as f64 * shared.cfg.llm_proxy.context_window_fraction) as u64
-                })
-        })
-        .cloned()
-        .collect();
-
     let mut policy = shared.llm_proxy.policy.lock().unwrap();
     let state = policy.entry(active.state_sid.clone()).or_default();
     if state.pinned_candidate.as_ref() != Some(&active.candidate) {
+        // A repin starts fresh, but which upstream model ids the provider rejects
+        // is a durable fact about the config — carry it across so the 404 retry
+        // loop doesn't restart on every repin.
+        let rejected = std::mem::take(&mut state.rejected_api_models);
         *state = RequestPolicyState {
             pinned_candidate: Some(active.candidate.clone()),
             current_model: Some(active.candidate.model.clone()),
+            rejected_api_models: rejected,
             ..Default::default()
         };
     }
     state.request_seq += 1;
     let request_seq = state.request_seq;
 
+    // An alternate has to fit the context AND accept the request's shape AND not
+    // already have been rejected upstream. The pinned candidate is always kept:
+    // it is what the adapter asked for, and leaving the route untouched is
+    // always valid.
+    let compatible: Vec<ModelOption> = models
+        .iter()
+        .filter(|model| {
+            model.id == active.candidate
+                || (model.context_window.is_some_and(|window| {
+                    signals.estimated_input
+                        <= (window as f64 * shared.cfg.llm_proxy.context_window_fraction) as u64
+                }) && model.accepts(&signals.wire)
+                    && !state.rejected_api_models.contains(&model.api_model))
+        })
+        .cloned()
+        .collect();
+
     let mut difficulty = state.pending_difficulty.take().or(signals.difficulty);
-    if let Some(fingerprint) = signals.test_fingerprint {
-        if state.last_test_fingerprint.as_ref() == Some(&fingerprint) {
-            state.repeated_test_output += 1;
-        } else {
-            state.repeated_test_output = 0;
+    // "Stuck" means the agent acted again and got back byte-identical failing test
+    // output. Both halves are load-bearing: without the advanced check, re-sending
+    // the same turn reads as stagnation; and the fingerprint is cleared once the
+    // failure goes away, so the escalation ends with the failure instead of
+    // persisting for the rest of the session.
+    let advanced = signals.tool_result_count > state.last_tool_result_count;
+    match signals.test_fingerprint {
+        Some(fingerprint) => {
+            if state.last_test_fingerprint.as_ref() == Some(&fingerprint) {
+                if advanced {
+                    state.repeated_test_output += 1;
+                }
+            } else {
+                state.repeated_test_output = 0;
+            }
             state.last_test_fingerprint = Some(fingerprint);
+            if state.repeated_test_output >= 1 {
+                difficulty = Some("test output stagnated across consecutive actions".to_string());
+            }
         }
-        if state.repeated_test_output >= 1 {
-            difficulty = Some("test output stagnated across consecutive actions".to_string());
+        None => {
+            state.repeated_test_output = 0;
+            state.last_test_fingerprint = None;
         }
     }
+    state.last_tool_result_count = signals.tool_result_count;
 
     let request_expired =
         state.elevated_until_request > 0 && request_seq > state.elevated_until_request;
@@ -1032,10 +1183,15 @@ fn inspect_request(body: &Value) -> RequestSignals {
     let recent = latest.content.clone().unwrap_or_else(lower_tail);
     let recent_name = latest.tool_name.clone().unwrap_or_default();
     let structural_error = latest.error;
+    // Deliberately narrow. A bare `error:` substring matches ordinary developer
+    // tool output — grep hits, type-checker noise, log tails, source text that
+    // merely contains the word — and escalated ~8% of real requests on its own.
+    // Genuine tool failure is carried by the STRUCTURAL signal below (`is_error`,
+    // a failed status, a non-zero exit code), which needs no substring guessing;
+    // these markers only cover shapes the structure misses.
     let failure_markers = [
         "test failed",
         "tests failed",
-        "error:",
         "traceback",
         "panic:",
         "command failed",
@@ -1055,6 +1211,12 @@ fn inspect_request(body: &Value) -> RequestSignals {
     let has_tool_result = latest.any_tool_result;
     // Routine when the producing tool is a read/search/edit-class tool, or its
     // output carries a benign completion marker.
+    // `bash`/`shell` matter as much as the read tools: shell commands are the
+    // highest-volume tool in a coding session, and on the Anthropic wire their
+    // tool_result is plain text with no `exit_code` field for the content markers
+    // below to match — so without the name they never counted routine and the
+    // streak could not form. A FAILING shell command is still excluded, because
+    // `routine` requires `difficulty.is_none()`.
     let name_markers = [
         "read",
         "grep",
@@ -1068,6 +1230,10 @@ fn inspect_request(body: &Value) -> RequestSignals {
         "write",
         "edit",
         "apply_patch",
+        "bash",
+        "shell",
+        "fetch",
+        "todo",
     ];
     let content_markers = [
         "git status",
@@ -1090,7 +1256,9 @@ fn inspect_request(body: &Value) -> RequestSignals {
         estimated_input,
         routine: difficulty.is_none() && has_tool_result && routine_tool,
         difficulty,
-        test_fingerprint: test_fingerprint(body),
+        test_fingerprint: test_fingerprint(latest.content.as_deref()),
+        tool_result_count: latest.result_count,
+        wire: request_wire_shape(body),
     }
 }
 
@@ -1102,6 +1270,10 @@ struct LatestTool {
     tool_name: Option<String>,
     /// Whether the request contains any tool-result-like block at all.
     any_tool_result: bool,
+    /// How many tool-result blocks the request carries. Compared across requests
+    /// to tell "the agent acted again and got the same output" (a stuck loop)
+    /// from "the same turn was re-sent" (no new action to judge).
+    result_count: usize,
     /// Whether the most recent tool-result block reported a structural failure
     /// (`is_error`, a failed/error status, or a non-zero exit code).
     error: bool,
@@ -1133,6 +1305,7 @@ fn latest_tool_context(body: &Value) -> LatestTool {
                     }
                     "tool_result" | "function_call_output" | "tool" | "computer_output" => {
                         out.any_tool_result = true;
+                        out.result_count += 1;
                         let content = object
                             .get("content")
                             .or_else(|| object.get("output"))
@@ -1222,57 +1395,36 @@ fn contains_nonzero_exit(value: &Value) -> bool {
     }
 }
 
-fn test_fingerprint(value: &Value) -> Option<String> {
-    fn visit(value: &Value, latest: &mut Option<String>) {
-        match value {
-            Value::Object(object) => {
-                let kind = object
-                    .get("type")
-                    .or_else(|| object.get("role"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if matches!(
-                    kind,
-                    "tool_result" | "function_call_output" | "tool" | "computer_output"
-                ) {
-                    let output = object
-                        .get("output")
-                        .or_else(|| object.get("content"))
-                        .map(|value| match value {
-                            Value::String(text) => text.clone(),
-                            other => serde_json::to_string(other).unwrap_or_default(),
-                        })
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    if [
-                        "test result: failed",
-                        "tests failed",
-                        "failures:",
-                        " failed",
-                        "error:",
-                    ]
-                    .iter()
-                    .any(|marker| output.contains(marker))
-                    {
-                        *latest = Some(output);
-                    }
-                }
-                for nested in object.values() {
-                    visit(nested, latest);
-                }
-            }
-            Value::Array(values) => {
-                for nested in values {
-                    visit(nested, latest);
-                }
-            }
-            _ => {}
-        }
+/// Fingerprint the CURRENT turn's tool output when it reads as a failing test
+/// run. Takes the latest tool-result content (already located structurally by
+/// `latest_tool_context`) rather than walking the whole body.
+///
+/// Scoping matters: the previous implementation searched the entire request and
+/// kept the last *matching* block anywhere in it. On the Anthropic wire the whole
+/// conversation history is resent every turn, so one historical failure made the
+/// fingerprint byte-identical on every subsequent request — the repeat counter
+/// latched and escalated the rest of the session. Fingerprinting only the latest
+/// result means a new tool result necessarily changes (or clears) it.
+///
+/// Markers are narrow for the same reason as `failure_markers`: a bare ` failed`
+/// or `error:` matches ordinary tool output, and this signal escalates to the
+/// most expensive model in the fleet.
+fn test_fingerprint(latest_output: Option<&str>) -> Option<String> {
+    let output = latest_output?;
+    const TEST_FAILURE_MARKERS: [&str; 5] = [
+        "test result: failed",
+        "tests failed",
+        "test failed",
+        "failures:",
+        "assertion failed",
+    ];
+    if !TEST_FAILURE_MARKERS
+        .iter()
+        .any(|marker| output.contains(marker))
+    {
+        return None;
     }
-
-    let mut latest = None;
-    visit(value, &mut latest);
-    latest.map(|output| format!("{:x}", Sha256::digest(output.trim().as_bytes())))
+    Some(format!("{:x}", Sha256::digest(output.trim().as_bytes())))
 }
 
 fn request_session_hints(body: &Value) -> Vec<String> {
@@ -1584,7 +1736,12 @@ fn cache_reprime_break_even(
             .agents
             .iter()
             .find(|agent| agent.name == candidate.agent)
-            .and_then(|agent| agent.models.iter().find(|model| model.id == candidate.model))
+            .and_then(|agent| {
+                agent
+                    .models
+                    .iter()
+                    .find(|model| model.id == candidate.model)
+            })
             .and_then(|model| model.pricing.clone())
     };
     let pinned = pricing(pinned)?;
@@ -1719,6 +1876,197 @@ agents:
         (dir, shared)
     }
 
+    /// The real production shape: the `claude` agent with the four shipped
+    /// candidates, their real `api_model` values, and Anthropic's real cache rates
+    /// (read = 0.1x input, write = 1.25x input) so the re-prime gate is live.
+    /// Score data (context windows, wire features) comes from the shipped
+    /// `data/scores.yaml`, not from a test stub.
+    fn kory_code_shared() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 3
+  minimum_dwell_requests: 0
+  verdict_ttl_requests: 6
+  verdict_ttl_secs: 900
+agents:
+  - name: claude
+    command: {{ type: stdio, command: claude-agent-acp }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: https://api.anthropic.com
+    models:
+      - id: haiku
+        cost_rank: 1
+        api_model: claude-haiku-4-5
+        pricing: {{ input_per_mtok: 1.0, output_per_mtok: 5.0, cache_read_per_mtok: 0.10, cache_write_per_mtok: 1.25 }}
+      - id: sonnet
+        cost_rank: 2
+        api_model: claude-sonnet-5
+        pricing: {{ input_per_mtok: 3.0, output_per_mtok: 15.0, cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 }}
+      - id: "opus[1m]"
+        cost_rank: 4
+        api_model: claude-opus-5
+        pricing: {{ input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }}
+      - id: "claude-fable-5[1m]"
+        cost_rank: 5
+        api_model: claude-fable-5
+        pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }}
+"#,
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("claude".to_string()),
+            vec![
+                "haiku".into(),
+                "sonnet".into(),
+                "opus[1m]".into(),
+                "claude-fable-5[1m]".into(),
+            ],
+        );
+        (dir, shared)
+    }
+
+    fn claude_active(candidate: &str) -> ActiveTurn {
+        ActiveTurn {
+            candidate: CandidateId::new("claude", candidate),
+            ..active("haiku")
+        }
+    }
+
+    /// A request shaped like the ones `claude-agent-acp` actually emits, captured
+    /// off the wire: bare api model id, adaptive thinking, `output_config.effort`,
+    /// `max_tokens: 64000`, a large system + tools prelude, and the whole
+    /// conversation resent every turn. `turns` controls how much history is
+    /// replayed, which is what pushes a real session past 180k tokens.
+    fn kory_code_request(turns: usize, latest_tool_output: &str) -> Value {
+        let tools: Vec<Value> = (0..29)
+            .map(|i| {
+                json!({
+                    "name": format!("Tool{i}"),
+                    "description": "x".repeat(1_200),
+                    "input_schema": {"type":"object","properties":{"a":{"type":"string"}}}
+                })
+            })
+            .collect();
+        let mut messages = Vec::new();
+        for turn in 0..turns {
+            messages.push(json!({
+                "role":"assistant",
+                "content":[{"type":"tool_use","name":"Bash","id":format!("t{turn}"),"input":{"command":"ls"}}]
+            }));
+            messages.push(json!({
+                "role":"user",
+                "content":[{"type":"tool_result","tool_use_id":format!("t{turn}"),
+                    "content": format!("$ ls\n{}", "src/file.rs\n".repeat(500))}]
+            }));
+        }
+        // The turn under judgement, last in document order.
+        messages.push(json!({
+            "role":"assistant",
+            "content":[{"type":"tool_use","name":"Bash","id":"latest","input":{"command":"ls"}}]
+        }));
+        messages.push(json!({
+            "role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"latest","content":latest_tool_output}]
+        }));
+        json!({
+            "model": "claude-fable-5",
+            "max_tokens": 64000,
+            "stream": true,
+            "thinking": {"type":"adaptive","display":"omitted"},
+            "output_config": {"effort":"high"},
+            "system": [{"type":"text","text":"y".repeat(20_000)}],
+            "tools": tools,
+            "messages": messages
+        })
+    }
+
+    #[test]
+    fn real_sized_kory_code_request_demotes_fable_to_sonnet() {
+        let (_dir, shared) = kory_code_shared();
+        let turn = claude_active("claude-fable-5[1m]");
+
+        // Sized like a mid-session Kory Code request. The measured median was
+        // ~214k actual input tokens; anything over 180k was previously excluded
+        // from every cheaper candidate by the mis-scored 200k windows.
+        let body = kory_code_request(120, "$ ls\nsrc/main.rs\nsrc/lib.rs");
+        let estimated = inspect_request(&body).estimated_input;
+        assert!(
+            (180_000..900_000).contains(&estimated),
+            "fixture must sit above the old 180k gate and inside Sonnet's 1M window, got {estimated}"
+        );
+
+        // Two gates run in series before a demotion is allowed: the configured
+        // routine_streak (3), then the Fable->Sonnet cache re-prime break-even (4).
+        // So streaks 1-2 are simply steady, streak 3 is held back to amortize the
+        // cache write, and streak 4 demotes. Sonnet, not Haiku: Haiku is both too
+        // small (200k) and rejects adaptive thinking + effort, so the cheapest
+        // COMPATIBLE candidate is Sonnet.
+        let events: Vec<(String, String)> = (0..4)
+            .map(|_| {
+                let decision = select_request_model(&shared, &turn, &body);
+                (decision.event, decision.model)
+            })
+            .collect();
+        let observed: Vec<(&str, &str)> = events
+            .iter()
+            .map(|(event, model)| (event.as_str(), model.as_str()))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("steady", "claude-fable-5"),
+                ("steady", "claude-fable-5"),
+                ("cache-hold", "claude-fable-5"),
+                ("demotion", "claude-sonnet-5"),
+            ]
+        );
+    }
+
+    #[test]
+    fn real_sized_request_escalates_and_recovers_instead_of_latching() {
+        // The measured production failure: 46% of requests carried
+        // "test output stagnated", and once escalated a session never came back.
+        // A genuine repeat escalates; a clean following turn returns to steady.
+        let (_dir, shared) = kory_code_shared();
+        let turn = claude_active("claude-fable-5[1m]");
+        const FAILING: &str = "running 2 tests\ntest result: FAILED. 1 passed; 1 failed";
+
+        assert_ne!(
+            select_request_model(&shared, &turn, &kory_code_request(20, FAILING)).event,
+            "escalation",
+            "first sight of a failure is not yet stagnation"
+        );
+        let stuck = select_request_model(&shared, &turn, &kory_code_request(21, FAILING));
+        assert_eq!(stuck.event, "escalation");
+        assert_eq!(stuck.model, "claude-fable-5");
+
+        // Verdict TTL is 6 requests, so the next few stay elevated by design; once
+        // it expires with clean output the session must return to the pinned model
+        // and become demotable again rather than staying escalated forever.
+        let mut events = Vec::new();
+        for turns in 22..34 {
+            let decision = select_request_model(
+                &shared,
+                &turn,
+                &kory_code_request(turns, "$ ls\nsrc/main.rs"),
+            );
+            events.push(decision.event);
+        }
+        assert!(
+            events.iter().any(|event| event == "demotion"),
+            "a recovered session must become demotable again, saw {events:?}"
+        );
+    }
+
     fn active(candidate: &str) -> ActiveTurn {
         ActiveTurn {
             registration_id: 1,
@@ -1758,7 +2106,9 @@ agents:
         // in the tool schemas and misses the tool_result entirely; structural
         // detection must still classify it as routine.
         let big_tool_schema: String = (0..4000)
-            .map(|i| format!("{{\"name\":\"synthetic_field_{i}\",\"desc\":\"padding schema entry\"}}"))
+            .map(|i| {
+                format!("{{\"name\":\"synthetic_field_{i}\",\"desc\":\"padding schema entry\"}}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         let body = json!({
@@ -1780,7 +2130,10 @@ agents:
         assert!(!serialized[serialized.len() - 24_000..].contains("git status"));
 
         let signal = inspect_request(&body);
-        assert!(signal.routine, "buried tool_result must still read as routine");
+        assert!(
+            signal.routine,
+            "buried tool_result must still read as routine"
+        );
         assert!(signal.difficulty.is_none());
         assert!(inspect_request(&body).original_model.as_deref() == Some("claude-fable-5"));
     }
@@ -1814,25 +2167,29 @@ agents:
             ]
         });
         let signal = inspect_request(&body);
-        assert!(signal.difficulty.is_none(), "recovered turn must not stay escalated");
+        assert!(
+            signal.difficulty.is_none(),
+            "recovered turn must not stay escalated"
+        );
         assert!(signal.routine);
     }
 
     #[test]
-    fn repeated_failing_test_output_escalates_despite_new_trace_items() {
+    fn repeated_failing_test_output_escalates_when_the_agent_acted_again() {
         let (_dir, shared) = policy_shared(0);
+        const FAILING: &str = "test result: FAILED. 1 passed; 1 failed";
         let first = json!({
             "model":"haiku",
-            "input":[{
-                "type":"function_call_output",
-                "output":"test result: FAILED. 1 passed; 1 failed"
-            }]
+            "input":[{"type":"function_call_output","output":FAILING}]
         });
+        // The agent acted and re-ran the suite: the trace now carries a SECOND
+        // output, byte-identical to the first. That is the stuck signal.
         let second = json!({
             "model":"haiku",
             "input":[
+                {"type":"function_call_output","output":FAILING},
                 {"role":"assistant","content":"I changed src/lib.rs"},
-                {"type":"function_call_output","output":"test result: FAILED. 1 passed; 1 failed"}
+                {"type":"function_call_output","output":FAILING}
             ]
         });
         assert_eq!(
@@ -1843,6 +2200,120 @@ agents:
         assert_eq!(decision.event, "escalation");
         assert_eq!(decision.selected_model, "opus");
         assert!(decision.reason.contains("stagnated"));
+    }
+
+    #[test]
+    fn resending_the_same_turn_is_not_read_as_stagnation() {
+        // Same body twice: the failing output is unchanged but the agent has not
+        // acted again, so there is no new attempt to judge as stuck.
+        let (_dir, shared) = policy_shared(0);
+        let body = json!({
+            "model":"haiku",
+            "input":[{"type":"function_call_output","output":"test result: FAILED. 1 failed"}]
+        });
+        assert_eq!(
+            select_request_model(&shared, &active("haiku"), &body).event,
+            "steady"
+        );
+        assert_eq!(
+            select_request_model(&shared, &active("haiku"), &body).event,
+            "steady"
+        );
+    }
+
+    #[test]
+    fn historical_test_failure_does_not_latch_escalation_on_later_turns() {
+        // The regression that produced 0 demotions in real sessions: on the
+        // Anthropic wire the whole conversation is resent every turn, so an early
+        // failing test result stayed visible forever. Fingerprinting the whole body
+        // made it byte-identical on every subsequent request and escalated the rest
+        // of the session. Only the CURRENT turn's output may drive the verdict.
+        let (_dir, shared) = policy_shared(0);
+        let turn = |latest: &str| {
+            json!({
+                "model":"haiku",
+                "messages":[
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"t0",
+                        "content":"test result: FAILED. 1 passed; 1 failed"}]},
+                    {"role":"assistant","content":[{"type":"tool_use","name":"Read","id":"t1","input":{}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":latest}]}
+                ]
+            })
+        };
+        for latest in ["fn main() {}", "working tree clean", "ok"] {
+            let decision = select_request_model(&shared, &active("haiku"), &turn(latest));
+            assert_ne!(
+                decision.event, "escalation",
+                "clean current turn must not inherit a historical failure: {}",
+                decision.reason
+            );
+        }
+    }
+
+    #[test]
+    fn haiku_is_excluded_when_the_request_carries_adaptive_thinking_and_effort() {
+        // Real Kory Code requests carry `thinking: {type: adaptive}` and
+        // `output_config.effort`; Haiku 4.5 rejects both. Since the proxy forwards
+        // every byte but the model name, demoting to Haiku would 400 — it must not
+        // be offered as an alternate for such a request.
+        let wire = request_wire_shape(&json!({
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high"},
+            "max_tokens": 64000
+        }));
+        assert!(wire.adaptive_thinking);
+        assert!(wire.effort);
+        assert_eq!(wire.max_output, 64000);
+
+        let haiku = ModelOption {
+            id: CandidateId::new("claude", "haiku"),
+            api_model: "claude-haiku-4-5".to_string(),
+            cost_rank: 1,
+            quality: 0.55,
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
+            adaptive_thinking: false,
+            effort: false,
+        };
+        let sonnet = ModelOption {
+            adaptive_thinking: true,
+            effort: true,
+            context_window: Some(1_000_000),
+            id: CandidateId::new("claude", "sonnet"),
+            api_model: "claude-sonnet-5".to_string(),
+            ..haiku.clone()
+        };
+        assert!(!haiku.accepts(&wire));
+        assert!(sonnet.accepts(&wire));
+
+        // A request with neither feature is fine on Haiku.
+        let plain = request_wire_shape(&json!({"max_tokens": 4096}));
+        assert!(haiku.accepts(&plain));
+    }
+
+    #[test]
+    fn scored_context_windows_match_the_shipped_model_generation() {
+        // The gate that blocked every demotion: a 214k-token request (the real
+        // median in a Kory Code session) is only reroutable if the score table
+        // knows Opus 5 and Sonnet 5 hold 1M tokens. Haiku 4.5 really is 200k.
+        let table = crate::candidate::ScoreTable::builtin();
+        for (model, expected) in [
+            ("claude-fable-5[1m]", 1_000_000),
+            ("opus[1m]", 1_000_000),
+            ("sonnet", 1_000_000),
+            ("haiku", 200_000),
+        ] {
+            let scores = table.lookup(&CandidateId::new("claude", model));
+            assert_eq!(
+                scores.context_window,
+                Some(expected),
+                "context window for {model}"
+            );
+        }
+        let haiku = table.lookup(&CandidateId::new("claude", "haiku"));
+        assert!(!haiku.adaptive_thinking && !haiku.effort);
+        let sonnet = table.lookup(&CandidateId::new("claude", "sonnet"));
+        assert!(sonnet.adaptive_thinking && sonnet.effort);
     }
 
     #[test]
