@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::v1::{ContentBlock, McpServer, PromptRequest};
+use agent_client_protocol::schema::v1::{
+    ContentBlock, McpServer, PromptRequest, SetSessionModeRequest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -17,7 +19,7 @@ use crate::candidate::{CandidateId, TaskClass};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
     DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
-    open_downstream_session, prompt_display_text,
+    open_downstream_session, prompt_display_text, resolve_mode_id,
 };
 
 /// Marker embedded in the evaluator prompt so mock agents (and logs) can
@@ -396,7 +398,9 @@ fn fail_open(
 }
 
 /// Run the evaluator as a short-lived tool-less ACP session on the first
-/// eligible `evaluator` candidate. Fail-open on any error.
+/// eligible `evaluator` candidate. Fail-open on any error. Tries each matching
+/// evaluator in preference order (a timed-out/broken haiku does not sink the
+/// whole pre-class).
 pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentBlock]) -> PreClassResult {
     let started = Instant::now();
     let cfg = shared.cfg.clone();
@@ -408,7 +412,7 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
     let user_text = prompt_display_text(prompt);
     let eval_prompt = build_evaluator_prompt(&cfg, &user_text);
 
-    let (class, excluded, cwd, dirs) = shared
+    let (class, mut excluded, cwd, dirs) = shared
         .with_session(router_sid, |s| {
             (
                 s.task_class.unwrap_or(TaskClass::CodingGeneral),
@@ -424,27 +428,87 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
             Vec::new(),
         ));
 
-    let Some(candidate) =
-        first_eligible_candidate(shared, &pcfg.evaluator, class, &excluded)
-    else {
-        return fail_open(
-            "no evaluator candidate available",
-            None,
-            started.elapsed().as_millis() as u64,
-            "",
-        );
-    };
+    let mut attempts: Vec<String> = Vec::new();
+    let mut last_fail: Option<PreClassResult> = None;
 
+    // Prefer-order walk: first_eligible_candidate ranks by quality within the
+    // evaluator glob pool; after a failure we exclude that exact id and retry.
+    for _attempt in 0..pcfg.evaluator.len().max(1) + 2 {
+        let Some(candidate) =
+            first_eligible_candidate(shared, &pcfg.evaluator, class, &excluded)
+        else {
+            break;
+        };
+        let cand_str = candidate.to_string();
+        // Skip already-tried exact ids even if the glob still matches.
+        if attempts.iter().any(|a| a == &cand_str) {
+            excluded.push(cand_str);
+            continue;
+        }
+
+        let result = evaluate_on_candidate(
+            shared,
+            router_sid,
+            &candidate,
+            cwd.clone(),
+            dirs.clone(),
+            &eval_prompt,
+            &cfg,
+            started,
+        )
+        .await;
+        attempts.push(cand_str.clone());
+
+        if result.ok {
+            return result;
+        }
+        tracing::warn!(
+            session = router_sid,
+            evaluator = %cand_str,
+            reason = result.skip_reason.as_deref().unwrap_or("?"),
+            "pre-class evaluator attempt failed; trying next"
+        );
+        last_fail = Some(result);
+        excluded.push(cand_str);
+    }
+
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if let Some(mut fail) = last_fail {
+        fail.latency_ms = latency_ms;
+        fail.log.push_str(&format!(
+            "tried evaluators: {}\n",
+            attempts.join(", ")
+        ));
+        return fail;
+    }
+    fail_open(
+        "no evaluator candidate available",
+        None,
+        latency_ms,
+        "",
+    )
+}
+
+/// One evaluator attempt: open (with auto mode) → prompt → close → parse.
+async fn evaluate_on_candidate(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    candidate: &CandidateId,
+    cwd: std::path::PathBuf,
+    dirs: Vec<std::path::PathBuf>,
+    eval_prompt: &str,
+    cfg: &Config,
+    started: Instant,
+) -> PreClassResult {
     let cand_str = candidate.to_string();
+    let pcfg = &cfg.pre_classifier;
     let capture = Arc::new(Mutex::new(String::new()));
 
-    // Phase 1 — spawn + session/new. Deliberately NOT on `timeout_ms`: a cold
-    // ACP open often outlives the prompt budget, which used to fail-open every
-    // real evaluation.
+    // Phase 1 — spawn + session/new + auto mode. NOT on `timeout_ms`.
     let open_timeout_ms = cfg.probe_timeout_ms.clamp(1, OPEN_TIMEOUT_CAP_MS);
     let opened = match tokio::time::timeout(
         Duration::from_millis(open_timeout_ms),
-        open_evaluator_session(shared, router_sid, &candidate, cwd, dirs, capture.clone()),
+        open_evaluator_session(shared, router_sid, candidate, cwd, dirs, capture.clone()),
     )
     .await
     {
@@ -471,7 +535,7 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
     let open_ms = started.elapsed().as_millis() as u64;
     let request = PromptRequest::new(
         opened.downstream_sid.clone(),
-        vec![ContentBlock::from(eval_prompt)],
+        vec![ContentBlock::from(eval_prompt.to_string())],
     );
     let turn = tokio::time::timeout(
         Duration::from_millis(pcfg.timeout_ms.max(1)),
@@ -506,7 +570,7 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
                 Ok(parsed) => {
                     let mut raw_log = format!("raw reply:\n{body}\n");
                     raw_log.push_str(&format!("parsed: {parsed}\n"));
-                    apply_thresholds(&cfg, &parsed, Some(&cand_str), latency_ms, &raw_log)
+                    apply_thresholds(cfg, &parsed, Some(&cand_str), latency_ms, &raw_log)
                 }
                 Err(e) => fail_open(
                     format!("parse failed: {e}"),
@@ -530,7 +594,9 @@ fn strip_mock_echo(raw: &str) -> String {
 }
 
 /// Spawn the evaluator process if needed and open a tool-less session on it.
-/// Caller owns closing the returned session.
+/// Applies the configured `auto` session mode (bypassPermissions for Claude)
+/// so the short evaluator turn never blocks on a permission gate — the same
+/// contract delegates use. Caller owns closing the returned session.
 async fn open_evaluator_session(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -550,7 +616,7 @@ async fn open_evaluator_session(
             .map_err(|e| format!("start_downstream: {e}"))?;
     }
 
-    open_downstream_session(
+    let opened = open_downstream_session(
         shared,
         candidate,
         cwd,
@@ -562,7 +628,55 @@ async fn open_evaluator_session(
         },
     )
     .await
-    .map_err(|e| format!("session/new: {e}"))
+    .map_err(|e| format!("session/new: {e}"))?;
+
+    // Critical: without auto/bypass the Claude ACP adapter waits forever on
+    // permission prompts even for a tool-less classify turn — observed as a
+    // clean prompt-budget timeout with empty capture (rtr-e743ca2c…).
+    let available_modes: Vec<String> = opened
+        .modes
+        .as_ref()
+        .map(|m| {
+            m.available_modes
+                .iter()
+                .map(|mode| mode.id.0.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if available_modes.is_empty() {
+        tracing::info!(
+            session = router_sid,
+            candidate = %candidate,
+            "pre-class evaluator advertises no session modes; proceeding without set_mode"
+        );
+    } else {
+        match resolve_mode_id(shared, &candidate.agent, "auto", &available_modes) {
+            Some(mode_id) => {
+                let set =
+                    SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
+                if let Err(err) = opened.conn.send_request(set).block_task().await {
+                    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                    return Err(format!(
+                        "set_mode auto ({mode_id}) rejected: {err}; modes={available_modes:?}"
+                    ));
+                }
+                tracing::info!(
+                    session = router_sid,
+                    candidate = %candidate,
+                    applied = %mode_id,
+                    "pre-class evaluator session mode applied"
+                );
+            }
+            None => {
+                close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                return Err(format!(
+                    "no auto mode among advertised modes {available_modes:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(opened)
 }
 
 /// Emit disclosure lines for a pre-class result (start was optional; done is always).
