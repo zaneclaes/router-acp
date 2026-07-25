@@ -216,16 +216,18 @@ pub fn apply_thresholds(
     latency_ms: u64,
     raw_log: &str,
 ) -> PreClassResult {
+    // Client-visible log stays compact: no "raw reply" dump (that leaked into
+    // the chat as a giant JSON code block + dual classify cards). Full raw
+    // stays in tracing for operators.
+    if !raw_log.is_empty() {
+        tracing::debug!(raw = %raw_log, "pre-class evaluator raw reply");
+    }
     let mut log = String::new();
     log.push_str(&format!(
         "router-acp · pre-class · evaluator={} · {}ms\n",
         evaluator.unwrap_or("(none)"),
         latency_ms
     ));
-    log.push_str(raw_log);
-    if !raw_log.ends_with('\n') {
-        log.push('\n');
-    }
 
     let mut acted_modes = Vec::new();
     let mut injects = Vec::new();
@@ -684,17 +686,17 @@ pub fn disclose(shared: &Arc<Shared>, router_sid: &str, result: &PreClassResult)
     if !shared.cfg.pre_classifier.disclose {
         return;
     }
-    // Multi-line log as a single notification block so FE can parse it.
-    crate::session::notify_user(shared, router_sid, result.log.trim_end().to_string());
-    // Structured meta-friendly one-liner with JSON summary (stable prefix).
-    crate::session::notify_user(
-        shared,
-        router_sid,
-        format!(
-            "router-acp · pre-class summary · {}",
-            result.summary
-        ),
-    );
+    // ONE multi-line block: log + summary. Two separate notify_user calls
+    // made the FE peel two classify cards for a single evaluation.
+    let mut block = result.log.trim_end().to_string();
+    if !block.is_empty() && !block.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push_str(&format!(
+        "router-acp · pre-class summary · {}",
+        result.summary
+    ));
+    crate::session::notify_user(shared, router_sid, block);
 }
 
 /// Default description for the built-in orchestrate dimension (docs / tests).
