@@ -1,5 +1,11 @@
 state_file: ~/.local/state/router-acp/sessions.db
 
+# EXAMPLE config for standalone / non-Hickory deployments of router-acp.
+# Hickory engineer workstations do NOT load this file — their source of truth
+# is hickory-ai's `kory-code/router.yaml`, shipped by `dev-env code-install`.
+# Keep this example useful for new router-acp consumers; Hickory routing policy
+# changes land in the monorepo file, not here.
+#
 # Opt in only after the adapter-specific endpoints and `api_model` ids below
 # have been verified. This moves routing from one decision per ACP turn to one
 # decision per provider inference request while preserving auth and SSE.
