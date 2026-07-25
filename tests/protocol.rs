@@ -1363,6 +1363,109 @@ async fn mid_session_rate_limit_fails_over_on_later_prompt() {
 }
 
 #[tokio::test]
+async fn context_overflow_fails_over_to_a_larger_window_and_carries_a_transcript() {
+    // The dead-end this reproduces: a resumed session pinned on a small-window
+    // model hits `Compacting failed: too_few_groups` then `Prompt is too long`.
+    // Before ContextOverflow existed this classified as `Other`, which
+    // suppresses failover outright — the turn just errored. It must now fail
+    // over, and specifically toward the candidate with the ROOMIER window
+    // (never the same-size one, which would hit the identical wall), seeding
+    // the fresh session with a transcript so it isn't blind.
+    let state = temp_state_file("ctx-overflow");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"fancy/*\", context_window: 50000, default_quality: 0.9 }\n\
+         \x20 - { pattern: \"cheap/*\", context_window: 1000000, default_quality: 0.1 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "fancy",
+            &[("opus", 3)],
+            &[
+                ("MOCK_FAIL_PROMPT_MSG", "Compacting failed: too_few_groups"),
+                ("MOCK_FAIL_PROMPT_AFTER", "1"),
+            ]
+        ),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+
+        // Turn 1 works on fancy (the higher-quality, smaller-window pick).
+        let resp = prompt_text(&cx, &sid, "turn one").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert!(agent_text(&observed, &sid).contains("echo:opus:turn one"));
+
+        // Turn 2 overflows fancy's window and must fail over to cheap — the
+        // ONLY other candidate, and it happens to have the larger window, so
+        // this also exercises the larger-context preference.
+        let resp = prompt_text(&cx, &sid, "turn two").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("fancy/opus could not fit this turn in its context window"),
+            "overflow disclosed with the right symptom, not generic \"unavailable\": {text}"
+        );
+        assert!(
+            text.contains("context overflow"),
+            "human-readable reason surfaced: {text}"
+        );
+        assert!(
+            !text.contains("token/usage limit"),
+            "must not be cordoned as a usage limit — the model is healthy: {text}"
+        );
+        assert!(
+            text.contains("failover: auto → cheap/haiku"),
+            "failed over to the larger-window candidate: {text}"
+        );
+        assert!(
+            text.contains("carrying a truncated transcript"),
+            "fresh session told it isn't starting blind: {text}"
+        );
+        assert!(
+            text.contains("prior context carried over as a truncated transcript"),
+            "the failover note reflects that context DID transfer here: {text}"
+        );
+        assert!(
+            !text.contains("context from earlier turns does not"),
+            "the generic cold-failover note must not contradict the handoff: {text}"
+        );
+        // The new pin answered, and what it received began with the handoff
+        // block carrying the earlier turn — not a blind `turn two`.
+        assert!(text.contains("echo:haiku:"), "answer arrived: {text}");
+        assert!(
+            text.contains("Assistant: echo:opus:turn one"),
+            "the earlier turn reached the new model: {text}"
+        );
+
+        // fancy must not be cordoned/quarantined by the overflow: a later
+        // session should still be able to pin it fresh (no accumulated
+        // transcript, so no reason to avoid it).
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        let resp2 = prompt_text(&cx, &sid2, "fresh session").await?;
+        assert_eq!(resp2.stop_reason, StopReason::EndTurn);
+        assert!(
+            agent_text(&observed, &sid2).contains("auto → fancy/opus"),
+            "fancy still routeable after an overflow (not cordoned): {}",
+            agent_text(&observed, &sid2)
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn no_failover_after_output_streamed() {
     let state = temp_state_file("no-failover");
     let yaml = format!(

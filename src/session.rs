@@ -2416,6 +2416,14 @@ pub(crate) fn apply_failure(
             msg.truncate(160);
             format!("outage ({msg})")
         }
+        FailureClass::ContextOverflow => {
+            // Deliberately no cordon and no quarantine: the model is healthy,
+            // this session simply outgrew its window. Sidelining the agent
+            // would penalize every other session for one big transcript.
+            let mut msg = format!("{err}");
+            msg.truncate(160);
+            format!("context overflow ({msg})")
+        }
         FailureClass::Other => {
             let mut msg = format!("{err}");
             msg.truncate(160);
@@ -2459,11 +2467,36 @@ async fn revive_dead_targets(shared: &Arc<Shared>) {
     }
 }
 
+/// Narrow a routing pool to candidates whose context window is strictly larger
+/// than `min`. Returns the pool untouched when nothing is roomier (or no window
+/// is known), so a context-overflow re-pin degrades to normal ranking instead of
+/// failing the turn — a fresh session on an equal window usually fits anyway,
+/// since it no longer carries the transcript that overflowed.
+fn prefer_larger_context(
+    scores: &ScoreTable,
+    pool: Vec<CandidateView>,
+    min: u64,
+) -> Vec<CandidateView> {
+    let roomier: Vec<CandidateView> = pool
+        .iter()
+        .filter(|v| {
+            scores
+                .lookup(&v.id)
+                .context_window
+                .is_some_and(|window| window > min)
+        })
+        .cloned()
+        .collect();
+    if roomier.is_empty() { pool } else { roomier }
+}
+
 /// Pick a candidate for this session, open + verify its downstream session,
 /// commit the pin, apply any deferred/previous session mode, persist, and
 /// disclose the decision (and every skipped candidate) to the user.
 ///
 /// `exclude` removes the just-failed candidate during a failover re-pin.
+/// `larger_context_than` is set when that failure was a context overflow: the
+/// pool then prefers a window strictly larger than the one that overflowed.
 async fn pin_session(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -2471,6 +2504,7 @@ async fn pin_session(
     cancellation: &RequestCancellation,
     exclude: Option<&CandidateId>,
     is_failover: bool,
+    larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
     let (cwd, dirs, client_mcp, strategy, override_, run_label) = shared
         .with_session(router_sid, |s| {
@@ -2540,6 +2574,9 @@ async fn pin_session(
     }
     if !excluded_patterns.is_empty() {
         pool.retain(|v| !is_excluded(&v.id, &excluded_patterns));
+    }
+    if let Some(min) = larger_context_than {
+        pool = prefer_larger_context(&shared.scores, pool, min);
     }
     // All-cordoned "least-bad" fallback: if the pool is empty only because every
     // candidate is usage-cordoned, route to the one whose cordon resets soonest
@@ -2916,11 +2953,20 @@ async fn pin_session(
                     ));
                 }
                 if is_failover {
-                    lines.push(
+                    // A context-overflow failover seeds a log-transcript handoff
+                    // before re-pinning; every other failover starts cold.
+                    let carried = shared
+                        .with_session(router_sid, |s| s.pending_context.is_some())
+                        .unwrap_or(false);
+                    lines.push(if carried {
+                        "note: prior context carried over as a truncated transcript \
+                         reconstructed from router-acp's logs"
+                            .to_string()
+                    } else {
                         "note: conversation context from earlier turns does not \
                          transfer to the new model"
-                            .to_string(),
-                    );
+                            .to_string()
+                    });
                 }
 
                 // Queue the human-readable disclosure to ride the model's
@@ -3233,6 +3279,14 @@ async fn send_prompt_with_failover(
                     && !matches!(class, FailureClass::Other)
                     && attempt < max_attempts;
 
+                // "unavailable" misdescribes an overflow — the model answered,
+                // it just could not hold this turn.
+                let symptom = if matches!(class, FailureClass::ContextOverflow) {
+                    "could not fit this turn in its context window"
+                } else {
+                    "unavailable"
+                };
+
                 if !can_fail_over {
                     if !matches!(class, FailureClass::Other) {
                         let detail = if saw_output {
@@ -3243,7 +3297,7 @@ async fn send_prompt_with_failover(
                         notify_user(
                             &shared,
                             &router_sid,
-                            format!("router-acp · {candidate} unavailable — {human}{detail}"),
+                            format!("router-acp · {candidate} {symptom} — {human}{detail}"),
                         );
                     }
                     // The turn ends in error, so no model chunk will carry the
@@ -3259,11 +3313,36 @@ async fn send_prompt_with_failover(
                     error = %err,
                     "pinned candidate failed; attempting failover"
                 );
+                let tail = if matches!(class, FailureClass::ContextOverflow) {
+                    "; starting a fresh session on another candidate, carrying a truncated \
+                     transcript of the work across"
+                } else {
+                    "; failing over…"
+                };
                 notify_user(
                     &shared,
                     &router_sid,
-                    format!("router-acp · {candidate} unavailable — {human}; failing over…"),
+                    format!("router-acp · {candidate} {symptom} — {human}{tail}"),
                 );
+
+                // An overflow is only recovered by a session that does not carry
+                // the transcript that overflowed — but the fresh pin would then
+                // start blind, so seed it with the same log-transcript handoff
+                // `switch_pin` uses when the outgoing model cannot summarize.
+                // That transcript is budget-capped, so it cannot re-overflow.
+                let overflowed = matches!(class, FailureClass::ContextOverflow);
+                if overflowed {
+                    let transcript = transcript_from_logs(&shared, &router_sid);
+                    if !transcript.trim().is_empty() {
+                        let framed = frame_transcript(&candidate, &transcript);
+                        shared.with_session(&router_sid, |s| s.pending_context = Some(framed));
+                    }
+                }
+                // Re-pinning to an equally small window can hit the same wall
+                // when the prompt itself is the oversized part.
+                let larger_context_than = overflowed
+                    .then(|| shared.scores.lookup(&candidate).context_window)
+                    .flatten();
 
                 // Tear down the failed downstream session and re-pin.
                 let old_key = shared
@@ -3281,6 +3360,7 @@ async fn send_prompt_with_failover(
                     &responder.cancellation(),
                     Some(&candidate),
                     true,
+                    larger_context_than,
                 )
                 .await
                 {
@@ -4562,6 +4642,7 @@ async fn route_and_pin(
         &responder.cancellation(),
         None,
         false,
+        None,
     )
     .await;
     shared.with_session(&router_sid, |s| s.pinning = false);

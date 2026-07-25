@@ -30,6 +30,12 @@ pub enum FailureClass {
     /// The downstream is unreachable: process died, connection closed,
     /// request timed out, provider overloaded.
     Outage,
+    /// The turn does not fit the pinned model's context window — the prompt, or
+    /// a resumed session's accumulated transcript, overflowed it and the
+    /// adapter's own compaction did not rescue it. The model itself is healthy,
+    /// so the caller fails over (fresh session, roomier window) and cordons
+    /// nothing.
+    ContextOverflow,
     /// Anything else (bad params, refusals, ...): surface to the caller.
     Other,
 }
@@ -41,6 +47,12 @@ fn error_text(err: &AcpError) -> String {
 /// Classify a downstream error.
 pub fn classify_failure(err: &AcpError) -> FailureClass {
     let text = error_text(err).to_lowercase();
+    // Checked before the limit patterns: some overflow phrasings carry the word
+    // "limit" ("input length and `max_tokens` exceed context limit"), and a
+    // window that is too small is never fixed by waiting for a reset.
+    if is_context_overflow_text(&text) {
+        return FailureClass::ContextOverflow;
+    }
     if is_rate_limit_text(&text) {
         return FailureClass::RateLimited {
             retry_after: parse_reset_delay_at(&text, SystemTime::now()),
@@ -77,6 +89,25 @@ pub fn is_spend_limit_text(lower: &str) -> bool {
         || lower.contains("monthly limit")
         || lower.contains("credit limit")
         || lower.contains("credit balance")
+}
+
+/// The turn exceeded the model's context window. Claude Code surfaces this as
+/// `Prompt is too long`, often preceded by `Compacting failed: too_few_groups`
+/// when its auto-compaction could not shrink the transcript; OpenAI-shaped
+/// layers use `context_length_exceeded`. Before this these read as plain
+/// refusals and classified as `Other`, so no failover happened and the turn
+/// dead-ended — which is the worst possible answer, since a fresh session on a
+/// roomier window recovers it.
+pub fn is_context_overflow_text(lower: &str) -> bool {
+    lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || lower.contains("conversation is too long")
+        || lower.contains("context length")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("context window")
+        || lower.contains("exceed context limit")
+        || lower.contains("compacting failed")
+        || lower.contains("too_few_groups")
 }
 
 pub fn is_outage_text(lower: &str) -> bool {
@@ -338,6 +369,36 @@ mod tests {
 
         let other = AcpError::invalid_params().data("unknown config id");
         assert_eq!(classify_failure(&other), FailureClass::Other);
+    }
+
+    #[test]
+    fn context_overflow_is_recognized_and_not_a_plain_refusal() {
+        // The exact dead-end from a resumed session: Claude Code's own
+        // compaction fails first, then the prompt itself is rejected as too
+        // long. Before `ContextOverflow` existed both fell through to `Other`,
+        // which suppresses failover — the session just errors out.
+        let compacting = AcpError::internal_error().data("Compacting failed: too_few_groups");
+        assert_eq!(classify_failure(&compacting), FailureClass::ContextOverflow);
+
+        let too_long = AcpError::internal_error().data("Prompt is too long");
+        assert_eq!(classify_failure(&too_long), FailureClass::ContextOverflow);
+
+        let openai_shaped = AcpError::invalid_params()
+            .data("This model's maximum context length is exceeded: context_length_exceeded");
+        assert_eq!(
+            classify_failure(&openai_shaped),
+            FailureClass::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn context_overflow_is_checked_before_generic_limit_wording() {
+        // Some overflow phrasings contain the word "limit" — must not be
+        // misclassified as a waitable rate limit (waiting never shrinks a
+        // transcript).
+        let err = AcpError::internal_error()
+            .data("input length and `max_tokens` exceed context limit: 200000");
+        assert_eq!(classify_failure(&err), FailureClass::ContextOverflow);
     }
 
     #[test]
