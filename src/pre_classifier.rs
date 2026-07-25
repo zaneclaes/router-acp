@@ -388,7 +388,7 @@ fn fail_open(
         summary: json!({
             "ok": false,
             "skip_reason": reason,
-            "evaluator": null,
+            "evaluator": evaluator,
             "latency_ms": latency_ms,
             "acted_modes": ["none"],
         }),
