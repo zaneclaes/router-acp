@@ -18,8 +18,15 @@ use regex::Regex;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureClass {
     /// Token/usage/rate limit. `retry_after` is parsed from the error when
-    /// the model reported its reset time.
-    RateLimited { retry_after: Option<Duration> },
+    /// the model reported its reset time. `spend_scoped` marks the limits that
+    /// cap the seat's *money* (monthly spend / credit balance) rather than one
+    /// agent's plan window: only the model whose plan budget was already spent
+    /// needs that money, so the caller cordons that candidate instead of the
+    /// whole agent.
+    RateLimited {
+        retry_after: Option<Duration>,
+        spend_scoped: bool,
+    },
     /// The downstream is unreachable: process died, connection closed,
     /// request timed out, provider overloaded.
     Outage,
@@ -37,6 +44,7 @@ pub fn classify_failure(err: &AcpError) -> FailureClass {
     if is_rate_limit_text(&text) {
         return FailureClass::RateLimited {
             retry_after: parse_reset_delay_at(&text, SystemTime::now()),
+            spend_scoped: is_spend_limit_text(&text),
         };
     }
     if is_outage_text(&text) {
@@ -56,6 +64,19 @@ pub fn is_rate_limit_text(lower: &str) -> bool {
         || lower.contains("limit reached")
         || lower.contains("out of credits")
         || lower.contains("credits_exhausted")
+        || is_spend_limit_text(lower)
+}
+
+/// A spend/credit cap on the seat's money, e.g. "You've hit your monthly spend
+/// limit". These read as plain refusals to a substring matcher tuned for
+/// "rate limit"/"quota" phrasing, so before this they classified as `Other` and
+/// no failover happened at all.
+pub fn is_spend_limit_text(lower: &str) -> bool {
+    lower.contains("spend limit")
+        || lower.contains("spending limit")
+        || lower.contains("monthly limit")
+        || lower.contains("credit limit")
+        || lower.contains("credit balance")
 }
 
 pub fn is_outage_text(lower: &str) -> bool {
@@ -307,7 +328,8 @@ mod tests {
         assert!(matches!(
             classify_failure(&limit),
             FailureClass::RateLimited {
-                retry_after: Some(_)
+                retry_after: Some(_),
+                spend_scoped: false
             }
         ));
 
@@ -316,6 +338,29 @@ mod tests {
 
         let other = AcpError::invalid_params().data("unknown config id");
         assert_eq!(classify_failure(&other), FailureClass::Other);
+    }
+
+    #[test]
+    fn monthly_spend_limit_is_a_rate_limit_and_scoped_to_spend() {
+        // The live error text. Before spend phrasing was recognized this fell
+        // through to `Other`, which suppresses failover entirely.
+        let text = "You've hit your monthly spend limit".to_lowercase();
+        assert!(is_rate_limit_text(&text));
+        assert!(is_spend_limit_text(&text));
+
+        let err = AcpError::internal_error().data("You've hit your monthly spend limit");
+        assert_eq!(
+            classify_failure(&err),
+            FailureClass::RateLimited {
+                retry_after: None,
+                spend_scoped: true
+            }
+        );
+
+        // A plan-window limit is still agent-scoped, not spend-scoped.
+        assert!(!is_spend_limit_text(
+            "claude ai usage limit reached|1752530400"
+        ));
     }
 
     #[test]
