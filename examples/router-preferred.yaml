@@ -62,7 +62,6 @@ agents:
     # the per-request proxy: rewriting the request body's `model` to a CLI alias
     # gets a 404 from api.anthropic.com. Values below verified against the ids
     # claude-agent-acp actually puts on the wire for each alias.
-    models:
     # Cache rates are load-bearing, not decoration: without them
     # `cache_reprime_break_even` returns 0 and the cache-aware demotion gate is
     # inert, leaving `minimum_dwell_requests` as the only (blunt) thrash guard.

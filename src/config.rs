@@ -1618,4 +1618,32 @@ agents:
             vec!["--config", "/home/zane/cfg.yaml", "--flag"]
         );
     }
+
+    /// The shipped examples are not documentation — `router-preferred.yaml` is
+    /// fetched at the pinned rev and installed as the box's actual defaults, so a
+    /// malformed one breaks every session's provider launch. Nothing used to parse
+    /// them, and a duplicate `models:` key introduced while adding a comment block
+    /// shipped and reached a box before `check-config` caught it.
+    #[test]
+    fn shipped_example_configs_parse_and_validate() {
+        for (name, yaml) in [
+            (
+                "router-preferred.yaml",
+                include_str!("../examples/router-preferred.yaml"),
+            ),
+            (
+                "router-full.yaml",
+                include_str!("../examples/router-full.yaml"),
+            ),
+        ] {
+            let cfg = Config::from_yaml(yaml)
+                .unwrap_or_else(|e| panic!("examples/{name} must parse: {e}"));
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("examples/{name} must validate: {e}"));
+            assert!(
+                !cfg.agents.is_empty(),
+                "examples/{name} must define at least one agent"
+            );
+        }
+    }
 }
