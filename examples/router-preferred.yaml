@@ -79,7 +79,10 @@ agents:
           api_model: claude-sonnet-5,
           pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00,
                      cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 } }
-      - { id: "opus[1m]", display_name: Claude Opus 1M, cost_rank: 4,
+      # Claude Opus 5 — API id `claude-opus-5` (not 4.8). Same list price as
+      # 4.8 ($5/$25, cache 0.1×/1.25× of input). CLI alias remains `opus[1m]`
+      # (1M context is the only Opus 5 window).
+      - { id: "opus[1m]", display_name: Claude Opus 5 1M, cost_rank: 4,
           api_model: claude-opus-5,
           pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
                      cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
@@ -232,8 +235,10 @@ availability_preference:
 orchestration:
   enabled: true
   min_items: 2                              # smallest list treated as multi-part
-  planner: ["*fable*", "*sol*", "*grok-4.5*"] # best first
-  reviewer: ["*sol*", "*fable*", "*grok-4.5*"] # a different lineage will be preferred
+  # Opus 5 outranks Grok 4.5 on quality (see data/scores.yaml); keep Fable /
+  # Sol first as absolute frontiers, then Opus, then Grok as cross-lineage.
+  planner: ["*fable*", "*sol*", "*opus*", "*grok-4.5*"] # best first
+  reviewer: ["*sol*", "*opus*", "*fable*", "*grok-4.5*"] # different lineage preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
@@ -282,4 +287,5 @@ ticket_context:
 # re-pin). Candidates are candidate globs in preference order.
 skill_routing:
   - pattern: ship-pr
-    candidates: ["*grok*", "*opus*", "*gpt-5.5*"]
+    # Opus 5 > Grok 4.5 on quality; prefer Opus when the Claude seat is free.
+    candidates: ["*opus*", "*grok*", "*gpt-5.5*"]

@@ -153,8 +153,8 @@ agents:
         cost_rank: 2            # 1 = cheapest/least scarce
         pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00, cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 }
       - id: opus
-        display_name: Claude Opus
-        api_model: claude-opus-4-8
+        display_name: Claude Opus 5
+        api_model: claude-opus-5
         cost_rank: 3
         pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }
 

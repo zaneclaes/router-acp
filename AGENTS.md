@@ -236,7 +236,7 @@ SDK traps below, which were all discovered the hard way.
   mock-driven end-to-end test (`proxy_streams_rewrites_preserves_auth_and_accounts_requests`,
   `protocol: anthropic`) proves demotion+rewrite+accounting+fallback on the
   Anthropic wire; the demotion-target `api_model` ids (`claude-sonnet-5`,
-  `claude-opus-4-8`) are valid on the subscription OAuth `/v1/messages` endpoint.
+  `claude-opus-5`) are valid on the subscription OAuth `/v1/messages` endpoint.
   **Anthropic cache caveat + the cache-reprime gate:** prompt caching is
   per-model, so a mid-session demotion forfeits the incumbent's warm cache and
   the switch turn pays the cheaper model's cache-*write* rate to re-prime the

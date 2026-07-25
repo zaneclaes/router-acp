@@ -449,10 +449,12 @@ fn default_min_items() -> usize {
 }
 
 fn default_planner() -> Vec<String> {
+    // Opus 5 outranks Grok 4.5; prefer it over gpt-5.5 when both are free.
     vec![
         "*sol*".to_string(),
         "*fable*".to_string(),
         "*opus*".to_string(),
+        "*grok*".to_string(),
         "*gpt-5.5*".to_string(),
     ]
 }
@@ -463,6 +465,7 @@ fn default_reviewer() -> Vec<String> {
         "*sol*".to_string(),
         "*opus*".to_string(),
         "*fable*".to_string(),
+        "*grok*".to_string(),
     ]
 }
 

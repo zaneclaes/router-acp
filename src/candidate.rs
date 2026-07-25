@@ -417,6 +417,33 @@ mod score_resolution_tests {
         );
     }
 
+    /// Opus 5 is a step-change over 4.8 and outranks Grok 4.5 on quality while
+    /// remaining a notch under Fable (and cheaper than Fable at cost_rank 4).
+    #[test]
+    fn opus5_outranks_grok_and_sits_under_fable() {
+        let t = ScoreTable::builtin();
+        let opus = t.lookup(&CandidateId::parse("claude/opus[1m]").unwrap());
+        let grok = t.lookup(&CandidateId::parse("grok/grok-4.5").unwrap());
+        let fable = t.lookup(&CandidateId::parse("claude/claude-fable-5[1m]").unwrap());
+        assert_eq!(opus.coding_tier, CodingTier::High);
+        assert!(
+            opus.quality(TaskClass::CodingGeneral) > grok.quality(TaskClass::CodingGeneral),
+            "opus5 ({}) must beat grok-4.5 ({})",
+            opus.quality(TaskClass::CodingGeneral),
+            grok.quality(TaskClass::CodingGeneral)
+        );
+        assert!(
+            fable.quality(TaskClass::CodingGeneral) > opus.quality(TaskClass::CodingGeneral),
+            "fable stays slightly ahead of opus5 for cost-aware auto"
+        );
+        // Wire alias `claude-opus-5` and legacy `claude-opus-4` both match `*opus*`.
+        let by_api_id = t.lookup(&CandidateId::new("claude", "claude-opus-5"));
+        assert_eq!(
+            by_api_id.quality(TaskClass::BugFix),
+            opus.quality(TaskClass::BugFix)
+        );
+    }
+
     #[test]
     fn sol_line_scores_at_the_top_and_beats_generic_gpt5() {
         let t = ScoreTable::builtin();

@@ -149,7 +149,7 @@ const GOLDEN: &[Golden] = &[
         class: TaskClass::Architecture,
         complexity: 0.72,
         winner: "claude/opus[1m]",
-        utility: 1.01,
+        utility: 1.02,
     },
     Golden {
         prompt: "investigate why the integration suite is flaky: there's a race between the \
@@ -157,12 +157,12 @@ const GOLDEN: &[Golden] = &[
         class: TaskClass::Research,
         complexity: 0.26,
         winner: "claude/opus[1m]",
-        utility: 0.80,
+        utility: 0.83,
     },
     Golden {
         prompt: "implement an OAuth2 login flow with refresh tokens and secure token storage",
         class: TaskClass::Feature,
-        complexity: 0.09,
+        complexity: 0.08,
         winner: "claude/sonnet",
         utility: 0.84,
     },
@@ -172,7 +172,7 @@ const GOLDEN: &[Golden] = &[
         class: TaskClass::Architecture,
         complexity: 0.39,
         winner: "claude/opus[1m]",
-        utility: 0.87,
+        utility: 0.88,
     },
     Golden {
         prompt: "spend as long as you need investigating this deep cross-cutting bug that \

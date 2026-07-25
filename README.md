@@ -328,7 +328,7 @@ agents:
       upstream_base_url: https://api.anthropic.com
     models:
       - id: opus
-        api_model: claude-opus-4-6  # only if the ACP id is an API-invalid alias
+        api_model: claude-opus-5  # only if the ACP id is an API-invalid alias
         cost_rank: 3
       - { id: sonnet, cost_rank: 2 }
 ```

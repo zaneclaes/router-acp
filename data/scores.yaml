@@ -18,26 +18,27 @@ candidates:
     coding_percentile: 0.97
     context_window: 1000000
     max_output_tokens: 128000
-    # Fable and Opus are close-tier frontier models. The quality gap over Opus
-    # is deliberately kept NARROW (~0.02/class) so `auto` doesn't over-select
+    # Fable 5 and Opus 5 are close-tier frontier models. Anthropic prices Opus 5
+    # at half of Fable with "frontier intelligence" parity claims; we keep a
+    # NARROW quality gap over Opus (~0.02/class) so `auto` doesn't over-select
     # Fable: since Opus is a notch cheaper (cost_rank 4 vs 5) it then wins the
     # everyday/medium tasks on cost, while Fable stays marginally ahead so it
     # still wins the hardest prompts (where the complexity-scaled tradeoff leans
     # hard on quality). Widen this gap to send more traffic back to Fable;
     # narrow it (toward Opus's numbers) to send even the hard tasks to Opus.
-    # These are still comfortably above Sonnet, so nothing skews down-tier.
-    default_quality: 0.87
+    # Both sit above Grok 4.5 and Sonnet.
+    default_quality: 0.92
     quality:
-      UiTweak: 0.87
-      BugFix: 0.92
-      Feature: 0.92
-      Refactor: 0.92
-      Algorithms: 0.94
+      UiTweak: 0.91
+      BugFix: 0.95
+      Feature: 0.95
+      Refactor: 0.95
+      Algorithms: 0.96
       Architecture: 0.97
-      Research: 0.92
-      Writing: 0.92
-      Ops: 0.87
-      CodingGeneral: 0.92
+      Research: 0.95
+      Writing: 0.94
+      Ops: 0.91
+      CodingGeneral: 0.95
 
   # GPT "sol / terra / luna" lines (ids like `gpt-5.6-sol`). Kept above the
   # `*gpt-5*` patterns so a `gpt-5.6-sol` id doesn't fall through to the generic
@@ -98,23 +99,27 @@ candidates:
       Ops: 0.6
       CodingGeneral: 0.6
 
+  # Claude Opus 5 (`claude-opus-5` / CLI alias `opus[1m]`). Step-change over
+  # Opus 4.8; prices match 4.8 ($5/$25) and sit at half of Fable. Quality is
+  # above Grok 4.5 and just under Fable so cost-aware auto prefers Opus for
+  # most hard work and only escalates to Fable when quality is decisive.
   - pattern: "*opus*"
     coding_tier: high
-    coding_percentile: 0.9
+    coding_percentile: 0.93
     context_window: 1000000
     max_output_tokens: 128000
-    default_quality: 0.85
+    default_quality: 0.90
     quality:
-      UiTweak: 0.85
-      BugFix: 0.9
-      Feature: 0.9
-      Refactor: 0.9
-      Algorithms: 0.92
-      Architecture: 0.95
-      Research: 0.9
-      Writing: 0.9
-      Ops: 0.85
-      CodingGeneral: 0.9
+      UiTweak: 0.90
+      BugFix: 0.93
+      Feature: 0.93
+      Refactor: 0.93
+      Algorithms: 0.94
+      Architecture: 0.96
+      Research: 0.93
+      Writing: 0.92
+      Ops: 0.90
+      CodingGeneral: 0.93
 
   - pattern: "*sonnet*"
     coding_tier: high
@@ -212,9 +217,10 @@ candidates:
     default_quality: 0.55
 
   # xAI Grok — BEST-GUESS estimates (no seat-benchmark data yet). grok-4.5 is
-  # xAI's current frontier ≈ opus/sol tier; grok-code-fast is a cheap, fast,
-  # coding-tuned model ≈ sonnet-tier coding at haiku-ish cost. `*grok*code*`
-  # MUST precede `*grok*` (first-match-wins). Tune once you've run real tasks.
+  # xAI's current frontier, a notch under Claude Opus 5 / Fable 5 on quality
+  # (and cheaper); grok-code-fast is a cheap, fast, coding-tuned model ≈
+  # sonnet-tier coding at haiku-ish cost. `*grok*code*` MUST precede `*grok*`
+  # (first-match-wins). Tune once you've run real tasks.
   - pattern: "*grok*code*"           # grok-code-fast-* (cheap fast coder)
     coding_tier: medium
     coding_percentile: 0.62
