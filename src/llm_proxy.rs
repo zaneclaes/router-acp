@@ -65,6 +65,9 @@ struct RequestPolicyState {
     /// rewrite is not re-attempted every request — each attempt costs a wasted
     /// round trip and is logged as a non-delegation, making it invisible.
     rejected_api_models: std::collections::HashSet<String>,
+    /// `{event}:{model}` pairs already disclosed to the user this session, so an
+    /// anomaly is surfaced once rather than on every request that hits it.
+    disclosed_events: std::collections::HashSet<String>,
 }
 
 /// Shared proxy runtime. Constructed with `Shared`, bound when `serve_shared`
@@ -460,6 +463,14 @@ async fn proxy_request(
                             .as_ref()
                             .map(|decision| decision.estimated_input)
                             .unwrap_or_else(|| estimate_request_tokens(&body));
+                        // Name the model that was rejected. Without it the record
+                        // read "alternate model returned HTTP 404" with from and to
+                        // both showing the pinned model — true but useless for
+                        // finding the misconfigured `api_model`.
+                        let attempted = decision
+                            .as_ref()
+                            .map(|decision| decision.model.clone())
+                            .unwrap_or_else(|| "<unknown>".to_string());
                         decision = Some(RequestDecision {
                             model: parsed
                                 .as_ref()
@@ -472,8 +483,9 @@ async fn proxy_request(
                             selected_model: active.candidate.model.clone(),
                             rewrite: false,
                             reason: format!(
-                                "alternate model returned HTTP {failed_status}; retried unchanged \
-                                 on the pinned model"
+                                "alternate model `{attempted}` returned HTTP {failed_status}; \
+                                 retried unchanged on {} (not retried again this session)",
+                                active.candidate
                             ),
                             event: "proxy-fallback".to_string(),
                             estimated_input,
@@ -622,15 +634,38 @@ fn start_request_record(
             ..Default::default()
         },
     );
-    if event != "steady" && event != "pass-through" && event != "dwell" && event != "cache-hold" {
-        state
-            .shared
-            .with_session(&active.parent_router_sid, |session| {
-                session.pending_disclosure.push(format!(
-                    "router-acp · request {event}: {} → {model_id} — {reason}",
-                    active.candidate
-                ));
-            });
+    // Per-request routing does NOT belong in the model's prose. There is one
+    // inference request per tool-call turn, so disclosing each one put a router
+    // block between every pair of messages for a whole session — and the same
+    // information is already carried per tool call (each call records the model
+    // that served it) and in full in the `llm_requests` table behind the
+    // analytics page. Routine events (demotion / escalation / verdict) are
+    // therefore silent here.
+    //
+    // An alternate the provider REJECTED is different: it is an anomaly the
+    // operator should see. Disclose it once per (event, model) per session — the
+    // rejection is also recorded so the model is not retried, but the dedup
+    // keeps a pre-fix binary or a transient rejection from flooding the
+    // transcript regardless.
+    if event == "proxy-fallback" {
+        let first_time = state
+            .runtime
+            .policy
+            .lock()
+            .unwrap()
+            .entry(active.state_sid.clone())
+            .or_default()
+            .disclosed_events
+            .insert(format!("{event}:{model_id}"));
+        if first_time {
+            state
+                .shared
+                .with_session(&active.parent_router_sid, |session| {
+                    session
+                        .pending_disclosure
+                        .push(format!("router-acp · {reason}"));
+                });
+        }
     }
     Some(CompletionContext {
         request_id: request_id.to_string(),
