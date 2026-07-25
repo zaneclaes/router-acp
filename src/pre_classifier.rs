@@ -378,7 +378,7 @@ fn fail_open(
     PreClassResult {
         ok: false,
         skip_reason: Some(reason.clone()),
-        evaluator,
+        evaluator: evaluator.clone(),
         latency_ms,
         orchestrate: None,
         dimensions: BTreeMap::new(),
