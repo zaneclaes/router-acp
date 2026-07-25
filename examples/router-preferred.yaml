@@ -257,7 +257,7 @@ orchestration:
 pre_classifier:
   enabled: false                            # opt in; Hickory enables in monorepo yaml
   evaluator: ["*haiku*", "*mini*", "*flash*"]
-  timeout_ms: 4000
+  timeout_ms: 15000                         # prompt-turn budget only (spawn + session/new excluded)
   disclose: true
   orchestrate_min_confidence: 0.65
   dimensions: []

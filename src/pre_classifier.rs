@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::candidate::{CandidateId, TaskClass};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
-    DownstreamRoute, Shared, close_downstream_session, first_eligible_candidate,
+    DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
     open_downstream_session, prompt_display_text,
 };
 
@@ -25,6 +25,11 @@ use crate::session::{
 pub const PRECLASS_MARKER: &str = "[router-acp pre-classifier]";
 
 const PROMPT_TRUNCATE: usize = 4000;
+
+/// Upper bound on the evaluator *open* phase (process spawn + `session/new`).
+/// A cold ACP open routinely takes seconds, so it gets its own generous budget
+/// instead of eating the prompt budget: `min(probe_timeout_ms, this)`.
+const OPEN_TIMEOUT_CAP_MS: u64 = 30_000;
 
 /// Structured outcome of one pre-class evaluation (success or fail-open).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,39 +435,70 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
         );
     };
 
-    let timeout = Duration::from_millis(pcfg.timeout_ms.max(1));
+    let cand_str = candidate.to_string();
     let capture = Arc::new(Mutex::new(String::new()));
-    let result = tokio::time::timeout(
-        timeout,
-        run_evaluator_session(
-            shared,
-            router_sid,
-            &candidate,
-            cwd,
-            dirs,
-            eval_prompt.clone(),
-            capture.clone(),
-        ),
+
+    // Phase 1 — spawn + session/new. Deliberately NOT on `timeout_ms`: a cold
+    // ACP open often outlives the prompt budget, which used to fail-open every
+    // real evaluation.
+    let open_timeout_ms = cfg.probe_timeout_ms.clamp(1, OPEN_TIMEOUT_CAP_MS);
+    let opened = match tokio::time::timeout(
+        Duration::from_millis(open_timeout_ms),
+        open_evaluator_session(shared, router_sid, &candidate, cwd, dirs, capture.clone()),
+    )
+    .await
+    {
+        Err(_) => {
+            return fail_open(
+                format!("evaluator session open timed out after {open_timeout_ms}ms"),
+                Some(cand_str),
+                started.elapsed().as_millis() as u64,
+                "",
+            );
+        }
+        Ok(Err(err)) => {
+            return fail_open(
+                format!("evaluator session open failed: {err}"),
+                Some(cand_str),
+                started.elapsed().as_millis() as u64,
+                "",
+            );
+        }
+        Ok(Ok(opened)) => opened,
+    };
+
+    // Phase 2 — the LLM generation, which is what `timeout_ms` budgets.
+    let open_ms = started.elapsed().as_millis() as u64;
+    let request = PromptRequest::new(
+        opened.downstream_sid.clone(),
+        vec![ContentBlock::from(eval_prompt)],
+    );
+    let turn = tokio::time::timeout(
+        Duration::from_millis(pcfg.timeout_ms.max(1)),
+        opened.conn.send_request(request).block_task(),
     )
     .await;
+    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
 
     let latency_ms = started.elapsed().as_millis() as u64;
-    let cand_str = candidate.to_string();
 
-    match result {
+    match turn {
         Err(_) => fail_open(
-            format!("evaluator timed out after {}ms", pcfg.timeout_ms),
+            format!(
+                "evaluator prompt timed out after {}ms (session open took {open_ms}ms)",
+                pcfg.timeout_ms
+            ),
             Some(cand_str),
             latency_ms,
             "",
         ),
         Ok(Err(err)) => fail_open(
-            format!("evaluator session failed: {err}"),
+            format!("evaluator session failed: session/prompt: {err}"),
             Some(cand_str),
             latency_ms,
             "",
         ),
-        Ok(Ok(())) => {
+        Ok(Ok(_)) => {
             let raw = capture.lock().unwrap().clone();
             // mock-agent echoes `echo:<model>:<text>` — strip that wrapper when present.
             let body = strip_mock_echo(&raw);
@@ -493,15 +529,16 @@ fn strip_mock_echo(raw: &str) -> String {
     raw.to_string()
 }
 
-async fn run_evaluator_session(
+/// Spawn the evaluator process if needed and open a tool-less session on it.
+/// Caller owns closing the returned session.
+async fn open_evaluator_session(
     shared: &Arc<Shared>,
     router_sid: &str,
     candidate: &CandidateId,
     cwd: std::path::PathBuf,
     dirs: Vec<std::path::PathBuf>,
-    eval_prompt: String,
     capture: Arc<Mutex<String>>,
-) -> Result<(), String> {
+) -> Result<OpenedSession, String> {
     // Ensure the target process is live (same as pin/delegate).
     let runtime = shared
         .candidate_runtime(candidate)
@@ -513,7 +550,7 @@ async fn run_evaluator_session(
             .map_err(|e| format!("start_downstream: {e}"))?;
     }
 
-    let opened = open_downstream_session(
+    open_downstream_session(
         shared,
         candidate,
         cwd,
@@ -521,20 +558,11 @@ async fn run_evaluator_session(
         Vec::<McpServer>::new(), // tool-less
         DownstreamRoute::Delegate {
             parent_router_sid: router_sid.to_string(),
-            capture: capture.clone(),
+            capture,
         },
     )
     .await
-    .map_err(|e| format!("session/new: {e}"))?;
-
-    let prompt = PromptRequest::new(
-        opened.downstream_sid.clone(),
-        vec![ContentBlock::from(eval_prompt)],
-    );
-    let turn = opened.conn.send_request(prompt).block_task().await;
-    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-    turn.map_err(|e| format!("session/prompt: {e}"))?;
-    Ok(())
+    .map_err(|e| format!("session/new: {e}"))
 }
 
 /// Emit disclosure lines for a pre-class result (start was optional; done is always).
@@ -578,7 +606,7 @@ agents:
         cfg.pre_classifier = PreClassifierConfig {
             enabled: true,
             evaluator: vec!["*m1*".into()],
-            timeout_ms: 4000,
+            timeout_ms: 15_000,
             disclose: true,
             orchestrate_min_confidence: 0.65,
             dimensions: dims,

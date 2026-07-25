@@ -546,6 +546,8 @@ pub struct PreClassifierConfig {
     /// Candidate globs for the evaluator seat, preference order (cheapest first).
     #[serde(default = "default_preclass_evaluator")]
     pub evaluator: Vec<String>,
+    /// Budget for the evaluator's prompt turn only — process spawn and
+    /// session/new are excluded (a cold ACP open alone can exceed it).
     #[serde(default = "default_preclass_timeout_ms")]
     pub timeout_ms: u64,
     /// Emit `router-acp · pre-class …` disclosure lines.
@@ -568,7 +570,7 @@ fn default_preclass_evaluator() -> Vec<String> {
 }
 
 fn default_preclass_timeout_ms() -> u64 {
-    4000
+    15_000
 }
 
 fn default_orchestrate_min_confidence() -> f64 {
