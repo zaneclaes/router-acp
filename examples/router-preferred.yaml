@@ -249,6 +249,29 @@ orchestration:
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
 
+# Composable LLM pre-classifier: one cheap ACP evaluation decides auto-
+# orchestration (and host dimensions) instead of regex task-list detection.
+# When disabled, orchestration falls back to tasklist::detect_task_list.
+# Hosts (e.g. Kory Code) register extra dimensions under `dimensions:`.
+# Hickory boxes load defaults from kory-code/router.yaml, not this example.
+pre_classifier:
+  enabled: false                            # opt in; Hickory enables in monorepo yaml
+  evaluator: ["*haiku*", "*mini*", "*flash*"]
+  timeout_ms: 4000
+  disclose: true
+  orchestrate_min_confidence: 0.65
+  dimensions: []
+  # Example host dimension (Kory Code registers ui_planning in monorepo yaml):
+  # dimensions:
+  #   - id: ui_planning
+  #     description: |
+  #       Is this a non-trivial UI-bearing request that should enter mockup-first
+  #       planning? mode is one of: planning | trivial-bypass | execution.
+  #     min_confidence: 0.70
+  #     act_when: { field: mode, equals: planning }
+  #     inject_prompt: |
+  #       [host guidance text…]
+
 # Demotion — the counterpart of escalation/auto-upgrade. An ELEVATED pin (one
 # the router raised for an escalation, an auto-upgrade, or a skill_routing
 # rule — never an explicit user pick) expires after this many consecutive

@@ -495,6 +495,99 @@ impl Default for OrchestrationConfig {
     }
 }
 
+/// When a host-registered pre-classifier dimension should inject its prompt.
+///
+/// YAML shapes:
+/// - `{ field: mode, equals: planning }` — string field match
+/// - `{ warranted: true }` — boolean `warranted` field is true
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ActWhen {
+    /// Act when `value[field] == equals` (string compare).
+    FieldEquals { field: String, equals: String },
+    /// Act when `value.warranted` equals this flag (usually `true`).
+    Warranted { warranted: bool },
+}
+
+impl Default for ActWhen {
+    fn default() -> Self {
+        ActWhen::Warranted { warranted: true }
+    }
+}
+
+/// One host-registered pre-classifier dimension (e.g. Kory's `ui_planning`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreClassDimension {
+    pub id: String,
+    /// Evaluator instruction for this dimension.
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_dim_min_confidence")]
+    pub min_confidence: f64,
+    #[serde(default)]
+    pub act_when: ActWhen,
+    /// Text injected into the user/agent turn when the dimension acts.
+    #[serde(default)]
+    pub inject_prompt: String,
+}
+
+fn default_dim_min_confidence() -> f64 {
+    0.70
+}
+
+/// Composable LLM pre-classifier: one cheap ACP evaluation returns structured
+/// decisions for auto-orchestration and host-registered dimensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreClassifierConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Candidate globs for the evaluator seat, preference order (cheapest first).
+    #[serde(default = "default_preclass_evaluator")]
+    pub evaluator: Vec<String>,
+    #[serde(default = "default_preclass_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Emit `router-acp · pre-class …` disclosure lines.
+    #[serde(default = "default_true")]
+    pub disclose: bool,
+    /// Minimum confidence to act on the built-in `orchestrate` dimension.
+    #[serde(default = "default_orchestrate_min_confidence")]
+    pub orchestrate_min_confidence: f64,
+    /// Host extensions (e.g. `ui_planning`). One evaluator call covers all.
+    #[serde(default)]
+    pub dimensions: Vec<PreClassDimension>,
+}
+
+fn default_preclass_evaluator() -> Vec<String> {
+    vec![
+        "*haiku*".to_string(),
+        "*mini*".to_string(),
+        "*flash*".to_string(),
+    ]
+}
+
+fn default_preclass_timeout_ms() -> u64 {
+    4000
+}
+
+fn default_orchestrate_min_confidence() -> f64 {
+    0.65
+}
+
+impl Default for PreClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            evaluator: default_preclass_evaluator(),
+            timeout_ms: default_preclass_timeout_ms(),
+            disclose: true,
+            orchestrate_min_confidence: default_orchestrate_min_confidence(),
+            dimensions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailoverConfig {
@@ -877,6 +970,9 @@ pub struct Config {
     /// Automatic orchestration of multi-part task lists.
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+    /// Composable LLM pre-classifier (orchestration + host dimensions).
+    #[serde(default)]
+    pub pre_classifier: PreClassifierConfig,
     /// Expiry of elevated pins (escalations, auto-upgrades, skill pins):
     /// demote back to a cheaper candidate after a run of quiet turns.
     #[serde(default)]
@@ -1402,6 +1498,50 @@ impl Config {
                     "orchestration.review_confidence must be within 0.0..=1.0, got `{}`",
                     self.orchestration.review_confidence
                 )));
+            }
+        }
+        if self.pre_classifier.enabled {
+            if self.pre_classifier.evaluator.is_empty() {
+                return Err(ConfigError(
+                    "pre_classifier.enabled is true but pre_classifier.evaluator is empty".into(),
+                ));
+            }
+            if self.pre_classifier.timeout_ms == 0 {
+                return Err(ConfigError(
+                    "pre_classifier.timeout_ms must be greater than 0".into(),
+                ));
+            }
+            if !(0.0..=1.0).contains(&self.pre_classifier.orchestrate_min_confidence) {
+                return Err(ConfigError(format!(
+                    "pre_classifier.orchestrate_min_confidence must be within 0.0..=1.0, got `{}`",
+                    self.pre_classifier.orchestrate_min_confidence
+                )));
+            }
+            let mut seen = HashSet::new();
+            for dim in &self.pre_classifier.dimensions {
+                if dim.id.trim().is_empty() {
+                    return Err(ConfigError(
+                        "pre_classifier.dimensions: id must not be empty".into(),
+                    ));
+                }
+                if dim.id == "orchestrate" {
+                    return Err(ConfigError(
+                        "pre_classifier.dimensions: id `orchestrate` is reserved for the built-in dimension"
+                            .into(),
+                    ));
+                }
+                if !seen.insert(dim.id.clone()) {
+                    return Err(ConfigError(format!(
+                        "pre_classifier.dimensions: duplicate id `{}`",
+                        dim.id
+                    )));
+                }
+                if !(0.0..=1.0).contains(&dim.min_confidence) {
+                    return Err(ConfigError(format!(
+                        "pre_classifier.dimensions.`{}`.min_confidence must be within 0.0..=1.0",
+                        dim.id
+                    )));
+                }
             }
         }
         Ok(())

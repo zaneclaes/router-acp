@@ -38,6 +38,38 @@ you: "Fix the bugs in issue X: (1)… (2)… (3)…"
 
 ## How it triggers
 
+Two authority paths — pick with config:
+
+### A. Pre-classifier (recommended when enabled)
+
+When `pre_classifier.enabled: true`, auto-orchestration is decided by a **single
+cheap ACP evaluation** on a haiku-class seat (`pre_classifier.evaluator`), not by
+regex. The evaluator returns JSON including:
+
+```json
+"orchestrate": {
+  "warranted": true,
+  "confidence": 0.86,
+  "estimated_parts": 3,
+  "reason": "…"
+}
+```
+
+Auto-orchestrate only if `warranted && confidence >= orchestrate_min_confidence`
+(default `0.65`). Hosts can register extra dimensions under
+`pre_classifier.dimensions` (e.g. Kory Code's `ui_planning`); one call covers all.
+Fail-open: timeout / parse / no evaluator → do **not** orchestrate; the session
+continues normally and the skip is disclosed (`router-acp · pre-class …`).
+
+v1 runs the pre-class once per session on the first eligible turn (not every
+mid-session message). `orchestrate:` force still works anytime without needing a
+successful pre-class for the force decision.
+
+See `src/pre_classifier.rs` and the `pre_classifier:` block in
+`examples/router-preferred.yaml`.
+
+### B. Legacy task-list detector (when pre-classifier is off)
+
 `src/tasklist.rs` classifies the incoming prompt as a multi-part list. It
 recognizes markdown numbers (`1. …`), markdown bullets (`- …`), inline
 enumeration (`… (1) … (2) …`), and ordered prose ("first … then … finally …").

@@ -230,7 +230,9 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
         model_ids.join(",")
     ));
     for (k, v) in env {
-        out.push_str(&format!("        - {{ name: {k}, value: \"{v}\" }}\n"));
+        // Escape for a double-quoted YAML scalar (JSON env values need this).
+        let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("        - {{ name: {k}, value: \"{escaped}\" }}\n"));
     }
     out.push_str("    model_selection: { type: config-option }\n    models:\n");
     for (id, cost) in models {
@@ -4078,6 +4080,269 @@ async fn same_company_agents_share_a_lineage_for_review() {
             !text.contains("one of: claude-b/opus-x"),
             "same-lineage sibling must not be offered as reviewer: {text}"
         );
+        Ok(())
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-classifier (HAI-7056)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn preclass_false_positive_list_does_not_orchestrate() {
+    // A multi-bullet plan/Q&A that the legacy detector would treat as a task
+    // list must NOT orchestrate when pre-class says warranted=false.
+    let state = temp_state_file("preclass-fp");
+    let log = temp_log("preclass-fp");
+    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.92,"estimated_parts":1,"reason":"enumerated Q&A / plan, not multi-track impl"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
+         \x20 orchestrate_min_confidence: 0.65\n  disclose: true\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", preclass_json),
+            ]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Open decisions:\n1. postgres or sqlite?\n2. oauth or saml?\n3. fly or k8s?",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("pre-class"),
+            "pre-class disclosure expected: {text}"
+        );
+        assert!(
+            !text.contains("orchestrating"),
+            "pre-class FP must not orchestrate: {text}"
+        );
+        assert!(
+            !text.contains("you are the ORCHESTRATOR"),
+            "no orchestration protocol: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_true_multi_track_still_orchestrates() {
+    let state = temp_state_file("preclass-tp");
+    let log = temp_log("preclass-tp");
+    let preclass_json = r#"{"orchestrate":{"warranted":true,"confidence":0.9,"estimated_parts":3,"reason":"multi-track implementation"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
+         \x20 orchestrate_min_confidence: 0.65\n  disclose: true\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", preclass_json),
+            ]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("pre-class"),
+            "pre-class disclosure: {text}"
+        );
+        assert!(
+            text.contains("orchestrating a 3-part task"),
+            "pre-class TP must orchestrate: {text}"
+        );
+        assert!(
+            text.contains("you are the ORCHESTRATOR"),
+            "protocol injected: {text}"
+        );
+        assert!(text.contains("echo:m2:"), "pinned planner b/m2: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_dimension_injects_ui_planning() {
+    let state = temp_state_file("preclass-ui");
+    let log = temp_log("preclass-ui");
+    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"single UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
+         \x20 disclose: true\n\
+         \x20 dimensions:\n\
+         \x20   - id: ui_planning\n\
+         \x20     description: UI mockup planning\n\
+         \x20     min_confidence: 0.70\n\
+         \x20     act_when: {{ field: mode, equals: planning }}\n\
+         \x20     inject_prompt: |\n\
+         \x20       [kory-code] PLANNING INJECT\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", preclass_json),
+            ]
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "Redesign the settings page with better density").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("pre-class"),
+            "pre-class disclosure: {text}"
+        );
+        assert!(
+            text.contains("[kory-code] PLANNING INJECT"),
+            "ui_planning inject must ride the prompt: {text}"
+        );
+        assert!(
+            !text.contains("orchestrating"),
+            "must not orchestrate: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_force_orchestrate_still_works() {
+    // orchestrate: force overrides pre-class saying no.
+    let state = temp_state_file("preclass-force");
+    let log = temp_log("preclass-force");
+    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", preclass_json),
+            ]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "orchestrate: ship the release notes").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating"),
+            "force must orchestrate despite pre-class no: {text}"
+        );
+        assert!(
+            text.contains("you are the ORCHESTRATOR"),
+            "protocol injected: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_fail_open_on_bad_json() {
+    let state = temp_state_file("preclass-failopen");
+    let log = temp_log("preclass-failopen");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_LOG", &log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", "NOT VALID JSON {{{"),
+            ]
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("pre-class") && (text.contains("skip") || text.contains("parse")),
+            "fail-open disclosure: {text}"
+        );
+        assert!(
+            !text.contains("orchestrating"),
+            "fail-open must not orchestrate: {text}"
+        );
+        // Session still completed a normal turn.
+        assert!(text.contains("echo:"), "normal turn continued: {text}");
         Ok(())
     })
     .await;
