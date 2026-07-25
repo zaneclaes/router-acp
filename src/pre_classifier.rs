@@ -699,6 +699,83 @@ pub fn disclose(shared: &Arc<Shared>, router_sid: &str, result: &PreClassResult)
     crate::session::notify_user(shared, router_sid, block);
 }
 
+/// Compact, authoritative note prepended to the agent's turn so it cannot
+/// re-litigate routing (e.g. re-running `tasklist::detect_task_list` and telling
+/// the user "orchestration will fire — override with orchestrate:"). UI-only
+/// disclosures are peeled into a tool card and never reach the model.
+pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
+    let thr = cfg.pre_classifier.orchestrate_min_confidence;
+    let mut lines = vec![
+        "[router-acp pre-class decision — AUTHORITATIVE for this turn]".to_string(),
+        "The router already evaluated auto-orchestration and host dimensions.".to_string(),
+        "Do NOT re-run tasklist heuristics, do NOT claim orchestration will fire,".to_string(),
+        "and do NOT tell the user to `orchestrate:` unless they explicitly want it.".to_string(),
+    ];
+
+    if !result.ok {
+        lines.push(format!(
+            "Pre-class FAIL-OPEN: {} — auto-orchestration was NOT started.",
+            result
+                .skip_reason
+                .as_deref()
+                .unwrap_or("unknown error")
+        ));
+    } else if let Some(o) = result.orchestrate.as_ref() {
+        let acts = o.warranted && o.confidence >= thr;
+        if acts {
+            lines.push(format!(
+                "Auto-orchestration: WILL RUN (warranted=true, confidence={:.2} ≥ thr={thr:.2}, ~{} parts). Reason: {}",
+                o.confidence, o.estimated_parts, o.reason
+            ));
+        } else {
+            lines.push(format!(
+                "Auto-orchestration: SUPPRESSED (warranted={}, confidence={:.2}, thr={thr:.2}). Reason: {}",
+                o.warranted, o.confidence, o.reason
+            ));
+            lines.push(
+                "A multi-bullet ticket body alone does NOT orchestrate while pre_classifier is on."
+                    .to_string(),
+            );
+        }
+    } else if cfg.orchestration.enabled {
+        lines.push(
+            "Auto-orchestration: SUPPRESSED (no orchestrate decision in evaluator reply)."
+                .to_string(),
+        );
+    }
+
+    for dim in &cfg.pre_classifier.dimensions {
+        if let Some(val) = result.dimensions.get(&dim.id) {
+            let conf = val
+                .get("confidence")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let acts = conf >= dim.min_confidence && act_when_matches(&dim.act_when, val);
+            let mode = val
+                .get("mode")
+                .and_then(|x| x.as_str())
+                .unwrap_or("—");
+            let reason = val
+                .get("reason")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            lines.push(format!(
+                "Dimension `{}`: acts={} mode={} conf={:.2} — {}",
+                dim.id, acts, mode, conf, reason
+            ));
+        }
+    }
+
+    if !result.injects.is_empty() {
+        lines.push(format!(
+            "Host injects applied this turn: {}.",
+            result.injects.len()
+        ));
+    }
+
+    lines.join("\n")
+}
+
 /// Default description for the built-in orchestrate dimension (docs / tests).
 pub fn orchestrate_dimension_description() -> &'static str {
     "Complex multi-track implementation with distinct sub-tracks — not enumerated prose/Q&A/plans."
@@ -825,5 +902,42 @@ agents:
         assert!(!should_run(&pcfg, false, false));
         let off = PreClassifierConfig::default();
         assert!(!should_run(&off, false, true));
+    }
+
+    #[test]
+    fn agent_decision_note_suppresses_orchestration_clearly() {
+        let cfg = cfg_with_dims(vec![]);
+        let parsed = json!({
+            "orchestrate": {
+                "warranted": false,
+                "confidence": 0.85,
+                "estimated_parts": 1,
+                "reason": "single-track sequential pipeline"
+            }
+        });
+        let r = apply_thresholds(&cfg, &parsed, Some("claude/haiku"), 100, "");
+        let note = agent_decision_note(&cfg, &r);
+        assert!(note.contains("AUTHORITATIVE"));
+        assert!(note.contains("SUPPRESSED"));
+        assert!(note.contains("single-track sequential pipeline"));
+        assert!(note.contains("Do NOT"));
+        assert!(!note.contains("WILL RUN"));
+    }
+
+    #[test]
+    fn agent_decision_note_when_orchestrate_acts() {
+        let cfg = cfg_with_dims(vec![]);
+        let parsed = json!({
+            "orchestrate": {
+                "warranted": true,
+                "confidence": 0.9,
+                "estimated_parts": 3,
+                "reason": "multi-track impl"
+            }
+        });
+        let r = apply_thresholds(&cfg, &parsed, Some("a/m1"), 50, "");
+        let note = agent_decision_note(&cfg, &r);
+        assert!(note.contains("WILL RUN"));
+        assert!(note.contains("multi-track impl"));
     }
 }

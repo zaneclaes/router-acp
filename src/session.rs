@@ -5545,8 +5545,15 @@ async fn dispatch_prompt(
             );
         }
         let result = crate::pre_classifier::evaluate(&shared, &router_sid, &req.prompt).await;
+        // Authoritative decision note MUST reach the model — UI disclosures are
+        // peeled into a classify tool card and never enter the agent prompt, so
+        // without this inject the agent re-runs tasklist heuristics and wrongly
+        // tells the user "orchestration will fire; override with orchestrate:".
+        let decision_note =
+            crate::pre_classifier::agent_decision_note(&shared.cfg, &result);
         shared.with_session(&router_sid, |s| {
             s.preclass_done = true;
+            s.pending_injects.push(decision_note);
             if !result.injects.is_empty() {
                 s.pending_injects.extend(result.injects.iter().cloned());
             }

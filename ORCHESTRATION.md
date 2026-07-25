@@ -65,6 +65,12 @@ v1 runs the pre-class once per session on the first eligible turn (not every
 mid-session message). `orchestrate:` force still works anytime without needing a
 successful pre-class for the force decision.
 
+When pre-class returns `orchestrate.warranted=false`, auto-orchestration is
+**not** started — a multi-bullet ticket body alone is not enough. The router also
+injects a short **authoritative decision note** into the agent prompt so the
+model cannot re-litigate routing (UI disclosures alone are peeled into a tool
+card and never reach the model).
+
 See `src/pre_classifier.rs` and the `pre_classifier:` block in
 `examples/router-preferred.yaml`.
 
