@@ -47,14 +47,24 @@ agents:
     # plan budget and flips it into a penalty when the seat is burning paid
     # overage, so the "free" seat wins while this one is spending money.
     preference: 0.1
+    # `id` is the value passed to the CLI's `--model`; `api_model` is what the
+    # provider's HTTP API calls the same model. They DIFFER here — `sonnet` and
+    # `opus[1m]` are CLI aliases, not model ids — so `api_model` is required for
+    # the per-request proxy: rewriting the request body's `model` to a CLI alias
+    # gets a 404 from api.anthropic.com. Values below verified against the ids
+    # claude-agent-acp actually puts on the wire for each alias.
     models:
       - { id: haiku, display_name: Claude Haiku, cost_rank: 1,
+          api_model: claude-haiku-4-5,
           pricing: { input_per_mtok: 1.00, output_per_mtok: 5.00 } }
       - { id: sonnet, display_name: Claude Sonnet, cost_rank: 2,
+          api_model: claude-sonnet-5,
           pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00 } }
       - { id: "opus[1m]", display_name: Claude Opus 1M, cost_rank: 4,
+          api_model: claude-opus-5,
           pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00 } }
       - { id: "claude-fable-5[1m]", display_name: Claude Fable 5 1M, cost_rank: 5,
+          api_model: claude-fable-5,
           pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00 } }
 
   - name: codex

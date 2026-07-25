@@ -176,6 +176,17 @@ pub struct ScoreEntryRaw {
     pub coding_percentile: Option<f64>,
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Largest `max_tokens` the model accepts. A request asking for more cannot
+    /// be rerouted here.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Whether the model accepts `thinking: {type: adaptive}`. Older models take
+    /// only the fixed-budget form and reject adaptive outright.
+    #[serde(default)]
+    pub adaptive_thinking: Option<bool>,
+    /// Whether the model accepts `output_config.effort`.
+    #[serde(default)]
+    pub effort: Option<bool>,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Per-class quality scores in [0, 1], keyed by task class name.
@@ -210,6 +221,9 @@ pub struct ResolvedScores {
     pub coding_tier: CodingTier,
     pub coding_percentile: Option<f64>,
     pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub adaptive_thinking: bool,
+    pub effort: bool,
     pub tags: Vec<String>,
     quality: HashMap<TaskClass, f64>,
     default_quality: f64,
@@ -230,6 +244,9 @@ impl Default for ResolvedScores {
             coding_tier: CodingTier::Medium,
             coding_percentile: None,
             context_window: None,
+            max_output_tokens: None,
+            adaptive_thinking: true,
+            effort: true,
             tags: Vec::new(),
             quality: HashMap::new(),
             default_quality: 0.5,
@@ -276,6 +293,9 @@ impl ScoreTable {
                     coding_tier: raw_entry.coding_tier.unwrap_or(CodingTier::Medium),
                     coding_percentile: raw_entry.coding_percentile,
                     context_window: raw_entry.context_window,
+                    max_output_tokens: raw_entry.max_output_tokens,
+                    adaptive_thinking: raw_entry.adaptive_thinking.unwrap_or(true),
+                    effort: raw_entry.effort.unwrap_or(true),
                     tags: raw_entry.tags,
                     quality,
                     default_quality: raw_entry.default_quality.unwrap_or(0.5).clamp(0.0, 1.0),
