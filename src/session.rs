@@ -753,6 +753,15 @@ impl Shared {
             if !ignore_usage_cordons && headroom.usage_cordon(&c.id).is_some() {
                 continue;
             }
+            // Seat availability reporting an exhausted plan with no overage
+            // absorbing it means the same thing as a cordon: there is nothing
+            // left to spend on this candidate. Excluding it here — not merely
+            // scaling its preference to 0 below — is what stops a quality edge
+            // from winning the route while the cordon set is still stale (the
+            // poll fails open, and the first poll lands after startup).
+            if !ignore_usage_cordons && headroom.seat_exhausted(&c.id) {
+                continue;
+            }
             let scores = self.scores.lookup(&c.id);
             let static_preference = self
                 .cfg
@@ -2335,9 +2344,10 @@ pub fn flush_pending_disclosure(shared: &Arc<Shared>, router_sid: &str) {
 /// human-readable reason for user-facing notices.
 ///
 /// Token/usage limits cordon the whole agent until the reset time the model
-/// reported (or `headroom.cordon_default_secs` when it reported none).
-/// Outages count toward candidate quarantine; process death is already
-/// tracked by the connection watchdog.
+/// reported (or `headroom.cordon_default_secs` when it reported none); a spend
+/// cap on the seat's money cordons only the candidate that hit it. Outages
+/// count toward candidate quarantine; process death is already tracked by the
+/// connection watchdog.
 pub(crate) fn apply_failure(
     shared: &Arc<Shared>,
     candidate: &CandidateId,
@@ -2346,31 +2356,54 @@ pub(crate) fn apply_failure(
 ) -> String {
     use crate::limits::{FailureClass, humanize};
     match class {
-        FailureClass::RateLimited { retry_after } => {
+        FailureClass::RateLimited {
+            retry_after,
+            spend_scoped,
+        } => {
             let effective = retry_after.unwrap_or(std::time::Duration::from_secs(
                 shared.cfg.headroom.cordon_default_secs,
             ));
+            let kind = if *spend_scoped {
+                "spend limit"
+            } else {
+                "token/usage limit"
+            };
             let reason = if retry_after.is_some() {
-                format!(
-                    "token/usage limit (model reports reset in {})",
-                    humanize(effective)
-                )
+                format!("{kind} (model reports reset in {})", humanize(effective))
             } else {
                 format!(
-                    "token/usage limit (no reset time reported; retrying in {})",
+                    "{kind} (no reset time reported; retrying in {})",
                     humanize(effective)
                 )
             };
-            shared.headroom.lock().unwrap().cordon(
-                &candidate.agent,
-                Some(effective),
-                reason.clone(),
-            );
-            tracing::warn!(
-                agent = candidate.agent,
-                cordon_secs = effective.as_secs(),
-                "agent cordoned by token/usage limit"
-            );
+            if *spend_scoped {
+                // The seat's money is capped, not this agent's plan window: the
+                // only model that needed the money is the one whose own plan
+                // budget was already spent. Cordoning the agent would take the
+                // agent's still-funded models down with it, so scope this to
+                // the candidate that actually hit the wall.
+                shared.headroom.lock().unwrap().cordon_candidate(
+                    candidate,
+                    reason.clone(),
+                    std::time::SystemTime::now() + effective,
+                );
+                tracing::warn!(
+                    candidate = %candidate,
+                    cordon_secs = effective.as_secs(),
+                    "candidate cordoned by spend limit"
+                );
+            } else {
+                shared.headroom.lock().unwrap().cordon(
+                    &candidate.agent,
+                    Some(effective),
+                    reason.clone(),
+                );
+                tracing::warn!(
+                    agent = candidate.agent,
+                    cordon_secs = effective.as_secs(),
+                    "agent cordoned by token/usage limit"
+                );
+            }
             reason
         }
         FailureClass::Outage => {
@@ -2565,7 +2598,26 @@ async fn pin_session(
                  (image/audio/embedded context)",
             )
         } else {
-            AcpError::internal_error().data("no routeable candidates available")
+            // Seat exhaustion excludes candidates without any cordon of its
+            // own, so name the spent seats — "no routeable candidates" alone
+            // leaves the user nothing to act on.
+            let exhausted: Vec<String> = shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availabilities()
+                .into_iter()
+                .filter(|(_, a)| a.plan_exhausted())
+                .map(|(id, _)| id.to_string())
+                .collect();
+            if exhausted.is_empty() {
+                AcpError::internal_error().data("no routeable candidates available")
+            } else {
+                AcpError::internal_error().data(format!(
+                    "every candidate's plan budget is spent with no overage to cover it — {}",
+                    exhausted.join(", ")
+                ))
+            }
         });
     }
 

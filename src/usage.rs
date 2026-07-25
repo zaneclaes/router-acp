@@ -1000,7 +1000,7 @@ fn codex_overage_usable(rate_limits: &Value) -> bool {
 
 /// Format a Unix epoch (seconds) as a UTC RFC-3339 timestamp, for advertising.
 /// Hand-rolled (no chrono dep); inverse of `limits::iso_to_epoch`'s civil math.
-fn epoch_to_rfc3339(secs: u64) -> String {
+pub(crate) fn epoch_to_rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (h, m, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
@@ -1467,6 +1467,80 @@ mod tests {
         // preference penalty.
         let a = anthropic_availability(&exhausted_payload(), &cands());
         assert!(!a[&fable()].on_overage);
+    }
+
+    #[test]
+    fn reported_payload_exhausts_fable_only_and_cordons_it() {
+        // The payload from the report, verbatim in shape: Fable's weekly-scoped
+        // window at 100% critical, monthly credits AND spend both at 100%,
+        // session idle at 0% and weekly_all at 81%. Fable alone has nothing left
+        // to spend; Sonnet and Opus keep the 19% the seat-wide window still has,
+        // so they must stay routeable — the bug routed Fable here anyway.
+        let p = json!({
+            "extra_usage": { "is_enabled": true, "utilization": 100.0 },
+            "spend": { "enabled": true, "percent": 100, "severity": "critical" },
+            "limits": [
+                { "kind": "session", "group": "session", "percent": 0, "severity": "normal",
+                  "resets_at": null, "scope": null, "is_active": false },
+                { "kind": "weekly_all", "group": "weekly", "percent": 81, "severity": "warning",
+                  "resets_at": "2026-07-29T16:59:59+00:00", "scope": null, "is_active": false },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 100, "severity": "critical",
+                  "resets_at": "2026-07-29T16:59:59+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+                  "is_active": true }
+            ]
+        });
+        let opus = CandidateId::new("claude", "opus");
+        let mut candidates = cands();
+        candidates.push((opus.clone(), "Claude Opus 5".to_string()));
+
+        let a = anthropic_availability(&p, &candidates);
+        assert!(a[&fable()].plan_exhausted(), "fable: {:?}", a[&fable()]);
+        assert!(!a[&sonnet()].plan_exhausted(), "sonnet: {:?}", a[&sonnet()]);
+        assert!(!a[&opus].plan_exhausted(), "opus: {:?}", a[&opus]);
+        assert!(
+            (a[&sonnet()].plan_headroom - 0.19).abs() < 1e-9,
+            "seat-wide window leaves 19% free: {:?}",
+            a[&sonnet()]
+        );
+
+        // The proactive cordon agrees, and is likewise scoped to Fable.
+        let c = anthropic_cordons(&p, &candidates, SystemTime::now());
+        assert!(c.contains_key(&fable()));
+        assert!(!c.contains_key(&sonnet()) && !c.contains_key(&opus));
+    }
+
+    #[test]
+    fn exhausted_payload_style_plan_exhausted_is_fable_only() {
+        // Mirrors the live anthropic-oauth.json shape: Fable's weekly-scoped
+        // window is at 100% with overage/spend both maxed, so Fable alone has
+        // nothing left to spend — Sonnet's seat-wide windows (72%/78%) still
+        // have headroom and must stay routeable.
+        let a = anthropic_availability(&exhausted_payload(), &cands());
+        assert!(a[&fable()].plan_exhausted(), "fable: {:?}", a[&fable()]);
+        assert!(!a[&sonnet()].plan_exhausted(), "sonnet: {:?}", a[&sonnet()]);
+    }
+
+    #[test]
+    fn session_and_weekly_saturated_with_overage_maxed_exhausts_every_claude_candidate() {
+        // Session (all-models, no scope) AND weekly_all both at 100%, overage
+        // and spend both maxed: nothing narrows the exhaustion to one model, so
+        // every candidate's seat-wide headroom must read as exhausted.
+        let p = json!({
+            "extra_usage": { "is_enabled": true, "utilization": 100.0 },
+            "spend": { "enabled": true, "percent": 100 },
+            "limits": [
+                { "kind": "session", "percent": 100, "severity": "critical",
+                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": true },
+                { "kind": "weekly_all", "percent": 100, "severity": "critical",
+                  "resets_at": "2026-07-29T16:59:59+00:00", "scope": null, "is_active": true }
+            ]
+        });
+        let a = anthropic_availability(&p, &cands());
+        assert!(
+            a.values().all(|v| v.plan_exhausted()),
+            "every claude candidate should be plan-exhausted: {a:?}"
+        );
     }
 
     #[test]

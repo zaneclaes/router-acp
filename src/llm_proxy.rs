@@ -869,6 +869,7 @@ fn select_request_model(
             !headroom.is_quarantined(&candidate.id)
                 && headroom.cordon_active(&candidate.id.agent).is_none()
                 && headroom.usage_cordon(&candidate.id).is_none()
+                && !headroom.seat_exhausted(&candidate.id)
         })
         .map(|candidate| {
             let scores = shared.scores.lookup(&candidate.id);
@@ -885,8 +886,17 @@ fn select_request_model(
             }
         })
         .collect();
+    // The pin is normally kept in the pool unconditionally (below): leaving the
+    // adapter's own choice alone is always valid. That stops being true once the
+    // pin itself is out of budget — re-adding it there forces every remaining
+    // request of the session onto a model that can only answer with a limit
+    // error.
+    let pin_routeable = !headroom.is_quarantined(&active.candidate)
+        && headroom.cordon_active(&active.candidate.agent).is_none()
+        && headroom.usage_cordon(&active.candidate).is_none()
+        && !headroom.seat_exhausted(&active.candidate);
     drop(headroom);
-    if !models.iter().any(|model| model.id == active.candidate) {
+    if pin_routeable && !models.iter().any(|model| model.id == active.candidate) {
         let cost_rank = shared
             .candidate_runtime(&active.candidate)
             .map(|candidate| candidate.cost_rank)
@@ -977,7 +987,7 @@ fn select_request_model(
         state.elevated_until_time = None;
     }
 
-    let (desired, mut reason, mut event, emergency) = if let Some(reason) = difficulty {
+    let (mut desired, mut reason, mut event, mut emergency) = if let Some(reason) = difficulty {
         state.routine_streak = 0;
         state.elevated_until_request = if shared.cfg.llm_proxy.verdict_ttl_requests == 0 {
             0
@@ -1076,6 +1086,22 @@ fn select_request_model(
             )
         }
     };
+
+    // Every "hold the pin" branch above resolves to the pinned candidate by
+    // name, so an out-of-budget pin survives them all. Hand the request to the
+    // strongest sibling that still has budget instead, and treat it as an
+    // emergency so the minimum-dwell counter can't hold us on the exhausted
+    // model. With no routeable sibling the pin stands — this proxy only rewrites
+    // a model id, it cannot decline the request.
+    if !pin_routeable
+        && desired == active.candidate
+        && let Some(alternate) = strongest_model(&compatible).filter(|alt| alt != &active.candidate)
+    {
+        reason = format!("{reason}; pinned model is out of plan budget");
+        event = "exhausted-repin".to_string();
+        emergency = true;
+        desired = alternate;
+    }
 
     let current_model = state
         .current_model

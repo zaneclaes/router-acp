@@ -41,6 +41,23 @@ pub struct SeatAvailability {
     pub source: &'static str,
 }
 
+impl SeatAvailability {
+    /// The seat has nothing left to spend on this candidate: its plan budget is
+    /// gone and no overage/credit pool is absorbing the excess. Semantically
+    /// identical to a [`UsageCordon`] — the candidate is unroutable — but
+    /// derived from graded availability, so it also holds in the window before
+    /// the poller installs cordons (or when a client hint is the only signal).
+    /// Preference scaling alone is not enough there: it leaves the candidate at
+    /// preference 0, which a quality edge can still win.
+    pub fn plan_exhausted(&self) -> bool {
+        self.plan_headroom <= PLAN_HEADROOM_EPSILON && !self.on_overage
+    }
+}
+
+/// `plan_headroom` is a ratio of reported percentages, so "zero" is a
+/// tolerance, not an equality.
+const PLAN_HEADROOM_EPSILON: f64 = 1e-9;
+
 #[derive(Debug, Default)]
 struct AgentWindow {
     prompts: VecDeque<Instant>,
@@ -74,6 +91,11 @@ pub struct HeadroomTracker {
     /// wholesale by the usage poller each cycle (`set_usage_cordons`); each
     /// entry self-lifts at its absolute `resets_at`.
     usage_cordons: HashMap<CandidateId, UsageCordon>,
+    /// Reactive per-candidate cordons from failures the candidate itself hit
+    /// (a spend cap denies the model with no plan budget left, while the
+    /// agent's other models still have theirs). Held apart from
+    /// `usage_cordons` so the poller's wholesale refresh cannot erase them.
+    candidate_cordons: HashMap<CandidateId, UsageCordon>,
     /// Seat availability from the router's own usage poller. Recomputed
     /// wholesale each poll cycle.
     availability_poll: HashMap<CandidateId, SeatAvailability>,
@@ -95,6 +117,7 @@ impl HeadroomTracker {
             candidates: HashMap::new(),
             cordons: HashMap::new(),
             usage_cordons: HashMap::new(),
+            candidate_cordons: HashMap::new(),
             availability_poll: HashMap::new(),
             availability_hints: HashMap::new(),
         }
@@ -107,23 +130,76 @@ impl HeadroomTracker {
         self.usage_cordons = cordons;
     }
 
+    /// Reactively cordon ONE candidate until `resets_at`, for a failure that
+    /// implicates only that candidate's budget rather than its agent's — a
+    /// monthly/spend cap denies the model whose plan window is already spent
+    /// while the agent's other models still have plan budget of their own.
+    /// Never shortens an existing cordon.
+    pub fn cordon_candidate(
+        &mut self,
+        id: &CandidateId,
+        reason: impl Into<String>,
+        resets_at: SystemTime,
+    ) {
+        if self
+            .candidate_cordons
+            .get(id)
+            .is_some_and(|c| c.resets_at >= resets_at)
+        {
+            return;
+        }
+        let epoch = resets_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.candidate_cordons.insert(
+            id.clone(),
+            UsageCordon {
+                reason: reason.into(),
+                resets_at,
+                resets_at_rfc3339: crate::usage::epoch_to_rfc3339(epoch),
+            },
+        );
+    }
+
     /// The active usage cordon for a candidate, if any (i.e. `now < resets_at`).
     pub fn usage_cordon(&self, id: &CandidateId) -> Option<&UsageCordon> {
         self.usage_cordon_at(id, SystemTime::now())
     }
 
+    /// The polled and reactive cordons are independent sources; whichever
+    /// resets later governs, so a candidate hit by both stays out until the
+    /// last one clears.
     pub fn usage_cordon_at(&self, id: &CandidateId, now: SystemTime) -> Option<&UsageCordon> {
-        self.usage_cordons.get(id).filter(|c| c.resets_at > now)
+        let polled = self.usage_cordons.get(id).filter(|c| c.resets_at > now);
+        let reactive = self.candidate_cordons.get(id).filter(|c| c.resets_at > now);
+        match (polled, reactive) {
+            (Some(polled), Some(reactive)) => Some(if reactive.resets_at > polled.resets_at {
+                reactive
+            } else {
+                polled
+            }),
+            (polled, reactive) => polled.or(reactive),
+        }
     }
 
     /// All candidates currently usage-cordoned, for advertising and the
     /// all-cordoned "least-bad" fallback.
     pub fn active_usage_cordons(&self) -> Vec<(CandidateId, UsageCordon)> {
         let now = SystemTime::now();
-        self.usage_cordons
-            .iter()
-            .filter(|(_, c)| c.resets_at > now)
-            .map(|(id, c)| (id.clone(), c.clone()))
+        let mut ids: Vec<CandidateId> = self
+            .usage_cordons
+            .keys()
+            .chain(self.candidate_cordons.keys())
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.into_iter()
+            .filter_map(|id| {
+                self.usage_cordon_at(&id, now)
+                    .map(|c| (id.clone(), c.clone()))
+            })
             .collect()
     }
 
@@ -165,6 +241,19 @@ impl HeadroomTracker {
             return Some(a.clone());
         }
         self.availability_poll.get(id).cloned()
+    }
+
+    /// True when the freshest availability report says this candidate's seat is
+    /// spent (see [`SeatAvailability::plan_exhausted`]) — the candidate is
+    /// unroutable. Unknown availability is *not* exhaustion: a poll that never
+    /// ran or failed must fail open, so `None` keeps the candidate routeable.
+    pub fn seat_exhausted(&self, id: &CandidateId) -> bool {
+        self.seat_exhausted_at(id, SystemTime::now())
+    }
+
+    pub fn seat_exhausted_at(&self, id: &CandidateId, now: SystemTime) -> bool {
+        self.availability_at(id, now)
+            .is_some_and(|a| a.plan_exhausted())
     }
 
     /// All candidates with known seat availability (hint-fresh over poll),
@@ -508,5 +597,76 @@ mod tests {
         // A hint for one agent never affects another's candidates.
         let other = CandidateId::new("codex", "gpt-5.5");
         assert!(t.availability_at(&other, now).is_none());
+    }
+
+    #[test]
+    fn plan_exhausted_excludes_zero_headroom_without_overage() {
+        let exhausted = SeatAvailability {
+            plan_headroom: 0.0,
+            on_overage: false,
+            source: "poll",
+        };
+        assert!(exhausted.plan_exhausted());
+
+        // Zero headroom but overage/credits are absorbing it: still routable,
+        // just paying — not the same as a cordon.
+        let paying = SeatAvailability {
+            plan_headroom: 0.0,
+            on_overage: true,
+            source: "poll",
+        };
+        assert!(!paying.plan_exhausted());
+
+        // Free budget remaining: routable regardless of overage state.
+        let free = SeatAvailability {
+            plan_headroom: 0.4,
+            on_overage: false,
+            source: "poll",
+        };
+        assert!(!free.plan_exhausted());
+
+        // Below the float-compare epsilon still counts as zero.
+        let near_zero = SeatAvailability {
+            plan_headroom: 1e-10,
+            on_overage: false,
+            source: "poll",
+        };
+        assert!(near_zero.plan_exhausted());
+    }
+
+    #[test]
+    fn seat_exhausted_excludes_the_candidate_from_eligibility() {
+        // seat_exhausted is the predicate eligible_views_inner gates on: a
+        // candidate whose polled availability is plan-exhausted must report
+        // exhausted, and one with headroom (or no report at all) must not.
+        let mut t = tracker(10);
+        let exhausted_id = CandidateId::new("claude", "claude-fable-5[1m]");
+        let has_headroom_id = CandidateId::new("claude", "sonnet");
+        let now = SystemTime::now();
+
+        // Unknown availability (poll never ran / not yet installed): fail
+        // open, never treat as exhausted.
+        assert!(!t.seat_exhausted_at(&exhausted_id, now));
+
+        t.set_polled_availability(HashMap::from([
+            (
+                exhausted_id.clone(),
+                SeatAvailability {
+                    plan_headroom: 0.0,
+                    on_overage: false,
+                    source: "poll",
+                },
+            ),
+            (
+                has_headroom_id.clone(),
+                SeatAvailability {
+                    plan_headroom: 0.22,
+                    on_overage: false,
+                    source: "poll",
+                },
+            ),
+        ]));
+        assert!(t.seat_exhausted_at(&exhausted_id, now));
+        assert!(!t.seat_exhausted_at(&has_headroom_id, now));
     }
 }
