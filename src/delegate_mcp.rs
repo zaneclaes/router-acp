@@ -777,6 +777,7 @@ fn render_await(
 fn scope_delegate_pool(
     pool: Vec<CandidateView>,
     parent_cost: u32,
+    parent_agent: &str,
     orchestrating: bool,
     hinted: bool,
 ) -> Vec<CandidateView> {
@@ -788,10 +789,26 @@ fn scope_delegate_pool(
         .filter(|v| v.cost_rank < parent_cost)
         .cloned()
         .collect();
-    if orchestrating && cheaper.is_empty() {
-        return pool;
+    let cheaper = if orchestrating && cheaper.is_empty() {
+        pool
+    } else {
+        cheaper
+    };
+    // A main-session model switch changes the natural worker family too:
+    // Sol delegates to cheaper Codex siblings (Terra/Luna/etc.), not a stale
+    // Claude candidate. Cross-lineage review remains available through an
+    // explicit orchestration hint. Fall back globally only for agents such as
+    // Grok that have no cheaper sibling at all.
+    let same_agent: Vec<CandidateView> = cheaper
+        .iter()
+        .filter(|view| view.id.agent == parent_agent)
+        .cloned()
+        .collect();
+    if same_agent.is_empty() {
+        cheaper
+    } else {
+        same_agent
     }
-    cheaper
 }
 
 /// Synthesize a delegate turn's cost from configured `pricing` when the
@@ -885,6 +902,7 @@ pub async fn run_delegate_task(
     let mut pool = scope_delegate_pool(
         shared.eligible_views(&RequiredCaps::default(), profile.class),
         parent_cost,
+        &pin.candidate.agent,
         orchestrating,
         hinted.is_some(),
     );
@@ -1548,6 +1566,7 @@ mod tests {
                 quality: 0.8,
                 coding_tier: CodingTier::High,
                 headroom: 1.0,
+                on_overage: false,
                 preference: 0.0,
             }
         };
@@ -1560,18 +1579,18 @@ mod tests {
 
     #[test]
     fn ordinary_delegation_is_strictly_cheaper() {
-        let scoped = scope_delegate_pool(pool3(), 5, false, false);
+        let scoped = scope_delegate_pool(pool3(), 5, "claude", false, false);
         assert!(scoped.iter().all(|v| v.cost_rank < 5));
         assert_eq!(scoped.len(), 2);
         // Parent already cheapest → empty pool → the caller's error path.
-        assert!(scope_delegate_pool(pool3(), 1, false, false).is_empty());
+        assert!(scope_delegate_pool(pool3(), 1, "claude", false, false).is_empty());
     }
 
     #[test]
     fn orchestration_workers_are_cheaper_only_without_a_hint() {
         // A hint-less (worker) delegation from an orchestrating frontier
         // planner must not land back on the frontier tier.
-        let scoped = scope_delegate_pool(pool3(), 5, true, false);
+        let scoped = scope_delegate_pool(pool3(), 5, "claude", true, false);
         assert!(
             scoped.iter().all(|v| v.cost_rank < 5),
             "same-tier candidate survived a hint-less orchestration delegation"
@@ -1583,14 +1602,31 @@ mod tests {
     fn orchestration_hinted_delegation_keeps_the_full_pool() {
         // The planner addresses its cross-lineage reviewer by explicit
         // `hints.candidate` — same-/higher-tier must stay routeable.
-        let scoped = scope_delegate_pool(pool3(), 5, true, true);
+        let scoped = scope_delegate_pool(pool3(), 5, "claude", true, true);
         assert_eq!(scoped.len(), 3);
     }
 
     #[test]
     fn orchestration_from_the_cheapest_tier_falls_back_to_full_pool() {
         // Never break the pipeline when the planner is already cheapest.
-        let scoped = scope_delegate_pool(pool3(), 1, true, false);
+        let scoped = scope_delegate_pool(pool3(), 1, "claude", true, false);
         assert_eq!(scoped.len(), 3);
+    }
+
+    #[test]
+    fn sol_delegation_prefers_cheaper_codex_siblings() {
+        let mut pool = pool3();
+        let mut codex = pool3();
+        codex[0].id = CandidateId::new("codex", "luna");
+        codex[0].cost_rank = 2;
+        codex[1].id = CandidateId::new("codex", "terra");
+        codex[1].cost_rank = 4;
+        codex[2].id = CandidateId::new("codex", "sol");
+        codex[2].cost_rank = 5;
+        pool.extend(codex);
+
+        let scoped = scope_delegate_pool(pool, 5, "codex", false, false);
+        let ids: Vec<String> = scoped.into_iter().map(|view| view.id.to_string()).collect();
+        assert_eq!(ids, vec!["codex/luna", "codex/terra"]);
     }
 }

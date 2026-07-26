@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "PyYAML>=6.0,<7",
+# ]
+# ///
 """Update router-acp's model catalog and quality/cost tables.
 
 One command that discovers what each agent currently exposes, proposes anchored

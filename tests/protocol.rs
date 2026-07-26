@@ -232,7 +232,9 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
     for (k, v) in env {
         // Escape for a double-quoted YAML scalar (JSON env values need this).
         let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
-        out.push_str(&format!("        - {{ name: {k}, value: \"{escaped}\" }}\n"));
+        out.push_str(&format!(
+            "        - {{ name: {k}, value: \"{escaped}\" }}\n"
+        ));
     }
     out.push_str("    model_selection: { type: config-option }\n    models:\n");
     for (id, cost) in models {
@@ -4195,7 +4197,7 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
     // list must NOT orchestrate when pre-class says warranted=false.
     let state = temp_state_file("preclass-fp");
     let log = temp_log("preclass-fp");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.92,"estimated_parts":1,"reason":"enumerated Q&A / plan, not multi-track impl"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"Writing","task_classes":["Writing"],"categories":["docs"],"complexity":0.18,"confidence":0.9,"reason":"bounded plan"},"orchestrate":{"warranted":false,"confidence":0.92,"estimated_parts":1,"reason":"enumerated Q&A / plan, not multi-track impl"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -4241,6 +4243,12 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
             !text.contains("you are the ORCHESTRATOR"),
             "no orchestration protocol: {text}"
         );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted");
+        assert_eq!(routing["class"], "Writing", "{routing}");
+        assert_eq!(routing["complexity"], 0.18, "{routing}");
         Ok(())
     })
     .await;
@@ -4250,7 +4258,7 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
 async fn preclass_true_multi_track_still_orchestrates() {
     let state = temp_state_file("preclass-tp");
     let log = temp_log("preclass-tp");
-    let preclass_json = r#"{"orchestrate":{"warranted":true,"confidence":0.9,"estimated_parts":3,"reason":"multi-track implementation"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"Feature","task_classes":["Feature","Architecture"],"categories":["backend"],"complexity":0.72,"confidence":0.9,"reason":"multi-track implementation"},"orchestrate":{"warranted":true,"confidence":0.9,"estimated_parts":3,"reason":"multi-track implementation"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -4284,10 +4292,7 @@ async fn preclass_true_multi_track_still_orchestrates() {
         .await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("pre-class"),
-            "pre-class disclosure: {text}"
-        );
+        assert!(text.contains("pre-class"), "pre-class disclosure: {text}");
         assert!(
             text.contains("orchestrating a 3-part task"),
             "pre-class TP must orchestrate: {text}"
@@ -4306,7 +4311,7 @@ async fn preclass_true_multi_track_still_orchestrates() {
 async fn preclass_dimension_injects_ui_planning() {
     let state = temp_state_file("preclass-ui");
     let log = temp_log("preclass-ui");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"single UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"UiTweak","task_classes":["UiTweak","Feature"],"categories":["UX","frontend"],"complexity":0.55,"confidence":0.92,"reason":"new UI surface"},"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"single UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -4338,10 +4343,7 @@ async fn preclass_dimension_injects_ui_planning() {
         let resp = prompt_text(&cx, &sid, "Redesign the settings page with better density").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("pre-class"),
-            "pre-class disclosure: {text}"
-        );
+        assert!(text.contains("pre-class"), "pre-class disclosure: {text}");
         assert!(
             text.contains("[kory-code] PLANNING INJECT"),
             "ui_planning inject must ride the prompt: {text}"
@@ -4360,7 +4362,7 @@ async fn preclass_force_orchestrate_still_works() {
     // orchestrate: force overrides pre-class saying no.
     let state = temp_state_file("preclass-force");
     let log = temp_log("preclass-force");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"CodingGeneral","task_classes":["CodingGeneral"],"categories":["code"],"complexity":0.4,"confidence":0.9,"reason":"bounded work"},"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\

@@ -72,6 +72,7 @@ fn route(prompt: &str) -> Outcome {
                 quality: resolved.quality(profile.class),
                 coding_tier: resolved.coding_tier,
                 headroom: 1.0,
+                on_overage: false,
                 preference: *preference,
             }
         })

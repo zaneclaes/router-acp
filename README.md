@@ -238,13 +238,13 @@ instead of staying frozen:
   `preference × plan_headroom`. Model-scoped weekly caps count only for their
   model, so Claude Fable's separate window does not make other Claude models
   look scarce.
-- **A seat burning paid overage takes a penalty.** When a candidate's cap is
-  exhausted but it stays routable because the overage/credit pool absorbs
-  usage, its utility drops by `availability_preference.overage_penalty`
-  (default 0.25) — so among candidates of comparable quality the router
-  always picks the seat that still has *free* team-plan budget, and only
-  spends overage money when nothing comparable is free. (A saturated seat
-  with *no* overage headroom is a cordon, not a penalty — see above.)
+- **Paid overage raises the quality bar.** When a candidate's cap is exhausted
+  but it stays routable because the overage/credit pool absorbs usage, its
+  utility drops by `cost_aversion × (1 - task complexity)`. The default
+  `cost_aversion: 0.1` therefore favors an included-plan fallback for ordinary
+  work while still allowing a materially stronger paid model on hard work.
+  Set it to `0` to ignore overage cost. A saturated seat with *no* overage
+  headroom is a cordon, not a surcharge.
 
 Availability comes from two sources:
 
@@ -482,7 +482,9 @@ is failing) still completes without the dead model's help. Three triggers:
 The pinned primary agent gets a router-provided MCP tool, `delegate_task`,
 for small self-contained subtasks (mechanical edits, isolated bug fixes,
 focused research). The router runs each delegated subtask in an **ephemeral
-downstream session on a strictly lower-`cost_rank` candidate**, returns the
+downstream session on a strictly lower-`cost_rank` candidate**, preferring a
+same-agent sibling before using a cross-lineage fallback. Thus a Sol primary
+delegates ordinary work to Terra/Luna when they are eligible. It returns the
 sub-agent's output as the tool result, and forwards the sub-session's
 permission/fs/terminal callbacks to the original client under the parent
 session id — permission UX stays intact while sub-agent transcript streaming
@@ -657,11 +659,12 @@ example.
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
 | `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). Also gates the usage polling that feeds `availability_preference`. |
 | `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
-| `availability_preference.enabled` | `true` | Plan-aware routing: effective quota headroom is the lower of local and reported candidate plan headroom; effective preference = `agents[].preference × plan_headroom`; paid overage also incurs `overage_penalty`. Off = local headroom plus static preference, hints ignored. |
-| `availability_preference.overage_penalty` | `0.25` | Utility penalty for a candidate whose seat is past its plan cap and burning paid overage. Same additive scale as `agents[].preference`. |
+| `availability_preference.enabled` | `true` | Plan-aware routing: effective quota headroom is the lower of local and reported candidate plan headroom; effective preference = `agents[].preference × plan_headroom`; paid overage also incurs a difficulty-scaled surcharge. Off = local headroom plus static preference, hints ignored. |
+| `availability_preference.cost_aversion` | `0.1` | Paid-overage surcharge coefficient. Utility subtracts `cost_aversion × (1 - task complexity)`; `0` means the user is perfectly willing to pay. |
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
 | `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
+| `agents[].llm_proxy.codex_chatgpt_provider` | `false` | For an OpenAI-protocol Codex agent, install a custom HTTP Responses provider so ChatGPT-authenticated Codex traffic traverses the proxy instead of bypassing it over WebSocket. |
 | `llm_proxy.listen` | `127.0.0.1:0` | Loopback listener; port `0` selects a free port. Non-loopback addresses are rejected because provider credentials pass through it. |
 | `llm_proxy.routine_streak` | `3` | Consecutive successful routine tool-result requests required before demotion. |
 | `llm_proxy.minimum_dwell_requests` | `12` | Requests a selected model serves before an ordinary switch; difficulty and automation bypass it. |

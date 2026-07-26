@@ -32,6 +32,9 @@ pub struct CandidateView {
     pub coding_tier: CodingTier,
     /// Tightest local/plan headroom estimate in [0, 1].
     pub headroom: f64,
+    /// The candidate has exhausted included-plan headroom and is spending
+    /// paid overage/credits. Exhausted overage is filtered before this point.
+    pub on_overage: bool,
     /// Configured per-agent tie-break preference (`agents[].preference`).
     pub preference: f64,
 }
@@ -83,7 +86,10 @@ pub trait RouterStrategy: Send + Sync {
 pub fn make_strategy(kind: StrategyKind, cfg: &Config) -> Box<dyn RouterStrategy> {
     match kind {
         StrategyKind::Static => Box::new(StaticStrategy::new(cfg.routers.static_.clone())),
-        StrategyKind::Auto => Box::new(AutoStrategy::new(cfg.routers.auto.clone())),
+        StrategyKind::Auto => Box::new(AutoStrategy::with_cost_aversion(
+            cfg.routers.auto.clone(),
+            cfg.availability_preference.cost_aversion,
+        )),
         StrategyKind::ParetoCode => {
             Box::new(ParetoCodeStrategy::new(cfg.routers.pareto_code.clone()))
         }
@@ -159,6 +165,7 @@ pub(crate) mod test_util {
             quality,
             coding_tier: tier,
             headroom,
+            on_overage: false,
             preference: 0.0,
         }
     }

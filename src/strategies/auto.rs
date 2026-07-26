@@ -24,6 +24,7 @@ use super::{
 
 pub struct AutoStrategy {
     cfg: AutoRouterConfig,
+    cost_aversion: f64,
 }
 
 /// Included-plan usage is not marginal dollar spend. Rank remains a bounded
@@ -33,7 +34,17 @@ const INCLUDED_PLAN_SCARCITY_WEIGHT: f64 = 0.5;
 
 impl AutoStrategy {
     pub fn new(cfg: AutoRouterConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            cost_aversion: 0.1,
+        }
+    }
+
+    pub fn with_cost_aversion(cfg: AutoRouterConfig, cost_aversion: f64) -> Self {
+        Self {
+            cfg,
+            cost_aversion: cost_aversion.clamp(0.0, 1.0),
+        }
     }
 }
 
@@ -82,8 +93,16 @@ impl RouterStrategy for AutoStrategy {
         let mut gate_note = None;
         if ctx.profile.complexity >= self.cfg.complexity_floor && pool.len() > 1 {
             let p75 = quality_p75(&pool);
-            let gated: Vec<&CandidateView> =
-                pool.iter().copied().filter(|c| c.quality >= p75).collect();
+            let comparing_paid_overage = pool.iter().any(|candidate| candidate.on_overage);
+            // Keep free-plan candidates in the comparison even when they sit
+            // below p75. Otherwise the hard quality gate removes Grok before
+            // paid-overage aversion can raise the frontier model's difficulty
+            // bar, making `cost_aversion` inert exactly when it matters.
+            let gated: Vec<&CandidateView> = pool
+                .iter()
+                .copied()
+                .filter(|c| c.quality >= p75 || (comparing_paid_overage && !c.on_overage))
+                .collect();
             if !gated.is_empty() {
                 if gated.len() != pool.len() {
                     gate_note = Some(format!(
@@ -131,8 +150,14 @@ impl RouterStrategy for AutoStrategy {
                 let quota_score =
                     c.headroom * (1.0 - INCLUDED_PLAN_SCARCITY_WEIGHT * normalized_cost_rank);
                 let normalized_quality = task_fit_quality(c.quality, quality_demand);
+                let overage_surcharge = if c.on_overage {
+                    self.cost_aversion * (1.0 - ctx.profile.complexity.clamp(0.0, 1.0))
+                } else {
+                    0.0
+                };
                 let utility =
-                    quality_weight * normalized_quality + cost_weight * quota_score + c.preference;
+                    quality_weight * normalized_quality + cost_weight * quota_score + c.preference
+                        - overage_surcharge;
                 (utility, c.clone(), gate_note.clone())
             })
             .collect();
@@ -149,18 +174,23 @@ impl RouterStrategy for AutoStrategy {
         Ok(to_ranked(
             scored,
             move |utility, view| {
-                // Effective (availability-scaled) preference; negative means
-                // the seat is past its plan cap and burning paid overage.
                 let pref = if view.preference > 0.0 {
                     format!(" + pref {:.2}", view.preference)
                 } else if view.preference < 0.0 {
-                    format!(" - pref {:.2} (seat on paid overage)", -view.preference)
+                    format!(" - pref {:.2}", -view.preference)
+                } else {
+                    String::new()
+                };
+                let overage = if view.on_overage {
+                    let surcharge =
+                        self.cost_aversion * (1.0 - ctx.profile.complexity.clamp(0.0, 1.0));
+                    format!(" - overage {surcharge:.2}")
                 } else {
                     String::new()
                 };
                 format!(
                     "utility {:.2} = {:.2}×quality {:.2}→{:.2} ({}) + {:.2}×quota (headroom {:.0}%, \
-                     cost rank {}){}{}",
+                     cost rank {}){}{}{}",
                     utility,
                     quality_weight,
                     view.quality,
@@ -170,6 +200,7 @@ impl RouterStrategy for AutoStrategy {
                     view.headroom * 100.0,
                     view.cost_rank,
                     pref,
+                    overage,
                     scaled_note,
                 )
             },
@@ -187,6 +218,13 @@ impl RouterStrategy for AutoStrategy {
                     "headroom": view.headroom,
                     "cost_rank": view.cost_rank,
                     "preference": view.preference,
+                    "on_overage": view.on_overage,
+                    "cost_aversion": self.cost_aversion,
+                    "overage_surcharge": if view.on_overage {
+                        self.cost_aversion * (1.0 - ctx.profile.complexity.clamp(0.0, 1.0))
+                    } else {
+                        0.0
+                    },
                 })
             },
         ))
@@ -313,32 +351,44 @@ mod tests {
     }
 
     #[test]
-    fn overage_penalty_prefers_the_free_seat() {
-        // The availability-scaled preference arrives here already folded into
-        // `view.preference`: claude's 0.1 bonus became a −0.25 penalty (seat
-        // on paid overage) while codex still has free plan budget. The free
-        // seat must win despite claude's static preference — and the reason
-        // string must say why.
-        let s = AutoStrategy::new(cfg(3.0));
+    fn cost_aversion_raises_the_paid_frontier_difficulty_bar() {
+        let s = AutoStrategy::with_cost_aversion(
+            AutoRouterConfig {
+                complexity_scales_tradeoff: true,
+                complexity_floor: 0.7,
+                min_cost_weight: 0.15,
+                ..cfg(3.0)
+            },
+            0.1,
+        );
         let mut p = vec![
-            view("claude", "fable", 5, 0, 0.95, CodingTier::High, 1.0),
-            view("codex", "sol", 5, 1, 0.93, CodingTier::High, 1.0),
+            view("claude", "fable", 5, 0, 3.0, CodingTier::High, 0.0),
+            view("grok", "grok-4.5", 5, 1, 1.6, CodingTier::High, 1.0),
         ];
-        p[0].preference = 0.1;
-        let ranked = s.rank(&ctx(), &p).unwrap();
-        assert_eq!(ranked[0].candidate.agent, "claude");
-        p[0].preference = -0.25;
-        let ranked = s.rank(&ctx(), &p).unwrap();
-        assert_eq!(ranked[0].candidate.agent, "codex");
-        let claude = ranked
+        p[0].on_overage = true;
+
+        let mut context = ctx();
+        context.profile.class = crate::candidate::TaskClass::Architecture;
+        context.profile.complexity = 0.4;
+        let ranked = s.rank(&context, &p).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "grok");
+        let fable = ranked
             .iter()
             .find(|r| r.candidate.agent == "claude")
             .unwrap();
-        assert!(
-            claude.reason.contains("- pref 0.25 (seat on paid overage)"),
-            "{}",
-            claude.reason
-        );
+        assert!(fable.reason.contains("- overage 0.06"), "{}", fable.reason);
+
+        context.profile.complexity = 0.9;
+        let ranked = s.rank(&context, &p).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "claude");
+
+        let no_aversion = AutoStrategy::with_cost_aversion(s.cfg.clone(), 0.0);
+        context.profile.complexity = 0.4;
+        let ranked = no_aversion.rank(&context, &p).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "claude");
+        context.profile.complexity = 0.7;
+        let ranked = no_aversion.rank(&context, &p).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "claude");
     }
 
     #[test]

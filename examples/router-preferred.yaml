@@ -110,6 +110,10 @@ agents:
       protocol: openai
       base_url_env: OPENAI_BASE_URL
       upstream_base_url: https://chatgpt.com/backend-api/codex
+      # ChatGPT OAuth prefers a WebSocket that ignores OPENAI_BASE_URL.
+      # Install router-acp as an HTTP Responses provider so Sol requests can
+      # demote within Codex to compatible Terra/Luna/etc.
+      codex_chatgpt_provider: true
     mode_map: { auto: full-access, approve: auto, chat: read-only }
     # `pricing` (USD per Mtok, published API rates as of 2026-07) prices
     # provider requests and synthesizes turn cost when an adapter reports none.
@@ -225,9 +229,10 @@ cordon:
 # Plan-aware effective cost (on by default). A candidate's quota term uses the
 # lower of local sliding-window headroom and its reported free plan headroom.
 # The static `agents[].preference` bonus also fades with plan headroom, and a
-# seat past its cap but still routable via overage/credits takes
-# `overage_penalty` off its utility. Model-scoped windows (including Claude
-# Fable's separate weekly cap) affect only matching models. Availability comes
+# seat past its cap but still routable via overage/credits pays a
+# difficulty-scaled `cost_aversion × (1 - complexity)` surcharge. Model-scoped
+# windows (including Claude Fable's separate weekly cap) affect only matching
+# models. Availability comes
 # from the same usage
 # polls as `cordon` plus optional client hints (the `router-acp/
 # availability_hint` extension notification; e.g. Kory Code pushes its own
@@ -235,7 +240,7 @@ cordon:
 # `hint_ttl_secs`, then the poll rules again.
 availability_preference:
   enabled: true
-  overage_penalty: 0.25   # utility penalty while a seat spends overage budget
+  cost_aversion: 0.1      # 0 = happy to pay; higher raises the difficulty bar
   hint_ttl_secs: 600      # how long a client hint stays authoritative
 
 orchestration:
@@ -249,9 +254,10 @@ orchestration:
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
 
-# Composable LLM pre-classifier: one cheap ACP evaluation decides auto-
-# orchestration (and host dimensions) instead of regex task-list detection.
-# When disabled, orchestration falls back to tasklist::detect_task_list.
+# Composable LLM pre-classifier: one cheap ACP evaluation authoritatively
+# decides task class, complexity, auto-orchestration, and host dimensions.
+# When disabled or invalid, routing falls back to the static classifier and
+# orchestration falls back to tasklist::detect_task_list.
 # Hosts (e.g. Kory Code) register extra dimensions under `dimensions:`.
 # Hickory boxes load defaults from kory-code/router.yaml, not this example.
 pre_classifier:

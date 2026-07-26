@@ -203,6 +203,9 @@ impl LlmProxyRuntime {
         let proxy_base = format!("http://{addr}/proxy/{token}{upstream_path}");
         env.retain(|(name, _)| name != &target.config.base_url_env);
         env.push((target.config.base_url_env.clone(), proxy_base.clone()));
+        if target.config.codex_chatgpt_provider {
+            env = codex_proxy_env(env, &proxy_base);
+        }
         tracing::info!(
             target = %spec.key,
             env = target.config.base_url_env,
@@ -230,6 +233,29 @@ impl LlmProxyRuntime {
                 process_key,
                 registration_id: 0,
             };
+        }
+        // A main-session repin can change providers before the new adapter
+        // emits its first inference request. Reset attribution here, not lazily
+        // in `select_request_model`, so tool frames can never combine the new
+        // agent with a stale model from the prior provider.
+        {
+            let mut policy = self.policy.lock().unwrap();
+            let state = policy.entry(state_sid.clone()).or_default();
+            if state.pinned_candidate.as_ref() != Some(&candidate) {
+                let rejected = std::mem::take(&mut state.rejected_api_models);
+                *state = RequestPolicyState {
+                    pinned_candidate: Some(candidate.clone()),
+                    current_model: Some(candidate.model.clone()),
+                    last_candidate: Some(candidate.to_string()),
+                    last_reason: Some("session-pinned model; awaiting inference decision".into()),
+                    rejected_api_models: rejected,
+                    ..Default::default()
+                };
+            } else if state.last_candidate.is_none() {
+                state.last_candidate = Some(candidate.to_string());
+                state.last_reason =
+                    Some("session-pinned model; awaiting inference decision".into());
+            }
         }
         let registration_id = self.next_registration.fetch_add(1, Ordering::Relaxed);
         let active = ActiveTurn {
@@ -321,6 +347,47 @@ pub struct LlmTurnGuard {
     runtime: Option<Arc<LlmProxyRuntime>>,
     process_key: ProcessKey,
     registration_id: u64,
+}
+
+/// Codex ChatGPT OAuth does not honor `OPENAI_BASE_URL` on its preferred
+/// WebSocket path. Give codex-acp an explicit HTTP Responses provider instead.
+/// Existing `CODEX_CONFIG` keys are preserved; only this provider and the
+/// selected provider id are replaced.
+fn codex_proxy_env(mut env: Vec<(String, String)>, proxy_base: &str) -> Vec<(String, String)> {
+    const PROVIDER: &str = "router-acp-proxy";
+    let existing = env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CODEX_CONFIG")
+        .and_then(|(_, value)| serde_json::from_str::<Value>(value).ok());
+    let mut config = existing
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let providers = config
+        .entry("model_providers".to_string())
+        .or_insert_with(|| json!({}));
+    if !providers.is_object() {
+        *providers = json!({});
+    }
+    providers.as_object_mut().unwrap().insert(
+        PROVIDER.to_string(),
+        json!({
+            "name": "router-acp local proxy",
+            "base_url": proxy_base,
+            "wire_api": "responses",
+            "requires_openai_auth": true,
+            "supports_websockets": false,
+        }),
+    );
+    config.insert("model_provider".to_string(), json!(PROVIDER));
+
+    env.retain(|(name, _)| name != "CODEX_CONFIG" && name != "MODEL_PROVIDER");
+    env.push((
+        "CODEX_CONFIG".to_string(),
+        Value::Object(config).to_string(),
+    ));
+    env.push(("MODEL_PROVIDER".to_string(), PROVIDER.to_string()));
+    env
 }
 
 impl Drop for LlmTurnGuard {
@@ -2411,6 +2478,83 @@ agents:
     }
 
     #[test]
+    fn codex_proxy_env_installs_http_provider_without_losing_config() {
+        let env = codex_proxy_env(
+            vec![
+                (
+                    "CODEX_CONFIG".into(),
+                    r#"{"model":"gpt-5.6-sol","sandbox_mode":"workspace-write"}"#.into(),
+                ),
+                ("MODEL_PROVIDER".into(), "legacy".into()),
+            ],
+            "http://127.0.0.1:4321/proxy/token/backend-api/codex",
+        );
+        let provider = env
+            .iter()
+            .find(|(name, _)| name == "MODEL_PROVIDER")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(provider, Some("router-acp-proxy"));
+        let raw = env
+            .iter()
+            .find(|(name, _)| name == "CODEX_CONFIG")
+            .map(|(_, value)| value)
+            .unwrap();
+        let config: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(config["model"], "gpt-5.6-sol");
+        assert_eq!(config["sandbox_mode"], "workspace-write");
+        assert_eq!(
+            config["model_providers"]["router-acp-proxy"]["wire_api"],
+            "responses"
+        );
+        assert_eq!(
+            config["model_providers"]["router-acp-proxy"]["requires_openai_auth"],
+            true
+        );
+        assert_eq!(
+            config["model_providers"]["router-acp-proxy"]["supports_websockets"],
+            false
+        );
+    }
+
+    #[test]
+    fn begin_turn_resets_stale_model_attribution_on_repin() {
+        let (_dir, shared) = policy_shared(0);
+        let first = shared.llm_proxy.begin_turn(
+            ProcessKey("mock".into()),
+            "r1".into(),
+            "r1".into(),
+            "d1".into(),
+            CandidateId::new("claude", "sonnet"),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        assert_eq!(
+            shared.llm_proxy.last_attribution("r1").unwrap().0,
+            "claude/sonnet"
+        );
+        drop(first);
+
+        let second = shared.llm_proxy.begin_turn(
+            ProcessKey("mock".into()),
+            "r1".into(),
+            "r1".into(),
+            "d2".into(),
+            CandidateId::new("codex", "gpt-5.6-sol"),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        assert_eq!(
+            shared.llm_proxy.last_attribution("r1").unwrap().0,
+            "codex/gpt-5.6-sol"
+        );
+        assert_eq!(
+            shared.llm_proxy.current_model("r1").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        drop(second);
+    }
+
+    #[test]
     fn only_inference_endpoints_are_rewritten() {
         assert!(is_inference_endpoint(
             LlmWireProtocol::Anthropic,
@@ -2440,6 +2584,7 @@ agents:
                 protocol: LlmWireProtocol::Openai,
                 base_url_env: "MOCK_URL".into(),
                 upstream_base_url: "https://example.test/v1?api-version=1".into(),
+                codex_chatgpt_provider: false,
             },
         };
         let incoming: Uri = "/proxy/token/v1/responses?trace=2".parse().unwrap();

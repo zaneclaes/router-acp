@@ -179,6 +179,7 @@ agents:
       protocol: openai
       base_url_env: OPENAI_BASE_URL
       upstream_base_url: https://chatgpt.com/backend-api/codex
+      codex_chatgpt_provider: true
     mode_map: { auto: full-access, approve: auto, chat: read-only }
     models:
       - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }

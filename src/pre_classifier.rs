@@ -43,6 +43,10 @@ pub struct PreClassResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator: Option<String>,
     pub latency_ms: u64,
+    /// Authoritative task class/difficulty for model selection when present.
+    /// Missing/invalid output fails open to the static classifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingDecision>,
     pub orchestrate: Option<OrchestrateDecision>,
     /// Extension dimension id → raw JSON object the evaluator returned.
     #[serde(default)]
@@ -57,6 +61,22 @@ pub struct PreClassResult {
     pub log: String,
     /// Compact structured summary for FE (not only log text).
     pub summary: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingDecision {
+    pub task_class: TaskClass,
+    /// Other materially involved router task classes, for audit/explanation.
+    #[serde(default)]
+    pub task_classes: Vec<TaskClass>,
+    /// Human-facing domains such as UX, frontend, database, infrastructure.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// 0.0 (mechanical/trivial) to 1.0 (long-horizon/high-risk).
+    pub complexity: f64,
+    pub confidence: f64,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +114,30 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
     );
 
     let mut schema_keys: Vec<String> = Vec::new();
+
+    out.push_str(
+        "## Dimension: routing (REQUIRED)\n\
+         Assess the work itself, not prompt length or formatting. Choose one primary task_class \
+         from: UiTweak, BugFix, Feature, Refactor, Algorithms, Architecture, Research, Writing, \
+         Ops, CodingGeneral. UiTweak includes UX/UI/frontend visual or interaction changes; Ops \
+         includes CI, deployment, configuration, and operational inspection.\n\
+         Return task_classes for other materially involved classes and categories for human \
+         domains such as UX, frontend, backend, database, infrastructure, security, docs.\n\
+         Score complexity using these anchors:\n\
+         - 0.00-0.15: mechanical, localized, obvious change or lookup\n\
+         - 0.16-0.35: bounded routine work with a known implementation path\n\
+         - 0.36-0.60: multi-file debugging/implementation with meaningful verification\n\
+         - 0.61-0.80: ambiguous design, cross-system reasoning, migration, or high blast radius\n\
+         - 0.81-1.00: novel/long-horizon work with deep architecture, uncertainty, or severe risk\n\
+         Consider ambiguity, reasoning depth, dependencies, blast radius, reversibility, domain \
+         novelty, and verification burden. Do NOT increase complexity merely because a ticket is \
+         long, contains many bullets, or supplies detailed context.\n\
+         Return:\n\
+         \"routing\": { \"task_class\": string, \"task_classes\": [strings], \
+         \"categories\": [strings], \"complexity\": 0.0-1.0, \
+         \"confidence\": 0.0-1.0, \"reason\": string }\n\n",
+    );
+    schema_keys.push("routing".into());
 
     if cfg.orchestration.enabled {
         out.push_str(
@@ -188,7 +232,10 @@ fn parse_orchestrate(v: &Value) -> Option<OrchestrateDecision> {
         .get("warranted")
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
-    let confidence = obj.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let confidence = obj
+        .get("confidence")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
     let estimated_parts = obj
         .get("estimated_parts")
         .and_then(|x| x.as_u64())
@@ -205,6 +252,54 @@ fn parse_orchestrate(v: &Value) -> Option<OrchestrateDecision> {
         confidence,
         estimated_parts,
         reason,
+    })
+}
+
+fn parse_routing(v: &Value) -> Option<RoutingDecision> {
+    let obj = v.as_object()?;
+    let task_class = obj
+        .get("task_class")
+        .and_then(Value::as_str)
+        .and_then(TaskClass::parse)?;
+    let complexity = obj.get("complexity").and_then(Value::as_f64)?;
+    let confidence = obj.get("confidence").and_then(Value::as_f64)?;
+    if !complexity.is_finite() || !confidence.is_finite() {
+        return None;
+    }
+    let mut task_classes: Vec<TaskClass> = obj
+        .get("task_classes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(TaskClass::parse)
+        .collect();
+    if !task_classes.contains(&task_class) {
+        task_classes.insert(0, task_class);
+    }
+    task_classes.dedup();
+    let categories = obj
+        .get("categories")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(8)
+        .map(ToString::to_string)
+        .collect();
+    Some(RoutingDecision {
+        task_class,
+        task_classes,
+        categories,
+        complexity: complexity.clamp(0.0, 1.0),
+        confidence: confidence.clamp(0.0, 1.0),
+        reason: obj
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -234,6 +329,40 @@ pub fn apply_thresholds(
     let mut dimensions = BTreeMap::new();
     let mut summary_dims = serde_json::Map::new();
 
+    let routing = parsed.get("routing").and_then(parse_routing);
+    if let Some(ref decision) = routing {
+        summary_dims.insert(
+            "routing".into(),
+            json!({
+                "task_class": decision.task_class.as_str(),
+                "task_classes": decision.task_classes.iter().map(TaskClass::as_str).collect::<Vec<_>>(),
+                "categories": decision.categories,
+                "complexity": decision.complexity,
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+                "authoritative": true,
+            }),
+        );
+        log.push_str(&format!(
+            "routing: class={} complexity={:.2} conf={:.2} categories={} — {}\n",
+            decision.task_class.as_str(),
+            decision.complexity,
+            decision.confidence,
+            if decision.categories.is_empty() {
+                "none".to_string()
+            } else {
+                decision.categories.join(",")
+            },
+            decision.reason
+        ));
+    } else {
+        summary_dims.insert(
+            "routing".into(),
+            json!({ "present": false, "authoritative": false, "fallback": "static classifier" }),
+        );
+        log.push_str("routing: missing/invalid — static classifier fallback\n");
+    }
+
     let orchestrate = parsed.get("orchestrate").and_then(parse_orchestrate);
     if let Some(ref o) = orchestrate {
         let thr = cfg.pre_classifier.orchestrate_min_confidence;
@@ -260,10 +389,7 @@ pub fn apply_thresholds(
 
     for dim in &cfg.pre_classifier.dimensions {
         let Some(val) = parsed.get(&dim.id) else {
-            summary_dims.insert(
-                dim.id.clone(),
-                json!({ "present": false, "acts": false }),
-            );
+            summary_dims.insert(dim.id.clone(), json!({ "present": false, "acts": false }));
             log.push_str(&format!("{}: missing from evaluator reply\n", dim.id));
             continue;
         };
@@ -286,10 +412,7 @@ pub fn apply_thresholds(
         );
         log.push_str(&format!(
             "{}: conf={:.2} acts={} raw={}\n",
-            dim.id,
-            conf,
-            acts,
-            val
+            dim.id, conf, acts, val
         ));
         if acts {
             // FE chip label: ui_planning → "UI"
@@ -323,6 +446,7 @@ pub fn apply_thresholds(
         skip_reason: None,
         evaluator: evaluator.map(|s| s.to_string()),
         latency_ms,
+        routing,
         orchestrate,
         dimensions,
         acted_modes,
@@ -384,6 +508,7 @@ fn fail_open(
         skip_reason: Some(reason.clone()),
         evaluator: evaluator.clone(),
         latency_ms,
+        routing: None,
         orchestrate: None,
         dimensions: BTreeMap::new(),
         acted_modes: Vec::new(),
@@ -403,7 +528,11 @@ fn fail_open(
 /// eligible `evaluator` candidate. Fail-open on any error. Tries each matching
 /// evaluator in preference order (a timed-out/broken haiku does not sink the
 /// whole pre-class).
-pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentBlock]) -> PreClassResult {
+pub async fn evaluate(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    prompt: &[ContentBlock],
+) -> PreClassResult {
     let started = Instant::now();
     let cfg = shared.cfg.clone();
     let pcfg = &cfg.pre_classifier;
@@ -436,8 +565,7 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
     // Prefer-order walk: first_eligible_candidate ranks by quality within the
     // evaluator glob pool; after a failure we exclude that exact id and retry.
     for _attempt in 0..pcfg.evaluator.len().max(1) + 2 {
-        let Some(candidate) =
-            first_eligible_candidate(shared, &pcfg.evaluator, class, &excluded)
+        let Some(candidate) = first_eligible_candidate(shared, &pcfg.evaluator, class, &excluded)
         else {
             break;
         };
@@ -477,21 +605,15 @@ pub async fn evaluate(shared: &Arc<Shared>, router_sid: &str, prompt: &[ContentB
     let latency_ms = started.elapsed().as_millis() as u64;
     if let Some(mut fail) = last_fail {
         fail.latency_ms = latency_ms;
-        fail.log.push_str(&format!(
-            "tried evaluators: {}\n",
-            attempts.join(", ")
-        ));
+        fail.log
+            .push_str(&format!("tried evaluators: {}\n", attempts.join(", ")));
         return fail;
     }
-    fail_open(
-        "no evaluator candidate available",
-        None,
-        latency_ms,
-        "",
-    )
+    fail_open("no evaluator candidate available", None, latency_ms, "")
 }
 
 /// One evaluator attempt: open (with auto mode) → prompt → close → parse.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_on_candidate(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -587,10 +709,10 @@ async fn evaluate_on_candidate(
 
 fn strip_mock_echo(raw: &str) -> String {
     // mock-agent default: `echo:<model>:<text>` possibly multi-line after second colon.
-    if let Some(rest) = raw.strip_prefix("echo:") {
-        if let Some((_, body)) = rest.split_once(':') {
-            return body.to_string();
-        }
+    if let Some(rest) = raw.strip_prefix("echo:")
+        && let Some((_, body)) = rest.split_once(':')
+    {
+        return body.to_string();
     }
     raw.to_string()
 }
@@ -715,10 +837,7 @@ pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
     if !result.ok {
         lines.push(format!(
             "Pre-class FAIL-OPEN: {} — auto-orchestration was NOT started.",
-            result
-                .skip_reason
-                .as_deref()
-                .unwrap_or("unknown error")
+            result.skip_reason.as_deref().unwrap_or("unknown error")
         ));
     } else if let Some(o) = result.orchestrate.as_ref() {
         let acts = o.warranted && o.confidence >= thr;
@@ -744,6 +863,23 @@ pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
         );
     }
 
+    if let Some(routing) = result.routing.as_ref() {
+        lines.push(format!(
+            "Routing assessment: class={} complexity={:.2} confidence={:.2}; categories={}. Reason: {}",
+            routing.task_class.as_str(),
+            routing.complexity,
+            routing.confidence,
+            if routing.categories.is_empty() {
+                "none".to_string()
+            } else {
+                routing.categories.join(",")
+            },
+            routing.reason
+        ));
+    } else {
+        lines.push("Routing assessment: unavailable; static classifier fallback.".to_string());
+    }
+
     for dim in &cfg.pre_classifier.dimensions {
         if let Some(val) = result.dimensions.get(&dim.id) {
             let conf = val
@@ -751,14 +887,8 @@ pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
                 .and_then(|x| x.as_f64())
                 .unwrap_or(0.0);
             let acts = conf >= dim.min_confidence && act_when_matches(&dim.act_when, val);
-            let mode = val
-                .get("mode")
-                .and_then(|x| x.as_str())
-                .unwrap_or("—");
-            let reason = val
-                .get("reason")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let mode = val.get("mode").and_then(|x| x.as_str()).unwrap_or("—");
+            let reason = val.get("reason").and_then(|x| x.as_str()).unwrap_or("");
             lines.push(format!(
                 "Dimension `{}`: acts={} mode={} conf={:.2} — {}",
                 dim.id, acts, mode, conf, reason
@@ -812,6 +942,8 @@ agents:
         let cfg = cfg_with_dims(vec![]);
         let p = build_evaluator_prompt(&cfg, "1. do a\n2. do b");
         assert!(p.contains(PRECLASS_MARKER));
+        assert!(p.contains("Dimension: routing"));
+        assert!(p.contains("Do NOT increase complexity merely because"));
         assert!(p.contains("Dimension: orchestrate"));
         assert!(p.contains("1. do a"));
     }
@@ -855,6 +987,14 @@ agents:
             inject_prompt: "INJECT-UI".into(),
         }]);
         let parsed = json!({
+            "routing": {
+                "task_class": "UiTweak",
+                "task_classes": ["UiTweak", "Feature"],
+                "categories": ["UX", "frontend"],
+                "complexity": 0.42,
+                "confidence": 0.91,
+                "reason": "new interactive surface"
+            },
             "orchestrate": {
                 "warranted": true,
                 "confidence": 0.9,
@@ -869,6 +1009,8 @@ agents:
         });
         let r = apply_thresholds(&cfg, &parsed, Some("a/m1"), 12, "raw\n");
         assert!(r.ok);
+        assert_eq!(r.routing.as_ref().unwrap().task_class, TaskClass::UiTweak);
+        assert_eq!(r.routing.as_ref().unwrap().complexity, 0.42);
         assert!(r.acted_modes.contains(&"orchestrate".to_string()));
         assert!(r.acted_modes.contains(&"UI".to_string()));
         assert_eq!(r.injects, vec!["INJECT-UI".to_string()]);
@@ -879,6 +1021,14 @@ agents:
     fn thresholds_fail_low_confidence() {
         let cfg = cfg_with_dims(vec![]);
         let parsed = json!({
+            "routing": {
+                "task_class": "Writing",
+                "task_classes": ["Writing"],
+                "categories": ["docs"],
+                "complexity": 0.12,
+                "confidence": 0.9,
+                "reason": "bounded prose"
+            },
             "orchestrate": {
                 "warranted": true,
                 "confidence": 0.4,
@@ -908,6 +1058,14 @@ agents:
     fn agent_decision_note_suppresses_orchestration_clearly() {
         let cfg = cfg_with_dims(vec![]);
         let parsed = json!({
+            "routing": {
+                "task_class": "Architecture",
+                "task_classes": ["Architecture"],
+                "categories": ["backend"],
+                "complexity": 0.7,
+                "confidence": 0.9,
+                "reason": "cross-system design"
+            },
             "orchestrate": {
                 "warranted": false,
                 "confidence": 0.85,
@@ -928,6 +1086,14 @@ agents:
     fn agent_decision_note_when_orchestrate_acts() {
         let cfg = cfg_with_dims(vec![]);
         let parsed = json!({
+            "routing": {
+                "task_class": "Feature",
+                "task_classes": ["Feature"],
+                "categories": ["backend"],
+                "complexity": 0.65,
+                "confidence": 0.9,
+                "reason": "multi-track implementation"
+            },
             "orchestrate": {
                 "warranted": true,
                 "confidence": 0.9,
