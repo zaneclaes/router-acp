@@ -504,7 +504,7 @@ fails.
   cordon only. Score estimates in `data/scores.yaml` are BEST-GUESS (grok-4.5 ≈
   opus/sol tier; kimi-k2 ≈ sonnet coding tier, cheaper). Claude modes: `auto,
   default, acceptEdits, plan, dontAsk, bypassPermissions`; codex modes:
-  `read-only, auto, full-access`. To re-discover ids, declare a bogus model and
+  `read-only, agent, agent-full-access`. To re-discover ids, declare a bogus model and
   read the `available=[…]` warning under `RUST_LOG=router_acp=debug`.
 - The user prefers Claude (bigger plan): `preference: 0.05` on the claude
   agent, `cost_quality_tradeoff: 3`. History: routing once sent an hour-long
