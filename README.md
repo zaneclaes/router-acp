@@ -491,7 +491,7 @@ session id — permission UX stays intact while sub-agent transcript streaming
 is not interleaved into the parent transcript. Delegates have no upstream
 client of their own, so the router explicitly applies each candidate's `auto`
 `mode_map` entry at session creation (for example Claude `bypassPermissions`
-or Codex `full-access`). Their full task/final response, streamed progress,
+or Codex `agent-full-access`). Their full task/final response, streamed progress,
 and tool activity are recorded in the delegate's `session_log` row for UIs.
 
 Because ACP `mcpServers` entries must be concrete transports, the tool is a

@@ -370,13 +370,12 @@ Mode ids on your installed adapters (probed July 9, 2026):
 | adapter | mode ids |
 | --- | --- |
 | claude-agent-acp | `auto`, `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` |
-| codex-acp | `read-only`, `auto`, `full-access` |
+| codex-acp | `read-only`, `agent`, `agent-full-access` |
 
 The `pi-acp` slot sends goose modes as `auto`, `approve`, `smart-approve`,
-or `chat`. Your `GOOSE_MODE: auto` matches an `auto` mode on **both**
-adapters, so it works with no extra config. The other goose modes have no
-downstream equivalent; translate them (and/or change what `auto` means) with
-an optional per-agent `mode_map` in `router.yaml`:
+or `chat`. Claude advertises `auto`, while Codex requires `auto` to be
+translated to `agent-full-access`. Translate the client modes with a
+per-agent `mode_map` in `router.yaml`:
 
 ```yaml
 agents:
@@ -388,7 +387,7 @@ agents:
     # ...
 
   - name: codex
-    mode_map: { approve: read-only }
+    mode_map: { auto: agent-full-access, approve: agent, chat: read-only }
     # ...
 ```
 
