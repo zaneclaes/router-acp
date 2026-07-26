@@ -183,13 +183,15 @@ SDK traps below, which were all discovered the hard way.
   `gate_message` never cordons. Grok therefore needs **no** `usage_source` in
   config — the cordon is automatic. Pure decision is `xai_gate_reason` (tested,
   `xai_gate_tests`).
-- **Dynamic preference scaling** (`availability_preference.*`; same poll +
-  client hints): `agents[].preference` is the *static* base — `eligible_views`
-  computes the effective preference as `preference × plan_headroom`, minus
-  `overage_penalty` when the seat is past its cap but routable via
-  overage/credits (spending real money). That keeps the router on whichever
-  seat still has FREE plan budget among comparable candidates; a saturated
-  seat with no overage headroom is a cordon, never a penalty. Availability
+- **Plan-aware effective cost** (`availability_preference.*`; same poll +
+  client hints): `eligible_views` uses the lower of local sliding-window
+  headroom and candidate-specific reported plan headroom in the quota term.
+  It also scales the static `agents[].preference` base as
+  `preference × plan_headroom`, then subtracts `overage_penalty` when the seat
+  is past its cap but routable via overage/credits (spending real money).
+  Model-scoped windows affect only matching models. That preserves FREE plan
+  budget among comparable candidates; a saturated seat with no overage
+  headroom is a cordon, never a penalty. Availability
   sources: the usage poller (`set_polled_availability`, wholesale per cycle)
   and the `router-acp/availability_hint` extension notification
   (`apply_availability_hint` — session-less, consumed in `on_catch_all`,

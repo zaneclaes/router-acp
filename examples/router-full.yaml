@@ -70,10 +70,10 @@ cordon:
   poll_secs: 300         # usage poll interval / cache TTL (~5 min)
 
 # Mid-session model switching. A pinned session can move to a more capable
-# model on its own when its confidence drops. Confidence = the pinned model's
-# quality for the task class minus accumulated "struggle" (token-ceiling hits,
-# refusals, repeated tool failures). Explicit `[router: switch=agent/model]`
-# always works regardless of this setting.
+# model on its own when its confidence drops. Confidence = the fraction of
+# classified capability demand met by benchmark quality minus accumulated
+# "struggle" (token-ceiling hits, refusals, repeated tool failures). Explicit
+# `[router: switch=agent/model]` always works regardless of this setting.
 auto_upgrade:
   enabled: true                 # false disables automatic upgrades entirely
   confidence_threshold: 0.55    # upgrade below this; higher = more eager
@@ -135,8 +135,8 @@ agents:
       base_url_env: ANTHROPIC_BASE_URL
       upstream_base_url: https://api.anthropic.com
     mode_map: { auto: bypassPermissions, approve: default, chat: plan }
-    preference: 0.1             # prefer this agent when candidates are
-                                # otherwise comparable (bigger seat/plan)
+    preference: 0.1             # static tie-break; client/provider plan
+                                # headroom makes scarce seats costlier
     models:
       # ids must exactly match the downstream model selector's values;
       # run with RUST_LOG=router_acp=debug to see what the adapter offers.

@@ -1,0 +1,291 @@
+# Model catalog + scoring POLICY for router-acp.
+#
+# `data/scores.yaml` holds the quality numbers the router actually loads; this
+# file holds the *procedure* that produced them and the invariants they must
+# keep. Rust does not read this file — `scripts/update_models.py` does. See
+# `docs/model-updater.md`.
+#
+# Division of labour, on purpose:
+#   * sourced observations and fixed benchmark calibrations are authoritative.
+#   * scores.yaml is deterministic output plus routing capabilities/comments.
+version: 1
+
+# ---------------------------------------------------------------------------
+# Quality scale. Fixed, deliberately NOT min-maxed over the live candidate set:
+# adding one model never changes another model's benchmark calibration.
+# ---------------------------------------------------------------------------
+anchors:
+  # 1 = minimal, 2 = standard, 3 = frontier. Decimals preserve measured
+  # differences inside a band; 0.5 and 3.5 are the hard extrapolation limits.
+  quality_band: { min: 0.5, max: 3.5 }
+  round_to: 0.01
+
+# Each benchmark has fixed raw-result anchors for quality 1, 2, and 3.
+# Piecewise interpolation/extrapolation (clipped to 0.5..3.5) turns an observed
+# result into a comparable quality unit. These anchors move only when the
+# benchmark itself changes version. A model's default is the weighted mean of
+# its observations. A TaskClass override is emitted only when at least two
+# mapped observations agree and differ from the default by >= 0.15.
+benchmark_scoring:
+  minimum_task_observations: 2
+  meaningful_task_delta: 0.15
+  benchmarks:
+    AA-Coding-Agent-v1.1:
+      task_classes: [Algorithms, CodingGeneral]
+      anchors: { minimal: 70, standard: 75, frontier: 78 }
+    SWE-Bench-Pro:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 60, standard: 69, frontier: 80 }
+    DeepSWE-v1.1:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 50, standard: 60, frontier: 70 }
+    Terminal-Bench-2.1:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 78, standard: 84, frontier: 89 }
+    SWE-Bench-Verified-2025:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 70, standard: 77, frontier: 84 }
+    Terminal-Bench-1:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 40, standard: 55, frontier: 70 }
+    Local-Executable-Gate:
+      task_classes: [UiTweak, Ops, CodingGeneral]
+      anchors: { minimal: 1, standard: 2, frontier: 3 }
+    Kimi-SWE-Bench-Verified:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 55, standard: 70, frontier: 80 }
+    Kimi-TerminalBench:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 20, standard: 35, frontier: 50 }
+    Kimi-BrowseComp:
+      task_classes: [Research, Architecture]
+      anchors: { minimal: 30, standard: 50, frontier: 70 }
+  model_evidence:
+    "*fable*":
+      - { benchmark: AA-Coding-Agent-v1.1, result: 77.2, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 80.0, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 69.7, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 83.1, source: "https://openai.com/index/gpt-5-6/" }
+    "*sol*":
+      - { benchmark: AA-Coding-Agent-v1.1, result: 80.0, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 64.6, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 72.7, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 88.8, source: "https://openai.com/index/gpt-5-6/" }
+    "*terra*":
+      - { benchmark: AA-Coding-Agent-v1.1, result: 77.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 63.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 69.6, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 87.4, source: "https://openai.com/index/gpt-5-6/" }
+    "*luna*":
+      - { benchmark: AA-Coding-Agent-v1.1, result: 74.6, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 62.7, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 67.2, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 84.7, source: "https://openai.com/index/gpt-5-6/" }
+    "*gpt-5*":
+      - { benchmark: AA-Coding-Agent-v1.1, result: 76.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 59.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 67.0, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 85.6, source: "https://openai.com/index/gpt-5-6/" }
+    "*opus*":
+      # The live Opus 5 alias currently uses the latest published Opus 4.8
+      # comparison row as a conservative proxy until an Opus 5 card is public.
+      - { benchmark: AA-Coding-Agent-v1.1, result: 72.5, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 69.2, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 59.0, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 78.9, source: "https://openai.com/index/gpt-5-6/" }
+    "*grok*":
+      - { benchmark: SWE-Bench-Pro, result: 64.7, source: "https://x.ai/news/grok-4-5" }
+      - { benchmark: DeepSWE-v1.1, result: 53.0, source: "https://x.ai/news/grok-4-5" }
+      - { benchmark: Terminal-Bench-2.1, result: 83.3, source: "https://x.ai/news/grok-4-5" }
+    "*sonnet*":
+      - { benchmark: SWE-Bench-Pro, result: 63.2, source: "https://www.anthropic.com/news/claude-sonnet-5" }
+      - { benchmark: Terminal-Bench-2.1, result: 80.4, source: "https://www.anthropic.com/news/claude-sonnet-5" }
+    "*haiku*":
+      - { benchmark: SWE-Bench-Verified-2025, result: 73.3, source: "https://www.anthropic.com/news/claude-haiku-4-5" }
+      - { benchmark: Terminal-Bench-1, result: 41.75, source: "https://www.anthropic.com/news/claude-haiku-4-5" }
+    "*mini*":
+      - { benchmark: Local-Executable-Gate, result: 1, source: "benchmarks/llm-proxy/RESULTS.md#quality-result" }
+      - { benchmark: Local-Executable-Gate, result: 1, source: "benchmarks/llm-proxy/RESULTS.md#workload-results" }
+    "*kimi*":
+      - { benchmark: Kimi-SWE-Bench-Verified, result: 65.8, source: "https://github.com/MoonshotAI/Kimi-K2" }
+      - { benchmark: Kimi-TerminalBench, result: 30.0, source: "https://github.com/MoonshotAI/Kimi-K2" }
+    "*kimi*k2*thinking*":
+      - { benchmark: Kimi-SWE-Bench-Verified, result: 71.3, source: "https://www.kimi.com/blog/kimi-k2-thinking" }
+      - { benchmark: Kimi-BrowseComp, result: 60.2, source: "https://www.kimi.com/blog/kimi-k2-thinking" }
+
+# ---------------------------------------------------------------------------
+# Cost / scarcity. `cost_rank` is an ORDINAL 1..5 (1 = cheapest/least scarce,
+# 5 = frontier/scarce), not USD: seats are flat-rate, and `auto` min-max
+# normalizes rank inside the surviving pool. Do not extend past 5 — that
+# rescales every pool norm and moves models you did not touch.
+# ---------------------------------------------------------------------------
+cost:
+  ladder: { min: 1, max: 5 }
+  # Blended price prior used to sanity-check ranks: input + k*output, with k
+  # from the observed output/input token ratio on real sessions.
+  blended_output_weight: 3
+  # Provider cache rates that are a fixed ratio of the input rate rather than an
+  # independently published number. Validated, so a hand-edited catalog cannot
+  # quietly break the cache-reprime break-even the demotion gate computes.
+  cache_ratios:
+    claude: { read: 0.1, write: 1.25 }
+  # Ranks must be weakly monotonic in blended price WITHIN an agent: a cheaper
+  # model must not carry a higher rank. Every exception is deliberate and lives
+  # here with its reason, so a genuine mistake still shows up as an error.
+  rank_exceptions:
+    - candidate: "codex/gpt-5.6-terra"
+      over: "codex/gpt-5.5"
+      why: >-
+        Terra lists cheaper than 5.5 but scores well above it, so it is held at
+        rank 4 (reserved for harder work) while 5.5 stays the rank-3 everyday
+        codex model. Ranking Terra by list price would make it the default and
+        spend frontier-grade capability on routine turns.
+    - candidate: "grok/grok-4.5"
+      why: >-
+        Cheapest frontier on list price ($2/$6) but pinned at rank 5: the value
+        is cross-lineage review (the planner/reviewer globs), the seat is
+        scarce, and a rank matching its price would make it win ordinary `auto`
+        traffic that the Claude and Codex seats already cover.
+    - candidate: "kimi/kimi-k2"
+      why: >-
+        Cheapest model in the catalog on list price, held at rank 2 rather than
+        1: it is a mid-tier worker (roughly sonnet-tier coding), not a
+        haiku-class small model, and rank 1 would pull trivial traffic off
+        seats whose flat-rate budget is already paid for.
+
+# ---------------------------------------------------------------------------
+# Witnesses: concrete `agent/model` ids the invariants are evaluated on.
+# Invariants run through the real first-match glob lookup, so they catch
+# pattern-ordering bugs and not just number typos. Ids that are not in the
+# shipped catalog (commented out, or not released yet) are still valid
+# witnesses — the score table answers for any id.
+# ---------------------------------------------------------------------------
+witnesses:
+  fable: "claude/claude-fable-5[1m]"
+  opus: "claude/opus[1m]"
+  sonnet: "claude/sonnet"
+  haiku: "claude/haiku"
+  mini: "codex/gpt-5.4-mini"
+  gpt5: "codex/gpt-5.5"
+  gpt5_codex: "codex/gpt-5.5-codex"
+  sol: "codex/gpt-5.6-sol"
+  terra: "codex/gpt-5.6-terra"
+  luna: "codex/gpt-5.6-luna"
+  grok: "grok/grok-4.5"
+  grok_code: "grok/grok-code-fast-1"
+  kimi: "kimi/kimi-k2"
+  kimi_thinking: "kimi/kimi-k2-thinking"
+  gemini_pro: "gemini/gemini-3-pro"
+  gemini_flash: "gemini/gemini-3-flash"
+
+# ---------------------------------------------------------------------------
+# Invariants. This is the contract: absolute numbers may drift, ORDERING may
+# not. `scripts/update_models.py --validate-only` checks them, and they are the
+# gate on any hand edit to scores.yaml.
+# ---------------------------------------------------------------------------
+invariants:
+  # Strictly decreasing quality, every TaskClass, left to right.
+  strict_desc:
+    - chain: [fable, opus, sonnet, haiku]
+      why: the claude ladder every golden routing case depends on
+    - chain: [sol, terra, luna]
+      why: provisional GPT sol/terra/luna tiering
+    - chain: [sol, gpt5]
+      why: sol must not fall through to the generic *gpt-5* entry
+    - chain: [terra, gpt5]
+      why: terra is held above the everyday codex model
+    - chain: [gpt5, mini]
+      why: >-
+        the original mini-shadowing bug — a broad *gpt-5* entry above *mini*
+        once routed hour-long investigations to gpt-5.4-mini
+    - chain: [kimi_thinking, kimi]
+      why: published K2 Thinking benchmarks exceed the base K2 observations
+    - chain: [gemini_pro, gemini_flash]
+      why: >-
+        the other shadowing canary — "gemini" contains "mini", so a *mini*
+        entry above the gemini ones collapses both onto one mini-class score
+  # Non-increasing (ties allowed).
+  weak_desc:
+    - chain: [grok, grok_code]
+      why: frontier grok is never below the cheap coding-tuned grok
+  # Ceilings are used only where the benchmark-derived values support them.
+  at_most:
+    - a: grok
+      b: opus
+      why: current published benchmark aggregate places Grok 4.5 just under Opus
+  # Concrete id -> the score-table pattern that must win the first-match race.
+  resolves_to:
+    "codex/gpt-5.4-mini": "*mini*"
+    "codex/gpt-5.5": "*gpt-5*"
+    "codex/gpt-5.5-codex": "*gpt-5*codex*"
+    "codex/gpt-5.6-sol": "*sol*"
+    "codex/gpt-5.6-terra": "*terra*"
+    "codex/gpt-5.6-luna": "*luna*"
+    "claude/claude-fable-5[1m]": "*fable*"
+    "claude/opus[1m]": "*opus*"
+    "claude/sonnet": "*sonnet*"
+    "claude/haiku": "*haiku*"
+    "gemini/gemini-3-pro": "*gemini*pro*"
+    "gemini/gemini-3-flash": "*gemini*flash*"
+    "grok/grok-4.5": "*grok*"
+    "grok/grok-code-fast-1": "*grok*code*"
+    "kimi/kimi-k2": "*kimi*"
+    "kimi/kimi-k2-thinking": "*kimi*k2*thinking*"
+
+# ---------------------------------------------------------------------------
+# Published API rates, as verified on `as_of`. The agent catalog is what the
+# router loads; this is the provider-side reference it gets audited against, so
+# a fat-fingered rate or a silent provider price change surfaces as a finding
+# instead of quietly skewing cost routing. USD per Mtok.
+# ---------------------------------------------------------------------------
+published_pricing:
+  as_of: "2026-07"
+  models:
+    "claude/haiku": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
+    "claude/sonnet": { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+    "claude/opus[1m]": { input_per_mtok: 5.00, output_per_mtok: 25.00 }
+    "claude/claude-fable-5[1m]": { input_per_mtok: 10.00, output_per_mtok: 50.00 }
+    "codex/gpt-5.4-mini": { input_per_mtok: 0.75, output_per_mtok: 4.50 }
+    "codex/gpt-5.5": { input_per_mtok: 5.00, output_per_mtok: 30.00 }
+    "codex/gpt-5.6-luna": { input_per_mtok: 1.00, output_per_mtok: 6.00 }
+    "codex/gpt-5.6-terra": { input_per_mtok: 2.50, output_per_mtok: 15.00 }
+    "codex/gpt-5.6-sol": { input_per_mtok: 5.00, output_per_mtok: 30.00 }
+    "grok/grok-4.5":
+      { input_per_mtok: 2.00, output_per_mtok: 6.00, cache_read_per_mtok: 0.50 }
+    "kimi/kimi-k2": { input_per_mtok: 0.55, output_per_mtok: 2.20 }
+
+# ---------------------------------------------------------------------------
+# Discovery. How each agent's live model list is obtained. `snapshot` means
+# there is no machine-readable list yet, so the configured catalog is treated as
+# last-known-good and a failed probe can never propose removals.
+# ---------------------------------------------------------------------------
+discovery:
+  agents:
+    claude:
+      method: snapshot
+      note: >-
+        claude-agent-acp enumerates models over ACP `session/set_config_option`
+        (category `model`), which needs a live adapter session; there is no
+        offline CLI list. Refresh by reading the adapter's model selector.
+    codex:
+      method: snapshot
+      note: >-
+        codex exposes no offline model list; ids come from its rollout config.
+    grok:
+      method: command
+      command: ["grok", "models"]
+      note: documented in the preferred config; requires `grok login`.
+    kimi:
+      method: command
+      command: ["kimi", "--version"]
+      probe_only: true
+      note: >-
+        kimi-cli writes the account's model ids into its own config at login;
+        there is no list subcommand, so this only proves the CLI exists.
+  # A model that vanishes from discovery is commented out for one release with a
+  # `retired <date>` note rather than deleted, so a flaky probe cannot drop a
+  # working candidate.
+  retire_grace_releases: 1
+  # A newly discovered model lands commented-out and unscored: enabling it is a
+  # human decision that needs benchmark evidence and a rank first.
+  new_models_start_disabled: true

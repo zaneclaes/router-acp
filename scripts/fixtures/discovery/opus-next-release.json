@@ -1,0 +1,34 @@
+{
+  "_comment": "Synthetic release: Anthropic ships a new frontier alias `opus-next[1m]` and retires nothing. Exercises the add path — a new model must land commented-out with a proposed curve and a suggested rank, WITHOUT collapsing the existing rank ladder to pure quality-max.",
+  "generated_at": "2026-07-26",
+  "agents": {
+    "claude": {
+      "status": "ok",
+      "method": "command",
+      "available": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]", "opus-next[1m]"],
+      "configured": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]"],
+      "note": "synthetic fixture for the new-release path"
+    },
+    "codex": {
+      "status": "snapshot",
+      "method": "snapshot",
+      "available": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "configured": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "note": "unchanged"
+    },
+    "grok": {
+      "status": "ok",
+      "method": "command",
+      "available": ["grok-4.5"],
+      "configured": ["grok-4.5"],
+      "note": "unchanged"
+    },
+    "kimi": {
+      "status": "snapshot",
+      "method": "command",
+      "available": ["kimi-k2"],
+      "configured": ["kimi-k2"],
+      "note": "unchanged"
+    }
+  }
+}

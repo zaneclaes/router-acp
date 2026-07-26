@@ -71,7 +71,7 @@ the router never calls provider model APIs directly.
    **why**, plus every candidate that was skipped and the reason:
 
    ```
-   [router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · utility 0.82 = 0.3×quality 0.80 (BugFix) + 0.7×quota (headroom 100%, cost rank 2)
+   [router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · utility 0.63 = 0.3×quality 1.38→0.29 (BugFix) + 0.7×quota (headroom 100%, cost rank 2)
    [router-acp] skipped codex/gpt-5.5: token/usage limit (model reports reset in ~2h05m)
    ```
 
@@ -105,9 +105,18 @@ preference, config order.
   ```text
   quality_weight = 1 - cost_quality_tradeoff / 10
   cost_weight    = cost_quality_tradeoff / 10
-  quota_score    = headroom[agent] * (1 - normalized_cost_rank)
-  utility        = quality_weight * quality[task_class] + cost_weight * quota_score
+  quality_demand = min(task_class_base + 2 * complexity, 3)
+  quality_value  = (min(quality[task_class], quality_demand) - 0.5) / 3.0
+  effective_headroom = min(local_headroom, reported_plan_headroom[candidate])
+  quota_score    = effective_headroom * (1 - 0.5 * normalized_cost_rank)
+  utility        = quality_weight * quality_value + cost_weight * quota_score
   ```
+
+  Included-plan usage has no marginal dollar cost, so rank applies only a
+  bounded 50% scarcity discount. Candidate-specific plan headroom is the larger
+  cost signal; paid overage is penalized separately. An explicit
+  `cost_quality_tradeoff: 0` bypasses the demand cap and remains true
+  quality-max routing.
 
   When the prompt's classified complexity reaches `complexity_floor`,
   candidates below the 75th-percentile quality for that task class are
@@ -208,12 +217,14 @@ and it always tells the user what happened:
 
 ### Headroom and quarantine
 
-ACP adapters don't expose seat meters, so headroom is an estimate: per-agent
-sliding-window counters (default 5 h) of prompts and sessions, normalized
-against `budget_prompts_5h`. A rate-limit/auth/quota error before the first
-prompt zeroes an agent's headroom and the router walks the fallback chain; a
-candidate that keeps failing pre-prompt is quarantined for a cool-off. Errors
-after a session is pinned are surfaced, never rerouted.
+Without provider usage data, headroom falls back to per-agent sliding-window
+counters (default 5 h) of prompts and sessions, normalized against
+`budget_prompts_5h`. When a provider poll or client hint reports plan
+availability, routing uses the lower of that candidate's plan headroom and the
+local estimate. A rate-limit/auth/quota error before the first prompt zeroes an
+agent's headroom and the router walks the fallback chain; a candidate that
+keeps failing pre-prompt is quarantined for a cool-off. Errors after a session
+is pinned are surfaced, never rerouted.
 
 ### Dynamic preference: route to the free seat
 
@@ -221,10 +232,12 @@ after a session is pinned are surfaced, never rerouted.
 plan"). With `availability_preference` (on by default) it tracks reality
 instead of staying frozen:
 
-- **The bonus fades with the seat's free plan budget** — effective
-  preference is `preference × plan_headroom`, where `plan_headroom` is the
-  minimum free fraction across the plan windows that cover the candidate
-  (model-scoped weekly caps count only for their model).
+- **Free plan headroom is part of effective cost** — each candidate's quota
+  term uses the lower of local sliding-window headroom and reported plan
+  headroom. The static preference bonus also fades as
+  `preference × plan_headroom`. Model-scoped weekly caps count only for their
+  model, so Claude Fable's separate window does not make other Claude models
+  look scarce.
 - **A seat burning paid overage takes a penalty.** When a candidate's cap is
   exhausted but it stays routable because the overage/credit pool absorbs
   usage, its utility drops by `availability_preference.overage_penalty`
@@ -276,8 +289,19 @@ in a versioned YAML table shipped with the binary
 ([`data/scores.yaml`](data/scores.yaml)) and overridden wholesale with the
 `score_table` config key. Entries are keyed by candidate pattern
 (`agent/model`, `*` wildcards, first match wins). Updating routing quality is
-a data edit, not a code change. The heuristic classifier's rule tables work
-the same way ([`data/classifier.yaml`](data/classifier.yaml),
+a data edit, not a code change. Quality uses a benchmark-calibrated 0.5–3.5
+scale: about 1 is minimal, 2 is standard, and 3 is frontier. The router maps
+that scale linearly to 0–1 before combining it with quota and preference, so a
+  one-point quality difference always has a defined utility meaning. The task
+  class sets a minimal/implementation/reasoning demand base and complexity adds
+  up to two points, capped at frontier demand 3. Capability above what the task
+  can use is not rewarded, which prevents spending frontier headroom on work a
+  minimal or standard model can reliably finish. Task-class overrides are
+  emitted only when at least two relevant benchmark observations support a
+  difference of 0.15 or more. The reproducible updater procedure is
+documented in [`docs/model-updater.md`](docs/model-updater.md). The heuristic
+classifier's rule tables work the same way
+([`data/classifier.yaml`](data/classifier.yaml),
 `classifier.rules_file`).
 
 ## Per-request LLM routing
@@ -633,7 +657,7 @@ example.
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
 | `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). Also gates the usage polling that feeds `availability_preference`. |
 | `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
-| `availability_preference.enabled` | `true` | Dynamic preference scaling: effective preference = `agents[].preference × plan_headroom`, minus `overage_penalty` while the seat spends overage/credit budget. Off = static preference, hints ignored. |
+| `availability_preference.enabled` | `true` | Plan-aware routing: effective quota headroom is the lower of local and reported candidate plan headroom; effective preference = `agents[].preference × plan_headroom`; paid overage also incurs `overage_penalty`. Off = local headroom plus static preference, hints ignored. |
 | `availability_preference.overage_penalty` | `0.25` | Utility penalty for a candidate whose seat is past its plan cap and burning paid overage. Same additive scale as `agents[].preference`. |
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
@@ -649,7 +673,7 @@ example.
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |
 | `auto_upgrade.enabled` | `true` | Auto-switch a pinned session up to a more capable model when confidence drops. `false` disables it (explicit `[router: switch=…]` still works). |
-| `auto_upgrade.confidence_threshold` | `0.55` | Upgrade when confidence (pinned quality − struggle) falls below this. Higher = more eager; `0` ≈ never. |
+| `auto_upgrade.confidence_threshold` | `0.55` | Upgrade when confidence (fraction of task capability demand met − struggle) falls below this. Higher = more eager; `0` ≈ never. |
 | `skill_routing[]` | `[]` | Rules forcing a skill onto a model class: `pattern` (skill name, matched as `/name` or a standalone token) → `candidates` (candidate globs in preference order). Mid-session it switches; pre-pin it steers routing. |
 | `ticket_context[]` | `[]` | Ticket-loading rules: `prefix` (e.g. `HAI-`, matched at a word start + digits) → `command` (argv, `$TICKET` substituted, run without a shell) whose stdout is prepended to the prompt before routing. Pluggable across ticketing systems; fail-open. |
 | `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review→submit protocol. |

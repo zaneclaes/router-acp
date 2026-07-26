@@ -58,9 +58,9 @@ agents:
     #                     # should share a lineage so one never reviews the other.
     # Larger plan on claude: prefer it over codex when candidates are
     # otherwise comparable (small additive utility bonus). This is the STATIC
-    # base — `availability_preference` (below) scales it with the seat's free
-    # plan budget and flips it into a penalty when the seat is burning paid
-    # overage, so the "free" seat wins while this one is spending money.
+    # base — `availability_preference` (below) also folds candidate-specific
+    # free plan headroom into effective cost, scales this bonus by that
+    # headroom, and applies a penalty while the seat burns paid overage.
     preference: 0.1
     # `id` is the value passed to the CLI's `--model`; `api_model` is what the
     # provider's HTTP API calls the same model. They DIFFER here — `sonnet` and
@@ -202,10 +202,9 @@ routers:
     # quality: trivial prompts still go cheap because the tradeoff scales
     # down with classified complexity (complexity_scales_tradeoff, on by
     # default) — hard prompts get frontier models. NOTE: this is a GLOBAL
-    # cost/quality knob — raising it skews toward the cheapest models
-    # (haiku/sonnet/mini). To rebalance between two same-tier models (e.g. send
-    # more Fable traffic to Opus) tune their quality gap in the score table, not
-    # this knob (Fable's built-in scores already sit just above Opus for that).
+    # cost/quality knob — raising it skews toward candidates with more free
+    # plan headroom and lower scarcity ranks. Quality differences come only
+    # from the benchmark calibration in data/model-policy.yaml.
     cost_quality_tradeoff: 3
     # Floor on the effective cost weight after complexity scaling. Without
     # it, a complexity-1.0 classification zeroes the cost term entirely and
@@ -223,12 +222,13 @@ cordon:
   enabled: true
   poll_secs: 300
 
-# Dynamic preference scaling (on by default). The static `agents[].preference`
-# tie-break tracks seat availability: the bonus fades as the seat's free plan
-# budget is consumed (preference × plan_headroom), and a seat past its cap but
-# still routable via overage/credits takes `overage_penalty` off its utility —
-# so the router always favors the seat with free team-plan budget among
-# candidates of comparable quality. Availability comes from the same usage
+# Plan-aware effective cost (on by default). A candidate's quota term uses the
+# lower of local sliding-window headroom and its reported free plan headroom.
+# The static `agents[].preference` bonus also fades with plan headroom, and a
+# seat past its cap but still routable via overage/credits takes
+# `overage_penalty` off its utility. Model-scoped windows (including Claude
+# Fable's separate weekly cap) affect only matching models. Availability comes
+# from the same usage
 # polls as `cordon` plus optional client hints (the `router-acp/
 # availability_hint` extension notification; e.g. Kory Code pushes its own
 # per-minute seat-usage view). A fresh hint outranks the poll for

@@ -176,8 +176,11 @@ pub struct RouterSession {
     /// The session's classified task class (set at pin), for choosing an
     /// upgrade target.
     pub task_class: Option<crate::candidate::TaskClass>,
+    /// Classified complexity used to interpret benchmark quality against the
+    /// capability demand for confidence and demotion.
+    pub task_complexity: f64,
     /// Accumulated "struggle" signal (max-tokens/refusal stops, tool-call
-    /// failures); subtracted from `pinned_quality` to get confidence.
+    /// failures); subtracted from task-demand confidence.
     pub struggle: f64,
     /// Failed tool calls seen this turn (reset each turn).
     pub turn_tool_failures: u32,
@@ -285,6 +288,7 @@ impl RouterSession {
             delegates: Vec::new(),
             pinned_quality: 0.0,
             task_class: None,
+            task_complexity: 0.0,
             struggle: 0.0,
             turn_tool_failures: 0,
             turn_counted_tools: HashSet::new(),
@@ -332,6 +336,7 @@ impl RouterSession {
             delegates: Vec::new(),
             pinned_quality: 0.0,
             task_class: None,
+            task_complexity: 0.0,
             struggle: 0.0,
             turn_tool_failures: 0,
             turn_counted_tools: HashSet::new(),
@@ -784,7 +789,8 @@ impl Shared {
             // seat's free plan budget, and a seat running on paid overage
             // takes a penalty — so the "free" seat wins among comparable
             // candidates.
-            let preference = match headroom.availability(&c.id) {
+            let availability = headroom.availability(&c.id);
+            let preference = match &availability {
                 Some(a) if self.cfg.availability_preference.enabled => {
                     static_preference * a.plan_headroom.clamp(0.0, 1.0)
                         - if a.on_overage {
@@ -795,8 +801,14 @@ impl Shared {
                 }
                 _ => static_preference,
             };
+            let local_headroom = headroom.headroom(&c.id.agent);
+            let effective_headroom = availability
+                .as_ref()
+                .filter(|_| self.cfg.availability_preference.enabled)
+                .map(|a| local_headroom.min(a.plan_headroom.clamp(0.0, 1.0)))
+                .unwrap_or(local_headroom);
             views.push(CandidateView {
-                headroom: headroom.headroom(&c.id.agent),
+                headroom: effective_headroom,
                 quality: scores.quality(class),
                 coding_tier: scores.coding_tier,
                 cost_rank: c.cost_rank,
@@ -1334,7 +1346,10 @@ fn escalation_target(
     let current = current?;
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     pool.retain(|v| {
-        v.id != current && !is_excluded(&v.id, &excluded) && v.quality > current_q + 0.05
+        v.id != current
+            && !is_excluded(&v.id, &excluded)
+            && crate::candidate::quality_utility(v.quality)
+                > crate::candidate::quality_utility(current_q) + 0.05
     });
     let pick = match path {
         EscalationPath::Leap => pool.into_iter().max_by(|a, b| {
@@ -2747,6 +2762,7 @@ async fn pin_session(
                         // Confidence baseline for this pin; reset struggle.
                         s.pinned_quality = pin_quality;
                         s.task_class = Some(profile.class);
+                        s.task_complexity = profile.complexity;
                         s.struggle = 0.0;
                         // Deferred pre-pin mode wins; on failover re-apply
                         // whatever the client had set for this session.
@@ -4007,13 +4023,15 @@ fn maybe_trigger_orchestration(
     true
 }
 
-/// Estimate a session's confidence in [0, 1]: the pinned model's quality for
-/// the task class, minus accumulated struggle. Low = the model looks
-/// under-powered for how the session is actually going.
+/// Estimate a session's confidence in [0, 1]: how fully the pinned model's
+/// benchmark quality meets classified task demand, minus accumulated struggle.
 fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
     shared
         .with_session(router_sid, |s| {
-            (s.pinned_quality - s.struggle).clamp(0.0, 1.0)
+            let class = s.task_class.unwrap_or(TaskClass::CodingGeneral);
+            (crate::candidate::quality_confidence(s.pinned_quality, class, s.task_complexity)
+                - s.struggle)
+                .clamp(0.0, 1.0)
         })
         .unwrap_or(1.0)
 }
@@ -4033,7 +4051,10 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     pool.retain(|v| v.id != current && !is_excluded(&v.id, &excluded));
     pool.into_iter()
-        .filter(|v| v.quality > current_q + 0.05)
+        .filter(|v| {
+            crate::candidate::quality_utility(v.quality)
+                > crate::candidate::quality_utility(current_q) + 0.05
+        })
         .max_by(|a, b| {
             a.quality
                 .partial_cmp(&b.quality)
@@ -4047,15 +4068,17 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
 /// re-trigger an auto-upgrade: when auto-upgrade is enabled, the target's
 /// quality (minus current struggle) must clear the upgrade threshold.
 fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
-    let (class, current, excluded, struggle, strategy) = shared.with_session(router_sid, |s| {
-        (
-            s.task_class.unwrap_or(TaskClass::CodingGeneral),
-            s.pin.as_ref().map(|p| p.candidate.clone()),
-            s.excluded.clone(),
-            s.struggle,
-            s.strategy,
-        )
-    })?;
+    let (class, complexity, current, excluded, struggle, strategy) =
+        shared.with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.task_complexity,
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+                s.excluded.clone(),
+                s.struggle,
+                s.strategy,
+            )
+        })?;
     let current = current?;
     let current_cost = shared.candidate_runtime(&current).map(|c| c.cost_rank)?;
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
@@ -4068,7 +4091,10 @@ fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId
     // the demotion.
     if shared.cfg.auto_upgrade.enabled && strategy != StrategyKind::Escalation {
         let threshold = shared.cfg.auto_upgrade.confidence_threshold;
-        pool.retain(|v| v.quality - struggle >= threshold);
+        pool.retain(|v| {
+            crate::candidate::quality_confidence(v.quality, class, complexity) - struggle
+                >= threshold
+        });
     }
     pool.into_iter()
         .max_by(|a, b| {

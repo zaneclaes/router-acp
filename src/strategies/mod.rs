@@ -27,10 +27,10 @@ pub struct CandidateView {
     pub cost_rank: u32,
     /// Position in config declaration order (stable tie-break).
     pub config_index: usize,
-    /// Quality score in [0, 1] for the classified task class.
+    /// Benchmark quality in [0.5, 3.5] for the classified task class.
     pub quality: f64,
     pub coding_tier: CodingTier,
-    /// Per-agent headroom estimate in [0, 1].
+    /// Tightest local/plan headroom estimate in [0, 1].
     pub headroom: f64,
     /// Configured per-agent tie-break preference (`agents[].preference`).
     pub preference: f64,

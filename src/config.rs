@@ -234,15 +234,12 @@ impl Default for CordonConfig {
     }
 }
 
-/// Dynamic preference scaling from seat availability. The static
-/// `agents[].preference` is a *plan-size* tie-break; this section makes it
-/// track reality: the bonus fades as the seat's free plan budget is consumed
-/// (`preference × plan_headroom`), and a seat whose cap is exhausted but still
-/// routable via overage/credits takes a utility *penalty* — so when one seat
-/// still has free team-plan budget and the other is burning paid overage, the
-/// free seat wins among candidates of comparable quality. Availability comes
-/// from the usage poller (`agents[].usage_source`) and from client
-/// `availability_hint` extension notifications (see README).
+/// Plan-aware effective cost. Reported candidate plan headroom caps the local
+/// sliding-window headroom used by routing. The static `agents[].preference`
+/// bonus also fades as free plan budget is consumed, and a seat whose cap is
+/// exhausted but remains routable via overage/credits takes a utility penalty.
+/// Availability comes from the usage poller (`agents[].usage_source`) and from
+/// client `availability_hint` extension notifications (see README).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AvailabilityPreferenceConfig {

@@ -1,0 +1,93 @@
+version: 1.0.0
+title: router-acp model scoring judgment
+description: >-
+  Find comparable published benchmark results for newly discovered models and
+  flag id renames. Returns JSON only; deterministic Python owns score math.
+
+parameters:
+  - key: UNSCORED
+    input_type: string
+    requirement: required
+    description: comma-separated `agent/model` ids that have no score-table entry yet
+  - key: CURRENT_SCORES
+    input_type: string
+    requirement: required
+    description: path to data/scores.yaml
+  - key: POLICY
+    input_type: string
+    requirement: required
+    description: path to data/model-policy.yaml (benchmark calibrations/evidence, invariants)
+  - key: CATALOG
+    input_type: string
+    requirement: required
+    description: path to the agent config whose catalog is being updated
+  - key: BENCHMARKS
+    input_type: string
+    requirement: optional
+    default: benchmarks/llm-proxy/RESULTS.md
+    description: local benchmark notes to weigh above published evals
+
+instructions: |
+  You are collecting benchmark EVIDENCE for a router's quality table. You do
+  not assign a tier, base, or per-class score. Deterministic code maps raw
+  results through the fixed calibrations in POLICY.
+
+  Read first, in this order of authority:
+    1. {{ BENCHMARKS }} — local seat measurements, if present. Outranks everything.
+    2. {{ POLICY }} — use only benchmark names already declared under
+       `benchmark_scoring.benchmarks`, whose versions and calibrations are fixed.
+    3. {{ CURRENT_SCORES }} — the currently shipped benchmark-derived output.
+    4. {{ CATALOG }} — how the model is configured (price, rank, whether enabled).
+
+  Rules that are not negotiable:
+    * Every observation needs the exact benchmark name, numeric result, and a
+      primary-source URL or checked-in local result path.
+    * Do not translate marketing prose into a score. With no comparable result,
+      return no observations and name the missing evidence under `risks`.
+    * Do not mix benchmark versions or harnesses. If the POLICY lacks the exact
+      benchmark version, list it as a risk for an operator to calibrate first.
+
+  For renames, propose one only when a NEW id plainly supersedes an OLD one (a
+  version bump of the same line, e.g. `gpt-5.6-sol` -> `gpt-5.7-sol`). Two
+  models that merely look similar are two models. Renames are reported to a
+  human and never applied automatically, so say what you actually believe and
+  put your uncertainty in `confidence`.
+
+  Output a SINGLE JSON object and nothing else — no prose, no code fence:
+
+  {
+    "models": [
+      {
+        "candidate": "claude/opus-next[1m]",
+        "pattern": "*opus-next*",
+        "observations": [
+          {"benchmark": "SWE-Bench-Pro", "result": 71.2,
+           "source": "https://provider.example/model-card"}
+        ],
+        "rationale": "one or two sentences citing what you actually read",
+        "risks": []
+      }
+    ],
+    "renames": [
+      { "from": "codex/gpt-5.6-sol", "to": "codex/gpt-5.7-sol", "confidence": 0.8,
+        "rationale": "same line, version bump" }
+    ]
+  }
+
+  Use an empty array for either key when there is nothing to report. A reply
+  that is not parseable JSON or has an unsourced/non-numeric observation is
+  rejected by the caller.
+
+prompt: |
+  Find comparable benchmark evidence for these unscored candidates: {{ UNSCORED }}.
+  Output JSON only.
+
+extensions:
+  - type: builtin
+    name: developer
+    display_name: Developer
+    timeout: 300
+    bundled: true
+
+settings:
+  temperature: 0.1
