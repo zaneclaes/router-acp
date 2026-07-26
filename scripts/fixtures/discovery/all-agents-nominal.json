@@ -1,0 +1,34 @@
+{
+  "_comment": "Recorded discovery for the shipped catalog: every configured model is still offered, so a dry run using this fixture must propose no changes. claude/codex report `snapshot` because neither exposes an offline model list.",
+  "generated_at": "2026-07-26",
+  "agents": {
+    "claude": {
+      "status": "snapshot",
+      "method": "snapshot",
+      "available": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]"],
+      "configured": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]"],
+      "note": "model list comes from the ACP adapter's model selector"
+    },
+    "codex": {
+      "status": "snapshot",
+      "method": "snapshot",
+      "available": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "configured": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "note": "ids come from the codex rollout config"
+    },
+    "grok": {
+      "status": "ok",
+      "method": "command",
+      "available": ["grok-4.5"],
+      "configured": ["grok-4.5"],
+      "note": "parsed from `grok models`"
+    },
+    "kimi": {
+      "status": "snapshot",
+      "method": "command",
+      "available": ["kimi-k2"],
+      "configured": ["kimi-k2"],
+      "note": "probe only: CLI present, no list available"
+    }
+  }
+}

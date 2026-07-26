@@ -232,7 +232,9 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
     for (k, v) in env {
         // Escape for a double-quoted YAML scalar (JSON env values need this).
         let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
-        out.push_str(&format!("        - {{ name: {k}, value: \"{escaped}\" }}\n"));
+        out.push_str(&format!(
+            "        - {{ name: {k}, value: \"{escaped}\" }}\n"
+        ));
     }
     out.push_str("    model_selection: { type: config-option }\n    models:\n");
     for (id, cost) in models {
@@ -1553,13 +1555,13 @@ async fn routing_scales_with_task_complexity_and_prefers_claude() {
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
 
-        // Session 1: trivial prompt -> a mid-tier claude model, not codex.
+        // Session 1: trivial prompt -> the minimal claude model, not codex.
         let s1 = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &s1, "hello world").await?;
         let text1 = agent_text(&observed, &s1);
         assert!(
-            text1.contains("auto → claude/sonnet"),
-            "trivial prompt routes to a cheap-ish claude model: {text1}"
+            text1.contains("auto → claude/haiku"),
+            "trivial prompt does not spend unused frontier capability: {text1}"
         );
 
         // Session 2: cross-system investigation -> a frontier claude model.
@@ -3723,13 +3725,26 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
 async fn availability_hint_penalizes_overage_seat() {
     let state = temp_state_file("avail-hint");
     let log = temp_log("avail-hint");
-    // Pure-quality routing: a/fable-5 (0.92) beats b/sonnet (0.8) — until a
-    // client hint reports agent `a`'s seat past its cap and burning paid
-    // overage, whose penalty (default 0.25) hands the win to the free seat.
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"a/*\", default_quality: 1.2 }\n\
+         \x20 - { pattern: \"b/*\", default_quality: 1.1 }\n",
+    )
+    .unwrap();
+    // Pure-quality routing: a narrowly beats b — until a client hint reports
+    // agent `a` past its cap and burning paid overage. The default 0.25
+    // penalty hands the win to the comparable free seat.
     let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         cordon: {{ enabled: false }}\n\
          routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
         state.display(),
+        scores.display(),
         agent_yaml(
             "a",
             &[("fable-5", 5)],
@@ -3810,6 +3825,93 @@ async fn availability_hint_penalizes_overage_seat() {
                 && a["on_overage"] == true
                 && a["source"] == "hint"),
             "availability disclosed: {routing}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn partial_plan_headroom_changes_effective_cost() {
+    let state = temp_state_file("avail-headroom");
+    let log = temp_log("avail-headroom");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"*\", default_quality: 2.0 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         cordon: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 10 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("worker", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("worker", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+
+        // Equal quality, rank, preference, and local usage: config order wins.
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "small task").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:worker:"));
+        assert_eq!(
+            open_state(&state)
+                .get(&sid)
+                .map(|session| session.agent.clone()),
+            Some("a".to_string())
+        );
+
+        // Both seats remain inside their plans, but b has four times the
+        // weekly headroom. That makes b effectively cheaper before overage.
+        let hint = agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({
+                "ttl_secs": 300,
+                "agents": [
+                    {
+                        "agent": "a",
+                        "windows": [{ "percent": 80, "scope": serde_json::Value::Null }]
+                    },
+                    {
+                        "agent": "b",
+                        "windows": [{ "percent": 20, "scope": serde_json::Value::Null }]
+                    }
+                ]
+            }),
+        )?;
+        cx.send_notification(hint)?;
+
+        let a = router_acp::candidate::CandidateId::new("a", "worker");
+        for _ in 0..50 {
+            if shared.headroom.lock().unwrap().availability(&a).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid2, "small task").await?;
+        assert_eq!(
+            open_state(&state)
+                .get(&sid2)
+                .map(|session| session.agent.clone()),
+            Some("b".to_string()),
+            "the candidate with more included-plan headroom should be cheaper"
         );
         Ok(())
     })
@@ -4095,7 +4197,7 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
     // list must NOT orchestrate when pre-class says warranted=false.
     let state = temp_state_file("preclass-fp");
     let log = temp_log("preclass-fp");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.92,"estimated_parts":1,"reason":"enumerated Q&A / plan, not multi-track impl"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"Writing","task_classes":["Writing"],"categories":["docs"],"complexity":0.18,"confidence":0.9,"reason":"bounded plan"},"orchestrate":{"warranted":false,"confidence":0.92,"estimated_parts":1,"reason":"enumerated Q&A / plan, not multi-track impl"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -4141,6 +4243,12 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
             !text.contains("you are the ORCHESTRATOR"),
             "no orchestration protocol: {text}"
         );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted");
+        assert_eq!(routing["class"], "Writing", "{routing}");
+        assert_eq!(routing["complexity"], 0.18, "{routing}");
         Ok(())
     })
     .await;
@@ -4150,7 +4258,7 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
 async fn preclass_true_multi_track_still_orchestrates() {
     let state = temp_state_file("preclass-tp");
     let log = temp_log("preclass-tp");
-    let preclass_json = r#"{"orchestrate":{"warranted":true,"confidence":0.9,"estimated_parts":3,"reason":"multi-track implementation"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"Feature","task_classes":["Feature","Architecture"],"categories":["backend"],"complexity":0.72,"confidence":0.9,"reason":"multi-track implementation"},"orchestrate":{"warranted":true,"confidence":0.9,"estimated_parts":3,"reason":"multi-track implementation"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -4184,10 +4292,7 @@ async fn preclass_true_multi_track_still_orchestrates() {
         .await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("pre-class"),
-            "pre-class disclosure: {text}"
-        );
+        assert!(text.contains("pre-class"), "pre-class disclosure: {text}");
         assert!(
             text.contains("orchestrating a 3-part task"),
             "pre-class TP must orchestrate: {text}"
@@ -4206,7 +4311,7 @@ async fn preclass_true_multi_track_still_orchestrates() {
 async fn preclass_dimension_injects_ui_planning() {
     let state = temp_state_file("preclass-ui");
     let log = temp_log("preclass-ui");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"single UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"UiTweak","task_classes":["UiTweak","Feature"],"categories":["UX","frontend"],"complexity":0.55,"confidence":0.92,"reason":"new UI surface"},"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"single UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -4238,10 +4343,7 @@ async fn preclass_dimension_injects_ui_planning() {
         let resp = prompt_text(&cx, &sid, "Redesign the settings page with better density").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("pre-class"),
-            "pre-class disclosure: {text}"
-        );
+        assert!(text.contains("pre-class"), "pre-class disclosure: {text}");
         assert!(
             text.contains("[kory-code] PLANNING INJECT"),
             "ui_planning inject must ride the prompt: {text}"
@@ -4260,7 +4362,7 @@ async fn preclass_force_orchestrate_still_works() {
     // orchestrate: force overrides pre-class saying no.
     let state = temp_state_file("preclass-force");
     let log = temp_log("preclass-force");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"CodingGeneral","task_classes":["CodingGeneral"],"categories":["code"],"complexity":0.4,"confidence":0.9,"reason":"bounded work"},"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\

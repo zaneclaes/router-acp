@@ -1,0 +1,13 @@
+{
+  "_comment": "The failure mode that must never turn into a mass retirement: `grok models` cannot run (not logged in), so the probe is untrustworthy. The catalog stands as last-known-good and to_remove must stay empty.",
+  "generated_at": "2026-07-26",
+  "agents": {
+    "grok": {
+      "status": "unavailable",
+      "method": "command",
+      "available": ["grok-4.5"],
+      "configured": ["grok-4.5"],
+      "error": "exit 1: not logged in — run `grok login`"
+    }
+  }
+}

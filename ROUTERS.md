@@ -68,14 +68,16 @@ candidate is in the pool only if it is:
 
 And for `auto`, each candidate carries three numbers:
 
-- **quality** — a 0–1 score *for the kind of task you asked*, from a data
+- **quality** — a benchmark-calibrated 0.5–3.5 score *for the kind of task you
+  asked* (roughly 1 minimal, 2 standard, 3 frontier), from a data
   table ([`data/scores.yaml`](data/scores.yaml), overridable with
   `score_table:`). Patterns are first-match-wins, so specific patterns
   (`*mini*`) must come before broad ones (`*gpt-5*`).
 - **cost rank** — your `models[].cost_rank` (1 = cheapest/least scarce).
   With flat-rate seats this models *scarcity*, not dollars.
-- **headroom** — an estimate of how much seat budget the agent has left in
-  the current window (prompts used vs `budget_prompts_5h`).
+- **headroom** — the lower of the local sliding-window estimate and reported
+  free plan headroom for this candidate. Model-scoped caps, such as Claude
+  Fable's weekly window, apply only to that model.
 
 The kind of task comes from a **classifier** that reads your first prompt:
 it assigns a task class (BugFix, Research, Architecture, UiTweak, …) and a
@@ -98,10 +100,19 @@ quality.
 For each candidate:
 
 ```
-utility = quality_weight × quality(task class)
-        + cost_weight × headroom × (1 − normalized cost rank)
+quality_demand = min(task-class base + 2 × complexity, 3)
+quality_value = (min(quality(task class), quality_demand) − 0.5) / 3.0
+effective_headroom = min(local headroom, reported plan headroom)
+utility = quality_weight × quality_value
+        + cost_weight × effective_headroom × (1 − 0.5 × normalized cost rank)
         + preference
 ```
+
+Included-plan usage is free at the margin, so rank is only a bounded scarcity
+pressure against wasting large-token/frontier models. Reported plan headroom is
+the dominant cost signal; paid overage receives a separate penalty. At
+`cost_quality_tradeoff: 0`, the demand cap is bypassed and raw benchmark
+quality wins.
 
 The weights come from one dial, `cost_quality_tradeoff` (0–10):
 
@@ -111,11 +122,16 @@ The weights come from one dial, `cost_quality_tradeoff` (0–10):
 
 Two behaviors make `auto` feel smart:
 
-1. **Complexity scales the dial** (`complexity_scales_tradeoff`, on by
+1. **Task difficulty caps useful capability:** editing/ops classes start at
+   demand 1, implementation at 1.2, and open-ended reasoning at 1.5.
+   Complexity adds up to two points, capped at frontier demand 3. A stronger
+   model keeps its measured quality, but quality above the task's demand has no
+   extra utility for that decision.
+2. **Complexity scales the dial** (`complexity_scales_tradeoff`, on by
    default): the effective tradeoff is `tradeoff × (1 − complexity)`. A
    "hello world" keeps your configured cost-consciousness; an hour-long
    investigation drives the tradeoff toward 0 so frontier models win.
-2. **The complexity gate** (`complexity_floor`, default 0.7): when a prompt
+3. **The complexity gate** (`complexity_floor`, default 0.7): when a prompt
    classifies above the floor, candidates below the 75th-percentile quality
    for that task class are dropped *before* scoring — cheap models can't
    even compete for genuinely hard work.
@@ -145,7 +161,7 @@ agents:
 input:
 
 ```
-[router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · utility 0.82 = 0.70×quality 0.80 (BugFix) + 0.30×quota (headroom 100%, cost rank 2) + pref 0.05 · tradeoff 3→2.0 (complexity-scaled)
+[router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · utility 0.48 = 0.70×quality 1.38→0.29 (BugFix) + 0.30×quota (headroom 100%, cost rank 2) + pref 0.05 · tradeoff 3→2.0 (complexity-scaled)
 ```
 
 - routed too cheap on a hard task → `complexity` was scored too low (tune
@@ -327,11 +343,14 @@ Three ways it happens:
    prose. Pre-pin, the shorthand steers the initial pin instead of switching.
 
 2. **Auto-upgrade.** After each turn the router estimates the session's
-   **confidence** — the pinned model's quality for the task class minus an
-   accumulated **struggle** score (raised by hitting the token ceiling, refusing,
-   or repeated tool failures within a turn). When confidence falls below a
-   threshold, the router queues an upgrade to the best strictly-more-capable
-   eligible candidate and performs it on the next prompt. Tunable:
+   **confidence** — the fraction of the classified task's capability demand
+   met by the pinned model's benchmark quality, minus an accumulated
+   **struggle** score (raised by hitting the token ceiling, refusing, or
+   repeated tool failures within a turn). A model meeting demand starts at
+   full confidence regardless of its absolute tier. When confidence falls
+   below a threshold, the router queues an upgrade to the best
+   strictly-more-capable eligible candidate and performs it on the next
+   prompt. Tunable:
 
    ```yaml
    auto_upgrade:

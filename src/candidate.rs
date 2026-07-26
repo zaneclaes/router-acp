@@ -261,6 +261,37 @@ pub struct ScoreTable {
 }
 
 pub const BUILTIN_SCORE_TABLE: &str = include_str!("../data/scores.yaml");
+pub const QUALITY_MIN: f64 = 0.5;
+pub const QUALITY_MAX: f64 = 3.5;
+
+/// Convert the benchmark capability scale into the 0..1 value used by utility
+/// and confidence math. Raw scores stay visible for ordering and diagnostics.
+pub fn quality_utility(score: f64) -> f64 {
+    ((score.clamp(QUALITY_MIN, QUALITY_MAX) - QUALITY_MIN) / (QUALITY_MAX - QUALITY_MIN))
+        .clamp(0.0, 1.0)
+}
+
+/// Capability demand on the benchmark scale. Editing/operational work starts
+/// minimal, implementation slightly higher, and open-ended reasoning at
+/// standard capability; classified complexity adds up to two points.
+pub fn quality_demand(class: TaskClass, complexity: f64) -> f64 {
+    let base = match class {
+        TaskClass::UiTweak | TaskClass::Writing | TaskClass::Ops => 1.0,
+        TaskClass::BugFix | TaskClass::Feature | TaskClass::Refactor | TaskClass::CodingGeneral => {
+            1.2
+        }
+        TaskClass::Algorithms | TaskClass::Architecture | TaskClass::Research => 1.5,
+    };
+    (base + 2.0 * complexity.clamp(0.0, 1.0)).min(3.0)
+}
+
+/// Confidence that a score meets this task's demand. Meeting or exceeding the
+/// demand is full confidence; falling short is measured across the usable
+/// 0.5..demand interval before observed struggle is applied.
+pub fn quality_confidence(score: f64, class: TaskClass, complexity: f64) -> f64 {
+    let demand = quality_demand(class, complexity);
+    ((score.clamp(QUALITY_MIN, QUALITY_MAX) - QUALITY_MIN) / (demand - QUALITY_MIN)).clamp(0.0, 1.0)
+}
 
 impl ScoreTable {
     pub fn builtin() -> Self {
@@ -277,7 +308,7 @@ impl ScoreTable {
             for (class_name, score) in &raw_entry.quality {
                 match TaskClass::parse(class_name) {
                     Some(class) => {
-                        quality.insert(class, score.clamp(0.0, 1.0));
+                        quality.insert(class, score.clamp(QUALITY_MIN, QUALITY_MAX));
                     }
                     None => {
                         return Err(format!(
@@ -298,7 +329,10 @@ impl ScoreTable {
                     effort: raw_entry.effort.unwrap_or(true),
                     tags: raw_entry.tags,
                     quality,
-                    default_quality: raw_entry.default_quality.unwrap_or(0.5).clamp(0.0, 1.0),
+                    default_quality: raw_entry
+                        .default_quality
+                        .unwrap_or(QUALITY_MIN)
+                        .clamp(QUALITY_MIN, QUALITY_MAX),
                 },
             ));
         }
@@ -380,6 +414,22 @@ mod tests {
         let unknown = table.lookup(&CandidateId::new("nobody", "nothing"));
         assert_eq!(unknown.quality(TaskClass::BugFix), 0.5);
     }
+
+    #[test]
+    fn benchmark_quality_has_stable_utility_meaning() {
+        assert_eq!(quality_utility(0.5), 0.0);
+        assert_eq!(quality_utility(2.0), 0.5);
+        assert_eq!(quality_utility(3.5), 1.0);
+        assert_eq!(quality_utility(-10.0), 0.0);
+        assert_eq!(quality_utility(10.0), 1.0);
+    }
+
+    #[test]
+    fn task_confidence_is_full_when_capability_meets_demand() {
+        assert_eq!(quality_confidence(1.3, TaskClass::UiTweak, 0.0), 1.0);
+        assert!(quality_confidence(1.3, TaskClass::Architecture, 0.5) < 0.5);
+        assert_eq!(quality_demand(TaskClass::Architecture, 1.0), 3.0);
+    }
 }
 
 #[cfg(test)]
@@ -393,15 +443,28 @@ mod score_resolution_tests {
     fn mini_models_resolve_to_medium_tier_not_gpt5_family() {
         let t = ScoreTable::builtin();
         let mini = t.lookup(&CandidateId::parse("codex/gpt-5.4-mini").unwrap());
+        let full = t.lookup(&CandidateId::parse("codex/gpt-5.5").unwrap());
         assert_eq!(mini.coding_tier, CodingTier::Medium);
         assert_eq!(mini.context_window, Some(400_000));
-        assert!(
-            mini.quality(TaskClass::Research) <= 0.5,
-            "mini is not opus-grade"
-        );
-        let full = t.lookup(&CandidateId::parse("codex/gpt-5.5").unwrap());
+        assert!(mini.quality(TaskClass::Research) < full.quality(TaskClass::Research));
         assert_eq!(full.coding_tier, CodingTier::High);
-        assert!(full.quality(TaskClass::Research) > 0.7);
+    }
+
+    /// Regression: "gemini" contains the substring "mini", so a `*mini*` entry
+    /// above the gemini ones silently scores Gemini Pro as a small mini-class
+    /// model. Order in `data/scores.yaml` is the only thing preventing it.
+    #[test]
+    fn gemini_ids_are_not_shadowed_by_the_mini_pattern() {
+        let t = ScoreTable::builtin();
+        let pro = t.lookup(&CandidateId::parse("gemini/gemini-3-pro").unwrap());
+        let flash = t.lookup(&CandidateId::parse("gemini/gemini-3-flash").unwrap());
+        assert_eq!(pro.coding_tier, CodingTier::High, "gemini pro is high tier");
+        assert_eq!(pro.context_window, Some(1_000_000), "gemini's own window");
+        assert!(
+            pro.quality(TaskClass::CodingGeneral) > flash.quality(TaskClass::CodingGeneral),
+            "pro outranks flash"
+        );
+        assert_eq!(flash.context_window, Some(1_000_000), "flash is not mini");
     }
 
     #[test]
@@ -465,10 +528,7 @@ mod score_resolution_tests {
         );
         // Must not collide with sonnet (no "sol" substring).
         let sonnet = t.lookup(&CandidateId::parse("claude/sonnet").unwrap());
-        assert!(
-            sonnet.quality(TaskClass::CodingGeneral) < 0.9,
-            "sonnet unaffected"
-        );
+        assert!(sonnet.quality(TaskClass::CodingGeneral) < sol.quality(TaskClass::CodingGeneral));
     }
 
     #[test]

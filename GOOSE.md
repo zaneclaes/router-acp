@@ -107,10 +107,20 @@ routers:
 ### Tuning: how prompts map to models
 
 `auto` scores every candidate as
-`utility = quality_weight×quality(task class) + cost_weight×quota + preference`,
-where the quality/cost weights come from `cost_quality_tradeoff` **scaled
-down by the prompt's classified complexity** (a hard prompt makes cost
-matter less). With the config above you should see roughly:
+`utility = quality_weight×normalized benchmark quality +
+cost_weight×quota + preference`. Raw quality is benchmark-calibrated on
+0.5–3.5 (about 1 minimal, 2 standard, 3 frontier), then mapped linearly to
+0–1 so the tradeoff has stable semantics. Task class sets the capability-demand
+base (1 editing/ops, 1.2 implementation, 1.5 open-ended reasoning), complexity
+adds up to two points, and demand caps at 3. Strength above that demand earns no
+extra utility, so included-plan frontier capacity is not spent on work a
+smaller model can reliably finish. Quota uses the lower of local
+sliding-window headroom and candidate-specific reported plan headroom. Because
+included usage is free at the margin, scarcity rank discounts that quota term
+by at most 50%; paid overage is penalized separately. The
+quality/cost weights come from `cost_quality_tradeoff` **scaled down by the
+prompt's classified complexity** (a hard prompt makes cost matter less).
+With the config above you should see roughly:
 
 | prompt | routes to |
 | --- | --- |
@@ -118,7 +128,7 @@ matter less). With the config above you should see roughly:
 | ordinary coding tasks | `claude/sonnet` |
 | cross-system investigation, architecture, "analyze the PR + ticket…" | `claude/claude-fable-5[1m]` or `claude/opus[1m]` |
 
-The disclosure line shows the math (`utility 0.86 = 0.86×quality 0.95
+The disclosure line shows the math (`utility 0.74 = 0.86×quality 2.81→0.77
 (Research) + 0.14×quota … + pref 0.05 · tradeoff 3→1.4
 (complexity-scaled)`), so when a choice looks wrong, the line tells you
 which factor drove it:
@@ -131,6 +141,18 @@ which factor drove it:
 - A model looks mis-scored → the quality data lives in `data/scores.yaml`
   (override with `score_table`); patterns are first-match-wins, so specific
   patterns (`*mini*`) must precede broad ones (`*gpt-5*`).
+
+### Updating the model catalog and scores
+
+Run `./scripts/update_models.py --dry-run` after a model launch, pricing
+change, or quarterly benchmark refresh. The updater discovers provider model
+ids, converts cited benchmark results through the fixed calibrations in
+`data/model-policy.yaml`, validates routing invariants, and writes a reviewable
+report without touching the checkout. Use `--apply` only after reviewing that
+report. Goose may research model aliases and benchmark observations, but the
+deterministic updater validates the evidence and owns every YAML edit. See
+[`docs/model-updater.md`](docs/model-updater.md) for evidence requirements,
+headroom/overage semantics, fixtures, and exit codes.
 
 Notes on this file:
 
@@ -381,7 +403,7 @@ answer):
 
 ```
 > router-acp · auto → claude/sonnet · task BugFix (complexity 0.35)
-> why: utility 0.82 = 0.3×quality 0.80 (BugFix) + 0.7×quota (headroom 100%, cost rank 2)
+> why: utility 0.63 = 0.3×quality 1.38→0.29 (BugFix) + 0.7×quota (headroom 100%, cost rank 2)
 ```
 
 On agentic turns (tool calls) goose splits the message stream, so the line

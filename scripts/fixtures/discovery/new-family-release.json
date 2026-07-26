@@ -1,0 +1,13 @@
+{
+  "_comment": "Synthetic release of a model in a family the score table has never seen (`gpt-6-atlas` matches no existing pattern). Exercises the full add path: an anchored curve is proposed, a non-shadowing pattern is placed, and the catalog entry lands commented-out — without rewriting any existing model's numbers or ranks.",
+  "generated_at": "2026-07-26",
+  "agents": {
+    "codex": {
+      "status": "ok",
+      "method": "command",
+      "available": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-atlas"],
+      "configured": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "note": "synthetic fixture for the new-family path"
+    }
+  }
+}

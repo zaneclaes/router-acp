@@ -234,15 +234,12 @@ impl Default for CordonConfig {
     }
 }
 
-/// Dynamic preference scaling from seat availability. The static
-/// `agents[].preference` is a *plan-size* tie-break; this section makes it
-/// track reality: the bonus fades as the seat's free plan budget is consumed
-/// (`preference × plan_headroom`), and a seat whose cap is exhausted but still
-/// routable via overage/credits takes a utility *penalty* — so when one seat
-/// still has free team-plan budget and the other is burning paid overage, the
-/// free seat wins among candidates of comparable quality. Availability comes
-/// from the usage poller (`agents[].usage_source`) and from client
-/// `availability_hint` extension notifications (see README).
+/// Plan-aware effective cost. Reported candidate plan headroom caps the local
+/// sliding-window headroom used by routing. The static `agents[].preference`
+/// bonus also fades as free plan budget is consumed, and a seat whose cap is
+/// exhausted but remains routable via overage/credits takes a utility penalty.
+/// Availability comes from the usage poller (`agents[].usage_source`) and from
+/// client `availability_hint` extension notifications (see README).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AvailabilityPreferenceConfig {
@@ -250,20 +247,21 @@ pub struct AvailabilityPreferenceConfig {
     /// statically and availability hints are ignored.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Utility penalty for a candidate whose seat is past its plan cap and
-    /// spending overage/credit budget. Sized like `preference` (same additive
-    /// utility scale): large enough to outweigh any static preference bonus,
-    /// small enough not to override real quality differences.
-    #[serde(default = "default_overage_penalty")]
-    pub overage_penalty: f64,
+    /// Aversion to spending paid overage, in [0, 1]. Auto routing subtracts
+    /// `cost_aversion * (1 - task_complexity)` from an overage candidate, so
+    /// difficult work can still justify frontier spend while 0 means the user
+    /// is perfectly happy to pay. `overage_penalty` is accepted as a legacy
+    /// alias for existing configs.
+    #[serde(default = "default_cost_aversion", alias = "overage_penalty")]
+    pub cost_aversion: f64,
     /// How long a client availability hint stays authoritative before the
     /// router falls back to its own poll, in seconds.
     #[serde(default = "default_hint_ttl_secs")]
     pub hint_ttl_secs: u64,
 }
 
-fn default_overage_penalty() -> f64 {
-    0.25
+fn default_cost_aversion() -> f64 {
+    0.1
 }
 
 fn default_hint_ttl_secs() -> u64 {
@@ -274,7 +272,7 @@ impl Default for AvailabilityPreferenceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            overage_penalty: default_overage_penalty(),
+            cost_aversion: default_cost_aversion(),
             hint_ttl_secs: default_hint_ttl_secs(),
         }
     }
@@ -1011,6 +1009,12 @@ pub struct AgentLlmProxyConfig {
     /// The real provider/subscription endpoint. Its origin and path are
     /// preserved; only the request body's top-level `model` field may change.
     pub upstream_base_url: String,
+    /// Codex ChatGPT OAuth ignores `OPENAI_BASE_URL` for its preferred
+    /// WebSocket transport. Install an HTTP Responses custom provider into
+    /// `CODEX_CONFIG`/`MODEL_PROVIDER` so inference actually crosses this
+    /// proxy while retaining the seat's ChatGPT authentication.
+    #[serde(default)]
+    pub codex_chatgpt_provider: bool,
 }
 
 /// Policy and listener settings for per-request routing.
@@ -1315,9 +1319,9 @@ impl Config {
                 )));
             }
         }
-        if !(0.0..=1.0).contains(&self.availability_preference.overage_penalty) {
+        if !(0.0..=1.0).contains(&self.availability_preference.cost_aversion) {
             return Err(ConfigError(
-                "availability_preference.overage_penalty must be between 0 and 1".into(),
+                "availability_preference.cost_aversion must be between 0 and 1".into(),
             ));
         }
         if self.delegation.max_concurrent == 0 {
@@ -1392,6 +1396,12 @@ impl Config {
                 if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
                     return Err(ConfigError(format!(
                         "agent `{}`: llm_proxy.upstream_base_url must be an absolute HTTP(S) URL",
+                        agent.name
+                    )));
+                }
+                if proxy.codex_chatgpt_provider && proxy.protocol != LlmWireProtocol::Openai {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: llm_proxy.codex_chatgpt_provider requires protocol `openai`",
                         agent.name
                     )));
                 }

@@ -183,13 +183,16 @@ SDK traps below, which were all discovered the hard way.
   `gate_message` never cordons. Grok therefore needs **no** `usage_source` in
   config — the cordon is automatic. Pure decision is `xai_gate_reason` (tested,
   `xai_gate_tests`).
-- **Dynamic preference scaling** (`availability_preference.*`; same poll +
-  client hints): `agents[].preference` is the *static* base — `eligible_views`
-  computes the effective preference as `preference × plan_headroom`, minus
-  `overage_penalty` when the seat is past its cap but routable via
-  overage/credits (spending real money). That keeps the router on whichever
-  seat still has FREE plan budget among comparable candidates; a saturated
-  seat with no overage headroom is a cordon, never a penalty. Availability
+- **Plan-aware effective cost** (`availability_preference.*`; same poll +
+  client hints): `eligible_views` uses the lower of local sliding-window
+  headroom and candidate-specific reported plan headroom in the quota term.
+  It also scales the static `agents[].preference` base as
+  `preference × plan_headroom`, then subtracts
+  `cost_aversion × (1 - task complexity)` when the seat is past its cap but
+  routable via overage/credits (spending real money).
+  Model-scoped windows affect only matching models. That preserves FREE plan
+  budget among comparable candidates; a saturated seat with no overage
+  headroom is a cordon, never a penalty. Availability
   sources: the usage poller (`set_polled_availability`, wholesale per cycle)
   and the `router-acp/availability_hint` extension notification
   (`apply_availability_hint` — session-less, consumed in `on_catch_all`,
@@ -198,14 +201,20 @@ SDK traps below, which were all discovered the hard way.
   reason string and `details.availability`
   (`[{candidate,plan_headroom,on_overage,source}]`) on the pin metadata.
   Tests: `usage::tests` (availability + hints), `headroom::tests`
-  (hint TTL/fallback), `auto::tests::overage_penalty_prefers_the_free_seat`.
+  (hint TTL/fallback),
+  `auto::tests::cost_aversion_raises_the_paid_frontier_difficulty_bar`.
 - **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by
   default): bind the loopback listener before spawning adapters, then inject
   their process-level base URL. Forward auth, paths, query strings, and SSE;
   normalize upstream `Accept-Encoding` to `identity` so usage can be accounted;
   only rewrite the inference body's top-level `model`. `models[].
   api_model` maps ACP aliases to provider ids. Request routing stays within the
-  same agent/auth/wire: routine streak → cheapest compatible candidate;
+  same agent/auth/wire: routine streak → cheapest compatible candidate.
+  Codex ChatGPT OAuth normally prefers WebSocket and bypasses
+  `OPENAI_BASE_URL`; `codex_chatgpt_provider: true` installs a custom HTTP
+  Responses provider so those requests are actually intercepted. A repin
+  resets request attribution immediately, before the first intercepted
+  inference, so tool history can never combine a new agent with a stale model;
   failure/stagnation/refusal/token ceiling → strongest compatible candidate;
   verdict expiry + minimum dwell bound frontier/cache residence; known context
   windows, cordons, and quarantines constrain alternates. Register EVERY
@@ -343,7 +352,9 @@ SDK traps below, which were all discovered the hard way.
   eligible `planner` glob, and queues `build_orchestration_instructions` into
   `s.pending_orchestration`. That one-shot block is prepended (before any switch
   `pending_context` handoff) in `send_prompt_with_failover`'s `effective_prompt`.
-  `orchestrating` relaxes the delegate pool (`run_delegate_task` /
+  Ordinary delegation first restricts the cheaper pool to the primary
+  candidate's agent (for example Sol → Terra/Luna), falling back cross-lineage
+  only when no cheaper sibling exists. `orchestrating` relaxes the delegate pool (`run_delegate_task` /
   `delegate_server_entry`) from cheaper-only to any-eligible so the cross-lineage
   reviewer is routeable — this is the ONLY router-level change; the pipeline
   itself is the planner following the injected protocol with `delegate_task` +
