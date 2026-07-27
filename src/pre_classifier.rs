@@ -3,7 +3,10 @@
 //!
 //! When enabled, this is the authority for auto-orchestration (replacing
 //! `tasklist::detect_task_list`) and for host injects such as Kory's
-//! `ui_planning` dimension. Fail-open on timeout / parse / no evaluator.
+//! `ui_planning` dimension. Prefer the configured `evaluator` globs (cheap
+//! seats first); if none are eligible, fall back to any available model. The
+//! only way evaluation is allowed to report "no evaluator candidate" is when
+//! the session has zero eligible models of any kind.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -531,7 +534,9 @@ fn fail_open(
 /// Run the evaluator as a short-lived tool-less ACP session on the first
 /// eligible `evaluator` candidate. Fail-open on any error. Tries each matching
 /// evaluator in preference order (a timed-out/broken haiku does not sink the
-/// whole pre-class).
+/// whole pre-class). When the preferred pool is empty or exhausted, widens to
+/// **any** eligible model — only reports "no evaluator candidate" when the
+/// session has zero models of any kind.
 pub async fn evaluate(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -566,16 +571,22 @@ pub async fn evaluate(
 
     let mut attempts: Vec<String> = Vec::new();
     let mut last_fail: Option<PreClassResult> = None;
+    let any_model = ["*".to_string()];
+    let mut widened_to_any = false;
 
     // Prefer-order walk: first_eligible_candidate ranks by quality within the
     // evaluator glob pool. A classifier failure is a real routing signal, not a
     // reason to give up: a down / out-of-credits evaluator is run through the
     // router's normal failure classification + cordon (`apply_failure`), then
     // excluded so the next eligible evaluator is tried — the same failover the
-    // main pin uses. There is NO wall-clock timeout on the evaluator's LLM call
-    // (a slow model must be allowed to finish); the only interrupts are a real
-    // connection failure (→ failover) or the client cancelling the turn.
-    for _attempt in 0..pcfg.evaluator.len().max(1) + 2 {
+    // main pin uses. When preferred globs match nothing (or are exhausted),
+    // widen to any eligible model — the classifier can run on Grok/Opus/etc.
+    // just as well as on Haiku; the prefs are only a cost preference. There is
+    // NO wall-clock timeout on the evaluator's LLM call (a slow model must be
+    // allowed to finish); the only interrupts are a real connection failure
+    // (→ failover) or the client cancelling the turn. Loop until no eligible
+    // model remains (excluded grows each attempt), never a fixed attempt cap.
+    loop {
         if cancel.is_cancelled() {
             return fail_open(
                 "pre-class cancelled by client",
@@ -585,6 +596,18 @@ pub async fn evaluate(
             );
         }
         let Some(candidate) = first_eligible_candidate(shared, &pcfg.evaluator, class, &excluded)
+            .or_else(|| {
+                // Preferred pool empty/exhausted — any model is a valid evaluator.
+                if !widened_to_any {
+                    widened_to_any = true;
+                    tracing::info!(
+                        session = router_sid,
+                        preferred = ?pcfg.evaluator,
+                        "pre-class: preferred evaluators unavailable; widening to any eligible model"
+                    );
+                }
+                first_eligible_candidate(shared, &any_model, class, &excluded)
+            })
         else {
             break;
         };
@@ -649,7 +672,8 @@ pub async fn evaluate(
 
     // No evaluator produced a classification. This is a fail result (routing is
     // None); the caller decides the terminal policy (hard-fail when the
-    // pre-classifier is enabled — see `dispatch_prompt`).
+    // pre-classifier is enabled — see `dispatch_prompt`). "no evaluator
+    // candidate available" is reserved for the zero-models case only.
     let latency_ms = started.elapsed().as_millis() as u64;
     if let Some(mut fail) = last_fail {
         fail.latency_ms = latency_ms;

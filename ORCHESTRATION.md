@@ -43,8 +43,11 @@ Two authority paths — pick with config:
 ### A. Pre-classifier (recommended when enabled)
 
 When `pre_classifier.enabled: true`, auto-orchestration is decided by a **single
-cheap ACP evaluation** on a haiku-class seat (`pre_classifier.evaluator`), not by
-regex. The evaluator returns JSON including:
+cheap ACP evaluation** on a preferred seat (`pre_classifier.evaluator`, default
+haiku/mini/flash globs), not by regex. If no preferred seat is eligible, the
+router widens to **any** available model — "no evaluator candidate" is only
+legal when the session has zero models of any kind. The evaluator returns JSON
+including:
 
 ```json
 "orchestrate": {
@@ -58,8 +61,10 @@ regex. The evaluator returns JSON including:
 Auto-orchestrate only if `warranted && confidence >= orchestrate_min_confidence`
 (default `0.65`). Hosts can register extra dimensions under
 `pre_classifier.dimensions` (e.g. Kory Code's `ui_planning`); one call covers all.
-Fail-open: timeout / parse / no evaluator → do **not** orchestrate; the session
-continues normally and the skip is disclosed (`router-acp · pre-class …`).
+Fail-open on parse/service failure after every eligible model was tried → do
+**not** orchestrate; when enabled the pre-classifier is mandatory for routing
+and a total classification miss hard-fails the turn (disclosed via
+`router-acp · pre-class …`).
 
 v1 runs the pre-class once per session on the first eligible turn (not every
 mid-session message). `orchestrate:` force still works anytime without needing a

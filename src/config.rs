@@ -542,6 +542,9 @@ pub struct PreClassifierConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Candidate globs for the evaluator seat, preference order (cheapest first).
+    /// These are a cost preference only: when none match an eligible model, the
+    /// pre-classifier widens to any available model. "No evaluator" is only
+    /// legal when the session has zero eligible models of any kind.
     #[serde(default = "default_preclass_evaluator")]
     pub evaluator: Vec<String>,
     /// DEPRECATED and ignored. The classifier LLM call is core infrastructure

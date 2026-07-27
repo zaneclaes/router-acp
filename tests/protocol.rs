@@ -4374,6 +4374,82 @@ async fn preclass_fails_over_to_next_evaluator() {
 }
 
 #[tokio::test]
+async fn preclass_widens_to_any_model_when_preferred_unavailable() {
+    // Preferred evaluator globs (haiku/mini/flash) match nothing, but another
+    // model is available. That model MUST be used as the evaluator — "no
+    // evaluator candidate" is only legal when zero models of any kind exist.
+    // Regression: without the any-model widen, this session would skip the
+    // classifier (or hard-fail) while still being able to pin Grok for the turn.
+    let state = temp_state_file("preclass-any-fallback");
+    let good = r#"{"routing":{"task_class":"BugFix","task_classes":["BugFix"],"categories":["backend"],"complexity":0.35,"confidence":0.9,"reason":"targeted fix"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*haiku*\", \"*mini*\", \"*flash*\"]\n  disclose: true\n\
+         agents:\n{}",
+        state.display(),
+        // Only Grok is configured — does not match preferred globs.
+        agent_yaml("a", &[("grok", 2)], &[("MOCK_PRECLASS_JSON", good)]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "fix the crash").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("pre-class"),
+            "pre-class must run on any-model fallback: {text}"
+        );
+        assert!(
+            !text.contains("no evaluator candidate"),
+            "must not report no evaluator when a model exists: {text}"
+        );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted from any-model evaluator fallback");
+        assert_eq!(routing["class"], "BugFix", "{routing}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_widens_after_preferred_pool_exhausted() {
+    // Preferred evaluator is present but fails; a non-preferred model must still
+    // be tried (widen to any), not "no evaluator candidate".
+    let state = temp_state_file("preclass-widen-after-fail");
+    let good = r#"{"routing":{"task_class":"Feature","task_classes":["Feature"],"categories":["backend"],"complexity":0.5,"confidence":0.9,"reason":"feature work"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*haiku*\"]\n  disclose: true\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("haiku", 1)],
+            &[("MOCK_FAIL_PROMPT_MSG", "rate limit exceeded; retry after 30s")]
+        ),
+        agent_yaml("b", &[("grok", 2)], &[("MOCK_PRECLASS_JSON", good)]),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "build the widget").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted after preferred exhausted + any-model widen");
+        assert_eq!(routing["class"], "Feature", "{routing}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn preclass_dimension_injects_ui_planning() {
     let state = temp_state_file("preclass-ui");
     let log = temp_log("preclass-ui");
