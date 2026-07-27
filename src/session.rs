@@ -5583,7 +5583,34 @@ async fn dispatch_prompt(
                 "router-acp · pre-class start · evaluating prompt…",
             );
         }
-        let result = crate::pre_classifier::evaluate(&shared, &router_sid, &req.prompt).await;
+        let result = crate::pre_classifier::evaluate(
+            &shared,
+            &router_sid,
+            &req.prompt,
+            &responder.cancellation(),
+        )
+        .await;
+
+        // Mandatory classifier: when the pre-classifier is enabled it is the
+        // authority for routing. If no evaluator produced a routing decision
+        // (every candidate down / out of credits / unparseable, after failover),
+        // we MUST NOT silently fall back to the static heuristic — the turn hard
+        // fails with a clear error. `preclass_done` stays false so a later
+        // client retry re-attempts classification once a model recovers; there
+        // is exactly one bounded classification attempt per prompt, so a failing
+        // classifier can never cascade into an unbounded router-side retry loop.
+        if result.routing.is_none() {
+            crate::pre_classifier::disclose(&shared, &router_sid, &result);
+            let msg = format!(
+                "router-acp · pre-classifier could not classify this prompt on any evaluator \
+                 ({}). Refusing to route without a classification.",
+                result.skip_reason.as_deref().unwrap_or("no classification result")
+            );
+            notify_user(&shared, &router_sid, msg.clone());
+            flush_pending_disclosure(&shared, &router_sid);
+            return responder.respond_with_error(AcpError::internal_error().data(msg));
+        }
+
         // Authoritative decision note MUST reach the model — UI disclosures are
         // peeled into a classify tool card and never enter the agent prompt, so
         // without this inject the agent re-runs tasklist heuristics and wrongly

@@ -4308,6 +4308,72 @@ async fn preclass_true_multi_track_still_orchestrates() {
 }
 
 #[tokio::test]
+async fn preclass_hard_fails_when_classifier_returns_no_routing() {
+    // The classifier is mandatory when enabled: if no evaluator produces a
+    // routing decision, the turn HARD FAILS with a clear error — it never
+    // silently falls back to the static heuristic, and never loops (exactly one
+    // bounded attempt per prompt, so a failing classifier cannot cascade into an
+    // unbounded retry / deadlock).
+    let state = temp_state_file("preclass-hardfail");
+    // Valid JSON, but no `routing` block → no classification result.
+    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"n/a"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  disclose: true\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[("MOCK_PRECLASS_JSON", preclass_json)]),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let err = prompt_text(&cx, &sid, "do the thing").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("could not classify"),
+            "classifier exhaustion must hard-fail the turn: {err}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_fails_over_to_next_evaluator() {
+    // A down / erroring evaluator must not sink pre-classification: the router
+    // fails over to the next eligible evaluator (its known failure handling),
+    // and the turn proceeds on that evaluator's classification. If failover were
+    // broken this would instead hard-fail.
+    let state = temp_state_file("preclass-failover");
+    let good = r#"{"routing":{"task_class":"BugFix","task_classes":["BugFix"],"categories":["backend"],"complexity":0.4,"confidence":0.9,"reason":"targeted fix"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*opus*\", \"*haiku*\"]\n  disclose: true\n\
+         agents:\n{}{}",
+        state.display(),
+        // opus ranks first for the evaluator pool but errors its prompt turn.
+        agent_yaml("a", &[("opus", 3)], &[("MOCK_FAIL_PROMPT_MSG", "rate limit exceeded; retry after 30s")]),
+        // haiku is the fallback evaluator and returns a real classification.
+        agent_yaml("b", &[("haiku", 1)], &[("MOCK_PRECLASS_JSON", good)]),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Must NOT hard-fail: failover produced a classification.
+        let resp = prompt_text(&cx, &sid, "fix the crash").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted from the fallback evaluator");
+        assert_eq!(routing["class"], "BugFix", "{routing}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn preclass_dimension_injects_ui_planning() {
     let state = temp_state_file("preclass-ui");
     let log = temp_log("preclass-ui");
@@ -4404,47 +4470,34 @@ async fn preclass_force_orchestrate_still_works() {
 }
 
 #[tokio::test]
-async fn preclass_fail_open_on_bad_json() {
-    let state = temp_state_file("preclass-failopen");
-    let log = temp_log("preclass-failopen");
+async fn preclass_hard_fails_on_unparseable_reply() {
+    // An unparseable evaluator reply yields no classification. Previously this
+    // failed OPEN (proceeded on the static heuristic); the classifier is now
+    // mandatory when enabled, so with no other evaluator to fail over to the
+    // turn HARD FAILS rather than silently mis-routing.
+    let state = temp_state_file("preclass-badjson");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
-         agents:\n{}{}",
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n\
+         agents:\n{}",
         state.display(),
         agent_yaml(
             "a",
             &[("m1", 1)],
-            &[
-                ("MOCK_LOG", &log.display().to_string()),
-                ("MOCK_PRECLASS_JSON", "NOT VALID JSON {{{"),
-            ]
+            &[("MOCK_PRECLASS_JSON", "NOT VALID JSON {{{")],
         ),
-        agent_yaml("b", &[("m2", 2)], &[]),
     );
-    run_test(yaml, async |cx, observed| {
+    run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
+        let err = prompt_text(&cx, &sid, "add a flag and wire it up")
+            .await
+            .unwrap_err();
         assert!(
-            text.contains("pre-class") && (text.contains("skip") || text.contains("parse")),
-            "fail-open disclosure: {text}"
+            format!("{err}").contains("could not classify"),
+            "unparseable classifier reply must hard-fail: {err}"
         );
-        assert!(
-            !text.contains("orchestrating"),
-            "fail-open must not orchestrate: {text}"
-        );
-        // Session still completed a normal turn.
-        assert!(text.contains("echo:"), "normal turn continued: {text}");
         Ok(())
     })
     .await;

@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agent_client_protocol::RequestCancellation;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, McpServer, PromptRequest, SetSessionModeRequest,
+    ContentBlock, Error as AcpError, McpServer, PromptRequest, SetSessionModeRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -535,6 +536,7 @@ pub async fn evaluate(
     shared: &Arc<Shared>,
     router_sid: &str,
     prompt: &[ContentBlock],
+    cancel: &RequestCancellation,
 ) -> PreClassResult {
     let started = Instant::now();
     let cfg = shared.cfg.clone();
@@ -566,8 +568,22 @@ pub async fn evaluate(
     let mut last_fail: Option<PreClassResult> = None;
 
     // Prefer-order walk: first_eligible_candidate ranks by quality within the
-    // evaluator glob pool; after a failure we exclude that exact id and retry.
+    // evaluator glob pool. A classifier failure is a real routing signal, not a
+    // reason to give up: a down / out-of-credits evaluator is run through the
+    // router's normal failure classification + cordon (`apply_failure`), then
+    // excluded so the next eligible evaluator is tried — the same failover the
+    // main pin uses. There is NO wall-clock timeout on the evaluator's LLM call
+    // (a slow model must be allowed to finish); the only interrupts are a real
+    // connection failure (→ failover) or the client cancelling the turn.
     for _attempt in 0..pcfg.evaluator.len().max(1) + 2 {
+        if cancel.is_cancelled() {
+            return fail_open(
+                "pre-class cancelled by client",
+                None,
+                started.elapsed().as_millis() as u64,
+                &format!("tried evaluators: {}\n", attempts.join(", ")),
+            );
+        }
         let Some(candidate) = first_eligible_candidate(shared, &pcfg.evaluator, class, &excluded)
         else {
             break;
@@ -579,7 +595,7 @@ pub async fn evaluate(
             continue;
         }
 
-        let result = evaluate_on_candidate(
+        let outcome = evaluate_on_candidate(
             shared,
             router_sid,
             &candidate,
@@ -588,23 +604,52 @@ pub async fn evaluate(
             &eval_prompt,
             &cfg,
             started,
+            cancel,
         )
         .await;
         attempts.push(cand_str.clone());
 
-        if result.ok {
-            return result;
+        match outcome {
+            // A classification with a routing decision is the only success —
+            // the classifier's core output must be present to proceed.
+            Ok(result) if result.routing.is_some() => return result,
+            // Model responded but gave no usable classification (parse failure /
+            // missing routing): try the next evaluator.
+            Ok(result) => {
+                tracing::warn!(
+                    session = router_sid,
+                    evaluator = %cand_str,
+                    reason = result.skip_reason.as_deref().unwrap_or("no routing decision"),
+                    "pre-class evaluator produced no classification; trying next"
+                );
+                last_fail = Some(result);
+            }
+            // Service failure (down / rate-limited / out of credits): hand it to
+            // the router's known failure handling (classify + cordon), then fail
+            // over to the next evaluator — exactly as a pinned turn would.
+            Err(err) => {
+                let class = crate::limits::classify_failure(&err);
+                let human = crate::session::apply_failure(shared, &candidate, &err, &class);
+                tracing::warn!(
+                    session = router_sid,
+                    evaluator = %cand_str,
+                    %human,
+                    "pre-class evaluator failed; cordoned and failing over"
+                );
+                last_fail = Some(fail_open(
+                    format!("evaluator {cand_str} failed: {human}"),
+                    Some(cand_str.clone()),
+                    started.elapsed().as_millis() as u64,
+                    "",
+                ));
+            }
         }
-        tracing::warn!(
-            session = router_sid,
-            evaluator = %cand_str,
-            reason = result.skip_reason.as_deref().unwrap_or("?"),
-            "pre-class evaluator attempt failed; trying next"
-        );
-        last_fail = Some(result);
         excluded.push(cand_str);
     }
 
+    // No evaluator produced a classification. This is a fail result (routing is
+    // None); the caller decides the terminal policy (hard-fail when the
+    // pre-classifier is enabled — see `dispatch_prompt`).
     let latency_ms = started.elapsed().as_millis() as u64;
     if let Some(mut fail) = last_fail {
         fail.latency_ms = latency_ms;
@@ -616,6 +661,13 @@ pub async fn evaluate(
 }
 
 /// One evaluator attempt: open (with auto mode) → prompt → close → parse.
+///
+/// Returns `Ok(PreClassResult)` when the evaluator model responded (the result
+/// may still lack a routing decision on a parse failure) or the session could
+/// not be established (fail-open, failover to the next evaluator). Returns
+/// `Err(AcpError)` when the model's prompt turn itself failed — a real service
+/// failure (down / rate-limited / out of credits) that the caller runs through
+/// the router's known failure handling and cordons before failing over.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_on_candidate(
     shared: &Arc<Shared>,
@@ -626,12 +678,15 @@ async fn evaluate_on_candidate(
     eval_prompt: &str,
     cfg: &Config,
     started: Instant,
-) -> PreClassResult {
+    cancel: &RequestCancellation,
+) -> Result<PreClassResult, AcpError> {
     let cand_str = candidate.to_string();
-    let pcfg = &cfg.pre_classifier;
     let capture = Arc::new(Mutex::new(String::new()));
 
-    // Phase 1 — spawn + session/new + auto mode. NOT on `timeout_ms`.
+    // Phase 1 — spawn + session/new + auto mode. This is connection
+    // ESTABLISHMENT (process spawn + handshake), not the classifier LLM call, so
+    // it keeps a bounded guard purely as a wedged-spawn deadlock backstop; on
+    // expiry it fails over to the next evaluator (never a silent proceed).
     let open_timeout_ms = cfg.probe_timeout_ms.clamp(1, OPEN_TIMEOUT_CAP_MS);
     let opened = match tokio::time::timeout(
         Duration::from_millis(open_timeout_ms),
@@ -640,56 +695,52 @@ async fn evaluate_on_candidate(
     .await
     {
         Err(_) => {
-            return fail_open(
+            return Ok(fail_open(
                 format!("evaluator session open timed out after {open_timeout_ms}ms"),
                 Some(cand_str),
                 started.elapsed().as_millis() as u64,
                 "",
-            );
+            ));
         }
         Ok(Err(err)) => {
-            return fail_open(
+            return Ok(fail_open(
                 format!("evaluator session open failed: {err}"),
                 Some(cand_str),
                 started.elapsed().as_millis() as u64,
                 "",
-            );
+            ));
         }
         Ok(Ok(opened)) => opened,
     };
 
-    // Phase 2 — the LLM generation, which is what `timeout_ms` budgets.
-    let open_ms = started.elapsed().as_millis() as u64;
+    // Phase 2 — the classifier LLM generation. NO wall-clock timeout: core
+    // infrastructure that must be allowed to run to completion. The only
+    // interrupts are the client cancelling the turn (`run_until_cancelled`) or a
+    // real connection failure (a dead process EOFs → `Err`, handled as a
+    // service failure by the caller).
     let request = PromptRequest::new(
         opened.downstream_sid.clone(),
         vec![ContentBlock::from(eval_prompt.to_string())],
     );
-    let turn = tokio::time::timeout(
-        Duration::from_millis(pcfg.timeout_ms.max(1)),
-        opened.conn.send_request(request).block_task(),
-    )
-    .await;
+    let turn = cancel
+        .run_until_cancelled(opened.conn.send_request(request).block_task())
+        .await;
     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
 
     let latency_ms = started.elapsed().as_millis() as u64;
 
     match turn {
-        Err(_) => fail_open(
-            format!(
-                "evaluator prompt timed out after {}ms (session open took {open_ms}ms)",
-                pcfg.timeout_ms
-            ),
+        // Client cancelled the turn — not a service failure; do not cordon.
+        Err(_) if cancel.is_cancelled() => Ok(fail_open(
+            "evaluator cancelled by client",
             Some(cand_str),
             latency_ms,
             "",
-        ),
-        Ok(Err(err)) => fail_open(
-            format!("evaluator session failed: session/prompt: {err}"),
-            Some(cand_str),
-            latency_ms,
-            "",
-        ),
-        Ok(Ok(_)) => {
+        )),
+        // The model's prompt turn failed: surface the error so the caller can
+        // classify it (rate-limit / outage / other) and cordon + fail over.
+        Err(err) => Err(err),
+        Ok(_) => {
             let raw = capture.lock().unwrap().clone();
             // mock-agent echoes `echo:<model>:<text>` — strip that wrapper when present.
             let body = strip_mock_echo(&raw);
@@ -697,14 +748,20 @@ async fn evaluate_on_candidate(
                 Ok(parsed) => {
                     let mut raw_log = format!("raw reply:\n{body}\n");
                     raw_log.push_str(&format!("parsed: {parsed}\n"));
-                    apply_thresholds(cfg, &parsed, Some(&cand_str), latency_ms, &raw_log)
+                    Ok(apply_thresholds(
+                        cfg,
+                        &parsed,
+                        Some(&cand_str),
+                        latency_ms,
+                        &raw_log,
+                    ))
                 }
-                Err(e) => fail_open(
+                Err(e) => Ok(fail_open(
                     format!("parse failed: {e}"),
                     Some(cand_str),
                     latency_ms,
                     &format!("raw reply:\n{body}\n"),
-                ),
+                )),
             }
         }
     }

@@ -544,8 +544,11 @@ pub struct PreClassifierConfig {
     /// Candidate globs for the evaluator seat, preference order (cheapest first).
     #[serde(default = "default_preclass_evaluator")]
     pub evaluator: Vec<String>,
-    /// Budget for the evaluator's prompt turn only — process spawn and
-    /// session/new are excluded (a cold ACP open alone can exceed it).
+    /// DEPRECATED and ignored. The classifier LLM call is core infrastructure
+    /// that must run to completion, so it no longer has a wall-clock timeout: a
+    /// failed evaluator is detected as a connection failure and failed over to
+    /// the next candidate, and the turn is interrupted only by client
+    /// cancellation. Retained (accepted, unused) so existing configs still load.
     #[serde(default = "default_preclass_timeout_ms")]
     pub timeout_ms: u64,
     /// Emit `router-acp · pre-class …` disclosure lines.
@@ -1518,11 +1521,8 @@ impl Config {
                     "pre_classifier.enabled is true but pre_classifier.evaluator is empty".into(),
                 ));
             }
-            if self.pre_classifier.timeout_ms == 0 {
-                return Err(ConfigError(
-                    "pre_classifier.timeout_ms must be greater than 0".into(),
-                ));
-            }
+            // pre_classifier.timeout_ms is deprecated/ignored (the classifier no
+            // longer times out); any value — including 0 — is accepted.
             if !(0.0..=1.0).contains(&self.pre_classifier.orchestrate_min_confidence) {
                 return Err(ConfigError(format!(
                     "pre_classifier.orchestrate_min_confidence must be within 0.0..=1.0, got `{}`",
