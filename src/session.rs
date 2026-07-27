@@ -805,13 +805,16 @@ impl Shared {
                 .as_ref()
                 .is_some_and(|a| self.cfg.availability_preference.enabled && a.on_overage);
             let local_headroom = headroom.headroom(&c.id.agent);
-            let effective_headroom = availability
+            let plan_headroom = availability
                 .as_ref()
                 .filter(|_| self.cfg.availability_preference.enabled)
-                .map(|a| local_headroom.min(a.plan_headroom.clamp(0.0, 1.0)))
+                .map(|a| a.plan_headroom.clamp(0.0, 1.0));
+            let effective_headroom = plan_headroom
+                .map(|p| local_headroom.min(p))
                 .unwrap_or(local_headroom);
             views.push(CandidateView {
                 headroom: effective_headroom,
+                plan_headroom,
                 quality: scores.quality(class),
                 coding_tier: scores.coding_tier,
                 cost_rank: c.cost_rank,
@@ -821,6 +824,9 @@ impl Shared {
                 id: c.id,
             });
         }
+        // Unmetered seats (no plan signal) must not look "more free" than a
+        // metered seat that still has included plan — see cap_unmetered_headroom.
+        crate::strategies::cap_unmetered_headroom(&mut views);
         views
     }
 

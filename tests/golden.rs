@@ -72,6 +72,8 @@ fn route(prompt: &str) -> Outcome {
                 quality: resolved.quality(profile.class),
                 coding_tier: resolved.coding_tier,
                 headroom: 1.0,
+                // Full free plan on every seat — goldens assume no scarcity.
+                plan_headroom: Some(1.0),
                 on_overage: false,
                 preference: *preference,
             }

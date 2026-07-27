@@ -465,4 +465,76 @@ mod tests {
             assert_eq!(ranked[0].candidate.to_string(), "a/m1");
         }
     }
+
+    /// Live regression: Ops complexity 0.18 with Claude at 7% weekly free plan,
+    /// Codex at 44%, and unmetered Grok at local 100%. Before the free-plan
+    /// cap, Grok won on quota alone despite cost_rank 5. After the cap (applied
+    /// in `eligible_views`), Grok's headroom is clipped to 0.44 and a metered
+    /// candidate must win.
+    #[test]
+    fn unmetered_frontier_does_not_beat_free_metered_on_trivial_ops() {
+        use crate::candidate::TaskClass;
+        use crate::strategies::{cap_unmetered_headroom, test_util::view_metered};
+
+        let s = AutoStrategy::new(AutoRouterConfig {
+            cost_quality_tradeoff: 3.0,
+            complexity_floor: 0.7, // below 0.18 — no p75 gate
+            complexity_scales_tradeoff: true,
+            min_cost_weight: 0.15,
+            allowed_candidates: vec!["*".into()],
+        });
+        let mut pool = vec![
+            view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.07),
+            view_metered("claude", "sonnet", 2, 1, 1.38, CodingTier::High, 0.07),
+            view_metered(
+                "codex",
+                "gpt-5.4-mini",
+                1,
+                2,
+                1.00,
+                CodingTier::Medium,
+                0.44,
+            ),
+            view_metered(
+                "codex",
+                "gpt-5.6-luna",
+                2,
+                3,
+                2.02,
+                CodingTier::Medium,
+                0.44,
+            ),
+            // Unmetered frontier — the pre-fix winner.
+            view("grok", "grok-4.5", 5, 4, 1.57, CodingTier::High, 1.0),
+        ];
+        cap_unmetered_headroom(&mut pool);
+
+        let mut context = ctx();
+        context.profile.class = TaskClass::Ops;
+        context.profile.complexity = 0.18;
+        let ranked = s.rank(&context, &pool).unwrap();
+        assert_ne!(
+            ranked[0].candidate.to_string(),
+            "grok/grok-4.5",
+            "Grok must not win trivial Ops while free metered plan remains; got {} ({})",
+            ranked[0].candidate,
+            ranked[0].reason
+        );
+        assert!(
+            ranked[0].candidate.agent == "codex" || ranked[0].candidate.agent == "claude",
+            "expected a metered seat, got {}",
+            ranked[0].candidate
+        );
+        // Without the cap, the same pool pins Grok (documents the bug).
+        let mut uncapped = pool.clone();
+        if let Some(g) = uncapped.iter_mut().find(|v| v.id.agent == "grok") {
+            g.headroom = 1.0;
+        }
+        let broken = s.rank(&context, &uncapped).unwrap();
+        assert_eq!(
+            broken[0].candidate.to_string(),
+            "grok/grok-4.5",
+            "fixture drift: uncapped pool should still prefer Grok"
+        );
+    }
 }

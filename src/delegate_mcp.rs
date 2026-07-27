@@ -1566,6 +1566,7 @@ mod tests {
                 quality: 0.8,
                 coding_tier: CodingTier::High,
                 headroom: 1.0,
+                plan_headroom: None,
                 on_overage: false,
                 preference: 0.0,
             }
