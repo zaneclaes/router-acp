@@ -838,7 +838,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
         .unwrap()
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct RequestSignals {
     original_model: Option<String>,
     estimated_input: u64,
@@ -854,7 +854,7 @@ struct RequestSignals {
 /// `max_tokens` — reaches whichever model is named. A model that rejects one of
 /// them (Haiku 4.5 takes neither adaptive thinking nor `effort`) turns a demotion
 /// into a 400, so these gate the candidate set alongside the context window.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct WireShape {
     adaptive_thinking: bool,
     effort: bool,
@@ -1013,6 +1013,29 @@ fn select_request_model(
         })
         .cloned()
         .collect();
+    // Per-request routing is a cost optimization, not a second quality ladder:
+    // a request may move below the session pin, but a difficulty signal must
+    // never spend above it. Keep a separate ceilinged pool for escalation and
+    // verdict decisions. If the pin is unavailable, the normal failover path
+    // below may still use the best surviving model.
+    let pin_cost_rank = if pin_routeable {
+        models
+            .iter()
+            .find(|model| model.id == active.candidate)
+            .map(|model| model.cost_rank)
+            .unwrap_or(u32::MAX)
+    } else {
+        u32::MAX
+    };
+    let escalation_compatible: Vec<ModelOption> = if pin_routeable {
+        compatible
+            .iter()
+            .filter(|model| model.cost_rank <= pin_cost_rank)
+            .cloned()
+            .collect()
+    } else {
+        compatible.clone()
+    };
 
     let mut difficulty = state.pending_difficulty.take().or(signals.difficulty);
     // "Stuck" means the agent acted again and got back byte-identical failing test
@@ -1066,7 +1089,8 @@ fn select_request_model(
         } else {
             Some(Instant::now() + Duration::from_secs(shared.cfg.llm_proxy.verdict_ttl_secs))
         };
-        let strongest = strongest_model(&compatible).unwrap_or_else(|| active.candidate.clone());
+        let strongest =
+            strongest_model(&escalation_compatible).unwrap_or_else(|| active.candidate.clone());
         (
             strongest,
             format!("difficulty signal: {reason}"),
@@ -1074,7 +1098,8 @@ fn select_request_model(
             true,
         )
     } else if elevated_active {
-        let strongest = strongest_model(&compatible).unwrap_or_else(|| active.candidate.clone());
+        let strongest =
+            strongest_model(&escalation_compatible).unwrap_or_else(|| active.candidate.clone());
         (
             strongest,
             "prior difficulty verdict still active".to_string(),
@@ -1186,7 +1211,7 @@ fn select_request_model(
         }
         desired
     } else {
-        let selected = models
+        let selected = escalation_compatible
             .iter()
             .find(|model| model.id.model == current_model)
             .map(|model| model.id.clone())
@@ -1270,6 +1295,8 @@ fn cheapest_model(models: &[ModelOption]) -> Option<CandidateId> {
 }
 
 fn inspect_request(body: &Value) -> RequestSignals {
+    // This is intentionally a pure local classifier. Per-request routing must
+    // not spend a provider call asking an LLM to classify another provider call.
     let serialized = serde_json::to_string(body).unwrap_or_default();
     let estimated_input =
         estimate_request_tokens(serialized.as_bytes()) + max_output_tokens(body).unwrap_or(0);
@@ -2212,6 +2239,17 @@ agents:
     }
 
     #[test]
+    fn request_inspection_is_deterministic_and_local() {
+        let body = json!({
+            "model": "sonnet",
+            "messages": [{"role":"user","content":[{
+                "type":"tool_result","content":"git status clean","status":"completed"
+            }]}]
+        });
+        assert_eq!(inspect_request(&body), inspect_request(&body));
+    }
+
+    #[test]
     fn routine_detection_survives_large_anthropic_tools_prelude() {
         // Reproduces the Claude/Anthropic wire shape: the current turn's
         // tool_result sits inside `messages`, ahead of a large `system` and
@@ -2311,7 +2349,8 @@ agents:
         );
         let decision = select_request_model(&shared, &active("haiku"), &second);
         assert_eq!(decision.event, "escalation");
-        assert_eq!(decision.selected_model, "opus");
+        assert_eq!(decision.selected_model, "haiku");
+        assert_eq!(decision.model, "haiku");
         assert!(decision.reason.contains("stagnated"));
     }
 
@@ -2628,6 +2667,45 @@ agents:
         let decision = select_request_model(&shared, &active, &failed);
         assert_eq!(decision.model, "opus");
         assert_eq!(decision.event, "escalation");
+    }
+
+    #[test]
+    fn difficulty_escalation_cannot_exceed_session_pin() {
+        let (_dir, shared) = kory_code_shared();
+        let active = claude_active("sonnet");
+        let mut failed = kory_code_request(20, "tests failed");
+        failed["model"] = json!("claude-sonnet-5");
+
+        let decision = select_request_model(&shared, &active, &failed);
+        assert_eq!(decision.event, "escalation");
+        assert_eq!(decision.model, "claude-sonnet-5");
+        assert_eq!(decision.selected_model, "sonnet");
+
+        let neutral =
+            json!({"model":"claude-sonnet-5","messages":[{"role":"user","content":"continue"}]});
+        let verdict = select_request_model(&shared, &active, &neutral);
+        assert_eq!(verdict.event, "verdict");
+        assert_eq!(verdict.model, "claude-sonnet-5");
+        assert_eq!(verdict.selected_model, "sonnet");
+    }
+
+    #[test]
+    fn dwell_cannot_retain_a_previously_over_ceiling_model() {
+        let (_dir, shared) = policy_shared(12);
+        let active = active("sonnet");
+        shared.llm_proxy.policy.lock().unwrap().insert(
+            "r1".to_string(),
+            RequestPolicyState {
+                pinned_candidate: Some(active.candidate.clone()),
+                current_model: Some("opus".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let decision = select_request_model(&shared, &active, &json!({"model":"sonnet"}));
+        assert_eq!(decision.event, "dwell");
+        assert_eq!(decision.model, "sonnet");
+        assert_eq!(decision.selected_model, "sonnet");
     }
 
     #[test]

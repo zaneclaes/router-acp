@@ -36,13 +36,16 @@ tool-result trace and may:
 
 - demote to the cheapest same-agent model after `llm_proxy.routine_streak`
   routine requests;
-- escalate immediately to the highest-quality same-agent model on failures,
-  unchanged test output, refusal, or token/context ceilings;
+- escalate immediately to the highest-quality compatible same-agent model at or
+  below the session pin's cost rank on failures, unchanged test output, refusal,
+  or token/context ceilings; per-request routing never spends above the pin;
 - return from an escalation when its request/time verdict expires; and
 - hold a model for `minimum_dwell_requests` to avoid repeatedly paying cold
   cache costs.
 
-Context-window guards, cordons, and quarantines constrain this pool. An
+Context-window guards, cordons, and quarantines constrain this pool. Request
+signals are extracted structurally and deterministically from the live tool
+payload; per-request routing does not call an LLM to classify requests. An
 automation hint (`_meta.router_acp.request_hint = "ci-poll"`, `"ship-nudge"`,
 or `"automation"`) goes directly to the cheap compatible model. Every
 attributed decision is disclosed as `router-acp · request …`, stored in

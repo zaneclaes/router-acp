@@ -215,7 +215,10 @@ SDK traps below, which were all discovered the hard way.
   Responses provider so those requests are actually intercepted. A repin
   resets request attribution immediately, before the first intercepted
   inference, so tool history can never combine a new agent with a stale model;
-  failure/stagnation/refusal/token ceiling → strongest compatible candidate;
+  failure/stagnation/refusal/token ceiling → strongest compatible candidate at
+  or below the session pin's cost rank (per-request routing never spends above
+  the pin); request signals are extracted structurally and deterministically,
+  with no LLM classification call;
   verdict expiry + minimum dwell bound frontier/cache residence; known context
   windows, cordons, and quarantines constrain alternates. Register EVERY
   downstream `session/prompt` path with `LlmProxyRuntime::begin_turn`.
