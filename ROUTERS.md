@@ -77,7 +77,12 @@ And for `auto`, each candidate carries three numbers:
   With flat-rate seats this models *scarcity*, not dollars.
 - **headroom** — the lower of the local sliding-window estimate and reported
   free plan headroom for this candidate. Model-scoped caps, such as Claude
-  Fable's weekly window, apply only to that model.
+  Fable's weekly window, apply only to that model. Agents with no usage meter
+  (Grok, Kimi) have no reported plan headroom; while **any metered seat still
+  has free included plan**, their effective headroom is capped at that best
+  free metered residual so a fake 100% does not beat free Claude/Codex on the
+  quota term. When every metered free plan is exhausted, unmetered keeps full
+  local headroom (valid failover).
 
 The kind of task comes from a **classifier** that reads your first prompt:
 it assigns a task class (BugFix, Research, Architecture, UiTweak, …) and a
@@ -103,6 +108,9 @@ For each candidate:
 quality_demand = min(task-class base + 2 × complexity, 3)
 quality_value = (min(quality(task class), quality_demand) − 0.5) / 3.0
 effective_headroom = min(local headroom, reported plan headroom)
+# unmetered (no reported plan): if any metered seat has free plan > 0,
+#   effective_headroom = min(local, max free metered plan)
+# else keep local (failover when metered free plan is gone)
 utility = quality_weight × quality_value
         + cost_weight × effective_headroom × (1 − 0.5 × normalized cost rank)
         + preference
@@ -110,8 +118,9 @@ utility = quality_weight × quality_value
 
 Included-plan usage is free at the margin, so rank is only a bounded scarcity
 pressure against wasting large-token/frontier models. Reported plan headroom is
-the dominant cost signal; paid overage receives a separate penalty. At
-`cost_quality_tradeoff: 0`, the demand cap is bypassed and raw benchmark
+the dominant cost signal; paid overage receives a separate penalty. Unmetered
+frontiers must not win low-complexity work solely because they lack a meter.
+At `cost_quality_tradeoff: 0`, the demand cap is bypassed and raw benchmark
 quality wins.
 
 The weights come from one dial, `cost_quality_tradeoff` (0–10):

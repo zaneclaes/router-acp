@@ -32,11 +32,51 @@ pub struct CandidateView {
     pub coding_tier: CodingTier,
     /// Tightest local/plan headroom estimate in [0, 1].
     pub headroom: f64,
+    /// Reported free included-plan fraction when a usage meter covers this
+    /// candidate (`Some`), or `None` for unmetered agents (Grok, Kimi — no
+    /// `usage_source`). Used by [`cap_unmetered_headroom`].
+    pub plan_headroom: Option<f64>,
     /// The candidate has exhausted included-plan headroom and is spending
     /// paid overage/credits. Exhausted overage is filtered before this point.
     pub on_overage: bool,
     /// Configured per-agent tie-break preference (`agents[].preference`).
     pub preference: f64,
+}
+
+/// Free-plan residual small enough to treat as exhausted (matches
+/// `headroom::SeatAvailability::plan_exhausted` tolerance).
+const FREE_PLAN_EPSILON: f64 = 1e-9;
+
+/// Product rule: while **any metered seat still has free included plan**, do
+/// not let an **unmetered** candidate keep a fake 100% plan headroom that
+/// beats free metered seats on the auto quota term alone.
+///
+/// Unmetered agents (no `usage_source` / no availability row — Grok, Kimi)
+/// otherwise default to local sliding-window headroom ≈ 1.0. With
+/// `quota = headroom × (1 − 0.5 × norm_cost_rank)`, a frontier unmetered
+/// model at cost_rank 5 still scores quota 0.5 and wins trivial Ops over
+/// haiku at 7% or mini at 44% free plan.
+///
+/// Cap: `unmetered.headroom = min(local, max free metered plan_headroom)`.
+/// When every metered free plan is exhausted (or the pool is unmetered-only),
+/// unmetered keeps full local headroom so it remains a valid failover.
+pub fn cap_unmetered_headroom(views: &mut [CandidateView]) {
+    let max_free_metered = views
+        .iter()
+        .filter(|v| !v.on_overage)
+        .filter_map(|v| v.plan_headroom)
+        .filter(|&p| p > FREE_PLAN_EPSILON)
+        .fold(None, |acc: Option<f64>, p| {
+            Some(acc.map_or(p, |a| a.max(p)))
+        });
+    let Some(cap) = max_free_metered else {
+        return;
+    };
+    for view in views.iter_mut() {
+        if view.plan_headroom.is_none() {
+            view.headroom = view.headroom.min(cap);
+        }
+    }
 }
 
 /// Context for one routing decision.
@@ -165,9 +205,91 @@ pub(crate) mod test_util {
             quality,
             coding_tier: tier,
             headroom,
+            // Unit tests that omit plan signals behave as unmetered-only pools
+            // (no free-plan cap) — preserves historical ranking fixtures.
+            plan_headroom: None,
             on_overage: false,
             preference: 0.0,
         }
+    }
+
+    pub fn view_metered(
+        agent: &str,
+        model: &str,
+        cost_rank: u32,
+        config_index: usize,
+        quality: f64,
+        tier: CodingTier,
+        headroom: f64,
+    ) -> CandidateView {
+        let mut v = view(
+            agent,
+            model,
+            cost_rank,
+            config_index,
+            quality,
+            tier,
+            headroom,
+        );
+        v.plan_headroom = Some(headroom);
+        v
+    }
+
+    #[test]
+    fn unmetered_headroom_capped_when_metered_has_free_plan() {
+        let mut views = vec![
+            view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.07),
+            view_metered(
+                "codex",
+                "gpt-5.6-luna",
+                2,
+                1,
+                2.02,
+                CodingTier::Medium,
+                0.44,
+            ),
+            // Grok: no plan signal, full local headroom (the live bug shape).
+            view("grok", "grok-4.5", 5, 2, 1.57, CodingTier::High, 1.0),
+        ];
+        cap_unmetered_headroom(&mut views);
+        let grok = views.iter().find(|v| v.id.agent == "grok").unwrap();
+        assert!(
+            (grok.headroom - 0.44).abs() < 1e-9,
+            "unmetered capped at best free metered plan, got {}",
+            grok.headroom
+        );
+        let haiku = views.iter().find(|v| v.id.model == "haiku").unwrap();
+        assert!((haiku.headroom - 0.07).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unmetered_keeps_full_headroom_when_metered_free_plan_exhausted() {
+        let mut views = vec![
+            {
+                let mut v = view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.0);
+                v.on_overage = true;
+                v
+            },
+            view("grok", "grok-4.5", 5, 1, 1.57, CodingTier::High, 1.0),
+        ];
+        cap_unmetered_headroom(&mut views);
+        let grok = views.iter().find(|v| v.id.agent == "grok").unwrap();
+        assert!(
+            (grok.headroom - 1.0).abs() < 1e-9,
+            "failover path: unmetered must stay at full local headroom, got {}",
+            grok.headroom
+        );
+    }
+
+    #[test]
+    fn unmetered_only_pool_is_unchanged() {
+        let mut views = vec![
+            view("grok", "grok-4.5", 5, 0, 1.57, CodingTier::High, 1.0),
+            view("kimi", "kimi-k2", 2, 1, 2.32, CodingTier::High, 0.9),
+        ];
+        cap_unmetered_headroom(&mut views);
+        assert!((views[0].headroom - 1.0).abs() < 1e-9);
+        assert!((views[1].headroom - 0.9).abs() < 1e-9);
     }
 
     pub fn ctx() -> RouteContext {
