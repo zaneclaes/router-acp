@@ -48,6 +48,8 @@ pub struct ClassRule {
 #[serde(deny_unknown_fields)]
 pub struct KeywordBump {
     pub bump: f64,
+    #[serde(default)]
+    pub floor: Option<f64>,
     pub keywords: Vec<String>,
 }
 
@@ -254,6 +256,7 @@ pub fn classify_heuristic(rules: &ClassifierRules, input: &ClassifyInput) -> Tas
     } else {
         0.0
     };
+    let mut keyword_floor: f64 = 0.0;
     for bump in &c.keyword_bumps {
         let hits = bump
             .keywords
@@ -263,6 +266,9 @@ pub fn classify_heuristic(rules: &ClassifierRules, input: &ClassifyInput) -> Tas
         // Accumulate per matching keyword, capped at twice the group bump so
         // repetitive prompts cannot dominate the estimate.
         complexity += bump.bump * (hits.min(2) as f64);
+        if hits > 0 {
+            keyword_floor = keyword_floor.max(bump.floor.unwrap_or(0.0));
+        }
     }
     let file_count = input.mentioned_paths.len() + input.resource_count;
     complexity += (file_count as f64 * c.per_file_bump).min(c.max_file_bump);
@@ -274,7 +280,7 @@ pub fn classify_heuristic(rules: &ClassifierRules, input: &ClassifyInput) -> Tas
         .map(|t| lower.matches(t.as_str()).count())
         .sum();
     complexity += (steps as f64 * rules.multi_step.per_token_bump).min(rules.multi_step.max_bump);
-    let complexity = complexity.clamp(0.0, 1.0);
+    let complexity = complexity.max(keyword_floor).clamp(0.0, 1.0);
 
     // Languages: extension mentions plus the cwd fingerprint, deduplicated
     // and sorted for determinism.
@@ -561,6 +567,16 @@ mod tests {
             p.complexity
         );
         assert_eq!(p.class, TaskClass::Research);
+    }
+
+    #[test]
+    fn failed_fix_follow_up_scores_high_complexity() {
+        let p = classify_text("Following up on a bug that should have been a simple fix");
+        assert!(
+            p.complexity >= 0.7,
+            "a failed-fix follow-up must select the high-complexity path: {}",
+            p.complexity
+        );
     }
 
     #[test]

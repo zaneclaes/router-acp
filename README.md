@@ -321,13 +321,16 @@ The request policy is deliberately stateful:
 - demote to the cheapest routeable model from the same agent after a sustained
   streak of successful routine tool results (reads, searches, mechanical
   edits, status/CI checks);
-- escalate immediately to that agent's highest-quality compatible model after
-  a tool failure, repeated unchanged test output, refusal, HTTP failure, or
-  token/context ceiling;
+- escalate immediately to that agent's highest-quality compatible model at or
+  below the session pin's cost rank after a tool failure, repeated unchanged
+  test output, refusal, HTTP failure, or token/context ceiling; per-request
+  routing never spends above the pin;
 - expire difficulty verdicts by request count and wall time; and
 - enforce a minimum dwell before ordinary switches to bound cold-cache churn.
   Difficulty and explicit automation hints bypass dwell.
 
+Request signals are extracted structurally and deterministically from the live
+tool payload; per-request routing does not call an LLM to classify requests.
 Demotion is rejected when the estimated request plus requested output exceeds
 `context_window_fraction` of the target's context window. An alternate whose
 window is unknown is never selected. Cordons and quarantines also apply.
