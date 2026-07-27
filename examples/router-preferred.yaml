@@ -185,7 +185,7 @@ agents:
           pricing: { input_per_mtok: 0.55, output_per_mtok: 2.20 } }
       # - { id: kimi-k2-thinking, display_name: Kimi K2 Thinking, cost_rank: 3 }
 
-router: escalation
+router: auto
 routers:
   escalation:
     initial_router: auto

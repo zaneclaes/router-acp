@@ -130,8 +130,11 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          - 0.61-0.80: ambiguous design, cross-system reasoning, migration, or high blast radius\n\
          - 0.81-1.00: novel/long-horizon work with deep architecture, uncertainty, or severe risk\n\
          Consider ambiguity, reasoning depth, dependencies, blast radius, reversibility, domain \
-         novelty, and verification burden. Do NOT increase complexity merely because a ticket is \
-         long, contains many bullets, or supplies detailed context.\n\
+         novelty, and verification burden. A follow-up after a failed or incomplete fix is strong \
+         evidence that the task is harder than it first appeared: phrases such as \"still broken\", \
+         \"that didn't work\", \"following up\", a reopened issue, or a prior agent failing the \
+         task should score complexity at least 0.70. Do NOT increase complexity merely because a \
+         ticket is long, contains many bullets, or supplies detailed context.\n\
          Return:\n\
          \"routing\": { \"task_class\": string, \"task_classes\": [strings], \
          \"categories\": [strings], \"complexity\": 0.0-1.0, \
@@ -944,6 +947,8 @@ agents:
         assert!(p.contains(PRECLASS_MARKER));
         assert!(p.contains("Dimension: routing"));
         assert!(p.contains("Do NOT increase complexity merely because"));
+        assert!(p.contains("follow-up after a failed or incomplete fix"));
+        assert!(p.contains("at least 0.70"));
         assert!(p.contains("Dimension: orchestrate"));
         assert!(p.contains("1. do a"));
     }

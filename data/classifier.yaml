@@ -51,6 +51,12 @@ complexity:
       keywords: [architecture, redesign, migrate, migration, rewrite, distributed, concurren, security audit, refactor the whole, across the codebase, end-to-end]
     - bump: 0.2
       keywords: [multiple, several, all the, every, entire, whole project, complex, tricky, subtle, race condition, deadlock]
+    # A follow-up after a failed fix is strong evidence that the work is more
+    # difficult than the original request suggested, even if the prompt is
+    # short or describes the expected fix as simple.
+    - bump: 0.15
+      floor: 0.7
+      keywords: [following up on a bug, follow-up on a bug, follow up on a bug, still broken, didn't work, did not work, reopened, re-opened, prior agent failed, failed the task, second attempt]
     # Cross-system work (repos, tickets, PRs) and open-ended investigation
     # are complex even when the prompt is short.
     - bump: 0.15
