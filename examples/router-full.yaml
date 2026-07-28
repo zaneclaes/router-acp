@@ -134,7 +134,8 @@ agents:
       protocol: anthropic
       base_url_env: ANTHROPIC_BASE_URL
       upstream_base_url: https://api.anthropic.com
-    mode_map: { auto: bypassPermissions, approve: default, chat: plan }
+    # `preclass` is required when pre_classifier.enabled: a tool-safe evaluator mode.
+    mode_map: { auto: bypassPermissions, approve: default, chat: plan, preclass: plan }
     preference: 0.1             # static tie-break; client/provider plan
                                 # headroom makes scarce seats costlier
     models:
@@ -180,7 +181,7 @@ agents:
       base_url_env: OPENAI_BASE_URL
       upstream_base_url: https://chatgpt.com/backend-api/codex
       codex_chatgpt_provider: true
-    mode_map: { auto: agent-full-access, approve: agent, chat: read-only }
+    mode_map: { auto: agent-full-access, approve: agent, chat: read-only, preclass: read-only }
     models:
       - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1 }
       - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3 }

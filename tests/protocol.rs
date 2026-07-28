@@ -231,12 +231,25 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
     ));
     for (k, v) in env {
         // Escape for a double-quoted YAML scalar (JSON env values need this).
-        let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = v
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
         out.push_str(&format!(
             "        - {{ name: {k}, value: \"{escaped}\" }}\n"
         ));
     }
-    out.push_str("    model_selection: { type: config-option }\n    models:\n");
+    let is_preclass = env.iter().any(|(key, _)| {
+        *key == "MOCK_PRECLASS_JSON" || *key == "MOCK_PRECLASS_TOOL" || *key == "MOCK_PRECLASS_CALLBACK"
+    });
+    if is_preclass {
+        out.push_str("        - { name: MOCK_SESSION_MODES, value: preclass }\n");
+    }
+    out.push_str("    model_selection: { type: config-option }\n");
+    if is_preclass {
+        out.push_str("    mode_map: { preclass: preclass }\n");
+    }
+    out.push_str("    models:\n");
     for (id, cost) in models {
         out.push_str(&format!("      - {{ id: {id}, cost_rank: {cost} }}\n"));
     }
@@ -4249,6 +4262,87 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
             .expect("routing persisted");
         assert_eq!(routing["class"], "Writing", "{routing}");
         assert_eq!(routing["complexity"], 0.18, "{routing}");
+        let events = read_log(&log);
+        let set_mode = events
+            .iter()
+            .position(|event| event["event"] == "set_mode" && event["modeId"] == "preclass")
+            .expect("pre-class safe mode must be set");
+        let prompt = events
+            .iter()
+            .position(|event| event["event"] == "prompt")
+            .expect("evaluator prompt");
+        assert!(set_mode < prompt, "safe mode must precede evaluator prompt: {events:?}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
+    let state = temp_state_file("preclass-no-safe-mode");
+    let log = temp_log("preclass-no-safe-mode");
+    let agent = agent_yaml(
+        "a",
+        &[("m1", 1)],
+        &[("MOCK_LOG", &log.display().to_string())],
+    )
+    .replace("    mode_map: { preclass: preclass }\n", "");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
+        state.display(), agent
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let err = prompt_text(&cx, &sid, "classify this").await.unwrap_err();
+        assert!(format!("{err}").contains("could not classify"));
+        assert!(
+            !read_log(&log).iter().any(|event| event["event"] == "prompt"),
+            "no classifier prompt may be sent without mode_map.preclass"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_tool_attempt_is_cancelled_and_fails_over() {
+    let state = temp_state_file("preclass-tool-violation");
+    let bad_log = temp_log("preclass-tool-violation-bad");
+    let good = r#"{"routing":{"task_class":"BugFix","complexity":0.4,"confidence":0.9,"reason":"fallback"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nauto_upgrade: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*bad*\", \"*good*\"]\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("bad", 1)],
+            &[
+                ("MOCK_LOG", &bad_log.display().to_string()),
+                ("MOCK_PRECLASS_TOOL", "1"),
+                ("MOCK_PRECLASS_CALLBACK", "1"),
+                ("MOCK_PRECLASS_JSON", good),
+            ],
+        ),
+        agent_yaml("b", &[("good", 2)], &[("MOCK_PRECLASS_JSON", good)]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(&cx, &sid, "fix it").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(
+            read_log(&bad_log).iter().any(|event| event["event"] == "cancel"),
+            "tool attempt must cancel the evaluator"
+        );
+        assert!(
+            observed.lock().unwrap().permission_session_ids.is_empty(),
+            "pre-class callback must not be forwarded to the parent client"
+        );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("fallback routing persisted");
+        assert_eq!(routing["class"], "BugFix");
         Ok(())
     })
     .await;
@@ -4552,27 +4646,49 @@ async fn preclass_hard_fails_on_unparseable_reply() {
     // mandatory when enabled, so with no other evaluator to fail over to the
     // turn HARD FAILS rather than silently mis-routing.
     let state = temp_state_file("preclass-badjson");
+    let malformed_reply = "Shipping PR regression sentinel\n\n## Rollout\n\n- Verify the canary\n- Watch the deploy logs";
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  disclose: true\n\
          agents:\n{}",
         state.display(),
         agent_yaml(
             "a",
             &[("m1", 1)],
-            &[("MOCK_PRECLASS_JSON", "NOT VALID JSON {{{")],
+            &[("MOCK_PRECLASS_JSON", malformed_reply)],
         ),
     );
-    run_test(yaml, async |cx, _observed| {
+    run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         let err = prompt_text(&cx, &sid, "add a flag and wire it up")
             .await
             .unwrap_err();
+        let parent_transcript = agent_text(&observed, &sid);
         assert!(
             format!("{err}").contains("could not classify"),
             "unparseable classifier reply must hard-fail: {err}"
+        );
+        assert!(
+            !parent_transcript.contains("raw reply:"),
+            "raw evaluator reply marker must stay out of parent transcript: {parent_transcript}"
+        );
+        assert!(
+            !parent_transcript.contains("Shipping PR regression sentinel"),
+            "raw evaluator body must stay out of parent transcript: {parent_transcript}"
+        );
+        assert!(
+            parent_transcript.contains("parse failed: JSON parse failed"),
+            "compact parse-failure metadata must remain in parent transcript: {parent_transcript}"
+        );
+        assert!(
+            parent_transcript.contains("could not classify"),
+            "classifier failure metadata must remain in parent transcript: {parent_transcript}"
+        );
+        assert!(
+            !parent_transcript.contains("parse failure: evaluator reply was not valid JSON"),
+            "bare parse-failure note must stay out of parent transcript: {parent_transcript}"
         );
         Ok(())
     })
