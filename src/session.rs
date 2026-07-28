@@ -87,6 +87,12 @@ pub enum DownstreamRoute {
         parent_router_sid: String,
         capture: Arc<Mutex<String>>,
     },
+    /// A tool-free pre-classification session. Any attempted tool use or
+    /// downstream callback is a safety violation, never a parent callback.
+    PreClass {
+        capture: Arc<Mutex<String>>,
+        violation: Arc<AtomicBool>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1794,6 +1800,42 @@ pub fn handle_downstream_dispatch(
                 }
                 let fwd = relay::with_session_id(&msg, &parent_router_sid)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;
+                Ok(Handled::Yes)
+            }
+            Dispatch::Response(..) => unreachable!("responses handled above"),
+        },
+        DownstreamRoute::PreClass { capture, violation } => match message {
+            Dispatch::Notification(msg) => {
+                if msg.method() == "session/update" {
+                    if let Some(text) = agent_chunk_text(msg.params()) {
+                        capture.lock().unwrap().push_str(&text);
+                    }
+                    let is_tool = msg
+                        .params()
+                        .get("update")
+                        .and_then(|u| u.get("sessionUpdate"))
+                        .and_then(|k| k.as_str())
+                        .is_some_and(|k| k == "tool_call" || k == "tool_call_update");
+                    if is_tool {
+                        violation.store(true, Ordering::Release);
+                        if let Some(conn) = shared.target_conn(key) {
+                            let _ = conn.send_notification(CancelNotification::new(down_sid));
+                        }
+                    }
+                }
+                Ok(Handled::Yes)
+            }
+            Dispatch::Request(msg, responder) => {
+                violation.store(true, Ordering::Release);
+                if let Some(conn) = shared.target_conn(key) {
+                    let _ = conn.send_notification(CancelNotification::new(down_sid));
+                }
+                responder.respond_with_error(
+                    AcpError::invalid_request().data(format!(
+                        "pre-class evaluator callbacks are denied: {}",
+                        msg.method()
+                    )),
+                )?;
                 Ok(Handled::Yes)
             }
             Dispatch::Response(..) => unreachable!("responses handled above"),

@@ -9,6 +9,7 @@
 //! the session has zero eligible models of any kind.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use crate::candidate::{CandidateId, TaskClass};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
     DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
-    open_downstream_session, prompt_display_text, resolve_mode_id,
+    open_downstream_session, prompt_display_text,
 };
 
 /// Marker embedded in the evaluator prompt so mock agents (and logs) can
@@ -684,7 +685,7 @@ pub async fn evaluate(
     fail_open("no evaluator candidate available", None, latency_ms, "")
 }
 
-/// One evaluator attempt: open (with auto mode) → prompt → close → parse.
+/// One evaluator attempt: open in the explicit safe preclass mode → prompt → close → parse.
 ///
 /// Returns `Ok(PreClassResult)` when the evaluator model responded (the result
 /// may still lack a routing decision on a parse failure) or the session could
@@ -706,15 +707,24 @@ async fn evaluate_on_candidate(
 ) -> Result<PreClassResult, AcpError> {
     let cand_str = candidate.to_string();
     let capture = Arc::new(Mutex::new(String::new()));
+    let violation = Arc::new(AtomicBool::new(false));
 
-    // Phase 1 — spawn + session/new + auto mode. This is connection
+    // Phase 1 — spawn + session/new + explicit preclass mode. This is connection
     // ESTABLISHMENT (process spawn + handshake), not the classifier LLM call, so
     // it keeps a bounded guard purely as a wedged-spawn deadlock backstop; on
     // expiry it fails over to the next evaluator (never a silent proceed).
     let open_timeout_ms = cfg.probe_timeout_ms.clamp(1, OPEN_TIMEOUT_CAP_MS);
     let opened = match tokio::time::timeout(
         Duration::from_millis(open_timeout_ms),
-        open_evaluator_session(shared, router_sid, candidate, cwd, dirs, capture.clone()),
+        open_evaluator_session(
+            shared,
+            router_sid,
+            candidate,
+            cwd,
+            dirs,
+            capture.clone(),
+            violation.clone(),
+        ),
     )
     .await
     {
@@ -752,6 +762,10 @@ async fn evaluate_on_candidate(
     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
 
     let latency_ms = started.elapsed().as_millis() as u64;
+
+    if violation.load(Ordering::Acquire) {
+        return Err(AcpError::internal_error().data("evaluator attempted tool use"));
+    }
 
     match turn {
         // Client cancelled the turn — not a service failure; do not cordon.
@@ -810,9 +824,9 @@ fn strip_mock_echo(raw: &str) -> String {
 }
 
 /// Spawn the evaluator process if needed and open a tool-less session on it.
-/// Applies the configured `auto` session mode (bypassPermissions for Claude)
-/// so the short evaluator turn never blocks on a permission gate — the same
-/// contract delegates use. Caller owns closing the returned session.
+/// The explicit `mode_map.preclass` mapping must name an advertised safe mode;
+/// unlike delegates, evaluators never inherit `auto` or a client chat mode.
+/// Caller owns closing the returned session.
 async fn open_evaluator_session(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -820,6 +834,7 @@ async fn open_evaluator_session(
     cwd: std::path::PathBuf,
     dirs: Vec<std::path::PathBuf>,
     capture: Arc<Mutex<String>>,
+    violation: Arc<AtomicBool>,
 ) -> Result<OpenedSession, String> {
     // Ensure the target process is live (same as pin/delegate).
     let runtime = shared
@@ -838,17 +853,11 @@ async fn open_evaluator_session(
         cwd,
         dirs,
         Vec::<McpServer>::new(), // tool-less
-        DownstreamRoute::Delegate {
-            parent_router_sid: router_sid.to_string(),
-            capture,
-        },
+        DownstreamRoute::PreClass { capture, violation },
     )
     .await
     .map_err(|e| format!("session/new: {e}"))?;
 
-    // Critical: without auto/bypass the Claude ACP adapter waits forever on
-    // permission prompts even for a tool-less classify turn — observed as a
-    // clean prompt-budget timeout with empty capture (rtr-e743ca2c…).
     let available_modes: Vec<String> = opened
         .modes
         .as_ref()
@@ -859,38 +868,33 @@ async fn open_evaluator_session(
                 .collect()
         })
         .unwrap_or_default();
-    if available_modes.is_empty() {
-        tracing::info!(
-            session = router_sid,
-            candidate = %candidate,
-            "pre-class evaluator advertises no session modes; proceeding without set_mode"
-        );
-    } else {
-        match resolve_mode_id(shared, &candidate.agent, "auto", &available_modes) {
-            Some(mode_id) => {
-                let set =
-                    SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
-                if let Err(err) = opened.conn.send_request(set).block_task().await {
-                    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-                    return Err(format!(
-                        "set_mode auto ({mode_id}) rejected: {err}; modes={available_modes:?}"
-                    ));
-                }
-                tracing::info!(
-                    session = router_sid,
-                    candidate = %candidate,
-                    applied = %mode_id,
-                    "pre-class evaluator session mode applied"
-                );
-            }
-            None => {
-                close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-                return Err(format!(
-                    "no auto mode among advertised modes {available_modes:?}"
-                ));
-            }
-        }
+    let mode_id = shared
+        .cfg
+        .agents
+        .iter()
+        .find(|agent| agent.name == candidate.agent)
+        .and_then(|agent| agent.mode_map.get("preclass"))
+        .filter(|mode| available_modes.iter().any(|available| available == *mode))
+        .cloned();
+    let Some(mode_id) = mode_id else {
+        close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+        return Err(format!(
+            "no advertised mode_map.preclass target; modes={available_modes:?}"
+        ));
+    };
+    let set = SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
+    if let Err(err) = opened.conn.send_request(set).block_task().await {
+        close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+        return Err(format!(
+            "set_mode preclass ({mode_id}) rejected: {err}; modes={available_modes:?}"
+        ));
     }
+    tracing::info!(
+        session = router_sid,
+        candidate = %candidate,
+        applied = %mode_id,
+        "pre-class evaluator session mode applied"
+    );
 
     Ok(opened)
 }

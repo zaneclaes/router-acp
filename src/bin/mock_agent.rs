@@ -18,6 +18,10 @@
 //!   set_config/prompt/cancel) for test assertions
 //! - `MOCK_PRECLASS_JSON`: when a prompt contains `[router-acp pre-classifier]`,
 //!   reply with this JSON body (pre-classifier evaluator tests)
+//! - `MOCK_PRECLASS_TOOL=1`: pre-classifier prompts emit a tool call before
+//!   replying (execution-safety regression tests)
+//! - `MOCK_PRECLASS_CALLBACK=1`: pre-classifier prompts also request a
+//!   permission callback (which the router must reject)
 //!
 //! Prompt text directives:
 //! - `PERM` — request permission from the client, echo the outcome
@@ -347,6 +351,28 @@ async fn run_prompt(
     // Pre-classifier evaluator: return scripted JSON (no echo: wrapper so the
     // router's parser can consume it directly).
     if text.contains("[router-acp pre-classifier]") {
+        if std::env::var("MOCK_PRECLASS_TOOL").as_deref() == Ok("1") {
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCall(
+                    ToolCall::new("preclass-tool", "Bash")
+                        .kind(ToolKind::Execute)
+                        .status(ToolCallStatus::Pending),
+                ),
+            ));
+        }
+        if std::env::var("MOCK_PRECLASS_CALLBACK").as_deref() == Ok("1") {
+            let permission = RequestPermissionRequest::new(
+                session_id.clone(),
+                ToolCallUpdate::new("preclass-tool", Default::default()),
+                vec![PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    PermissionOptionKind::AllowOnce,
+                )],
+            );
+            let _ = cx.send_request(permission).block_task().await;
+        }
         if let Ok(body) = std::env::var("MOCK_PRECLASS_JSON") {
             let _ = cx.send_notification(chunk(&session_id, body));
             return responder.respond(PromptResponse::new(StopReason::EndTurn));
