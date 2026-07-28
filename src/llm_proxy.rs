@@ -17,6 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use axum::routing::any;
 use futures::StreamExt;
+#[cfg(test)]
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -453,10 +454,14 @@ async fn proxy_request(
         _ => None,
     };
 
-    let outbound_body = match decision.as_ref() {
-        Some(decision) if decision.rewrite => {
-            rewrite_top_level_model(&body, &decision.model).unwrap_or_else(|| body.to_vec())
-        }
+    let outbound_body = match (decision.as_ref(), parsed.as_ref()) {
+        (Some(decision), Some(value)) => shape_provider_request(
+            value,
+            decision.rewrite.then_some(decision.model.as_str()),
+            decision.effort.as_deref(),
+            target.config.protocol,
+        )
+        .unwrap_or_else(|| body.to_vec()),
         _ => body.to_vec(),
     };
 
@@ -573,6 +578,15 @@ async fn proxy_request(
                             ),
                             event: "proxy-fallback".to_string(),
                             estimated_input,
+                            effort: state
+                                .shared
+                                .with_session(&active.parent_router_sid, |session| {
+                                    session
+                                        .resolved_effort
+                                        .as_ref()
+                                        .and_then(|resolution| resolution.provider_value.clone())
+                                })
+                                .flatten(),
                         });
                     }
                     upstream = response;
@@ -791,6 +805,7 @@ fn is_inference_endpoint(protocol: LlmWireProtocol, path: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn rewrite_top_level_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(body).ok()?;
     let fields: HashMap<String, &RawValue> = serde_json::from_str(text).ok()?;
@@ -804,6 +819,41 @@ fn rewrite_top_level_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
     rewritten.extend_from_slice(encoded.as_bytes());
     rewritten.extend_from_slice(&body[end..]);
     Some(rewritten)
+}
+
+/// Shape the provider request after routing. This is intentionally distinct
+/// from `WireShape::effort`, which remains a boolean compatibility gate for
+/// already-shaped requests during request-level model rerouting.
+fn shape_provider_request(
+    body: &Value,
+    model: Option<&str>,
+    effort: Option<&str>,
+    protocol: LlmWireProtocol,
+) -> Option<Vec<u8>> {
+    let mut body = body.clone();
+    let object = body.as_object_mut()?;
+    if let Some(model) = model {
+        object.insert("model".into(), Value::String(model.into()));
+    }
+    if let Some(value) = effort {
+        match protocol {
+            LlmWireProtocol::Anthropic => {
+                let config = object
+                    .entry("output_config")
+                    .or_insert_with(|| Value::Object(Default::default()));
+                let config = config.as_object_mut()?;
+                config.insert("effort".into(), Value::String(value.into()));
+            }
+            LlmWireProtocol::Openai => {
+                let reasoning = object
+                    .entry("reasoning")
+                    .or_insert_with(|| Value::Object(Default::default()));
+                let reasoning = reasoning.as_object_mut()?;
+                reasoning.insert("effort".into(), Value::String(value.into()));
+            }
+        }
+    }
+    serde_json::to_vec(&body).ok()
 }
 
 fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
@@ -886,6 +936,8 @@ struct RequestDecision {
     reason: String,
     event: String,
     estimated_input: u64,
+    /// Candidate-resolved provider-native effort, if the parameter is supported.
+    effort: Option<String>,
 }
 
 #[derive(Clone)]
@@ -927,6 +979,14 @@ fn select_request_model(
     body: &Value,
 ) -> RequestDecision {
     let signals = inspect_request(body);
+    let effort = shared
+        .with_session(&active.parent_router_sid, |session| {
+            session
+                .resolved_effort
+                .as_ref()
+                .and_then(|resolution| resolution.provider_value.clone())
+        })
+        .flatten();
     let candidates = shared.routeable_candidates();
     let mut headroom = shared.headroom.lock().unwrap();
     let mut models: Vec<ModelOption> = candidates
@@ -1251,6 +1311,7 @@ fn select_request_model(
         reason,
         event,
         estimated_input: signals.estimated_input,
+        effort,
     }
 }
 
@@ -2374,6 +2435,40 @@ agents:
         let (candidate, reason) = shared.llm_proxy.last_attribution("r1").unwrap();
         assert_eq!(candidate, "claude/sonnet");
         assert!(reason.contains("routine tool-result streak"), "{reason}");
+    }
+
+    #[test]
+    fn provider_request_shaping_only_replaces_effort_when_router_resolves_one() {
+        let anthropic = shape_provider_request(
+            &json!({"model": "old", "output_config": {"effort": "stale"}}),
+            Some("new"),
+            Some("intensive"),
+            LlmWireProtocol::Anthropic,
+        )
+        .unwrap();
+        let anthropic: Value = serde_json::from_slice(&anthropic).unwrap();
+        assert_eq!(anthropic["model"], "new");
+        assert_eq!(anthropic["output_config"]["effort"], "intensive");
+
+        let openai = shape_provider_request(
+            &json!({"model": "gpt", "reasoning": {"effort": "high"}}),
+            None,
+            None,
+            LlmWireProtocol::Openai,
+        )
+        .unwrap();
+        let openai: Value = serde_json::from_slice(&openai).unwrap();
+        assert_eq!(openai["reasoning"]["effort"], "high");
+        let anthropic_unchanged = shape_provider_request(
+            &json!({"model": "claude", "output_config": {"effort": "high"}}),
+            None,
+            None,
+            LlmWireProtocol::Anthropic,
+        )
+        .unwrap();
+        let anthropic_unchanged: Value = serde_json::from_slice(&anthropic_unchanged).unwrap();
+        assert_eq!(anthropic_unchanged["output_config"]["effort"], "high");
+        assert!(request_wire_shape(&anthropic).effort);
     }
 
     #[test]

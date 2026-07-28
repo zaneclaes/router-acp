@@ -1,6 +1,6 @@
 //! Candidate structs, score table, capability requirements.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -13,6 +13,54 @@ use agent_client_protocol::schema::v1::{ContentBlock, PromptCapabilities};
 pub struct CandidateId {
     pub agent: String,
     pub model: String,
+}
+
+/// Canonical reasoning-effort levels understood by router-acp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Auto,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl EffortLevel {
+    pub const ALL: [Self; 6] = [
+        Self::Auto,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str().eq_ignore_ascii_case(value))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// The result of resolving a canonical effort request for one candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortResolution {
+    pub requested: EffortLevel,
+    pub resolved: Option<EffortLevel>,
+    pub provider_value: Option<String>,
 }
 
 impl CandidateId {
@@ -185,8 +233,17 @@ pub struct ScoreEntryRaw {
     #[serde(default)]
     pub adaptive_thinking: Option<bool>,
     /// Whether the model accepts `output_config.effort`.
+    /// This remains a wire-shape compatibility flag; it is deliberately
+    /// independent from the canonical level support below.
     #[serde(default)]
     pub effort: Option<bool>,
+    /// Canonical effort levels this candidate supports. Omitted means the
+    /// candidate does not advertise level-based effort control.
+    #[serde(default)]
+    pub effort_levels: Option<Vec<EffortLevel>>,
+    /// Canonical level to provider-native parameter value.
+    #[serde(default)]
+    pub effort_mapping: BTreeMap<EffortLevel, String>,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Per-class quality scores in [0, 1], keyed by task class name.
@@ -224,6 +281,8 @@ pub struct ResolvedScores {
     pub max_output_tokens: Option<u64>,
     pub adaptive_thinking: bool,
     pub effort: bool,
+    pub effort_levels: Vec<EffortLevel>,
+    pub effort_mapping: BTreeMap<EffortLevel, String>,
     pub tags: Vec<String>,
     quality: HashMap<TaskClass, f64>,
     default_quality: f64,
@@ -236,6 +295,28 @@ impl ResolvedScores {
             .copied()
             .unwrap_or(self.default_quality)
     }
+
+    /// Resolve a requested canonical level to this candidate's closest
+    /// advertised provider mapping. `None` means omit the provider parameter.
+    pub fn resolve_effort(&self, requested: EffortLevel) -> EffortResolution {
+        let supported: Vec<_> = self
+            .effort_levels
+            .iter()
+            .copied()
+            .filter(|level| *level != EffortLevel::Auto && self.effort_mapping.contains_key(level))
+            .collect();
+        let resolved = supported.into_iter().min_by_key(|level| {
+            let requested_rank = requested as i16;
+            let level_rank = *level as i16;
+            (requested_rank - level_rank).unsigned_abs()
+        });
+        let provider_value = resolved.and_then(|level| self.effort_mapping.get(&level).cloned());
+        EffortResolution {
+            requested,
+            resolved,
+            provider_value,
+        }
+    }
 }
 
 impl Default for ResolvedScores {
@@ -247,6 +328,8 @@ impl Default for ResolvedScores {
             max_output_tokens: None,
             adaptive_thinking: true,
             effort: true,
+            effort_levels: Vec::new(),
+            effort_mapping: BTreeMap::new(),
             tags: Vec::new(),
             quality: HashMap::new(),
             default_quality: 0.5,
@@ -327,6 +410,8 @@ impl ScoreTable {
                     max_output_tokens: raw_entry.max_output_tokens,
                     adaptive_thinking: raw_entry.adaptive_thinking.unwrap_or(true),
                     effort: raw_entry.effort.unwrap_or(true),
+                    effort_levels: raw_entry.effort_levels.unwrap_or_default(),
+                    effort_mapping: raw_entry.effort_mapping,
                     tags: raw_entry.tags,
                     quality,
                     default_quality: raw_entry
@@ -429,6 +514,29 @@ mod tests {
         assert_eq!(quality_confidence(1.3, TaskClass::UiTweak, 0.0), 1.0);
         assert!(quality_confidence(1.3, TaskClass::Architecture, 0.5) < 0.5);
         assert_eq!(quality_demand(TaskClass::Architecture, 1.0), 3.0);
+    }
+
+    #[test]
+    fn effort_levels_parse_and_normalize_to_supported_provider_values() {
+        assert_eq!(EffortLevel::parse("xhigh"), Some(EffortLevel::Xhigh));
+        assert_eq!(EffortLevel::parse("AUTO"), Some(EffortLevel::Auto));
+        assert_eq!(EffortLevel::parse("turbo"), None);
+        let scores = ScoreTable::from_yaml(
+            "candidates:\n  - pattern: '*model*'\n    effort: false\n    effort_levels: [low, high]\n    effort_mapping: { low: minimal, high: intensive }\n",
+        )
+        .unwrap()
+        .lookup(&CandidateId::new("test", "model"));
+        // The legacy wire flag remains independent of level support.
+        assert!(!scores.effort);
+        let normalized = scores.resolve_effort(EffortLevel::Xhigh);
+        assert_eq!(normalized.resolved, Some(EffortLevel::High));
+        assert_eq!(normalized.provider_value.as_deref(), Some("intensive"));
+        assert_eq!(
+            ResolvedScores::default()
+                .resolve_effort(EffortLevel::High)
+                .resolved,
+            None
+        );
     }
 }
 

@@ -298,6 +298,7 @@ pub(crate) mod test_util {
                 class: TaskClass::CodingGeneral,
                 complexity: 0.5,
                 languages: vec![],
+                effort: None,
             },
             required_caps: RequiredCaps::default(),
             explicit_candidate: None,

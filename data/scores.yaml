@@ -19,6 +19,8 @@ candidates:
     coding_percentile: 0.97
     context_window: 1000000
     max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
     # Calibrated from AA Coding Agent, SWE-Bench Pro, DeepSWE, and Terminal-Bench.
     # The implementation lift is supported by two coding benchmarks; classes
     # without two agreeing task-specific observations keep the aggregate.
@@ -47,6 +49,8 @@ candidates:
     coding_tier: high
     coding_percentile: 0.96
     context_window: 400000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: high, max: high }
     default_quality: 2.81
     quality:
       UiTweak: 2.81
@@ -64,6 +68,8 @@ candidates:
     coding_tier: high
     coding_percentile: 0.9
     context_window: 400000
+    effort_levels: [low, medium, high]
+    effort_mapping: { low: low, medium: medium, high: high }
     default_quality: 2.45
     quality:
       UiTweak: 2.45
@@ -81,6 +87,8 @@ candidates:
     coding_tier: medium
     coding_percentile: 0.5
     context_window: 400000
+    effort_levels: [low, medium, high]
+    effort_mapping: { low: low, medium: medium, high: high }
     default_quality: 2.02
     quality:
       UiTweak: 2.02
@@ -102,6 +110,8 @@ candidates:
     coding_percentile: 0.93
     context_window: 1000000
     max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
     default_quality: 1.64
     quality:
       UiTweak: 1.64
@@ -120,6 +130,8 @@ candidates:
     coding_percentile: 0.8
     context_window: 1000000
     max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
     default_quality: 1.38
     quality:
       UiTweak: 1.38

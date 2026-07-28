@@ -20,7 +20,7 @@ use agent_client_protocol::schema::v1::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::candidate::{CandidateId, TaskClass};
+use crate::candidate::{CandidateId, EffortLevel, TaskClass};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
     DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
@@ -80,6 +80,8 @@ pub struct RoutingDecision {
     /// 0.0 (mechanical/trivial) to 1.0 (long-horizon/high-risk).
     pub complexity: f64,
     pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortLevel>,
     #[serde(default)]
     pub reason: String,
 }
@@ -140,10 +142,13 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          \"that didn't work\", \"following up\", a reopened issue, or a prior agent failing the \
          task should score complexity at least 0.70. Do NOT increase complexity merely because a \
          ticket is long, contains many bullets, or supplies detailed context.\n\
+         Also choose routing.effort from exactly: low, medium, high, xhigh, max. Use low for \
+         mechanical work, medium for bounded routine work, high for multi-file implementation, \
+         xhigh for ambiguous cross-system reasoning, and max only for novel or severe-risk work.\n\
          Return:\n\
          \"routing\": { \"task_class\": string, \"task_classes\": [strings], \
          \"categories\": [strings], \"complexity\": 0.0-1.0, \
-         \"confidence\": 0.0-1.0, \"reason\": string }\n\n",
+         \"confidence\": 0.0-1.0, \"effort\": \"low|medium|high|xhigh|max\", \"reason\": string }\n\n",
     );
     schema_keys.push("routing".into());
 
@@ -274,6 +279,11 @@ fn parse_routing(v: &Value) -> Option<RoutingDecision> {
     if !complexity.is_finite() || !confidence.is_finite() {
         return None;
     }
+    let effort = match obj.get("effort") {
+        Some(Value::String(value)) => Some(EffortLevel::parse(value)?),
+        Some(_) => return None,
+        None => None,
+    };
     let mut task_classes: Vec<TaskClass> = obj
         .get("task_classes")
         .and_then(Value::as_array)
@@ -303,6 +313,7 @@ fn parse_routing(v: &Value) -> Option<RoutingDecision> {
         categories,
         complexity: complexity.clamp(0.0, 1.0),
         confidence: confidence.clamp(0.0, 1.0),
+        effort,
         reason: obj
             .get("reason")
             .and_then(Value::as_str)
@@ -1052,6 +1063,8 @@ agents:
         assert!(p.contains("Do NOT increase complexity merely because"));
         assert!(p.contains("follow-up after a failed or incomplete fix"));
         assert!(p.contains("at least 0.70"));
+        assert!(p.contains("low, medium, high, xhigh, max"));
+        assert!(p.contains("xhigh for ambiguous cross-system reasoning"));
         assert!(p.contains("Dimension: orchestrate"));
         assert!(p.contains("1. do a"));
     }
@@ -1123,6 +1136,30 @@ agents:
         assert!(r.acted_modes.contains(&"UI".to_string()));
         assert_eq!(r.injects, vec!["INJECT-UI".to_string()]);
         assert!(r.orchestrate.as_ref().unwrap().warranted);
+    }
+
+    #[test]
+    fn classifier_output_rejects_invalid_effort_and_accepts_canonical_level() {
+        let cfg = cfg_with_dims(vec![]);
+        let invalid = json!({"routing": {
+            "task_class": "BugFix", "complexity": 0.4, "confidence": 0.9, "effort": "turbo"
+        }});
+        assert!(
+            apply_thresholds(&cfg, &invalid, Some("a/m1"), 1, "")
+                .routing
+                .is_none()
+        );
+
+        let valid = json!({"routing": {
+            "task_class": "BugFix", "complexity": 0.4, "confidence": 0.9, "effort": "xhigh"
+        }});
+        assert_eq!(
+            apply_thresholds(&cfg, &valid, Some("a/m1"), 1, "")
+                .routing
+                .unwrap()
+                .effort,
+            Some(EffortLevel::Xhigh)
+        );
     }
 
     #[test]
