@@ -780,12 +780,20 @@ async fn evaluate_on_candidate(
                         &raw_log,
                     ))
                 }
-                Err(e) => Ok(fail_open(
-                    format!("parse failed: {e}"),
-                    Some(cand_str),
-                    latency_ms,
-                    &format!("raw reply:\n{body}\n"),
-                )),
+                Err(e) => {
+                    tracing::debug!(
+                        evaluator = %cand_str,
+                        error = %e,
+                        raw_reply = %body,
+                        "pre-class evaluator reply could not be parsed"
+                    );
+                    Ok(fail_open(
+                        format!("parse failed: {e}"),
+                        Some(cand_str),
+                        latency_ms,
+                        "",
+                    ))
+                }
             }
         }
     }

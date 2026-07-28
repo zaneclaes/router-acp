@@ -231,7 +231,10 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
     ));
     for (k, v) in env {
         // Escape for a double-quoted YAML scalar (JSON env values need this).
-        let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = v
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
         out.push_str(&format!(
             "        - {{ name: {k}, value: \"{escaped}\" }}\n"
         ));
@@ -4552,27 +4555,49 @@ async fn preclass_hard_fails_on_unparseable_reply() {
     // mandatory when enabled, so with no other evaluator to fail over to the
     // turn HARD FAILS rather than silently mis-routing.
     let state = temp_state_file("preclass-badjson");
+    let malformed_reply = "Shipping PR regression sentinel\n\n## Rollout\n\n- Verify the canary\n- Watch the deploy logs";
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  disclose: true\n\
          agents:\n{}",
         state.display(),
         agent_yaml(
             "a",
             &[("m1", 1)],
-            &[("MOCK_PRECLASS_JSON", "NOT VALID JSON {{{")],
+            &[("MOCK_PRECLASS_JSON", malformed_reply)],
         ),
     );
-    run_test(yaml, async |cx, _observed| {
+    run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         let err = prompt_text(&cx, &sid, "add a flag and wire it up")
             .await
             .unwrap_err();
+        let parent_transcript = agent_text(&observed, &sid);
         assert!(
             format!("{err}").contains("could not classify"),
             "unparseable classifier reply must hard-fail: {err}"
+        );
+        assert!(
+            !parent_transcript.contains("raw reply:"),
+            "raw evaluator reply marker must stay out of parent transcript: {parent_transcript}"
+        );
+        assert!(
+            !parent_transcript.contains("Shipping PR regression sentinel"),
+            "raw evaluator body must stay out of parent transcript: {parent_transcript}"
+        );
+        assert!(
+            parent_transcript.contains("parse failed: JSON parse failed"),
+            "compact parse-failure metadata must remain in parent transcript: {parent_transcript}"
+        );
+        assert!(
+            parent_transcript.contains("could not classify"),
+            "classifier failure metadata must remain in parent transcript: {parent_transcript}"
+        );
+        assert!(
+            !parent_transcript.contains("parse failure: evaluator reply was not valid JSON"),
+            "bare parse-failure note must stay out of parent transcript: {parent_transcript}"
         );
         Ok(())
     })
