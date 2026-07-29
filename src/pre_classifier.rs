@@ -685,7 +685,8 @@ pub async fn evaluate(
     fail_open("no evaluator candidate available", None, latency_ms, "")
 }
 
-/// One evaluator attempt: open in the explicit safe preclass mode → prompt → close → parse.
+/// One evaluator attempt: open in the safe preclass mode when the adapter has
+/// modes, then prompt → close → parse.
 ///
 /// Returns `Ok(PreClassResult)` when the evaluator model responded (the result
 /// may still lack a routing decision on a parse failure) or the session could
@@ -824,8 +825,9 @@ fn strip_mock_echo(raw: &str) -> String {
 }
 
 /// Spawn the evaluator process if needed and open a tool-less session on it.
-/// The explicit `mode_map.preclass` mapping must name an advertised safe mode;
-/// unlike delegates, evaluators never inherit `auto` or a client chat mode.
+/// Agents that advertise session modes must have an explicit
+/// `mode_map.preclass` safe mode. Agents that advertise no modes have no
+/// permission gate to arm and proceed without a `set_mode` request.
 /// Caller owns closing the returned session.
 async fn open_evaluator_session(
     shared: &Arc<Shared>,
@@ -868,33 +870,41 @@ async fn open_evaluator_session(
                 .collect()
         })
         .unwrap_or_default();
-    let mode_id = shared
-        .cfg
-        .agents
-        .iter()
-        .find(|agent| agent.name == candidate.agent)
-        .and_then(|agent| agent.mode_map.get("preclass"))
-        .filter(|mode| available_modes.iter().any(|available| available == *mode))
-        .cloned();
-    let Some(mode_id) = mode_id else {
-        close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-        return Err(format!(
-            "no advertised mode_map.preclass target; modes={available_modes:?}"
-        ));
-    };
-    let set = SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
-    if let Err(err) = opened.conn.send_request(set).block_task().await {
-        close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-        return Err(format!(
-            "set_mode preclass ({mode_id}) rejected: {err}; modes={available_modes:?}"
-        ));
+    if available_modes.is_empty() {
+        tracing::info!(
+            session = router_sid,
+            candidate = %candidate,
+            "pre-class evaluator advertises no session modes; proceeding without set_mode"
+        );
+    } else {
+        let mode_id = shared
+            .cfg
+            .agents
+            .iter()
+            .find(|agent| agent.name == candidate.agent)
+            .and_then(|agent| agent.mode_map.get("preclass"))
+            .filter(|mode| available_modes.iter().any(|available| available == *mode))
+            .cloned();
+        let Some(mode_id) = mode_id else {
+            close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+            return Err(format!(
+                "no advertised mode_map.preclass target; modes={available_modes:?}"
+            ));
+        };
+        let set = SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
+        if let Err(err) = opened.conn.send_request(set).block_task().await {
+            close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+            return Err(format!(
+                "set_mode preclass ({mode_id}) rejected; modes={available_modes:?}: {err}"
+            ));
+        }
+        tracing::info!(
+            session = router_sid,
+            candidate = %candidate,
+            applied = %mode_id,
+            "pre-class evaluator session mode applied"
+        );
     }
-    tracing::info!(
-        session = router_sid,
-        candidate = %candidate,
-        applied = %mode_id,
-        "pre-class evaluator session mode applied"
-    );
 
     Ok(opened)
 }
