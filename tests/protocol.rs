@@ -4278,13 +4278,114 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
 }
 
 #[tokio::test]
+async fn preclass_mode_less_evaluator_runs_without_set_mode() {
+    let state = temp_state_file("preclass-mode-less");
+    let log = temp_log("preclass-mode-less");
+    let preclass_json = r#"{"routing":{"task_class":"BugFix","complexity":0.4,"confidence":0.9,"reason":"fallback"}}"#;
+    let agent = agent_yaml(
+        "grok",
+        &[("grok-4.5", 1)],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_PRECLASS_JSON", preclass_json),
+        ],
+    )
+    .replace(
+        "        - { name: MOCK_SESSION_MODES, value: preclass }\n",
+        "",
+    )
+    .replace("    mode_map: { preclass: preclass }\n", "");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*grok*\"]\nagents:\n{}",
+        state.display(),
+        agent
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "classify this").await?;
+        let events = read_log(&log);
+        assert!(
+            events.iter().any(|event| event["event"] == "prompt"),
+            "mode-less evaluator must receive the classifier prompt: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event["event"] == "set_mode"),
+            "mode-less evaluator must not receive set_mode: {events:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_preferred_evaluator_beats_grok_fallback() {
+    let state = temp_state_file("preclass-preferred");
+    let codex_log = temp_log("preclass-preferred-codex");
+    let grok_log = temp_log("preclass-preferred-grok");
+    let preclass_json = r#"{"routing":{"task_class":"BugFix","complexity":0.4,"confidence":0.9,"reason":"preferred"}}"#;
+    let codex = agent_yaml(
+        "codex",
+        &[("gpt-5.4-mini", 1)],
+        &[
+            ("MOCK_LOG", &codex_log.display().to_string()),
+            ("MOCK_PRECLASS_JSON", preclass_json),
+        ],
+    );
+    let grok = agent_yaml(
+        "grok",
+        &[("grok-4.5", 2)],
+        &[
+            ("MOCK_LOG", &grok_log.display().to_string()),
+            ("MOCK_PRECLASS_JSON", preclass_json),
+        ],
+    )
+    .replace(
+        "        - { name: MOCK_SESSION_MODES, value: preclass }\n",
+        "",
+    )
+    .replace("    mode_map: { preclass: preclass }\n", "");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*mini*\"]\nagents:\n{}{}",
+        state.display(),
+        codex,
+        grok
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "classify this").await?;
+        let codex_events = read_log(&codex_log);
+        assert!(
+            codex_events.iter().any(|event| event["event"] == "prompt"),
+            "preferred Codex evaluator must run"
+        );
+        assert!(
+            codex_events.iter().any(|event| event["event"] == "set_mode"),
+            "preferred Codex evaluator must enter its explicit preclass mode"
+        );
+        assert!(
+            !read_log(&grok_log)
+                .iter()
+                .any(|event| event["event"] == "prompt"),
+            "Grok must remain a fallback when preferred Codex succeeds"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
     let state = temp_state_file("preclass-no-safe-mode");
     let log = temp_log("preclass-no-safe-mode");
     let agent = agent_yaml(
         "a",
         &[("m1", 1)],
-        &[("MOCK_LOG", &log.display().to_string())],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_SESSION_MODES", "preclass"),
+        ],
     )
     .replace("    mode_map: { preclass: preclass }\n", "");
     let yaml = format!(
