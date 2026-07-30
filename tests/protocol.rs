@@ -454,6 +454,40 @@ async fn declared_model_missing_downstream_is_removed() {
 }
 
 #[tokio::test]
+async fn session_new_advertises_candidate_effort_capabilities() {
+    let state = temp_state_file("effort-capabilities");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-effort-capabilities-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'mock/m1', effort_levels: [low, high, max], effort_mapping: { low: minimal, high: intensive, max: exhaustive } }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let options = serde_json::to_string(&session.config_options).unwrap();
+        assert!(
+            options.contains(
+                "\"capabilities\":{\"effort\":{\"supported\":[\"low\",\"high\",\"max\"]}}"
+            ),
+            "effort capabilities advertised: {options}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn zero_routeable_candidates_fails_initialize() {
     let state = temp_state_file("zero");
     let yaml = format!(
@@ -696,6 +730,229 @@ async fn pre_pin_candidate_override_and_post_pin_rejection() {
         assert!(
             format!("{err}").contains("already pinned"),
             "post-pin rejection expected, got {err}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_effort_precedes_automatic_and_is_reresolved_on_failover() {
+    let state = temp_state_file("effort-failover");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-effort-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'a/*', default_quality: 3.0, effort_levels: [low, high], effort_mapping: { low: tiny, high: deep } }\n\
+         \x20 - { pattern: 'b/*', default_quality: 1.0, effort_levels: [max], effort_mapping: { max: tiny } }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nrouters:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 2)], &[("MOCK_FAIL_PROMPT_MSG", "rate limit")]),
+        agent_yaml("b", &[("m2", 1)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.candidate".to_string(),
+            SessionConfigOptionValue::value_id("a/m1"),
+        ))
+        .block_task()
+        .await?;
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.effort".to_string(),
+            SessionConfigOptionValue::value_id("max"),
+        ))
+        .block_task()
+        .await?;
+        prompt_text(&cx, &sid, "a tiny typo").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("effort: max → high"),
+            "initial resolution: {text}"
+        );
+        assert!(
+            text.contains("effort: max → max"),
+            "failover resolution: {text}"
+        );
+        let routing = open_state(&state).get(&sid).unwrap().routing.unwrap();
+        assert_eq!(routing["effort"]["requested"], "max");
+        assert_eq!(routing["effort"]["resolved"], "max");
+        assert_eq!(routing["effort"]["provider_value"], "tiny");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auto_model_routing_requires_the_explicit_effort_level() {
+    let state = temp_state_file("effort-auto-constraint");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-effort-auto-constraint-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'a/*', default_quality: 3.0, effort_levels: [low], effort_mapping: { low: low } }\n\
+         \x20 - { pattern: 'b/*', default_quality: 1.0, effort_levels: [high], effort_mapping: { high: high } }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nrouters:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 2)], &[]),
+        agent_yaml("b", &[("m2", 1)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.effort".to_string(),
+            SessionConfigOptionValue::value_id("high"),
+        ))
+        .block_task()
+        .await?;
+        prompt_text(&cx, &sid, "implement this").await?;
+        assert!(
+            agent_text(&observed, &sid).contains("auto → b/m2"),
+            "auto routing must exclude the higher-quality low-effort-only model"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auto_model_routing_errors_when_no_candidate_supports_explicit_effort() {
+    let state = temp_state_file("effort-auto-none");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-effort-auto-none-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'mock/*', effort_levels: [low], effort_mapping: { low: low } }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("mock", &[("m1", 1)], &[]),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.effort".to_string(),
+            SessionConfigOptionValue::value_id("high"),
+        ))
+        .block_task()
+        .await?;
+        let err = prompt_text(&cx, &sid, "implement this").await.unwrap_err();
+        assert!(
+            format!("{err}")
+                .contains("no routeable candidates support the explicitly requested effort `high`"),
+            "clear no-compatible error: {err}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclassifier_omitted_effort_falls_back_to_task_depth_recommendation() {
+    let state = temp_state_file("preclass-effort-fallback");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-preclass-effort-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'mock/*', effort_levels: [xhigh], effort_mapping: { xhigh: deep } }\n",
+    )
+    .unwrap();
+    let preclass = r#"{"routing":{"task_class":"Architecture","complexity":0.72,"confidence":0.9,"reason":"cross-system"}}"#;
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("mock", &[("m1", 1)], &[("MOCK_PRECLASS_JSON", preclass)]),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "design the architecture").await?;
+        let routing = open_state(&state).get(&sid).unwrap().routing.unwrap();
+        assert_eq!(routing["effort"]["requested"], "xhigh");
+        assert_eq!(routing["effort"]["provider_value"], "deep");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn post_pin_effort_config_and_directives_apply_without_ignore_notices() {
+    let state = temp_state_file("post-pin-effort");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-post-pin-effort-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'mock/*', effort_levels: [medium, high], effort_mapping: { medium: normal, high: deep } }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("mock", &[("m1", 1)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "first task").await?;
+        for _ in 0..2 {
+            cx.send_request(SetSessionConfigOptionRequest::new(
+                sid.clone(),
+                "router.effort".to_string(),
+                SessionConfigOptionValue::value_id("high"),
+            ))
+            .block_task()
+            .await?;
+        }
+        let resolution = shared
+            .with_session(&sid, |session| session.resolved_effort.clone())
+            .flatten()
+            .expect("post-pin effort must resolve");
+        assert_eq!(
+            resolution.requested,
+            router_acp::candidate::EffortLevel::High
+        );
+        assert_eq!(resolution.provider_value.as_deref(), Some("deep"));
+
+        prompt_text(&cx, &sid, "[router: effort=high] follow-up one").await?;
+        prompt_text(&cx, &sid, "[router: effort=high] follow-up two").await?;
+        assert!(
+            !agent_text(&observed, &sid).contains("routing directive ignored"),
+            "idempotent post-pin effort directives must be silent"
         );
         Ok(())
     })
@@ -3661,7 +3918,7 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
         let sess = new_session(&cx).await?;
         let opts = serde_json::to_string(&sess.config_options).unwrap();
         assert!(
-            opts.contains("\"available\":false") && opts.contains("Weekly Fable limit reached"),
+            opts.contains("\"available\":false") && opts.contains("Weekly Fable limit reached") && opts.contains("\"capabilities\":{\"effort\""),
             "cordoned candidate advertised unavailable: {opts}"
         );
 

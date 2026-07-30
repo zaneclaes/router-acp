@@ -28,8 +28,12 @@ use agent_client_protocol::{
     on_receive_request,
 };
 
-use crate::candidate::{CandidateId, RequiredCaps, ScoreTable, TaskClass};
-use crate::classifier::{ClassifierRules, ClassifyInput, classify, cwd_language_fingerprint};
+use crate::candidate::{
+    CandidateId, EffortLevel, EffortResolution, RequiredCaps, ScoreTable, TaskClass,
+};
+use crate::classifier::{
+    ClassifierRules, ClassifyInput, automatic_effort, classify, cwd_language_fingerprint,
+};
 use crate::config::{Config, DisclosureMode, EscalationPath, SkillRoute, StrategyKind};
 use crate::downstream::{
     ProcessKey, ProcessTargetSpec, SelectionKind, build_targets, is_auth_required, probe_target,
@@ -142,6 +146,11 @@ pub struct RouterSession {
     pub mcp_servers: Vec<McpServer>,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
+    /// Explicit user effort (`auto` clears it); it takes precedence over a
+    /// classifier recommendation and is retained across failover.
+    pub effort_request: Option<EffortLevel>,
+    /// Candidate-specific result, recomputed whenever the pin changes.
+    pub resolved_effort: Option<EffortResolution>,
     /// Soft preference from `[router: prefer=...]`: tried first at pin time,
     /// but falls through to the normal strategy ranking if unavailable.
     pub preferred_candidate: Option<CandidateId>,
@@ -281,6 +290,8 @@ impl RouterSession {
             mcp_servers,
             strategy: cfg.router,
             candidate_override: None,
+            effort_request: None,
+            resolved_effort: None,
             preferred_candidate: None,
             pin: None,
             pinning: false,
@@ -330,6 +341,8 @@ impl RouterSession {
             mcp_servers: req.mcp_servers.clone(),
             strategy: cfg.router,
             candidate_override: None,
+            effort_request: None,
+            resolved_effort: None,
             preferred_candidate: None,
             pin: None,
             pinning: false,
@@ -845,9 +858,11 @@ impl Shared {
     // ------------------------------------------------------------------
 
     pub fn router_config_options(&self, router_sid: &str) -> Vec<SessionConfigOption> {
-        let (strategy, override_) = self
-            .with_session(router_sid, |s| (s.strategy, s.candidate_override.clone()))
-            .unwrap_or((self.cfg.router, None));
+        let (strategy, override_, effort) = self
+            .with_session(router_sid, |s| {
+                (s.strategy, s.candidate_override.clone(), s.effort_request)
+            })
+            .unwrap_or((self.cfg.router, None, None));
 
         let strategy_option = SessionConfigOption::select(
             "router.strategy",
@@ -892,24 +907,25 @@ impl Shared {
                 .map(|c| {
                     let opt =
                         SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
-                    // available defaults to true/absent; a cordoned candidate is
-                    // advertised unavailable with a reason and reset time under
-                    // `_meta.router_acp`.
-                    match usage_cordons.get(&c.id) {
-                        Some(cordon) => {
-                            let mut meta = serde_json::Map::new();
-                            meta.insert(
-                                "router_acp".to_string(),
-                                json!({
-                                    "available": false,
-                                    "unavailable_reason": cordon.reason,
-                                    "resets_at": cordon.resets_at_rfc3339,
-                                }),
-                            );
-                            opt.meta(meta)
-                        }
-                        None => opt,
+                    let scores = self.scores.lookup(&c.id);
+                    let supported: Vec<_> = scores
+                        .effort_levels
+                        .iter()
+                        .filter(|level| **level != EffortLevel::Auto)
+                        .filter(|level| scores.effort_mapping.contains_key(level))
+                        .map(|level| level.as_str())
+                        .collect();
+                    let mut router_meta = json!({
+                        "capabilities": { "effort": { "supported": supported } },
+                    });
+                    if let Some(cordon) = usage_cordons.get(&c.id) {
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] = json!(cordon.reason);
+                        router_meta["resets_at"] = json!(cordon.resets_at_rfc3339);
                     }
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("router_acp".to_string(), router_meta);
+                    opt.meta(meta)
                 })
                 .collect();
             if !options.is_empty() {
@@ -932,13 +948,41 @@ impl Shared {
                         .to_string(),
                 );
 
-        vec![strategy_option, candidate_option]
+        let effort_option = SessionConfigOption::select(
+            "router.effort",
+            "Reasoning effort",
+            effort.unwrap_or(EffortLevel::Auto).as_str(),
+            EffortLevel::ALL
+                .into_iter()
+                .map(|level| SessionConfigSelectOption::new(level.as_str(), level.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .description(
+            "Explicit effort overrides automatic task-based effort; unsupported models omit it"
+                .to_string(),
+        );
+
+        vec![strategy_option, candidate_option, effort_option]
     }
 }
 
 /// Turn a `SessionId` into its string form.
 pub fn sid_str(sid: &agent_client_protocol::schema::v1::SessionId) -> String {
     sid.0.to_string()
+}
+
+/// Re-resolve effort for an already pinned session after a user changes the
+/// router-owned effort option. The next provider request reads this state.
+fn refresh_pinned_effort(scores: &ScoreTable, session: &mut RouterSession) {
+    let requested = session.effort_request.or_else(|| {
+        session
+            .task_class
+            .map(|class| automatic_effort(class, session.task_complexity))
+    });
+    session.resolved_effort = session
+        .pin
+        .as_ref()
+        .and_then(|pin| requested.map(|level| scores.lookup(&pin.candidate).resolve_effort(level)));
 }
 
 // ----------------------------------------------------------------------
@@ -1830,12 +1874,10 @@ pub fn handle_downstream_dispatch(
                 if let Some(conn) = shared.target_conn(key) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid));
                 }
-                responder.respond_with_error(
-                    AcpError::invalid_request().data(format!(
-                        "pre-class evaluator callbacks are denied: {}",
-                        msg.method()
-                    )),
-                )?;
+                responder.respond_with_error(AcpError::invalid_request().data(format!(
+                    "pre-class evaluator callbacks are denied: {}",
+                    msg.method()
+                )))?;
                 Ok(Handled::Yes)
             }
             Dispatch::Response(..) => unreachable!("responses handled above"),
@@ -2120,6 +2162,7 @@ pub struct PromptDirectives {
     pub strategy: Option<StrategyKind>,
     pub exclude: Vec<String>,
     pub label: Option<String>,
+    pub effort: Option<EffortLevel>,
 }
 
 /// Parse (and strip) a routing directive from the prompt.
@@ -2225,10 +2268,17 @@ pub fn parse_prompt_directives(
                     directives.label = Some(value.to_string());
                 }
             }
+            "effort" => {
+                directives.effort = Some(EffortLevel::parse(value).ok_or_else(|| {
+                    format!(
+                        "directive effort `{value}` must be auto, low, medium, high, xhigh, or max"
+                    )
+                })?);
+            }
             other => {
                 return Err(format!(
                     "unknown routing directive key `{other}` \
-                     (keys: candidate, prefer, switch, strategy, exclude, label)"
+                     (keys: candidate, prefer, switch, strategy, exclude, label, effort)"
                 ));
             }
         }
@@ -2583,7 +2633,7 @@ async fn pin_session(
     is_failover: bool,
     larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
-    let (cwd, dirs, client_mcp, strategy, override_, run_label) = shared
+    let (cwd, dirs, client_mcp, strategy, override_, effort_request, run_label) = shared
         .with_session(router_sid, |s| {
             (
                 s.cwd.clone(),
@@ -2591,6 +2641,7 @@ async fn pin_session(
                 s.mcp_servers.clone(),
                 s.strategy,
                 s.candidate_override.clone(),
+                s.effort_request,
                 s.run_label.clone(),
             )
         })
@@ -2634,6 +2685,10 @@ async fn pin_session(
         }
         None => None,
     };
+    // With Model=Auto, an explicit effort is a routing requirement rather
+    // than a post-selection preference. A concrete candidate remains allowed
+    // to normalize to its nearest provider-supported level.
+    let auto_effort = override_.is_none().then_some(effort_request).flatten();
     let ctx = RouteContext {
         profile: profile.clone(),
         required_caps: required,
@@ -2658,6 +2713,12 @@ async fn pin_session(
     if let Some(min) = larger_context_than {
         pool = prefer_larger_context(&shared.scores, pool, min);
     }
+    if let Some(effort) = auto_effort {
+        pool.retain(|view| {
+            let scores = shared.scores.lookup(&view.id);
+            scores.effort_levels.contains(&effort) && scores.effort_mapping.contains_key(&effort)
+        });
+    }
     // All-cordoned "least-bad" fallback: if the pool is empty only because every
     // candidate is usage-cordoned, route to the one whose cordon resets soonest
     // rather than failing the turn.
@@ -2669,6 +2730,13 @@ async fn pin_session(
         }
         if !excluded_patterns.is_empty() {
             relaxed.retain(|v| !is_excluded(&v.id, &excluded_patterns));
+        }
+        if let Some(effort) = auto_effort {
+            relaxed.retain(|view| {
+                let scores = shared.scores.lookup(&view.id);
+                scores.effort_levels.contains(&effort)
+                    && scores.effort_mapping.contains_key(&effort)
+            });
         }
         let soonest = {
             let hr = shared.headroom.lock().unwrap();
@@ -2692,7 +2760,12 @@ async fn pin_session(
         }
     }
     if pool.is_empty() {
-        return Err(if shared.has_auth_pending() {
+        return Err(if let Some(effort) = auto_effort {
+            AcpError::invalid_params().data(format!(
+                "no routeable candidates support the explicitly requested effort `{}` while Model=Auto",
+                effort.as_str()
+            ))
+        } else if shared.has_auth_pending() {
             AcpError::auth_required()
                 .data("no routeable candidates yet; authenticate a downstream agent first")
         } else if !cordons.is_empty() {
@@ -2806,6 +2879,12 @@ async fn pin_session(
                     })
                     .unwrap_or_default();
                 let pin_quality = shared.scores.lookup(&candidate).quality(profile.class);
+                let requested_effort = shared
+                    .with_session(router_sid, |s| s.effort_request)
+                    .flatten()
+                    .or(profile.effort.filter(|level| *level != EffortLevel::Auto));
+                let resolved_effort = requested_effort
+                    .map(|level| shared.scores.lookup(&candidate).resolve_effort(level));
                 let mode_to_apply = shared
                     .with_session(router_sid, |s| {
                         s.pin = Some(PinInfo {
@@ -2818,6 +2897,7 @@ async fn pin_session(
                         s.pinned_quality = pin_quality;
                         s.task_class = Some(profile.class);
                         s.task_complexity = profile.complexity;
+                        s.resolved_effort = resolved_effort.clone();
                         s.struggle = 0.0;
                         // Deferred pre-pin mode wins; on failover re-apply
                         // whatever the client had set for this session.
@@ -2949,6 +3029,12 @@ async fn pin_session(
                     "candidate": candidate.to_string(),
                     "class": profile.class.as_str(),
                     "complexity": (profile.complexity * 100.0).round() / 100.0,
+                    "effort": {
+                        "requested": requested_effort.map(EffortLevel::as_str),
+                        "resolved": resolved_effort.as_ref().and_then(|effort| effort.resolved.map(EffortLevel::as_str)),
+                        "provider_value": resolved_effort.as_ref().and_then(|effort| effort.provider_value.clone()),
+                        "explicit": shared.with_session(router_sid, |s| s.effort_request.is_some()).unwrap_or(false),
+                    },
                     "languages": profile.languages,
                     "reason": rc.reason,
                     "weights": rc.weights,
@@ -3016,6 +3102,23 @@ async fn pin_session(
                     ),
                 }];
                 lines.push(format!("why: {}", rc.reason));
+                lines.push(match (requested_effort, resolved_effort.as_ref()) {
+                    (Some(requested), Some(effort)) => match effort.resolved {
+                        Some(level) => {
+                            format!("effort: {} → {}", requested.as_str(), level.as_str())
+                        }
+                        None => format!(
+                            "effort: {} unsupported by {}; provider parameter omitted",
+                            requested.as_str(),
+                            candidate
+                        ),
+                    },
+                    (None, _) => {
+                        "effort: no automatic or explicit request; provider parameter omitted"
+                            .to_string()
+                    }
+                    _ => unreachable!("an effort resolution always has a request"),
+                });
                 if let Some(note) = &rc.note {
                     lines.push(format!("note: {note}"));
                 }
@@ -5304,13 +5407,29 @@ fn on_set_config_option(
             None => Action::UnknownSession,
             Some(session) => {
                 if is_router_option {
-                    if session.pin.is_some() || session.pinning {
+                    let value = match &req.value {
+                        SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+                        _ => String::new(),
+                    };
+                    if config_id == "router.effort" {
+                        match EffortLevel::parse(&value) {
+                            Some(EffortLevel::Auto) => {
+                                session.effort_request = None;
+                                refresh_pinned_effort(&shared.scores, session);
+                                Action::RouterUpdated
+                            }
+                            Some(level) => {
+                                session.effort_request = Some(level);
+                                refresh_pinned_effort(&shared.scores, session);
+                                Action::RouterUpdated
+                            }
+                            None => Action::BadValue(format!(
+                                "unknown effort `{value}`; expected auto, low, medium, high, xhigh, or max"
+                            )),
+                        }
+                    } else if session.pin.is_some() || session.pinning {
                         Action::AlreadyPinned
                     } else {
-                        let value = match &req.value {
-                            SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
-                            _ => String::new(),
-                        };
                         match config_id.as_str() {
                             "router.strategy" => match StrategyKind::parse(&value) {
                                 Some(kind) => {
@@ -5501,8 +5620,8 @@ fn on_prompt(
                     shared.with_session(&router_sid, |s| s.candidate_override = Some(target));
                 }
             }
-            // The remaining directives only shape the (still-unmade) routing
-            // decision, so they apply pre-pin only.
+            // Effort may change on a live pin; the remaining routing directives
+            // only shape the still-unmade routing decision.
             let has_pre_pin_directives = directives.strategy.is_some()
                 || directives.candidate.is_some()
                 || directives.prefer.is_some()
@@ -5511,7 +5630,13 @@ fn on_prompt(
             let applied = shared
                 .with_session(&router_sid, |s| {
                     if s.pin.is_some() || s.pinning {
-                        false
+                        if let Some(effort) = directives.effort {
+                            s.effort_request = (effort != EffortLevel::Auto).then_some(effort);
+                            refresh_pinned_effort(&shared.scores, s);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         if let Some(strategy) = directives.strategy {
                             s.strategy = strategy;
@@ -5525,6 +5650,9 @@ fn on_prompt(
                         s.excluded.extend(directives.exclude.clone());
                         if directives.label.is_some() {
                             s.run_label = directives.label.clone();
+                        }
+                        if let Some(effort) = directives.effort {
+                            s.effort_request = (effort != EffortLevel::Auto).then_some(effort);
                         }
                         true
                     }
@@ -5646,7 +5774,10 @@ async fn dispatch_prompt(
             let msg = format!(
                 "router-acp · pre-classifier could not classify this prompt on any evaluator \
                  ({}). Refusing to route without a classification.",
-                result.skip_reason.as_deref().unwrap_or("no classification result")
+                result
+                    .skip_reason
+                    .as_deref()
+                    .unwrap_or("no classification result")
             );
             notify_user(&shared, &router_sid, msg.clone());
             flush_pending_disclosure(&shared, &router_sid);
@@ -5666,6 +5797,9 @@ async fn dispatch_prompt(
                 class: routing.task_class,
                 complexity: routing.complexity,
                 languages: cwd_language_fingerprint(&shared.rules, &cwd),
+                effort: routing
+                    .effort
+                    .or_else(|| Some(automatic_effort(routing.task_class, routing.complexity))),
             }
         });
         shared.with_session(&router_sid, |s| {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use agent_client_protocol::schema::v1::ContentBlock;
 
-use crate::candidate::TaskClass;
+use crate::candidate::{EffortLevel, TaskClass};
 use crate::config::{ClassifierBackend, ClassifierConfig};
 
 /// The classifier's output for one prompt.
@@ -24,6 +24,9 @@ pub struct TaskProfile {
     /// 0.0 (trivial) to 1.0 (very complex).
     pub complexity: f64,
     pub languages: Vec<String>,
+    /// Automatic canonical effort requested by task classification. An
+    /// explicit user setting supersedes this at pin time.
+    pub effort: Option<EffortLevel>,
 }
 
 impl Default for TaskProfile {
@@ -32,7 +35,27 @@ impl Default for TaskProfile {
             class: TaskClass::CodingGeneral,
             complexity: 0.5,
             languages: Vec::new(),
+            effort: None,
         }
+    }
+}
+
+/// Conservative automatic effort recommendation from the classified task.
+pub fn automatic_effort(class: TaskClass, complexity: f64) -> EffortLevel {
+    let complexity = complexity.clamp(0.0, 1.0);
+    if complexity >= 0.85 {
+        EffortLevel::Max
+    } else if complexity >= 0.65
+        || matches!(
+            class,
+            TaskClass::Algorithms | TaskClass::Architecture | TaskClass::Research
+        )
+    {
+        EffortLevel::Xhigh
+    } else if complexity >= 0.35 {
+        EffortLevel::High
+    } else {
+        EffortLevel::Medium
     }
 }
 
@@ -297,6 +320,7 @@ pub fn classify_heuristic(rules: &ClassifierRules, input: &ClassifyInput) -> Tas
         class,
         complexity,
         languages: languages.into_iter().collect(),
+        effort: Some(automatic_effort(class, complexity)),
     }
 }
 
@@ -416,10 +440,12 @@ async fn classify_local_model(model_spec: &str, text: &str) -> Result<TaskProfil
         serde_json::from_str(inner).map_err(|e| format!("model returned non-JSON profile: {e}"))?;
     let class = TaskClass::parse(&reply.class)
         .ok_or_else(|| format!("model returned unknown class `{}`", reply.class))?;
+    let complexity = reply.complexity.clamp(0.0, 1.0);
     Ok(TaskProfile {
         class,
-        complexity: reply.complexity.clamp(0.0, 1.0),
+        complexity,
         languages: reply.languages,
+        effort: Some(automatic_effort(class, complexity)),
     })
 }
 
@@ -491,6 +517,11 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn absent_classifier_effort_does_not_default_to_medium() {
+        assert_eq!(TaskProfile::default().effort, None);
     }
 
     #[test]
