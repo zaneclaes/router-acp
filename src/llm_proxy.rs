@@ -458,7 +458,7 @@ async fn proxy_request(
         (Some(decision), Some(value)) => shape_provider_request(
             value,
             decision.rewrite.then_some(decision.model.as_str()),
-            decision.effort.as_deref(),
+            &decision.effort,
             target.config.protocol,
         )
         .unwrap_or_else(|| body.to_vec()),
@@ -578,15 +578,11 @@ async fn proxy_request(
                             ),
                             event: "proxy-fallback".to_string(),
                             estimated_input,
-                            effort: state
-                                .shared
-                                .with_session(&active.parent_router_sid, |session| {
-                                    session
-                                        .resolved_effort
-                                        .as_ref()
-                                        .and_then(|resolution| resolution.provider_value.clone())
-                                })
-                                .flatten(),
+                            effort: request_effort(
+                                &state.shared,
+                                &active.parent_router_sid,
+                                &active.candidate,
+                            ),
                         });
                     }
                     upstream = response;
@@ -827,7 +823,7 @@ fn rewrite_top_level_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
 fn shape_provider_request(
     body: &Value,
     model: Option<&str>,
-    effort: Option<&str>,
+    effort: &EffortShape,
     protocol: LlmWireProtocol,
 ) -> Option<Vec<u8>> {
     let mut body = body.clone();
@@ -835,22 +831,34 @@ fn shape_provider_request(
     if let Some(model) = model {
         object.insert("model".into(), Value::String(model.into()));
     }
-    if let Some(value) = effort {
-        match protocol {
-            LlmWireProtocol::Anthropic => {
-                let config = object
-                    .entry("output_config")
-                    .or_insert_with(|| Value::Object(Default::default()));
-                let config = config.as_object_mut()?;
-                config.insert("effort".into(), Value::String(value.into()));
+    match (protocol, effort) {
+        (_, EffortShape::Preserve) => {}
+        (LlmWireProtocol::Anthropic, EffortShape::Omit) => {
+            if let Some(config) = object
+                .get_mut("output_config")
+                .and_then(Value::as_object_mut)
+            {
+                config.remove("effort");
             }
-            LlmWireProtocol::Openai => {
-                let reasoning = object
-                    .entry("reasoning")
-                    .or_insert_with(|| Value::Object(Default::default()));
-                let reasoning = reasoning.as_object_mut()?;
-                reasoning.insert("effort".into(), Value::String(value.into()));
+        }
+        (LlmWireProtocol::Openai, EffortShape::Omit) => {
+            if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+                reasoning.remove("effort");
             }
+        }
+        (LlmWireProtocol::Anthropic, EffortShape::Set(value)) => {
+            let config = object
+                .entry("output_config")
+                .or_insert_with(|| Value::Object(Default::default()));
+            let config = config.as_object_mut()?;
+            config.insert("effort".into(), Value::String(value.clone()));
+        }
+        (LlmWireProtocol::Openai, EffortShape::Set(value)) => {
+            let reasoning = object
+                .entry("reasoning")
+                .or_insert_with(|| Value::Object(Default::default()));
+            let reasoning = reasoning.as_object_mut()?;
+            reasoning.insert("effort".into(), Value::String(value.clone()));
         }
     }
     serde_json::to_vec(&body).ok()
@@ -936,8 +944,43 @@ struct RequestDecision {
     reason: String,
     event: String,
     estimated_input: u64,
-    /// Candidate-resolved provider-native effort, if the parameter is supported.
-    effort: Option<String>,
+    /// Candidate-resolved provider-native effort handling for this request.
+    effort: EffortShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffortShape {
+    /// No router-owned effort exists, so leave the adapter request untouched.
+    Preserve,
+    /// The router owns the effort but this candidate has no compatible mapping.
+    Omit,
+    /// Replace the adapter value with this candidate's provider-native value.
+    Set(String),
+}
+
+fn request_effort(
+    shared: &Shared,
+    parent_router_sid: &str,
+    candidate: &CandidateId,
+) -> EffortShape {
+    let requested = shared
+        .with_session(parent_router_sid, |session| {
+            session
+                .resolved_effort
+                .as_ref()
+                .map(|resolution| resolution.requested)
+        })
+        .flatten();
+    match requested {
+        None => EffortShape::Preserve,
+        Some(level) => shared
+            .scores
+            .lookup(candidate)
+            .resolve_effort(level)
+            .provider_value
+            .map(EffortShape::Set)
+            .unwrap_or(EffortShape::Omit),
+    }
 }
 
 #[derive(Clone)]
@@ -979,14 +1022,6 @@ fn select_request_model(
     body: &Value,
 ) -> RequestDecision {
     let signals = inspect_request(body);
-    let effort = shared
-        .with_session(&active.parent_router_sid, |session| {
-            session
-                .resolved_effort
-                .as_ref()
-                .and_then(|resolution| resolution.provider_value.clone())
-        })
-        .flatten();
     let candidates = shared.routeable_candidates();
     let mut headroom = shared.headroom.lock().unwrap();
     let mut models: Vec<ModelOption> = candidates
@@ -1307,11 +1342,11 @@ fn select_request_model(
                 original != &upstream_model
             }),
         model: upstream_model,
-        selected_model: selected.model,
+        selected_model: selected.model.clone(),
         reason,
         event,
         estimated_input: signals.estimated_input,
-        effort,
+        effort: request_effort(shared, &active.parent_router_sid, &selected),
     }
 }
 
@@ -2000,6 +2035,8 @@ fn request_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candidate::EffortLevel;
+    use crate::session::RouterSession;
     use crate::state::PersistedSession;
 
     fn policy_shared(minimum_dwell_requests: u32) -> (tempfile::TempDir, Arc<Shared>) {
@@ -2438,11 +2475,11 @@ agents:
     }
 
     #[test]
-    fn provider_request_shaping_only_replaces_effort_when_router_resolves_one() {
+    fn provider_request_shaping_sets_omits_or_preserves_effort_as_resolved() {
         let anthropic = shape_provider_request(
             &json!({"model": "old", "output_config": {"effort": "stale"}}),
             Some("new"),
-            Some("intensive"),
+            &EffortShape::Set("intensive".to_string()),
             LlmWireProtocol::Anthropic,
         )
         .unwrap();
@@ -2453,22 +2490,101 @@ agents:
         let openai = shape_provider_request(
             &json!({"model": "gpt", "reasoning": {"effort": "high"}}),
             None,
-            None,
+            &EffortShape::Preserve,
             LlmWireProtocol::Openai,
         )
         .unwrap();
         let openai: Value = serde_json::from_slice(&openai).unwrap();
         assert_eq!(openai["reasoning"]["effort"], "high");
-        let anthropic_unchanged = shape_provider_request(
+        let anthropic_omitted = shape_provider_request(
             &json!({"model": "claude", "output_config": {"effort": "high"}}),
             None,
-            None,
+            &EffortShape::Omit,
             LlmWireProtocol::Anthropic,
         )
         .unwrap();
-        let anthropic_unchanged: Value = serde_json::from_slice(&anthropic_unchanged).unwrap();
-        assert_eq!(anthropic_unchanged["output_config"]["effort"], "high");
+        let anthropic_omitted: Value = serde_json::from_slice(&anthropic_omitted).unwrap();
+        assert!(anthropic_omitted["output_config"].get("effort").is_none());
         assert!(request_wire_shape(&anthropic).effort);
+    }
+
+    #[test]
+    fn request_level_routing_resolves_effort_for_the_selected_subtool_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let scores = dir.path().join("scores.yaml");
+        std::fs::write(
+            &scores,
+            "candidates:\n\
+             \x20 - { pattern: 'mock/parent', default_quality: 3.0, context_window: 400000, effort_levels: [max], effort_mapping: { max: parent-max } }\n\
+             \x20 - { pattern: 'mock/subtool', default_quality: 1.0, context_window: 400000, effort_levels: [high], effort_mapping: { high: subtool-high } }\n",
+        )
+        .unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+score_table: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 1
+  minimum_dwell_requests: 0
+agents:
+  - name: mock
+    command: {{ type: stdio, command: mock-agent }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: MOCK_BASE_URL
+      upstream_base_url: http://127.0.0.1:9
+    models:
+      - {{ id: subtool, cost_rank: 1 }}
+      - {{ id: parent, cost_rank: 3 }}
+"#,
+            dir.path().join("state.db").display(),
+            scores.display(),
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg.clone()).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("mock".to_string()),
+            vec!["subtool".into(), "parent".into()],
+        );
+        let mut session = RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new());
+        session.resolved_effort = Some(
+            shared
+                .scores
+                .lookup(&CandidateId::new("mock", "parent"))
+                .resolve_effort(EffortLevel::Max),
+        );
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".to_string(), session);
+
+        let body = json!({
+            "model": "parent",
+            "output_config": {"effort": "parent-max"},
+            "messages": [{"role":"user","content":[{
+                "type":"tool_result","content":"git status clean","status":"completed"
+            }]}]
+        });
+        let decision = select_request_model(&shared, &active("parent"), &body);
+        assert_eq!(decision.selected_model, "subtool");
+        assert_eq!(
+            decision.effort,
+            EffortShape::Set("subtool-high".to_string())
+        );
+
+        let shaped = shape_provider_request(
+            &body,
+            Some(&decision.model),
+            &decision.effort,
+            LlmWireProtocol::Anthropic,
+        )
+        .unwrap();
+        let shaped: Value = serde_json::from_slice(&shaped).unwrap();
+        assert_eq!(shaped["model"], "subtool");
+        assert_eq!(shaped["output_config"]["effort"], "subtool-high");
     }
 
     #[test]
