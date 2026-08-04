@@ -16,7 +16,7 @@
 //! tests treat router-acp as its own source of truth.
 
 use agent_client_protocol::schema::v1::ContentBlock;
-use router_acp::candidate::{CandidateId, RequiredCaps, ScoreTable, TaskClass};
+use router_acp::candidate::{CandidateId, EffortLevel, RequiredCaps, ScoreTable, TaskClass};
 use router_acp::classifier::{ClassifierRules, ClassifyInput, classify_heuristic};
 use router_acp::config::AutoRouterConfig;
 use router_acp::strategies::{AutoStrategy, CandidateView, RouteContext, RouterStrategy};
@@ -250,6 +250,33 @@ fn mini_pattern_not_shadowed_by_broad_gpt_pattern() {
         "mini ({mini}) should score below full gpt ({full}); the broad *gpt-5* pattern is \
          shadowing the specific *mini* pattern in data/scores.yaml"
     );
+}
+
+/// Regression for the live disclosure "effort: X unsupported by codex/gpt-5.5;
+/// provider parameter omitted": the `*gpt-5*` and `*mini*` score-table entries
+/// must advertise `effort_levels` / `effort_mapping` like their siblings, or
+/// every candidate resolving to them silently drops the provider's effort
+/// parameter and is excluded from auto-routing under an explicit effort ask.
+#[test]
+fn gpt5_and_mini_candidates_advertise_effort_capability() {
+    let scores = ScoreTable::builtin();
+
+    let medium = scores
+        .lookup(&CandidateId::new("codex", "gpt-5.5"))
+        .resolve_effort(EffortLevel::Medium);
+    assert_eq!(medium.resolved, Some(EffortLevel::Medium));
+    assert_eq!(medium.provider_value.as_deref(), Some("medium"));
+
+    // xhigh is not on the codex wire; it nearest-matches down to high.
+    let xhigh = scores
+        .lookup(&CandidateId::new("codex", "gpt-5.5"))
+        .resolve_effort(EffortLevel::Xhigh);
+    assert_eq!(xhigh.resolved, Some(EffortLevel::High));
+
+    let mini = scores
+        .lookup(&CandidateId::new("codex", "gpt-5.4-mini"))
+        .resolve_effort(EffortLevel::High);
+    assert_eq!(mini.resolved, Some(EffortLevel::High));
 }
 
 // Regenerate the golden table with:
