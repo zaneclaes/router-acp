@@ -189,6 +189,8 @@ candidates:
     coding_tier: medium
     coding_percentile: 0.45
     context_window: 400000
+    effort_levels: [low, medium, high]
+    effort_mapping: { low: low, medium: medium, high: high }
     default_quality: 1.00
     quality:
       UiTweak: 1.00
@@ -223,6 +225,8 @@ candidates:
     coding_tier: high
     coding_percentile: 0.8
     context_window: 400000
+    effort_levels: [low, medium, high]
+    effort_mapping: { low: low, medium: medium, high: high }
     default_quality: 2.11
     quality:
       UiTweak: 2.11
