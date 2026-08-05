@@ -932,6 +932,7 @@ pub async fn run_delegate_task(
         profile: profile.clone(),
         required_caps: RequiredCaps::default(),
         explicit_candidate: None,
+        explicit_source: None,
     };
     let ranked = make_strategy(strategy_kind, &shared.cfg)
         .rank(&ctx, &pool)

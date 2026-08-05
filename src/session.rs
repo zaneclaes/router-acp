@@ -42,7 +42,7 @@ use crate::downstream::{
 use crate::headroom::HeadroomTracker;
 use crate::relay;
 use crate::state::{PersistedSession, StateFile};
-use crate::strategies::{CandidateView, RouteContext, make_strategy};
+use crate::strategies::{CandidateView, OverrideSource, RouteContext, make_strategy};
 
 /// Status of one `(agent, model)` candidate.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +146,9 @@ pub struct RouterSession {
     pub mcp_servers: Vec<McpServer>,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
+    /// Who set `candidate_override` (user, a skill route, the orchestration
+    /// planner). Not persisted: the pin happens on the turn that sets it.
+    pub candidate_override_source: Option<OverrideSource>,
     /// Explicit user effort (`auto` clears it); it takes precedence over a
     /// classifier recommendation and is retained across failover.
     pub effort_request: Option<EffortLevel>,
@@ -290,6 +293,7 @@ impl RouterSession {
             mcp_servers,
             strategy: cfg.router,
             candidate_override: None,
+            candidate_override_source: None,
             effort_request: None,
             resolved_effort: None,
             preferred_candidate: None,
@@ -341,6 +345,7 @@ impl RouterSession {
             mcp_servers: req.mcp_servers.clone(),
             strategy: cfg.router,
             candidate_override: None,
+            candidate_override_source: None,
             effort_request: None,
             resolved_effort: None,
             preferred_candidate: None,
@@ -2633,19 +2638,21 @@ async fn pin_session(
     is_failover: bool,
     larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
-    let (cwd, dirs, client_mcp, strategy, override_, effort_request, run_label) = shared
-        .with_session(router_sid, |s| {
-            (
-                s.cwd.clone(),
-                s.additional_directories.clone(),
-                s.mcp_servers.clone(),
-                s.strategy,
-                s.candidate_override.clone(),
-                s.effort_request,
-                s.run_label.clone(),
-            )
-        })
-        .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
+    let (cwd, dirs, client_mcp, strategy, override_, override_source, effort_request, run_label) =
+        shared
+            .with_session(router_sid, |s| {
+                (
+                    s.cwd.clone(),
+                    s.additional_directories.clone(),
+                    s.mcp_servers.clone(),
+                    s.strategy,
+                    s.candidate_override.clone(),
+                    s.candidate_override_source.clone(),
+                    s.effort_request,
+                    s.run_label.clone(),
+                )
+            })
+            .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     // pin_session only ever creates primary (top-level) sessions; delegated
     // sub-agent rows are written by the delegation path with a parent link.
     let parent_session_id: Option<String> = None;
@@ -2689,10 +2696,14 @@ async fn pin_session(
     // than a post-selection preference. A concrete candidate remains allowed
     // to normalize to its nearest provider-supported level.
     let auto_effort = override_.is_none().then_some(effort_request).flatten();
+    // Dropping the override (failover exclude, cordon redirect) drops its
+    // provenance with it.
+    let override_source = override_source.filter(|_| override_.is_some());
     let ctx = RouteContext {
         profile: profile.clone(),
         required_caps: required,
         explicit_candidate: override_.clone(),
+        explicit_source: override_source,
     };
 
     // Cordons active right now (shown to the user so exclusions are visible).
@@ -3744,21 +3755,24 @@ fn strip_code_spans(text: &str) -> String {
     out
 }
 
-/// True when the prompt invokes `pattern` — either as a `/slash-command` or as
-/// a standalone token (so "ship-pr" matches "run ship-pr" and "/ship-pr" but
-/// not "membership-provider"). The caller passes text with code spans already
-/// stripped, so a skill name mentioned inside backticks does not count.
+/// True when the prompt invokes `pattern` — as a whole word, either bare or as
+/// a `/slash-command` (so "ship-pr" matches "run ship-pr" and "then /ship-pr?"
+/// but not "membership-provider"). A word carrying any further `/` is a PATH,
+/// not an invocation: `.claude/skills/ship-pr/SKILL.md` names the skill without
+/// asking for it, and clients that list every skill file must not steer routing.
+/// The caller passes text with code spans already stripped, so a skill name
+/// mentioned inside backticks does not count either.
 fn prompt_mentions_skill(text_lower: &str, pattern: &str) -> bool {
     let p = pattern.to_lowercase();
     if p.is_empty() {
         return false;
     }
-    if text_lower.contains(&format!("/{p}")) {
-        return true;
-    }
-    text_lower
-        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .any(|tok| tok == p)
+    text_lower.split_whitespace().any(|word| {
+        let word =
+            word.trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '-' | '_' | '/'));
+        let bare = word.strip_prefix('/').unwrap_or(word);
+        !bare.contains('/') && bare == p
+    })
 }
 
 /// The first configured skill route whose pattern the prompt invokes. Code spans
@@ -4146,6 +4160,7 @@ fn maybe_trigger_orchestration(
             shared.with_session(router_sid, |s| {
                 if s.candidate_override.is_none() {
                     s.candidate_override = Some(planner2);
+                    s.candidate_override_source = Some(OverrideSource::Planner);
                 }
             });
             notify_user(
@@ -5444,11 +5459,14 @@ fn on_set_config_option(
                             "router.candidate" => {
                                 if value == "auto" {
                                     session.candidate_override = None;
+                                    session.candidate_override_source = None;
                                     Action::RouterUpdated
                                 } else {
                                     match CandidateId::parse(&value) {
                                         Some(id) => {
                                             session.candidate_override = Some(id);
+                                            session.candidate_override_source =
+                                                Some(OverrideSource::UserPick);
                                             Action::RouterUpdated
                                         }
                                         None => Action::BadValue(format!(
@@ -5586,7 +5604,10 @@ fn on_prompt(
                         });
                     } else {
                         let target = target.clone();
-                        shared.with_session(&router_sid, |s| s.candidate_override = Some(target));
+                        shared.with_session(&router_sid, |s| {
+                            s.candidate_override = Some(target);
+                            s.candidate_override_source = Some(OverrideSource::UserPick);
+                        });
                     }
                     tracing::info!(
                         session = router_sid,
@@ -5617,7 +5638,10 @@ fn on_prompt(
                     });
                     tracing::info!(session = router_sid, %target, "mid-session switch requested");
                 } else {
-                    shared.with_session(&router_sid, |s| s.candidate_override = Some(target));
+                    shared.with_session(&router_sid, |s| {
+                        s.candidate_override = Some(target);
+                        s.candidate_override_source = Some(OverrideSource::UserPick);
+                    });
                 }
             }
             // Effort may change on a live pin; the remaining routing directives
@@ -5643,6 +5667,7 @@ fn on_prompt(
                         }
                         if let Some(candidate) = directives.candidate.clone() {
                             s.candidate_override = Some(candidate);
+                            s.candidate_override_source = Some(OverrideSource::UserPick);
                         }
                         if let Some(prefer) = directives.prefer.clone() {
                             s.preferred_candidate = Some(prefer);
@@ -5885,6 +5910,8 @@ async fn dispatch_prompt(
                     } else {
                         shared.with_session(&router_sid, |s| {
                             s.candidate_override = Some(target.clone());
+                            s.candidate_override_source =
+                                Some(OverrideSource::Skill(pattern.clone()));
                             s.elevation = Some(format!("skill `{pattern}`"));
                             s.quiet_turns = 0;
                         });
@@ -6585,6 +6612,13 @@ mod directive_tests {
         );
     }
 
+    /// The note the Kory Code client appends to the first prompt of every
+    /// session (abridged from ~50 paths).
+    const KORY_SKILL_CATALOG_NOTE: &str = "[kory-code] skills are available in this checkout. \
+         use the skill workflow, not memory or an improvised substitute: read the relevant file \
+         before acting. skill files: .claude/skills/agentic-coding-norms/skill.md, \
+         .claude/skills/ship-pr/skill.md, .claude/skills/testing/skill.md";
+
     #[test]
     fn skill_pattern_matches_slash_and_token_not_substring() {
         // slash-command form
@@ -6599,6 +6633,33 @@ mod directive_tests {
             "ship-pr"
         ));
         assert!(!prompt_mentions_skill("unrelated prompt", "ship-pr"));
+    }
+
+    #[test]
+    fn skill_pattern_matches_slash_form_with_punctuation() {
+        for text in ["/ship-pr", "then /ship-pr?", "(/ship-pr)", "use /ship-pr."] {
+            assert!(
+                prompt_mentions_skill(text, "ship-pr"),
+                "slash form must invoke: {text}"
+            );
+        }
+        // A bare token standing alone still invokes (code spans already gone).
+        assert!(prompt_mentions_skill(
+            "read and follow the checked-in ship-pr skill at ",
+            "ship-pr"
+        ));
+    }
+
+    #[test]
+    fn skill_named_as_path_segment_is_not_an_invocation() {
+        assert!(!prompt_mentions_skill(
+            ".claude/skills/ship-pr/skill.md",
+            "ship-pr"
+        ));
+        // The Kory Code client appends this catalog to every first prompt; it
+        // names ~50 skills and must steer nothing.
+        assert!(!prompt_mentions_skill(KORY_SKILL_CATALOG_NOTE, "ship-pr"));
+        assert!(!prompt_mentions_skill(KORY_SKILL_CATALOG_NOTE, "testing"));
     }
 
     #[test]
@@ -6630,6 +6691,21 @@ mod directive_tests {
         let miss = vec![ContentBlock::from("just refactor this".to_string())];
         assert!(detect_skill_route(&cfg, &hit).is_some());
         assert!(detect_skill_route(&cfg, &miss).is_none());
+
+        // The client's skill-file catalog rides along on the first prompt of
+        // EVERY session: it must not hijack routing, and must not mask a real
+        // invocation in the same prompt.
+        let catalog = vec![ContentBlock::from(format!(
+            "user task text\n\n{KORY_SKILL_CATALOG_NOTE}"
+        ))];
+        assert!(
+            detect_skill_route(&cfg, &catalog).is_none(),
+            "a skill listed as a file path must not resolve a route"
+        );
+        let both = vec![ContentBlock::from(format!(
+            "let's run ship-pr on this\n\n{KORY_SKILL_CATALOG_NOTE}"
+        ))];
+        assert!(detect_skill_route(&cfg, &both).is_some());
 
         // A skill NAMED inside backticks (a UI/example mention) must NOT count
         // as invoking it — this is the hickory-ai6 false positive.

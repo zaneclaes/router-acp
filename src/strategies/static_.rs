@@ -5,7 +5,9 @@
 use crate::candidate::CandidateId;
 use crate::config::StaticRouterConfig;
 
-use super::{CandidateView, RankedCandidate, RouteContext, RouteError, RouterStrategy};
+use super::{
+    CandidateView, OverrideSource, RankedCandidate, RouteContext, RouteError, RouterStrategy,
+};
 
 pub struct StaticStrategy {
     cfg: StaticRouterConfig,
@@ -43,7 +45,17 @@ impl RouterStrategy for StaticStrategy {
                 score: 1.0,
                 weights: serde_json::json!({ "explicit": explicit }),
                 reason: if explicit {
-                    "explicitly selected via router.candidate".to_string()
+                    match &ctx.explicit_source {
+                        Some(OverrideSource::Skill(name)) => {
+                            format!("steered by skill `{name}` routing")
+                        }
+                        Some(OverrideSource::Planner) => {
+                            "orchestration planner (auto-orchestrate)".to_string()
+                        }
+                        Some(OverrideSource::UserPick) | None => {
+                            "explicitly selected via router.candidate".to_string()
+                        }
+                    }
                 } else {
                     "configured static candidate".to_string()
                 },
@@ -113,6 +125,42 @@ mod tests {
         context.explicit_candidate = Some(crate::candidate::CandidateId::new("claude", "sonnet"));
         let ranked = s.rank(&context, &pool()).unwrap();
         assert_eq!(ranked[0].candidate.to_string(), "claude/sonnet");
+    }
+
+    /// Reason for an explicit pin, with the given provenance.
+    fn explicit_reason(source: Option<OverrideSource>) -> String {
+        let s = StaticStrategy::new(StaticRouterConfig {
+            candidate: Some("claude/opus".into()),
+            allow_fallback: false,
+        });
+        let mut context = ctx();
+        context.explicit_candidate = Some(crate::candidate::CandidateId::new("claude", "sonnet"));
+        context.explicit_source = source;
+        s.rank(&context, &pool()).unwrap()[0].reason.clone()
+    }
+
+    #[test]
+    fn user_pick_reason_names_the_session_option() {
+        let expected = "explicitly selected via router.candidate";
+        assert_eq!(explicit_reason(Some(OverrideSource::UserPick)), expected);
+        // No provenance recorded (e.g. rehydrated session): keep the old string.
+        assert_eq!(explicit_reason(None), expected);
+    }
+
+    #[test]
+    fn skill_steered_reason_names_the_skill() {
+        assert_eq!(
+            explicit_reason(Some(OverrideSource::Skill("ship-pr".into()))),
+            "steered by skill `ship-pr` routing"
+        );
+    }
+
+    #[test]
+    fn planner_steered_reason_names_orchestration() {
+        assert_eq!(
+            explicit_reason(Some(OverrideSource::Planner)),
+            "orchestration planner (auto-orchestrate)"
+        );
     }
 
     #[test]

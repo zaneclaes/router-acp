@@ -84,6 +84,7 @@ fn route(prompt: &str) -> Outcome {
         profile: profile.clone(),
         required_caps: RequiredCaps::default(),
         explicit_candidate: None,
+        explicit_source: None,
     };
     let ranked = AutoStrategy::new(auto_cfg())
         .rank(&ctx, &views)
