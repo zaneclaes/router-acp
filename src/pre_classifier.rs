@@ -24,14 +24,25 @@ use crate::candidate::{CandidateId, EffortLevel, TaskClass};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
     DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
-    open_downstream_session, prompt_display_text,
+    open_downstream_session,
 };
 
 /// Marker embedded in the evaluator prompt so mock agents (and logs) can
 /// recognize a pre-class turn.
 pub const PRECLASS_MARKER: &str = "[router-acp pre-classifier]";
 
-const PROMPT_TRUNCATE: usize = 4000;
+/// Overall cap (chars) on the prompt text handed to the evaluator.
+const PROMPT_TRUNCATE: usize = 8000;
+/// Head kept when the text exceeds `PROMPT_TRUNCATE`.
+const ELIDE_HEAD: usize = 3000;
+/// Tail kept when the text exceeds `PROMPT_TRUNCATE`.
+const ELIDE_TAIL: usize = 5000;
+const ELISION_MARKER: &str = "\n[… middle elided for classification …]\n";
+/// Per-block budget for an auto-injected ticket block: enough to see what the
+/// ticket covers, never enough to crowd out the user's own instruction.
+const TICKET_CONTEXT_BUDGET: usize = 1200;
+const TICKET_ELISION_MARKER: &str =
+    "\n[… ticket context truncated for classification; classify the user's own message below …]";
 
 /// Upper bound on the evaluator *open* phase (process spawn + `session/new`).
 /// A cold ACP open routinely takes seconds, so it gets its own generous budget
@@ -142,6 +153,22 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          \"that didn't work\", \"following up\", a reopened issue, or a prior agent failing the \
          task should score complexity at least 0.70. Do NOT increase complexity merely because a \
          ticket is long, contains many bullets, or supplies detailed context.\n\
+         The text may include auto-injected CONTEXT: \"[Ticket …]\" blocks pulled from a ticket \
+         system, and bracketed client or transport notes (lines opening with a tag such as \
+         \"[client-name]\") listing available skills or conventions. Context is background, NOT \
+         the ask — identify the user's own instruction and classify THAT.\n\
+         When the instruction delegates to the ticket (\"fix ABC-123\", \"implement this ticket\"), \
+         classify the ticket's work. When the instruction is itself a specific bounded action — \
+         ship, merge, rebase, or review an existing PR, check out a branch, run or re-run a \
+         command or workflow — classify that action: shipping an already-implemented, \
+         already-reviewed PR is mechanical Ops, complexity at most 0.20, however hard the \
+         underlying ticket was.\n\
+         A one-line symptom report (\"page X is slow — fix it\") with no evidence of cross-system \
+         spread is typically 0.36-0.60, not higher.\n\
+         Work whose deliverable includes documentation but whose substance is deciding policy or \
+         enforcement (hooks, permission models, invariants, migration order) is design or \
+         implementation work: class it by that substance rather than Writing, and score the \
+         decisions, not the prose.\n\
          Also choose routing.effort from exactly: low, medium, high, xhigh, max. Use low for \
          mechanical work, medium for bounded routine work, high for multi-file implementation, \
          xhigh for ambiguous cross-system reasoning, and max only for novel or severe-risk work.\n\
@@ -157,11 +184,17 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
             "## Dimension: orchestrate\n\
              Decide whether the router should auto-orchestrate this prompt as a multi-track \
              implementation job (plan → parallel subtasks → review).\n\
-             YES only for complex multi-track *implementation* work with distinct sub-tracks \
-             that benefit from parallel specialists.\n\
+             YES only when the work decomposes into genuinely INDEPENDENT tracks that different \
+             workers could implement in parallel.\n\
+             Sequential workflow STAGES of one deliverable (investigate → implement → test → \
+             verify → ship; rebase → CI → merge) are ONE track — never count them as parts.\n\
              NO for: enumerated prose, Q&A lists, design discussions, plans/RFCs the user wants \
              discussed (not built yet), single-track tasks, answers to the model's questions, \
              pure research/explanation.\n\
+             Shipping or merging an existing PR, a single bug fix (even one needing \
+             investigation), and any single-artifact change are all single-track: \
+             warranted=false.\n\
+             estimated_parts counts parallelizable tracks, not steps.\n\
              Return:\n\
              \"orchestrate\": { \"warranted\": bool, \"confidence\": 0.0-1.0, \
              \"estimated_parts\": int >= 1, \"reason\": string }\n\n",
@@ -192,17 +225,56 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
         out.push_str("  \"ok\": true");
     }
     out.push_str("\n}\n\n## User prompt\n");
-    out.push_str(&truncate_chars(user_text, PROMPT_TRUNCATE));
+    out.push_str(&elide_middle(user_text));
     out
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
+/// Flatten the prompt for classification, bounding each auto-injected ticket
+/// block so the user's own message always survives. `tickets::enrich_prompt`
+/// PREPENDS ticket bodies (up to 16k chars each), so a plain flatten fed the
+/// evaluator ticket text and nothing else.
+fn build_classified_text(prompt: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for b in prompt {
+        if let ContentBlock::Text(t) = b {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if crate::tickets::is_injected_ticket_block(&t.text) {
+                out.push_str(&truncate_head(
+                    &t.text,
+                    TICKET_CONTEXT_BUDGET,
+                    TICKET_ELISION_MARKER,
+                ));
+            } else {
+                out.push_str(&t.text);
+            }
+        }
+    }
+    out
+}
+
+/// Keep the first `max` chars, appending `marker` only when that actually cut.
+fn truncate_head(s: &str, max: usize, marker: &str) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str(marker);
     out
+}
+
+/// Bound `s` to `PROMPT_TRUNCATE` by eliding its MIDDLE. Auto-injected context
+/// rides the head while the user's own message rides the tail, so head-only
+/// truncation deleted the actual ask.
+fn elide_middle(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= PROMPT_TRUNCATE {
+        return s.to_string();
+    }
+    let head: String = chars[..ELIDE_HEAD].iter().collect();
+    let tail: String = chars[chars.len() - ELIDE_TAIL..].iter().collect();
+    format!("{head}{ELISION_MARKER}{tail}")
 }
 
 /// Parse the evaluator's free-text reply into a JSON object. Strips optional
@@ -562,7 +634,7 @@ pub async fn evaluate(
         return fail_open("pre_classifier disabled", None, 0, "");
     }
 
-    let user_text = prompt_display_text(prompt);
+    let user_text = build_classified_text(prompt);
     let eval_prompt = build_evaluator_prompt(&cfg, &user_text);
 
     let (class, mut excluded, cwd, dirs) = shared
@@ -1067,6 +1139,15 @@ agents:
         assert!(p.contains("xhigh for ambiguous cross-system reasoning"));
         assert!(p.contains("Dimension: orchestrate"));
         assert!(p.contains("1. do a"));
+        // Context-vs-ask + bounded-action + symptom-report + docs-deliverable anchors.
+        assert!(p.contains("Context is background, NOT the ask"));
+        assert!(p.contains("already-reviewed PR is mechanical Ops"));
+        assert!(p.contains("typically 0.36-0.60, not higher"));
+        assert!(p.contains("score the decisions, not the prose"));
+        // Orchestrate: independent tracks, not workflow stages.
+        assert!(p.contains("genuinely INDEPENDENT tracks"));
+        assert!(p.contains("never count them as parts"));
+        assert!(p.contains("estimated_parts counts parallelizable tracks, not steps"));
     }
 
     #[test]
@@ -1084,6 +1165,60 @@ agents:
         let p = build_evaluator_prompt(&cfg, "redesign the dashboard");
         assert!(p.contains("Dimension: ui_planning"));
         assert!(p.contains("mockup-first"));
+    }
+
+    #[test]
+    fn classified_text_bounds_injected_ticket_and_keeps_the_user_message() {
+        let ticket = crate::tickets::frame_ticket("ABC-123", &"ticket body detail. ".repeat(450));
+        assert!(
+            ticket.chars().count() > 8_000,
+            "fixture must exceed the cap"
+        );
+        let ask = "Ship PR #7009 (https://example) for ABC-123. Check out its branch `x`";
+        let text = build_classified_text(&[
+            ContentBlock::from(ticket),
+            ContentBlock::from(ask.to_string()),
+        ]);
+
+        assert!(text.contains(ask), "the user's own message must survive");
+        assert!(text.contains("ticket context truncated for classification"));
+        // Everything but the user block and the joining newline is ticket-derived.
+        let ticket_derived = text.chars().count() - ask.chars().count() - 1;
+        assert!(
+            ticket_derived <= 1_300,
+            "ticket-derived chars: {ticket_derived}"
+        );
+    }
+
+    #[test]
+    fn classified_text_passes_small_prompts_through() {
+        let text = build_classified_text(&[
+            ContentBlock::from("fix the login redirect".to_string()),
+            ContentBlock::from("it 404s on submit".to_string()),
+        ]);
+        assert_eq!(text, "fix the login redirect\nit 404s on submit");
+    }
+
+    #[test]
+    fn oversized_prompt_elides_the_middle_not_the_tail() {
+        let body = format!("{}{}", "A".repeat(10_000), "Z".repeat(10_000));
+        let flattened = build_classified_text(&[ContentBlock::from(body.clone())]);
+        assert_eq!(flattened, body, "a non-ticket block passes through whole");
+
+        let out = elide_middle(&flattened);
+        let head: String = body.chars().take(ELIDE_HEAD).collect();
+        let tail: String = body
+            .chars()
+            .skip(body.chars().count() - ELIDE_TAIL)
+            .collect();
+        assert!(out.starts_with(&head));
+        assert!(out.ends_with(&tail));
+        assert!(out.contains("middle elided for classification"));
+        assert!(
+            out.chars().count() <= 8_100,
+            "chars: {}",
+            out.chars().count()
+        );
     }
 
     #[test]

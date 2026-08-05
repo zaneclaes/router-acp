@@ -29,6 +29,12 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TICKET_CHARS: usize = 16_000;
 /// Global fetch-cache TTL.
 const CACHE_TTL: Duration = Duration::from_secs(300);
+/// Opening literal of a framed ticket block.
+const BLOCK_PREFIX: &str = "[Ticket ";
+/// First-line literal that marks a block as router-injected rather than prose
+/// that merely opens with `[Ticket …`. Shared with `frame_ticket` so the
+/// producer and the recognizer cannot drift.
+const BLOCK_TAG: &str = "— loaded automatically because the prompt references it]";
 
 /// Ticket ids referenced in `text` that match any configured rule: the prefix
 /// at a word start, followed by 1+ digits. Deduplicated, prompt order, capped.
@@ -78,8 +84,20 @@ pub fn frame_ticket(id: &str, body: &str) -> String {
         body.push_str("\n[… ticket truncated …]");
     }
     format!(
-        "[Ticket {id} — loaded automatically because the prompt references it]\n{body}\n[End of ticket {id}. The user's message follows.]"
+        "{BLOCK_PREFIX}{id} {BLOCK_TAG}\n{body}\n[End of ticket {id}. The user's message follows.]"
     )
+}
+
+/// Whether `text` is a ticket block this module injected (see `frame_ticket`),
+/// as opposed to prose that happens to start with `[Ticket …`. Lets downstream
+/// consumers — notably classification — budget auto-injected context separately
+/// from the user's own message.
+pub fn is_injected_ticket_block(text: &str) -> bool {
+    text.starts_with(BLOCK_PREFIX)
+        && text
+            .lines()
+            .next()
+            .is_some_and(|first| first.contains(BLOCK_TAG))
 }
 
 /// Run the rule's command with `$TICKET` substituted; stdout is the ticket
@@ -241,5 +259,22 @@ mod tests {
         assert!(framed.contains("body text"));
         let long = "x".repeat(MAX_TICKET_CHARS + 100);
         assert!(frame_ticket("HAI-1", &long).contains("ticket truncated"));
+    }
+
+    #[test]
+    fn recognizes_only_injected_ticket_blocks() {
+        assert!(is_injected_ticket_block(&frame_ticket(
+            "HAI-1",
+            "body text"
+        )));
+        // Prose that merely opens with the same bracket is the user's own text.
+        assert!(!is_injected_ticket_block(
+            "[Ticket HAI-1 is about the classifier] — please read it"
+        ));
+        assert!(!is_injected_ticket_block("Fix HAI-1 today"));
+        // The tag must be on the FIRST line, not somewhere in the body.
+        assert!(!is_injected_ticket_block(&format!(
+            "[Ticket HAI-1]\n{BLOCK_TAG}"
+        )));
     }
 }

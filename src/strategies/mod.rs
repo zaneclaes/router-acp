@@ -79,6 +79,20 @@ pub fn cap_unmetered_headroom(views: &mut [CandidateView]) {
     }
 }
 
+/// Who put the explicit candidate on the session. The router itself steers the
+/// pin for orchestration and skill routing, so the disclosure must not claim
+/// the user picked those.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverrideSource {
+    /// `router.candidate` config option, a `[router: candidate=…]` directive,
+    /// or the `model:` shorthand.
+    UserPick,
+    /// A `skill_routing` rule, carrying the matched pattern.
+    Skill(String),
+    /// Auto-orchestration steering the pin onto the planner.
+    Planner,
+}
+
 /// Context for one routing decision.
 #[derive(Debug, Clone)]
 pub struct RouteContext {
@@ -86,6 +100,8 @@ pub struct RouteContext {
     pub required_caps: RequiredCaps,
     /// Session-level explicit candidate (`router.candidate` config option).
     pub explicit_candidate: Option<CandidateId>,
+    /// Provenance of `explicit_candidate`, so the reason string is honest.
+    pub explicit_source: Option<OverrideSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +318,7 @@ pub(crate) mod test_util {
             },
             required_caps: RequiredCaps::default(),
             explicit_candidate: None,
+            explicit_source: None,
         }
     }
 }
