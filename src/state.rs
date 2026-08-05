@@ -250,6 +250,11 @@ impl StateFile {
             FOREIGN KEY(router_session_id) REFERENCES sessions(router_session_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_log_session ON session_log(router_session_id, id);
+        -- Covering index for time-range token analytics (the kory-code relay's
+        -- usage endpoint): range scans read only these narrow index pages
+        -- instead of walking every row's multi-KB detail payload.
+        CREATE INDEX IF NOT EXISTS idx_log_ts
+            ON session_log(ts, router_session_id, tokens_input, tokens_output);
         CREATE TABLE IF NOT EXISTS llm_requests (
             request_id               TEXT PRIMARY KEY,
             router_session_id        TEXT NOT NULL,
@@ -278,6 +283,8 @@ impl StateFile {
             ON llm_requests(router_session_id, started_at);
         CREATE INDEX IF NOT EXISTS idx_llm_requests_model
             ON llm_requests(model, started_at);
+        CREATE INDEX IF NOT EXISTS idx_llm_requests_started
+            ON llm_requests(started_at);
         CREATE TABLE IF NOT EXISTS tool_calls (
             router_session_id TEXT NOT NULL,
             tool_call_id      TEXT NOT NULL,
@@ -1198,6 +1205,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tool_model, "claude/haiku");
+    }
+
+    #[test]
+    fn time_range_analytics_indexes_exist_after_load() {
+        // Both new and pre-existing DBs get these on load (IF NOT EXISTS in
+        // init_schema); the kory-code relay's analytics range queries depend
+        // on them staying range-scannable as session_log/llm_requests grow.
+        let (_d, s) = store();
+        for (table, index, first_col) in [
+            ("session_log", "idx_log_ts", "ts"),
+            ("llm_requests", "idx_llm_requests_started", "started_at"),
+        ] {
+            let sql: String = s
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND name=?2",
+                    params![table, index],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| panic!("index {index} missing on {table}"));
+            let cols = sql.split_once('(').expect("index column list").1;
+            assert!(
+                cols.trim_start().starts_with(first_col),
+                "{index} must lead with {first_col} to serve time-range scans: {sql}"
+            );
+        }
     }
 
     #[test]
