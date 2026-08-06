@@ -2285,7 +2285,10 @@ agents:
         );
         let stuck = select_request_model(&shared, &turn, &kory_code_request(21, FAILING));
         assert_eq!(stuck.event, "escalation");
-        assert_eq!(stuck.model, "claude-fable-5");
+        // Since the Opus 5 score refresh, Opus outranks Fable in the table, so
+        // a struggling Fable-pinned session escalates onto Opus (previously
+        // nothing outranked Fable and the escalation stayed in place).
+        assert_eq!(stuck.model, "claude-opus-5");
 
         // Verdict TTL is 6 requests, so the next few stay elevated by design; once
         // it expires with clean output the session must return to the pinned model

@@ -152,16 +152,16 @@ const GOLDEN: &[Golden] = &[
                       and a new left nav, then update every affected component",
         class: TaskClass::Architecture,
         complexity: 0.72,
-        winner: "claude/claude-fable-5[1m]",
-        utility: 0.73,
+        winner: "claude/opus[1m]",
+        utility: 0.89,
     },
     Golden {
         prompt: "investigate why the integration suite is flaky: there's a race between the \
                       worker pool and the scheduler that only reproduces under load",
         class: TaskClass::Research,
         complexity: 0.26,
-        winner: "codex/gpt-5.5",
-        utility: 0.56,
+        winner: "claude/opus[1m]",
+        utility: 0.58,
     },
     Golden {
         prompt: "implement an OAuth2 login flow with refresh tokens and secure token storage",
@@ -175,8 +175,8 @@ const GOLDEN: &[Golden] = &[
                       delivery and backpressure",
         class: TaskClass::Architecture,
         complexity: 0.39,
-        winner: "claude/claude-fable-5[1m]",
-        utility: 0.63,
+        winner: "claude/opus[1m]",
+        utility: 0.65,
     },
     Golden {
         prompt: "spend as long as you need investigating this deep cross-cutting bug that \

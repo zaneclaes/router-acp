@@ -102,9 +102,11 @@ candidates:
       Ops: 2.02
       CodingGeneral: 2.02
 
-  # Claude Opus 5 (`claude-opus-5` / CLI alias `opus[1m]`). Until an Opus 5
-  # comparison card is published, the updater conservatively uses the published
-  # Opus 4.8 comparison row as its benchmark proxy.
+  # Claude Opus 5 (`claude-opus-5` / CLI alias `opus[1m]`). Real Opus 5
+  # evidence (card published 2026-07-24), replacing the Opus 4.8 proxy this
+  # entry launched with — see `data/model-policy.yaml` for sources. Opus now
+  # scores ABOVE Fable (beats it on Terminal-Bench and DeepSWE, trails by
+  # 0.8pt on SWE-Bench-Pro) at half Fable's price.
   - pattern: "*opus*"
     coding_tier: high
     coding_percentile: 0.93
@@ -112,18 +114,18 @@ candidates:
     max_output_tokens: 128000
     effort_levels: [low, medium, high, xhigh, max]
     effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
-    default_quality: 1.64
+    default_quality: 3.10
     quality:
-      UiTweak: 1.64
-      BugFix: 1.96
-      Feature: 1.96
-      Refactor: 1.96
-      Algorithms: 1.64
-      Architecture: 1.64
-      Research: 1.64
-      Writing: 1.64
-      Ops: 1.64
-      CodingGeneral: 1.81
+      UiTweak: 3.10
+      BugFix: 3.10
+      Feature: 3.10
+      Refactor: 3.10
+      Algorithms: 3.10
+      Architecture: 3.10
+      Research: 3.10
+      Writing: 3.10
+      Ops: 3.10
+      CodingGeneral: 3.10
 
   - pattern: "*sonnet*"
     coding_tier: high
@@ -132,18 +134,18 @@ candidates:
     max_output_tokens: 128000
     effort_levels: [low, medium, high, xhigh, max]
     effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
-    default_quality: 1.38
+    default_quality: 1.39
     quality:
-      UiTweak: 1.38
-      BugFix: 1.38
-      Feature: 1.38
-      Refactor: 1.38
-      Algorithms: 1.38
-      Architecture: 1.38
-      Research: 1.38
-      Writing: 1.38
-      Ops: 1.38
-      CodingGeneral: 1.38
+      UiTweak: 1.39
+      BugFix: 1.39
+      Feature: 1.39
+      Refactor: 1.39
+      Algorithms: 1.39
+      Architecture: 1.39
+      Research: 1.39
+      Writing: 1.39
+      Ops: 1.39
+      CodingGeneral: 1.39
 
   # Haiku 4.5 predates adaptive thinking and the effort parameter: a request
   # carrying `thinking: {type: adaptive}` or `output_config.effort` is rejected

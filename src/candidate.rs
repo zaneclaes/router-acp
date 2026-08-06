@@ -576,22 +576,28 @@ mod score_resolution_tests {
     }
 
     #[test]
-    fn fable_models_score_at_the_top() {
+    fn fable_models_score_at_the_top_tier() {
         let t = ScoreTable::builtin();
         let fable = t.lookup(&CandidateId::parse("claude/claude-fable-5[1m]").unwrap());
         assert_eq!(fable.coding_tier, CodingTier::High);
         assert!(fable.quality(TaskClass::Architecture) >= 0.95);
-        let opus = t.lookup(&CandidateId::parse("claude/opus[1m]").unwrap());
+        let sonnet = t.lookup(&CandidateId::parse("claude/sonnet").unwrap());
         assert!(
-            fable.quality(TaskClass::Research) > opus.quality(TaskClass::Research),
-            "fable outranks opus"
+            fable.quality(TaskClass::Research) > sonnet.quality(TaskClass::Research),
+            "fable outranks sonnet"
         );
     }
 
-    /// Opus 5 is a step-change over 4.8 and outranks Grok 4.5 on quality while
-    /// remaining a notch under Fable (and cheaper than Fable at cost_rank 4).
+    /// The claude ladder since the 2026-07-24 Opus 5 card: Opus outscores
+    /// Fable (it beats Fable on Terminal-Bench and DeepSWE and trails by
+    /// 0.8pt on SWE-Bench-Pro) at half the price and cost_rank 4 vs 5, so
+    /// cost-aware `auto` prefers Opus and Fable wins via pins, planner globs,
+    /// and escalation. That restores the original routing intent — the narrow
+    /// pre-calibration gap existed precisely so Opus won the everyday work —
+    /// which the Opus 4.8 benchmark proxy had silently inverted. Grok 4.5
+    /// stays below both.
     #[test]
-    fn opus5_outranks_grok_and_sits_under_fable() {
+    fn opus5_outranks_grok_and_leads_cost_aware_auto() {
         let t = ScoreTable::builtin();
         let opus = t.lookup(&CandidateId::parse("claude/opus[1m]").unwrap());
         let grok = t.lookup(&CandidateId::parse("grok/grok-4.5").unwrap());
@@ -604,8 +610,10 @@ mod score_resolution_tests {
             grok.quality(TaskClass::CodingGeneral)
         );
         assert!(
-            fable.quality(TaskClass::CodingGeneral) > opus.quality(TaskClass::CodingGeneral),
-            "fable stays slightly ahead of opus5 for cost-aware auto"
+            opus.quality(TaskClass::CodingGeneral) > fable.quality(TaskClass::CodingGeneral),
+            "opus5 leads the benchmark-calibrated claude ladder ({} vs fable {})",
+            opus.quality(TaskClass::CodingGeneral),
+            fable.quality(TaskClass::CodingGeneral)
         );
         // Wire alias `claude-opus-5` and legacy `claude-opus-4` both match `*opus*`.
         let by_api_id = t.lookup(&CandidateId::new("claude", "claude-opus-5"));

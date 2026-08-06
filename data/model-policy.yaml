@@ -87,12 +87,18 @@ benchmark_scoring:
       - { benchmark: DeepSWE-v1.1, result: 67.0, source: "https://openai.com/index/gpt-5-6/" }
       - { benchmark: Terminal-Bench-2.1, result: 85.6, source: "https://openai.com/index/gpt-5-6/" }
     "*opus*":
-      # The live Opus 5 alias currently uses the latest published Opus 4.8
-      # comparison row as a conservative proxy until an Opus 5 card is public.
-      - { benchmark: AA-Coding-Agent-v1.1, result: 72.5, source: "https://openai.com/index/gpt-5-6/" }
-      - { benchmark: SWE-Bench-Pro, result: 69.2, source: "https://openai.com/index/gpt-5-6/" }
-      - { benchmark: DeepSWE-v1.1, result: 59.0, source: "https://openai.com/index/gpt-5-6/" }
-      - { benchmark: Terminal-Bench-2.1, result: 78.9, source: "https://openai.com/index/gpt-5-6/" }
+      # Real Claude Opus 5 rows (card published 2026-07-24), replacing the
+      # Opus 4.8 proxy this entry launched with. SWE-Bench-Pro comes from the
+      # same system-card comparison table as the Fable 80.0 / Sol 64.6 rows
+      # above. Terminal-Bench is Artificial Analysis's independent max-effort
+      # run (Vals.ai's harness reports 84.6 with a refusal-fallback caveat —
+      # harness variance, not a typo). DeepSWE is the same public v1.1
+      # leaderboard the Fable 69.7 / Sol 72.7 rows trace to. No AA-Coding-Agent
+      # row: AA's current coding-agent index publishes on a points scale that
+      # does not map onto this benchmark's raw-result anchors.
+      - { benchmark: SWE-Bench-Pro, result: 79.2, source: "https://www.anthropic.com/news/claude-opus-5" }
+      - { benchmark: DeepSWE-v1.1, result: 73.6, source: "https://deepswe.datacurve.ai/" }
+      - { benchmark: Terminal-Bench-2.1, result: 89.1, source: "https://artificialanalysis.ai/evaluations/terminalbench-v2-1" }
     "*grok*":
       - { benchmark: SWE-Bench-Pro, result: 64.7, source: "https://x.ai/news/grok-4-5" }
       - { benchmark: DeepSWE-v1.1, result: 53.0, source: "https://x.ai/news/grok-4-5" }
@@ -100,6 +106,7 @@ benchmark_scoring:
     "*sonnet*":
       - { benchmark: SWE-Bench-Pro, result: 63.2, source: "https://www.anthropic.com/news/claude-sonnet-5" }
       - { benchmark: Terminal-Bench-2.1, result: 80.4, source: "https://www.anthropic.com/news/claude-sonnet-5" }
+      - { benchmark: DeepSWE-v1.1, result: 54.0, source: "https://deepswe.datacurve.ai/" }
     "*haiku*":
       - { benchmark: SWE-Bench-Verified-2025, result: 73.3, source: "https://www.anthropic.com/news/claude-haiku-4-5" }
       - { benchmark: Terminal-Bench-1, result: 41.75, source: "https://www.anthropic.com/news/claude-haiku-4-5" }
@@ -186,8 +193,14 @@ witnesses:
 invariants:
   # Strictly decreasing quality, every TaskClass, left to right.
   strict_desc:
-    - chain: [fable, opus, sonnet, haiku]
-      why: the claude ladder every golden routing case depends on
+    - chain: [opus, fable, sonnet, haiku]
+      why: >-
+        the claude ladder every golden routing case depends on. Opus 5 sits
+        ABOVE Fable since the 2026-07-24 card: it beats Fable on
+        Terminal-Bench 2.1 (89.1 vs 83.1) and DeepSWE (73.6 vs 69.7) and
+        trails by 0.8pt on SWE-Bench-Pro (79.2 vs 80.0) — at half the price.
+        The pre-refresh chain [fable, opus, ...] encoded the Opus 4.8 proxy
+        era; restoring it requires evidence Fable actually outscores Opus 5.
     - chain: [sol, terra, luna]
       why: provisional GPT sol/terra/luna tiering
     - chain: [sol, gpt5]
