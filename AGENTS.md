@@ -184,26 +184,92 @@ SDK traps below, which were all discovered the hard way.
   `gate_message` never cordons. Grok therefore needs **no** `usage_source` in
   config — the cordon is automatic. Pure decision is `xai_gate_reason` (tested,
   `xai_gate_tests`).
-- **Plan-aware effective cost** (`availability_preference.*`; same poll +
-  client hints): `eligible_views` uses the lower of local sliding-window
-  headroom and candidate-specific reported plan headroom in the quota term.
-  It also scales the static `agents[].preference` base as
-  `preference × plan_headroom`, then subtracts
+- **Plan-aware effective cost, in real dollars** (`availability_preference.*`;
+  same poll + client hints): `eligible_views` uses the lower of local
+  sliding-window headroom and `SeatAvailability::seat_budget(scale_dollars)`
+  in the quota term. `seat_budget` compares real DOLLARS, not the fraction of
+  each provider's own (differently-sized) cap — a $9k pool at 3% free ($270)
+  and a $3k pool at 3% free ($90) are the same fraction but not the same
+  seat, and a percent-only comparison can't tell them apart (or worse,
+  inverts against a smaller-cap seat with more real dollars left). It also
+  scales the static `agents[].preference` base the same way, then subtracts
   `cost_aversion × (1 - task complexity)` when the seat is past its cap but
-  routable via overage/credits (spending real money).
-  Model-scoped windows affect only matching models. That preserves FREE plan
-  budget among comparable candidates; a saturated seat with no overage
-  headroom is a cordon, never a penalty. Availability
-  sources: the usage poller (`set_polled_availability`, wholesale per cycle)
-  and the `router-acp/availability_hint` extension notification
-  (`apply_availability_hint` — session-less, consumed in `on_catch_all`,
-  per-agent TTL `hint_ttl_secs`; a fresh hint outranks the poll, e.g. Kory
-  Code's live per-minute view). Disclosure: signed `pref` term in the `auto`
-  reason string and `details.availability`
-  (`[{candidate,plan_headroom,on_overage,source}]`) on the pin metadata.
-  Tests: `usage::tests` (availability + hints), `headroom::tests`
-  (hint TTL/fallback),
-  `auto::tests::cost_aversion_raises_the_paid_frontier_difficulty_bar`.
+  routable via overage/credits (spending real money). Model-scoped windows
+  affect only matching models. That preserves FREE plan budget among
+  comparable candidates; a saturated seat with no overage headroom is a
+  cordon, never a penalty.
+  - **Overage/credit pools report real dollars directly from the provider
+    API**: `SeatAvailability::overage_remaining_dollars` — Anthropic prefers
+    `spend.limit.amount_minor − spend.used.amount_minor` (scaled by
+    `exponent`), falling back to `extra_usage.monthly_limit − used_credits`
+    (scaled by `decimal_places`); Codex prefers the per-member spend limit's
+    `individual_limit.limit − used` (string OR numeric JSON — the live API
+    sends strings), falling back to a positive credit `balance`.
+    `overage_headroom` (the pre-dollar fraction) remains as fallback +
+    disclosure only.
+  - **Included plan windows are ESTIMATED**, because neither provider reports
+    them in dollars (`limit_dollars`/`used_dollars` are always null on the
+    live Anthropic payload; Codex's `primary`/`secondary` carry only a
+    percent). `SeatAvailability::plan_remaining_dollars` comes from
+    `window_remaining_dollars(spent, percent) = spent × (100 − p) / p`, where
+    `spent` is the router's OWN metered spend into that window
+    (`StateFile::llm_cost_since`, over the box-shared `llm_requests` table —
+    covers every `router-acp serve` process, not just this one) since the
+    window's start (`resets_at − duration`; Anthropic infers `duration` from
+    `kind`: `session`→5h, `weekly_*`→7d via `anthropic_window_duration`; Codex
+    reads `windowDurationMins` directly). A model-scoped window (e.g. Claude
+    Fable's own weekly cap) restricts the spend lookup to that scope's
+    candidate models (`window_scope_models`) so sibling-model spend doesn't
+    dilute or inflate the estimate. Guarded (`window_remaining_dollars`
+    returns `None` below `MIN_ESTIMATE_PERCENT` (15%, below which
+    integer-rounded percents make the extrapolation swing wildly) or
+    `MIN_ESTIMATE_SPENT_DOLLARS` ($0.50, too little router-visible spend to
+    extrapolate from) — the percent fraction then stands in. Known skew:
+    spend outside the router (a different client on the same account) raises
+    the provider's percent without raising router-metered spend, which
+    UNDER-estimates remaining — the conservative direction; pricing-table vs
+    provider-internal window weighting can skew either way.
+  - `seat_budget(scale_dollars)` saturates the dollar figure at
+    `availability_preference.headroom_scale_dollars` (default `$200`) into
+    [0, 1] for the quota term; falls back to the percent fraction when no
+    dollar figure is obtainable, and to `0` when a paying seat's pool is
+    wholly unknown (the pre-dollar-grading behavior).
+    `cap_overage_headroom` mirrors `cap_unmetered_headroom`'s product rule so
+    a graded paying seat's headroom still never outranks a metered seat with
+    included plan left. **LESSON (shipped bug, two rounds):** the first fix
+    graded the overage pool as a FRACTION of each seat's own cap and compared
+    those fractions directly — live 2026-08-06, a codex seat with ~$100 of
+    member spend (~3% of its $3k cap) beat a claude seat with ~$6,600 of
+    extra usage (~74% of its $9k cap) only because the fractions happened to
+    order correctly; a $9k cap at 1% free ($90) vs a $3k cap at 5% free
+    ($150) would have inverted under percent comparison. Only real dollars,
+    normalized by a fixed scale, compare correctly across differently-sized
+    caps. Availability sources: the usage poller
+    (`set_polled_availability`, wholesale per cycle, spend closure built
+    fresh per agent in `poll_all`) and the `router-acp/availability_hint`
+    extension notification (`apply_availability_hint` — session-less,
+    consumed in `on_catch_all`, per-agent TTL `hint_ttl_secs`; a fresh hint
+    outranks the poll, e.g. Kory Code's live per-minute view; hints may
+    optionally carry `remaining_dollars` per window/overage for a client
+    that already knows real dollars). Disclosure: signed `pref` term in the
+    `auto` reason string and `details.availability`
+    (`[{candidate,plan_headroom,plan_remaining_dollars,on_overage,
+    overage_headroom,overage_remaining_dollars,source}]`) on the pin
+    metadata. Tests: `usage::tests` (availability + hints + dollar parsing,
+    incl. `overage_headroom_distinguishes_nearly_spent_from_plenty_left`,
+    `anthropic_overage_dollars_prefers_spend_over_extra_usage`,
+    `codex_overage_dollars_from_individual_limit_and_credits`,
+    `window_remaining_dollars_estimates_from_spend_and_percent`/
+    `_guards_low_signal`, `*_availability_with_spend_estimates_plan_window_dollars`),
+    `headroom::tests` (hint TTL/fallback,
+    `seat_budget_grades_the_overage_pool_…`,
+    `seat_budget_compares_real_dollars_not_fractions_of_different_caps`),
+    `state::tests::llm_cost_since_sums_by_agent_model_and_time`,
+    `strategies::test_util` (`overage_headroom_capped_…`,
+    `overage_headroom_keeps_its_grading_…`),
+    `auto::tests::cost_aversion_raises_the_paid_frontier_difficulty_bar`,
+    `overage_seat_with_more_dollars_left_beats_higher_fraction_smaller_cap`
+    (protocol E2E — a HIGHER fraction with FEWER dollars must still lose).
 - **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by
   default): bind the loopback listener before spawning adapters, then inject
   their process-level base URL. Forward auth, paths, query strings, and SSE;

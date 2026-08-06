@@ -61,15 +61,7 @@ const FREE_PLAN_EPSILON: f64 = 1e-9;
 /// When every metered free plan is exhausted (or the pool is unmetered-only),
 /// unmetered keeps full local headroom so it remains a valid failover.
 pub fn cap_unmetered_headroom(views: &mut [CandidateView]) {
-    let max_free_metered = views
-        .iter()
-        .filter(|v| !v.on_overage)
-        .filter_map(|v| v.plan_headroom)
-        .filter(|&p| p > FREE_PLAN_EPSILON)
-        .fold(None, |acc: Option<f64>, p| {
-            Some(acc.map_or(p, |a| a.max(p)))
-        });
-    let Some(cap) = max_free_metered else {
+    let Some(cap) = max_free_metered_plan(views) else {
         return;
     };
     for view in views.iter_mut() {
@@ -77,6 +69,40 @@ pub fn cap_unmetered_headroom(views: &mut [CandidateView]) {
             view.headroom = view.headroom.min(cap);
         }
     }
+}
+
+/// Sibling product rule for **paying** seats: graded overage headroom ranks
+/// them among each other (a seat with most of its overage pool left must
+/// out-rank one about to hit its spend cap), but it must not make a paying
+/// seat look "more free" than a metered seat still on included plan — free
+/// plan spends nothing, overage spends real money.
+///
+/// Cap: `on_overage.headroom = min(headroom, max free metered plan_headroom)`.
+/// When every metered free plan is exhausted (the all-seats-paying case this
+/// grading exists for), paying seats keep their full graded headroom.
+pub fn cap_overage_headroom(views: &mut [CandidateView]) {
+    let Some(cap) = max_free_metered_plan(views) else {
+        return;
+    };
+    for view in views.iter_mut() {
+        if view.on_overage {
+            view.headroom = view.headroom.min(cap);
+        }
+    }
+}
+
+/// The largest free included-plan fraction among metered, non-paying seats —
+/// the shared cap source for [`cap_unmetered_headroom`] and
+/// [`cap_overage_headroom`]. `None` when no metered seat has free plan left.
+fn max_free_metered_plan(views: &[CandidateView]) -> Option<f64> {
+    views
+        .iter()
+        .filter(|v| !v.on_overage)
+        .filter_map(|v| v.plan_headroom)
+        .filter(|&p| p > FREE_PLAN_EPSILON)
+        .fold(None, |acc: Option<f64>, p| {
+            Some(acc.map_or(p, |a| a.max(p)))
+        })
 }
 
 /// Who put the explicit candidate on the session. The router itself steers the
@@ -306,6 +332,58 @@ pub(crate) mod test_util {
         cap_unmetered_headroom(&mut views);
         assert!((views[0].headroom - 1.0).abs() < 1e-9);
         assert!((views[1].headroom - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overage_headroom_capped_when_metered_has_free_plan() {
+        let mut views = vec![
+            view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.44),
+            {
+                // Codex: no included plan left, paying, and (pre-fix) reads
+                // as full headroom because grading gave it a graded budget.
+                let mut v = view_metered("codex", "gpt-5.6-sol", 5, 1, 2.81, CodingTier::High, 0.0);
+                v.on_overage = true;
+                v.headroom = 0.9;
+                v
+            },
+        ];
+        cap_overage_headroom(&mut views);
+        let sol = views.iter().find(|v| v.id.agent == "codex").unwrap();
+        assert!(
+            (sol.headroom - 0.44).abs() < 1e-9,
+            "paying seat capped at best free metered plan, got {}",
+            sol.headroom
+        );
+        let haiku = views.iter().find(|v| v.id.model == "haiku").unwrap();
+        assert!(
+            (haiku.headroom - 0.44).abs() < 1e-9,
+            "free metered seat untouched"
+        );
+    }
+
+    #[test]
+    fn overage_headroom_keeps_its_grading_when_no_free_plan_remains() {
+        // Every seat is paying — the shape this grading exists for. Each
+        // paying seat keeps its own graded headroom rather than collapsing.
+        let mut views = vec![
+            {
+                let mut v = view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.0);
+                v.on_overage = true;
+                v.headroom = 0.73;
+                v
+            },
+            {
+                let mut v = view_metered("codex", "gpt-5.6-sol", 5, 1, 2.81, CodingTier::High, 0.0);
+                v.on_overage = true;
+                v.headroom = 0.03;
+                v
+            },
+        ];
+        cap_overage_headroom(&mut views);
+        let claude = views.iter().find(|v| v.id.agent == "claude").unwrap();
+        let codex = views.iter().find(|v| v.id.agent == "codex").unwrap();
+        assert!((claude.headroom - 0.73).abs() < 1e-9);
+        assert!((codex.headroom - 0.03).abs() < 1e-9);
     }
 
     pub fn ctx() -> RouteContext {

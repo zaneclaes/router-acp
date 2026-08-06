@@ -662,6 +662,36 @@ impl StateFile {
         );
     }
 
+    /// Total router-metered spend (`llm_requests.cost_usd`) for an agent
+    /// since `since_epoch`, box-wide (the state DB is shared across every
+    /// `router-acp serve` process). `models`, when given, restricts to those
+    /// exact `"agent/model"` strings (a scoped plan window, e.g. Claude
+    /// Fable's own weekly cap, must not count spend on sibling models toward
+    /// its estimate). Feeds [`crate::usage::window_remaining_dollars`].
+    pub fn llm_cost_since(&self, agent: &str, models: Option<&[String]>, since_epoch: i64) -> f64 {
+        let query = match models {
+            None => self.conn.query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_requests \
+                 WHERE agent = ?1 AND started_at >= ?2",
+                params![agent, since_epoch],
+                |row| row.get::<_, f64>(0),
+            ),
+            Some(models) if !models.is_empty() => {
+                let placeholders = models.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_requests \
+                     WHERE agent = ?1 AND started_at >= ?2 AND model IN ({placeholders})"
+                );
+                let mut stmt_params: Vec<&dyn rusqlite::ToSql> = vec![&agent, &since_epoch];
+                stmt_params.extend(models.iter().map(|m| m as &dyn rusqlite::ToSql));
+                self.conn
+                    .query_row(&sql, stmt_params.as_slice(), |row| row.get::<_, f64>(0))
+            }
+            Some(_) => return 0.0,
+        };
+        query.unwrap_or(0.0)
+    }
+
     /// Start a provider-level request record. Probe/auth traffic has no owning
     /// session and is intentionally not passed here.
     pub fn start_llm_request(&self, request: &LlmRequestStart) {
@@ -1205,6 +1235,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tool_model, "claude/haiku");
+    }
+
+    #[test]
+    fn llm_cost_since_sums_by_agent_model_and_time() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("claude"));
+        // Insert rows directly (bypassing `start_llm_request`'s real-clock
+        // `started_at`) so the query can be exercised across a controlled
+        // time boundary.
+        let insert = |request_id: &str, agent: &str, model: &str, started_at: i64, cost: f64| {
+            s.conn
+                .execute(
+                    "INSERT INTO llm_requests
+                        (request_id, router_session_id, agent, protocol, endpoint,
+                         pinned_model, model, routing_reason, routing_event,
+                         started_at, cost_usd)
+                     VALUES (?1, 'r1', ?2, 'anthropic', '/v1/messages', ?3, ?3, 'r', 'e', ?4, ?5)",
+                    params![request_id, agent, model, started_at, cost],
+                )
+                .unwrap();
+        };
+        insert("q1", "claude", "claude/haiku", 1000, 0.10);
+        insert("q2", "claude", "claude/sonnet", 2000, 0.20);
+        insert("q3", "claude", "claude/haiku", 500, 0.05); // before the cutoff
+        insert("q4", "codex", "codex/gpt-5.5", 1500, 0.30); // different agent
+
+        // Whole-agent total since a cutoff excludes the earlier row and the
+        // other agent's spend.
+        assert!((s.llm_cost_since("claude", None, 1000) - 0.30).abs() < 1e-9);
+        // Model-scoped: only the matching model string counts.
+        assert!(
+            (s.llm_cost_since("claude", Some(&["claude/haiku".to_string()]), 0) - 0.15).abs()
+                < 1e-9
+        );
+        // Unknown agent / empty window: zero, never an error.
+        assert_eq!(s.llm_cost_since("nonexistent", None, 0), 0.0);
+        assert_eq!(s.llm_cost_since("claude", Some(&[]), 0), 0.0);
     }
 
     #[test]

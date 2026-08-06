@@ -258,6 +258,14 @@ pub struct AvailabilityPreferenceConfig {
     /// router falls back to its own poll, in seconds.
     #[serde(default = "default_hint_ttl_secs")]
     pub hint_ttl_secs: u64,
+    /// Remaining budget, in real dollars, at/above which a seat's quota term
+    /// reads fully free. Seats are graded on dollars (not on the fraction of
+    /// each provider's own cap remaining) because caps differ in size across
+    /// providers/plans — a $9k cap at 3% free ($270) and a $3k cap at 3% free
+    /// ($90) are not comparable seats, but a percent-only comparison treats
+    /// them as identical.
+    #[serde(default = "default_headroom_scale_dollars")]
+    pub headroom_scale_dollars: f64,
 }
 
 fn default_cost_aversion() -> f64 {
@@ -268,12 +276,17 @@ fn default_hint_ttl_secs() -> u64 {
     10 * 60
 }
 
+fn default_headroom_scale_dollars() -> f64 {
+    200.0
+}
+
 impl Default for AvailabilityPreferenceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             cost_aversion: default_cost_aversion(),
             hint_ttl_secs: default_hint_ttl_secs(),
+            headroom_scale_dollars: default_headroom_scale_dollars(),
         }
     }
 }
@@ -1346,6 +1359,11 @@ impl Config {
         if !(0.0..=1.0).contains(&self.availability_preference.cost_aversion) {
             return Err(ConfigError(
                 "availability_preference.cost_aversion must be between 0 and 1".into(),
+            ));
+        }
+        if self.availability_preference.headroom_scale_dollars <= 0.0 {
+            return Err(ConfigError(
+                "availability_preference.headroom_scale_dollars must be > 0".into(),
             ));
         }
         if self.delegation.max_concurrent == 0 {
