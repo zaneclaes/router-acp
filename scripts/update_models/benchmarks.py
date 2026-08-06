@@ -97,7 +97,40 @@ def derive(policy: Policy) -> dict[str, BenchmarkScore]:
             quality=quality,
             observations=len(all_values),
         )
+    _apply_compression(config, out)
     return out
+
+
+def _apply_compression(config: dict[str, Any], scores: dict[str, BenchmarkScore]) -> None:
+    """Pin declared same-tier peers `max_gap` below their preferred member.
+
+    Peers whose benchmark gaps sit inside measurement noise must not let a
+    small, unreliable per-class delta out-vote a real price difference in
+    cost-aware routing. Policy declares the pair and its order; the `behind`
+    member's per-class output is superseded (its raw observations stay in the
+    evidence log), leaving a deterministic `max_gap` residual so ordering-
+    sensitive paths still resolve to `ahead`.
+    """
+    compression = config.get("compression") or {}
+    gap = float(compression.get("max_gap", 0.02))
+    for pair in compression.get("pairs") or []:
+        ahead_pattern, behind_pattern = pair.get("ahead"), pair.get("behind")
+        ahead = scores.get(ahead_pattern)
+        behind = scores.get(behind_pattern)
+        if ahead is None or behind is None:
+            missing = behind_pattern if ahead is not None else ahead_pattern
+            raise PolicyError(
+                f"compression pair references `{missing}`, which has no benchmark evidence"
+            )
+        scores[behind_pattern] = BenchmarkScore(
+            pattern=behind.pattern,
+            default_quality=round(ahead.default_quality - gap, 2),
+            quality={
+                task_class: round(score - gap, 2)
+                for task_class, score in ahead.quality.items()
+            },
+            observations=behind.observations,
+        )
 
 
 def resolve_profile(profiles: dict[str, BenchmarkScore], candidate: str) -> str | None:

@@ -151,8 +151,12 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          novelty, and verification burden. A follow-up after a failed or incomplete fix is strong \
          evidence that the task is harder than it first appeared: phrases such as \"still broken\", \
          \"that didn't work\", \"following up\", a reopened issue, or a prior agent failing the \
-         task should score complexity at least 0.70. Do NOT increase complexity merely because a \
-         ticket is long, contains many bullets, or supplies detailed context.\n\
+         task should score complexity at least 0.70. A bug or fix that has survived MULTIPLE \
+         rounds of attempts — \"still failing after N tries\", several prior agents/sessions each \
+         reporting the fix didn't hold, a reopened issue with its own history of reopens — is \
+         evidence the difficulty itself is severe, not merely that one attempt fell short: score \
+         it 0.90-1.00. Do NOT increase complexity merely because a ticket is long, contains many \
+         bullets, or supplies detailed context.\n\
          The text may include auto-injected CONTEXT: \"[Ticket …]\" blocks pulled from a ticket \
          system, and bracketed client or transport notes (lines opening with a tag such as \
          \"[client-name]\") listing available skills or conventions. Context is background, NOT \
@@ -1135,6 +1139,8 @@ agents:
         assert!(p.contains("Do NOT increase complexity merely because"));
         assert!(p.contains("follow-up after a failed or incomplete fix"));
         assert!(p.contains("at least 0.70"));
+        assert!(p.contains("survived MULTIPLE"));
+        assert!(p.contains("0.90-1.00"));
         assert!(p.contains("low, medium, high, xhigh, max"));
         assert!(p.contains("xhigh for ambiguous cross-system reasoning"));
         assert!(p.contains("Dimension: orchestrate"));

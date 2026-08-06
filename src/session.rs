@@ -1410,25 +1410,34 @@ fn escalation_target(
     })?;
     let current = current?;
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
-    pool.retain(|v| {
-        v.id != current
-            && !is_excluded(&v.id, &excluded)
-            && crate::candidate::quality_utility(v.quality)
-                > crate::candidate::quality_utility(current_q) + 0.05
-    });
-    let pick = match path {
-        EscalationPath::Leap => pool.into_iter().max_by(|a, b| {
-            a.quality
-                .partial_cmp(&b.quality)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        EscalationPath::Ladder => pool.into_iter().min_by(|a, b| {
-            a.quality
-                .partial_cmp(&b.quality)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
+    pool.retain(|v| v.id != current && !is_excluded(&v.id, &excluded));
+    // Same margin-then-fallback as `upgrade_target`: prefer a real (+0.05
+    // normalized) capability step, but when only a compressed peer sits
+    // above the current pin (Fable over Opus, Sol over Terra — a deliberate
+    // ~0.007 gap), observed difficulty must still be able to cross it.
+    let pick_above = |margin: f64| {
+        let above: Vec<&CandidateView> = pool
+            .iter()
+            .filter(|v| {
+                crate::candidate::quality_utility(v.quality)
+                    > crate::candidate::quality_utility(current_q) + margin
+            })
+            .collect();
+        match path {
+            EscalationPath::Leap => above.into_iter().max_by(|a, b| {
+                a.quality
+                    .partial_cmp(&b.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            EscalationPath::Ladder => above.into_iter().min_by(|a, b| {
+                a.quality
+                    .partial_cmp(&b.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        }
+        .map(|v| v.id.clone())
     };
-    pick.map(|v| v.id)
+    pick_above(0.05).or_else(|| pick_above(f64::EPSILON))
 }
 
 /// Count one investigation event for an `escalation` session and, if the
@@ -4211,6 +4220,16 @@ fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
 
 /// The best eligible candidate strictly more capable (higher quality for the
 /// session's task class) than the current pin — the auto-upgrade target.
+///
+/// The +0.05 normalized-quality margin filters out noise-level "upgrades"
+/// that would forfeit a warm cache for no real capability gain. But the
+/// score table's compressed peer pairs (`benchmark_scoring.compression` in
+/// data/model-policy.yaml) sit a deliberate ~0.007 normalized above their
+/// cheaper sibling — Fable over Opus, Sol over Terra — and a session pinned
+/// on the cheaper peer whose confidence keeps dropping (a fix surviving
+/// round after round) must still be able to climb onto the preferred member.
+/// So when nothing clears the margin, fall back to the best strictly-better
+/// candidate instead of returning nothing.
 fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
     let (class, current, current_q, excluded) = shared.with_session(router_sid, |s| {
         (
@@ -4223,17 +4242,20 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
     let current = current?;
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     pool.retain(|v| v.id != current && !is_excluded(&v.id, &excluded));
-    pool.into_iter()
-        .filter(|v| {
-            crate::candidate::quality_utility(v.quality)
-                > crate::candidate::quality_utility(current_q) + 0.05
-        })
-        .max_by(|a, b| {
-            a.quality
-                .partial_cmp(&b.quality)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|v| v.id)
+    let best_above = |margin: f64| {
+        pool.iter()
+            .filter(|v| {
+                crate::candidate::quality_utility(v.quality)
+                    > crate::candidate::quality_utility(current_q) + margin
+            })
+            .max_by(|a, b| {
+                a.quality
+                    .partial_cmp(&b.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|v| v.id.clone())
+    };
+    best_above(0.05).or_else(|| best_above(f64::EPSILON))
 }
 
 /// The strongest eligible candidate strictly cheaper than the current pin —

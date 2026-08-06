@@ -3080,6 +3080,49 @@ async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
 }
 
 #[tokio::test]
+async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_qualifies() {
+    let state = temp_state_file("upgrade-compressed");
+    // Mirrors a declared score-table compression pair (Fable/Opus, Sol/Terra):
+    // b/m2 sits only 0.02 above a/m1 on the raw 0.5..3.5 scale — normalized
+    // ~0.007, well under the +0.05 real-upgrade margin. a/m1's 0.85 puts the
+    // pinned session's confidence at (0.85−0.5)/(1.2−0.5) = 0.50, below the
+    // 0.55 default threshold, so auto-upgrade fires — and its only possible
+    // target is the compressed sibling.
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"b/*\", default_quality: 0.87 }\n\
+         \x20 - { pattern: \"a/*\", default_quality: 0.85 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nfirst turn").await?;
+        let resp = prompt_text(&cx, &sid, "second turn").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "upgraded across the compressed gap despite missing the +0.05 margin: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn auto_upgrade_disabled_keeps_the_pinned_model() {
     let state = temp_state_file("noupgrade");
     let scores = std::env::temp_dir().join(format!(
@@ -3554,6 +3597,45 @@ async fn escalation_mid_turn_on_tool_failures() {
             "tool-failure churn escalated mid-turn: {text}"
         );
         assert!(got_prompt(&logb), "strong model ran");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn escalation_escalates_across_a_compressed_gap_when_nothing_else_qualifies() {
+    // Mirrors a declared score-table compression pair (Fable/Opus, Sol/Terra):
+    // b/m2 sits only 0.02 above a/m1 on the raw scale — normalized well under
+    // the +0.05 real-upgrade margin `escalation_target` prefers — so a bug
+    // that survives multiple rounds of thrashing must still be able to climb
+    // onto the compressed-ahead sibling instead of getting stuck.
+    let state = temp_state_file("esc-fail-compressed");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-escscores-compressed-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"b/*\", default_quality: 1.42 }\n\
+         \x20 - { pattern: \"a/*\", default_quality: 1.40 }\n",
+    )
+    .unwrap();
+    let logb = temp_log("esc-fail-compressed-b");
+    let body = "    escalate_after_tool_failures: 3\n    escalate_after_reads: 0\n    escalate_after_tool_calls: 0\n    escalate_on_max_tokens: false\n    escalate_on_refusal: false\n";
+    let yaml = esc_yaml(&state, &scores, body, &logb.display().to_string());
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = "TOOL:fail\n".repeat(6) + "thrash";
+        let resp = prompt_text(&cx, &sid, &prompt).await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "tool-failure churn escalated across the compressed gap: {text}"
+        );
+        assert!(got_prompt(&logb), "compressed-ahead model ran");
         Ok(())
     })
     .await;

@@ -33,8 +33,9 @@ const CANDIDATES: &[(&str, &str, u32, f64)] = &[
     ("codex", "gpt-5.5", 3, 0.0),
 ];
 
-/// Fixed `auto` config for the golden cases (mirrors the live router.yaml:
-/// tradeoff 3, complexity scaling on).
+/// Fixed `auto` config for the golden cases (mirrors the shipped
+/// examples/router-preferred.yaml: tradeoff 3, complexity scaling on,
+/// min_cost_weight 0.15, apex 0.9).
 fn auto_cfg() -> AutoRouterConfig {
     AutoRouterConfig {
         cost_quality_tradeoff: 3.0,
@@ -42,6 +43,7 @@ fn auto_cfg() -> AutoRouterConfig {
         allowed_candidates: vec!["*".to_string()],
         complexity_scales_tradeoff: true,
         min_cost_weight: 0.15,
+        apex_complexity: 0.9,
     }
 }
 
@@ -153,7 +155,7 @@ const GOLDEN: &[Golden] = &[
         class: TaskClass::Architecture,
         complexity: 0.72,
         winner: "claude/opus[1m]",
-        utility: 0.89,
+        utility: 0.80,
     },
     Golden {
         prompt: "investigate why the integration suite is flaky: there's a race between the \
@@ -185,6 +187,18 @@ const GOLDEN: &[Golden] = &[
         complexity: 0.23,
         winner: "claude/opus[1m]",
         utility: 0.49,
+    },
+    // The apex carve-out: at extreme classified complexity the cost term is
+    // dropped and the compression pair's preferred member (Fable over the
+    // 0.02-compressed Opus) must win `auto` itself.
+    Golden {
+        prompt: "rewrite the distributed migration architecture across the codebase \
+                      end-to-end, handling race conditions and deadlocks in every concurrent \
+                      module",
+        class: TaskClass::Architecture,
+        complexity: 1.00,
+        winner: "claude/claude-fable-5[1m]",
+        utility: 0.76,
     },
 ];
 

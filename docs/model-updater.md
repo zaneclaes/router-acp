@@ -111,6 +111,35 @@ That is intentionally the most specific choice: guessing which substring is the
 pattern (`*atlas*`) is a review decision, and the goose step can propose one —
 it is rejected if it would shadow an existing entry.
 
+### Compression — same-tier peers within measurement noise
+
+Two models can be genuine peers — priced roughly 2x apart, marketed as
+different tiers, cost-ranked differently — while their raw benchmark gap is
+inside measurement noise (cross-harness comparisons, overlapping error bars,
+disagreeing vendor tables). Scoring that raw gap literally lets an unreliable
+per-class delta out-vote a real price difference in cost-aware routing: the
+cheaper peer never gets picked for everyday work even though nothing in the
+evidence actually supports "decisively more capable."
+
+`benchmark_scoring.compression.pairs` declares such a pair explicitly:
+`{ahead, behind}` patterns plus a shared `max_gap` (default 0.02). The
+updater keeps `ahead`'s own calibrated scores untouched and overwrites
+`behind`'s per-class OUTPUT to `ahead − max_gap` on every class — small
+enough that `cost_rank` decides ordinary `auto` routing, large enough that
+`behind`'s own ordering (escalation targets, the `auto` apex-complexity
+carve-out, planner/reviewer globs) still resolves to `ahead` when a task
+genuinely calls for the pricier seat. `behind`'s raw observations stay
+recorded in `model_evidence` — compression supersedes the derived number, not
+the evidence log — so restoring a raw gap later only requires new,
+same-harness evidence that the pair is not actually within noise.
+
+Declare a pair when: the models are marketed/priced as different tiers, AND
+the benchmark evidence for the pair either disagrees in direction across
+sources or is a same-direction gap smaller than typical error bars for that
+benchmark. Do not declare a pair to paper over a real, well-evidenced
+capability difference — that is what `strict_desc`/`at_most` exist to assert
+honestly.
+
 ### Cost rank
 
 `cost_rank` is an **ordinal 1..5 model-effort/scarcity ladder**, not marginal

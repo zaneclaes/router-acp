@@ -216,6 +216,12 @@ routers:
     # routing becomes pure quality-max — observed as 96% of delegate spend
     # landing on the top-rank model. 0 disables (legacy behavior).
     min_cost_weight: 0.15
+    # At/above this classified complexity, ranking bypasses cost entirely
+    # (pure quality, tradeoff forced to 0) — the break-glass path that lets a
+    # score-table compression pair's preferred member (see
+    # `data/model-policy.yaml`'s `benchmark_scoring.compression`) win `auto`
+    # itself at genuine extremes, not only via explicit pins/planner globs.
+    apex_complexity: 0.9
 
 # Proactive usage-cap cordoning (on by default; inert unless an agent declares a
 # `usage_source` above). Polls the provider usage API and marks a model

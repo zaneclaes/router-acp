@@ -29,6 +29,38 @@ anchors:
 benchmark_scoring:
   minimum_task_observations: 2
   meaningful_task_delta: 0.15
+  # Same-tier peer compression (the "compression rule" the updater plan
+  # contemplated). When two models are peers whose benchmark gaps sit inside
+  # measurement noise — cross-harness spread, overlapping error bars,
+  # disagreeing vendor tables — a raw evidence-derived gap would let a small,
+  # unreliable per-class delta out-vote a 2x price difference in cost-aware
+  # auto. Instead, POLICY declares the pair and its order: `ahead` keeps its
+  # own calibrated scores and `behind` is pinned `max_gap` below it on every
+  # class, so cost_rank breaks the tie on everyday work while the ordering
+  # (and the apex/escalation break-glass paths) still reach `ahead` for
+  # extreme work. The behind member's raw observations remain recorded below —
+  # compression supersedes their per-class OUTPUT, not the evidence log.
+  # Restoring a raw gap requires same-harness evidence that the pair is not
+  # actually within noise.
+  compression:
+    max_gap: 0.02
+    pairs:
+      # Anthropic positions Fable a tier above Opus 5 and prices it 2x; the
+      # only same-table row (SWE-Bench-Pro: Fable 80.0 vs Opus 79.2, Anthropic
+      # card) has Fable ahead by less than a point, DeepSWE error bars overlap
+      # (70±4 vs 74±4, with Anthropic's own launch table reportedly favoring
+      # Fable), and the Terminal-Bench comparison is cross-harness (Opus alone
+      # spans 84.6-89.1 across harnesses). Peers within noise; order = the
+      # marketing/preference tier; cost_rank (4 vs 5) routes everyday work to
+      # Opus at half price.
+      - { ahead: "*fable*", behind: "*opus*" }
+      # Same shape one tier down on codex: Terra lists at half Sol's price
+      # ($2.50/$15 vs $5/$30) and trails Sol by 0.9-3.1 raw points on all four
+      # same-source rows — consistent in direction but each inside typical
+      # error bars. Order = Sol (the xhigh-capable flagship the orchestration
+      # globs prefer); cost_rank (4 vs 5) routes everyday hard codex work to
+      # Terra.
+      - { ahead: "*sol*", behind: "*terra*" }
   benchmarks:
     AA-Coding-Agent-v1.1:
       task_classes: [Algorithms, CodingGeneral]
@@ -193,14 +225,14 @@ witnesses:
 invariants:
   # Strictly decreasing quality, every TaskClass, left to right.
   strict_desc:
-    - chain: [opus, fable, sonnet, haiku]
+    - chain: [fable, opus, sonnet, haiku]
       why: >-
-        the claude ladder every golden routing case depends on. Opus 5 sits
-        ABOVE Fable since the 2026-07-24 card: it beats Fable on
-        Terminal-Bench 2.1 (89.1 vs 83.1) and DeepSWE (73.6 vs 69.7) and
-        trails by 0.8pt on SWE-Bench-Pro (79.2 vs 80.0) — at half the price.
-        The pre-refresh chain [fable, opus, ...] encoded the Opus 4.8 proxy
-        era; restoring it requires evidence Fable actually outscores Opus 5.
+        the claude ladder every golden routing case depends on. Fable-ahead is
+        the compression pair's declared order (see benchmark_scoring
+        .compression), not a raw-evidence claim: measured, the pair is within
+        noise, and the 0.02 residual exists so cost_rank routes everyday work
+        to Opus while ordering-sensitive paths (apex complexity, escalation,
+        planner globs) still resolve to Fable.
     - chain: [sol, terra, luna]
       why: provisional GPT sol/terra/luna tiering
     - chain: [sol, gpt5]

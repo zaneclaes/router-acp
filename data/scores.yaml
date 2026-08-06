@@ -44,7 +44,10 @@ candidates:
   #
   # Scores are calibrated from OpenAI's published four-benchmark comparison.
   # Sol's aggregate is frontier-adjacent, while its two implementation
-  # benchmarks support a lower per-task override.
+  # benchmarks support a lower per-task override. Sol/Terra is a declared
+  # compression pair (`data/model-policy.yaml`): Terra's own raw evidence
+  # trails Sol on every same-source row, each within typical error bars — see
+  # the Terra entry below, whose OUTPUT is the compressed one.
   - pattern: "*sol*"
     coding_tier: high
     coding_percentile: 0.96
@@ -64,24 +67,32 @@ candidates:
       Ops: 2.81
       CodingGeneral: 2.81
 
+  # Compressed to Sol - 0.02 per class (see the compression note on the *sol*
+  # entry above and `benchmark_scoring.compression` in model-policy.yaml).
+  # Terra's own raw observations (AA-Coding-Agent 77.4, SWE-Bench-Pro 63.4,
+  # DeepSWE 69.6, Terminal-Bench 87.4) trail Sol's on all four rows but by
+  # 0.9-3.1 points each — inside noise, not a real capability gap — so a raw
+  # score here would let that unreliable delta out-vote cost_rank on
+  # everyday hard codex work. The updater regenerates this block; do not
+  # hand-edit it back to the raw-evidence numbers.
   - pattern: "*terra*"
     coding_tier: high
     coding_percentile: 0.9
     context_window: 400000
     effort_levels: [low, medium, high]
     effort_mapping: { low: low, medium: medium, high: high }
-    default_quality: 2.45
+    default_quality: 2.79
     quality:
-      UiTweak: 2.45
-      BugFix: 2.17
-      Feature: 2.17
-      Refactor: 2.17
-      Algorithms: 2.45
-      Architecture: 2.45
-      Research: 2.45
-      Writing: 2.45
-      Ops: 2.45
-      CodingGeneral: 2.45
+      UiTweak: 2.79
+      BugFix: 2.37
+      Feature: 2.37
+      Refactor: 2.37
+      Algorithms: 2.79
+      Architecture: 2.79
+      Research: 2.79
+      Writing: 2.79
+      Ops: 2.79
+      CodingGeneral: 2.79
 
   - pattern: "*luna*"
     coding_tier: medium
@@ -103,10 +114,21 @@ candidates:
       CodingGeneral: 2.02
 
   # Claude Opus 5 (`claude-opus-5` / CLI alias `opus[1m]`). Real Opus 5
-  # evidence (card published 2026-07-24), replacing the Opus 4.8 proxy this
-  # entry launched with — see `data/model-policy.yaml` for sources. Opus now
-  # scores ABOVE Fable (beats it on Terminal-Bench and DeepSWE, trails by
-  # 0.8pt on SWE-Bench-Pro) at half Fable's price.
+  # evidence (card published 2026-07-24) replaced the Opus 4.8 proxy this
+  # entry launched with, but the resulting raw gap vs Fable does not survive
+  # scrutiny as a genuine capability difference: the one same-table row
+  # (SWE-Bench-Pro) has Fable narrowly ahead (80.0 vs 79.2), the DeepSWE error
+  # bars overlap (70+/-4 vs 74+/-4, and Anthropic's own launch tables
+  # reportedly favor Fable there), and the Terminal-Bench comparison is
+  # cross-harness (Opus alone spans 84.6-89.1 across published harnesses).
+  # This is a declared compression pair (`benchmark_scoring.compression` in
+  # model-policy.yaml): Fable keeps its own calibrated scores and this OUTPUT
+  # is pinned to Fable - 0.02/class, so cost_rank (4 vs 5) routes everyday
+  # AND hard work to Opus at half the price, while the tiny residual gap
+  # preserves the marketing-consistent order for the apex/escalation paths
+  # that need to reach Fable at genuine extremes. The updater regenerates
+  # this block from that pairing; do not hand-edit it back to the raw
+  # evidence numbers (they're recorded, uncompressed, in model-policy.yaml).
   - pattern: "*opus*"
     coding_tier: high
     coding_percentile: 0.93
@@ -114,18 +136,18 @@ candidates:
     max_output_tokens: 128000
     effort_levels: [low, medium, high, xhigh, max]
     effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
-    default_quality: 3.10
+    default_quality: 2.62
     quality:
-      UiTweak: 3.10
-      BugFix: 3.10
-      Feature: 3.10
-      Refactor: 3.10
-      Algorithms: 3.10
-      Architecture: 3.10
-      Research: 3.10
-      Writing: 3.10
-      Ops: 3.10
-      CodingGeneral: 3.10
+      UiTweak: 2.62
+      BugFix: 2.97
+      Feature: 2.97
+      Refactor: 2.97
+      Algorithms: 2.62
+      Architecture: 2.62
+      Research: 2.62
+      Writing: 2.62
+      Ops: 2.62
+      CodingGeneral: 2.88
 
   - pattern: "*sonnet*"
     coding_tier: high

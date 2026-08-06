@@ -588,20 +588,52 @@ mod score_resolution_tests {
         );
     }
 
-    /// The claude ladder since the 2026-07-24 Opus 5 card: Opus outscores
-    /// Fable (it beats Fable on Terminal-Bench and DeepSWE and trails by
-    /// 0.8pt on SWE-Bench-Pro) at half the price and cost_rank 4 vs 5, so
-    /// cost-aware `auto` prefers Opus and Fable wins via pins, planner globs,
-    /// and escalation. That restores the original routing intent — the narrow
-    /// pre-calibration gap existed precisely so Opus won the everyday work —
-    /// which the Opus 4.8 benchmark proxy had silently inverted. Grok 4.5
-    /// stays below both.
+    /// The Fable/Opus and Sol/Terra pairs are COMPRESSED (see
+    /// `benchmark_scoring.compression` in data/model-policy.yaml): the
+    /// preferred member keeps its calibrated scores and the cheaper sibling
+    /// is pinned a deliberate hair below on every class, so cost_rank routes
+    /// everyday work to the cheaper member while ordering-sensitive paths
+    /// (apex complexity, escalation/auto-upgrade fallback, planner globs)
+    /// still resolve to the preferred one. Assert BOTH the order AND the gap
+    /// width: the previous ordering-only guard let the Opus 4.8 proxy blow
+    /// the intended ~0.02 gap out to 1.0 without any test noticing, which
+    /// silently handed all of `auto` to Fable.
     #[test]
-    fn opus5_outranks_grok_and_leads_cost_aware_auto() {
+    fn compressed_pairs_keep_order_and_a_hair_gap() {
+        let t = ScoreTable::builtin();
+        let pairs = [
+            ("claude/claude-fable-5[1m]", "claude/opus[1m]"),
+            ("codex/gpt-5.6-sol", "codex/gpt-5.6-terra"),
+        ];
+        for (ahead_id, behind_id) in pairs {
+            let ahead = t.lookup(&CandidateId::parse(ahead_id).unwrap());
+            let behind = t.lookup(&CandidateId::parse(behind_id).unwrap());
+            for class in TaskClass::ALL {
+                let gap = ahead.quality(class) - behind.quality(class);
+                assert!(
+                    gap > 0.0,
+                    "{ahead_id} must stay ahead of {behind_id} on {class:?} \
+                     ({} vs {})",
+                    ahead.quality(class),
+                    behind.quality(class)
+                );
+                assert!(
+                    gap <= 0.021,
+                    "{ahead_id}−{behind_id} gap on {class:?} must stay compressed \
+                     (≤0.02), got {gap:.3} — a wide gap silently hands all of \
+                     `auto` to the pricier member"
+                );
+            }
+        }
+    }
+
+    /// Opus 5 stays above Grok 4.5 on quality, and the `*opus*` pattern must
+    /// resolve the wire alias `claude-opus-5` identically to the CLI alias.
+    #[test]
+    fn opus5_outranks_grok_and_resolves_both_aliases() {
         let t = ScoreTable::builtin();
         let opus = t.lookup(&CandidateId::parse("claude/opus[1m]").unwrap());
         let grok = t.lookup(&CandidateId::parse("grok/grok-4.5").unwrap());
-        let fable = t.lookup(&CandidateId::parse("claude/claude-fable-5[1m]").unwrap());
         assert_eq!(opus.coding_tier, CodingTier::High);
         assert!(
             opus.quality(TaskClass::CodingGeneral) > grok.quality(TaskClass::CodingGeneral),
@@ -609,13 +641,6 @@ mod score_resolution_tests {
             opus.quality(TaskClass::CodingGeneral),
             grok.quality(TaskClass::CodingGeneral)
         );
-        assert!(
-            opus.quality(TaskClass::CodingGeneral) > fable.quality(TaskClass::CodingGeneral),
-            "opus5 leads the benchmark-calibrated claude ladder ({} vs fable {})",
-            opus.quality(TaskClass::CodingGeneral),
-            fable.quality(TaskClass::CodingGeneral)
-        );
-        // Wire alias `claude-opus-5` and legacy `claude-opus-4` both match `*opus*`.
         let by_api_id = t.lookup(&CandidateId::new("claude", "claude-opus-5"));
         assert_eq!(
             by_api_id.quality(TaskClass::BugFix),
