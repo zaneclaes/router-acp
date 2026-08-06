@@ -2285,6 +2285,9 @@ agents:
         );
         let stuck = select_request_model(&shared, &turn, &kory_code_request(21, FAILING));
         assert_eq!(stuck.event, "escalation");
+        // Fable is the compressed pair's ahead member (top of the table), so a
+        // struggling Fable-pinned session has nowhere higher to go and the
+        // escalation stays in place.
         assert_eq!(stuck.model, "claude-fable-5");
 
         // Verdict TTL is 6 requests, so the next few stay elevated by design; once

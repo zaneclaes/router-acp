@@ -794,10 +794,27 @@ pub struct AutoRouterConfig {
     /// behavior). Only applies when `complexity_scales_tradeoff` is on.
     #[serde(default = "default_min_cost_weight")]
     pub min_cost_weight: f64,
+    /// Classified complexity at/above which ranking goes PURE QUALITY
+    /// (tradeoff-0 semantics: cost term dropped, demand cap bypassed, raw
+    /// benchmark scores decide). This is the break-glass complement to the
+    /// score table's compressed peer pairs: everyday and hard work resolves
+    /// tie-breaks toward the cheaper peer, but at the extreme tail —
+    /// novel/severe-risk work, a fix that has survived multiple failed
+    /// rounds — the preferred member of a pair (Fable over Opus, Sol over
+    /// Terra) must remain reachable by `auto` itself, not only via explicit
+    /// pins and planner globs. The misrouting cost of a failed frontier task
+    /// dwarfs the seat-price difference out there. Values above 1.0 disable
+    /// (classified complexity is clamped to 1.0).
+    #[serde(default = "default_apex_complexity")]
+    pub apex_complexity: f64,
 }
 
 fn default_min_cost_weight() -> f64 {
     0.15
+}
+
+fn default_apex_complexity() -> f64 {
+    0.9
 }
 
 fn default_tradeoff() -> f64 {
@@ -820,6 +837,7 @@ impl Default for AutoRouterConfig {
             allowed_candidates: default_allowed(),
             complexity_scales_tradeoff: true,
             min_cost_weight: default_min_cost_weight(),
+            apex_complexity: default_apex_complexity(),
         }
     }
 }

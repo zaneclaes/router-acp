@@ -305,7 +305,7 @@ Update (with `--apply`):
 
 1. **Exact discovery CLIs** for claude/codex need a short spike — document actual commands in the PR.
 2. **Sol still scores above rebalanced fable** on most classes while comments say "≈ fable" — updater should flag drift; choose whether to re-normalize sol in the first apply.
-3. **Escalation +0.05 gate** vs **≤0.02 frontier compression** means auto-upgrade cannot climb fable from opus — document as intentional or follow-up.
+3. ~~**Escalation +0.05 gate** vs **≤0.02 frontier compression** means auto-upgrade cannot climb fable from opus~~ — **resolved**: both `upgrade_target` (the confidence-drop auto-upgrade active under `router: auto`) and `escalation_target` (the `router: escalation` ladder/leap) fall back to the best strictly-higher candidate when nothing clears the +0.05 margin, so a struggling Opus/Terra session still reaches Fable/Sol across the compressed gap. The llm_proxy per-request path never had the gate (`strongest_model` is an ungated max). See `kory-code/ROUTING.md` in the hickory-ai monorepo for the implementation record.
 4. **Provenance fields** need either comments-only or a Rust schema change (deny_unknown_fields).
 5. **Project ownership:** ship in `zaneclaes/router-acp` (not hickory monorepo).
 

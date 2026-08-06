@@ -23,7 +23,7 @@ from update_models import benchmarks, cli  # noqa: E402
 from update_models import patterns as pat  # noqa: E402
 from update_models import discover, goose, provenance, score, validate  # noqa: E402
 from update_models.catalog import parse_catalog  # noqa: E402
-from update_models.policy import TASK_CLASSES, load_policy  # noqa: E402
+from update_models.policy import TASK_CLASSES, PolicyError, load_policy  # noqa: E402
 from update_models.scores_file import parse_scores, parse_scores_text  # noqa: E402
 
 POLICY_PATH = REPO / "data" / "model-policy.yaml"
@@ -276,6 +276,44 @@ class ScoreProposalTest(unittest.TestCase):
             profiles["*sol*"].quality["BugFix"],
             "task evidence may reverse the aggregate order when the delta is meaningful",
         )
+
+    def test_compression_pins_behind_to_ahead_minus_max_gap(self):
+        profiles = benchmarks.derive(self.policy)
+        compression = self.policy.benchmark_scoring["compression"]
+        gap = compression["max_gap"]
+        for pair in compression["pairs"]:
+            ahead, behind = profiles[pair["ahead"]], profiles[pair["behind"]]
+            self.assertAlmostEqual(behind.default_quality, ahead.default_quality - gap, places=2)
+            for task_class in TASK_CLASSES:
+                self.assertAlmostEqual(
+                    behind.quality[task_class],
+                    ahead.quality[task_class] - gap,
+                    places=2,
+                    msg=f"{pair['behind']}/{task_class}",
+                )
+
+    def test_compression_supersedes_raw_evidence_not_the_ahead_side(self):
+        # The `ahead` member of a declared pair keeps its own calibrated
+        # scores untouched; only `behind`'s OUTPUT is overwritten.
+        profiles = benchmarks.derive(self.policy)
+        raw = dict(self.policy.benchmark_scoring["model_evidence"])
+        uncompressed_opus = benchmarks._calibrate(
+            79.2, self.policy.benchmark_scoring["benchmarks"]["SWE-Bench-Pro"]["anchors"],
+            self.policy.quality_band,
+        )
+        self.assertNotEqual(
+            profiles["*opus*"].default_quality,
+            uncompressed_opus,
+            "compression must overwrite the behind side's own evidence-derived output",
+        )
+        self.assertEqual(raw["*opus*"][0]["result"], 79.2, "raw evidence log is untouched")
+
+    def test_compression_pair_referencing_unscored_pattern_is_a_policy_error(self):
+        self.policy.benchmark_scoring["compression"]["pairs"].append(
+            {"ahead": "*fable*", "behind": "*does-not-exist*"}
+        )
+        with self.assertRaises(PolicyError):
+            benchmarks.derive(self.policy)
 
     def test_suggested_pattern_can_never_swallow_an_existing_family(self):
         # The deterministic default is the whole id: specific enough that it can

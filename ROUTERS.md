@@ -147,6 +147,19 @@ Two behaviors make `auto` feel smart:
    classifies above the floor, candidates below the 75th-percentile quality
    for that task class are dropped *before* scoring — cheap models can't
    even compete for genuinely hard work.
+4. **The apex carve-out** (`apex_complexity`, default 0.9): at/above this
+   complexity, ranking goes pure quality (tradeoff forced to 0, demand cap
+   bypassed) — the same regime as `cost_quality_tradeoff: 0`, but automatic
+   at genuine extremes rather than requiring a global config change. This
+   matters most for a **compressed** score-table pair (see
+   `data/model-policy.yaml`'s `benchmark_scoring.compression`): two peers
+   whose priced tiers differ but whose raw benchmark evidence is within
+   noise get a deliberately tiny (`max_gap`, default 0.02) quality gap so
+   `cost_rank` decides everyday ties — but that gap is too small to survive
+   even a modest cost term, so without the apex carve-out the preferred
+   member would only be reachable via explicit pins or planner globs, never
+   by `auto` itself. At the apex, the full (still small but now undiluted)
+   gap decides.
 
 Ties break deterministically: higher utility, then lower effective cost,
 then config order.
@@ -161,6 +174,7 @@ routers:
                                   # 3 suits flat-rate seats (quality-leaning)
     complexity_floor: 0.7         # quality gate threshold
     complexity_scales_tradeoff: true
+    apex_complexity: 0.9          # pure-quality carve-out for extreme work
     allowed_candidates: ["*"]     # glob allowlist, e.g. ["claude/*"]
 
 agents:

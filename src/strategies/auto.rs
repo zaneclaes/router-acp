@@ -116,11 +116,19 @@ impl RouterStrategy for AutoStrategy {
 
         // 4. Utility scoring. The tradeoff optionally scales down with
         //    classified complexity: scarcity matters for trivial prompts,
-        //    quality dominates hard ones.
+        //    quality dominates hard ones. At/above `apex_complexity` the
+        //    ranking goes pure quality (tradeoff 0): the score table's
+        //    compressed peer pairs hand everyday tie-breaks to the cheaper
+        //    member, and the apex is the break-glass where the preferred
+        //    member (Fable/Sol) must stay reachable by `auto` itself —
+        //    misrouting a novel/severe-risk task costs more than the seat.
+        let apex = ctx.profile.complexity.clamp(0.0, 1.0) >= self.cfg.apex_complexity;
         let min_cost = pool.iter().map(|c| c.cost_rank).min().unwrap_or(1) as f64;
         let max_cost = pool.iter().map(|c| c.cost_rank).max().unwrap_or(1) as f64;
         let base_tradeoff = self.cfg.cost_quality_tradeoff.clamp(0.0, 10.0);
-        let tradeoff = if self.cfg.complexity_scales_tradeoff {
+        let tradeoff = if apex {
+            0.0
+        } else if self.cfg.complexity_scales_tradeoff {
             let scaled = base_tradeoff * (1.0 - ctx.profile.complexity.clamp(0.0, 1.0));
             // Floor the scaled tradeoff so a complexity-1.0 classification
             // can't zero the cost term (pure quality-max routes everything
@@ -166,7 +174,13 @@ impl RouterStrategy for AutoStrategy {
         let mut scored = scored;
         sort_ranked(&mut scored);
         let class = ctx.profile.class;
-        let scaled_note = if (base_tradeoff - tradeoff).abs() > 0.05 {
+        let scaled_note = if apex {
+            format!(
+                " · apex complexity {:.2} >= {:.2}: pure quality (tradeoff {base_tradeoff:.0}→0)",
+                ctx.profile.complexity.clamp(0.0, 1.0),
+                self.cfg.apex_complexity
+            )
+        } else if (base_tradeoff - tradeoff).abs() > 0.05 {
             format!(" · tradeoff {base_tradeoff:.0}→{tradeoff:.1} (complexity-scaled)")
         } else {
             String::new()
@@ -211,6 +225,7 @@ impl RouterStrategy for AutoStrategy {
                     "cost_weight": cost_weight,
                     "base_tradeoff": base_tradeoff,
                     "effective_tradeoff": tradeoff,
+                    "apex": apex,
                     "quality": view.quality,
                     "normalized_quality": quality_utility(view.quality),
                     "task_fit_quality": task_fit_quality(view.quality, quality_demand),
@@ -246,6 +261,9 @@ mod tests {
             // it unless a test opts in.
             complexity_scales_tradeoff: false,
             min_cost_weight: 0.0,
+            // Above any complexity a test sets by default; tests that want
+            // the apex path set it explicitly and lower this.
+            apex_complexity: 1.1,
         }
     }
 
@@ -391,6 +409,75 @@ mod tests {
         assert_eq!(ranked[0].candidate.agent, "claude");
     }
 
+    /// The break-glass for a compressed peer pair: below the apex, a real
+    /// price gap out-votes a deliberately tiny quality gap; at/above it,
+    /// quality alone decides and the compressed-ahead candidate wins even
+    /// though it is priced/ranked higher.
+    #[test]
+    fn apex_complexity_lets_a_compressed_pair_reach_its_ahead_member() {
+        let s = AutoStrategy::new(AutoRouterConfig {
+            complexity_scales_tradeoff: true,
+            complexity_floor: 2.0, // keep the p75 gate out of the picture
+            min_cost_weight: 0.25,
+            apex_complexity: 0.9,
+            ..cfg(3.0)
+        });
+        // A compressed pair: "ahead" edges "behind" by 0.02, "behind" is
+        // twice as cheap (cost_rank 4 vs 5) — mirrors fable/opus and sol/terra.
+        let p = vec![
+            view("claude", "ahead", 5, 0, 2.66, CodingTier::High, 1.0),
+            view("claude", "behind", 4, 1, 2.64, CodingTier::High, 1.0),
+        ];
+        let mut context = ctx();
+        // Below the apex: the compressed gap can't outweigh the price gap.
+        context.profile.complexity = 0.5;
+        let ranked = s.rank(&context, &p).unwrap();
+        assert_eq!(
+            ranked[0].candidate.model, "behind",
+            "below apex, the cheaper compressed-behind member wins routine work: {}",
+            ranked[0].reason
+        );
+
+        // At the apex: pure quality, so "ahead" wins despite its cost rank.
+        context.profile.complexity = 0.95;
+        let ranked = s.rank(&context, &p).unwrap();
+        assert_eq!(
+            ranked[0].candidate.model, "ahead",
+            "at apex complexity, the compressed-ahead member must be reachable by auto \
+             itself: {}",
+            ranked[0].reason
+        );
+        assert!(
+            ranked[0].reason.contains("apex complexity"),
+            "{}",
+            ranked[0].reason
+        );
+    }
+
+    #[test]
+    fn apex_complexity_disabled_above_one_never_engages() {
+        let s = AutoStrategy::new(AutoRouterConfig {
+            complexity_scales_tradeoff: true,
+            complexity_floor: 2.0,
+            min_cost_weight: 0.25,
+            apex_complexity: 1.1, // clamp(complexity, 0, 1) can never reach this
+            ..cfg(3.0)
+        });
+        let p = vec![
+            view("claude", "ahead", 5, 0, 2.66, CodingTier::High, 1.0),
+            view("claude", "behind", 4, 1, 2.64, CodingTier::High, 1.0),
+        ];
+        let mut context = ctx();
+        context.profile.complexity = 1.0;
+        let ranked = s.rank(&context, &p).unwrap();
+        assert_eq!(
+            ranked[0].candidate.model, "behind",
+            "apex_complexity > 1.0 must disable the carve-out entirely: {}",
+            ranked[0].reason
+        );
+        assert!(!ranked[0].reason.contains("apex"), "{}", ranked[0].reason);
+    }
+
     #[test]
     fn complexity_scales_tradeoff_toward_quality() {
         let s = AutoStrategy::new(AutoRouterConfig {
@@ -482,6 +569,7 @@ mod tests {
             complexity_scales_tradeoff: true,
             min_cost_weight: 0.15,
             allowed_candidates: vec!["*".into()],
+            apex_complexity: 0.9, // above 0.18 — not the apex path
         });
         let mut pool = vec![
             view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.07),
