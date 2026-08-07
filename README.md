@@ -511,9 +511,11 @@ is failing) still completes without the dead model's help. Three triggers:
   `auto_upgrade.enabled: false` to disable; explicit `switch=` still works.
 - **Skill routing** — `skill_routing` forces skills that need a capable model
   onto a class of candidates. When a prompt invokes a configured skill (as
-  `/name` or a standalone token) and the pinned model isn't in the skill's
-  candidate globs, the session switches to the best available match (pre-pin it
-  steers the initial routing). See [`ROUTERS.md`](ROUTERS.md) for the full model.
+  `/name` or a standalone token) and the pinned model is in neither the skill's
+  `candidates` nor its `also_acceptable` globs, the session switches to the best
+  available `candidates` match (pre-pin it steers the initial routing). A pin
+  listed in `also_acceptable` is left alone but is never a switch target. See
+  [`ROUTERS.md`](ROUTERS.md) for the full model.
 
 ## In-session delegation
 
@@ -716,7 +718,7 @@ example.
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |
 | `auto_upgrade.enabled` | `true` | Auto-switch a pinned session up to a more capable model when confidence drops. `false` disables it (explicit `[router: switch=…]` still works). |
 | `auto_upgrade.confidence_threshold` | `0.55` | Upgrade when confidence (fraction of task capability demand met − struggle) falls below this. Higher = more eager; `0` ≈ never. |
-| `skill_routing[]` | `[]` | Rules forcing a skill onto a model class: `pattern` (skill name, matched as `/name` or a standalone token) → `candidates` (candidate globs in preference order). Mid-session it switches; pre-pin it steers routing. |
+| `skill_routing[]` | `[]` | Rules forcing a skill onto a model class: `pattern` (skill name, matched as `/name` or a standalone token) → `candidates` (switch-target globs in preference order), plus optional `also_acceptable` (globs that are fine to stay pinned on but are never switch targets — for models already good enough that you don't want to route *to*). The pin is left alone if it matches either list; a switch only ever targets `candidates`. Mid-session it switches; pre-pin it steers routing. |
 | `ticket_context[]` | `[]` | Ticket-loading rules: `prefix` (e.g. `HAI-`, matched at a word start + digits) → `command` (argv, `$TICKET` substituted, run without a shell) whose stdout is prepended to the prompt before routing. Pluggable across ticketing systems; fail-open. |
 | `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review→submit protocol. |
 | `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task. |

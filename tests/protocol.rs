@@ -2498,6 +2498,114 @@ async fn skill_routing_switches_off_usage_cordoned_pin() {
     .await;
 }
 
+/// Live bug (measured over 7 days of Kory Code sessions: 19 of 26 skill-forced
+/// switches): a session already pinned to a model that is *better* than
+/// anything in the skill's candidate list got force-switched anyway, purely
+/// because its pin was absent from that list — a full summarize + re-pin,
+/// losing the live context, to land on a LESSER model. `also_acceptable` names
+/// pins that are fine to stay on without making them switch targets.
+#[tokio::test]
+async fn skill_routing_leaves_also_acceptable_pin_alone() {
+    let state = temp_state_file("skill-also-ok");
+    let log = temp_log("skill-also-ok");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m2*\"]\n\
+         \x20   also_acceptable: [\"*m3*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Pin to c/m3 — NOT a switch target, but declared already-acceptable.
+        prompt_text(&cx, &sid, "[router: candidate=c/m3]\nwarm up").await?;
+        let resp = prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("switched"),
+            "also_acceptable pin must not be re-pinned: {text}"
+        );
+        assert!(
+            text.contains("echo:m3:please run ship-pr"),
+            "ship-pr must run on the existing m3 pin: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// The other half of the split: `also_acceptable` is an acceptance set ONLY.
+/// A pin in neither list still switches, and the target comes from
+/// `candidates` — never from `also_acceptable`, however high it scores. This
+/// is what makes the two lists worth having: merging them would fix the
+/// leave-it-alone case above by turning the expensive tier into the default
+/// switch target for every genuine switch.
+#[tokio::test]
+async fn skill_routing_never_switches_to_an_also_acceptable_model() {
+    let state = temp_state_file("skill-also-target");
+    let log = temp_log("skill-also-target");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m2*\"]\n\
+         \x20   also_acceptable: [\"*m3*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Pin to a/m1 — in neither list, so a switch is genuinely warranted.
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+        let resp = prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "switch target must come from candidates: {text}"
+        );
+        assert!(
+            !text.contains("c/m3") && !text.contains("echo:m3:"),
+            "also_acceptable must never be a switch target: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// A pin that becomes usage-cordoned mid-session is proactively switched off
 /// even when the prompt does not invoke a skill (no waiting for a rate-limit
 /// error to trip reactive failover).

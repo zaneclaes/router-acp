@@ -86,12 +86,20 @@ ticket_context:
     command: ["linear", "issue", "view", "$TICKET"]
 
 # Force skills onto a class of models. When a prompt invokes `pattern`
-# (as `/name` or a standalone token) and the pinned model isn't already in
-# `candidates`, the session switches to the best available match (summarize +
+# (as `/name` or a standalone token) and the pinned model isn't already
+# acceptable, the session switches to the best available match (summarize +
 # re-pin). Candidates are candidate globs in preference order.
+#
+# `candidates` is the switch-TARGET pool. `also_acceptable` (optional) names
+# pins that are fine to stay on but must never be switched to — use it for
+# models already good enough for the skill that you don't want to route to,
+# typically the expensive top of the range. Without it, the only way to stop
+# force-switching a good pin is to widen the target pool, which sends every
+# genuine switch to the most expensive entry.
 skill_routing:
   - pattern: ship-pr
     candidates: ["*opus*", "*gpt-5.5*"]
+    also_acceptable: ["*fable*", "*sol*"]
 
 # Auto-orchestration of multi-part task lists. When a prompt reads as a list
 # (markdown bullets/numbers, inline "(1)(2)", or "first… then… finally…") the

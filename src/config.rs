@@ -397,16 +397,29 @@ pub struct TicketRule {
 
 /// Force prompts that invoke a given skill onto a specific class of models.
 /// When a prompt matches `pattern` (case-insensitive substring, e.g. the
-/// skill name) and the pinned candidate is not in `candidates`, the session
-/// switches to the best routeable candidate that is.
+/// skill name) and the pinned candidate is neither in `candidates` nor in
+/// `also_acceptable`, the session switches to the best routeable candidate in
+/// `candidates`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillRoute {
     /// Substring matched against prompt text (typically the skill name).
     pub pattern: String,
-    /// Acceptable candidate globs (the required "model class"), e.g.
-    /// `["*opus*", "*gpt-5.5*"]`.
+    /// Switch-TARGET globs (the required "model class"), e.g.
+    /// `["*opus*", "*gpt-5.5*"]`. A pin matching one of these is left alone;
+    /// otherwise the best routeable candidate from this list is switched to.
     pub candidates: Vec<String>,
+    /// Globs that are acceptable to STAY on but are never switch targets.
+    ///
+    /// Without this, `candidates` does double duty — the "is the pin already
+    /// fine?" test and the switch-target pool are the same list — so the only
+    /// way to stop force-switching a good pin is to widen the target pool,
+    /// which then makes every *genuine* switch land on the widest entry.
+    /// Models that are already good enough for the skill but that you do not
+    /// want to route *to* (typically the expensive top of the range) belong
+    /// here instead.
+    #[serde(default)]
+    pub also_acceptable: Vec<String>,
 }
 
 /// Automatic orchestration. When a prompt reads as a multi-part task list

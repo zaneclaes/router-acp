@@ -5906,6 +5906,12 @@ async fn dispatch_prompt(
     // matching. A pin that matches `*opus*` but is usage-cordoned (plan at
     // 100%, no overage) must fall through to the next eligible skill
     // candidate (e.g. grok) instead of staying on the dead seat.
+    //
+    // Acceptability and switch targets are DIFFERENT sets: the pin is fine if
+    // it matches `candidates` OR `also_acceptable`, but a switch may only
+    // target `candidates`. Collapsing the two (the pre-`also_acceptable`
+    // behaviour) force-switches an already-better pin onto a lesser model for
+    // no reason other than its absence from the target pool.
     if !orchestrating_now && let Some(route) = detect_skill_route(&shared.cfg, &req.prompt) {
         let (class, excluded, current) = shared
             .with_session(&router_sid, |s| {
@@ -5917,7 +5923,11 @@ async fn dispatch_prompt(
             })
             .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None));
         let already_ok = current.as_ref().is_some_and(|c| {
-            route.candidates.iter().any(|rc| candidate_matches(rc, c))
+            route
+                .candidates
+                .iter()
+                .chain(route.also_acceptable.iter())
+                .any(|rc| candidate_matches(rc, c))
                 && !is_excluded(c, &excluded)
                 && shared
                     .eligible_views(&RequiredCaps::default(), class)
@@ -6752,6 +6762,46 @@ mod directive_tests {
         assert!(
             detect_skill_route(&cfg, &mention).is_none(),
             "a backticked skill mention must not trigger skill routing"
+        );
+    }
+
+    /// `SkillRoute` is `deny_unknown_fields`, so a fleet whose binary predates
+    /// `also_acceptable` hard-fails on a config that uses it — the field and
+    /// the config that sets it must ship together. The converse must stay
+    /// true forever: an existing config that omits it keeps parsing.
+    #[test]
+    fn skill_route_also_acceptable_is_optional_and_parses() {
+        let agents = "agents:\n\
+             \x20 - name: claude\n\
+             \x20   command: { type: stdio, command: /bin/true }\n\
+             \x20   model_selection: { type: config-option }\n\
+             \x20   models:\n\
+             \x20     - { id: opus, display_name: Opus, cost_rank: 4 }\n";
+        let without = Config::from_yaml(&format!(
+            "router: auto\n\
+             skill_routing:\n\
+             \x20 - pattern: ship-pr\n\
+             \x20   candidates: [\"*opus*\"]\n\
+             {agents}"
+        ))
+        .expect("config without also_acceptable still parses");
+        assert!(
+            without.skill_routing[0].also_acceptable.is_empty(),
+            "omitted also_acceptable defaults to empty"
+        );
+
+        let with = Config::from_yaml(&format!(
+            "router: auto\n\
+             skill_routing:\n\
+             \x20 - pattern: ship-pr\n\
+             \x20   candidates: [\"*opus*\"]\n\
+             \x20   also_acceptable: [\"*fable*\", \"*sol*\"]\n\
+             {agents}"
+        ))
+        .expect("config with also_acceptable parses");
+        assert_eq!(
+            with.skill_routing[0].also_acceptable,
+            vec!["*fable*".to_string(), "*sol*".to_string()]
         );
     }
 
