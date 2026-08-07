@@ -34,7 +34,9 @@ use crate::candidate::{
 use crate::classifier::{
     ClassifierRules, ClassifyInput, automatic_effort, classify, cwd_language_fingerprint,
 };
-use crate::config::{Config, DisclosureMode, EscalationPath, SkillRoute, StrategyKind};
+use crate::config::{
+    Config, DisclosureMode, EscalationPath, RouteSelection, SkillRoute, StrategyKind,
+};
 use crate::downstream::{
     ProcessKey, ProcessTargetSpec, SelectionKind, build_targets, is_auth_required, probe_target,
     start_downstream, verify_model_selected,
@@ -43,6 +45,21 @@ use crate::headroom::HeadroomTracker;
 use crate::relay;
 use crate::state::{PersistedSession, StateFile};
 use crate::strategies::{CandidateView, OverrideSource, RouteContext, make_strategy};
+
+/// Cap on the stored text of a logged prose turn (`user_prompt` /
+/// `agent_response`).
+///
+/// Applied at WRITE time, so it is the hard ceiling on what any later reader —
+/// `transcript_from_logs`, the `transcript` subcommand, the Kory Code UI — can
+/// ever recover. It was 500, which truncated most real turns mid-sentence and
+/// made a handoff transcript promise a fidelity it did not have.
+///
+/// Raising it is cheap because prose rows are rare: on a representative
+/// 1.7 GB state DB, `user_prompt` + `agent_response` together were ~2.2k rows
+/// against ~320k `tool_call` rows, so the added storage is single-digit MB
+/// even at the ceiling. Tool-call summaries are NOT capped here — they carry
+/// their own sizing and are the bulk of the table.
+const LOG_TEXT_CAP: usize = 8_000;
 
 /// Status of one `(agent, model)` candidate.
 #[derive(Debug, Clone, PartialEq)]
@@ -272,11 +289,28 @@ pub struct RouterSession {
     pub saw_adapter_cost: bool,
 }
 
-/// A requested mid-session model switch and why.
+/// What the outgoing model is asked to write when handing a session off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HandoffStyle {
+    /// Full summary: task, decisions, findings, files changed, commands run,
+    /// what remains. The right default when the incoming model must continue
+    /// mid-thought and cannot re-derive that state.
+    #[default]
+    Full,
+    /// Terse briefing: the task, the single identifier it operates on, and any
+    /// decision NOT re-derivable from the repository. Chosen by a
+    /// `terse_handoff` skill route (see `config::SkillRoute`).
+    Terse,
+}
+
+/// A requested mid-session model switch, why, and how to brief the target.
 #[derive(Debug, Clone)]
 pub struct SwitchRequest {
     pub target: CandidateId,
     pub reason: String,
+    /// How much context to carry across. Every switch except a `terse_handoff`
+    /// skill route wants `Full`.
+    pub handoff: HandoffStyle,
 }
 
 impl RouterSession {
@@ -1359,6 +1393,7 @@ fn note_tool_activity(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, ro
         s.escalation_requested = Some(SwitchRequest {
             target: target.clone(),
             reason: format!("escalation: {n}+ tool calls in one turn without finishing"),
+            handoff: HandoffStyle::Full,
         });
     });
     if let Some(conn) = shared.target_conn(key) {
@@ -1395,6 +1430,7 @@ fn note_tool_failure(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, rou
         s.escalation_requested = Some(SwitchRequest {
             target: target.clone(),
             reason: format!("escalation: {n}+ tool failures mid-turn — the model is struggling"),
+            handoff: HandoffStyle::Full,
         });
     });
     if let Some(conn) = shared.target_conn(key) {
@@ -1484,6 +1520,7 @@ fn note_investigation(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, ro
             reason: format!(
                 "escalation: {reads}+ investigation reads before any output — deeper than it looked"
             ),
+            handoff: HandoffStyle::Full,
         });
     });
     // Interrupt the in-flight cheap turn; the failover loop takes over.
@@ -3290,7 +3327,7 @@ async fn send_prompt_with_failover(
         .with_session(&router_sid, |s| s.pending_switch.take())
         .flatten()
     {
-        match switch_pin(&shared, &router_sid, &sw.target, &sw.reason).await {
+        match switch_pin(&shared, &router_sid, &sw.target, &sw.reason, sw.handoff).await {
             Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
             Ok(_) => {}
             Err(e) => notify_user(
@@ -3336,7 +3373,7 @@ async fn send_prompt_with_failover(
                 &crate::state::LogEntry {
                     kind: "user_prompt".to_string(),
                     role: "user".to_string(),
-                    summary: prompt_text.chars().take(500).collect(),
+                    summary: prompt_text.chars().take(LOG_TEXT_CAP).collect(),
                     tokens_input: crate::state::estimate_tokens(&prompt_text),
                     tokens_estimated: true,
                     ..Default::default()
@@ -3421,7 +3458,7 @@ async fn send_prompt_with_failover(
                 s.elevation = Some("escalation".to_string());
                 s.quiet_turns = 0;
             });
-            match switch_pin(&shared, &router_sid, &esc.target, &esc.reason).await {
+            match switch_pin(&shared, &router_sid, &esc.target, &esc.reason, esc.handoff).await {
                 Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
                 Ok(_) => {}
                 Err(e) => notify_user(
@@ -3451,7 +3488,7 @@ async fn send_prompt_with_failover(
                     &crate::state::LogEntry {
                         kind: "agent_response".to_string(),
                         role: "agent".to_string(),
-                        summary: output.chars().take(500).collect(),
+                        summary: output.chars().take(LOG_TEXT_CAP).collect(),
                         detail: Some(
                             serde_json::json!({"stop_reason": format!("{:?}", resp.stop_reason)}),
                         ),
@@ -3561,7 +3598,8 @@ async fn send_prompt_with_failover(
                 if overflowed {
                     let transcript = transcript_from_logs(&shared, &router_sid);
                     if !transcript.trim().is_empty() {
-                        let framed = frame_transcript(&candidate, &transcript);
+                        let cmd = transcript_command(&shared, &router_sid);
+                        let framed = frame_transcript(&candidate, &transcript, &cmd);
                         shared.with_session(&router_sid, |s| s.pending_context = Some(framed));
                     }
                 }
@@ -3651,6 +3689,57 @@ pub(crate) fn first_eligible_candidate(
                 .then(b.config_index.cmp(&a.config_index))
         })
         .map(|(v, _)| v.id.clone())
+}
+
+/// Pick the FIRST `patterns` entry that has any eligible candidate behind it,
+/// resolving ties *within* that one glob by preference-adjusted quality.
+///
+/// The counterpart of `first_eligible_candidate`, which maxes quality across
+/// the whole list and so treats list order as a mere tie-break. Here order is
+/// the decision: a route can name a seat the score table would never pick
+/// (a flat-rate seat, or a cross-lineage one for review value) and still get
+/// automatic fallthrough to the next glob when that seat is cordoned,
+/// excluded, or simply not declared.
+fn first_matching_pattern_candidate(
+    shared: &Arc<Shared>,
+    patterns: &[String],
+    class: TaskClass,
+    excluded: &[String],
+) -> Option<CandidateId> {
+    let views = shared.eligible_views(&RequiredCaps::default(), class);
+    patterns.iter().find_map(|pat| {
+        views
+            .iter()
+            .filter(|v| !is_excluded(&v.id, excluded))
+            .filter(|v| candidate_matches(pat, &v.id))
+            .max_by(|a, b| {
+                (a.quality + a.preference)
+                    .partial_cmp(&(b.quality + b.preference))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.config_index.cmp(&a.config_index))
+            })
+            .map(|v| v.id.clone())
+    })
+}
+
+/// Resolve a skill route's switch target under its configured selection
+/// strategy. Both arms draw from the same eligibility/cordon-filtered pool, so
+/// a `first-match` route never lands on a dead seat — it just gets to express
+/// a preference the quality scores do not.
+fn select_route_target(
+    shared: &Arc<Shared>,
+    route: &SkillRoute,
+    class: TaskClass,
+    excluded: &[String],
+) -> Option<CandidateId> {
+    match route.selection {
+        RouteSelection::BestQuality => {
+            first_eligible_candidate(shared, &route.candidates, class, excluded)
+        }
+        RouteSelection::FirstMatch => {
+            first_matching_pattern_candidate(shared, &route.candidates, class, excluded)
+        }
+    }
 }
 
 /// Resolve a loose model reference (from the `model:` shorthand) to the best
@@ -4208,6 +4297,7 @@ fn maybe_trigger_orchestration(
                 s.pending_switch = Some(SwitchRequest {
                     target: planner2,
                     reason: format!("orchestration of {what} ({why})"),
+                    handoff: HandoffStyle::Full,
                 });
             });
             notify_user(
@@ -4351,6 +4441,7 @@ fn maybe_demote(shared: &Arc<Shared>, router_sid: &str) {
         s.pending_switch = Some(SwitchRequest {
             target: target.clone(),
             reason: reason.clone(),
+            handoff: HandoffStyle::Full,
         });
         s.elevation = None;
         s.quiet_turns = 0;
@@ -4439,6 +4530,7 @@ fn update_confidence_and_maybe_upgrade(
                 reason: format!(
                     "auto-upgrade: confidence {confidence:.2} below threshold {threshold:.2}"
                 ),
+                handoff: HandoffStyle::Full,
             });
             s.elevation = Some("auto-upgrade".to_string());
             s.quiet_turns = 0;
@@ -4502,6 +4594,7 @@ fn escalation_post_turn(
         s.pending_switch = Some(SwitchRequest {
             target: target.clone(),
             reason: reason.clone(),
+            handoff: HandoffStyle::Full,
         });
         s.escalations_done += 1;
         s.elevation = Some("escalation".to_string());
@@ -4523,6 +4616,47 @@ const HANDOFF_SUMMARY_INSTRUCTION: &str = "You are about to hand this conversati
      commands run), and exactly what remains to be done. Do not continue the \
      task — only summarize.";
 
+/// The terse counterpart, used by a `terse_handoff` skill route. The incoming
+/// model is about to run a named workflow that re-derives its own state, so a
+/// narrative summary is not just unnecessary — it is a liability: a long
+/// session may mention several PRs, branches and abandoned approaches, and the
+/// briefing is where the wrong one gets picked up. Ask for one referent, not a
+/// story, and make "unknown" an explicitly allowed answer so the outgoing
+/// model does not fill the slot with a guess.
+const HANDOFF_TERSE_INSTRUCTION: &str = "You are about to hand this conversation off to a different model, \
+     which will CONTINUE this work by running a named skill/workflow from the \
+     start. Do not summarize the conversation. Write at most three short \
+     lines:\n\
+     1. TASK: the work to be done, in one line, naming the skill or workflow \
+     if one is in play.\n\
+     2. SUBJECT: the single concrete identifier it operates on (PR number, \
+     branch, ticket) — write `unknown` if none is established. Never guess, \
+     and never list more than one; if several came up, name only the one this \
+     work is on.\n\
+     3. NOT RE-DERIVABLE: any decision already made that the new model could \
+     NOT rediscover from the repository — e.g. a review finding judged a false \
+     positive, or a flaky test agreed to be re-run. Write `none` if there is \
+     nothing.\n\
+     Omit files changed, commands run, and findings — the new model re-derives \
+     those. Do not continue the task.";
+
+/// The command the incoming model can run to read the full prior transcript.
+///
+/// Resolved at switch time from this process's own binary path and the live
+/// state-file path, so the pointer is runnable as printed — no config path to
+/// discover, no `sqlite3` binary required (dev boxes do not ship one), and no
+/// assumption that `router-acp` is on the downstream agent's `PATH`.
+fn transcript_command(shared: &Arc<Shared>, router_sid: &str) -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "router-acp".to_string());
+    format!(
+        "{exe} transcript --state {} --session {router_sid}",
+        shared.cfg.state_file.display()
+    )
+}
+
 /// Strip a leading goose `<turn-context>…</turn-context>` preamble and trim,
 /// so a logged user turn reads as the user's actual words.
 fn clean_turn_text(s: &str) -> String {
@@ -4535,13 +4669,21 @@ fn clean_turn_text(s: &str) -> String {
 
 /// Reconstruct a truncated transcript of the prior conversation from the state
 /// DB logs — the fallback handoff used when the outgoing model cannot
-/// summarize (offline, token-limited, refused, or crashed). Each logged turn
-/// is already capped (~500 chars), so this is lossy but self-contained and
-/// needs nothing from the old model. Returns `""` when there is nothing to
-/// carry over. Prefers the most recent turns when over budget.
+/// summarize (offline, token-limited, refused, or crashed). Lossy but
+/// self-contained: it needs nothing from the old model. Returns `""` when
+/// there is nothing to carry over. Prefers the most recent turns when over
+/// budget.
+///
+/// `PER_TURN_CHARS` is this reader's own cap, deliberately far below the
+/// storage cap (`LOG_TEXT_CAP`): the output is injected into the incoming
+/// model's context, so BREADTH of turns beats depth of any one turn. Without
+/// it, raising the storage cap would silently shrink this transcript to one or
+/// two full-length turns against the same `MAX_CHARS` budget. The full,
+/// uncapped text stays available out-of-band via the `transcript` subcommand.
 fn transcript_from_logs(shared: &Arc<Shared>, router_sid: &str) -> String {
     const MAX_TURNS: usize = 40;
     const MAX_CHARS: usize = 12_000;
+    const PER_TURN_CHARS: usize = 500;
     let entries = shared.state.lock().unwrap().log_for(router_sid, 500);
     let turns: Vec<String> = entries
         .iter()
@@ -4553,7 +4695,13 @@ fn transcript_from_logs(shared: &Arc<Shared>, router_sid: &str) -> String {
                 "Assistant"
             };
             let text = clean_turn_text(&e.summary);
-            (!text.is_empty()).then(|| format!("{who}: {text}"))
+            (!text.is_empty()).then(|| {
+                let mut clipped: String = text.chars().take(PER_TURN_CHARS).collect();
+                if clipped.chars().count() < text.chars().count() {
+                    clipped.push('…');
+                }
+                format!("{who}: {clipped}")
+            })
         })
         .collect();
     if turns.is_empty() {
@@ -4596,26 +4744,54 @@ fn frame_summary(from: &CandidateId, summary: &str) -> String {
 
 /// Frame a log-reconstructed transcript as a context block (the fallback when
 /// the previous model could not summarize).
-fn frame_transcript(from: &CandidateId, transcript: &str) -> String {
+fn frame_transcript(from: &CandidateId, transcript: &str, transcript_cmd: &str) -> String {
     format!(
         "[Handoff context — the previous model ({from}) was unavailable to summarize, so this is \
          a truncated transcript of the prior session reconstructed from router-acp's logs (each \
-         turn is capped at ~500 characters, so detail may be lost). Treat it as established \
-         context for continuing the work.]\n\n{transcript}\n\n\
+         turn is capped, so detail may be lost). Treat it as established context for continuing \
+         the work. The FULL log, including tool calls, is available by running:\n\
+         \x20   {transcript_cmd}\n\
+         ]\n\n{transcript}\n\n\
+         [End of handoff context. The user's message follows.]"
+    )
+}
+
+/// Frame a terse briefing as a context block.
+///
+/// Deliberately unlike `frame_summary`: it tells the incoming model that the
+/// briefing is INCOMPLETE by design, that concrete state must be re-derived
+/// from the repository rather than inferred from the words above, and where to
+/// get the full record if it needs one. The "verify before you act on an
+/// identifier" line is the load-bearing part — the failure mode this whole
+/// path exists to avoid is a confident model acting on the wrong PR.
+fn frame_terse(from: &CandidateId, briefing: &str, transcript_cmd: &str) -> String {
+    format!(
+        "[Handoff context — you are picking up work in progress from {from}. This is a \
+         deliberately TERSE briefing, not a summary: it carries the task, its subject, and \
+         anything not re-derivable from the repository, and nothing else.\n\
+         Re-derive concrete state yourself (git status/log, `gh pr view` on the current branch, \
+         the ticket) rather than assuming it. Verify any identifier below before you act on it, \
+         and if it reads `unknown`, resolve it from the repository — do not guess.\n\
+         The full prior transcript, including tool calls, is available if you need detail this \
+         briefing omits:\n\
+         \x20   {transcript_cmd}\n\
+         ]\n\n{briefing}\n\n\
          [End of handoff context. The user's message follows.]"
     )
 }
 
 /// Switch a pinned session to `target` mid-conversation: ask the current
-/// model to summarize the work, open a fresh downstream session on the
-/// target, seed it with that summary (prepended to the next prompt), re-pin,
+/// model to brief its successor, open a fresh downstream session on the
+/// target, seed it with that briefing (prepended to the next prompt), re-pin,
 /// and close the old session. Context does not transfer via ACP, so the
-/// summary IS the handoff. Returns the switch disclosure lines.
+/// briefing IS the handoff. `style` chooses how much of it to carry — see
+/// `HandoffStyle`. Returns the switch disclosure lines.
 async fn switch_pin(
     shared: &Arc<Shared>,
     router_sid: &str,
     target: &CandidateId,
     reason: &str,
+    style: HandoffStyle,
 ) -> Result<Vec<String>, AcpError> {
     // Read the pin directly (not `pinned_route`, which requires a *live*
     // downstream): an outage may have killed the old process, and we still
@@ -4656,9 +4832,13 @@ async fn switch_pin(
     let summary = if let Some(conn) = &live_conn {
         let buffer = Arc::new(Mutex::new(String::new()));
         shared.with_session(router_sid, |s| s.capturing_summary = Some(buffer.clone()));
+        let instruction = match style {
+            HandoffStyle::Full => HANDOFF_SUMMARY_INSTRUCTION,
+            HandoffStyle::Terse => HANDOFF_TERSE_INSTRUCTION,
+        };
         let summary_prompt = PromptRequest::new(
             old_down_sid.clone(),
-            vec![ContentBlock::from(HANDOFF_SUMMARY_INSTRUCTION.to_string())],
+            vec![ContentBlock::from(instruction.to_string())],
         );
         let class = shared
             .with_session(router_sid, |session| session.task_class)
@@ -4700,18 +4880,30 @@ async fn switch_pin(
     };
 
     // Framed handoff block + a kind tag for the disclosure.
-    let (handoff, handoff_note): (Option<String>, &str) = match summary {
-        Some(s) => (
+    let transcript_cmd = transcript_command(shared, router_sid);
+    let (handoff, handoff_note): (Option<String>, &str) = match (summary, style) {
+        (Some(s), HandoffStyle::Terse) => (
+            Some(frame_terse(&old_candidate, &s, &transcript_cmd)),
+            "briefed by the previous model (terse; state re-derived from the repo)",
+        ),
+        (Some(s), HandoffStyle::Full) => (
             Some(frame_summary(&old_candidate, &s)),
             "summarized by the previous model",
         ),
-        None => {
+        // A failed briefing degrades to the log transcript regardless of
+        // style: a terse route still needs the new model to know what it is
+        // picking up, and the transcript needs nothing from the dead model.
+        (None, _) => {
             let transcript = transcript_from_logs(shared, router_sid);
             if transcript.trim().is_empty() {
                 (None, "no prior context was available to carry over")
             } else {
                 (
-                    Some(frame_transcript(&old_candidate, &transcript)),
+                    Some(frame_transcript(
+                        &old_candidate,
+                        &transcript,
+                        &transcript_cmd,
+                    )),
                     "previous model unavailable — prior context recovered from logs as a truncated transcript",
                 )
             }
@@ -5637,6 +5829,7 @@ fn on_prompt(
                             s.pending_switch = Some(SwitchRequest {
                                 target: target.clone(),
                                 reason: format!("requested via `{ref_str}:` shorthand"),
+                                handoff: HandoffStyle::Full,
                             });
                         });
                     } else {
@@ -5671,6 +5864,7 @@ fn on_prompt(
                         s.pending_switch = Some(SwitchRequest {
                             target: target.clone(),
                             reason: "requested via [router: switch=…]".to_string(),
+                            handoff: HandoffStyle::Full,
                         });
                     });
                     tracing::info!(session = router_sid, %target, "mid-session switch requested");
@@ -5935,9 +6129,14 @@ async fn dispatch_prompt(
                     .any(|v| &v.id == c)
         });
         if !already_ok {
-            match first_eligible_candidate(&shared, &route.candidates, class, &excluded) {
+            match select_route_target(&shared, route, class, &excluded) {
                 Some(target) => {
                     let pattern = route.pattern.clone();
+                    let handoff = if route.terse_handoff {
+                        HandoffStyle::Terse
+                    } else {
+                        HandoffStyle::Full
+                    };
                     // No-op if somehow already on the picked target (e.g. pin
                     // was outside the skill set but equal by coincidence).
                     if current.as_ref() == Some(&target) {
@@ -5949,6 +6148,7 @@ async fn dispatch_prompt(
                                 reason: format!(
                                     "skill `{pattern}` requires a {target}-class model"
                                 ),
+                                handoff,
                             });
                             s.elevation = Some(format!("skill `{pattern}`"));
                             s.quiet_turns = 0;
@@ -6017,6 +6217,7 @@ async fn dispatch_prompt(
                         s.pending_switch = Some(SwitchRequest {
                             target: target.clone(),
                             reason: reason.clone(),
+                            handoff: HandoffStyle::Full,
                         });
                         // Not an elevation: this is escaping a dead seat, not
                         // climbing the capability ladder.
@@ -6803,6 +7004,49 @@ mod directive_tests {
             with.skill_routing[0].also_acceptable,
             vec!["*fable*".to_string(), "*sol*".to_string()]
         );
+    }
+
+    /// `selection` and `terse_handoff` are additive keys: an existing route
+    /// that predates them must still parse, defaulting to today's behaviour
+    /// (`best-quality`, full summary) rather than failing to load.
+    #[test]
+    fn skill_route_selection_and_terse_handoff_default_and_parse() {
+        let agents = "agents:\n\
+             \x20 - name: claude\n\
+             \x20   command: { type: stdio, command: /bin/true }\n\
+             \x20   model_selection: { type: config-option }\n\
+             \x20   models:\n\
+             \x20     - { id: opus, display_name: Opus, cost_rank: 4 }\n";
+        let without = Config::from_yaml(&format!(
+            "router: auto\n\
+             skill_routing:\n\
+             \x20 - pattern: ship-pr\n\
+             \x20   candidates: [\"*opus*\"]\n\
+             {agents}"
+        ))
+        .expect("config without selection/terse_handoff still parses");
+        assert_eq!(
+            without.skill_routing[0].selection,
+            RouteSelection::BestQuality,
+            "omitted selection defaults to best-quality (today's behaviour)"
+        );
+        assert!(
+            !without.skill_routing[0].terse_handoff,
+            "omitted terse_handoff defaults to false (full summary, today's behaviour)"
+        );
+
+        let with = Config::from_yaml(&format!(
+            "router: auto\n\
+             skill_routing:\n\
+             \x20 - pattern: ship-pr\n\
+             \x20   candidates: [\"*grok*\", \"*opus*\"]\n\
+             \x20   selection: first-match\n\
+             \x20   terse_handoff: true\n\
+             {agents}"
+        ))
+        .expect("config with selection/terse_handoff parses");
+        assert_eq!(with.skill_routing[0].selection, RouteSelection::FirstMatch);
+        assert!(with.skill_routing[0].terse_handoff);
     }
 
     #[test]

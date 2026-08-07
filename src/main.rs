@@ -51,6 +51,23 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Dump the FULL interaction log for one router session, including tool
+    /// calls (which `Sessions --session` omits and the in-conversation
+    /// log-transcript handoff drops entirely). Needs only the state DB, not a
+    /// full router config, so a downstream agent picking up a handoff can run
+    /// it standalone — this is the command a `terse_handoff` skill route
+    /// hands the incoming model.
+    Transcript {
+        /// Path to the state DB (router.yaml's `state_file`, tilde-expanded).
+        #[arg(long)]
+        state: PathBuf,
+        /// The router session id to dump.
+        #[arg(long)]
+        session: String,
+        /// Max log entries to include (default: effectively unbounded).
+        #[arg(long, default_value_t = 100_000)]
+        limit: usize,
+    },
     /// Summarize orchestrated runs: planner vs delegate cost/compute, whether
     /// sub-tasks were actually delegated, and whether orchestration degraded to
     /// the adapter's built-in sub-agent tool.
@@ -211,6 +228,62 @@ async fn main() -> anyhow::Result<()> {
                             s.title.as_deref().unwrap_or("")
                         );
                     }
+                }
+            }
+            Ok(())
+        }
+        Command::Transcript {
+            state,
+            session,
+            limit,
+        } => {
+            // No `--config` here by design (see the subcommand's doc comment):
+            // this must run standalone from a bare state-file path, without a
+            // resolved router.yaml. That means the configured retention
+            // window is unknown — passing the library default would prune
+            // this DB against the WRONG window on open if the real config
+            // set something longer, silently deleting sessions this
+            // inspection-only command has no business touching. Load with an
+            // effectively-infinite retention instead: `prune_at` computes its
+            // cutoff via `now.saturating_sub(max_age.as_secs())`, so
+            // `Duration::MAX` saturates to a cutoff of 0 and nothing is ever
+            // pruned by this path.
+            let never_prune = router_acp::state::Retention {
+                max_age: std::time::Duration::MAX,
+            };
+            let path = router_acp::config::expand_tilde(&state);
+            let state = router_acp::state::StateFile::load(&path, never_prune);
+            let entries = state.log_for(&session, limit.max(1));
+            if entries.is_empty() {
+                println!(
+                    "no log entries for session {session} in {} (wrong --state path, or the \
+                     session was pruned/never existed)",
+                    path.display()
+                );
+                return Ok(());
+            }
+            println!(
+                "transcript for session {session} ({} entries):\n",
+                entries.len()
+            );
+            for e in entries {
+                let est = if e.tokens_estimated { "~" } else { "" };
+                let model = e.model.as_deref().unwrap_or("");
+                println!(
+                    "[{}/{}{}] {}  (in {}{est} / out {}{est})",
+                    e.role,
+                    e.kind,
+                    if model.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {model}")
+                    },
+                    e.summary.replace('\n', " "),
+                    e.tokens_input,
+                    e.tokens_output
+                );
+                if let Some(detail) = &e.detail {
+                    println!("    detail: {detail}");
                 }
             }
             Ok(())

@@ -647,6 +647,19 @@ degraded% — with:
 router-acp report --config router.yaml
 ```
 
+Read one session's **full** interaction log — including tool calls and their
+detail, which `sessions --session` omits — with:
+
+```sh
+router-acp transcript --state ~/.local/state/router-acp/sessions.db --session rtr-…
+```
+
+This takes the state DB path directly rather than a `--config`, so it runs
+standalone: a model that has just been handed a session (see `terse_handoff` in
+[ROUTERS.md](ROUTERS.md)) can read what its briefing omitted without a router
+config, and without `sqlite3` installed. Handoff briefings embed this command
+already resolved to the running binary and live state file.
+
 ## Install and run
 
 ```sh
