@@ -403,23 +403,63 @@ Three ways it happens:
    ```yaml
    skill_routing:
      - pattern: ship-pr            # matches "/ship-pr" or the token "ship-pr"
-       candidates: ["*opus*", "*gpt-5.5*"]   # switch TO these; first eligible wins
+       candidates: ["*opus*", "*gpt-5.5*"]   # switch TO these
        also_acceptable: ["*fable*", "*sol*"] # already here? leave the pin alone
    ```
 
-   Candidates are candidate globs (a *class*), tried in order; if none are
-   routeable (cordoned, down, excluded) the session keeps its current model and
-   says so, rather than blocking.
+   Candidates are candidate globs (a *class*); if none are routeable (cordoned,
+   down, excluded) the session keeps its current model and says so, rather than
+   blocking.
 
    **`candidates` and `also_acceptable` are different sets on purpose.** The
    pin is left alone if it matches *either*, but a switch may only target
    `candidates`. Without the split, one list has to answer two questions — "is
    the current pin good enough?" and "what do we switch to?" — and the only way
    to stop force-switching an already-better pin is to add it to the list,
-   which then makes it the switch target for every genuine switch (targets are
-   picked by highest quality). Put models that are fine to *stay* on but that
-   you don't want to route *to* — typically the expensive top of the range — in
-   `also_acceptable`.
+   which then makes it the switch target for every genuine switch. Put models
+   that are fine to *stay* on but that you don't want to route *to* — typically
+   the expensive top of the range — in `also_acceptable`.
+
+   **`selection` decides how a target is picked from `candidates`.**
+
+   ```yaml
+   skill_routing:
+     - pattern: ship-pr
+       selection: first-match      # default: best-quality
+       candidates: ["*grok*", "*opus*", "*gpt-5.5*"]
+       also_acceptable: ["*fable*", "*sol*"]
+       terse_handoff: true
+   ```
+
+   - `best-quality` (default) — highest `quality + preference` wins and list
+     order is only a tie-break. Right when the globs name interchangeable tiers
+     and you just want the best one that is up.
+   - `first-match` — the FIRST glob with an eligible candidate wins; quality
+     only breaks ties *within* that glob. Use it when list order encodes a
+     preference the score table does not: routing a ship flow to a flat-rate
+     seat, or to a different lineage for cross-vendor review, when a
+     quality-max pick would never select it. Fallthrough still works — both
+     modes draw from the same cordon/eligibility-filtered pool, so a
+     `first-match` route lands on the next glob when its preferred seat is
+     down.
+
+   **`terse_handoff` changes what the outgoing model writes.** A switch cannot
+   transfer context over ACP, so the outgoing model is asked to brief its
+   successor. By default that is a full summary. With `terse_handoff: true` it
+   is instead three lines — the task, the single identifier it operates on
+   (`unknown` is an allowed answer, so the model does not guess), and anything
+   *not* re-derivable from the repository — and the incoming model is told to
+   re-derive concrete state itself and verify identifiers before acting.
+
+   This is **not** a token optimization: the outgoing model reads its whole
+   context to write either one, so the cost is nearly identical. It is a
+   fidelity one. For a skill that re-derives its own state (a ship flow
+   resolving its PR from the current branch), one unambiguous referent beats a
+   narrative that may name three PRs and two abandoned approaches. It also
+   lands the new session near-empty, which matters when the target's context
+   window is smaller than the outgoing model's. When detail is genuinely
+   needed, the briefing carries a runnable `router-acp transcript` command for
+   the full prior log (see below).
 
 All three degrade gracefully: if the target is unavailable the session stays
 put with a visible note. Each switch is recorded in the state file with its

@@ -2606,6 +2606,148 @@ async fn skill_routing_never_switches_to_an_also_acceptable_model() {
     .await;
 }
 
+/// `selection: first-match` picks the FIRST candidates glob with an eligible
+/// seat behind it, even when a later glob scores strictly higher quality —
+/// the whole point of the setting. Without it (the default `best-quality`),
+/// list order is only a tie-break and the higher-quality m3 would win instead.
+#[tokio::test]
+async fn skill_routing_first_match_selection_overrides_quality_order() {
+    let state = temp_state_file("skill-first-match");
+    let log = temp_log("skill-first-match");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-first-match-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // b/m2 is listed first in `candidates` but scores lower than c/m3.
+    // best-quality would pick c/m3; first-match must pick b/m2.
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'b/m2', default_quality: 1.0 }\n\
+         \x20 - { pattern: 'c/m3', default_quality: 3.0 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    selection: first-match\n\
+         \x20   candidates: [\"*m2*\", \"*m3*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+        let resp = prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "first-match must land on the FIRST listed glob, not the highest-quality one: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// `terse_handoff: true` sends the terse briefing instruction instead of the
+/// full summary prompt, and the new model's seeded context is framed as a
+/// terse briefing (not "a summary of the conversation").
+#[tokio::test]
+async fn skill_routing_terse_handoff_sends_brief_instruction() {
+    let state = temp_state_file("skill-terse");
+    let log = temp_log("skill-terse");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m2*\"]\n\
+         \x20   terse_handoff: true\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+        let resp = prompt_text(&cx, &sid, "please run ship-pr on PR 42").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → b/m2"),
+            "skill switch happened: {text}"
+        );
+
+        let prompts: Vec<(String, String)> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "prompt")
+            .map(|e| {
+                (
+                    e["model"].as_str().unwrap_or("").to_string(),
+                    e["text"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        // The old model got the TERSE instruction, not the full-summary one.
+        assert!(
+            prompts
+                .iter()
+                .any(|(m, t)| m == "m1" && t.contains("Do not summarize the conversation")),
+            "old model got the terse briefing instruction, not the full summary prompt: {prompts:?}"
+        );
+        assert!(
+            !prompts
+                .iter()
+                .any(|(m, t)| m == "m1"
+                    && t.contains("Write a concise but complete handoff summary")),
+            "old model must NOT get the full-summary instruction on a terse route: {prompts:?}"
+        );
+        // The new model's seeded context is framed as a terse briefing and
+        // points at the transcript command, not framed as "a summary".
+        assert!(
+            prompts.iter().any(|(m, t)| m == "m2"
+                && t.contains("deliberately TERSE briefing")
+                && t.contains("transcript --state")
+                && t.contains("please run ship-pr on PR 42")),
+            "new model got the terse frame + transcript pointer + prompt: {prompts:?}"
+        );
+        assert!(
+            !prompts
+                .iter()
+                .any(|(m, t)| m == "m2" && t.contains("a summary of the conversation so far")),
+            "new model must not be told this is a full summary: {prompts:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// A pin that becomes usage-cordoned mid-session is proactively switched off
 /// even when the prompt does not invoke a skill (no waiting for a rate-limit
 /// error to trip reactive failover).

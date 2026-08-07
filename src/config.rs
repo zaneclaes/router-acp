@@ -395,11 +395,30 @@ pub struct TicketRule {
     pub command: Vec<String>,
 }
 
+/// How a route picks among the `candidates` globs that have an eligible
+/// candidate behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteSelection {
+    /// Highest `quality + preference` wins, regardless of list order (the
+    /// historical behaviour, and right when the globs name interchangeable
+    /// tiers and you simply want the best one that is up).
+    #[default]
+    BestQuality,
+    /// The FIRST glob with an eligible candidate wins; quality only breaks
+    /// ties *within* that one glob. Use when list order encodes a deliberate
+    /// preference the score table does not — e.g. routing a ship flow to a
+    /// flat-rate or cross-lineage seat that a quality-max pick would never
+    /// select, while still falling through to the next glob when that seat is
+    /// cordoned or excluded.
+    FirstMatch,
+}
+
 /// Force prompts that invoke a given skill onto a specific class of models.
 /// When a prompt matches `pattern` (case-insensitive substring, e.g. the
 /// skill name) and the pinned candidate is neither in `candidates` nor in
-/// `also_acceptable`, the session switches to the best routeable candidate in
-/// `candidates`.
+/// `also_acceptable`, the session switches to a candidate from `candidates`
+/// chosen per `selection`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillRoute {
@@ -407,7 +426,7 @@ pub struct SkillRoute {
     pub pattern: String,
     /// Switch-TARGET globs (the required "model class"), e.g.
     /// `["*opus*", "*gpt-5.5*"]`. A pin matching one of these is left alone;
-    /// otherwise the best routeable candidate from this list is switched to.
+    /// otherwise a candidate from this list is switched to, per `selection`.
     pub candidates: Vec<String>,
     /// Globs that are acceptable to STAY on but are never switch targets.
     ///
@@ -420,6 +439,24 @@ pub struct SkillRoute {
     /// here instead.
     #[serde(default)]
     pub also_acceptable: Vec<String>,
+    /// How to pick among `candidates`. Defaults to `best-quality`, which is
+    /// what every route did before this key existed.
+    #[serde(default)]
+    pub selection: RouteSelection,
+    /// Hand the incoming model a TERSE briefing (the task, the one identifier
+    /// it operates on, and any decision not re-derivable from the repo)
+    /// instead of a full conversation summary.
+    ///
+    /// A handoff summary costs the outgoing model a full read of its own
+    /// context no matter how long the output is, so this is not a token
+    /// optimization — it is a fidelity one. A skill that re-derives its own
+    /// state (a ship flow resolving its PR from the branch) is better served
+    /// by one unambiguous referent than by a narrative that may name three
+    /// PRs and two abandoned approaches; it also lands the new session near
+    /// empty, which matters when the target's context window is smaller than
+    /// the outgoing model's.
+    #[serde(default)]
+    pub terse_handoff: bool,
 }
 
 /// Automatic orchestration. When a prompt reads as a multi-part task list
