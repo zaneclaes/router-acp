@@ -31,11 +31,29 @@ pub struct UsageCordon {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeatAvailability {
     /// Fraction of the seat's plan budget still free for this candidate, in
-    /// [0, 1] (min across the plan windows that cover it).
+    /// [0, 1] (min across the plan windows that cover it). Drives the binary
+    /// gates (`plan_exhausted`, cordons) and is the ranking fallback when no
+    /// dollar figure is obtainable.
     pub plan_headroom: f64,
+    /// Estimated real dollars left in the binding plan window (min across the
+    /// windows that cover this candidate), derived from the router's own
+    /// metered spend vs the window's reported percent. `None` when the
+    /// estimate has too little signal — ranking falls back to the fraction.
+    pub plan_remaining_dollars: Option<f64>,
     /// The plan cap is exhausted and overage/credits are absorbing usage:
     /// still routable, but every turn now spends real money.
     pub on_overage: bool,
+    /// Fraction of the overage/credit pool still free, in [0, 1], when the
+    /// provider meters that pool (Anthropic extra-usage utilization, Codex
+    /// per-member spend limit). `None` = pool unmetered or size unknown.
+    /// Fallback + disclosure only — fractions of differently-sized caps are
+    /// not comparable across seats (a $9k cap at 3% free has 3x the money of
+    /// a $3k cap at 3% free), so ranking prefers the dollar figure below.
+    pub overage_headroom: Option<f64>,
+    /// Real dollars left in the overage/credit pool, straight from the
+    /// provider's usage API (Anthropic `spend`/`extra_usage`, Codex
+    /// `individual_limit`/credit balance). The cross-seat-comparable form.
+    pub overage_remaining_dollars: Option<f64>,
     /// Who reported it: `"poll"` (the router's own usage poller) or `"hint"`
     /// (a client availability hint).
     pub source: &'static str,
@@ -51,6 +69,32 @@ impl SeatAvailability {
     /// preference 0, which a quality edge can still win.
     pub fn plan_exhausted(&self) -> bool {
         self.plan_headroom <= PLAN_HEADROOM_EPSILON && !self.on_overage
+    }
+
+    /// The seat's usable budget for ranking, as a fraction in [0, 1]:
+    /// remaining real dollars saturated at `scale_dollars` (at/above the
+    /// scale the seat reads fully free), so seats are compared by absolute
+    /// money rather than by fractions of differently-sized caps. The free
+    /// plan is the budget while any remains; once the plan is gone and the
+    /// seat is paying, the overage/credit pool is. Where no dollar figure is
+    /// obtainable the reported fraction stands in (better than flattening to
+    /// 0, even though cross-cap fractions are only roughly comparable), and
+    /// a paying seat with a wholly unknown pool reads 0 — the pre-grading
+    /// behavior.
+    pub fn seat_budget(&self, scale_dollars: f64) -> f64 {
+        let scale = scale_dollars.max(f64::MIN_POSITIVE);
+        let plan = self.plan_headroom.clamp(0.0, 1.0);
+        if plan > PLAN_HEADROOM_EPSILON || !self.on_overage {
+            return self
+                .plan_remaining_dollars
+                .map(|d| (d.max(0.0) / scale).min(1.0))
+                .unwrap_or(plan);
+        }
+        self.overage_remaining_dollars
+            .map(|d| (d.max(0.0) / scale).min(1.0))
+            .or(self.overage_headroom)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -574,7 +618,10 @@ mod tests {
 
         let polled = SeatAvailability {
             plan_headroom: 0.6,
+            plan_remaining_dollars: None,
             on_overage: false,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
             source: "poll",
         };
         t.set_polled_availability(HashMap::from([(id.clone(), polled.clone())]));
@@ -582,7 +629,10 @@ mod tests {
 
         let hinted = SeatAvailability {
             plan_headroom: 0.0,
+            plan_remaining_dollars: None,
             on_overage: true,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
             source: "hint",
         };
         t.set_hinted_availability(
@@ -603,7 +653,10 @@ mod tests {
     fn plan_exhausted_excludes_zero_headroom_without_overage() {
         let exhausted = SeatAvailability {
             plan_headroom: 0.0,
+            plan_remaining_dollars: None,
             on_overage: false,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
             source: "poll",
         };
         assert!(exhausted.plan_exhausted());
@@ -612,7 +665,10 @@ mod tests {
         // just paying — not the same as a cordon.
         let paying = SeatAvailability {
             plan_headroom: 0.0,
+            plan_remaining_dollars: None,
             on_overage: true,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
             source: "poll",
         };
         assert!(!paying.plan_exhausted());
@@ -620,7 +676,10 @@ mod tests {
         // Free budget remaining: routable regardless of overage state.
         let free = SeatAvailability {
             plan_headroom: 0.4,
+            plan_remaining_dollars: None,
             on_overage: false,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
             source: "poll",
         };
         assert!(!free.plan_exhausted());
@@ -628,10 +687,131 @@ mod tests {
         // Below the float-compare epsilon still counts as zero.
         let near_zero = SeatAvailability {
             plan_headroom: 1e-10,
+            plan_remaining_dollars: None,
             on_overage: false,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
             source: "poll",
         };
         assert!(near_zero.plan_exhausted());
+    }
+
+    const SCALE: f64 = 200.0;
+
+    #[test]
+    fn seat_budget_grades_the_overage_pool_instead_of_flattening_to_zero() {
+        // Free plan remaining: budget is the plan fraction, regardless of
+        // overage_headroom (not paying yet) — no dollar figure supplied.
+        let free_plan = SeatAvailability {
+            plan_headroom: 0.3,
+            plan_remaining_dollars: None,
+            on_overage: false,
+            overage_headroom: Some(0.9),
+            overage_remaining_dollars: None,
+            source: "poll",
+        };
+        assert!((free_plan.seat_budget(SCALE) - 0.3).abs() < 1e-9);
+
+        // Plan exhausted, paying, overage pool has plenty of dollars left:
+        // saturates to full budget once past the scale.
+        let paying_with_room = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.73),
+            overage_remaining_dollars: Some(6_600.0),
+            source: "poll",
+        };
+        assert!((paying_with_room.seat_budget(SCALE) - 1.0).abs() < 1e-9);
+
+        // Plan exhausted, paying, overage pool nearly spent: low budget,
+        // graded by the dollar figure rather than the fraction.
+        let paying_low = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.02),
+            overage_remaining_dollars: Some(90.0),
+            source: "poll",
+        };
+        assert!((paying_low.seat_budget(SCALE) - 0.45).abs() < 1e-9);
+
+        // No dollar figure: falls back to the fraction.
+        let paying_fraction_only = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.02),
+            overage_remaining_dollars: None,
+            source: "poll",
+        };
+        assert!((paying_fraction_only.seat_budget(SCALE) - 0.02).abs() < 1e-9);
+
+        // Overage pool wholly unknown: pre-grading behavior — flattens to 0.
+        let paying_unknown = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: None,
+            overage_remaining_dollars: None,
+            source: "poll",
+        };
+        assert_eq!(paying_unknown.seat_budget(SCALE), 0.0);
+    }
+
+    // The user's exact complaint: percent-of-own-cap comparison hides real
+    // dollar gaps between differently-sized caps and can invert the ranking.
+    // A $9k cap at 3% free ($270) must out-rank a $3k cap at 3% free ($90)
+    // even though their fractions are identical — and a $3k cap at 10% free
+    // ($300) must STILL beat the $9k cap at 3% free ($270), proving this
+    // isn't just "bigger cap always wins" but genuinely dollar-driven.
+    #[test]
+    fn seat_budget_compares_real_dollars_not_fractions_of_different_caps() {
+        // Use a scale well above every dollar figure below so none of them
+        // saturate to 1.0 — the comparison must come from the dollars, not
+        // from every seat clipping to the same ceiling.
+        const LARGE_SCALE: f64 = 2_000.0;
+        let big_cap_low_fraction = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.03),
+            overage_remaining_dollars: Some(270.0), // 3% of $9,000
+            source: "poll",
+        };
+        let small_cap_same_fraction = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.03),
+            overage_remaining_dollars: Some(90.0), // 3% of $3,000
+            source: "poll",
+        };
+        // Same fraction (0.03) — a fraction-only comparison would tie these.
+        assert_eq!(
+            big_cap_low_fraction.overage_headroom,
+            small_cap_same_fraction.overage_headroom
+        );
+        assert!(
+            big_cap_low_fraction.seat_budget(LARGE_SCALE)
+                > small_cap_same_fraction.seat_budget(LARGE_SCALE),
+            "identical fractions but $270 vs $90 must not rank equal"
+        );
+
+        let small_cap_higher_fraction = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.10),
+            overage_remaining_dollars: Some(300.0), // 10% of $3,000
+            source: "poll",
+        };
+        assert!(
+            small_cap_higher_fraction.seat_budget(LARGE_SCALE)
+                > big_cap_low_fraction.seat_budget(LARGE_SCALE),
+            "the smaller cap with more real dollars left ($300 > $270) must win \
+             despite the bigger cap's larger nominal ceiling"
+        );
     }
 
     #[test]
@@ -653,7 +833,10 @@ mod tests {
                 exhausted_id.clone(),
                 SeatAvailability {
                     plan_headroom: 0.0,
+                    plan_remaining_dollars: None,
                     on_overage: false,
+                    overage_headroom: None,
+                    overage_remaining_dollars: None,
                     source: "poll",
                 },
             ),
@@ -661,7 +844,10 @@ mod tests {
                 has_headroom_id.clone(),
                 SeatAvailability {
                     plan_headroom: 0.22,
+                    plan_remaining_dollars: None,
                     on_overage: false,
+                    overage_headroom: None,
+                    overage_remaining_dollars: None,
                     source: "poll",
                 },
             ),

@@ -234,21 +234,27 @@ cordon:
   poll_secs: 300
 
 # Plan-aware effective cost (on by default). A candidate's quota term uses the
-# lower of local sliding-window headroom and its reported free plan headroom.
-# The static `agents[].preference` bonus also fades with plan headroom, and a
-# seat past its cap but still routable via overage/credits pays a
+# lower of local sliding-window headroom and its seat budget. Seats are
+# compared in real DOLLARS, not the fraction of each provider's own cap — a
+# $9k pool at 3% free and a $3k pool at 3% free are the same percentage but
+# not the same seat. Overage/credit pools report real dollars straight from
+# the provider API; included-plan windows have no dollar field on either
+# provider, so the router estimates them from its own metered spend vs the
+# window's percent (falls back to the percent fraction when the estimate
+# lacks signal). The static `agents[].preference` bonus fades the same way,
+# and a seat past its cap but still routable via overage/credits pays a
 # difficulty-scaled `cost_aversion × (1 - complexity)` surcharge. Model-scoped
 # windows (including Claude Fable's separate weekly cap) affect only matching
-# models. Availability comes
-# from the same usage
-# polls as `cordon` plus optional client hints (the `router-acp/
-# availability_hint` extension notification; e.g. Kory Code pushes its own
-# per-minute seat-usage view). A fresh hint outranks the poll for
+# models. Availability comes from the same usage polls as `cordon` plus
+# optional client hints (the `router-acp/availability_hint` extension
+# notification; e.g. Kory Code pushes its own per-minute seat-usage view,
+# optionally with real dollar amounts). A fresh hint outranks the poll for
 # `hint_ttl_secs`, then the poll rules again.
 availability_preference:
   enabled: true
-  cost_aversion: 0.1      # 0 = happy to pay; higher raises the difficulty bar
-  hint_ttl_secs: 600      # how long a client hint stays authoritative
+  cost_aversion: 0.1           # 0 = happy to pay; higher raises the difficulty bar
+  hint_ttl_secs: 600           # how long a client hint stays authoritative
+  headroom_scale_dollars: 200  # remaining budget at/above which a seat reads fully free
 
 orchestration:
   enabled: true

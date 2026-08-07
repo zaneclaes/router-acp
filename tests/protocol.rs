@@ -4183,6 +4183,124 @@ async fn availability_hint_penalizes_overage_seat() {
     .await;
 }
 
+// Live routing regression (session `rtr-067e9f43`, 2026-08-06), dollar-
+// normalized: two seats both past their included plan and paying overage,
+// at equal quality, must rank on real remaining DOLLARS, not on the
+// fraction of each seat's own (differently-sized) cap. A percent-only
+// comparison — the first version of this fix — ranks `a` ahead here (its
+// fraction is higher); the fix must still route to `b` because $900 is more
+// real budget than $300.
+#[tokio::test]
+async fn overage_seat_with_more_dollars_left_beats_higher_fraction_smaller_cap() {
+    let state = temp_state_file("avail-overage-grade");
+    let log = temp_log("avail-overage-grade");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"*\", default_quality: 2.0 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         cordon: {{ enabled: false }}\n\
+         availability_preference: {{ headroom_scale_dollars: 2000 }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 10 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("worker", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("worker", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+
+        // Both seats saturated and paying overage. `a` reports a HIGHER free
+        // overage FRACTION (10%) but its cap is small ($3,000 → $300 left);
+        // `b` reports a lower fraction (3%) on a much bigger cap ($30,000 →
+        // $900 left). A percent-only comparison would pick `a`;
+        // dollar-normalized ranking must pick `b`. The config's
+        // `headroom_scale_dollars: 2000` keeps both figures below the
+        // saturation ceiling so the comparison stays dollar-driven, not a
+        // tie at 1.0.
+        let hint = agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({
+                "ttl_secs": 300,
+                "agents": [
+                    {
+                        "agent": "a",
+                        "windows": [{ "percent": 100, "scope": serde_json::Value::Null, "active": true }],
+                        "overage": { "enabled": true, "percent": 90, "remaining_dollars": 300.0 }
+                    },
+                    {
+                        "agent": "b",
+                        "windows": [{ "percent": 100, "scope": serde_json::Value::Null, "active": true }],
+                        "overage": { "enabled": true, "percent": 97, "remaining_dollars": 900.0 }
+                    }
+                ]
+            }),
+        )?;
+        cx.send_notification(hint)?;
+
+        let a = router_acp::candidate::CandidateId::new("a", "worker");
+        for _ in 0..50 {
+            if shared.headroom.lock().unwrap().availability(&a).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Both flagged on_overage with identical (zeroed) plan_headroom, and
+        // `a` has the HIGHER overage fraction — a percent-only comparison
+        // would rank `a` ahead. The dollar figures invert that.
+        let (avail_a, avail_b) = {
+            let headroom = shared.headroom.lock().unwrap();
+            (
+                headroom.availability(&a).expect("a hinted"),
+                headroom
+                    .availability(&router_acp::candidate::CandidateId::new("b", "worker"))
+                    .expect("b hinted"),
+            )
+        };
+        assert!(avail_a.on_overage && avail_b.on_overage);
+        assert!((avail_a.plan_headroom - avail_b.plan_headroom).abs() < 1e-9);
+        assert!(
+            avail_a.overage_headroom.unwrap() > avail_b.overage_headroom.unwrap(),
+            "a's fraction must be HIGHER than b's, so the eventual win for b proves this \
+             isn't a fraction-driven outcome: a={avail_a:?} b={avail_b:?}"
+        );
+        const SCALE: f64 = 2000.0;
+        assert!(
+            avail_a.seat_budget(SCALE) < avail_b.seat_budget(SCALE),
+            "a's smaller dollar pool must read as less budget despite its higher fraction: \
+             a={avail_a:?} b={avail_b:?}"
+        );
+
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "do the thing").await?;
+        assert_eq!(
+            open_state(&state)
+                .get(&sid)
+                .map(|session| session.agent.clone()),
+            Some("b".to_string()),
+            "the seat with more real overage dollars left must win, even with a lower fraction"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn partial_plan_headroom_changes_effective_cost() {
     let state = temp_state_file("avail-headroom");

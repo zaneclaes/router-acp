@@ -116,6 +116,20 @@ async fn poll_all(
         if candidates.is_empty() {
             continue;
         }
+        // The router's own metered spend into a window, for estimating its
+        // real dollars left (see `estimate_plan_window_dollars`). Scoped to
+        // this agent so one provider's spend never estimates another's
+        // window; `models` further scopes to a model-scoped window.
+        let spend_lookup = |models: Option<&[String]>, since: SystemTime| -> Option<f64> {
+            let since_epoch = since.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+            Some(
+                shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .llm_cost_since(&agent.name, models, since_epoch),
+            )
+        };
         let (cordons, availability) = match source {
             UsageSourceConfig::AnthropicOauth => {
                 let cached =
@@ -124,7 +138,12 @@ async fn poll_all(
                 match cached {
                     Some(payload) => (
                         anthropic_cordons(&payload, &candidates, SystemTime::now()),
-                        anthropic_availability(&payload, &candidates),
+                        anthropic_availability_with_spend(
+                            &payload,
+                            &candidates,
+                            Some(&spend_lookup),
+                            SystemTime::now(),
+                        ),
                     ),
                     None => {
                         tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
@@ -153,7 +172,12 @@ async fn poll_all(
                 }
                 (
                     codex_cordons(&snapshots, &candidates, SystemTime::now()),
-                    codex_availability(&snapshots, &candidates, SystemTime::now()),
+                    codex_availability_with_spend(
+                        &snapshots,
+                        &candidates,
+                        Some(&spend_lookup),
+                        SystemTime::now(),
+                    ),
                 )
             }
         };
@@ -425,29 +449,113 @@ fn upsert_latest(
 // ----------------------------------------------------------------------
 
 /// One plan window as it feeds availability: how full it is, whether it has
-/// hit its cap, and which model it covers (`None` = the whole seat).
+/// hit its cap, which model it covers (`None` = the whole seat), and — when
+/// estimable — how many real dollars it has left.
 #[derive(Debug, Clone)]
 pub struct AvailWindow {
     pub percent: f64,
     pub scope: Option<String>,
     pub saturated: bool,
+    /// Estimated real dollars left in this window (see
+    /// [`window_remaining_dollars`]), or a client-reported figure on the
+    /// hint path. `None` = not estimable; the percent fraction stands in.
+    pub remaining_dollars: Option<f64>,
+}
+
+/// Below this reported percent the estimate is too noisy to trust: window
+/// percents are integer-rounded, so a small numerator makes
+/// `spent × (100 − p) / p` swing wildly with ±0.5% of rounding.
+const MIN_ESTIMATE_PERCENT: f64 = 15.0;
+/// Below this much router-metered spend there isn't enough signal to
+/// extrapolate the window's dollar capacity from.
+const MIN_ESTIMATE_SPENT_DOLLARS: f64 = 0.50;
+
+/// Estimate the real dollars left in a plan window from the router's own
+/// metered spend into it. Neither provider reports plan windows in dollars
+/// (only the overage pools carry real amounts), but the router prices every
+/// proxied request (`llm_requests.cost_usd`), so `spent / (p/100)` estimates
+/// the window's dollar capacity and `spent × (100 − p) / p` what's left.
+/// Known skews, both fail-soft: spend by clients outside the router raises
+/// `p` without raising `spent`, which UNDER-estimates remaining (the
+/// conservative direction); the pricing table vs the provider's internal
+/// window weighting can skew either way. Returns `None` below the signal
+/// guards — ranking then falls back to the percent fraction.
+pub fn window_remaining_dollars(spent: f64, percent: f64) -> Option<f64> {
+    if percent < MIN_ESTIMATE_PERCENT || spent < MIN_ESTIMATE_SPENT_DOLLARS {
+        return None;
+    }
+    Some(spent * (100.0 - percent).max(0.0) / percent)
+}
+
+/// Router-metered spend lookup: total `cost_usd` for one agent, optionally
+/// restricted to specific `"agent/model"` strings (a scoped window), since a
+/// given instant. `poll_all` builds the real one over `StateFile::
+/// llm_cost_since`; tests that don't care about dollar estimation pass
+/// `None` and every plan window falls back to its percent fraction.
+pub type SpendLookup<'a> = dyn Fn(Option<&[String]>, SystemTime) -> Option<f64> + 'a;
+
+/// `"agent/model"` strings for the candidates a window's scope covers, for
+/// restricting a spend lookup to a scoped window (e.g. Claude Fable's own
+/// weekly cap must not count spend on sibling Claude models). `None` scope
+/// (the window covers the whole seat) returns `None` — the caller's spend
+/// lookup then totals the whole agent.
+fn window_scope_models(
+    scope: Option<&str>,
+    candidates: &[(CandidateId, String)],
+) -> Option<Vec<String>> {
+    let scope = scope?;
+    Some(
+        candidates
+            .iter()
+            .filter(|(id, display)| model_matches(scope, id, display))
+            .map(|(id, _)| id.to_string())
+            .collect(),
+    )
+}
+
+/// Dollar estimate for one plan window: resolve its start from `resets_at`
+/// and `duration`, total the router's metered spend into it (scoped to the
+/// window if it names one), and estimate what's left. `None` at any missing
+/// input (no spend lookup, unparseable reset, no known duration) — the
+/// window's percent fraction remains the fallback.
+fn estimate_plan_window_dollars(
+    spend: Option<&SpendLookup>,
+    candidates: &[(CandidateId, String)],
+    scope: Option<&str>,
+    resets_at: SystemTime,
+    duration: Duration,
+    percent: f64,
+) -> Option<f64> {
+    let spend = spend?;
+    let window_start = resets_at.checked_sub(duration)?;
+    let models = window_scope_models(scope, candidates);
+    let spent = spend(models.as_deref(), window_start)?;
+    window_remaining_dollars(spent, percent)
 }
 
 /// Fold plan windows into per-candidate seat availability. A candidate's
 /// `plan_headroom` is the minimum free fraction across the windows that cover
 /// it; it is `on_overage` when any covering window is saturated AND the
 /// overage/credit pool can absorb the excess (without that pool the candidate
-/// is cordon territory, not preference territory). Candidates covered by no
-/// window get no entry — their static preference applies unscaled.
+/// is cordon territory, not preference territory). `overage_headroom` grades
+/// how much of that pool is left — `None` when the pool's size can't be
+/// determined (the caller falls back to treating the seat as spent, the
+/// pre-grading behavior). Candidates covered by no window get no entry —
+/// their static preference applies unscaled.
 pub fn availability_from_windows(
     windows: &[AvailWindow],
     overage_available: bool,
+    overage_headroom: Option<f64>,
+    overage_remaining_dollars: Option<f64>,
     candidates: &[(CandidateId, String)],
     source: &'static str,
 ) -> HashMap<CandidateId, SeatAvailability> {
     let mut out = HashMap::new();
     for (id, display) in candidates {
         let mut headroom: Option<f64> = None;
+        // Binding-window semantics, mirroring the fraction min: the covering
+        // window with the fewest dollars left constrains the candidate.
+        let mut remaining_dollars: Option<f64> = None;
         let mut saturated = false;
         for w in windows {
             let covers = match &w.scope {
@@ -459,6 +567,7 @@ pub fn availability_from_windows(
             }
             let free = (1.0 - w.percent / 100.0).clamp(0.0, 1.0);
             headroom = Some(headroom.map_or(free, |h: f64| h.min(free)));
+            remaining_dollars = min_option(remaining_dollars, w.remaining_dollars);
             saturated |= w.saturated;
         }
         if let Some(plan_headroom) = headroom {
@@ -466,7 +575,10 @@ pub fn availability_from_windows(
                 id.clone(),
                 SeatAvailability {
                     plan_headroom,
+                    plan_remaining_dollars: remaining_dollars,
                     on_overage: saturated && overage_available,
+                    overage_headroom,
+                    overage_remaining_dollars,
                     source,
                 },
             );
@@ -485,18 +597,58 @@ fn merge_worst(
         into.entry(id)
             .and_modify(|e| {
                 e.plan_headroom = e.plan_headroom.min(a.plan_headroom);
+                e.plan_remaining_dollars =
+                    min_option(e.plan_remaining_dollars, a.plan_remaining_dollars);
                 e.on_overage |= a.on_overage;
+                e.overage_headroom = min_option(e.overage_headroom, a.overage_headroom);
+                e.overage_remaining_dollars =
+                    min_option(e.overage_remaining_dollars, a.overage_remaining_dollars);
             })
             .or_insert(a);
+    }
+}
+
+/// The tighter (smaller) of two optional dollar/fraction figures — `Some`
+/// wins over `None` (a pool multiple sources didn't report is not "free").
+fn min_option(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// A window's nominal duration from its `kind` — `None` (e.g. a
+/// model-scoped weekly cap's own `kind` naming, or an unrecognized kind)
+/// leaves the window's dollar estimate un-computed; its percent fraction
+/// still applies. Anthropic's only documented windows are the rolling
+/// 5-hour session and the 7-day weekly (all-models or scoped).
+fn anthropic_window_duration(kind: &str) -> Option<Duration> {
+    match kind {
+        "session" => Some(Duration::from_secs(5 * 3600)),
+        "weekly_all" | "weekly_scoped" => Some(Duration::from_secs(7 * 86_400)),
+        _ => None,
     }
 }
 
 /// Seat availability from an Anthropic usage payload: every reported limit is
 /// a window (model-scoped ones cover only their candidate), and overage
 /// headroom decides whether a saturated window means "paying" or "cordoned".
+/// `spend`, when given, estimates each window's real dollars left from the
+/// router's own metered spend (see [`estimate_plan_window_dollars`]); `None`
+/// (the shape every existing caller/test uses) leaves dollar estimation off
+/// and every window falls back to its percent fraction.
 pub fn anthropic_availability(
     payload: &Value,
     candidates: &[(CandidateId, String)],
+) -> HashMap<CandidateId, SeatAvailability> {
+    anthropic_availability_with_spend(payload, candidates, None, SystemTime::now())
+}
+
+pub fn anthropic_availability_with_spend(
+    payload: &Value,
+    candidates: &[(CandidateId, String)],
+    spend: Option<&SpendLookup>,
+    now: SystemTime,
 ) -> HashMap<CandidateId, SeatAvailability> {
     let Some(limits) = payload.get("limits").and_then(|l| l.as_array()) else {
         return HashMap::new();
@@ -515,16 +667,107 @@ pub fn anthropic_availability(
                         .or_else(|| m.get("id").and_then(Value::as_str))
                 })
                 .map(str::to_string);
+            let remaining_dollars = lim
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(anthropic_window_duration)
+                .zip(
+                    lim.get("resets_at")
+                        .and_then(Value::as_str)
+                        .and_then(|s| crate::limits::parse_reset_delay_at(&s.to_lowercase(), now))
+                        .map(|delay| now + delay),
+                )
+                .and_then(|(duration, resets_at)| {
+                    estimate_plan_window_dollars(
+                        spend,
+                        candidates,
+                        scope.as_deref(),
+                        resets_at,
+                        duration,
+                        percent,
+                    )
+                });
             Some(AvailWindow {
                 percent,
                 scope,
                 // True exhaustion only — see `anthropic_cordons` on why
                 // `is_active`/`severity` must not gate this.
                 saturated: percent >= 100.0,
+                remaining_dollars,
             })
         })
         .collect();
-    availability_from_windows(&windows, overage_has_headroom(payload), candidates, "poll")
+    availability_from_windows(
+        &windows,
+        overage_has_headroom(payload),
+        anthropic_overage_headroom(payload),
+        anthropic_overage_dollars(payload),
+        candidates,
+        "poll",
+    )
+}
+
+/// How much of the overage/credit pool is left, in [0, 1] — the magnitude
+/// `overage_has_headroom` discards. `extra_usage.utilization` is the paid
+/// pool's own percent-used meter (mirrors the free-plan `percent` fields);
+/// `spend.percent` is its sibling on the spend-limit path. `None` when
+/// neither is reported (a bare `has_credits`-only account has no size to
+/// grade — falls back to treating the seat as spent once on overage). This
+/// fraction is fallback/disclosure only — `anthropic_overage_dollars` below
+/// is what ranking actually compares across seats, since a fraction alone
+/// can't tell a $9k cap from a $3k one.
+fn anthropic_overage_headroom(payload: &Value) -> Option<f64> {
+    if let Some(eu) = payload.get("extra_usage")
+        && eu.get("is_enabled").and_then(Value::as_bool) == Some(true)
+        && let Some(util) = eu.get("utilization").and_then(Value::as_f64)
+    {
+        return Some((1.0 - util / 100.0).clamp(0.0, 1.0));
+    }
+    if let Some(sp) = payload.get("spend")
+        && sp.get("enabled").and_then(Value::as_bool) == Some(true)
+        && let Some(pct) = sp.get("percent").and_then(Value::as_f64)
+    {
+        return Some((1.0 - pct / 100.0).clamp(0.0, 1.0));
+    }
+    None
+}
+
+/// Real dollars left in the overage/credit pool. Prefers `spend`
+/// (`limit.amount_minor`/`used.amount_minor`, scaled by `exponent` — minor
+/// units, e.g. cents when `exponent: 2`) since it's the newer, more complete
+/// shape; falls back to the equivalent `extra_usage` fields
+/// (`monthly_limit`/`used_credits`, scaled by `decimal_places`). `None` when
+/// neither carries a usable cap (a bare `has_credits`-only account has no
+/// size to grade — the fraction-only fallback in `seat_budget` applies).
+fn anthropic_overage_dollars(payload: &Value) -> Option<f64> {
+    if let Some(sp) = payload.get("spend")
+        && sp.get("enabled").and_then(Value::as_bool) == Some(true)
+        && let Some(limit) = sp.get("limit").and_then(|l| l.get("amount_minor"))
+        && let Some(limit) = limit.as_f64()
+        && let Some(used) = sp.get("used").and_then(|u| u.get("amount_minor"))
+        && let Some(used) = used.as_f64()
+    {
+        let exponent = sp
+            .get("limit")
+            .and_then(|l| l.get("exponent"))
+            .and_then(Value::as_u64)
+            .unwrap_or(2);
+        let scale = 10f64.powi(exponent as i32);
+        return Some(((limit - used) / scale).max(0.0));
+    }
+    if let Some(eu) = payload.get("extra_usage")
+        && eu.get("is_enabled").and_then(Value::as_bool) == Some(true)
+        && let Some(limit) = eu.get("monthly_limit").and_then(Value::as_f64)
+        && let Some(used) = eu.get("used_credits").and_then(Value::as_f64)
+    {
+        let decimal_places = eu
+            .get("decimal_places")
+            .and_then(Value::as_u64)
+            .unwrap_or(2);
+        let scale = 10f64.powi(decimal_places as i32);
+        return Some(((limit - used) / scale).max(0.0));
+    }
+    None
 }
 
 /// Codex pool objects arrive in two spellings: snake_case from rollout-file
@@ -548,6 +791,15 @@ pub fn codex_availability(
     candidates: &[(CandidateId, String)],
     now: SystemTime,
 ) -> HashMap<CandidateId, SeatAvailability> {
+    codex_availability_with_spend(rate_limits, candidates, None, now)
+}
+
+pub fn codex_availability_with_spend(
+    rate_limits: &[Value],
+    candidates: &[(CandidateId, String)],
+    spend: Option<&SpendLookup>,
+    now: SystemTime,
+) -> HashMap<CandidateId, SeatAvailability> {
     let mut out = HashMap::new();
     for pool in rate_limits {
         let mut windows = Vec::new();
@@ -559,15 +811,29 @@ pub fn codex_availability(
             else {
                 continue;
             };
-            if let Some(epoch) = field(win, "resets_at", "resetsAt").and_then(Value::as_u64)
+            let resets_epoch = field(win, "resets_at", "resetsAt").and_then(Value::as_u64);
+            if let Some(epoch) = resets_epoch
                 && SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now
             {
                 continue; // already reset
             }
+            let remaining_dollars = resets_epoch
+                .zip(field(win, "window_minutes", "windowDurationMins").and_then(Value::as_u64))
+                .and_then(|(epoch, mins)| {
+                    estimate_plan_window_dollars(
+                        spend,
+                        candidates,
+                        None,
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(epoch),
+                        Duration::from_secs(mins * 60),
+                        used,
+                    )
+                });
             windows.push(AvailWindow {
                 percent: used,
                 scope: None,
                 saturated: used >= 100.0,
+                remaining_dollars,
             });
         }
         let plan_headroom = codex_plan_has_headroom(pool, now);
@@ -581,18 +847,92 @@ pub fn codex_availability(
                 .and_then(Value::as_u64)
                 .is_some_and(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now)
         {
+            // The member limit already reports real dollars (`limit`/`used`)
+            // — no estimation needed, unlike the plan windows above.
+            let remaining_dollars = il
+                .get("limit")
+                .and_then(as_dollar_amount)
+                .zip(il.get("used").and_then(as_dollar_amount))
+                .map(|(limit, used)| (limit - used).max(0.0));
             windows.push(AvailWindow {
                 percent: (100.0 - remaining).clamp(0.0, 100.0),
                 scope: None,
                 saturated: remaining <= 0.0,
+                remaining_dollars,
             });
         }
         merge_worst(
             &mut out,
-            availability_from_windows(&windows, codex_overage_usable(pool), candidates, "poll"),
+            availability_from_windows(
+                &windows,
+                codex_overage_usable(pool),
+                codex_overage_headroom(pool),
+                codex_overage_dollars(pool),
+                candidates,
+                "poll",
+            ),
         );
     }
     out
+}
+
+/// How much of Codex's overage pool is left, in [0, 1] — mirrors
+/// `codex_overage_usable`'s gates but reports the fraction instead of a
+/// bool. The per-member spend limit's `remaining_percent` IS the pool's own
+/// meter, so it grades directly; unlimited credits report full headroom.
+/// Balance-only credits (no percent, no `unlimited`) have no denominator to
+/// grade against, so they report `None` — same fallback as an unmetered pool.
+/// Fallback/disclosure only — `codex_overage_dollars` below is what ranking
+/// actually compares, since a fraction alone can't distinguish this seat's
+/// per-member cap size from another provider's.
+fn codex_overage_headroom(rate_limits: &Value) -> Option<f64> {
+    if field(rate_limits, "spend_control_reached", "spendControlReached").and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some(0.0);
+    }
+    if let Some(il) = field(rate_limits, "individual_limit", "individualLimit")
+        && let Some(remaining) =
+            field(il, "remaining_percent", "remainingPercent").and_then(Value::as_f64)
+    {
+        return Some((remaining / 100.0).clamp(0.0, 1.0));
+    }
+    let credits = rate_limits.get("credits").filter(|c| !c.is_null())?;
+    if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
+        return Some(1.0);
+    }
+    None
+}
+
+/// A JSON number or numeric string as an `f64` — Codex's `individual_limit`
+/// reports `limit`/`used` as strings (`"3000"`, `"3000.534..."`) while other
+/// fields in the same payload are plain numbers; accept either.
+fn as_dollar_amount(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Real dollars left in Codex's overage pool. `spend_control_reached` is a
+/// hard block regardless of any positive balance elsewhere (see
+/// `codex_overage_usable`). `individual_limit.limit`/`used` are the
+/// per-member spend cap in real dollars — the primary source. Falls back to
+/// a positive credit `balance` when no member limit is reported. Unlimited
+/// credits have no dollar ceiling to report (the fraction path handles
+/// them); a bare `has_credits` with no balance/limit has no size to grade.
+fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
+    if field(rate_limits, "spend_control_reached", "spendControlReached").and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some(0.0);
+    }
+    if let Some(il) = field(rate_limits, "individual_limit", "individualLimit")
+        && let Some(limit) = il.get("limit").and_then(as_dollar_amount)
+        && let Some(used) = il.get("used").and_then(as_dollar_amount)
+    {
+        return Some((limit - used).max(0.0));
+    }
+    let credits = rate_limits.get("credits").filter(|c| !c.is_null())?;
+    credits.get("balance").and_then(as_dollar_amount)
 }
 
 // ----------------------------------------------------------------------
@@ -685,23 +1025,40 @@ pub fn hint_agent_availability(
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let remaining_dollars = w.get("remaining_dollars").and_then(Value::as_f64);
                     Some(AvailWindow {
                         percent,
                         scope,
                         saturated: percent >= 100.0 || active,
+                        remaining_dollars,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default();
-    let overage_available = entry
+    let overage_entry = entry
         .get("overage")
-        .map(|o| {
-            o.get("enabled").and_then(Value::as_bool) == Some(true)
-                && o.get("percent").and_then(Value::as_f64).unwrap_or(100.0) < 100.0
-        })
-        .unwrap_or(false);
-    availability_from_windows(&windows, overage_available, candidates, "hint")
+        .filter(|o| o.get("enabled").and_then(Value::as_bool) == Some(true));
+    let overage_percent = overage_entry
+        .and_then(|o| o.get("percent"))
+        .and_then(Value::as_f64)
+        .unwrap_or(100.0);
+    let overage_available = overage_entry.is_some() && overage_percent < 100.0;
+    let overage_headroom = overage_entry.map(|_| (1.0 - overage_percent / 100.0).clamp(0.0, 1.0));
+    // A client that already knows real dollars (e.g. Kory Code's own
+    // provider polling) can report them directly instead of forcing a
+    // percent-of-cap round trip; percent stays the required fallback shape.
+    let overage_remaining_dollars = overage_entry
+        .and_then(|o| o.get("remaining_dollars"))
+        .and_then(Value::as_f64);
+    availability_from_windows(
+        &windows,
+        overage_available,
+        overage_headroom,
+        overage_remaining_dollars,
+        candidates,
+        "hint",
+    )
 }
 
 // ----------------------------------------------------------------------
@@ -1541,6 +1898,142 @@ mod tests {
         assert_eq!(epoch_to_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
     }
 
+    // ---- Dollar-normalized headroom ----
+
+    #[test]
+    fn window_remaining_dollars_estimates_from_spend_and_percent() {
+        // $10 spent at 20% used → $40 window capacity, $40 left (5x spent).
+        assert!((window_remaining_dollars(10.0, 20.0).unwrap() - 40.0).abs() < 1e-9);
+        // Fully spent: nothing left.
+        assert_eq!(window_remaining_dollars(10.0, 100.0), Some(0.0));
+    }
+
+    #[test]
+    fn window_remaining_dollars_guards_low_signal() {
+        // Below the percent guard: too little of the window elapsed to
+        // extrapolate reliably (integer rounding noise dominates).
+        assert_eq!(window_remaining_dollars(10.0, 14.9), None);
+        assert!(window_remaining_dollars(10.0, 15.0).is_some());
+        // Below the spend guard: not enough router-metered signal.
+        assert_eq!(window_remaining_dollars(0.49, 50.0), None);
+        assert!(window_remaining_dollars(0.50, 50.0).is_some());
+    }
+
+    #[test]
+    fn anthropic_overage_dollars_prefers_spend_over_extra_usage() {
+        let both = json!({
+            "spend": { "enabled": true, "limit": { "amount_minor": 900_000, "exponent": 2 },
+                       "used": { "amount_minor": 234_000, "exponent": 2 } },
+            "extra_usage": { "is_enabled": true, "monthly_limit": 500_000,
+                              "used_credits": 0.0, "decimal_places": 2 }
+        });
+        assert!((anthropic_overage_dollars(&both).unwrap() - 6_660.0).abs() < 1e-6);
+
+        let extra_usage_only = json!({
+            "extra_usage": { "is_enabled": true, "monthly_limit": 900_000,
+                              "used_credits": 234_000.0, "decimal_places": 2 }
+        });
+        assert!((anthropic_overage_dollars(&extra_usage_only).unwrap() - 6_660.0).abs() < 1e-6);
+
+        // Neither carries a usable cap: no dollar figure to grade.
+        assert_eq!(anthropic_overage_dollars(&json!({})), None);
+        let disabled = json!({ "spend": { "enabled": false } });
+        assert_eq!(anthropic_overage_dollars(&disabled), None);
+    }
+
+    #[test]
+    fn codex_overage_dollars_from_individual_limit_and_credits() {
+        // Real dollar member limit — string amounts, as the live API sends.
+        let member_limit = json!({
+            "individualLimit": { "limit": "3000", "used": "2910" }
+        });
+        assert!((codex_overage_dollars(&member_limit).unwrap() - 90.0).abs() < 1e-6);
+
+        // Numeric amounts also accepted.
+        let numeric = json!({
+            "individual_limit": { "limit": 3000, "used": 2910 }
+        });
+        assert!((codex_overage_dollars(&numeric).unwrap() - 90.0).abs() < 1e-6);
+
+        // Spend control reached is a hard 0 regardless of a positive limit.
+        let blocked = json!({
+            "spendControlReached": true,
+            "individualLimit": { "limit": "3000", "used": "100" }
+        });
+        assert_eq!(codex_overage_dollars(&blocked), Some(0.0));
+
+        // No member limit: falls back to a positive credit balance.
+        let balance_only = json!({ "credits": { "balance": 42.5 } });
+        assert!((codex_overage_dollars(&balance_only).unwrap() - 42.5).abs() < 1e-9);
+
+        // Nothing usable to grade.
+        assert_eq!(codex_overage_dollars(&json!({})), None);
+        assert_eq!(
+            codex_overage_dollars(&json!({ "credits": { "unlimited": true } })),
+            None,
+            "unlimited has no dollar ceiling — the fraction path (Some(1.0)) handles it"
+        );
+    }
+
+    #[test]
+    fn anthropic_availability_with_spend_estimates_plan_window_dollars() {
+        // $50 spent on Fable-scoped requests since the window started, 80%
+        // used → $12.50 window capacity, $2.50 left.
+        let mut p = exhausted_payload();
+        p["limits"][2]["percent"] = json!(80); // the Fable-scoped weekly window
+        let now = SystemTime::now();
+        let resets_str = "2026-08-12T17:00:00+00:00";
+        p["limits"][2]["resets_at"] = json!(resets_str);
+        let spend: &SpendLookup = &|_models, _since| Some(50.0);
+        let a = anthropic_availability_with_spend(&p, &cands(), Some(spend), now);
+        let f = &a[&fable()];
+        assert!(
+            (f.plan_remaining_dollars.unwrap() - 12.5).abs() < 1.0,
+            "fable: {f:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_availability_falls_back_without_a_spend_lookup() {
+        // No spend lookup (the default `anthropic_availability` shape, and
+        // every existing test/caller): dollar estimation stays off.
+        let a = anthropic_availability(&exhausted_payload(), &cands());
+        assert!(a[&fable()].plan_remaining_dollars.is_none());
+    }
+
+    #[test]
+    fn codex_availability_with_spend_estimates_plan_window_dollars() {
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "primary": { "usedPercent": 80.0, "windowDurationMins": 10080,
+                         "resetsAt": future_epoch(now) },
+        })];
+        let spend: &SpendLookup = &|_models, _since| Some(40.0);
+        let a = codex_availability_with_spend(&rl, &codex_cands(), Some(spend), now);
+        let sol = &a[&CandidateId::new("codex", "gpt-5.6-sol")];
+        // $40 spent at 80% used → $10 window capacity, $10 left.
+        assert!(
+            (sol.plan_remaining_dollars.unwrap() - 10.0).abs() < 1.0,
+            "sol: {sol:?}"
+        );
+    }
+
+    #[test]
+    fn codex_availability_member_limit_reports_real_dollars_directly() {
+        // The member limit already carries real dollars — no estimation
+        // needed, and no spend lookup is required for it.
+        let now = SystemTime::now();
+        let rl = vec![json!({
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "individualLimit": { "limit": "3000", "used": "2910", "remainingPercent": 3.0, "resetsAt": future_epoch(now) },
+            "spendControlReached": false,
+        })];
+        let a = codex_availability(&rl, &codex_cands(), now);
+        let sol = &a[&CandidateId::new("codex", "gpt-5.6-sol")];
+        assert!((sol.overage_remaining_dollars.unwrap() - 90.0).abs() < 1e-6);
+    }
+
     // ---- Seat availability ----
 
     #[test]
@@ -1738,6 +2231,91 @@ mod tests {
         assert!(
             a.values().all(|v| (v.plan_headroom - 1.0).abs() < 1e-9),
             "inactive full meter ignored: {a:?}"
+        );
+    }
+
+    #[test]
+    fn hint_overage_headroom_grades_the_pool() {
+        let entry = json!({
+            "agent": "claude",
+            "windows": [ { "percent": 100 } ],
+            "overage": { "enabled": true, "percent": 40 }
+        });
+        let a = hint_agent_availability(&entry, &cands());
+        let f = &a[&fable()];
+        assert!(f.on_overage);
+        assert!(
+            (f.overage_headroom.unwrap() - 0.6).abs() < 1e-9,
+            "60% of the overage pool free: {f:?}"
+        );
+
+        // Overage disabled: no pool to grade.
+        let disabled = json!({
+            "agent": "claude",
+            "windows": [ { "percent": 100 } ]
+        });
+        let a = hint_agent_availability(&disabled, &cands());
+        assert!(a.values().all(|v| v.overage_headroom.is_none()));
+    }
+
+    // Regression for the live routing bug (session `rtr-067e9f43`, 2026-08-06):
+    // codex's overage pool (member spend) was nearly spent (~2% left) while
+    // claude's overage pool (extra_usage) had ~74% left, but both providers'
+    // ungraded `on_overage: true` flattened to identical `plan_headroom: 0`
+    // availability — so the router had no signal that claude had roughly 37x
+    // the remaining budget and routed into the codex seat that ran out
+    // minutes later. Grading the pool must surface that gap.
+    #[test]
+    fn overage_headroom_distinguishes_nearly_spent_from_plenty_left() {
+        let now = SystemTime::now();
+
+        // Claude: Fable's scoped weekly window is saturated (per
+        // `exhausted_payload`), extra-usage pool is a real $9,000 cap at 26%
+        // utilized ($2,340 used, $6,660 free) — the live account shape.
+        let mut claude_payload = exhausted_payload();
+        claude_payload["extra_usage"]["utilization"] = json!(26.0);
+        claude_payload["extra_usage"]["monthly_limit"] = json!(900_000);
+        claude_payload["extra_usage"]["used_credits"] = json!(234_000.0);
+        claude_payload["extra_usage"]["decimal_places"] = json!(2);
+        let claude_avail = anthropic_availability(&claude_payload, &cands());
+        let claude_fable = &claude_avail[&fable()];
+        assert!(claude_fable.on_overage);
+        assert!(
+            (claude_fable.overage_remaining_dollars.unwrap() - 6_660.0).abs() < 1e-6,
+            "claude: {claude_fable:?}"
+        );
+
+        // Codex: weekly plan saturated, member spend is a real $3,000 cap
+        // with $2,910 used ($90 free, ~3%) — the live near-spent shape.
+        let codex_rl = vec![json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": future_epoch(now) },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": serde_json::Value::Null },
+            "individualLimit": { "limit": "3000", "used": "2910", "remainingPercent": 3.0, "resetsAt": future_epoch(now) },
+            "spendControlReached": false,
+        })];
+        let codex_avail = codex_availability(&codex_rl, &codex_cands(), now);
+        let codex_sol = &codex_avail[&CandidateId::new("codex", "gpt-5.6-sol")];
+        assert!(codex_sol.on_overage);
+        assert!(
+            (codex_sol.overage_remaining_dollars.unwrap() - 90.0).abs() < 1e-6,
+            "codex: {codex_sol:?}"
+        );
+
+        // Both are flagged on_overage with the same plan_headroom (0) — the
+        // pre-grading signal was identical for both. seat_budget() must not
+        // be, and the ranking must come from the DOLLARS: $6,660 saturates
+        // to a fully-free seat at the $200 scale, while $90 reads visibly
+        // constrained (0.45).
+        assert!((claude_fable.plan_headroom - codex_sol.plan_headroom).abs() < 1e-9);
+        const SCALE: f64 = 200.0;
+        assert!(
+            (claude_fable.seat_budget(SCALE) - 1.0).abs() < 1e-9,
+            "claude: {claude_fable:?}"
+        );
+        assert!(
+            (codex_sol.seat_budget(SCALE) - 0.45).abs() < 1e-9,
+            "codex: {codex_sol:?}"
         );
     }
 }

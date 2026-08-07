@@ -233,9 +233,10 @@ plan"). With `availability_preference` (on by default) it tracks reality
 instead of staying frozen:
 
 - **Free plan headroom is part of effective cost** — each candidate's quota
-  term uses the lower of local sliding-window headroom and reported plan
-  headroom. The static preference bonus also fades as
-  `preference × plan_headroom`. Model-scoped weekly caps count only for their
+  term uses the lower of local sliding-window headroom and the seat's reported
+  budget: the free plan fraction while any remains, else the remaining
+  overage/credit pool once the seat is paying. The static preference bonus
+  fades the same way. Model-scoped weekly caps count only for their
   model, so Claude Fable's separate window does not make other Claude models
   look scarce.
 - **Paid overage raises the quality bar.** When a candidate's cap is exhausted
@@ -245,6 +246,35 @@ instead of staying frozen:
   work while still allowing a materially stronger paid model on hard work.
   Set it to `0` to ignore overage cost. A saturated seat with *no* overage
   headroom is a cordon, not a surcharge.
+- **Headroom is compared in real dollars, not fractions of each seat's own
+  cap.** Caps differ in size across providers and plans — a $9k pool at 3%
+  free ($270) and a $3k pool at 3% free ($90) are identical percentages but
+  very different seats. So the seat budget above is a *dollar* figure
+  wherever one is obtainable, saturated at
+  `availability_preference.headroom_scale_dollars` (default `$200`: at or
+  above it a seat's quota term reads fully free, below it the seat reads
+  proportionally constrained):
+  - **Overage pools report real dollars directly.** Anthropic:
+    `spend.limit − spend.used` (falling back to `extra_usage.monthly_limit −
+    used_credits`); Codex: the per-member spend limit's `limit − used`, or a
+    positive credit `balance`. Two saturated seats no longer flatten to the
+    same zero — the one with real money left out-ranks the one about to hit
+    its spend cap (the live failure this fixes: a codex seat with ~$100 of
+    member spend left won over a claude seat with ~$6,600 of extra usage
+    remaining, then hit its wall minutes later).
+  - **Included plan windows are only reported as percentages** (no provider
+    exposes their dollar size), so the router *estimates* them from its own
+    metered spend: every proxied request is priced (`llm_requests.cost_usd`),
+    and `spent × (100 − p) / p` extrapolates what the window has left. The
+    estimate is skipped below a signal floor (window < 15% elapsed or < $0.50
+    metered spend) and whenever the LLM proxy isn't metering — the percent
+    fraction then stands in. Spend by clients outside the router raises `p`
+    without raising metered spend, which under-estimates remaining budget —
+    the conservative direction.
+  - Percent-only fractions (`overage_headroom`, `plan_headroom`) remain the
+    fallback when no dollar figure exists, and a paying seat still never
+    looks "more free" than a seat with included plan remaining
+    (`cap_overage_headroom`).
 
 Availability comes from two sources:
 
@@ -265,7 +295,7 @@ Availability comes from two sources:
         { "agent": "claude",
           "windows": [ { "percent": 72, "scope": null, "active": false },
                        { "percent": 100, "scope": "Fable", "active": true } ],
-          "overage": { "enabled": true, "percent": 40 } },
+          "overage": { "enabled": true, "percent": 40, "remaining_dollars": 5400.0 } },
         { "agent": "codex",
           "windows": [ { "percent": 35, "scope": null } ] }
       ]
@@ -276,11 +306,16 @@ Availability comes from two sources:
   A fresh hint outranks the router's own poll for that agent until it
   expires (`ttl_secs`, default `availability_preference.hint_ttl_secs`);
   unknown agents and windowless entries are ignored, and hints are
-  session-less (send once per connection, not per session). Effective
+  session-less (send once per connection, not per session). The
+  `remaining_dollars` fields (on `overage`, and accepted per window) are
+  optional — a client that knows real dollars reports them and gets
+  dollar-normalized ranking; percent-only hints keep working on the
+  fraction fallback. Effective
   preferences show up in the routing disclosure (`+ pref 0.07` /
   `- pref 0.25 (seat on paid overage)`) and the known availability set rides
   the pin metadata as `_meta.router_acp.availability`
-  (`[{candidate, plan_headroom, on_overage, source}]`).
+  (`[{candidate, plan_headroom, plan_remaining_dollars, on_overage,
+  overage_headroom, overage_remaining_dollars, source}]`).
 
 ### Quality data
 
@@ -662,9 +697,10 @@ example.
 | `headroom.cordon_default_secs` | `900` | Cordon length for a rate/usage-limited agent when the error carries no parseable reset time. |
 | `cordon.enabled` | `true` | Master switch for proactive usage-cap cordons (inert unless an agent has a `usage_source`). Also gates the usage polling that feeds `availability_preference`. |
 | `cordon.poll_secs` | `300` | Usage poll interval / cache TTL. |
-| `availability_preference.enabled` | `true` | Plan-aware routing: effective quota headroom is the lower of local and reported candidate plan headroom; effective preference = `agents[].preference × plan_headroom`; paid overage also incurs a difficulty-scaled surcharge. Off = local headroom plus static preference, hints ignored. |
+| `availability_preference.enabled` | `true` | Plan-aware routing: effective quota headroom is the lower of local headroom and the candidate's seat budget (real dollars where estimable, else the reported plan fraction); effective preference scales the same way. Paid overage also incurs a difficulty-scaled surcharge. Off = local headroom plus static preference, hints ignored. |
 | `availability_preference.cost_aversion` | `0.1` | Paid-overage surcharge coefficient. Utility subtracts `cost_aversion × (1 - task complexity)`; `0` means the user is perfectly willing to pay. |
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
+| `availability_preference.headroom_scale_dollars` | `200` | Remaining budget, in dollars, at/above which a seat's quota term reads fully free. Ranking compares real dollars (overage pools directly from the provider API, plan windows estimated from the router's own metered spend), not the fraction of each provider's own (differently-sized) cap. |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
 | `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
 | `agents[].llm_proxy.codex_chatgpt_provider` | `false` | For an OpenAI-protocol Codex agent, install a custom HTTP Responses provider so ChatGPT-authenticated Codex traffic traverses the proxy instead of bypassing it over WebSocket. |

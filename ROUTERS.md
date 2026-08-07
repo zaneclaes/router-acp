@@ -78,14 +78,22 @@ And for `auto`, each candidate carries three numbers:
   (`*mini*`) must come before broad ones (`*gpt-5*`).
 - **cost rank** — your `models[].cost_rank` (1 = cheapest/least scarce).
   With flat-rate seats this models *scarcity*, not dollars.
-- **headroom** — the lower of the local sliding-window estimate and reported
-  free plan headroom for this candidate. Model-scoped caps, such as Claude
-  Fable's weekly window, apply only to that model. Agents with no usage meter
-  (Grok, Kimi) have no reported plan headroom; while **any metered seat still
-  has free included plan**, their effective headroom is capped at that best
-  free metered residual so a fake 100% does not beat free Claude/Codex on the
-  quota term. When every metered free plan is exhausted, unmetered keeps full
-  local headroom (valid failover).
+- **headroom** — the lower of the local sliding-window estimate and the
+  candidate's seat budget: while included plan remains, its reported free
+  fraction; once a seat is paying overage, its remaining budget is compared in
+  real **dollars** (not the fraction of that provider's own cap — a $9k pool
+  at 3% free and a $3k pool at 3% free are the same percentage but not the
+  same seat), saturated at `availability_preference.headroom_scale_dollars`
+  (default $200). Overage pools report real dollars straight from the
+  provider API; included-plan windows have no dollar field on either
+  provider, so the router estimates them from its own metered spend vs the
+  window's percent. Model-scoped caps, such as Claude Fable's weekly window,
+  apply only to that model. Agents with no usage meter (Grok, Kimi) have no
+  reported plan headroom; while **any metered seat still has free included
+  plan**, their effective headroom is capped at that best free metered
+  residual so a fake 100% does not beat free Claude/Codex on the quota term.
+  When every metered free plan is exhausted, unmetered keeps full local
+  headroom (valid failover).
 
 The kind of task comes from a **classifier** that reads your first prompt:
 it assigns a task class (BugFix, Research, Architecture, UiTweak, …) and a

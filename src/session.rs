@@ -815,13 +815,21 @@ impl Shared {
                 .map(|a| a.preference)
                 .unwrap_or(0.0);
             // Dynamic preference scaling: the configured bonus fades with the
-            // seat's free plan budget. Paid-overage aversion is applied by the
-            // auto strategy against task complexity, where it can raise the
-            // difficulty bar without making a frontier candidate impossible.
+            // seat's usable budget — free plan while any remains, else the
+            // graded overage/credit pool once the plan is spent (so a seat
+            // with thousands of overage dollars left doesn't flatten to the
+            // same 0 as one about to hit its spend cap). Paid-overage
+            // aversion is applied by the auto strategy against task
+            // complexity, where it can raise the difficulty bar without
+            // making a frontier candidate impossible.
             let availability = headroom.availability(&c.id);
-            let preference = match &availability {
-                Some(a) if self.cfg.availability_preference.enabled => {
-                    static_preference * a.plan_headroom.clamp(0.0, 1.0)
+            let seat_budget = availability.as_ref().map(|a| {
+                a.seat_budget(self.cfg.availability_preference.headroom_scale_dollars)
+                    .clamp(0.0, 1.0)
+            });
+            let preference = match seat_budget {
+                Some(budget) if self.cfg.availability_preference.enabled => {
+                    static_preference * budget
                 }
                 _ => static_preference,
             };
@@ -833,8 +841,9 @@ impl Shared {
                 .as_ref()
                 .filter(|_| self.cfg.availability_preference.enabled)
                 .map(|a| a.plan_headroom.clamp(0.0, 1.0));
-            let effective_headroom = plan_headroom
-                .map(|p| local_headroom.min(p))
+            let effective_headroom = seat_budget
+                .filter(|_| self.cfg.availability_preference.enabled)
+                .map(|budget| local_headroom.min(budget))
                 .unwrap_or(local_headroom);
             views.push(CandidateView {
                 headroom: effective_headroom,
@@ -851,6 +860,9 @@ impl Shared {
         // Unmetered seats (no plan signal) must not look "more free" than a
         // metered seat that still has included plan — see cap_unmetered_headroom.
         crate::strategies::cap_unmetered_headroom(&mut views);
+        // Paying seats must not look "more free" than a metered seat still on
+        // included plan either — see cap_overage_headroom.
+        crate::strategies::cap_overage_headroom(&mut views);
         views
     }
 
@@ -3039,7 +3051,10 @@ async fn pin_session(
                         json!({
                             "candidate": id.to_string(),
                             "plan_headroom": (a.plan_headroom * 100.0).round() / 100.0,
+                            "plan_remaining_dollars": a.plan_remaining_dollars.map(|d| (d * 100.0).round() / 100.0),
                             "on_overage": a.on_overage,
+                            "overage_headroom": a.overage_headroom.map(|h| (h * 100.0).round() / 100.0),
+                            "overage_remaining_dollars": a.overage_remaining_dollars.map(|d| (d * 100.0).round() / 100.0),
                             "source": a.source,
                         })
                     })
