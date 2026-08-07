@@ -378,7 +378,19 @@ SDK traps below, which were all discovered the hard way.
   `auto_upgrade.confidence_threshold` it queues an upgrade to the best
   strictly-more-capable eligible candidate, `auto_upgrade.enabled` gates it);
   and **`skill_routing`** (a prompt invoking a configured skill pattern forces
-  the session onto that skill's candidate globs). `detect_skill_route` strips
+  the session onto that skill's candidate globs). **`candidates` vs
+  `also_acceptable`:** acceptance and switch-target are deliberately two sets —
+  `already_ok` tests the pin against `candidates ∪ also_acceptable`, but
+  `first_eligible_candidate` only ever searches `candidates`. **LESSON
+  (downgrade-on-skill):** they used to be one list, so a session pinned to a
+  model *better* than anything in `candidates` was force-switched (summarize +
+  re-pin, live context lost) onto a *lesser* one purely for being absent from
+  the list — 19 of 26 skill-forced switches in a 7-day Kory Code sample.
+  Widening `candidates` can't fix it: targets are picked by highest quality, so
+  the added entry becomes the target for every genuine switch instead.
+  Regression-tested in `skill_routing_leaves_also_acceptable_pin_alone` and
+  `skill_routing_never_switches_to_an_also_acceptable_model`.
+  `detect_skill_route` strips
   code spans (`strip_code_spans`) before matching so a skill *named* in
   backticks/examples doesn't count as invoking it — **LESSON (hickory-ai6):** a
   feature-list prompt describing an autocomplete for `` `/ship-pr` `` matched the

@@ -397,18 +397,29 @@ Three ways it happens:
 3. **A skill demands a model class.** Some skills should always run on capable
    models. `skill_routing` maps a skill pattern to a preferred set of candidate
    globs; when a prompt invokes that skill (as `/name` or a standalone token)
-   and the pinned model is not already in the set, the session switches to the
+   and the pinned model is not already acceptable, the session switches to the
    best available match. Before the pin it steers the initial routing instead.
 
    ```yaml
    skill_routing:
      - pattern: ship-pr            # matches "/ship-pr" or the token "ship-pr"
-       candidates: ["*opus*", "*gpt-5.5*"]   # first eligible match wins
+       candidates: ["*opus*", "*gpt-5.5*"]   # switch TO these; first eligible wins
+       also_acceptable: ["*fable*", "*sol*"] # already here? leave the pin alone
    ```
 
    Candidates are candidate globs (a *class*), tried in order; if none are
    routeable (cordoned, down, excluded) the session keeps its current model and
    says so, rather than blocking.
+
+   **`candidates` and `also_acceptable` are different sets on purpose.** The
+   pin is left alone if it matches *either*, but a switch may only target
+   `candidates`. Without the split, one list has to answer two questions — "is
+   the current pin good enough?" and "what do we switch to?" — and the only way
+   to stop force-switching an already-better pin is to add it to the list,
+   which then makes it the switch target for every genuine switch (targets are
+   picked by highest quality). Put models that are fine to *stay* on but that
+   you don't want to route *to* — typically the expensive top of the range — in
+   `also_acceptable`.
 
 All three degrade gracefully: if the target is unavailable the session stays
 put with a visible note. Each switch is recorded in the state file with its
