@@ -186,18 +186,20 @@ SDK traps below, which were all discovered the hard way.
   `xai_gate_tests`).
 - **Plan-aware effective cost, in real dollars** (`availability_preference.*`;
   same poll + client hints): `eligible_views` uses the lower of local
-  sliding-window headroom and `SeatAvailability::seat_budget(scale_dollars)`
-  in the quota term. `seat_budget` compares real DOLLARS, not the fraction of
-  each provider's own (differently-sized) cap — a $9k pool at 3% free ($270)
-  and a $3k pool at 3% free ($90) are the same fraction but not the same
-  seat, and a percent-only comparison can't tell them apart (or worse,
-  inverts against a smaller-cap seat with more real dollars left). It also
-  scales the static `agents[].preference` base the same way, then subtracts
-  `cost_aversion × (1 - task complexity)` when the seat is past its cap but
-  routable via overage/credits (spending real money). Model-scoped windows
-  affect only matching models. That preserves FREE plan budget among
-  comparable candidates; a saturated seat with no overage headroom is a
-  cordon, never a penalty.
+  sliding-window headroom and `SeatAvailability::seat_budget` in the quota
+  term. **Formula A (cheap plan ≫ expensive overage):** while free plan
+  remains, `budget = plan_headroom + overage_budget_weight × overage_signal`
+  — the cheap signal is the weekly/included **fraction**, never
+  `plan_remaining_dollars` (that estimate saturates at
+  `headroom_scale_dollars` and made a 6% weekly seat look fully free next to
+  a 100% weekly seat). Overage still ranks in real DOLLARS across
+  differently-sized caps (a $9k pool at 3% free ($270) vs a $3k pool at 3%
+  free ($90) must not tie); when plan is empty the overage signal is used at
+  full scale. It also scales the static `agents[].preference` base the same
+  way, then subtracts `cost_aversion × (1 - task complexity)` when the seat
+  is past its cap but routable via overage/credits. Model-scoped windows
+  affect only matching models. A saturated seat with no overage headroom is
+  a cordon, never a penalty.
   - **Overage/credit pools report real dollars directly from the provider
     API**: `SeatAvailability::overage_remaining_dollars` — Anthropic prefers
     `spend.limit.amount_minor − spend.used.amount_minor` (scaled by
@@ -229,22 +231,20 @@ SDK traps below, which were all discovered the hard way.
     the provider's percent without raising router-metered spend, which
     UNDER-estimates remaining — the conservative direction; pricing-table vs
     provider-internal window weighting can skew either way.
-  - `seat_budget(scale_dollars)` saturates the dollar figure at
-    `availability_preference.headroom_scale_dollars` (default `$200`) into
-    [0, 1] for the quota term; falls back to the percent fraction when no
-    dollar figure is obtainable, and to `0` when a paying seat's pool is
-    wholly unknown (the pre-dollar-grading behavior).
-    `cap_overage_headroom` mirrors `cap_unmetered_headroom`'s product rule so
-    a graded paying seat's headroom still never outranks a metered seat with
-    included plan left. **LESSON (shipped bug, two rounds):** the first fix
-    graded the overage pool as a FRACTION of each seat's own cap and compared
-    those fractions directly — live 2026-08-06, a codex seat with ~$100 of
-    member spend (~3% of its $3k cap) beat a claude seat with ~$6,600 of
-    extra usage (~74% of its $9k cap) only because the fractions happened to
-    order correctly; a $9k cap at 1% free ($90) vs a $3k cap at 5% free
-    ($150) would have inverted under percent comparison. Only real dollars,
-    normalized by a fixed scale, compare correctly across differently-sized
-    caps. Availability sources: the usage poller
+  - `seat_budget` (formula A): plan fraction is primary; overage dollars
+    (scale `headroom_scale_dollars`, default `$200`) are secondary at
+    `overage_budget_weight` (default 0.2) while plan remains, full scale when
+    plan is empty. Falls back to the overage percent fraction when no dollar
+    figure is obtainable, and to `0` when a paying seat's pool is wholly
+    unknown. `cap_overage_headroom` mirrors `cap_unmetered_headroom` so a
+    paying seat never outranks free metered plan, and unmetered Grok never
+    keeps a fake 100% while free plan remains. **LESSON (shipped bug, plan
+    dollars):** using `plan_remaining_dollars / scale` for free-plan ranking
+    made Claude at 6% weekly + $202 estimated remaining score headroom 100%
+    next to Codex at 100% weekly (`rtr-ed57c6a2…`). **LESSON (shipped bug,
+    overage fractions):** grading overage as a FRACTION of each seat's own
+    cap inverted across differently-sized caps — only real dollars, normalized
+    by a fixed scale, compare correctly. Availability sources: the usage poller
     (`set_polled_availability`, wholesale per cycle, spend closure built
     fresh per agent in `poll_all`) and the `router-acp/availability_hint`
     extension notification (`apply_availability_hint` — session-less,
@@ -263,7 +263,8 @@ SDK traps below, which were all discovered the hard way.
     `_guards_low_signal`, `*_availability_with_spend_estimates_plan_window_dollars`),
     `headroom::tests` (hint TTL/fallback,
     `seat_budget_grades_the_overage_pool_…`,
-    `seat_budget_compares_real_dollars_not_fractions_of_different_caps`),
+    `seat_budget_compares_real_dollars_not_fractions_of_different_caps`,
+    `seat_budget_uses_plan_fraction_not_plan_dollars`),
     `state::tests::llm_cost_since_sums_by_agent_model_and_time`,
     `strategies::test_util` (`overage_headroom_capped_…`,
     `overage_headroom_keeps_its_grading_…`),

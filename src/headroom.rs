@@ -71,32 +71,70 @@ impl SeatAvailability {
         self.plan_headroom <= PLAN_HEADROOM_EPSILON && !self.on_overage
     }
 
-    /// The seat's usable budget for ranking, as a fraction in [0, 1]:
-    /// remaining real dollars saturated at `scale_dollars` (at/above the
-    /// scale the seat reads fully free), so seats are compared by absolute
-    /// money rather than by fractions of differently-sized caps. The free
-    /// plan is the budget while any remains; once the plan is gone and the
-    /// seat is paying, the overage/credit pool is. Where no dollar figure is
-    /// obtainable the reported fraction stands in (better than flattening to
-    /// 0, even though cross-cap fractions are only roughly comparable), and
-    /// a paying seat with a wholly unknown pool reads 0 — the pre-grading
-    /// behavior.
+    /// The seat's usable budget for ranking, as a fraction in [0, 1].
+    ///
+    /// **Formula A — cheap plan always dominates expensive overage:**
+    ///
+    /// ```text
+    /// plan_signal    = plan_headroom          # weekly / included fraction
+    /// overage_signal = overage $ / scale      # absolute dollars (or fraction fallback)
+    ///
+    /// while plan remains:
+    ///   budget = plan_signal + overage_weight × overage_signal   # clamp 1.0
+    /// when plan is empty (paying):
+    ///   budget = overage_signal                # full dollar grading among payers
+    /// ```
+    ///
+    /// Plan FRACTION is the cheap signal — not `plan_remaining_dollars`. Plan
+    /// dollars are an estimate that saturates at `scale_dollars` (default $200)
+    /// and made a seat at 6% weekly look fully free next to another at 100%
+    /// weekly (live: `rtr-ed57c6a2…`). Plan dollars remain on the struct for
+    /// disclosure only.
+    ///
+    /// Overage still ranks in **absolute dollars** across differently-sized
+    /// caps (f1517c0 lesson: $9k@3% vs $3k@3% must not tie). While free plan
+    /// remains, overage only contributes a weighted tie-break
+    /// (`overage_weight`, default 0.2) so it cannot overturn a real weekly gap.
+    /// Once the plan is gone, overage is the sole budget at full scale so
+    /// two paying seats still separate by remaining dollars.
+    ///
+    /// Unmetered seats (Grok) never call this with a synthetic full plan —
+    /// they have no availability row and are clipped by
+    /// `cap_unmetered_headroom` to the best free metered plan. Quality weight
+    /// (0.75) still keeps Opus/Fable ahead of Grok on non-trivial work.
     pub fn seat_budget(&self, scale_dollars: f64) -> f64 {
+        self.seat_budget_with_overage_weight(scale_dollars, DEFAULT_OVERAGE_BUDGET_WEIGHT)
+    }
+
+    /// Like [`Self::seat_budget`] with an explicit overage weight in [0, 1].
+    /// Fleet config passes `availability_preference.overage_budget_weight`.
+    pub fn seat_budget_with_overage_weight(
+        &self,
+        scale_dollars: f64,
+        overage_weight: f64,
+    ) -> f64 {
         let scale = scale_dollars.max(f64::MIN_POSITIVE);
         let plan = self.plan_headroom.clamp(0.0, 1.0);
-        if plan > PLAN_HEADROOM_EPSILON || !self.on_overage {
-            return self
-                .plan_remaining_dollars
-                .map(|d| (d.max(0.0) / scale).min(1.0))
-                .unwrap_or(plan);
-        }
-        self.overage_remaining_dollars
+        let overage_signal = self
+            .overage_remaining_dollars
             .map(|d| (d.max(0.0) / scale).min(1.0))
             .or(self.overage_headroom)
             .unwrap_or(0.0)
-            .clamp(0.0, 1.0)
+            .clamp(0.0, 1.0);
+        if plan > PLAN_HEADROOM_EPSILON {
+            let w = overage_weight.clamp(0.0, 1.0);
+            (plan + w * overage_signal).min(1.0)
+        } else {
+            // Plan empty: overage is the only pool — full [0, 1] dollar grading.
+            overage_signal
+        }
     }
 }
+
+/// Default weight on the expensive (overage) term while free plan remains.
+/// Full overage contribution (0.2) is smaller than a meaningful weekly gap,
+/// so free plan always outranks pure-overage when comparing across seats.
+pub const DEFAULT_OVERAGE_BUDGET_WEIGHT: f64 = 0.2;
 
 /// `plan_headroom` is a ratio of reported percentages, so "zero" is a
 /// tolerance, not an equality.
@@ -700,8 +738,8 @@ mod tests {
 
     #[test]
     fn seat_budget_grades_the_overage_pool_instead_of_flattening_to_zero() {
-        // Free plan remaining: budget is the plan fraction, regardless of
-        // overage_headroom (not paying yet) — no dollar figure supplied.
+        // Free plan remaining: budget is the plan fraction plus a weighted
+        // overage tie-break (overage_headroom 0.9 × default weight 0.2).
         let free_plan = SeatAvailability {
             plan_headroom: 0.3,
             plan_remaining_dollars: None,
@@ -710,10 +748,11 @@ mod tests {
             overage_remaining_dollars: None,
             source: "poll",
         };
-        assert!((free_plan.seat_budget(SCALE) - 0.3).abs() < 1e-9);
+        let expected_free = 0.3 + DEFAULT_OVERAGE_BUDGET_WEIGHT * 0.9;
+        assert!((free_plan.seat_budget(SCALE) - expected_free).abs() < 1e-9);
 
         // Plan exhausted, paying, overage pool has plenty of dollars left:
-        // saturates to full budget once past the scale.
+        // full-scale dollar grading saturates to 1.0 once past the scale.
         let paying_with_room = SeatAvailability {
             plan_headroom: 0.0,
             plan_remaining_dollars: None,
@@ -758,6 +797,55 @@ mod tests {
         };
         assert_eq!(paying_unknown.seat_budget(SCALE), 0.0);
     }
+
+    /// Live regression (`rtr-ed57c6a2…`): Claude weekly plan at 6% with
+    /// ~$202 plan-dollars estimated remaining was scored headroom 100%
+    /// because `plan_remaining_dollars / $200` saturated to 1.0, while Codex
+    /// weekly at 100% also scored 1.0 — quality then picked Opus. Formula A
+    /// ranks the plan FRACTION, so 6% loses to 100% even when plan dollars
+    /// and a huge overage pool would have looked "full free".
+    #[test]
+    fn seat_budget_uses_plan_fraction_not_plan_dollars() {
+        let claude_nearly_spent = SeatAvailability {
+            plan_headroom: 0.06,
+            plan_remaining_dollars: Some(202.19), // saturates old $200 scale
+            on_overage: false,
+            overage_headroom: Some(0.53),
+            overage_remaining_dollars: Some(4_769.39),
+            source: "poll",
+        };
+        let codex_full_weekly = SeatAvailability {
+            plan_headroom: 1.0,
+            plan_remaining_dollars: None,
+            on_overage: false,
+            overage_headroom: Some(0.0),
+            overage_remaining_dollars: Some(0.0),
+            source: "poll",
+        };
+        // Old formula would have given Claude min(1, 202/200)=1.0 — equal
+        // to Codex. New formula: Claude ≈ 0.06 + 0.2×1.0 = 0.26 < Codex 1.0.
+        let claude = claude_nearly_spent.seat_budget(SCALE);
+        let codex = codex_full_weekly.seat_budget(SCALE);
+        assert!(
+            claude < 0.5,
+            "nearly-spent weekly must not read as half-free or better: {claude}"
+        );
+        assert!(
+            codex > claude,
+            "full weekly Codex must outrank nearly-spent Claude: claude={claude} codex={codex}"
+        );
+        // Plan dollars must not drive the ranking (still 0.06 primary).
+        let without_plan_dollars = SeatAvailability {
+            plan_remaining_dollars: None,
+            ..claude_nearly_spent.clone()
+        };
+        assert!(
+            (without_plan_dollars.seat_budget(SCALE) - claude).abs() < 1e-9,
+            "plan_remaining_dollars must not affect seat_budget"
+        );
+    }
+
+
 
     // The user's exact complaint: percent-of-own-cap comparison hides real
     // dollar gaps between differently-sized caps and can invert the ranking.

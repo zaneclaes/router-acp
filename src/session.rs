@@ -858,8 +858,11 @@ impl Shared {
             // making a frontier candidate impossible.
             let availability = headroom.availability(&c.id);
             let seat_budget = availability.as_ref().map(|a| {
-                a.seat_budget(self.cfg.availability_preference.headroom_scale_dollars)
-                    .clamp(0.0, 1.0)
+                a.seat_budget_with_overage_weight(
+                    self.cfg.availability_preference.headroom_scale_dollars,
+                    self.cfg.availability_preference.overage_budget_weight,
+                )
+                .clamp(0.0, 1.0)
             });
             let preference = match seat_budget {
                 Some(budget) if self.cfg.availability_preference.enabled => {

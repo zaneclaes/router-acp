@@ -258,14 +258,20 @@ pub struct AvailabilityPreferenceConfig {
     /// router falls back to its own poll, in seconds.
     #[serde(default = "default_hint_ttl_secs")]
     pub hint_ttl_secs: u64,
-    /// Remaining budget, in real dollars, at/above which a seat's quota term
-    /// reads fully free. Seats are graded on dollars (not on the fraction of
-    /// each provider's own cap remaining) because caps differ in size across
-    /// providers/plans — a $9k cap at 3% free ($270) and a $3k cap at 3% free
-    /// ($90) are not comparable seats, but a percent-only comparison treats
-    /// them as identical.
+    /// Remaining overage/credit budget, in real dollars, at/above which the
+    /// *expensive* term of `seat_budget` reads fully free. Used only for the
+    /// overage/credit pool (absolute dollars across differently-sized caps).
+    /// Free included-plan ranking uses `plan_headroom` fraction, not dollars
+    /// (plan dollars saturated here and made a 6% weekly seat look fully free).
     #[serde(default = "default_headroom_scale_dollars")]
     pub headroom_scale_dollars: f64,
+    /// Weight on the expensive (overage) term while free plan remains, in
+    /// [0, 1]. `seat_budget = plan_headroom + overage_budget_weight ×
+    /// overage_signal` (clamped). Default 0.2 so full overage cannot overturn
+    /// a real weekly gap; when plan is empty the overage signal is used at
+    /// full scale so two paying seats still separate by remaining dollars.
+    #[serde(default = "default_overage_budget_weight")]
+    pub overage_budget_weight: f64,
 }
 
 fn default_cost_aversion() -> f64 {
@@ -280,6 +286,10 @@ fn default_headroom_scale_dollars() -> f64 {
     200.0
 }
 
+fn default_overage_budget_weight() -> f64 {
+    crate::headroom::DEFAULT_OVERAGE_BUDGET_WEIGHT
+}
+
 impl Default for AvailabilityPreferenceConfig {
     fn default() -> Self {
         Self {
@@ -287,6 +297,7 @@ impl Default for AvailabilityPreferenceConfig {
             cost_aversion: default_cost_aversion(),
             hint_ttl_secs: default_hint_ttl_secs(),
             headroom_scale_dollars: default_headroom_scale_dollars(),
+            overage_budget_weight: default_overage_budget_weight(),
         }
     }
 }
@@ -1414,6 +1425,11 @@ impl Config {
         if self.availability_preference.headroom_scale_dollars <= 0.0 {
             return Err(ConfigError(
                 "availability_preference.headroom_scale_dollars must be > 0".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.availability_preference.overage_budget_weight) {
+            return Err(ConfigError(
+                "availability_preference.overage_budget_weight must be between 0 and 1".into(),
             ));
         }
         if self.delegation.max_concurrent == 0 {
