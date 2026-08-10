@@ -622,12 +622,25 @@ pub struct PreClassifierConfig {
     #[serde(default = "default_preclass_evaluator")]
     pub evaluator: Vec<String>,
     /// DEPRECATED and ignored. The classifier LLM call is core infrastructure
-    /// that must run to completion, so it no longer has a wall-clock timeout: a
-    /// failed evaluator is detected as a connection failure and failed over to
-    /// the next candidate, and the turn is interrupted only by client
-    /// cancellation. Retained (accepted, unused) so existing configs still load.
+    /// that must run to completion, so it has no *total* wall-clock timeout — a
+    /// slow-but-working evaluator is allowed to finish. Retained (accepted,
+    /// unused) so existing configs still load. The safety role this field used
+    /// to serve now belongs to `stall_timeout_ms`, which bounds silence rather
+    /// than duration.
     #[serde(default = "default_preclass_timeout_ms")]
     pub timeout_ms: u64,
+    /// Max time the evaluator may go with **no streamed progress** before the
+    /// attempt is treated as a service failure (cordon → next evaluator →
+    /// static classifier). This is deliberately NOT a total wall-clock cap: a
+    /// slow evaluator that keeps streaming never trips it, so it preserves
+    /// "must be allowed to run to completion" while still bounding a wedge.
+    ///
+    /// Without this, an evaluator that is alive but silent hangs the prompt
+    /// forever: the turn never starts and the session shows no activity at all
+    /// (observed 2026-08-10 — a 2h57m wedge on a live session). Set 0 to
+    /// disable, which restores the unbounded-hang behavior.
+    #[serde(default = "default_preclass_stall_timeout_ms")]
+    pub stall_timeout_ms: u64,
     /// Emit `router-acp · pre-class …` disclosure lines.
     #[serde(default = "default_true")]
     pub disclose: bool,
@@ -651,6 +664,14 @@ fn default_preclass_timeout_ms() -> u64 {
     15_000
 }
 
+/// Generous: a classification is a small prompt returning small JSON, so 90s of
+/// total silence means wedged, not thinking. Sized well above a slow non-
+/// streaming adapter (which reports nothing until its final chunk) and far
+/// below the multi-hour hang this exists to stop.
+fn default_preclass_stall_timeout_ms() -> u64 {
+    90_000
+}
+
 fn default_orchestrate_min_confidence() -> f64 {
     0.65
 }
@@ -661,6 +682,7 @@ impl Default for PreClassifierConfig {
             enabled: false,
             evaluator: default_preclass_evaluator(),
             timeout_ms: default_preclass_timeout_ms(),
+            stall_timeout_ms: default_preclass_stall_timeout_ms(),
             disclose: true,
             orchestrate_min_confidence: default_orchestrate_min_confidence(),
             dimensions: Vec::new(),

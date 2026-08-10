@@ -49,6 +49,11 @@ const TICKET_ELISION_MARKER: &str =
 /// instead of eating the prompt budget: `min(probe_timeout_ms, this)`.
 const OPEN_TIMEOUT_CAP_MS: u64 = 30_000;
 
+/// How often the Phase 2 guard samples liveness + streamed progress. Cheap
+/// (two mutex reads), so it can be tight enough that a dead peer is noticed
+/// promptly without meaningfully polling-taxing a healthy turn.
+const GUARD_TICK_MS: u64 = 500;
+
 /// Structured outcome of one pre-class evaluation (success or fail-open).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreClassResult {
@@ -670,10 +675,11 @@ pub async fn evaluate(
     // main pin uses. When preferred globs match nothing (or are exhausted),
     // widen to any eligible model — the classifier can run on Grok/Opus/etc.
     // just as well as on Haiku; the prefs are only a cost preference. There is
-    // NO wall-clock timeout on the evaluator's LLM call (a slow model must be
-    // allowed to finish); the only interrupts are a real connection failure
-    // (→ failover) or the client cancelling the turn. Loop until no eligible
-    // model remains (excluded grows each attempt), never a fixed attempt cap.
+    // NO total wall-clock timeout on the evaluator's LLM call (a slow model must
+    // be allowed to finish); the interrupts are a connection failure, a peer
+    // death, a stall (no streamed progress — see `guard_turn`), or the client
+    // cancelling the turn. Loop until no eligible model remains (excluded grows
+    // each attempt), never a fixed attempt cap.
     loop {
         if cancel.is_cancelled() {
             return fail_open(
@@ -835,17 +841,35 @@ async fn evaluate_on_candidate(
         Ok(Ok(opened)) => opened,
     };
 
-    // Phase 2 — the classifier LLM generation. NO wall-clock timeout: core
-    // infrastructure that must be allowed to run to completion. The only
-    // interrupts are the client cancelling the turn (`run_until_cancelled`) or a
-    // real connection failure (a dead process EOFs → `Err`, handled as a
-    // service failure by the caller).
+    // Phase 2 — the classifier LLM generation. Still NO *total* wall-clock
+    // timeout: core infrastructure that must be allowed to run to completion,
+    // so a slow-but-working evaluator is never cut off. What IS bounded now is
+    // silence — see `guard_turn`. A downstream peer that dies outright already
+    // resolves `block_task()` promptly on its own (verified:
+    // `preclass_dead_evaluator_peer_fails_over_promptly`) — `send_request`'s
+    // wait runs on the *upstream* connection, not a task spawned on the dying
+    // downstream one, so it isn't the `relay_request`-documented hang. The gap
+    // this guard closes is the process that stays alive but never answers and
+    // never streams: that produces neither a client cancel nor a connection
+    // error, so nothing used to end the turn (observed 2026-08-10: a live
+    // session wedged 2h57m on exactly this). `guard_turn` also re-checks
+    // liveness each tick as cheap belt-and-suspenders, in case a future
+    // regression ever makes that path slower to resolve.
     let request = PromptRequest::new(
         opened.downstream_sid.clone(),
         vec![ContentBlock::from(eval_prompt.to_string())],
     );
+    let stall_timeout_ms = cfg.pre_classifier.stall_timeout_ms;
     let turn = cancel
-        .run_until_cancelled(opened.conn.send_request(request).block_task())
+        .run_until_cancelled(guard_turn(
+            shared,
+            router_sid,
+            &cand_str,
+            &opened,
+            &capture,
+            request,
+            stall_timeout_ms,
+        ))
         .await;
     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
 
@@ -895,6 +919,79 @@ async fn evaluate_on_candidate(
                         latency_ms,
                         "",
                     ))
+                }
+            }
+        }
+    }
+}
+
+/// Await the evaluator's prompt turn, but never indefinitely.
+///
+/// Returns the turn's own result when it completes — this already covers
+/// outright peer death, which resolves `block_task()` promptly on its own.
+/// Returns `Err` — which the caller classifies as a service failure and
+/// cordons + fails over — when the process is silent past `stall_timeout_ms`.
+/// The primary purpose here is the stall guard; the liveness re-check each
+/// tick is a redundant belt-and-suspenders check against the process dying
+/// with `guard_turn` itself somehow not yet noticing.
+///
+/// "Silence" is measured against streamed progress (`capture` growing), not
+/// elapsed time, so an evaluator that is slow but still emitting tokens is
+/// never cut off. An adapter that streams nothing until its final chunk gets
+/// the whole budget as one window, which is why the default is generous.
+async fn guard_turn(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    cand_str: &str,
+    opened: &OpenedSession,
+    capture: &Arc<Mutex<String>>,
+    request: PromptRequest,
+    stall_timeout_ms: u64,
+) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
+    let turn = opened.conn.send_request(request).block_task();
+    tokio::pin!(turn);
+
+    let mut last_len = capture.lock().unwrap().len();
+    let mut last_progress = Instant::now();
+    let stall = (stall_timeout_ms > 0).then(|| Duration::from_millis(stall_timeout_ms));
+
+    loop {
+        tokio::select! {
+            // Bias the turn: on a tie a real response always wins over the tick,
+            // so a turn that lands in the same instant is never mis-reported.
+            biased;
+            result = &mut turn => return result,
+            _ = tokio::time::sleep(Duration::from_millis(GUARD_TICK_MS)) => {
+                // The peer died: shared state knows even though our future never woke.
+                if shared.target_conn(&opened.process_key).is_none() {
+                    tracing::warn!(
+                        session = router_sid,
+                        evaluator = %cand_str,
+                        "pre-class evaluator peer died mid-turn; failing over"
+                    );
+                    return Err(AcpError::internal_error()
+                        .data("evaluator connection died mid-turn"));
+                }
+                let len = capture.lock().unwrap().len();
+                if len != last_len {
+                    last_len = len;
+                    last_progress = Instant::now();
+                    continue;
+                }
+                if let Some(stall) = stall
+                    && last_progress.elapsed() >= stall
+                {
+                    let silent_ms = last_progress.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        session = router_sid,
+                        evaluator = %cand_str,
+                        silent_ms,
+                        streamed_bytes = len,
+                        "pre-class evaluator stalled (no streamed progress); failing over"
+                    );
+                    return Err(AcpError::internal_error().data(format!(
+                        "evaluator stalled: no progress for {silent_ms}ms"
+                    )));
                 }
             }
         }
@@ -1123,6 +1220,7 @@ agents:
             enabled: true,
             evaluator: vec!["*m1*".into()],
             timeout_ms: 15_000,
+            stall_timeout_ms: 90_000,
             disclose: true,
             orchestrate_min_confidence: 0.65,
             dimensions: dims,

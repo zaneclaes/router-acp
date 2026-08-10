@@ -22,6 +22,10 @@
 //!   replying (execution-safety regression tests)
 //! - `MOCK_PRECLASS_CALLBACK=1`: pre-classifier prompts also request a
 //!   permission callback (which the router must reject)
+//! - `MOCK_PRECLASS_HANG=1`: pre-classifier prompts never respond and stream
+//!   nothing, while the process stays alive and healthy. This is the wedge that
+//!   used to hang a session forever: alive means no EOF, silent means no
+//!   progress, so neither of the old interrupts could fire.
 //!
 //! Prompt text directives:
 //! - `PERM` — request permission from the client, echo the outcome
@@ -351,6 +355,11 @@ async fn run_prompt(
     // Pre-classifier evaluator: return scripted JSON (no echo: wrapper so the
     // router's parser can consume it directly).
     if text.contains("[router-acp pre-classifier]") {
+        if std::env::var("MOCK_PRECLASS_HANG").as_deref() == Ok("1") {
+            // Never respond, never stream, never exit. The responder is dropped
+            // only when the process is torn down at end of test.
+            std::future::pending::<()>().await;
+        }
         if std::env::var("MOCK_PRECLASS_TOOL").as_deref() == Ok("1") {
             let _ = cx.send_notification(SessionNotification::new(
                 session_id.clone(),
