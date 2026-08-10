@@ -5711,6 +5711,33 @@ fn on_set_config_option(
                             _ => Action::UnknownConfig,
                         }
                     }
+                } else if config_id == "model" && session.pin.is_none() && !session.pinning {
+                    // ACP clients set their configured model on the session
+                    // before the first prompt (goose does this unconditionally,
+                    // and errors the whole run if the set is refused). router-acp
+                    // picks the model itself, so the `default`/`auto` placeholder
+                    // carries no preference and is accepted as a no-op. A real
+                    // candidate IS a preference and must not be silently dropped —
+                    // the same invariant we enforce on downstream agents that
+                    // no-op our own set_config_option.
+                    let value = match &req.value {
+                        SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+                        _ => String::new(),
+                    };
+                    if value.eq_ignore_ascii_case("default") || value.eq_ignore_ascii_case("auto") {
+                        Action::RouterUpdated
+                    } else {
+                        match CandidateId::parse(&value) {
+                            Some(id) => {
+                                session.candidate_override = Some(id);
+                                session.candidate_override_source = Some(OverrideSource::UserPick);
+                                Action::RouterUpdated
+                            }
+                            None => Action::BadValue(format!(
+                                "`{value}` is not `default` or an `agent/model` candidate id"
+                            )),
+                        }
+                    }
                 } else {
                     match &session.pin {
                         Some(pin) => {
