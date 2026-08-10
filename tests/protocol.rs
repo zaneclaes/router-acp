@@ -736,6 +736,67 @@ async fn pre_pin_candidate_override_and_post_pin_rejection() {
     .await;
 }
 
+// goose sets its configured model on the session before the first prompt and
+// aborts the run if the set is refused, which took down every scheduled recipe.
+// `default`/`auto` carries no preference (router-acp picks), but a concrete
+// candidate must be honored rather than silently dropped.
+#[tokio::test]
+async fn client_model_option_defers_to_router_or_pins_a_candidate() {
+    let state = temp_state_file("client-model");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1), ("m2", 2)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+
+        // `default` is accepted and leaves the router's own choice intact.
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "model".to_string(),
+            SessionConfigOptionValue::value_id("default"),
+        ))
+        .block_task()
+        .await?;
+
+        // A concrete candidate is honored, exactly as router.candidate would be.
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid2.clone(),
+            "model".to_string(),
+            SessionConfigOptionValue::value_id("mock/m2"),
+        ))
+        .block_task()
+        .await?;
+        prompt_text(&cx, &sid2, "which model").await?;
+        assert!(
+            agent_text(&observed, &sid2).contains("echo:m2:which model"),
+            "client-set model should pin the candidate: {}",
+            agent_text(&observed, &sid2)
+        );
+
+        // An unusable value is refused rather than silently ignored.
+        let sid3 = new_session(&cx).await?.session_id.0.to_string();
+        let err = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                sid3,
+                "model".to_string(),
+                SessionConfigOptionValue::value_id("not-a-candidate"),
+            ))
+            .block_task()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("candidate id"),
+            "bad model value should be refused, got {err}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn explicit_effort_precedes_automatic_and_is_reresolved_on_failover() {
     let state = temp_state_file("effort-failover");
