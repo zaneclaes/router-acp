@@ -240,7 +240,10 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
         ));
     }
     let is_preclass = env.iter().any(|(key, _)| {
-        *key == "MOCK_PRECLASS_JSON" || *key == "MOCK_PRECLASS_TOOL" || *key == "MOCK_PRECLASS_CALLBACK"
+        *key == "MOCK_PRECLASS_JSON"
+            || *key == "MOCK_PRECLASS_TOOL"
+            || *key == "MOCK_PRECLASS_CALLBACK"
+            || *key == "MOCK_PRECLASS_HANG"
     });
     if is_preclass {
         out.push_str("        - { name: MOCK_SESSION_MODES, value: preclass }\n");
@@ -5081,6 +5084,112 @@ async fn preclass_mode_less_evaluator_runs_without_set_mode() {
             !events.iter().any(|event| event["event"] == "set_mode"),
             "mode-less evaluator must not receive set_mode: {events:?}"
         );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_stalled_evaluator_fails_over_instead_of_hanging() {
+    // Regression: an evaluator that opens fine, then never answers and streams
+    // nothing, used to hang the prompt forever — the turn never started and the
+    // session showed no activity at all. It must now be bounded by
+    // `stall_timeout_ms`, cordoned, and failed over to the next evaluator.
+    let state = temp_state_file("preclass-stall");
+    let hang_log = temp_log("preclass-stall-hang");
+    let ok_log = temp_log("preclass-stall-ok");
+    let preclass_json = r#"{"routing":{"task_class":"Ops","complexity":0.31,"confidence":0.9,"reason":"after stall failover"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  stall_timeout_ms: 1500\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "hang",
+            &[("m1", 1)],
+            &[
+                ("MOCK_LOG", &hang_log.display().to_string()),
+                ("MOCK_PRECLASS_HANG", "1"),
+            ]
+        ),
+        agent_yaml(
+            "ok",
+            &[("m2", 2)],
+            &[
+                ("MOCK_LOG", &ok_log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", preclass_json),
+            ]
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "fix the failing build").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        // The stalled evaluator got its safe mode set (so Phase 1 succeeded and
+        // the wedge really was in the generation phase) and was prompted.
+        let hang_events = read_log(&hang_log);
+        assert!(
+            hang_events
+                .iter()
+                .any(|event| event["event"] == "set_mode" && event["modeId"] == "preclass"),
+            "stalled evaluator must have opened successfully: {hang_events:?}"
+        );
+        assert!(
+            hang_events.iter().any(|event| event["event"] == "prompt"),
+            "stalled evaluator must have been prompted: {hang_events:?}"
+        );
+        // Failover landed on the healthy evaluator, whose classification stuck.
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted after stall failover");
+        assert_eq!(routing["class"], "Ops", "{routing}");
+        assert_eq!(routing["complexity"], 0.31, "{routing}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_dead_evaluator_peer_fails_over_promptly() {
+    // Characterization, not a regression: unlike the stall case above, this
+    // path already resolved correctly before `guard_turn` existed —
+    // `send_request(..).block_task()`'s wait runs on the *upstream*
+    // connection, so a downstream peer dying surfaces as an error result
+    // directly, without the dropped-consuming-task hang `relay_request`
+    // documents for `forward_response_to`. `stall_timeout_ms` is set far
+    // longer than the test can afford to wait, so passing proves the turn
+    // ended via peer death, not via the (much later) stall guard tripping.
+    let state = temp_state_file("preclass-dead");
+    let ok_log = temp_log("preclass-dead-ok");
+    let preclass_json = r#"{"routing":{"task_class":"BugFix","complexity":0.44,"confidence":0.9,"reason":"after peer death"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  stall_timeout_ms: 600000\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("dead", &[("m1", 1)], &[("MOCK_EXIT_ON_PROMPT", "1")]),
+        agent_yaml(
+            "ok",
+            &[("m2", 2)],
+            &[
+                ("MOCK_LOG", &ok_log.display().to_string()),
+                ("MOCK_PRECLASS_JSON", preclass_json),
+            ]
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "fix the failing build").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("routing persisted after peer-death failover");
+        assert_eq!(routing["class"], "BugFix", "{routing}");
+        assert_eq!(routing["complexity"], 0.44, "{routing}");
         Ok(())
     })
     .await;
