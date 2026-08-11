@@ -73,20 +73,35 @@ pub fn cap_unmetered_headroom(views: &mut [CandidateView]) {
 
 /// Sibling product rule for **paying** seats: graded overage headroom ranks
 /// them among each other (a seat with most of its overage pool left must
-/// out-rank one about to hit its spend cap), but it must not make a paying
-/// seat look "more free" than a metered seat still on included plan — free
-/// plan spends nothing, overage spends real money.
+/// out-rank one about to hit its spend cap), but while any metered seat still
+/// has free included plan, a paying seat must rank meaningfully BELOW it —
+/// free plan spends nothing, overage spends real money.
 ///
-/// Cap: `on_overage.headroom = min(headroom, max free metered plan_headroom)`.
-/// When every metered free plan is exhausted (the all-seats-paying case this
-/// grading exists for), paying seats keep their full graded headroom.
-pub fn cap_overage_headroom(views: &mut [CandidateView]) {
+/// A bare ceiling (`min(headroom, best free plan)`) is not enough: a flush
+/// overage pool saturates `seat_budget` to 1.0 (any balance past
+/// `headroom_scale_dollars` reads "fully free" — correct for grading two
+/// payers against each other), so the ceiling merely TIES the paying seat
+/// with the free one and quality/preference then break the tie toward paid
+/// spend (live: `rtr-7dc8a15f…`, Opus-on-overage over Codex at 99% weekly).
+/// So while a free metered plan exists, an overage seat's budget counts for
+/// only `overage_budget_weight` of itself — the same discipline
+/// `seat_budget` applies to the overage term while a seat's own plan
+/// remains — and its scaled preference is discounted identically (it is
+/// derived from the same saturated budget).
+///
+/// `on_overage.headroom = min(headroom × weight, max free metered plan)`.
+/// When every metered free plan is exhausted (the all-seats-paying case the
+/// dollar grading exists for), paying seats keep their full graded headroom
+/// and preference.
+pub fn cap_overage_headroom(views: &mut [CandidateView], overage_budget_weight: f64) {
     let Some(cap) = max_free_metered_plan(views) else {
         return;
     };
+    let weight = overage_budget_weight.clamp(0.0, 1.0);
     for view in views.iter_mut() {
         if view.on_overage {
-            view.headroom = view.headroom.min(cap);
+            view.headroom = (view.headroom * weight).min(cap);
+            view.preference *= weight;
         }
     }
 }
@@ -335,7 +350,7 @@ pub(crate) mod test_util {
     }
 
     #[test]
-    fn overage_headroom_capped_when_metered_has_free_plan() {
+    fn overage_headroom_discounted_when_metered_has_free_plan() {
         let mut views = vec![
             view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.44),
             {
@@ -347,11 +362,11 @@ pub(crate) mod test_util {
                 v
             },
         ];
-        cap_overage_headroom(&mut views);
+        cap_overage_headroom(&mut views, 0.2);
         let sol = views.iter().find(|v| v.id.agent == "codex").unwrap();
         assert!(
-            (sol.headroom - 0.44).abs() < 1e-9,
-            "paying seat capped at best free metered plan, got {}",
+            (sol.headroom - 0.18).abs() < 1e-9,
+            "paying seat discounted to weight x budget (0.9 x 0.2), got {}",
             sol.headroom
         );
         let haiku = views.iter().find(|v| v.id.model == "haiku").unwrap();
@@ -361,15 +376,59 @@ pub(crate) mod test_util {
         );
     }
 
+    /// Live regression (`rtr-7dc8a15f…`): Claude's weekly plan fully spent
+    /// (every token is paid overage) with thousands of overage dollars left
+    /// saturated `seat_budget` to 1.0, and the old bare ceiling only clipped
+    /// it to Codex's ~0.99 free plan — a paying seat TIED with an untouched
+    /// free one, and Claude's +0.1 preference (scaled by the same saturated
+    /// budget) then broke the tie toward paid spend. The discount must leave
+    /// the paying seat meaningfully below the free one, preference included.
+    #[test]
+    fn overage_seat_ranks_meaningfully_below_untouched_free_plan() {
+        let mut views = vec![
+            {
+                let mut v = view_metered("claude", "opus[1m]", 4, 0, 2.97, CodingTier::High, 0.0);
+                v.on_overage = true;
+                v.headroom = 0.99; // saturated seat_budget, ceiling-clipped
+                v.preference = 0.1; // static 0.1 x saturated budget 1.0
+                v
+            },
+            view_metered("codex", "gpt-5.6-terra", 4, 1, 2.37, CodingTier::High, 0.99),
+        ];
+        cap_overage_headroom(&mut views, 0.2);
+        let opus = views.iter().find(|v| v.id.agent == "claude").unwrap();
+        let terra = views.iter().find(|v| v.id.agent == "codex").unwrap();
+        assert!(
+            (opus.headroom - 0.198).abs() < 1e-9,
+            "paying seat must sit at weight x budget, got {}",
+            opus.headroom
+        );
+        assert!(
+            opus.headroom < terra.headroom * 0.5,
+            "paying seat must rank well below the free seat: {} vs {}",
+            opus.headroom,
+            terra.headroom
+        );
+        assert!(
+            (opus.preference - 0.02).abs() < 1e-9,
+            "preference derived from the saturated budget takes the same \
+             discount, got {}",
+            opus.preference
+        );
+        assert!((terra.headroom - 0.99).abs() < 1e-9, "free seat untouched");
+    }
+
     #[test]
     fn overage_headroom_keeps_its_grading_when_no_free_plan_remains() {
         // Every seat is paying — the shape this grading exists for. Each
-        // paying seat keeps its own graded headroom rather than collapsing.
+        // paying seat keeps its own graded headroom and preference rather
+        // than collapsing.
         let mut views = vec![
             {
                 let mut v = view_metered("claude", "haiku", 1, 0, 1.29, CodingTier::Medium, 0.0);
                 v.on_overage = true;
                 v.headroom = 0.73;
+                v.preference = 0.1;
                 v
             },
             {
@@ -379,10 +438,11 @@ pub(crate) mod test_util {
                 v
             },
         ];
-        cap_overage_headroom(&mut views);
+        cap_overage_headroom(&mut views, 0.2);
         let claude = views.iter().find(|v| v.id.agent == "claude").unwrap();
         let codex = views.iter().find(|v| v.id.agent == "codex").unwrap();
         assert!((claude.headroom - 0.73).abs() < 1e-9);
+        assert!((claude.preference - 0.1).abs() < 1e-9);
         assert!((codex.headroom - 0.03).abs() < 1e-9);
     }
 

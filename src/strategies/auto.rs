@@ -625,4 +625,100 @@ mod tests {
             "fixture drift: uncapped pool should still prefer Grok"
         );
     }
+
+    /// Live regression (`rtr-7dc8a15f…`, 2026-08-11): Claude's weekly plan
+    /// fully spent — every token paid overage — with thousands of overage
+    /// dollars left, next to Codex at 99% free weekly. `seat_budget`'s
+    /// dollar grading saturated to 1.0, the old ceiling-only cap clipped it
+    /// to Codex's 0.99 (a tie), and Claude's +0.1 preference broke the tie:
+    /// Opus won a BugFix both Terra and Sol met (demand 2.2 under all three
+    /// scores), spending real money with a free equal-fit seat idle. After
+    /// the discount, a free codex seat must win; the pre-fix shape is kept
+    /// as the documents-the-bug leg.
+    #[test]
+    fn paid_overage_does_not_beat_untouched_free_plan_on_met_demand() {
+        use crate::candidate::TaskClass;
+        use crate::strategies::{cap_overage_headroom, test_util::view_metered};
+
+        // Fleet config shape (kory-code/router.yaml).
+        let s = AutoStrategy::with_cost_aversion(
+            AutoRouterConfig {
+                cost_quality_tradeoff: 3.0,
+                complexity_floor: 0.7, // above 0.5 — no p75 gate
+                complexity_scales_tradeoff: true,
+                min_cost_weight: 0.25,
+                allowed_candidates: vec!["*".into()],
+                apex_complexity: 0.9, // above 0.5 — not the apex path
+            },
+            0.1,
+        );
+        // The recorded availability: four Claude seats paying (plan 0.0,
+        // saturated budget ceiling-clipped to 0.99, preference 0.1), five
+        // Codex seats on an almost untouched weekly plan (0.99).
+        let overage_claude = |model: &str, rank, idx, quality| {
+            let mut v = view_metered("claude", model, rank, idx, quality, CodingTier::High, 0.0);
+            v.on_overage = true;
+            v.headroom = 0.99;
+            v.preference = 0.1;
+            v
+        };
+        let mut pool = vec![
+            overage_claude("haiku", 1, 0, 1.29),
+            overage_claude("sonnet", 2, 1, 1.39),
+            overage_claude("opus[1m]", 4, 2, 2.97),
+            overage_claude("claude-fable-5[1m]", 5, 3, 2.99),
+            view_metered(
+                "codex",
+                "gpt-5.4-mini",
+                1,
+                4,
+                1.00,
+                CodingTier::Medium,
+                0.99,
+            ),
+            view_metered(
+                "codex",
+                "gpt-5.6-luna",
+                2,
+                5,
+                2.02,
+                CodingTier::Medium,
+                0.99,
+            ),
+            view_metered("codex", "gpt-5.5", 3, 6, 1.82, CodingTier::High, 0.99),
+            view_metered("codex", "gpt-5.6-terra", 4, 7, 2.37, CodingTier::High, 0.99),
+            view_metered("codex", "gpt-5.6-sol", 5, 8, 2.39, CodingTier::High, 0.99),
+        ];
+
+        let mut context = ctx();
+        context.profile.class = TaskClass::BugFix;
+        context.profile.complexity = 0.5;
+
+        // The documents-the-bug leg: the pre-discount views (ceiling-only
+        // cap already applied) pin Opus on preference + tied headroom.
+        let broken = s.rank(&context, &pool).unwrap();
+        assert_eq!(
+            broken[0].candidate.to_string(),
+            "claude/opus[1m]",
+            "fixture drift: without the discount the paying seat should win: {}",
+            broken[0].reason
+        );
+
+        cap_overage_headroom(&mut pool, 0.2);
+        let ranked = s.rank(&context, &pool).unwrap();
+        assert_eq!(
+            ranked[0].candidate.agent, "codex",
+            "a free seat meeting the demand must beat a paid-overage seat; got {} ({})",
+            ranked[0].candidate, ranked[0].reason
+        );
+        let opus = ranked
+            .iter()
+            .find(|r| r.candidate.model == "opus[1m]")
+            .unwrap();
+        assert!(
+            opus.reason.contains("- overage"),
+            "paying seat still discloses its surcharge: {}",
+            opus.reason
+        );
+    }
 }

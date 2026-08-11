@@ -897,9 +897,12 @@ impl Shared {
         // Unmetered seats (no plan signal) must not look "more free" than a
         // metered seat that still has included plan — see cap_unmetered_headroom.
         crate::strategies::cap_unmetered_headroom(&mut views);
-        // Paying seats must not look "more free" than a metered seat still on
-        // included plan either — see cap_overage_headroom.
-        crate::strategies::cap_overage_headroom(&mut views);
+        // Paying seats must rank meaningfully below a metered seat still on
+        // included plan (not merely no better) — see cap_overage_headroom.
+        crate::strategies::cap_overage_headroom(
+            &mut views,
+            self.cfg.availability_preference.overage_budget_weight,
+        );
         views
     }
 
