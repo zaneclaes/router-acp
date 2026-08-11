@@ -207,6 +207,9 @@ impl LlmProxyRuntime {
         if target.config.codex_chatgpt_provider {
             env = codex_proxy_env(env, &proxy_base);
         }
+        if target.config.protocol == LlmWireProtocol::Anthropic {
+            env = anthropic_proxy_env(env);
+        }
         tracing::info!(
             target = %spec.key,
             env = target.config.base_url_env,
@@ -388,6 +391,28 @@ fn codex_proxy_env(mut env: Vec<(String, String)>, proxy_base: &str) -> Vec<(Str
         Value::Object(config).to_string(),
     ));
     env.push(("MODEL_PROVIDER".to_string(), PROVIDER.to_string()));
+    env
+}
+
+/// Claude Code disables MCP tool search whenever `ANTHROPIC_BASE_URL` is not a
+/// first-party Anthropic host, because a proxy that drops `tool_reference`
+/// blocks would leave the model unable to load the tools it asked for. It then
+/// falls back to sending every MCP tool schema eagerly — on a session with a
+/// few connectors that is ~150k tokens of context before the first reply.
+///
+/// Interposing that base URL is exactly what `process_env` just did, and this
+/// proxy forwards request and response bodies verbatim (only the top-level
+/// `model` is ever rewritten), so the condition Claude Code asks about holds.
+/// Only the proxy can answer that question, so answer it here rather than
+/// making every deployment set the variable by hand.
+///
+/// An explicit operator setting always wins — including `false`, which is how
+/// you opt out if a future body rewrite ever stops being transparent.
+fn anthropic_proxy_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    const TOOL_SEARCH: &str = "ENABLE_TOOL_SEARCH";
+    if !env.iter().any(|(name, _)| name == TOOL_SEARCH) {
+        env.push((TOOL_SEARCH.to_string(), "true".to_string()));
+    }
     env
 }
 
@@ -2770,6 +2795,33 @@ agents:
     }
 
     #[test]
+    fn anthropic_proxy_env_enables_tool_search() {
+        let env = anthropic_proxy_env(vec![(
+            "ANTHROPIC_BASE_URL".into(),
+            "http://127.0.0.1:4321/proxy/token/v1".into(),
+        )]);
+        let tool_search = env
+            .iter()
+            .find(|(name, _)| name == "ENABLE_TOOL_SEARCH")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(tool_search, Some("true"));
+    }
+
+    #[test]
+    fn anthropic_proxy_env_keeps_an_explicit_operator_setting() {
+        let env = anthropic_proxy_env(vec![
+            ("ANTHROPIC_BASE_URL".into(), "http://127.0.0.1:4321".into()),
+            ("ENABLE_TOOL_SEARCH".into(), "false".into()),
+        ]);
+        let values: Vec<&str> = env
+            .iter()
+            .filter(|(name, _)| name == "ENABLE_TOOL_SEARCH")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values, vec!["false"]);
+    }
+
+    #[test]
     fn begin_turn_resets_stale_model_attribution_on_repin() {
         let (_dir, shared) = policy_shared(0);
         let first = shared.llm_proxy.begin_turn(
@@ -3132,9 +3184,16 @@ agents:
         );
         let proxy_task = shared.llm_proxy.bind(shared.clone()).await.unwrap();
         let spec = shared.target_spec(&ProcessKey("mock".to_string())).unwrap();
-        let proxy_base = shared
-            .llm_proxy
-            .process_env(&spec)
+        let process_env = shared.llm_proxy.process_env(&spec);
+        // An interposed anthropic target also carries the tool-search override.
+        assert_eq!(
+            process_env
+                .iter()
+                .find(|(name, _)| name == "ENABLE_TOOL_SEARCH")
+                .map(|(_, value)| value.as_str()),
+            Some("true")
+        );
+        let proxy_base = process_env
             .into_iter()
             .find(|(name, _)| name == "MOCK_BASE_URL")
             .unwrap()
