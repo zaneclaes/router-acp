@@ -81,6 +81,16 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Report adoption of the ordinary scoped delegation directive: how often
+    /// it was injected, how often a real router delegate child was created,
+    /// and whether a provider-native subagent bypassed the router.
+    DelegationReport {
+        #[arg(long)]
+        config: PathBuf,
+        /// Max prompted sessions to show (summary always covers all retained data).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -431,6 +441,100 @@ async fn main() -> anyhow::Result<()> {
                 "\nnote: cost is the adapter's own usage_update.cost (USD). \"degraded\" runs used\n\
                  the built-in Task tool instead of delegate_task — their sub-work is not captured\n\
                  here. Join git_sha/branch to CI/merge outcomes for accuracy signal."
+            );
+            Ok(())
+        }
+        Command::DelegationReport { config, limit } => {
+            let cfg = Config::from_file(&config)?;
+            let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
+            let all = state.all();
+            // Probe per primary session so SQLite uses idx_log_session; a
+            // global kind scan is prohibitively expensive on long-lived DBs.
+            let directive_counts: std::collections::HashMap<String, u64> = all
+                .iter()
+                .filter(|(_, session)| session.kind == "primary")
+                .filter_map(|(id, _)| {
+                    let count = state.log_kind_count(id, "delegation_directive");
+                    (count > 0).then(|| (id.clone(), count))
+                })
+                .collect();
+            let mut children: std::collections::HashMap<String, Vec<_>> =
+                std::collections::HashMap::new();
+            for (id, session) in &all {
+                if let Some(parent) = &session.parent_session_id {
+                    children
+                        .entry(parent.clone())
+                        .or_default()
+                        .push((id.clone(), session.clone()));
+                }
+            }
+            let prompted: Vec<_> = all
+                .iter()
+                .filter(|(id, session)| {
+                    session.kind == "primary" && directive_counts.contains_key(id)
+                })
+                .collect();
+            let adopted = prompted
+                .iter()
+                .filter(|(id, _)| children.get(id).is_some_and(|kids| !kids.is_empty()))
+                .count();
+            let injections: u64 = prompted
+                .iter()
+                .map(|(id, _)| directive_counts.get(id).copied().unwrap_or(0))
+                .sum();
+            let native_bypasses: u64 = prompted
+                .iter()
+                .map(|(_, session)| session.native_subagent_calls)
+                .sum();
+            let effective_cost = |session: &router_acp::state::PersistedSession| {
+                if session.llm_requests_total > 0 && session.llm_request_cost_usd > 0.0 {
+                    session.llm_request_cost_usd
+                } else {
+                    session.cost_usd
+                }
+            };
+            let parent_cost: f64 = prompted
+                .iter()
+                .map(|(_, session)| effective_cost(session))
+                .sum();
+            let delegate_cost: f64 = prompted
+                .iter()
+                .flat_map(|(id, _)| children.get(id).into_iter().flatten())
+                .map(|(_, session)| effective_cost(session))
+                .sum();
+
+            println!(
+                "ordinary delegation adoption report ({} prompted sessions)\n",
+                prompted.len()
+            );
+            for (id, session) in prompted.iter().take(limit.max(1)) {
+                let kid_count = children.get(id).map_or(0, Vec::len);
+                println!(
+                    "{}  {}/{}  injections {} | delegates {} | native bypasses {}",
+                    &id[..id.len().min(20)],
+                    session.agent,
+                    session.model,
+                    directive_counts.get(id).copied().unwrap_or(0),
+                    kid_count,
+                    session.native_subagent_calls,
+                );
+            }
+            println!("\n── summary ──");
+            println!("  prompted sessions      : {}", prompted.len());
+            println!("  directive injections   : {injections}");
+            println!(
+                "  sessions that delegated: {} ({}%)",
+                adopted,
+                if prompted.is_empty() {
+                    0
+                } else {
+                    adopted * 100 / prompted.len()
+                }
+            );
+            println!("  native bypass calls    : {native_bypasses}");
+            println!(
+                "  cost: parents ${parent_cost:.2} + delegates ${delegate_cost:.2} = ${:.2}",
+                parent_cost + delegate_cost
             );
             Ok(())
         }

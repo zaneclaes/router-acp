@@ -22,6 +22,9 @@ classifier:
 
 delegation:
   enabled: true
+  # Opt in to a one-shot, scoped delegation directive, but only on ordinary
+  # sessions where the router actually attached a cheaper-worker tool.
+  inject_prompt: false
   max_concurrent: 3
 
 # Graceful degradation. Rate/usage-limited agents are cordoned until the

@@ -883,6 +883,20 @@ impl StateFile {
         out
     }
 
+    /// Number of `kind` log entries for one session. The session-first filter
+    /// uses `idx_log_session`; reports intentionally call this per retained
+    /// primary rather than scanning the full (potentially multi-GB) log table.
+    pub fn log_kind_count(&self, router_session_id: &str, kind: &str) -> u64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_log \
+                 WHERE router_session_id=?1 AND kind=?2",
+                params![router_session_id, kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64
+    }
+
     /// Delete sessions (and, by cascade, their logs) idle past `max_age`.
     pub fn prune(&self) -> usize {
         self.prune_at(now_epoch())

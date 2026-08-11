@@ -29,6 +29,9 @@ llm_proxy:
 
 delegation:
   enabled: true
+  # Prompt ordinary parents to use router-owned delegation for bounded,
+  # independent work when its briefing/verification overhead is worthwhile.
+  inject_prompt: true
   max_concurrent: 3
   # The parent has already decomposed the work into a fully-specified brief;
   # long, detailed briefs otherwise classify as max complexity, which zeroes
