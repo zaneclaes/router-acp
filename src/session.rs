@@ -3461,6 +3461,11 @@ async fn send_prompt_with_failover(
                 shared.with_session(&router_sid, |s| {
                     s.delegation_directive_active = true;
                 });
+                shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .note_delegation_directive(&router_sid);
                 shared.state.lock().unwrap().log(
                     &router_sid,
                     &crate::state::LogEntry {

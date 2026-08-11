@@ -96,6 +96,9 @@ pub struct PersistedSession {
     /// orchestrating session — each one bypasses the router's `delegate_task`,
     /// so a non-zero value means orchestration silently degraded.
     pub native_subagent_calls: u64,
+    /// Number of ordinary delegation directives injected into downstream model
+    /// sessions. Detailed candidate/scope data remains in `session_log`.
+    pub delegation_directive_injections: u64,
     /// Accumulated model compute time (prompt-sent → response), in ms —
     /// excludes user idle time between turns (unlike updated_at − created_at).
     pub compute_ms: u64,
@@ -226,6 +229,7 @@ impl StateFile {
             llm_request_cost_usd  REAL NOT NULL DEFAULT 0,
             llm_requests_total    INTEGER NOT NULL DEFAULT 0,
             native_subagent_calls INTEGER NOT NULL DEFAULT 0,
+            delegation_directive_injections INTEGER NOT NULL DEFAULT 0,
             compute_ms            INTEGER NOT NULL DEFAULT 0,
             git_branch            TEXT,
             git_sha               TEXT
@@ -316,6 +320,7 @@ impl StateFile {
             "ALTER TABLE sessions ADD COLUMN prior_session_id TEXT",
             "ALTER TABLE sessions ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN native_subagent_calls INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN delegation_directive_injections INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN compute_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN git_branch TEXT",
             "ALTER TABLE sessions ADD COLUMN git_sha TEXT",
@@ -422,6 +427,9 @@ impl StateFile {
             llm_request_cost_usd: row.get("llm_request_cost_usd").unwrap_or(0.0),
             llm_requests_total: row.get::<_, i64>("llm_requests_total").unwrap_or(0) as u64,
             native_subagent_calls: row.get::<_, i64>("native_subagent_calls").unwrap_or(0) as u64,
+            delegation_directive_injections: row
+                .get::<_, i64>("delegation_directive_injections")
+                .unwrap_or(0) as u64,
             compute_ms: row.get::<_, i64>("compute_ms").unwrap_or(0) as u64,
             git_branch: row.get("git_branch").unwrap_or(None),
             git_sha: row.get("git_sha").unwrap_or(None),
@@ -833,6 +841,17 @@ impl StateFile {
         );
     }
 
+    /// Increment the cheap session-level counter used by delegation reports.
+    /// The corresponding detailed event is stored separately in session_log.
+    pub fn note_delegation_directive(&self, router_session_id: &str) {
+        let _ = self.conn.execute(
+            "UPDATE sessions SET \
+             delegation_directive_injections=delegation_directive_injections+1 \
+             WHERE router_session_id=?1",
+            params![router_session_id],
+        );
+    }
+
     /// Add model compute time (ms) for a turn (excludes user idle).
     pub fn add_compute_ms(&self, router_session_id: &str, ms: u64) {
         let _ = self.conn.execute(
@@ -881,20 +900,6 @@ impl StateFile {
         }
         out.reverse();
         out
-    }
-
-    /// Number of `kind` log entries for one session. The session-first filter
-    /// uses `idx_log_session`; reports intentionally call this per retained
-    /// primary rather than scanning the full (potentially multi-GB) log table.
-    pub fn log_kind_count(&self, router_session_id: &str, kind: &str) -> u64 {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_log \
-                 WHERE router_session_id=?1 AND kind=?2",
-                params![router_session_id, kind],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as u64
     }
 
     /// Delete sessions (and, by cascade, their logs) idle past `max_age`.

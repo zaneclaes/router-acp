@@ -448,16 +448,6 @@ async fn main() -> anyhow::Result<()> {
             let cfg = Config::from_file(&config)?;
             let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
             let all = state.all();
-            // Probe per primary session so SQLite uses idx_log_session; a
-            // global kind scan is prohibitively expensive on long-lived DBs.
-            let directive_counts: std::collections::HashMap<String, u64> = all
-                .iter()
-                .filter(|(_, session)| session.kind == "primary")
-                .filter_map(|(id, _)| {
-                    let count = state.log_kind_count(id, "delegation_directive");
-                    (count > 0).then(|| (id.clone(), count))
-                })
-                .collect();
             let mut children: std::collections::HashMap<String, Vec<_>> =
                 std::collections::HashMap::new();
             for (id, session) in &all {
@@ -470,8 +460,8 @@ async fn main() -> anyhow::Result<()> {
             }
             let prompted: Vec<_> = all
                 .iter()
-                .filter(|(id, session)| {
-                    session.kind == "primary" && directive_counts.contains_key(id)
+                .filter(|(_, session)| {
+                    session.kind == "primary" && session.delegation_directive_injections > 0
                 })
                 .collect();
             let adopted = prompted
@@ -480,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
                 .count();
             let injections: u64 = prompted
                 .iter()
-                .map(|(id, _)| directive_counts.get(id).copied().unwrap_or(0))
+                .map(|(_, session)| session.delegation_directive_injections)
                 .sum();
             let native_bypasses: u64 = prompted
                 .iter()
@@ -502,6 +492,11 @@ async fn main() -> anyhow::Result<()> {
                 .flat_map(|(id, _)| children.get(id).into_iter().flatten())
                 .map(|(_, session)| effective_cost(session))
                 .sum();
+            let delegate_cost = if delegate_cost == 0.0 {
+                0.0
+            } else {
+                delegate_cost
+            };
 
             println!(
                 "ordinary delegation adoption report ({} prompted sessions)\n",
@@ -514,7 +509,7 @@ async fn main() -> anyhow::Result<()> {
                     &id[..id.len().min(20)],
                     session.agent,
                     session.model,
-                    directive_counts.get(id).copied().unwrap_or(0),
+                    session.delegation_directive_injections,
                     kid_count,
                     session.native_subagent_calls,
                 );

@@ -1270,7 +1270,9 @@ async fn ordinary_delegation_directive_is_scoped_one_shot_and_reinjected_after_s
         );
         let db = open_state(&state_path);
         assert_eq!(
-            db.log_kind_count(&sid, "delegation_directive"),
+            db.get(&sid)
+                .expect("parent row")
+                .delegation_directive_injections,
             2,
             "telemetry records both real injections"
         );
@@ -1311,7 +1313,11 @@ async fn ordinary_delegation_directive_requires_a_cheaper_available_worker() {
             "no directive without an attached delegation tool: {prompts:?}"
         );
         assert!(
-            open_state(&state_path).log_kind_count(&sid, "delegation_directive") == 0,
+            open_state(&state_path)
+                .get(&sid)
+                .expect("parent row")
+                .delegation_directive_injections
+                == 0,
             "no injection telemetry without an injection"
         );
         Ok(())
@@ -3058,7 +3064,7 @@ async fn orchestration_pins_planner_and_injects_protocol_on_a_list() {
         let row = db.get(&sid).expect("session row");
         assert_eq!(row.run_label.as_deref(), Some("orchestrate"));
         assert!(
-            db.log_kind_count(&sid, "delegation_directive") == 0,
+            row.delegation_directive_injections == 0,
             "the stronger orchestration protocol suppresses the ordinary directive"
         );
         Ok(())
