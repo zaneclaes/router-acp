@@ -543,6 +543,16 @@ session. The delegate server is *not* injected when delegation is disabled,
 when only one candidate exists, or when no cheaper candidate exists for the
 parent — and never into delegated sessions themselves (depth is capped at 1).
 
+`delegation.inject_prompt: true` also prepends a one-shot directive to each
+ordinary downstream session that actually received those tools. It asks the
+parent to delegate only bounded, independent work whose briefing and
+verification overhead is worthwhile, forbids hidden-context/tightly-coupled/
+overlapping-edit work, and requires the parent to verify and integrate the
+result. A model switch creates a fresh downstream session, so the router
+re-injects there when a cheaper worker remains available. Orchestration does not
+receive this ordinary directive because its stronger protocol already governs
+delegation. The opt-in defaults to `false`.
+
 Concurrency is bounded by `delegation.max_concurrent`; `session/cancel` on the
 parent cancels the primary prompt and all active sub-sessions.
 
@@ -704,6 +714,7 @@ example.
 | `classifier.timeout_ms` | `1500` | Local-model call timeout. |
 | `classifier.rules_file` | built-in | Path to a classifier rules YAML. |
 | `delegation.enabled` | `true` | Offer `delegate_task` to pinned sessions. |
+| `delegation.inject_prompt` | `false` | When the tools are actually attached to an ordinary primary session, inject one scoped instruction to use them for suitable bounded work. Re-injected after a model switch; suppressed for orchestration. |
 | `delegation.max_concurrent` | `3` | Concurrent delegated sub-sessions. |
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `headroom.window_secs` | `18000` | Sliding-window length (5 h). |
@@ -862,6 +873,15 @@ for the note explaining tier or fallback decisions.
 **Delegation tool never appears.**
 The tool is only injected when delegation is enabled, more than one candidate
 is routeable, and a strictly cheaper candidate exists for the pinned parent.
+
+**Measure ordinary delegation adoption.**
+Each model-facing injection is recorded as a `delegation_directive` session-log
+event; actual use remains authoritative child rows in `sessions`. Summarize
+prompted sessions, adoption, native-subagent bypasses, and parent/delegate cost:
+
+```sh
+router-acp delegation-report --config router.yaml
+```
 
 ## Integration matrix
 

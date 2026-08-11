@@ -548,7 +548,10 @@ so it works from any ACP client and plain chat.
 - **Delegation reuses the session's router** over a pool restricted to
   candidates strictly cheaper than the pinned one (a static session
   delegates with `auto` semantics, since "the configured candidate" is never
-  in the cheaper pool).
+  in the cheaper pool). With `delegation.inject_prompt: true`, an ordinary
+  downstream session gets one scoped instruction only when that cheaper-worker
+  tool was actually attached; model switches re-establish it, while
+  orchestration keeps its stronger protocol.
 - **Determinism.** Identical inputs and state produce identical decisions —
   ranking has no randomness, and all tie-breaks are stable.
 - **Every decision is disclosed** on the console

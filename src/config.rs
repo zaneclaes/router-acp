@@ -106,6 +106,11 @@ impl Default for ClassifierConfig {
 pub struct DelegationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Inject a scoped, model-facing directive when the router actually offers
+    /// its delegation tools to an ordinary primary session. Disabled by
+    /// default so deployments opt into the behavioral change explicitly.
+    #[serde(default)]
+    pub inject_prompt: bool,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Unix-domain socket path for the delegate MCP helper to connect back on.
@@ -140,6 +145,7 @@ impl Default for DelegationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            inject_prompt: false,
             max_concurrent: default_max_concurrent(),
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
@@ -1732,12 +1738,20 @@ agents:
         assert_eq!(cfg.router, StrategyKind::Auto);
         assert_eq!(cfg.delegation.max_concurrent, 3);
         assert!(cfg.delegation.enabled);
+        assert!(!cfg.delegation.inject_prompt);
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
         assert_eq!(cfg.orchestration.review_confidence, 0.8);
         assert!(!cfg.llm_proxy.enabled);
         assert_eq!(cfg.llm_proxy.minimum_dwell_requests, 12);
+    }
+
+    #[test]
+    fn parses_delegation_prompt_opt_in() {
+        let yaml = format!("delegation:\n  inject_prompt: true\n{}", minimal_yaml());
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert!(cfg.delegation.inject_prompt);
     }
 
     #[test]

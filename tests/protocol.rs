@@ -1226,6 +1226,143 @@ async fn downstream_crash_after_pin_surfaces_error() {
 // Milestone 6: delegation
 // ======================================================================
 
+#[tokio::test]
+async fn ordinary_delegation_directive_is_scoped_one_shot_and_reinjected_after_switch() {
+    let state = temp_state_file("delegate-prompt");
+    let log = temp_log("delegate-prompt");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, inject_prompt: true }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1), ("m2", 2), ("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    let state_path = state.clone();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=mock/m2]\nfirst task").await?;
+        prompt_text(&cx, &sid, "second turn").await?;
+        prompt_text(&cx, &sid, "[router: switch=mock/m3]\nthird turn").await?;
+
+        let prompted: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|event| event["event"] == "prompt")
+            .filter_map(|event| event["text"].as_str().map(str::to_string))
+            .filter(|text| text.contains("[router-acp delegation]"))
+            .collect();
+        assert_eq!(
+            prompted.len(),
+            2,
+            "one directive per downstream model session: {prompted:?}"
+        );
+        assert!(
+            prompted.iter().all(|text| {
+                text.contains("bounded, independent work")
+                    && text.contains("briefing and verification overhead")
+                    && text.contains("never use provider-native Task/spawn/subagent tools")
+            }),
+            "directive carries the safety scope: {prompted:?}"
+        );
+        let db = open_state(&state_path);
+        assert_eq!(
+            db.get(&sid)
+                .expect("parent row")
+                .delegation_directive_injections,
+            2,
+            "telemetry records both real injections"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ordinary_delegation_directive_requires_a_cheaper_available_worker() {
+    let state = temp_state_file("delegate-prompt-cheapest");
+    let log = temp_log("delegate-prompt-cheapest");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, inject_prompt: true }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1), ("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    let state_path = state.clone();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=mock/m1]\ncheap task").await?;
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|event| event["event"] == "prompt")
+            .filter_map(|event| event["text"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            prompts
+                .iter()
+                .all(|text| !text.contains("[router-acp delegation]")),
+            "no directive without an attached delegation tool: {prompts:?}"
+        );
+        assert!(
+            open_state(&state_path)
+                .get(&sid)
+                .expect("parent row")
+                .delegation_directive_injections
+                == 0,
+            "no injection telemetry without an injection"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ordinary_native_subagent_bypass_is_reported() {
+    let state = temp_state_file("delegate-prompt-bypass");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, inject_prompt: true }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1), ("m2", 2)], &[])
+    );
+    let state_path = state.clone();
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=mock/m2]\nwork directly\nTOOL:mcp:Task",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("delegation bypassed"),
+            "bypass disclosed: {text}"
+        );
+        assert_eq!(
+            open_state(&state_path)
+                .get(&sid)
+                .expect("parent row")
+                .native_subagent_calls,
+            1,
+            "bypass recorded on the prompted parent"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 fn delegation_yaml(
     state: &std::path::Path,
     log: &std::path::Path,
@@ -2874,7 +3011,7 @@ async fn orchestration_pins_planner_and_injects_protocol_on_a_list() {
     // Planner = b/m2. A multi-part list on a fresh session must pin the planner
     // and prepend the orchestration protocol (visible in the mock's echo).
     let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+        "state_file: {}\ndelegation: {{ enabled: true, inject_prompt: true }}\n\
          auto_upgrade: {{ enabled: false }}\n\
          orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
          agents:\n{}{}",
@@ -2926,6 +3063,10 @@ async fn orchestration_pins_planner_and_injects_protocol_on_a_list() {
         let db = open_state(&state_path);
         let row = db.get(&sid).expect("session row");
         assert_eq!(row.run_label.as_deref(), Some("orchestrate"));
+        assert!(
+            row.delegation_directive_injections == 0,
+            "the stronger orchestration protocol suppresses the ordinary directive"
+        );
         Ok(())
     })
     .await;

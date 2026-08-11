@@ -68,6 +68,7 @@ state_file: ~/.local/state/router-acp/sessions.json
 
 delegation:
   enabled: true
+  inject_prompt: true
   max_concurrent: 3
 
 agents:
@@ -519,7 +520,11 @@ you can later join outcomes to CI/merge results.
 - **Delegation:** in routed sessions the pinned agent gets a `delegate_task`
   MCP tool and may hand small subtasks (mechanical edits, isolated fixes) to
   a cheaper candidate in an ephemeral session; permission prompts for
-  delegated work still appear in goose under the parent session. Set
+  delegated work still appear in goose under the parent session.
+  `inject_prompt: true` gives each eligible ordinary model session a one-shot,
+  scoped instruction to use the router tool only when delegation overhead is
+  worthwhile. Inspect adoption with
+  `router-acp delegation-report --config ~/.config/router-acp/router.yaml`. Set
   `delegation: { enabled: false }` in `router.yaml` to turn this off.
 - **Auth:** both adapters are already seat-authenticated, so probes pass
   silently. If an adapter loses auth, routed sessions get `auth_required`

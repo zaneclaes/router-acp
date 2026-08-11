@@ -262,6 +262,13 @@ pub struct RouterSession {
     /// One-shot host injects from the pre-classifier (e.g. ui_planning guidance),
     /// prepended after the orchestration protocol when both fire.
     pub pending_injects: Vec<String>,
+    /// Candidate whose freshly opened downstream session should receive the
+    /// ordinary delegation directive on its first prompt. Set only when the
+    /// router's delegate MCP server was actually attached to that session.
+    pub pending_delegation_directive: Option<CandidateId>,
+    /// Whether the current downstream session received the ordinary delegation
+    /// directive. Used to detect native-subagent bypasses as telemetry.
+    pub delegation_directive_active: bool,
     /// Pre-classifier has already run once for this session (v1: first eligible
     /// turn only).
     pub preclass_done: bool,
@@ -362,6 +369,8 @@ impl RouterSession {
             orchestrating: false,
             pending_orchestration: None,
             pending_injects: Vec::new(),
+            pending_delegation_directive: None,
+            delegation_directive_active: false,
             preclass_done: false,
             preclass_profile: None,
             turn_native_subagent_warned: false,
@@ -414,6 +423,8 @@ impl RouterSession {
             orchestrating: false,
             pending_orchestration: None,
             pending_injects: Vec::new(),
+            pending_delegation_directive: None,
+            delegation_directive_active: false,
             preclass_done: false,
             preclass_profile: None,
             turn_native_subagent_warned: false,
@@ -1678,17 +1689,16 @@ pub fn handle_downstream_dispatch(
                             // per distinct tool (on its initial announcement).
                             if su == "tool_call" {
                                 note_tool_activity(shared, key, &down_sid, &router_sid);
-                                // Orchestration degradation: an orchestrating
-                                // planner using the adapter's built-in sub-agent
-                                // tool (Claude's `Task`) instead of the router's
-                                // `delegate_task` — sub-work stays in-lineage and
-                                // invisible to routing (no cross-lineage review,
-                                // no per-subtask model selection). Record it and
-                                // warn once per turn.
+                                // Delegation degradation: a model that received
+                                // either router delegation protocol used the
+                                // adapter's built-in sub-agent tool instead.
+                                let delegation_mode = shared.with_session(&router_sid, |s| {
+                                    (s.orchestrating, s.delegation_directive_active)
+                                });
                                 if is_native_subagent_tool(update)
-                                    && shared
-                                        .with_session(&router_sid, |s| s.orchestrating)
-                                        .unwrap_or(false)
+                                    && delegation_mode.is_some_and(|(orchestrating, prompted)| {
+                                        orchestrating || prompted
+                                    })
                                 {
                                     shared
                                         .state
@@ -1706,14 +1716,24 @@ pub fn handle_downstream_dispatch(
                                         })
                                         .unwrap_or(false);
                                     if warn {
+                                        let orchestrating = delegation_mode
+                                            .is_some_and(|(orchestrating, _)| orchestrating);
                                         notify_user(
                                             shared,
                                             &router_sid,
-                                            "router-acp · orchestration degraded: the planner used \
-                                             its built-in sub-agent tool instead of `delegate_task` \
-                                             — sub-tasks stay in the planner's lineage and are \
-                                             invisible to the router (no cross-lineage review, no \
-                                             per-subtask model routing, no delegate rows recorded)",
+                                            if orchestrating {
+                                                "router-acp · orchestration degraded: the planner \
+                                                 used its built-in sub-agent tool instead of \
+                                                 `delegate_task` — sub-tasks stay in the planner's \
+                                                 lineage and are invisible to the router (no \
+                                                 cross-lineage review, no per-subtask model routing, \
+                                                 no delegate rows recorded)"
+                                            } else {
+                                                "router-acp · delegation bypassed: the model used \
+                                                 its built-in sub-agent tool instead of the router's \
+                                                 `delegate_task`; that work is invisible to router \
+                                                 routing and cost telemetry"
+                                            },
                                         );
                                     }
                                 }
@@ -2928,7 +2948,8 @@ async fn pin_session(
             return Ok(PinOutcome::Cancelled);
         }
         let candidate = rc.candidate.clone();
-        let mcp_servers = mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp);
+        let (mcp_servers, delegate_attached) =
+            mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp);
         match open_downstream_session(
             shared,
             &candidate,
@@ -2968,6 +2989,17 @@ async fn pin_session(
                             downstream_sid: opened.downstream_sid.clone(),
                             available_modes: available_modes.clone(),
                         });
+                        // Each pin opens a fresh downstream session. Queue its
+                        // delegation instruction only if that session actually
+                        // received the router tools.
+                        s.pending_delegation_directive = None;
+                        s.delegation_directive_active = false;
+                        if delegate_attached
+                            && shared.cfg.delegation.inject_prompt
+                            && !s.orchestrating
+                        {
+                            s.pending_delegation_directive = Some(candidate.clone());
+                        }
                         // Confidence baseline for this pin; reset struggle.
                         s.pinned_quality = pin_quality;
                         s.task_class = Some(profile.class);
@@ -3307,12 +3339,28 @@ fn mcp_servers_for_pin(
     router_sid: &str,
     candidate: &CandidateId,
     client_mcp: &[McpServer],
-) -> Vec<McpServer> {
+) -> (Vec<McpServer>, bool) {
     let mut servers = client_mcp.to_vec();
+    let mut delegate_attached = false;
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
+        delegate_attached = true;
     }
-    servers
+    (servers, delegate_attached)
+}
+
+fn build_delegation_instructions() -> String {
+    "[router-acp delegation]\n\
+     The router's `delegate_task`, `delegate_await`, `delegate_followup`, and \
+     `delegate_close` tools are available for cheaper sub-sessions. Proactively \
+     delegate only bounded, independent work when the briefing and verification \
+     overhead is lower than doing it yourself. Do not delegate work that depends \
+     on hidden conversation context, tightly coupled integration, or overlapping \
+     file edits. Give each delegate a complete brief, verify its result, and \
+     integrate it yourself. Use only the router-owned delegation tools; never use \
+     provider-native Task/spawn/subagent tools. If no suitable subtask exists, \
+     continue directly."
+        .to_string()
 }
 
 /// Forward a prompt to the pinned downstream, failing over to the next best
@@ -3390,22 +3438,47 @@ async fn send_prompt_with_failover(
         // attempt — pre-loop pending_switch, or a mid-turn escalation on the
         // previous iteration) is prepended, consumed once. It is already fully
         // framed by `switch_pin` (summary or log-transcript fallback).
-        let (orchestration, injects, handoff) = shared
+        let (orchestration, delegation, injects, handoff) = shared
             .with_session(&router_sid, |s| {
                 (
                     s.pending_orchestration.take(),
+                    s.pending_delegation_directive.take(),
                     std::mem::take(&mut s.pending_injects),
                     s.pending_context.take(),
                 )
             })
-            .unwrap_or((None, Vec::new(), None));
+            .unwrap_or((None, None, Vec::new(), None));
         let effective_prompt = {
             let mut blocks = Vec::new();
-            // Orchestration protocol first (role framing), then host pre-class
-            // injects (e.g. ui_planning), then any switch handoff context, then
-            // the user's actual task.
+            // Router role framing first (the full orchestration protocol or the
+            // scoped ordinary-delegation directive), then host pre-class injects
+            // (e.g. ui_planning), then switch handoff context, then the task.
             if let Some(instr) = orchestration {
                 blocks.push(ContentBlock::from(instr));
+            }
+            if let Some(directive_candidate) = delegation {
+                blocks.push(ContentBlock::from(build_delegation_instructions()));
+                shared.with_session(&router_sid, |s| {
+                    s.delegation_directive_active = true;
+                });
+                shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .note_delegation_directive(&router_sid);
+                shared.state.lock().unwrap().log(
+                    &router_sid,
+                    &crate::state::LogEntry {
+                        kind: "delegation_directive".to_string(),
+                        role: "router".to_string(),
+                        summary: "scoped ordinary delegation directive injected".to_string(),
+                        detail: Some(serde_json::json!({
+                            "candidate": directive_candidate.to_string(),
+                            "scope": "ordinary",
+                        })),
+                        ..Default::default()
+                    },
+                );
             }
             for inj in injects {
                 blocks.push(ContentBlock::from(inj));
@@ -4927,7 +5000,8 @@ async fn switch_pin(
             )
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
-    let mcp_servers = mcp_servers_for_pin(shared, router_sid, target, &client_mcp);
+    let (mcp_servers, delegate_attached) =
+        mcp_servers_for_pin(shared, router_sid, target, &client_mcp);
     let opened = open_downstream_session(
         shared,
         target,
@@ -4969,6 +5043,11 @@ async fn switch_pin(
         s.struggle = 0.0;
         s.pending_switch = None;
         s.pending_context = handoff.clone();
+        s.pending_delegation_directive = None;
+        s.delegation_directive_active = false;
+        if delegate_attached && shared.cfg.delegation.inject_prompt && !s.orchestrating {
+            s.pending_delegation_directive = Some(target.clone());
+        }
     });
 
     // 4. Re-apply the session mode on the new downstream (best effort).
