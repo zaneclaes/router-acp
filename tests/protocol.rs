@@ -5445,7 +5445,7 @@ async fn preclass_preferred_evaluator_beats_grok_fallback() {
 }
 
 #[tokio::test]
-async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
+async fn preclass_without_safe_mode_mapping_runs_tool_less() {
     let state = temp_state_file("preclass-no-safe-mode");
     let log = temp_log("preclass-no-safe-mode");
     let agent = agent_yaml(
@@ -5454,6 +5454,10 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
         &[
             ("MOCK_LOG", &log.display().to_string()),
             ("MOCK_SESSION_MODES", "preclass"),
+            (
+                "MOCK_PRECLASS_JSON",
+                r#"{"routing":{"task_class":"Ops","complexity":0.1,"confidence":0.9,"reason":"tool-less fallback"}}"#,
+            ),
         ],
     )
     .replace("    mode_map: { preclass: preclass }\n", "");
@@ -5465,13 +5469,13 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        let err = prompt_text(&cx, &sid, "classify this").await.unwrap_err();
-        assert!(format!("{err}").contains("could not classify"));
+        let response = prompt_text(&cx, &sid, "classify this").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
-            !read_log(&log)
+            read_log(&log)
                 .iter()
                 .any(|event| event["event"] == "prompt"),
-            "no classifier prompt may be sent without mode_map.preclass"
+            "tool-less classifier prompt must be sent without mode_map.preclass"
         );
         Ok(())
     })
