@@ -6507,6 +6507,9 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
     if let Dispatch::Notification(msg) = &message
         && msg.method() == "router-acp/delegate_mcp_catalogs"
     {
+        if !shared.cfg.delegation.mcp_catalogs {
+            return Ok(Handled::Yes);
+        }
         let Some(router_sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) else {
             return Ok(Handled::Yes);
         };

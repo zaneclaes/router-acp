@@ -111,6 +111,11 @@ pub struct DelegationConfig {
     /// default so deployments opt into the behavioral change explicitly.
     #[serde(default)]
     pub inject_prompt: bool,
+    /// Permit the host to register named MCP bundles which are inert until a
+    /// parent explicitly requests one for a delegate. Disabled by default so
+    /// hosts opt into passing integrations and credentials across this boundary.
+    #[serde(default)]
+    pub mcp_catalogs: bool,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Unix-domain socket path for the delegate MCP helper to connect back on.
@@ -146,6 +151,7 @@ impl Default for DelegationConfig {
         Self {
             enabled: true,
             inject_prompt: false,
+            mcp_catalogs: false,
             max_concurrent: default_max_concurrent(),
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
@@ -1739,6 +1745,7 @@ agents:
         assert_eq!(cfg.delegation.max_concurrent, 3);
         assert!(cfg.delegation.enabled);
         assert!(!cfg.delegation.inject_prompt);
+        assert!(!cfg.delegation.mcp_catalogs);
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
@@ -1752,6 +1759,13 @@ agents:
         let yaml = format!("delegation:\n  inject_prompt: true\n{}", minimal_yaml());
         let cfg = Config::from_yaml(&yaml).unwrap();
         assert!(cfg.delegation.inject_prompt);
+    }
+
+    #[test]
+    fn parses_delegate_mcp_catalog_opt_in() {
+        let yaml = format!("delegation:\n  mcp_catalogs: true\n{}", minimal_yaml());
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert!(cfg.delegation.mcp_catalogs);
     }
 
     #[test]

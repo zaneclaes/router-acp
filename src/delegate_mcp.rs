@@ -873,6 +873,9 @@ pub async fn run_delegate_task(
         })
         .ok_or("parent session no longer exists")?;
     let pin = pin.ok_or("parent session is not pinned")?;
+    if !args.mcp_catalogs.is_empty() && !shared.cfg.delegation.mcp_catalogs {
+        return Err("delegate MCP catalogs are disabled by router configuration".to_string());
+    }
     let parent_cost = shared
         .candidate_runtime(&pin.candidate)
         .map(|c| c.cost_rank)

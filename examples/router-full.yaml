@@ -25,6 +25,10 @@ delegation:
   # Opt in to a one-shot, scoped delegation directive, but only on ordinary
   # sessions where the router actually attached a cheaper-worker tool.
   inject_prompt: false
+  # Permit the ACP host to register named MCP bundles that an agent can attach
+  # to a bounded delegate with `delegate_task.mcp_catalogs`. The router never
+  # owns URLs or credentials; default false keeps this capability off.
+  mcp_catalogs: false
   max_concurrent: 3
 
 # Graceful degradation. Rate/usage-limited agents are cordoned until the

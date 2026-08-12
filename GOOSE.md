@@ -526,6 +526,9 @@ you can later join outcomes to CI/merge results.
   worthwhile. Inspect adoption with
   `router-acp delegation-report --config ~/.config/router-acp/router.yaml`. Set
   `delegation: { enabled: false }` in `router.yaml` to turn this off.
+  For a host integration that must remain absent from the main agent, enable
+  `delegation.mcp_catalogs: true`; the host may register a named bundle and the
+  agent can attach it only to `delegate_task` with `mcp_catalogs`.
 - **Auth:** both adapters are already seat-authenticated, so probes pass
   silently. If an adapter loses auth, routed sessions get `auth_required`
   from `session/new`; re-run the vendor CLI login (`claude`, `codex login`)

@@ -32,6 +32,9 @@ delegation:
   # Prompt ordinary parents to use router-owned delegation for bounded,
   # independent work when its briefing/verification overhead is worthwhile.
   inject_prompt: true
+  # Let an ACP host expose named, delegate-only MCP bundles. The model can only
+  # request a host-registered name; it cannot supply endpoints or credentials.
+  mcp_catalogs: true
   max_concurrent: 3
   # The parent has already decomposed the work into a fully-specified brief;
   # long, detailed briefs otherwise classify as max complexity, which zeroes

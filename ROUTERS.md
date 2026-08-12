@@ -526,6 +526,15 @@ and config are in [`ORCHESTRATION.md`](ORCHESTRATION.md); because it is built on
 the router's own `delegate_task` tool it needs no recipe or `summon` extension,
 so it works from any ACP client and plain chat.
 
+### Delegate-only host MCPs
+
+With `delegation.mcp_catalogs: true`, an ACP host may register named MCP
+bundles for a router session. They never reach the primary downstream agent.
+The primary requests a bundle only for a bounded `delegate_task` via
+`mcp_catalogs`; unknown names and disabled catalogs fail closed. The router
+remains integration-agnostic: the host provides concrete servers and
+credentials, while the model can name only a registered bundle.
+
 ---
 
 ## Things that apply to every router
