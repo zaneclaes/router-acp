@@ -330,6 +330,11 @@ pub fn select_current(option: &SessionConfigOption) -> Option<String> {
 
 pub fn is_auth_required(err: &AcpError) -> bool {
     err.code == AcpError::auth_required().code
+        || crate::auth::error_is_auth_rejection(&format!(
+            "{} {}",
+            err.message,
+            err.data.clone().unwrap_or_default()
+        ))
 }
 
 /// Heuristic detection of rate-limit/quota errors from downstream adapters.

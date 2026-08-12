@@ -526,6 +526,10 @@ you can later join outcomes to CI/merge results.
   worthwhile. Inspect adoption with
   `router-acp delegation-report --config ~/.config/router-acp/router.yaml`. Set
   `delegation: { enabled: false }` in `router.yaml` to turn this off.
+  Configure `delegation.mcp_catalogs` with host-defined catalog capabilities.
+  A host pre-classifier extension can attach matching bundles to the initial
+  session; later the agent requests bounded research using
+  `delegate_task.required_capabilities`.
 - **Auth:** both adapters are already seat-authenticated, so probes pass
   silently. If an adapter loses auth, routed sessions get `auth_required`
   from `session/new`; re-run the vendor CLI login (`claude`, `codex login`)

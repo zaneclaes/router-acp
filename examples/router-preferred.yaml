@@ -32,6 +32,8 @@ delegation:
   # Prompt ordinary parents to use router-owned delegation for bounded,
   # independent work when its briefing/verification overhead is worthwhile.
   inject_prompt: true
+  # The host maps opaque capabilities to its registered MCP catalogs.
+  mcp_catalogs: []
   max_concurrent: 3
   # The parent has already decomposed the work into a fully-specified brief;
   # long, detailed briefs otherwise classify as max complexity, which zeroes
@@ -51,6 +53,15 @@ agents:
     # token) and mark a candidate unroutable when its weekly cap is exhausted
     # with no overage/credit headroom — before the router even tries it.
     usage_source: { type: anthropic-oauth }
+    # Auth-as-availability: a logged-out Claude still advertises every model, so
+    # ask the CLI rather than trust the advertisement. Logged out prints
+    # `"loggedIn": false`; anything unreadable (missing binary, timeout) is
+    # unknown and fails open.
+    auth_probe:
+      command: claude
+      args: ["auth", "status"]
+      timeout_ms: 3000
+      unauthenticated_patterns: ['"loggedin": false']
     llm_proxy:
       protocol: anthropic
       base_url_env: ANTHROPIC_BASE_URL
@@ -110,6 +121,9 @@ agents:
     # Proactive cordons from Codex's own on-disk rate-limit snapshot (last-known,
     # since Codex has no pollable usage endpoint; reactive cordon backstops it).
     usage_source: { type: codex-rollout }
+    # Logged out prints `Not logged in`, which the default patterns already
+    # cover; logged in prints `Logged in using ChatGPT` and exits zero.
+    auth_probe: { command: codex, args: ["login", "status"] }
     llm_proxy:
       protocol: openai
       base_url_env: OPENAI_BASE_URL
@@ -149,6 +163,12 @@ agents:
       args: ["agent"]             # + template below → `grok agent --model <id> stdio`
     lineage: xai
     budget_prompts_5h: 400
+    # `grok models` exits zero either way, so the text is the only signal:
+    # logged out says `You are not authenticated.`
+    auth_probe:
+      command: grok
+      args: ["models"]
+      unauthenticated_patterns: ["not authenticated"]
     llm_proxy:
       protocol: openai
       base_url_env: GROK_CLI_CHAT_PROXY_BASE_URL

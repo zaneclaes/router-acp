@@ -2063,6 +2063,193 @@ async fn routing_scales_with_task_complexity_and_prefers_claude() {
 }
 
 #[tokio::test]
+async fn unauthenticated_agent_is_not_spawned_and_auto_routes_live_peer() {
+    let state = temp_state_file("auth-preflight");
+    let claude_log = temp_log("auth-preflight-claude");
+    let grok_log = temp_log("auth-preflight-grok");
+    let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.08,"confidence":0.95,"reason":"trivial ops"}}"#;
+    let claude = agent_yaml(
+        "claude",
+        &[("haiku", 1), ("sonnet", 2), ("opus", 4)],
+        &[("MOCK_LOG", &claude_log.display().to_string())],
+    )
+    .replace(
+        "    model_selection:",
+        "    auth_probe:\n      command: /bin/sh\n      args: [\"-c\", \"echo Claude is not signed in >&2; exit 1\"]\n    model_selection:",
+    );
+    let grok = agent_yaml(
+        "grok",
+        &[("grok-4.5", 5)],
+        &[
+            ("MOCK_LOG", &grok_log.display().to_string()),
+            ("MOCK_PRECLASS_JSON", preclass),
+        ],
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier: {{ enabled: true }}\nagents:\n{}{}",
+        state.display(),
+        claude,
+        grok,
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        assert!(
+            read_log(&claude_log).is_empty(),
+            "definitely logged-out Claude must not be spawned"
+        );
+
+        let session = new_session(&cx).await?;
+        let options = serde_json::to_value(&session.config_options).unwrap();
+        let text = options.to_string();
+        for model in ["claude/haiku", "claude/sonnet", "claude/opus"] {
+            let pos = text
+                .find(model)
+                .unwrap_or_else(|| panic!("missing {model}: {text}"));
+            let tail = &text[pos..text.len().min(pos + 500)];
+            assert!(tail.contains("\"available\":false"), "{model}: {tail}");
+            assert!(
+                tail.contains("provider is not signed in"),
+                "{model}: {tail}"
+            );
+            assert!(
+                !tail.contains("resets_at"),
+                "auth has no reset timestamp: {tail}"
+            );
+        }
+
+        let sid = session.session_id.0.to_string();
+        prompt_text(&cx, &sid, "What tickets are assigned to me?").await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(routed.contains("auto → grok/grok-4.5"), "{routed}");
+        assert!(
+            read_log(&claude_log).is_empty(),
+            "pre-class and primary routing must both skip Claude"
+        );
+        let grok_events = read_log(&grok_log);
+        assert!(
+            grok_events.iter().any(|e| e["event"] == "prompt"),
+            "Grok handled classifier and primary prompt: {grok_events:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn authenticated_agent_remains_eligible_for_preclass_and_ops_pin() {
+    let state = temp_state_file("auth-preflight-ok");
+    let claude_log = temp_log("auth-preflight-ok-claude");
+    let grok_log = temp_log("auth-preflight-ok-grok");
+    let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.08,"confidence":0.95,"reason":"trivial ops"}}"#;
+    let claude = agent_yaml(
+        "claude",
+        &[("haiku", 1), ("sonnet", 2)],
+        &[
+            ("MOCK_LOG", &claude_log.display().to_string()),
+            ("MOCK_PRECLASS_JSON", preclass),
+        ],
+    )
+    .replace(
+        "    model_selection:",
+        "    auth_probe:\n      command: /bin/true\n    model_selection:",
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier: {{ enabled: true }}\nagents:\n{}{}",
+        state.display(),
+        claude,
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[("MOCK_LOG", &grok_log.display().to_string())],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "List my tickets").await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(routed.contains("auto → claude/haiku"), "{routed}");
+        assert!(
+            read_log(&claude_log)
+                .iter()
+                .filter(|e| e["event"] == "prompt")
+                .count()
+                >= 2,
+            "Claude handled preclass and primary prompt"
+        );
+        assert!(
+            !read_log(&grok_log).iter().any(|e| e["event"] == "prompt"),
+            "preferred authenticated Claude prevents Grok widening"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn runtime_auth_rejection_removes_agent_from_next_auto_decision() {
+    let state = temp_state_file("auth-reactive");
+    let claude_log = temp_log("auth-reactive-claude");
+    let grok_log = temp_log("auth-reactive-grok");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "claude",
+            &[("haiku", 1), ("sonnet", 2)],
+            &[
+                ("MOCK_LOG", &claude_log.display().to_string()),
+                ("MOCK_FAIL_PROMPT_MSG", "Authentication required"),
+                ("MOCK_FAIL_PROMPT_TIMES", "1"),
+            ],
+        ),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[("MOCK_LOG", &grok_log.display().to_string())],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let first = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &first, "First Ops prompt").await?;
+        assert!(
+            agent_text(&observed, &first).contains("echo:grok-4.5:"),
+            "first Claude auth rejection fails over to Grok"
+        );
+        let claude_prompts = read_log(&claude_log)
+            .iter()
+            .filter(|e| e["event"] == "prompt")
+            .count();
+
+        let second_session = new_session(&cx).await?;
+        let opts = serde_json::to_string(&second_session.config_options).unwrap();
+        assert!(
+            opts.contains("claude/haiku")
+                && opts.contains("\"available\":false")
+                && opts.contains("claude is not signed in"),
+            "reactive auth state reaches picker: {opts}"
+        );
+        let second = second_session.session_id.0.to_string();
+        prompt_text(&cx, &second, "Second Ops prompt").await?;
+        assert!(
+            agent_text(&observed, &second).contains("auto → grok/grok-4.5"),
+            "next Auto decision skips all Claude models"
+        );
+        assert_eq!(
+            read_log(&claude_log)
+                .iter()
+                .filter(|e| e["event"] == "prompt")
+                .count(),
+            claude_prompts,
+            "next decision never probes another Claude model"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn state_db_records_routing_diagnostics_title_and_tokens() {
     let state = temp_state_file("diagnostics");
     let yaml = format!(
@@ -4455,7 +4642,9 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
         let sess = new_session(&cx).await?;
         let opts = serde_json::to_string(&sess.config_options).unwrap();
         assert!(
-            opts.contains("\"available\":false") && opts.contains("Weekly Fable limit reached") && opts.contains("\"capabilities\":{\"effort\""),
+            opts.contains("\"available\":false")
+                && opts.contains("Weekly Fable limit reached")
+                && opts.contains("\"capabilities\":{\"effort\""),
             "cordoned candidate advertised unavailable: {opts}"
         );
 
@@ -5183,7 +5372,10 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
             .iter()
             .position(|event| event["event"] == "prompt")
             .expect("evaluator prompt");
-        assert!(set_mode < prompt, "safe mode must precede evaluator prompt: {events:?}");
+        assert!(
+            set_mode < prompt,
+            "safe mode must precede evaluator prompt: {events:?}"
+        );
         Ok(())
     })
     .await;
@@ -5379,7 +5571,9 @@ async fn preclass_preferred_evaluator_beats_grok_fallback() {
             "preferred Codex evaluator must run"
         );
         assert!(
-            codex_events.iter().any(|event| event["event"] == "set_mode"),
+            codex_events
+                .iter()
+                .any(|event| event["event"] == "set_mode"),
             "preferred Codex evaluator must enter its explicit preclass mode"
         );
         assert!(
@@ -5408,7 +5602,8 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
     .replace("    mode_map: { preclass: preclass }\n", "");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
-        state.display(), agent
+        state.display(),
+        agent
     );
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
@@ -5416,7 +5611,9 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
         let err = prompt_text(&cx, &sid, "classify this").await.unwrap_err();
         assert!(format!("{err}").contains("could not classify"));
         assert!(
-            !read_log(&log).iter().any(|event| event["event"] == "prompt"),
+            !read_log(&log)
+                .iter()
+                .any(|event| event["event"] == "prompt"),
             "no classifier prompt may be sent without mode_map.preclass"
         );
         Ok(())
@@ -5450,7 +5647,9 @@ async fn preclass_tool_attempt_is_cancelled_and_fails_over() {
         let response = prompt_text(&cx, &sid, "fix it").await?;
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
-            read_log(&bad_log).iter().any(|event| event["event"] == "cancel"),
+            read_log(&bad_log)
+                .iter()
+                .any(|event| event["event"] == "cancel"),
             "tool attempt must cancel the evaluator"
         );
         assert!(
@@ -5566,7 +5765,14 @@ async fn preclass_fails_over_to_next_evaluator() {
          agents:\n{}{}",
         state.display(),
         // opus ranks first for the evaluator pool but errors its prompt turn.
-        agent_yaml("a", &[("opus", 3)], &[("MOCK_FAIL_PROMPT_MSG", "rate limit exceeded; retry after 30s")]),
+        agent_yaml(
+            "a",
+            &[("opus", 3)],
+            &[(
+                "MOCK_FAIL_PROMPT_MSG",
+                "rate limit exceeded; retry after 30s"
+            )]
+        ),
         // haiku is the fallback evaluator and returns a real classification.
         agent_yaml("b", &[("haiku", 1)], &[("MOCK_PRECLASS_JSON", good)]),
     );
@@ -5643,7 +5849,10 @@ async fn preclass_widens_after_preferred_pool_exhausted() {
         agent_yaml(
             "a",
             &[("haiku", 1)],
-            &[("MOCK_FAIL_PROMPT_MSG", "rate limit exceeded; retry after 30s")]
+            &[(
+                "MOCK_FAIL_PROMPT_MSG",
+                "rate limit exceeded; retry after 30s"
+            )]
         ),
         agent_yaml("b", &[("grok", 2)], &[("MOCK_PRECLASS_JSON", good)]),
     );

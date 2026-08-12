@@ -111,6 +111,11 @@ pub struct DelegationConfig {
     /// default so deployments opt into the behavioral change explicitly.
     #[serde(default)]
     pub inject_prompt: bool,
+    /// Host-defined MCP catalogs and the opaque capabilities each supplies.
+    /// The router only resolves these strings; their meanings stay with the
+    /// host's pre-classifier extension.
+    #[serde(default)]
+    pub mcp_catalogs: Vec<McpCatalogConfig>,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Unix-domain socket path for the delegate MCP helper to connect back on.
@@ -127,6 +132,13 @@ pub struct DelegationConfig {
     /// 1.0 disables the cap.
     #[serde(default = "default_delegate_complexity_cap")]
     pub complexity_cap: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCatalogConfig {
+    pub catalog: String,
+    pub capabilities: Vec<String>,
 }
 
 fn default_delegate_complexity_cap() -> f64 {
@@ -146,6 +158,7 @@ impl Default for DelegationConfig {
         Self {
             enabled: true,
             inject_prompt: false,
+            mcp_catalogs: Vec::new(),
             max_concurrent: default_max_concurrent(),
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
@@ -840,6 +853,12 @@ pub struct AgentConfig {
     /// usage caps and cordons this agent's candidates that are exhausted.
     #[serde(default)]
     pub usage_source: Option<UsageSourceConfig>,
+    /// Optional non-interactive provider login probe. Exit zero is positive
+    /// authentication evidence. A non-zero result is negative evidence only
+    /// when its output matches `unauthenticated_patterns`; every other error
+    /// and timeout is unknown (fail open).
+    #[serde(default)]
+    pub auth_probe: Option<AuthProbeConfig>,
     /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
     /// agent name. Orchestration's cross-lineage review compares THIS — the
     /// point is a reviewer whose models come from a **different company** (and
@@ -853,6 +872,33 @@ pub struct AgentConfig {
     /// providers' public API endpoints.
     #[serde(default)]
     pub llm_proxy: Option<AgentLlmProxyConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthProbeConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_auth_probe_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_auth_failure_patterns")]
+    pub unauthenticated_patterns: Vec<String>,
+}
+
+fn default_auth_probe_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_auth_failure_patterns() -> Vec<String> {
+    vec![
+        "not logged in".to_string(),
+        "not signed in".to_string(),
+        "authentication required".to_string(),
+        "sign in".to_string(),
+        "log in".to_string(),
+        "login required".to_string(),
+    ]
 }
 
 fn default_budget() -> u32 {
@@ -1355,6 +1401,12 @@ impl Config {
             for arg in &mut agent.command.args {
                 *arg = expand_tilde_str(arg);
             }
+            if let Some(probe) = &mut agent.auth_probe {
+                probe.command = expand_tilde_str(&probe.command);
+                for arg in &mut probe.args {
+                    *arg = expand_tilde_str(arg);
+                }
+            }
             if let ModelSelectionConfig::SpawnConfig { process_template } =
                 &mut agent.model_selection
             {
@@ -1413,6 +1465,27 @@ impl Config {
                     "agent `{}` declares no models; every agent needs at least one model",
                     agent.name
                 )));
+            }
+            if let Some(probe) = &agent.auth_probe {
+                if probe.command.is_empty() {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: auth_probe.command must not be empty",
+                        agent.name
+                    )));
+                }
+                if probe.timeout_ms == 0 {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: auth_probe.timeout_ms must be >= 1",
+                        agent.name
+                    )));
+                }
+                if probe.unauthenticated_patterns.iter().any(|p| p.is_empty()) {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: auth_probe.unauthenticated_patterns must not contain an \
+                         empty pattern (it would match every output)",
+                        agent.name
+                    )));
+                }
             }
             let mut model_ids = HashSet::new();
             for model in &agent.models {
@@ -1689,6 +1762,41 @@ impl Config {
                 }
             }
         }
+        let mut catalogs = HashSet::new();
+        for catalog in &self.delegation.mcp_catalogs {
+            if catalog.catalog.trim().is_empty() {
+                return Err(ConfigError(
+                    "delegation.mcp_catalogs: catalog must not be empty".into(),
+                ));
+            }
+            if !catalogs.insert(catalog.catalog.clone()) {
+                return Err(ConfigError(format!(
+                    "delegation.mcp_catalogs: duplicate catalog `{}`",
+                    catalog.catalog
+                )));
+            }
+            if catalog.capabilities.is_empty() {
+                return Err(ConfigError(format!(
+                    "delegation.mcp_catalogs.`{}`: capabilities must not be empty",
+                    catalog.catalog
+                )));
+            }
+            let mut capabilities = HashSet::new();
+            for capability in &catalog.capabilities {
+                if capability.trim().is_empty() {
+                    return Err(ConfigError(format!(
+                        "delegation.mcp_catalogs.`{}`: capability must not be empty",
+                        catalog.catalog
+                    )));
+                }
+                if !capabilities.insert(capability.clone()) {
+                    return Err(ConfigError(format!(
+                        "delegation.mcp_catalogs.`{}`: duplicate capability `{capability}`",
+                        catalog.catalog
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1739,6 +1847,7 @@ agents:
         assert_eq!(cfg.delegation.max_concurrent, 3);
         assert!(cfg.delegation.enabled);
         assert!(!cfg.delegation.inject_prompt);
+        assert!(cfg.delegation.mcp_catalogs.is_empty());
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
@@ -1752,6 +1861,16 @@ agents:
         let yaml = format!("delegation:\n  inject_prompt: true\n{}", minimal_yaml());
         let cfg = Config::from_yaml(&yaml).unwrap();
         assert!(cfg.delegation.inject_prompt);
+    }
+
+    #[test]
+    fn parses_delegate_mcp_catalog_policy() {
+        let yaml = format!(
+            "delegation:\n  mcp_catalogs:\n    - catalog: observability\n      capabilities: [metrics, traces]\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.delegation.mcp_catalogs[0].catalog, "observability");
     }
 
     #[test]

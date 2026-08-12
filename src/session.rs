@@ -161,6 +161,12 @@ pub struct RouterSession {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub mcp_servers: Vec<McpServer>,
+    /// Host-registered MCP bundles available only to explicitly opted-in
+    /// delegate sessions. They never reach the primary downstream session.
+    pub delegate_mcp_catalogs: HashMap<String, Vec<McpServer>>,
+    /// Opaque capability requirements returned by the first-prompt
+    /// pre-classifier. Used only to resolve host-configured MCP catalogs.
+    pub required_mcp_capabilities: Vec<String>,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
     /// Who set `candidate_override` (user, a skill route, the orchestration
@@ -332,6 +338,8 @@ impl RouterSession {
             cwd: persisted.cwd.clone(),
             additional_directories: persisted.additional_directories.clone(),
             mcp_servers,
+            delegate_mcp_catalogs: HashMap::new(),
+            required_mcp_capabilities: Vec::new(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -386,6 +394,8 @@ impl RouterSession {
             cwd: req.cwd.clone(),
             additional_directories: req.additional_directories.clone(),
             mcp_servers: req.mcp_servers.clone(),
+            delegate_mcp_catalogs: HashMap::new(),
+            required_mcp_capabilities: Vec::new(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -445,6 +455,7 @@ pub struct Shared {
     pub state: Mutex<StateFile>,
     pub llm_proxy: Arc<crate::llm_proxy::LlmProxyRuntime>,
     pub headroom: Mutex<HeadroomTracker>,
+    pub auth: Mutex<crate::auth::AuthTracker>,
     pub sessions: Mutex<HashMap<String, RouterSession>>,
     pub targets: Mutex<HashMap<ProcessKey, TargetRuntime>>,
     pub candidates: Mutex<Vec<CandidateRuntime>>,
@@ -545,6 +556,7 @@ impl Shared {
             state: Mutex::new(state),
             llm_proxy,
             headroom: Mutex::new(headroom),
+            auth: Mutex::new(crate::auth::AuthTracker::default()),
             sessions: Mutex::new(HashMap::new()),
             targets: Mutex::new(targets),
             candidates: Mutex::new(candidates),
@@ -825,6 +837,15 @@ impl Shared {
             if target.conn.is_none() {
                 continue;
             }
+            if self
+                .auth
+                .lock()
+                .unwrap()
+                .unauthenticated(&c.id.agent)
+                .is_some()
+            {
+                continue;
+            }
             let caps_ok = target
                 .init
                 .as_ref()
@@ -971,7 +992,16 @@ impl Shared {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c.id.agent == agent.name && c.status == CandidateStatus::Routeable)
+                .filter(|c| {
+                    c.id.agent == agent.name
+                        && (c.status == CandidateStatus::Routeable
+                            || self
+                                .auth
+                                .lock()
+                                .unwrap()
+                                .unauthenticated(&c.id.agent)
+                                .is_some())
+                })
                 .map(|c| {
                     let opt =
                         SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
@@ -990,6 +1020,11 @@ impl Shared {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(cordon.reason);
                         router_meta["resets_at"] = json!(cordon.resets_at_rfc3339);
+                    } else if let Some(reason) =
+                        self.auth.lock().unwrap().unauthenticated(&c.id.agent)
+                    {
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] = json!(reason);
                     }
                     let mut meta = serde_json::Map::new();
                     meta.insert("router_acp".to_string(), router_meta);
@@ -2722,6 +2757,7 @@ async fn pin_session(
     is_failover: bool,
     larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
+    crate::auth::refresh_before_selection(shared).await;
     let (cwd, dirs, client_mcp, strategy, override_, override_source, effort_request, run_label) =
         shared
             .with_session(router_sid, |s| {
@@ -2949,7 +2985,7 @@ async fn pin_session(
         }
         let candidate = rc.candidate.clone();
         let (mcp_servers, delegate_attached) =
-            mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp);
+            mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp)?;
         match open_downstream_session(
             shared,
             &candidate,
@@ -3299,6 +3335,11 @@ async fn pin_session(
                     "candidate failed pre-prompt; walking fallback chain"
                 );
                 let why = if is_auth_required(&err) {
+                    crate::auth::note_unauthenticated(
+                        &shared.auth,
+                        &candidate.agent,
+                        format!("{} is not signed in", candidate.agent),
+                    );
                     if let Some(rt) = shared.candidate_runtime(&candidate) {
                         shared.set_target_auth_pending(&rt.process_key);
                     }
@@ -3339,14 +3380,112 @@ fn mcp_servers_for_pin(
     router_sid: &str,
     candidate: &CandidateId,
     client_mcp: &[McpServer],
-) -> (Vec<McpServer>, bool) {
+) -> Result<(Vec<McpServer>, bool), AcpError> {
     let mut servers = client_mcp.to_vec();
+    let (required_capabilities, catalogs) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.required_mcp_capabilities.clone(),
+                s.delegate_mcp_catalogs.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let names = resolve_mcp_catalogs(&shared.cfg, &required_capabilities, &catalogs)
+        .map_err(|reason| AcpError::invalid_params().data(reason))?;
+    for name in names {
+        if let Some(entries) = catalogs.get(&name) {
+            for entry in entries {
+                if !servers.contains(entry) {
+                    servers.push(entry.clone());
+                }
+            }
+        }
+    }
     let mut delegate_attached = false;
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
         delegate_attached = true;
     }
-    (servers, delegate_attached)
+    Ok((servers, delegate_attached))
+}
+
+/// Resolve opaque capability names to host-provided catalog entries. The
+/// generic router never defines capability meanings or concrete MCP servers.
+pub(crate) fn resolve_mcp_catalogs(
+    cfg: &Config,
+    required: &[String],
+    available: &HashMap<String, Vec<McpServer>>,
+) -> Result<Vec<String>, String> {
+    let mut unresolved: HashSet<&str> = required.iter().map(String::as_str).collect();
+    let mut selected = Vec::new();
+    for policy in &cfg.delegation.mcp_catalogs {
+        if policy
+            .capabilities
+            .iter()
+            .any(|cap| unresolved.contains(cap.as_str()))
+        {
+            if !available.contains_key(&policy.catalog) {
+                return Err(format!(
+                    "MCP catalog `{}` is not available in this session",
+                    policy.catalog
+                ));
+            }
+            selected.push(policy.catalog.clone());
+            for capability in &policy.capabilities {
+                unresolved.remove(capability.as_str());
+            }
+        }
+    }
+    if unresolved.is_empty() {
+        Ok(selected)
+    } else {
+        let mut missing: Vec<_> = unresolved.into_iter().collect();
+        missing.sort_unstable();
+        Err(format!(
+            "no configured MCP catalog supplies required capabilities: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod mcp_catalog_tests {
+    use super::resolve_mcp_catalogs;
+    use crate::config::{Config, McpCatalogConfig};
+    use agent_client_protocol::schema::v1::McpServer;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resolves_host_defined_capabilities_without_integration_knowledge() {
+        let mut cfg = test_config();
+        cfg.delegation.mcp_catalogs = vec![McpCatalogConfig {
+            catalog: "telemetry".into(),
+            capabilities: vec!["series".into(), "spans".into()],
+        }];
+        let available = HashMap::from([("telemetry".into(), Vec::<McpServer>::new())]);
+        assert_eq!(
+            resolve_mcp_catalogs(&cfg, &["spans".into()], &available).unwrap(),
+            ["telemetry"]
+        );
+    }
+
+    #[test]
+    fn refuses_uncovered_or_unregistered_capabilities() {
+        let mut cfg = test_config();
+        cfg.delegation.mcp_catalogs = vec![McpCatalogConfig {
+            catalog: "telemetry".into(),
+            capabilities: vec!["series".into()],
+        }];
+        assert!(resolve_mcp_catalogs(&cfg, &["spans".into()], &HashMap::new()).is_err());
+        assert!(resolve_mcp_catalogs(&cfg, &["series".into()], &HashMap::new()).is_err());
+    }
+
+    fn test_config() -> Config {
+        Config::from_yaml(
+            "agents:\n  - name: mock\n    command:\n      type: stdio\n      command: mock-agent\n    model_selection:\n      type: config-option\n    models:\n      - id: model\n        display_name: Model\n        cost_rank: 1\n",
+        )
+        .unwrap()
+    }
 }
 
 fn build_delegation_instructions() -> String {
@@ -3616,22 +3755,36 @@ async fn send_prompt_with_failover(
                 let class = classify_failure(&err);
                 let human = apply_failure(&shared, &candidate, &err, &class);
 
+                // A credential rejection is not the per-candidate `Other` that
+                // must not fail over: it takes out the whole seat, and every
+                // other agent is still able to serve the turn.
+                let auth_rejected = is_auth_required(&err);
+                if auth_rejected {
+                    crate::auth::note_unauthenticated(
+                        &shared.auth,
+                        &candidate.agent,
+                        format!("{} is not signed in", candidate.agent),
+                    );
+                }
+
                 let can_fail_over = shared.cfg.failover.enabled
                     && !cancelled
                     && !saw_output
-                    && !matches!(class, FailureClass::Other)
+                    && (auth_rejected || !matches!(class, FailureClass::Other))
                     && attempt < max_attempts;
 
                 // "unavailable" misdescribes an overflow — the model answered,
                 // it just could not hold this turn.
                 let symptom = if matches!(class, FailureClass::ContextOverflow) {
                     "could not fit this turn in its context window"
+                } else if auth_rejected {
+                    "is not signed in"
                 } else {
                     "unavailable"
                 };
 
                 if !can_fail_over {
-                    if !matches!(class, FailureClass::Other) {
+                    if auth_rejected || !matches!(class, FailureClass::Other) {
                         let detail = if saw_output {
                             "; not failing over because this turn already produced output"
                         } else {
@@ -5001,7 +5154,7 @@ async fn switch_pin(
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     let (mcp_servers, delegate_attached) =
-        mcp_servers_for_pin(shared, router_sid, target, &client_mcp);
+        mcp_servers_for_pin(shared, router_sid, target, &client_mcp)?;
     let opened = open_downstream_session(
         shared,
         target,
@@ -5414,9 +5567,9 @@ fn build_agent(
         )
         // -------------------------------------------------- session/new
         .on_receive_request(
-            move |req: NewSessionRequest, responder: Responder<NewSessionResponse>, _cx| {
+            move |req: NewSessionRequest, responder: Responder<NewSessionResponse>, cx| {
                 let shared = s_new.clone();
-                async move { on_session_new(shared, req, responder) }
+                async move { on_session_new(shared, req, responder, cx) }
             },
             on_receive_request!(),
         )
@@ -5594,9 +5747,23 @@ fn on_initialize(
 
     let task_shared = shared.clone();
     cx.spawn(async move {
+        crate::auth::refresh_before_selection(&task_shared).await;
         let keys = task_shared.target_keys();
         // Spawn every downstream process, then probe them concurrently.
         for key in &keys {
+            if task_shared
+                .target_spec(key)
+                .and_then(|spec| {
+                    task_shared
+                        .auth
+                        .lock()
+                        .unwrap()
+                        .unauthenticated(&spec.agent_name)
+                })
+                .is_some()
+            {
+                continue;
+            }
             if let Err(err) = start_downstream(&task_shared, key).await {
                 task_shared.set_target_failed(key, &format!("failed to start: {err}"));
             }
@@ -5647,12 +5814,22 @@ fn on_authenticate(
             AcpError::invalid_params().data(format!("unknown agent `{agent}` in auth method id")),
         );
     }
+    let agent = agent.to_string();
     let downstream_method = downstream_method.to_string();
     let meta = req.meta.clone();
     cx.spawn(async move {
         let mut succeeded = false;
         let mut last_err: Option<AcpError> = None;
         for key in &keys {
+            // Startup skips spawning targets whose agent is known logged out —
+            // which is exactly the agent someone calls `authenticate` for. Bring
+            // the process up on demand so signing in is still possible.
+            if shared.target_conn(key).is_none()
+                && let Err(err) = start_downstream(&shared, key).await
+            {
+                tracing::warn!(target = %key, error = %err, "cannot start target to authenticate");
+                last_err = Some(err);
+            }
             let Some(conn) = shared.target_conn(key) else {
                 continue;
             };
@@ -5671,6 +5848,10 @@ fn on_authenticate(
             );
             return Ok(());
         }
+        // A successful sign-in is the most authoritative positive evidence
+        // there is; clear any prior rejection before re-probing so the agent's
+        // candidates can become routeable again.
+        crate::auth::note_authenticated(&shared.auth, &agent);
         // Re-run probe verification for this agent; success may create the
         // first routeable candidate.
         futures::future::join_all(keys.iter().map(|k| probe_target(&shared, k))).await;
@@ -5683,33 +5864,46 @@ fn on_session_new(
     shared: Arc<Shared>,
     req: NewSessionRequest,
     responder: Responder<NewSessionResponse>,
+    cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
     if !shared.is_initialized() {
         return responder
             .respond_with_error(AcpError::invalid_request().data("initialize the router first"));
     }
-    let routeable = shared.routeable_candidates();
-    if routeable.is_empty() {
-        return if shared.has_auth_pending() {
-            responder.respond_with_error(AcpError::auth_required().data(
-                "all candidates are waiting for authentication; call authenticate with a \
-                 namespaced method id",
-            ))
-        } else {
-            responder.respond_with_error(
+    cx.spawn(async move {
+        crate::auth::refresh_before_selection(&shared).await;
+        let routeable = shared.routeable_candidates();
+        if routeable.is_empty() {
+            let err = if shared.has_auth_pending()
+                || shared.cfg.agents.iter().any(|a| {
+                    shared
+                        .auth
+                        .lock()
+                        .unwrap()
+                        .unauthenticated(&a.name)
+                        .is_some()
+                })
+            {
+                AcpError::auth_required().data(
+                    "all candidates are waiting for authentication; sign in to a configured provider",
+                )
+            } else {
                 AcpError::invalid_params()
-                    .data("invalid configuration: no routeable or auth-pending candidates remain"),
-            )
-        };
-    }
-    let router_sid = format!("rtr-{}", uuid::Uuid::new_v4());
-    shared
-        .sessions
-        .lock()
-        .unwrap()
-        .insert(router_sid.clone(), RouterSession::new(&shared.cfg, &req));
-    let options = shared.router_config_options(&router_sid);
-    responder.respond(NewSessionResponse::new(router_sid).config_options(options))
+                    .data("invalid configuration: no routeable or auth-pending candidates remain")
+            };
+            let _ = responder.respond_with_error(err);
+            return Ok(());
+        }
+        let router_sid = format!("rtr-{}", uuid::Uuid::new_v4());
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(router_sid.clone(), RouterSession::new(&shared.cfg, &req));
+        let options = shared.router_config_options(&router_sid);
+        let _ = responder.respond(NewSessionResponse::new(router_sid).config_options(options));
+        Ok(())
+    })
 }
 
 fn on_set_config_option(
@@ -6101,6 +6295,7 @@ async fn dispatch_prompt(
     explicit_routing: bool,
     force_orchestrate: bool,
 ) -> Result<(), AcpError> {
+    crate::auth::refresh_before_selection(&shared).await;
     // Pre-classifier (when enabled): one cheap ACP evaluation covering
     // orchestrate + host dimensions. v1 = first eligible turn per session.
     // Fail-open. Explicit `[router:…]` / `model:` suppress the auto path;
@@ -6172,6 +6367,11 @@ async fn dispatch_prompt(
         });
         shared.with_session(&router_sid, |s| {
             s.preclass_done = true;
+            s.required_mcp_capabilities = result
+                .routing
+                .as_ref()
+                .map(|routing| routing.required_capabilities.clone())
+                .unwrap_or_default();
             if preclass_profile.is_some() {
                 s.preclass_profile = preclass_profile;
             }
@@ -6493,6 +6693,28 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
         && msg.method() == crate::usage::AVAILABILITY_HINT_METHOD
     {
         crate::usage::apply_availability_hint(&shared, msg.params());
+        return Ok(Handled::Yes);
+    }
+    // Host-owned delegate MCP catalogs are registered against a router session
+    // and remain inert until that session explicitly asks a delegate to use a
+    // named bundle. This is intentionally generic: router-acp never knows the
+    // integration, URL, or credential behind a catalog entry.
+    if let Dispatch::Notification(msg) = &message
+        && msg.method() == "router-acp/delegate_mcp_catalogs"
+    {
+        if shared.cfg.delegation.mcp_catalogs.is_empty() {
+            return Ok(Handled::Yes);
+        }
+        let Some(router_sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) else {
+            return Ok(Handled::Yes);
+        };
+        let catalogs = msg
+            .params()
+            .get("catalogs")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<HashMap<String, Vec<McpServer>>>(v).ok())
+            .unwrap_or_default();
+        shared.with_session(router_sid, |s| s.delegate_mcp_catalogs = catalogs);
         return Ok(Handled::Yes);
     }
     let Some(router_sid) = message.message().and_then(relay::session_id_of) else {

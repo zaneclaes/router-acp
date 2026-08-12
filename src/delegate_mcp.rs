@@ -150,6 +150,11 @@ pub struct DelegateTaskArgs {
     pub context_files: Vec<String>,
     #[serde(default)]
     pub hints: DelegateHints,
+    /// Opaque capabilities required by this bounded subtask. The router maps
+    /// these through the host-configured catalog policy; agents never name
+    /// endpoints, credentials, or catalog identities.
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
     /// Keep the sub-session open after this turn so the orchestrator can send
     /// follow-up instructions to the same sub-agent (context preserved) via
     /// `delegate_followup`. Returns a `delegate_id` to reference it.
@@ -227,6 +232,11 @@ fn tool_definition() -> Value {
                             "description": "Preferred agent/model candidate id."
                         }
                     }
+                },
+                "required_capabilities": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Host-defined capabilities needed by this bounded subtask. The router attaches matching registered MCP catalogs only to this delegate."
                 },
                 "keep_open": {
                     "type": "boolean",
@@ -849,19 +859,24 @@ pub async fn run_delegate_task(
         .acquire()
         .await
         .map_err(|_| "router shutting down".to_string())?;
+    crate::auth::refresh_before_selection(shared).await;
 
-    let (pin, cwd, dirs, client_mcp, strategy) = shared
+    let (pin, cwd, dirs, client_mcp, delegate_mcp_catalogs, strategy) = shared
         .with_session(router_sid, |s| {
             (
                 s.pin.clone(),
                 s.cwd.clone(),
                 s.additional_directories.clone(),
                 s.mcp_servers.clone(),
+                s.delegate_mcp_catalogs.clone(),
                 s.strategy,
             )
         })
         .ok_or("parent session no longer exists")?;
     let pin = pin.ok_or("parent session is not pinned")?;
+    if !args.required_capabilities.is_empty() && shared.cfg.delegation.mcp_catalogs.is_empty() {
+        return Err("delegate MCP catalogs are disabled by router configuration".to_string());
+    }
     let parent_cost = shared
         .candidate_runtime(&pin.candidate)
         .map(|c| c.cost_rank)
@@ -939,8 +954,23 @@ pub async fn run_delegate_task(
         .map_err(|e| format!("delegate routing failed: {e}"))?;
 
     // Depth cap 1: the ephemeral session gets the client's MCP servers
-    // without the router delegate entry.
-    let sub_mcp = strip_delegate_server(&client_mcp);
+    // without the router delegate entry, plus only explicitly requested
+    // host-registered bundles. The host—not the model—owns all definitions
+    // and credentials in the catalog.
+    let mut sub_mcp = strip_delegate_server(&client_mcp);
+    let catalog_names = crate::session::resolve_mcp_catalogs(
+        &shared.cfg,
+        &args.required_capabilities,
+        &delegate_mcp_catalogs,
+    )?;
+    for name in &catalog_names {
+        let Some(servers) = delegate_mcp_catalogs.get(name) else {
+            return Err(format!(
+                "delegate MCP catalog `{name}` is not available in this session"
+            ));
+        };
+        sub_mcp.extend(servers.iter().cloned());
+    }
     let capture = Arc::new(Mutex::new(String::new()));
 
     let mut last_err = None;
@@ -1104,6 +1134,7 @@ pub async fn run_delegate_task(
                         detail: Some(serde_json::json!({
                             "task": args.task,
                             "context_files": args.context_files,
+                            "required_capabilities": args.required_capabilities,
                         })),
                         tokens_input: crate::state::estimate_tokens(&args.task),
                         tokens_estimated: true,
@@ -1246,6 +1277,13 @@ pub async fn run_delegate_task(
             }
             Err(err) => {
                 tracing::warn!(candidate = %candidate, error = %err, "delegate candidate failed");
+                if crate::downstream::is_auth_required(&err) {
+                    crate::auth::note_unauthenticated(
+                        &shared.auth,
+                        &candidate.agent,
+                        format!("{} is not signed in", candidate.agent),
+                    );
+                }
                 let class = crate::limits::classify_failure(&err);
                 let human = crate::session::apply_failure(shared, &candidate, &err, &class);
                 crate::session::notify_user(
@@ -1508,6 +1546,12 @@ mod tests {
         let args: DelegateTaskArgs =
             serde_json::from_value(json!({"task": "do a thing", "background": true})).unwrap();
         assert!(args.background);
+        let args: DelegateTaskArgs = serde_json::from_value(json!({
+            "task": "inspect telemetry",
+            "required_capabilities": ["metrics"]
+        }))
+        .unwrap();
+        assert_eq!(args.required_capabilities, ["metrics"]);
         let await_args: DelegateAwaitArgs = serde_json::from_value(json!({})).unwrap();
         assert!(await_args.delegate_ids.is_empty());
         assert!(await_args.timeout_seconds.is_none());

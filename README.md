@@ -167,6 +167,29 @@ and it always tells the user what happened:
   cordoned off from routing until that reset (or
   `headroom.cordon_default_secs` when no time was reported), and later
   routing disclosures include the cordon and its remaining time.
+- **Auth-aware availability.** A provider you are signed out of advertises its
+  models exactly like one you are signed into — the adapter lists them from a
+  static manifest, so *advertisement is not availability*. The router therefore
+  tracks authentication per **agent** (it belongs to a provider seat, never to
+  an individual model) as a tri-state: authenticated, unauthenticated, or
+  unknown. Unknown **fails open**; only definite evidence changes eligibility.
+  Evidence comes from three places: an optional non-interactive `auth_probe`
+  (below), the authenticated usage read (a clean read proves the seat works; an
+  explicit credential rejection disproves it; a timeout or parse error proves
+  nothing), and runtime ACP rejections. All configured probes run concurrently
+  before selection — startup, `session/new`, pre-classification, pin, dispatch,
+  and delegate selection — on a 5-second freshness TTL, so one routing pipeline
+  costs one round of probes rather than one per decision. An agent known to be
+  logged out is not spawned at startup, is excluded from the pre-classifier
+  evaluator pool, from `auto`, from failover, from skill routing, and from
+  delegates, and its candidates are advertised on the `router.candidate` picker
+  as `available: false` with the auth reason and **no** `resets_at` (signing in
+  is what fixes it, not waiting). A runtime `Authentication required` takes the
+  whole agent out immediately and fails the turn over to a live peer instead of
+  surfacing the provider's sign-in error. Reactive negatives decay after 15
+  minutes so an out-of-band `login` on an agent with no configured probe is not
+  ignored for the process lifetime, and a successful ACP `authenticate` clears
+  the state outright (starting the target if startup had skipped it).
 - **Proactive per-candidate usage cordons.** Beyond reacting to errors, the
   router can read a provider's own usage state and cordon an *exhausted model*
   before it's ever tried. Enable per-agent with `usage_source`:
@@ -543,6 +566,18 @@ session. The delegate server is *not* injected when delegation is disabled,
 when only one candidate exists, or when no cheaper candidate exists for the
 parent — and never into delegated sessions themselves (depth is capped at 1).
 
+### Host-owned capability MCP catalogs
+
+An ACP host registers concrete named MCP bundles with
+`router-acp/delegate_mcp_catalogs`; config maps those catalog names to opaque
+capabilities. The host's pre-classifier extension defines when a first prompt
+needs those capabilities. Before opening the primary downstream session, the
+router resolves the requirement and attaches the matching registered catalog.
+A later bounded `delegate_task` instead asks for `required_capabilities`; the
+router resolves and attaches them only to that delegate. Unknown capabilities,
+missing catalog registrations, and incomplete coverage fail closed. The router
+never defines capability meanings, endpoints, or credentials.
+
 `delegation.inject_prompt: true` also prepends a one-shot directive to each
 ordinary downstream session that actually received those tools. It asks the
 parent to delegate only bounded, independent work whose briefing and
@@ -715,6 +750,7 @@ example.
 | `classifier.rules_file` | built-in | Path to a classifier rules YAML. |
 | `delegation.enabled` | `true` | Offer `delegate_task` to pinned sessions. |
 | `delegation.inject_prompt` | `false` | When the tools are actually attached to an ordinary primary session, inject one scoped instruction to use them for suitable bounded work. Re-injected after a model switch; suppressed for orchestration. |
+| `delegation.mcp_catalogs` | `[]` | Host-defined catalog-to-capability policy for first-prompt and bounded-delegate MCP attachment. |
 | `delegation.max_concurrent` | `3` | Concurrent delegated sub-sessions. |
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `headroom.window_secs` | `18000` | Sliding-window length (5 h). |
@@ -728,6 +764,9 @@ example.
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `availability_preference.headroom_scale_dollars` | `200` | Remaining budget, in dollars, at/above which a seat's quota term reads fully free. Ranking compares real dollars (overage pools directly from the provider API, plan windows estimated from the router's own metered spend), not the fraction of each provider's own (differently-sized) cap. |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` reads Codex's own on-disk rate-limit snapshots (`~/.codex/sessions/**/rollout-*.jsonl`), newest per limit pool — last-known (Codex has no pollable endpoint), reactive cordon backstops it; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
+| `agents[].auth_probe` | – | Optional non-interactive login check for this agent's provider seat, e.g. `{ command: claude, args: ["auth", "status"] }`. Run concurrently with every other probe before selection. Output matching `unauthenticated_patterns` (case-insensitive substring) means signed out; otherwise exit zero means signed in; a non-zero exit that matches nothing, a spawn failure, or a timeout is **unknown** and fails open. Omit it for providers with no reliable non-interactive status command — they stay fail-open and reactive. |
+| `agents[].auth_probe.timeout_ms` | `2000` | Probe timeout. Exceeding it is unknown, not a failure. |
+| `agents[].auth_probe.unauthenticated_patterns` | `not logged in`, `not signed in`, `authentication required`, `sign in`, `log in`, `login required` | Substrings that make the probe's output definite negative evidence. Set explicitly when a provider's logged-*in* output also mentions signing in. |
 | `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
 | `agents[].llm_proxy.codex_chatgpt_provider` | `false` | For an OpenAI-protocol Codex agent, install a custom HTTP Responses provider so ChatGPT-authenticated Codex traffic traverses the proxy instead of bypassing it over WebSocket. |
 | (Anthropic-protocol `agents[].llm_proxy`) | always on | Claude Code disables MCP tool search when `ANTHROPIC_BASE_URL` is not a first-party Anthropic host, eagerly loading every tool schema instead. This proxy forwards `tool_reference` blocks untouched, so `ENABLE_TOOL_SEARCH=true` is set on every anthropic-protocol target unless the process env already sets it explicitly. |

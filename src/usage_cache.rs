@@ -73,6 +73,30 @@ pub struct Snapshot {
     pub payload: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub enum CachedUsage {
+    Success(Value),
+    AuthRejected(String),
+    Unknown(Option<Value>),
+}
+
+impl CachedUsage {
+    fn from_snapshot(snapshot: Option<Snapshot>) -> Self {
+        let Some(snapshot) = snapshot else {
+            return Self::Unknown(None);
+        };
+        if let Some(error) = snapshot.last_error.as_deref()
+            && crate::auth::error_is_auth_rejection(error)
+        {
+            return Self::AuthRejected(error.to_string());
+        }
+        match snapshot.payload {
+            Some(payload) if snapshot.last_error.is_none() => Self::Success(payload),
+            payload => Self::Unknown(payload),
+        }
+    }
+}
+
 // ----------------------------------------------------------------------
 // Refresh policy (pure — the unit-tested core)
 // ----------------------------------------------------------------------
@@ -306,8 +330,10 @@ fn classify_error(err: &str) -> String {
 /// The cache-mediated usage read — the box-wide rate limiter. Returns the
 /// freshest payload available (possibly stale on failure or lock contention),
 /// or `None` when there's nothing usable (fail open, as before).
-pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> Option<Value> {
-    let creds = crate::usage::anthropic_oauth_credentials()?;
+pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> CachedUsage {
+    let Some(creds) = crate::usage::anthropic_oauth_credentials() else {
+        return CachedUsage::AuthRejected("Claude is not signed in".to_string());
+    };
     let fp = fingerprint(
         creds
             .refresh_token
@@ -329,8 +355,10 @@ pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> Option<Value> {
 /// The RPC is local process spawn + one backend read, but it still deserves
 /// the shared cache — every serve process polling it independently is wasted
 /// work, and the snapshot is what the relay reads.
-pub async fn cached_codex_usage(min_refresh_secs: u64) -> Option<Value> {
-    let fp = crate::usage::codex_account_fingerprint()?;
+pub async fn cached_codex_usage(min_refresh_secs: u64) -> CachedUsage {
+    let Some(fp) = crate::usage::codex_account_fingerprint() else {
+        return CachedUsage::AuthRejected("Codex is not signed in".to_string());
+    };
     cached_usage(CODEX_SOURCE, "codex.json", &fp, min_refresh_secs, || {
         crate::usage::fetch_codex_usage()
     })
@@ -345,15 +373,17 @@ async fn cached_usage<F, Fut>(
     fp: &str,
     min_refresh_secs: u64,
     fetch: F,
-) -> Option<Value>
+) -> CachedUsage
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
-    let path = snapshot_path(file_name)?;
+    let Some(path) = snapshot_path(file_name) else {
+        return CachedUsage::Unknown(None);
+    };
     let snap = read_snapshot(&path);
     if !should_fetch(snap.as_ref(), unix_now(), fp, min_refresh_secs) {
-        return snap.and_then(|s| s.payload);
+        return CachedUsage::from_snapshot(snap);
     }
     let lock_path = path.with_extension("json.lock");
     let Some(_lock) = acquire_lock(
@@ -368,7 +398,7 @@ where
             source,
             "usage fetch lock held by another process; using cached snapshot"
         );
-        return snap.filter(|s| s.account == fp).and_then(|s| s.payload);
+        return CachedUsage::from_snapshot(snap.filter(|s| s.account == fp));
     };
     // Re-read under the lock: another process may have completed its own
     // attempt between our first read and the lock acquisition. Its outcome —
@@ -377,15 +407,15 @@ where
     // here could overwrite a sibling's fresher success.
     let snap = read_snapshot(&path);
     if !should_fetch(snap.as_ref(), unix_now(), fp, min_refresh_secs) {
-        return snap.and_then(|s| s.payload);
+        return CachedUsage::from_snapshot(snap);
     }
     match fetch().await {
         Ok(payload) => {
-            let s = on_success(source, fp, unix_now(), payload);
+            let s = on_success(source, fp, unix_now(), payload.clone());
             if let Err(e) = write_snapshot(&path, &s) {
                 tracing::debug!(error = %e, "cannot persist usage snapshot");
             }
-            s.payload
+            CachedUsage::Success(payload)
         }
         Err(err) => {
             tracing::debug!(source, %err, "usage fetch failed; keeping last-good snapshot");
@@ -393,7 +423,7 @@ where
             if let Err(e) = write_snapshot(&path, &s) {
                 tracing::debug!(error = %e, "cannot persist usage snapshot");
             }
-            s.payload
+            CachedUsage::from_snapshot(Some(s))
         }
     }
 }
@@ -413,6 +443,35 @@ mod tests {
             last_error: None,
             payload: Some(json!({"limits": []})),
         }
+    }
+
+    #[test]
+    fn usage_evidence_separates_auth_rejection_from_ordinary_failure() {
+        // A clean read is positive authentication evidence.
+        assert!(matches!(
+            CachedUsage::from_snapshot(Some(snap("acct", 10, 0))),
+            CachedUsage::Success(_)
+        ));
+        // A credential rejection is negative evidence even though the stale
+        // payload survives for quota purposes.
+        let mut rejected = snap("acct", 10, 1);
+        rejected.last_error = Some("usage fetch failed: HTTP 401 Unauthorized".to_string());
+        assert!(matches!(
+            CachedUsage::from_snapshot(Some(rejected)),
+            CachedUsage::AuthRejected(_)
+        ));
+        // Every other failure says nothing about authentication; the last-good
+        // payload still comes back so cordoning keeps working.
+        let mut errored = snap("acct", 10, 1);
+        errored.last_error = Some("timed out after 5000ms".to_string());
+        assert!(matches!(
+            CachedUsage::from_snapshot(Some(errored)),
+            CachedUsage::Unknown(Some(_))
+        ));
+        assert!(matches!(
+            CachedUsage::from_snapshot(None),
+            CachedUsage::Unknown(None)
+        ));
     }
 
     #[test]

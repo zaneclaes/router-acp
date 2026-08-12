@@ -93,6 +93,11 @@ pub struct RoutingDecision {
     /// Human-facing domains such as UX, frontend, database, infrastructure.
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Opaque host-defined capabilities needed to begin this task. Their
+    /// definitions come from a configured classifier extension, never router
+    /// source code.
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
     /// 0.0 (mechanical/trivial) to 1.0 (long-horizon/high-risk).
     pub complexity: f64,
     pub confidence: f64,
@@ -183,7 +188,7 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          xhigh for ambiguous cross-system reasoning, and max only for novel or severe-risk work.\n\
          Return:\n\
          \"routing\": { \"task_class\": string, \"task_classes\": [strings], \
-         \"categories\": [strings], \"complexity\": 0.0-1.0, \
+         \"categories\": [strings], \"required_capabilities\": [strings], \"complexity\": 0.0-1.0, \
          \"confidence\": 0.0-1.0, \"effort\": \"low|medium|high|xhigh|max\", \"reason\": string }\n\n",
     );
     schema_keys.push("routing".into());
@@ -388,10 +393,22 @@ fn parse_routing(v: &Value) -> Option<RoutingDecision> {
         .take(8)
         .map(ToString::to_string)
         .collect();
+    let required_capabilities = obj
+        .get("required_capabilities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(16)
+        .map(ToString::to_string)
+        .collect();
     Some(RoutingDecision {
         task_class,
         task_classes,
         categories,
+        required_capabilities,
         complexity: complexity.clamp(0.0, 1.0),
         confidence: confidence.clamp(0.0, 1.0),
         effort,
@@ -745,6 +762,13 @@ pub async fn evaluate(
             // the router's known failure handling (classify + cordon), then fail
             // over to the next evaluator — exactly as a pinned turn would.
             Err(err) => {
+                if crate::downstream::is_auth_required(&err) {
+                    crate::auth::note_unauthenticated(
+                        &shared.auth,
+                        &candidate.agent,
+                        format!("{} is not signed in", candidate.agent),
+                    );
+                }
                 let class = crate::limits::classify_failure(&err);
                 let human = crate::session::apply_failure(shared, &candidate, &err, &class);
                 tracing::warn!(

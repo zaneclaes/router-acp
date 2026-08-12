@@ -526,6 +526,17 @@ and config are in [`ORCHESTRATION.md`](ORCHESTRATION.md); because it is built on
 the router's own `delegate_task` tool it needs no recipe or `summon` extension,
 so it works from any ACP client and plain chat.
 
+### Host capability MCPs
+
+The host registers concrete bundles per router session, while
+`delegation.mcp_catalogs` maps each catalog to opaque capabilities. A
+pluggable pre-classifier extension defines those capability terms and returns
+`routing.required_capabilities`; the router resolves them before opening the
+first downstream session. Later, the primary requests
+`delegate_task.required_capabilities` for a bounded subtask. The router stays
+integration-agnostic: it does not define capability meanings, endpoints, or
+credentials, and incomplete coverage fails closed.
+
 ---
 
 ## Things that apply to every router
