@@ -161,6 +161,9 @@ pub struct RouterSession {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub mcp_servers: Vec<McpServer>,
+    /// Host-registered MCP bundles available only to explicitly opted-in
+    /// delegate sessions. They never reach the primary downstream session.
+    pub delegate_mcp_catalogs: HashMap<String, Vec<McpServer>>,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
     /// Who set `candidate_override` (user, a skill route, the orchestration
@@ -332,6 +335,7 @@ impl RouterSession {
             cwd: persisted.cwd.clone(),
             additional_directories: persisted.additional_directories.clone(),
             mcp_servers,
+            delegate_mcp_catalogs: HashMap::new(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -386,6 +390,7 @@ impl RouterSession {
             cwd: req.cwd.clone(),
             additional_directories: req.additional_directories.clone(),
             mcp_servers: req.mcp_servers.clone(),
+            delegate_mcp_catalogs: HashMap::new(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -6493,6 +6498,25 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
         && msg.method() == crate::usage::AVAILABILITY_HINT_METHOD
     {
         crate::usage::apply_availability_hint(&shared, msg.params());
+        return Ok(Handled::Yes);
+    }
+    // Host-owned delegate MCP catalogs are registered against a router session
+    // and remain inert until that session explicitly asks a delegate to use a
+    // named bundle. This is intentionally generic: router-acp never knows the
+    // integration, URL, or credential behind a catalog entry.
+    if let Dispatch::Notification(msg) = &message
+        && msg.method() == "router-acp/delegate_mcp_catalogs"
+    {
+        let Some(router_sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) else {
+            return Ok(Handled::Yes);
+        };
+        let catalogs = msg
+            .params()
+            .get("catalogs")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<HashMap<String, Vec<McpServer>>>(v).ok())
+            .unwrap_or_default();
+        shared.with_session(router_sid, |s| s.delegate_mcp_catalogs = catalogs);
         return Ok(Handled::Yes);
     }
     let Some(router_sid) = message.message().and_then(relay::session_id_of) else {

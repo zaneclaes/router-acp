@@ -150,6 +150,11 @@ pub struct DelegateTaskArgs {
     pub context_files: Vec<String>,
     #[serde(default)]
     pub hints: DelegateHints,
+    /// Names of host-registered MCP bundles to attach only to this delegate.
+    /// Unknown names fail closed; agents cannot supply arbitrary server URLs
+    /// or credentials through this API.
+    #[serde(default)]
+    pub mcp_catalogs: Vec<String>,
     /// Keep the sub-session open after this turn so the orchestrator can send
     /// follow-up instructions to the same sub-agent (context preserved) via
     /// `delegate_followup`. Returns a `delegate_id` to reference it.
@@ -227,6 +232,11 @@ fn tool_definition() -> Value {
                             "description": "Preferred agent/model candidate id."
                         }
                     }
+                },
+                "mcp_catalogs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Host-registered MCP bundles for this delegate only. Use only when the task requires the named capability."
                 },
                 "keep_open": {
                     "type": "boolean",
@@ -850,13 +860,14 @@ pub async fn run_delegate_task(
         .await
         .map_err(|_| "router shutting down".to_string())?;
 
-    let (pin, cwd, dirs, client_mcp, strategy) = shared
+    let (pin, cwd, dirs, client_mcp, delegate_mcp_catalogs, strategy) = shared
         .with_session(router_sid, |s| {
             (
                 s.pin.clone(),
                 s.cwd.clone(),
                 s.additional_directories.clone(),
                 s.mcp_servers.clone(),
+                s.delegate_mcp_catalogs.clone(),
                 s.strategy,
             )
         })
@@ -939,8 +950,18 @@ pub async fn run_delegate_task(
         .map_err(|e| format!("delegate routing failed: {e}"))?;
 
     // Depth cap 1: the ephemeral session gets the client's MCP servers
-    // without the router delegate entry.
-    let sub_mcp = strip_delegate_server(&client_mcp);
+    // without the router delegate entry, plus only explicitly requested
+    // host-registered bundles. The host—not the model—owns all definitions
+    // and credentials in the catalog.
+    let mut sub_mcp = strip_delegate_server(&client_mcp);
+    for name in &args.mcp_catalogs {
+        let Some(servers) = delegate_mcp_catalogs.get(name) else {
+            return Err(format!(
+                "delegate MCP catalog `{name}` is not available in this session"
+            ));
+        };
+        sub_mcp.extend(servers.iter().cloned());
+    }
     let capture = Arc::new(Mutex::new(String::new()));
 
     let mut last_err = None;
@@ -1104,6 +1125,7 @@ pub async fn run_delegate_task(
                         detail: Some(serde_json::json!({
                             "task": args.task,
                             "context_files": args.context_files,
+                            "mcp_catalogs": args.mcp_catalogs,
                         })),
                         tokens_input: crate::state::estimate_tokens(&args.task),
                         tokens_estimated: true,
@@ -1508,6 +1530,12 @@ mod tests {
         let args: DelegateTaskArgs =
             serde_json::from_value(json!({"task": "do a thing", "background": true})).unwrap();
         assert!(args.background);
+        let args: DelegateTaskArgs = serde_json::from_value(json!({
+            "task": "inspect telemetry",
+            "mcp_catalogs": ["observability"]
+        }))
+        .unwrap();
+        assert_eq!(args.mcp_catalogs, ["observability"]);
         let await_args: DelegateAwaitArgs = serde_json::from_value(json!({})).unwrap();
         assert!(await_args.delegate_ids.is_empty());
         assert!(await_args.timeout_seconds.is_none());
