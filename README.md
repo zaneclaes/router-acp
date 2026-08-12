@@ -770,7 +770,7 @@ example.
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
 | `agents[].models[]` | – | `id` (must exactly match the downstream selector's value for `config-option`), optional `display_name`, `api_model` (provider model id for proxy rewrites; defaults to `id`), `cost_rank` (1 = cheapest/least scarce), and optional API-equivalent `pricing`. |
-| `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). When configured, a tool-safe `preclass` entry is applied before the classifier prompt. An adapter with no matching entry still runs the evaluator tool-less, so a connected provider can operate in isolation. |
+| `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). When `pre_classifier.enabled`, an evaluator that advertises session modes requires an explicit tool-safe `preclass` entry whose target it advertises; it is applied before the classifier prompt. Mode-less adapters run the evaluator without `session/set_mode`. |
 | `agents[].lineage` | agent name | Model-company tag (e.g. `anthropic`, `openai`). Orchestration's cross-lineage review requires the reviewer's lineage to differ from the planner's — the intent is a different **company** with different failure modes — so two agents backed by the same vendor should declare the same `lineage`. |
 | `agents[].preference` | `0` | Additive utility tie-break for this agent (`auto`) and within-tier tie-break (`pareto-code`). Keep small, e.g. `0.05`. Scaled dynamically by seat availability unless `availability_preference.enabled: false`. |
 | `routers.auto.complexity_scales_tradeoff` | `true` | Scale the tradeoff by `1 − complexity`: cost matters for trivial prompts, quality dominates hard ones. |
@@ -800,14 +800,14 @@ same translation, and are likewise lenient when no equivalent exists.
 Delegated sessions explicitly apply the candidate's `auto` mapping because
 there is no separate upstream client to send them a mode request.
 
-Pre-classifier sessions are intentionally tool-less. Configure an explicit
-`mode_map.preclass` target when an adapter exposes a known safe mode (for
-example `preclass: plan` for Claude or `preclass: read-only` for Codex); the
-router never reuses `auto` or guesses `chat`. If an adapter has no matching
-safe-mode mapping — including a provider that gains or changes advertised modes
-— it still evaluates without `session/set_mode`. This preserves single-provider
-operation; any evaluator tool call or downstream callback is cancelled and
-rejected.
+Pre-classifier sessions are intentionally different: an adapter that advertises
+session modes requires an explicit `mode_map.preclass` target (for example
+`preclass: plan` for Claude or `preclass: read-only` for Codex), and the target
+must be advertised by that adapter. The router never reuses `auto` or guesses
+`chat`; an adapter with modes but without that safe mapping is skipped before it
+receives the user or classifier prompt. An adapter that advertises no modes
+(such as Grok) has no mode gate to arm and runs without `session/set_mode`.
+Any evaluator tool call or downstream callback is cancelled and rejected.
 
 ## First-run authentication
 
