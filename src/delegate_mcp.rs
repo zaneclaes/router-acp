@@ -150,11 +150,11 @@ pub struct DelegateTaskArgs {
     pub context_files: Vec<String>,
     #[serde(default)]
     pub hints: DelegateHints,
-    /// Names of host-registered MCP bundles to attach only to this delegate.
-    /// Unknown names fail closed; agents cannot supply arbitrary server URLs
-    /// or credentials through this API.
+    /// Opaque capabilities required by this bounded subtask. The router maps
+    /// these through the host-configured catalog policy; agents never name
+    /// endpoints, credentials, or catalog identities.
     #[serde(default)]
-    pub mcp_catalogs: Vec<String>,
+    pub required_capabilities: Vec<String>,
     /// Keep the sub-session open after this turn so the orchestrator can send
     /// follow-up instructions to the same sub-agent (context preserved) via
     /// `delegate_followup`. Returns a `delegate_id` to reference it.
@@ -233,10 +233,10 @@ fn tool_definition() -> Value {
                         }
                     }
                 },
-                "mcp_catalogs": {
+                "required_capabilities": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Host-registered MCP bundles for this delegate only. Use only when the task requires the named capability."
+                    "description": "Host-defined capabilities needed by this bounded subtask. The router attaches matching registered MCP catalogs only to this delegate."
                 },
                 "keep_open": {
                     "type": "boolean",
@@ -873,7 +873,7 @@ pub async fn run_delegate_task(
         })
         .ok_or("parent session no longer exists")?;
     let pin = pin.ok_or("parent session is not pinned")?;
-    if !args.mcp_catalogs.is_empty() && !shared.cfg.delegation.mcp_catalogs {
+    if !args.required_capabilities.is_empty() && shared.cfg.delegation.mcp_catalogs.is_empty() {
         return Err("delegate MCP catalogs are disabled by router configuration".to_string());
     }
     let parent_cost = shared
@@ -957,7 +957,12 @@ pub async fn run_delegate_task(
     // host-registered bundles. The host—not the model—owns all definitions
     // and credentials in the catalog.
     let mut sub_mcp = strip_delegate_server(&client_mcp);
-    for name in &args.mcp_catalogs {
+    let catalog_names = crate::session::resolve_mcp_catalogs(
+        &shared.cfg,
+        &args.required_capabilities,
+        &delegate_mcp_catalogs,
+    )?;
+    for name in &catalog_names {
         let Some(servers) = delegate_mcp_catalogs.get(name) else {
             return Err(format!(
                 "delegate MCP catalog `{name}` is not available in this session"
@@ -1128,7 +1133,7 @@ pub async fn run_delegate_task(
                         detail: Some(serde_json::json!({
                             "task": args.task,
                             "context_files": args.context_files,
-                            "mcp_catalogs": args.mcp_catalogs,
+                            "required_capabilities": args.required_capabilities,
                         })),
                         tokens_input: crate::state::estimate_tokens(&args.task),
                         tokens_estimated: true,
@@ -1535,10 +1540,10 @@ mod tests {
         assert!(args.background);
         let args: DelegateTaskArgs = serde_json::from_value(json!({
             "task": "inspect telemetry",
-            "mcp_catalogs": ["observability"]
+            "required_capabilities": ["metrics"]
         }))
         .unwrap();
-        assert_eq!(args.mcp_catalogs, ["observability"]);
+        assert_eq!(args.required_capabilities, ["metrics"]);
         let await_args: DelegateAwaitArgs = serde_json::from_value(json!({})).unwrap();
         assert!(await_args.delegate_ids.is_empty());
         assert!(await_args.timeout_seconds.is_none());

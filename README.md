@@ -543,14 +543,17 @@ session. The delegate server is *not* injected when delegation is disabled,
 when only one candidate exists, or when no cheaper candidate exists for the
 parent — and never into delegated sessions themselves (depth is capped at 1).
 
-### Host-owned delegate MCP catalogs
+### Host-owned capability MCP catalogs
 
-With `delegation.mcp_catalogs: true`, an ACP host may register named MCP
-bundles with `router-acp/delegate_mcp_catalogs`. Registered entries remain out
-of the primary downstream session. A parent may attach one only to a bounded
-`delegate_task` through `mcp_catalogs: ["name"]`; unknown names fail closed.
-The host owns each endpoint and credential, so a model cannot add arbitrary
-MCP servers. This is appropriate for expensive or production-only integrations.
+An ACP host registers concrete named MCP bundles with
+`router-acp/delegate_mcp_catalogs`; config maps those catalog names to opaque
+capabilities. The host's pre-classifier extension defines when a first prompt
+needs those capabilities. Before opening the primary downstream session, the
+router resolves the requirement and attaches the matching registered catalog.
+A later bounded `delegate_task` instead asks for `required_capabilities`; the
+router resolves and attaches them only to that delegate. Unknown capabilities,
+missing catalog registrations, and incomplete coverage fail closed. The router
+never defines capability meanings, endpoints, or credentials.
 
 `delegation.inject_prompt: true` also prepends a one-shot directive to each
 ordinary downstream session that actually received those tools. It asks the
@@ -724,7 +727,7 @@ example.
 | `classifier.rules_file` | built-in | Path to a classifier rules YAML. |
 | `delegation.enabled` | `true` | Offer `delegate_task` to pinned sessions. |
 | `delegation.inject_prompt` | `false` | When the tools are actually attached to an ordinary primary session, inject one scoped instruction to use them for suitable bounded work. Re-injected after a model switch; suppressed for orchestration. |
-| `delegation.mcp_catalogs` | `false` | Permit host-registered named MCP bundles on explicitly requested delegate sessions only. |
+| `delegation.mcp_catalogs` | `[]` | Host-defined catalog-to-capability policy for first-prompt and bounded-delegate MCP attachment. |
 | `delegation.max_concurrent` | `3` | Concurrent delegated sub-sessions. |
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `headroom.window_secs` | `18000` | Sliding-window length (5 h). |

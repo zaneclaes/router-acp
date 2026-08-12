@@ -164,6 +164,9 @@ pub struct RouterSession {
     /// Host-registered MCP bundles available only to explicitly opted-in
     /// delegate sessions. They never reach the primary downstream session.
     pub delegate_mcp_catalogs: HashMap<String, Vec<McpServer>>,
+    /// Opaque capability requirements returned by the first-prompt
+    /// pre-classifier. Used only to resolve host-configured MCP catalogs.
+    pub required_mcp_capabilities: Vec<String>,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
     /// Who set `candidate_override` (user, a skill route, the orchestration
@@ -336,6 +339,7 @@ impl RouterSession {
             additional_directories: persisted.additional_directories.clone(),
             mcp_servers,
             delegate_mcp_catalogs: HashMap::new(),
+            required_mcp_capabilities: Vec::new(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -391,6 +395,7 @@ impl RouterSession {
             additional_directories: req.additional_directories.clone(),
             mcp_servers: req.mcp_servers.clone(),
             delegate_mcp_catalogs: HashMap::new(),
+            required_mcp_capabilities: Vec::new(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -2954,7 +2959,7 @@ async fn pin_session(
         }
         let candidate = rc.candidate.clone();
         let (mcp_servers, delegate_attached) =
-            mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp);
+            mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp)?;
         match open_downstream_session(
             shared,
             &candidate,
@@ -3344,14 +3349,112 @@ fn mcp_servers_for_pin(
     router_sid: &str,
     candidate: &CandidateId,
     client_mcp: &[McpServer],
-) -> (Vec<McpServer>, bool) {
+) -> Result<(Vec<McpServer>, bool), AcpError> {
     let mut servers = client_mcp.to_vec();
+    let (required_capabilities, catalogs) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.required_mcp_capabilities.clone(),
+                s.delegate_mcp_catalogs.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let names = resolve_mcp_catalogs(&shared.cfg, &required_capabilities, &catalogs)
+        .map_err(|reason| AcpError::invalid_params().data(reason))?;
+    for name in names {
+        if let Some(entries) = catalogs.get(&name) {
+            for entry in entries {
+                if !servers.contains(entry) {
+                    servers.push(entry.clone());
+                }
+            }
+        }
+    }
     let mut delegate_attached = false;
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
         delegate_attached = true;
     }
-    (servers, delegate_attached)
+    Ok((servers, delegate_attached))
+}
+
+/// Resolve opaque capability names to host-provided catalog entries. The
+/// generic router never defines capability meanings or concrete MCP servers.
+pub(crate) fn resolve_mcp_catalogs(
+    cfg: &Config,
+    required: &[String],
+    available: &HashMap<String, Vec<McpServer>>,
+) -> Result<Vec<String>, String> {
+    let mut unresolved: HashSet<&str> = required.iter().map(String::as_str).collect();
+    let mut selected = Vec::new();
+    for policy in &cfg.delegation.mcp_catalogs {
+        if policy
+            .capabilities
+            .iter()
+            .any(|cap| unresolved.contains(cap.as_str()))
+        {
+            if !available.contains_key(&policy.catalog) {
+                return Err(format!(
+                    "MCP catalog `{}` is not available in this session",
+                    policy.catalog
+                ));
+            }
+            selected.push(policy.catalog.clone());
+            for capability in &policy.capabilities {
+                unresolved.remove(capability.as_str());
+            }
+        }
+    }
+    if unresolved.is_empty() {
+        Ok(selected)
+    } else {
+        let mut missing: Vec<_> = unresolved.into_iter().collect();
+        missing.sort_unstable();
+        Err(format!(
+            "no configured MCP catalog supplies required capabilities: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod mcp_catalog_tests {
+    use super::resolve_mcp_catalogs;
+    use crate::config::{Config, McpCatalogConfig};
+    use agent_client_protocol::schema::v1::McpServer;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resolves_host_defined_capabilities_without_integration_knowledge() {
+        let mut cfg = test_config();
+        cfg.delegation.mcp_catalogs = vec![McpCatalogConfig {
+            catalog: "telemetry".into(),
+            capabilities: vec!["series".into(), "spans".into()],
+        }];
+        let available = HashMap::from([("telemetry".into(), Vec::<McpServer>::new())]);
+        assert_eq!(
+            resolve_mcp_catalogs(&cfg, &["spans".into()], &available).unwrap(),
+            ["telemetry"]
+        );
+    }
+
+    #[test]
+    fn refuses_uncovered_or_unregistered_capabilities() {
+        let mut cfg = test_config();
+        cfg.delegation.mcp_catalogs = vec![McpCatalogConfig {
+            catalog: "telemetry".into(),
+            capabilities: vec!["series".into()],
+        }];
+        assert!(resolve_mcp_catalogs(&cfg, &["spans".into()], &HashMap::new()).is_err());
+        assert!(resolve_mcp_catalogs(&cfg, &["series".into()], &HashMap::new()).is_err());
+    }
+
+    fn test_config() -> Config {
+        Config::from_yaml(
+            "agents:\n  - name: mock\n    command:\n      type: stdio\n      command: mock-agent\n    model_selection:\n      type: config-option\n    models:\n      - id: model\n        display_name: Model\n        cost_rank: 1\n",
+        )
+        .unwrap()
+    }
 }
 
 fn build_delegation_instructions() -> String {
@@ -5006,7 +5109,7 @@ async fn switch_pin(
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     let (mcp_servers, delegate_attached) =
-        mcp_servers_for_pin(shared, router_sid, target, &client_mcp);
+        mcp_servers_for_pin(shared, router_sid, target, &client_mcp)?;
     let opened = open_downstream_session(
         shared,
         target,
@@ -6177,6 +6280,11 @@ async fn dispatch_prompt(
         });
         shared.with_session(&router_sid, |s| {
             s.preclass_done = true;
+            s.required_mcp_capabilities = result
+                .routing
+                .as_ref()
+                .map(|routing| routing.required_capabilities.clone())
+                .unwrap_or_default();
             if preclass_profile.is_some() {
                 s.preclass_profile = preclass_profile;
             }
@@ -6507,7 +6615,7 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
     if let Dispatch::Notification(msg) = &message
         && msg.method() == "router-acp/delegate_mcp_catalogs"
     {
-        if !shared.cfg.delegation.mcp_catalogs {
+        if shared.cfg.delegation.mcp_catalogs.is_empty() {
             return Ok(Handled::Yes);
         }
         let Some(router_sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) else {

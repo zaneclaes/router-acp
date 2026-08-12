@@ -111,11 +111,11 @@ pub struct DelegationConfig {
     /// default so deployments opt into the behavioral change explicitly.
     #[serde(default)]
     pub inject_prompt: bool,
-    /// Permit the host to register named MCP bundles which are inert until a
-    /// parent explicitly requests one for a delegate. Disabled by default so
-    /// hosts opt into passing integrations and credentials across this boundary.
+    /// Host-defined MCP catalogs and the opaque capabilities each supplies.
+    /// The router only resolves these strings; their meanings stay with the
+    /// host's pre-classifier extension.
     #[serde(default)]
-    pub mcp_catalogs: bool,
+    pub mcp_catalogs: Vec<McpCatalogConfig>,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Unix-domain socket path for the delegate MCP helper to connect back on.
@@ -132,6 +132,13 @@ pub struct DelegationConfig {
     /// 1.0 disables the cap.
     #[serde(default = "default_delegate_complexity_cap")]
     pub complexity_cap: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCatalogConfig {
+    pub catalog: String,
+    pub capabilities: Vec<String>,
 }
 
 fn default_delegate_complexity_cap() -> f64 {
@@ -151,7 +158,7 @@ impl Default for DelegationConfig {
         Self {
             enabled: true,
             inject_prompt: false,
-            mcp_catalogs: false,
+            mcp_catalogs: Vec::new(),
             max_concurrent: default_max_concurrent(),
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
@@ -1695,6 +1702,41 @@ impl Config {
                 }
             }
         }
+        let mut catalogs = HashSet::new();
+        for catalog in &self.delegation.mcp_catalogs {
+            if catalog.catalog.trim().is_empty() {
+                return Err(ConfigError(
+                    "delegation.mcp_catalogs: catalog must not be empty".into(),
+                ));
+            }
+            if !catalogs.insert(catalog.catalog.clone()) {
+                return Err(ConfigError(format!(
+                    "delegation.mcp_catalogs: duplicate catalog `{}`",
+                    catalog.catalog
+                )));
+            }
+            if catalog.capabilities.is_empty() {
+                return Err(ConfigError(format!(
+                    "delegation.mcp_catalogs.`{}`: capabilities must not be empty",
+                    catalog.catalog
+                )));
+            }
+            let mut capabilities = HashSet::new();
+            for capability in &catalog.capabilities {
+                if capability.trim().is_empty() {
+                    return Err(ConfigError(format!(
+                        "delegation.mcp_catalogs.`{}`: capability must not be empty",
+                        catalog.catalog
+                    )));
+                }
+                if !capabilities.insert(capability.clone()) {
+                    return Err(ConfigError(format!(
+                        "delegation.mcp_catalogs.`{}`: duplicate capability `{capability}`",
+                        catalog.catalog
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1745,7 +1787,7 @@ agents:
         assert_eq!(cfg.delegation.max_concurrent, 3);
         assert!(cfg.delegation.enabled);
         assert!(!cfg.delegation.inject_prompt);
-        assert!(!cfg.delegation.mcp_catalogs);
+        assert!(cfg.delegation.mcp_catalogs.is_empty());
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
@@ -1762,10 +1804,13 @@ agents:
     }
 
     #[test]
-    fn parses_delegate_mcp_catalog_opt_in() {
-        let yaml = format!("delegation:\n  mcp_catalogs: true\n{}", minimal_yaml());
+    fn parses_delegate_mcp_catalog_policy() {
+        let yaml = format!(
+            "delegation:\n  mcp_catalogs:\n    - catalog: observability\n      capabilities: [metrics, traces]\n{}",
+            minimal_yaml()
+        );
         let cfg = Config::from_yaml(&yaml).unwrap();
-        assert!(cfg.delegation.mcp_catalogs);
+        assert_eq!(cfg.delegation.mcp_catalogs[0].catalog, "observability");
     }
 
     #[test]
