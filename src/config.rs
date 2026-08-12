@@ -853,6 +853,12 @@ pub struct AgentConfig {
     /// usage caps and cordons this agent's candidates that are exhausted.
     #[serde(default)]
     pub usage_source: Option<UsageSourceConfig>,
+    /// Optional non-interactive provider login probe. Exit zero is positive
+    /// authentication evidence. A non-zero result is negative evidence only
+    /// when its output matches `unauthenticated_patterns`; every other error
+    /// and timeout is unknown (fail open).
+    #[serde(default)]
+    pub auth_probe: Option<AuthProbeConfig>,
     /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
     /// agent name. Orchestration's cross-lineage review compares THIS — the
     /// point is a reviewer whose models come from a **different company** (and
@@ -866,6 +872,33 @@ pub struct AgentConfig {
     /// providers' public API endpoints.
     #[serde(default)]
     pub llm_proxy: Option<AgentLlmProxyConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthProbeConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_auth_probe_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_auth_failure_patterns")]
+    pub unauthenticated_patterns: Vec<String>,
+}
+
+fn default_auth_probe_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_auth_failure_patterns() -> Vec<String> {
+    vec![
+        "not logged in".to_string(),
+        "not signed in".to_string(),
+        "authentication required".to_string(),
+        "sign in".to_string(),
+        "log in".to_string(),
+        "login required".to_string(),
+    ]
 }
 
 fn default_budget() -> u32 {
@@ -1368,6 +1401,12 @@ impl Config {
             for arg in &mut agent.command.args {
                 *arg = expand_tilde_str(arg);
             }
+            if let Some(probe) = &mut agent.auth_probe {
+                probe.command = expand_tilde_str(&probe.command);
+                for arg in &mut probe.args {
+                    *arg = expand_tilde_str(arg);
+                }
+            }
             if let ModelSelectionConfig::SpawnConfig { process_template } =
                 &mut agent.model_selection
             {
@@ -1426,6 +1465,27 @@ impl Config {
                     "agent `{}` declares no models; every agent needs at least one model",
                     agent.name
                 )));
+            }
+            if let Some(probe) = &agent.auth_probe {
+                if probe.command.is_empty() {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: auth_probe.command must not be empty",
+                        agent.name
+                    )));
+                }
+                if probe.timeout_ms == 0 {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: auth_probe.timeout_ms must be >= 1",
+                        agent.name
+                    )));
+                }
+                if probe.unauthenticated_patterns.iter().any(|p| p.is_empty()) {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: auth_probe.unauthenticated_patterns must not contain an \
+                         empty pattern (it would match every output)",
+                        agent.name
+                    )));
+                }
             }
             let mut model_ids = HashSet::new();
             for model in &agent.models {

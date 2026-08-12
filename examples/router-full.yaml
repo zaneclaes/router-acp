@@ -145,6 +145,11 @@ agents:
     budget_prompts_5h: 400
     usage_source:               # proactive cordons from the Anthropic usage API
       type: anthropic-oauth     # (reads the CLI OAuth token; see `cordon` above)
+    auth_probe:                 # a logged-out Claude still advertises every
+      command: claude           # model, so ask the CLI instead of trusting the
+      args: ["auth", "status"]  # advertisement. Unreadable output = fail open.
+      timeout_ms: 3000
+      unauthenticated_patterns: ['"loggedin": false']
     llm_proxy:
       protocol: anthropic
       base_url_env: ANTHROPIC_BASE_URL
@@ -189,6 +194,9 @@ agents:
     budget_prompts_5h: 400
     usage_source:               # proactive cordons from Codex's on-disk snapshot
       type: codex-rollout       # (no pollable endpoint; last-known + reactive backstop)
+    auth_probe:                 # `Not logged in` matches the default patterns
+      command: codex
+      args: ["login", "status"]
     # ChatGPT OAuth endpoint. For API-key auth use
     # `upstream_base_url: https://api.openai.com/v1`.
     llm_proxy:
@@ -219,6 +227,12 @@ agents:
       args: ["agent"]
     lineage: xai
     budget_prompts_5h: 400
+    # `grok models` exits zero either way, so the text is the only signal:
+    # logged out says `You are not authenticated.`
+    auth_probe:
+      command: grok
+      args: ["models"]
+      unauthenticated_patterns: ["not authenticated"]
     # Browser-login/OAuth endpoint. With XAI_API_KEY use GROK_MODELS_BASE_URL
     # and https://api.x.ai/v1 instead.
     llm_proxy:

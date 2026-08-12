@@ -762,6 +762,13 @@ pub async fn evaluate(
             // the router's known failure handling (classify + cordon), then fail
             // over to the next evaluator — exactly as a pinned turn would.
             Err(err) => {
+                if crate::downstream::is_auth_required(&err) {
+                    crate::auth::note_unauthenticated(
+                        &shared.auth,
+                        &candidate.agent,
+                        format!("{} is not signed in", candidate.agent),
+                    );
+                }
                 let class = crate::limits::classify_failure(&err);
                 let human = crate::session::apply_failure(shared, &candidate, &err, &class);
                 tracing::warn!(

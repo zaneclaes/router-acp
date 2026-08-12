@@ -136,38 +136,64 @@ async fn poll_all(
                     crate::usage_cache::cached_anthropic_usage(shared.cfg.cordon.min_refresh_secs)
                         .await;
                 match cached {
-                    Some(payload) => (
-                        anthropic_cordons(&payload, &candidates, SystemTime::now()),
-                        anthropic_availability_with_spend(
-                            &payload,
-                            &candidates,
-                            Some(&spend_lookup),
-                            SystemTime::now(),
-                        ),
-                    ),
-                    None => {
-                        tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
+                    crate::usage_cache::CachedUsage::Success(payload) => {
+                        crate::auth::note_authenticated(&shared.auth, &agent.name);
+                        (
+                            anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                            anthropic_availability_with_spend(
+                                &payload,
+                                &candidates,
+                                Some(&spend_lookup),
+                                SystemTime::now(),
+                            ),
+                        )
+                    }
+                    crate::usage_cache::CachedUsage::AuthRejected(reason) => {
+                        crate::auth::note_unauthenticated(&shared.auth, &agent.name, reason);
                         continue;
+                    }
+                    crate::usage_cache::CachedUsage::Unknown(payload) => {
+                        let Some(payload) = payload else {
+                            tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
+                            continue;
+                        };
+                        (
+                            anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                            anthropic_availability_with_spend(
+                                &payload,
+                                &candidates,
+                                Some(&spend_lookup),
+                                SystemTime::now(),
+                            ),
+                        )
                     }
                 }
             }
             UsageSourceConfig::CodexRollout => {
-                // Live RPC through the shared cache first; the rollout-file
-                // scrape stays as the fallback (an RPC failure or a missing
-                // `codex` binary must not lose the passive signal we had).
-                let mut snapshots = match crate::usage_cache::cached_codex_usage(
-                    shared.cfg.cordon.min_refresh_secs,
-                )
-                .await
-                {
-                    Some(payload) => codex_pools_from_payload(&payload),
-                    None => Vec::new(),
+                let cached =
+                    crate::usage_cache::cached_codex_usage(shared.cfg.cordon.min_refresh_secs)
+                        .await;
+                let mut snapshots = match cached {
+                    crate::usage_cache::CachedUsage::Success(payload) => {
+                        crate::auth::note_authenticated(&shared.auth, &agent.name);
+                        codex_pools_from_payload(&payload)
+                    }
+                    crate::usage_cache::CachedUsage::AuthRejected(reason) => {
+                        crate::auth::note_unauthenticated(&shared.auth, &agent.name, reason);
+                        continue;
+                    }
+                    crate::usage_cache::CachedUsage::Unknown(payload) => payload
+                        .as_ref()
+                        .map(codex_pools_from_payload)
+                        .unwrap_or_default(),
                 };
+                // The passive rollout fallback carries quota data but is not
+                // fresh authentication evidence.
                 if snapshots.is_empty() {
                     snapshots = latest_codex_rate_limits();
                 }
                 if snapshots.is_empty() {
-                    tracing::debug!(agent = %agent.name, "no codex rate-limit snapshot; failing open");
+                    tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
                     continue;
                 }
                 (
@@ -1778,9 +1804,10 @@ mod tests {
         })];
         let c = codex_cordons(&rl, &codex_cands(), now);
         assert_eq!(c.len(), 2, "plan+member exhausted must cordon: {c:?}");
-        assert!(c.values().all(|v| {
-            v.reason.contains("member") || v.reason.contains("weekly")
-        }));
+        assert!(
+            c.values()
+                .all(|v| { v.reason.contains("member") || v.reason.contains("weekly") })
+        );
     }
 
     #[test]

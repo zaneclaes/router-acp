@@ -859,6 +859,7 @@ pub async fn run_delegate_task(
         .acquire()
         .await
         .map_err(|_| "router shutting down".to_string())?;
+    crate::auth::refresh_before_selection(shared).await;
 
     let (pin, cwd, dirs, client_mcp, delegate_mcp_catalogs, strategy) = shared
         .with_session(router_sid, |s| {
@@ -1276,6 +1277,13 @@ pub async fn run_delegate_task(
             }
             Err(err) => {
                 tracing::warn!(candidate = %candidate, error = %err, "delegate candidate failed");
+                if crate::downstream::is_auth_required(&err) {
+                    crate::auth::note_unauthenticated(
+                        &shared.auth,
+                        &candidate.agent,
+                        format!("{} is not signed in", candidate.agent),
+                    );
+                }
                 let class = crate::limits::classify_failure(&err);
                 let human = crate::session::apply_failure(shared, &candidate, &err, &class);
                 crate::session::notify_user(
