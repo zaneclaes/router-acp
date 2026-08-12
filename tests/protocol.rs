@@ -4455,7 +4455,9 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
         let sess = new_session(&cx).await?;
         let opts = serde_json::to_string(&sess.config_options).unwrap();
         assert!(
-            opts.contains("\"available\":false") && opts.contains("Weekly Fable limit reached") && opts.contains("\"capabilities\":{\"effort\""),
+            opts.contains("\"available\":false")
+                && opts.contains("Weekly Fable limit reached")
+                && opts.contains("\"capabilities\":{\"effort\""),
             "cordoned candidate advertised unavailable: {opts}"
         );
 
@@ -5183,7 +5185,10 @@ async fn preclass_false_positive_list_does_not_orchestrate() {
             .iter()
             .position(|event| event["event"] == "prompt")
             .expect("evaluator prompt");
-        assert!(set_mode < prompt, "safe mode must precede evaluator prompt: {events:?}");
+        assert!(
+            set_mode < prompt,
+            "safe mode must precede evaluator prompt: {events:?}"
+        );
         Ok(())
     })
     .await;
@@ -5224,6 +5229,50 @@ async fn preclass_mode_less_evaluator_runs_without_set_mode() {
         assert!(
             !events.iter().any(|event| event["event"] == "set_mode"),
             "mode-less evaluator must not receive set_mode: {events:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preclass_modal_provider_without_preclass_mapping_still_routes_alone() {
+    // A provider can independently authenticate and still advertise modes that
+    // do not include a known read-only/preclass equivalent. That must not make
+    // the whole router unusable when it is the only connected company (the
+    // observed Grok case). The evaluator remains tool-less and its existing
+    // tool/callback guard is the safety boundary.
+    let state = temp_state_file("preclass-modal-standalone");
+    let log = temp_log("preclass-modal-standalone");
+    let preclass_json = r#"{"routing":{"task_class":"Ops","complexity":0.1,"confidence":0.9,"reason":"single-provider routing"}}"#;
+    let agent = agent_yaml(
+        "standalone",
+        &[("only-model", 1)],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_PRECLASS_JSON", preclass_json),
+        ],
+    )
+    .replace(
+        "        - { name: MOCK_SESSION_MODES, value: preclass }\n",
+        "        - { name: MOCK_SESSION_MODES, value: default,interactive }\n",
+    )
+    .replace("    mode_map: { preclass: preclass }\n", "");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*only-model*\"]\nagents:\n{}",
+        state.display(),
+        agent
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(&cx, &sid, "inspect this").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let events = read_log(&log);
+        assert!(events.iter().any(|event| event["event"] == "prompt"));
+        assert!(
+            !events.iter().any(|event| event["event"] == "set_mode"),
+            "no unavailable preclass mode may block the sole provider: {events:?}"
         );
         Ok(())
     })
@@ -5379,7 +5428,9 @@ async fn preclass_preferred_evaluator_beats_grok_fallback() {
             "preferred Codex evaluator must run"
         );
         assert!(
-            codex_events.iter().any(|event| event["event"] == "set_mode"),
+            codex_events
+                .iter()
+                .any(|event| event["event"] == "set_mode"),
             "preferred Codex evaluator must enter its explicit preclass mode"
         );
         assert!(
@@ -5408,7 +5459,8 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
     .replace("    mode_map: { preclass: preclass }\n", "");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\npre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
-        state.display(), agent
+        state.display(),
+        agent
     );
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
@@ -5416,7 +5468,9 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
         let err = prompt_text(&cx, &sid, "classify this").await.unwrap_err();
         assert!(format!("{err}").contains("could not classify"));
         assert!(
-            !read_log(&log).iter().any(|event| event["event"] == "prompt"),
+            !read_log(&log)
+                .iter()
+                .any(|event| event["event"] == "prompt"),
             "no classifier prompt may be sent without mode_map.preclass"
         );
         Ok(())
@@ -5450,7 +5504,9 @@ async fn preclass_tool_attempt_is_cancelled_and_fails_over() {
         let response = prompt_text(&cx, &sid, "fix it").await?;
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
-            read_log(&bad_log).iter().any(|event| event["event"] == "cancel"),
+            read_log(&bad_log)
+                .iter()
+                .any(|event| event["event"] == "cancel"),
             "tool attempt must cancel the evaluator"
         );
         assert!(
@@ -5566,7 +5622,14 @@ async fn preclass_fails_over_to_next_evaluator() {
          agents:\n{}{}",
         state.display(),
         // opus ranks first for the evaluator pool but errors its prompt turn.
-        agent_yaml("a", &[("opus", 3)], &[("MOCK_FAIL_PROMPT_MSG", "rate limit exceeded; retry after 30s")]),
+        agent_yaml(
+            "a",
+            &[("opus", 3)],
+            &[(
+                "MOCK_FAIL_PROMPT_MSG",
+                "rate limit exceeded; retry after 30s"
+            )]
+        ),
         // haiku is the fallback evaluator and returns a real classification.
         agent_yaml("b", &[("haiku", 1)], &[("MOCK_PRECLASS_JSON", good)]),
     );
@@ -5643,7 +5706,10 @@ async fn preclass_widens_after_preferred_pool_exhausted() {
         agent_yaml(
             "a",
             &[("haiku", 1)],
-            &[("MOCK_FAIL_PROMPT_MSG", "rate limit exceeded; retry after 30s")]
+            &[(
+                "MOCK_FAIL_PROMPT_MSG",
+                "rate limit exceeded; retry after 30s"
+            )]
         ),
         agent_yaml("b", &[("grok", 2)], &[("MOCK_PRECLASS_JSON", good)]),
     );

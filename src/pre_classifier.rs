@@ -1026,9 +1026,13 @@ fn strip_mock_echo(raw: &str) -> String {
 }
 
 /// Spawn the evaluator process if needed and open a tool-less session on it.
-/// Agents that advertise session modes must have an explicit
-/// `mode_map.preclass` safe mode. Agents that advertise no modes have no
-/// permission gate to arm and proceed without a `set_mode` request.
+/// When configured, `mode_map.preclass` selects an explicit tool-safe mode.
+/// It is an optional hardening layer, not an eligibility requirement: an ACP
+/// adapter may advertise modes without exposing a comparable read-only mode
+/// (or change its mode list across releases). In that case the evaluator still
+/// runs tool-less and its callback/tool-use guard is the safety boundary. This
+/// keeps every independently authenticated provider usable as the sole router
+/// candidate.
 /// Caller owns closing the returned session.
 async fn open_evaluator_session(
     shared: &Arc<Shared>,
@@ -1087,10 +1091,13 @@ async fn open_evaluator_session(
             .filter(|mode| available_modes.iter().any(|available| available == *mode))
             .cloned();
         let Some(mode_id) = mode_id else {
-            close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-            return Err(format!(
-                "no advertised mode_map.preclass target; modes={available_modes:?}"
-            ));
+            tracing::info!(
+                session = router_sid,
+                candidate = %candidate,
+                modes = ?available_modes,
+                "pre-class evaluator has no configured safe mode; proceeding tool-less"
+            );
+            return Ok(opened);
         };
         let set = SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
         if let Err(err) = opened.conn.send_request(set).block_task().await {
