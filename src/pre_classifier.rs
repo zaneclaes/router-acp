@@ -9,6 +9,7 @@
 //! the session has zero eligible models of any kind.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -119,6 +120,32 @@ pub struct OrchestrateDecision {
 
 fn default_parts() -> usize {
     1
+}
+
+/// The workspace the evaluator's throwaway session should open with: the host's
+/// nominated classification directory when configured, else the classified
+/// session's own.
+///
+/// The evaluator classifies the prompt text, not the project, and its session is
+/// opened tool-less — but cwd is how every agent finds its project context, so
+/// without this it loads that context anyway and the host pays a second full
+/// startup per session. `additional_directories` goes with the cwd: nominating a
+/// classification directory means "not the project", and leaving the extra
+/// directories attached would re-admit part of what was just excluded.
+///
+/// Pure — no I/O, and it does not check that the directory exists. A bad path is
+/// the host's error to see: it surfaces as a `session/new` failure, which the
+/// evaluator walk already reports and fails over on, rather than being silently
+/// swapped for a fallback that quietly restores the cost this exists to avoid.
+pub(crate) fn evaluator_workspace(
+    cfg: &PreClassifierConfig,
+    session_cwd: PathBuf,
+    session_dirs: Vec<PathBuf>,
+) -> (PathBuf, Vec<PathBuf>) {
+    match cfg.evaluator_cwd.as_ref() {
+        Some(dir) => (dir.clone(), Vec::new()),
+        None => (session_cwd, session_dirs),
+    }
 }
 
 /// Whether auto pre-class should run for this prompt.
@@ -678,6 +705,8 @@ pub async fn evaluate(
             std::env::temp_dir(),
             Vec::new(),
         ));
+
+    let (cwd, dirs) = evaluator_workspace(pcfg, cwd, dirs);
 
     let mut attempts: Vec<String> = Vec::new();
     let mut last_fail: Option<PreClassResult> = None;
@@ -1248,8 +1277,77 @@ agents:
             disclose: true,
             orchestrate_min_confidence: 0.65,
             dimensions: dims,
+            evaluator_cwd: None,
         };
         cfg
+    }
+
+    #[test]
+    fn evaluator_workspace_defaults_to_the_classified_session_cwd() {
+        let cfg = cfg_with_dims(vec![]);
+        assert!(cfg.pre_classifier.evaluator_cwd.is_none());
+        let (cwd, dirs) = evaluator_workspace(
+            &cfg.pre_classifier,
+            PathBuf::from("/repo"),
+            vec![PathBuf::from("/extra")],
+        );
+        // Unset must not change behavior for hosts that never configure it.
+        assert_eq!(cwd, PathBuf::from("/repo"));
+        assert_eq!(dirs, vec![PathBuf::from("/extra")]);
+    }
+
+    #[test]
+    fn evaluator_workspace_replaces_cwd_and_drops_extra_dirs() {
+        let mut cfg = cfg_with_dims(vec![]);
+        cfg.pre_classifier.evaluator_cwd = Some(PathBuf::from("/classify-here"));
+        let (cwd, dirs) = evaluator_workspace(
+            &cfg.pre_classifier,
+            PathBuf::from("/repo"),
+            vec![PathBuf::from("/extra")],
+        );
+        assert_eq!(cwd, PathBuf::from("/classify-here"));
+        // The extra directories must go with the cwd: nominating a
+        // classification directory means "not the project", and leaving these
+        // attached would re-admit part of what was just excluded.
+        assert!(dirs.is_empty(), "additional_directories must be dropped");
+    }
+
+    #[test]
+    fn evaluator_cwd_parses_from_yaml_and_is_optional() {
+        // Config carries deny_unknown_fields, so a host on an older binary must
+        // not see this key — but a host on this one must be able to set it, and
+        // omitting it must still load.
+        let with = Config::from_yaml(
+            r#"
+agents:
+  - name: a
+    command: { type: stdio, command: mock-agent }
+    model_selection: { type: config-option }
+    models: [{ id: m1, display_name: M1, cost_rank: 1 }]
+pre_classifier:
+  enabled: true
+  evaluator_cwd: /var/lib/router-acp/classify
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with.pre_classifier.evaluator_cwd,
+            Some(PathBuf::from("/var/lib/router-acp/classify"))
+        );
+
+        let without = Config::from_yaml(
+            r#"
+agents:
+  - name: a
+    command: { type: stdio, command: mock-agent }
+    model_selection: { type: config-option }
+    models: [{ id: m1, display_name: M1, cost_rank: 1 }]
+pre_classifier:
+  enabled: true
+"#,
+        )
+        .unwrap();
+        assert!(without.pre_classifier.evaluator_cwd.is_none());
     }
 
     #[test]

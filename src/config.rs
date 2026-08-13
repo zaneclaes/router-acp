@@ -669,6 +669,29 @@ pub struct PreClassifierConfig {
     /// Host extensions (e.g. `ui_planning`). One evaluator call covers all.
     #[serde(default)]
     pub dimensions: Vec<PreClassDimension>,
+    /// Working directory for the evaluator's throwaway session, replacing the
+    /// classified session's own cwd. Also drops `additional_directories`.
+    ///
+    /// The classifier reads the user's prompt text and returns JSON, and its
+    /// session is already opened tool-less, so it has no reason to load the
+    /// project's agent context — but cwd is what every agent uses to find that
+    /// context, so it loads anyway and the host pays a second full startup per
+    /// session. Measured on a Claude host against a large repo: 38,026 input
+    /// tokens for one classification at the repo cwd (its `CLAUDE.md`/
+    /// `AGENTS.md`, a 59-entry skills catalog, `.mcp.json`) versus 20,917 at a
+    /// directory holding only a settings file — 17,109 tokens to classify a
+    /// prompt the repo has no bearing on.
+    ///
+    /// Point this at a small host-owned directory rather than an empty one:
+    /// agent context is not the only thing cwd governs, and on a Claude host
+    /// the project settings there are also what suppress unused built-in tool
+    /// schemas (worth ~14k tokens by itself). An empty temp dir strips the
+    /// context AND that suppression, which nets almost nothing.
+    ///
+    /// Unset (default) keeps the previous behavior of classifying from the
+    /// session's own cwd.
+    #[serde(default)]
+    pub evaluator_cwd: Option<PathBuf>,
 }
 
 fn default_preclass_evaluator() -> Vec<String> {
@@ -705,6 +728,7 @@ impl Default for PreClassifierConfig {
             disclose: true,
             orchestrate_min_confidence: default_orchestrate_min_confidence(),
             dimensions: Vec::new(),
+            evaluator_cwd: None,
         }
     }
 }
