@@ -3141,9 +3141,11 @@ async fn skill_routing_terse_handoff_sends_brief_instruction() {
 /// skill's own `candidates` — because demotion picks the globally
 /// highest-quality cheaper candidate with no awareness of the skill pool
 /// that elevated the pin. `b` here plays that role: cheaper than the current
-/// pin, outside the skill's `["*a*", "*c*"]` pool, and scored HIGHER than
-/// every in-pool alternative, so an unrestricted demotion always prefers it.
-/// The fix must land the demotion on `c` (in-pool) instead.
+/// pin, outside the skill's `["*a*", "*c*"]` target pool, and scored HIGHER
+/// than every in-pool alternative, so an unrestricted demotion always prefers
+/// it. `d` is cheaper still and has the highest score, but belongs only to
+/// `also_acceptable`, whose contract says it is never a switch target. The fix
+/// must land the demotion on `c` (in-pool) instead of either one.
 #[tokio::test]
 async fn demotion_of_a_skill_elevated_pin_stays_inside_the_skill_pool() {
     let state = temp_state_file("skill-demote-pool");
@@ -3152,12 +3154,14 @@ async fn demotion_of_a_skill_elevated_pin_stays_inside_the_skill_pool() {
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\ndemotion: {{ after_quiet_turns: 1 }}\n\
          skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*a*\", \"*c*\"]\n\
-         agents:\n{}{}{}",
+         \x20   also_acceptable: [\"*d*\"]\n\
+         agents:\n{}{}{}{}",
         state.display(),
         scores.display(),
         agent_yaml("a", &[("m1", 5)], &[]), // current pin: expensive, low quality
         agent_yaml("b", &[("m2", 4)], &[]), // OUTSIDE the skill pool, highest quality
         agent_yaml("c", &[("m3", 3)], &[]), // in-pool, cheapest
+        agent_yaml("d", &[("m4", 2)], &[]), // acceptable to stay on, never a target
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
@@ -3179,6 +3183,10 @@ async fn demotion_of_a_skill_elevated_pin_stays_inside_the_skill_pool() {
             !text.contains("→ b/m2"),
             "demotion must not pick the highest-quality candidate outside the skill pool: {text}"
         );
+        assert!(
+            !text.contains("→ d/m4"),
+            "demotion must not turn also_acceptable into a switch target: {text}"
+        );
         Ok(())
     })
     .await;
@@ -3193,6 +3201,7 @@ fn skill_pool_demotion_scores(tag: &str) -> PathBuf {
         &p,
         "version: 1\ncandidates:\n\
          \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
+         \x20 - { pattern: \"d/*\", default_quality: 0.95 }\n\
          \x20 - { pattern: \"c/*\", default_quality: 0.60 }\n\
          \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
     )

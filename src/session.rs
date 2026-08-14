@@ -4610,8 +4610,8 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
 /// quality (minus current struggle) must clear the upgrade threshold.
 ///
 /// When the expiring elevation is a skill route (`elevation_skill`), the
-/// pool is further restricted to that route's own `candidates ∪
-/// also_acceptable` — otherwise demotion picks by raw cost/quality alone,
+/// pool is further restricted to that route's own `candidates` — otherwise
+/// demotion picks by raw cost/quality alone,
 /// which can land OUTSIDE the skill's approved pool (e.g. `ship-pr` pins
 /// `grok` but demotion, unaware of that contract, switched a live ship to
 /// `codex/gpt-5.6-terra` because it scored higher than grok at lower cost).
@@ -4645,7 +4645,6 @@ fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId
             route
                 .candidates
                 .iter()
-                .chain(route.also_acceptable.iter())
                 .any(|rc| candidate_matches(rc, &v.id))
         });
     }

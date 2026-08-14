@@ -468,11 +468,11 @@ Three ways it happens:
    the quietest turns there are, so this fires readily. Two rules keep that
    from fighting the route: re-invoking the skill re-arms the clock even when
    the pin already complies (it is a restatement of the verdict, not a no-op),
-   and the demotion target is drawn from the route's own
-   `candidates ∪ also_acceptable` rather than from everything cheaper — so an
-   expiring ship verdict can step down within the ship pool but never lands on
-   a model the route excluded. If nothing in the pool is cheaper than the pin,
-   the session simply stays put.
+   and the demotion target is drawn from the route's `candidates` rather than
+   from everything cheaper — so an expiring ship verdict can step down within
+   the ship target pool but never lands on a model the route excluded or one
+   declared only `also_acceptable`. If no candidate target is cheaper than the
+   pin, the session simply stays put.
 
 All three degrade gracefully: if the target is unavailable the session stays
 put with a visible note. Each switch is recorded in the state file with its
