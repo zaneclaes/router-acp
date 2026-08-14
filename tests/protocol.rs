@@ -3136,6 +3136,128 @@ async fn skill_routing_terse_handoff_sends_brief_instruction() {
     .await;
 }
 
+/// Live bug (Kory Code session `cda39082…`, PR #7328): a mid-flight
+/// `/ship-pr` demoted the session to `codex/gpt-5.6-terra` — outside the
+/// skill's own `candidates` — because demotion picks the globally
+/// highest-quality cheaper candidate with no awareness of the skill pool
+/// that elevated the pin. `b` here plays that role: cheaper than the current
+/// pin, outside the skill's `["*a*", "*c*"]` pool, and scored HIGHER than
+/// every in-pool alternative, so an unrestricted demotion always prefers it.
+/// The fix must land the demotion on `c` (in-pool) instead.
+#[tokio::test]
+async fn demotion_of_a_skill_elevated_pin_stays_inside_the_skill_pool() {
+    let state = temp_state_file("skill-demote-pool");
+    let scores = skill_pool_demotion_scores("skill-demote-pool");
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ndemotion: {{ after_quiet_turns: 1 }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*a*\", \"*c*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m1", 5)], &[]), // current pin: expensive, low quality
+        agent_yaml("b", &[("m2", 4)], &[]), // OUTSIDE the skill pool, highest quality
+        agent_yaml("c", &[("m3", 3)], &[]), // in-pool, cheapest
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+        // ship-pr elevates (a/m1 already matches the skill pool, so this is
+        // the "already_ok" path, not a switch). `after_quiet_turns: 1` means
+        // this very turn's own (unstruggled) completion already satisfies
+        // the clock, queuing the demotion for the next prompt.
+        prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        let resp = prompt_text(&cx, &sid, "poll status").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → c/m3"),
+            "demotion must land inside the skill's own candidate pool: {text}"
+        );
+        assert!(
+            !text.contains("→ b/m2"),
+            "demotion must not pick the highest-quality candidate outside the skill pool: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+fn skill_pool_demotion_scores(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "router-acp-skillpoolscores-{tag}-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &p,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
+         \x20 - { pattern: \"c/*\", default_quality: 0.60 }\n\
+         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+    )
+    .unwrap();
+    p
+}
+
+/// Live bug companion: re-invoking `ship-pr` on an already-compliant pin was
+/// a complete no-op, so the demotion clock kept counting from the FIRST
+/// invocation — a second `/ship-pr` mid-flow did nothing to stop an elevated
+/// pin expiring under it. Re-invocation must reset the quiet-turn clock.
+#[tokio::test]
+async fn skill_reinvocation_rearms_the_demotion_clock() {
+    let state = temp_state_file("skill-rearm");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ndemotion: {{ after_quiet_turns: 3 }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    selection: first-match\n\
+         \x20   candidates: [\"*a*\", \"*c*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 2)], &[]),
+        agent_yaml("b", &[("m2", 3)], &[]), // starting pin, outside the skill pool
+        agent_yaml("c", &[("m3", 1)], &[]), // in-pool demotion target
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Start outside the skill pool, so the FIRST ship-pr is a real steer
+        // (the path that sets the elevation), matching the live session.
+        prompt_text(&cx, &sid, "[router: candidate=b/m2]\nwarm up").await?;
+        // T2: ship-pr switches to a/m1 and elevates. The clock starts at 0,
+        // but this turn's own (unstruggled) completion already ticks it to 1.
+        prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        // T3: a quiet turn — clock at 2.
+        prompt_text(&cx, &sid, "CI is still running").await?;
+        // T4: re-invoke ship-pr. Without the fix this is a no-op and the
+        // clock (already at 2) ticks to 3 at THIS turn's own completion —
+        // one turn early. With the fix it re-arms to 0, then ticks to 1.
+        prompt_text(&cx, &sid, "please run ship-pr on this branch again").await?;
+        // T5: clock at 2 (with the fix) / already demoted (without it).
+        prompt_text(&cx, &sid, "still waiting on CI").await?;
+        // T6: clock at 3 (with the fix) — demotion queues at THIS turn's
+        // completion, to fire on the next prompt.
+        let r6 = prompt_text(&cx, &sid, "checking again").await?;
+        assert_eq!(r6.stop_reason, StopReason::EndTurn);
+        let text_by_t6 = agent_text(&observed, &sid);
+        assert!(
+            !text_by_t6.contains("switched a/m1"),
+            "re-invocation must reset the quiet-turn clock, not no-op \
+             (a broken clock would have already demoted by now): {text_by_t6}"
+        );
+        // T7: the queued demotion fires before forwarding this prompt.
+        let r7 = prompt_text(&cx, &sid, "one more poll").await?;
+        assert_eq!(r7.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched a/m1 → c/m3"),
+            "demotion fires on schedule from the re-armed clock: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// A pin that becomes usage-cordoned mid-session is proactively switched off
 /// even when the prompt does not invoke a skill (no waiting for a rate-limit
 /// error to trip reactive failover).

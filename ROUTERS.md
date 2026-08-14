@@ -461,6 +461,19 @@ Three ways it happens:
    needed, the briefing carries a runnable `router-acp transcript` command for
    the full prior log (see below).
 
+   **The elevation a skill route creates is bounded by `demotion`, and stays
+   inside the route's own pool.** A skill pin is an *elevation* like an
+   escalation or an auto-upgrade, so `demotion.after_quiet_turns` expires it
+   after a run of turns with no struggle signals — a ship flow's CI polls are
+   the quietest turns there are, so this fires readily. Two rules keep that
+   from fighting the route: re-invoking the skill re-arms the clock even when
+   the pin already complies (it is a restatement of the verdict, not a no-op),
+   and the demotion target is drawn from the route's own
+   `candidates ∪ also_acceptable` rather than from everything cheaper — so an
+   expiring ship verdict can step down within the ship pool but never lands on
+   a model the route excluded. If nothing in the pool is cheaper than the pin,
+   the session simply stays put.
+
 All three degrade gracefully: if the target is unavailable the session stays
 put with a visible note. Each switch is recorded in the state file with its
 `from`, `to`, and reason.

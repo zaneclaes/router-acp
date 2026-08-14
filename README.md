@@ -537,7 +537,9 @@ is failing) still completes without the dead model's help. Three triggers:
   `/name` or a standalone token) and the pinned model is in neither the skill's
   `candidates` nor its `also_acceptable` globs, the session switches to the best
   available `candidates` match (pre-pin it steers the initial routing). A pin
-  listed in `also_acceptable` is left alone but is never a switch target. See
+  listed in `also_acceptable` is left alone but is never a switch target.
+  Re-invoking the skill re-arms the demotion clock, and when `demotion` does
+  expire a skill pin it steps down within that skill's own globs. See
   [`ROUTERS.md`](ROUTERS.md) for the full model.
 
 ## In-session delegation
