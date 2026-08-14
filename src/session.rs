@@ -293,6 +293,12 @@ pub struct RouterSession {
     /// un-elevated pin. Explicit user picks never set this. Demotion
     /// (`demotion.after_quiet_turns`) only ever expires elevated pins.
     pub elevation: Option<String>,
+    /// The `skill_routing` pattern behind the current elevation, when a skill
+    /// route is what elevated the pin. Demotion consults it so an expiring
+    /// verdict lands inside the skill's own pool instead of anywhere cheaper —
+    /// `elevation` alone is prose, and parsing the pattern back out of it is
+    /// not a contract. Cleared whenever `elevation` is set by anything else.
+    pub elevation_skill: Option<String>,
     /// Consecutive turns without struggle signals since the last elevation —
     /// the demotion clock (reset by any struggle).
     pub quiet_turns: u32,
@@ -384,6 +390,7 @@ impl RouterSession {
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             elevation: None,
+            elevation_skill: None,
             quiet_turns: 0,
             saw_adapter_cost: false,
         }
@@ -440,6 +447,7 @@ impl RouterSession {
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             elevation: None,
+            elevation_skill: None,
             quiet_turns: 0,
             saw_adapter_cost: false,
         }
@@ -3674,6 +3682,7 @@ async fn send_prompt_with_failover(
             shared.with_session(&router_sid, |s| {
                 s.escalations_done += 1;
                 s.elevation = Some("escalation".to_string());
+                s.elevation_skill = None;
                 s.quiet_turns = 0;
             });
             match switch_pin(&shared, &router_sid, &esc.target, &esc.reason, esc.handoff).await {
@@ -4599,9 +4608,16 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
 /// the demotion target. Guarded so the landing spot won't immediately
 /// re-trigger an auto-upgrade: when auto-upgrade is enabled, the target's
 /// quality (minus current struggle) must clear the upgrade threshold.
+///
+/// When the expiring elevation is a skill route (`elevation_skill`), the
+/// pool is further restricted to that route's own `candidates` — otherwise
+/// demotion picks by raw cost/quality alone,
+/// which can land OUTSIDE the skill's approved pool (e.g. `ship-pr` pins
+/// `grok` but demotion, unaware of that contract, switched a live ship to
+/// `codex/gpt-5.6-terra` because it scored higher than grok at lower cost).
 fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
-    let (class, complexity, current, excluded, struggle, strategy) =
-        shared.with_session(router_sid, |s| {
+    let (class, complexity, current, excluded, struggle, strategy, elevation_skill) = shared
+        .with_session(router_sid, |s| {
             (
                 s.task_class.unwrap_or(TaskClass::CodingGeneral),
                 s.task_complexity,
@@ -4609,6 +4625,7 @@ fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId
                 s.excluded.clone(),
                 s.struggle,
                 s.strategy,
+                s.elevation_skill.clone(),
             )
         })?;
     let current = current?;
@@ -4617,6 +4634,20 @@ fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId
     pool.retain(|v| {
         v.id != current && !is_excluded(&v.id, &excluded) && v.cost_rank < current_cost
     });
+    if let Some(pattern) = elevation_skill.as_deref()
+        && let Some(route) = shared
+            .cfg
+            .skill_routing
+            .iter()
+            .find(|r| r.pattern == pattern)
+    {
+        pool.retain(|v| {
+            route
+                .candidates
+                .iter()
+                .any(|rc| candidate_matches(rc, &v.id))
+        });
+    }
     // Escalation sessions re-escalate only on fresh struggle signals, so a
     // quiet-turn demotion can't ping-pong there; the threshold guard applies
     // only where the confidence-based auto-upgrade could immediately undo
@@ -4676,6 +4707,7 @@ fn maybe_demote(shared: &Arc<Shared>, router_sid: &str) {
             handoff: HandoffStyle::Full,
         });
         s.elevation = None;
+        s.elevation_skill = None;
         s.quiet_turns = 0;
     });
     notify_user(
@@ -4765,6 +4797,7 @@ fn update_confidence_and_maybe_upgrade(
                 handoff: HandoffStyle::Full,
             });
             s.elevation = Some("auto-upgrade".to_string());
+            s.elevation_skill = None;
             s.quiet_turns = 0;
         });
         notify_user(
@@ -4830,6 +4863,7 @@ fn escalation_post_turn(
         });
         s.escalations_done += 1;
         s.elevation = Some("escalation".to_string());
+        s.elevation_skill = None;
         s.quiet_turns = 0;
     });
     notify_user(
@@ -6440,7 +6474,19 @@ async fn dispatch_prompt(
                     .iter()
                     .any(|v| &v.id == c)
         });
-        if !already_ok {
+        if already_ok {
+            // Re-invoking the skill on an already-compliant pin is an
+            // explicit restatement of the verdict, not a no-op: without this,
+            // the demotion clock kept counting from the FIRST invocation, so
+            // a second `/ship-pr` mid-flow did nothing to stop an elevated
+            // pin expiring under it.
+            let pattern = route.pattern.clone();
+            shared.with_session(&router_sid, |s| {
+                s.elevation = Some(format!("skill `{pattern}`"));
+                s.elevation_skill = Some(pattern.clone());
+                s.quiet_turns = 0;
+            });
+        } else {
             match select_route_target(&shared, route, class, &excluded) {
                 Some(target) => {
                     let pattern = route.pattern.clone();
@@ -6452,7 +6498,11 @@ async fn dispatch_prompt(
                     // No-op if somehow already on the picked target (e.g. pin
                     // was outside the skill set but equal by coincidence).
                     if current.as_ref() == Some(&target) {
-                        // leave pin alone
+                        shared.with_session(&router_sid, |s| {
+                            s.elevation = Some(format!("skill `{pattern}`"));
+                            s.elevation_skill = Some(pattern.clone());
+                            s.quiet_turns = 0;
+                        });
                     } else if current.is_some() {
                         shared.with_session(&router_sid, |s| {
                             s.pending_switch = Some(SwitchRequest {
@@ -6463,6 +6513,7 @@ async fn dispatch_prompt(
                                 handoff,
                             });
                             s.elevation = Some(format!("skill `{pattern}`"));
+                            s.elevation_skill = Some(pattern.clone());
                             s.quiet_turns = 0;
                         });
                         tracing::info!(session = router_sid, skill = %pattern, %target, "skill switch queued");
@@ -6472,6 +6523,7 @@ async fn dispatch_prompt(
                             s.candidate_override_source =
                                 Some(OverrideSource::Skill(pattern.clone()));
                             s.elevation = Some(format!("skill `{pattern}`"));
+                            s.elevation_skill = Some(pattern.clone());
                             s.quiet_turns = 0;
                         });
                         notify_user(
