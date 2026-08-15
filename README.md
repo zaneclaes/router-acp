@@ -591,6 +591,9 @@ seeds `delegate_mcp_catalogs` once at session creation, so the same
 notification ever arrives. It's an additive fallback only: absent or
 malformed content fails open to no catalogs (same as today when nothing
 registers), and a later live notification still overwrites the seed as usual.
+When a required catalog is selected, its host-supplied entry replaces any
+same-named server forwarded by the client; the catalog registration is the
+authoritative definition for that capability.
 
 `delegation.inject_prompt: true` also prepends a one-shot directive to each
 ordinary downstream session that actually received those tools. It asks the

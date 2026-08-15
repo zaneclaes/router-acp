@@ -3402,11 +3402,7 @@ fn mcp_servers_for_pin(
         .map_err(|reason| AcpError::invalid_params().data(reason))?;
     for name in names {
         if let Some(entries) = catalogs.get(&name) {
-            for entry in entries {
-                if !servers.contains(entry) {
-                    servers.push(entry.clone());
-                }
-            }
+            merge_catalog_entries(&mut servers, entries);
         }
     }
     let mut delegate_attached = false;
@@ -3415,6 +3411,31 @@ fn mcp_servers_for_pin(
         delegate_attached = true;
     }
     Ok((servers, delegate_attached))
+}
+
+fn mcp_server_name(server: &McpServer) -> Option<&str> {
+    match server {
+        McpServer::Http(server) => Some(&server.name),
+        McpServer::Sse(server) => Some(&server.name),
+        McpServer::Stdio(server) => Some(&server.name),
+        _ => None,
+    }
+}
+
+/// A host-selected catalog entry is authoritative over a same-named client
+/// entry. Some clients transform their native MCP config while forwarding it
+/// through ACP (notably header interpolation), so retaining the client copy
+/// first can leave the downstream adapter starting a stale or unauthenticated
+/// definition even though the host supplied a valid catalog entry.
+fn merge_catalog_entries(servers: &mut Vec<McpServer>, entries: &[McpServer]) {
+    for entry in entries {
+        if let Some(name) = mcp_server_name(entry) {
+            servers.retain(|server| mcp_server_name(server) != Some(name));
+        } else if servers.contains(entry) {
+            continue;
+        }
+        servers.push(entry.clone());
+    }
 }
 
 /// Host-supplied seed for `delegate_mcp_catalogs`, in the same shape as the
@@ -3484,9 +3505,9 @@ pub(crate) fn resolve_mcp_catalogs(
 
 #[cfg(test)]
 mod mcp_catalog_tests {
-    use super::{parse_seeded_mcp_catalogs, resolve_mcp_catalogs};
+    use super::{merge_catalog_entries, parse_seeded_mcp_catalogs, resolve_mcp_catalogs};
     use crate::config::{Config, McpCatalogConfig};
-    use agent_client_protocol::schema::v1::McpServer;
+    use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
     use std::collections::HashMap;
 
     #[test]
@@ -3538,6 +3559,24 @@ mod mcp_catalog_tests {
         assert!(parse_seeded_mcp_catalogs(Some("   ")).is_empty());
         assert!(parse_seeded_mcp_catalogs(Some("{not json")).is_empty());
         assert!(parse_seeded_mcp_catalogs(Some(r#"{"telemetry":"nope"}"#)).is_empty());
+    }
+
+    #[test]
+    fn selected_catalog_entry_replaces_same_named_client_copy() {
+        let client = McpServer::Http(
+            McpServerHttp::new("telemetry", "https://example.test/mcp")
+                .headers(vec![HttpHeader::new("Authorization", "stale")]),
+        );
+        let seeded = McpServer::Http(
+            McpServerHttp::new("telemetry", "https://example.test/mcp")
+                .headers(vec![HttpHeader::new("Authorization", "fresh")]),
+        );
+        let unrelated = McpServer::Http(McpServerHttp::new("other", "https://other.test/mcp"));
+        let mut servers = vec![client, unrelated.clone()];
+
+        merge_catalog_entries(&mut servers, std::slice::from_ref(&seeded));
+
+        assert_eq!(servers, vec![unrelated, seeded]);
     }
 
     fn test_config() -> Config {
