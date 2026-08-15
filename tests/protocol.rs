@@ -10,12 +10,12 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthenticateRequest, CancelNotification, CloseSessionRequest, ContentBlock, Error as AcpError,
-    ImageContent, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    StopReason,
+    ImageContent, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Channel, Client as ClientPeer, ConnectionTo, Responder,
@@ -995,8 +995,19 @@ async fn env_seeded_catalogs_pin_a_session_that_never_registers_any() {
     );
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
-        // Today's behavior with no registration and no seed: the pin is refused.
-        let unseeded = new_session(&cx).await?.session_id.0.to_string();
+        // Goose already supplies this server in session/new from its native
+        // extension config. The separate catalog registration is still absent.
+        let client_mcp = McpServer::Stdio(McpServerStdio::new("telemetry-mcp", "/bin/true"));
+        let new_with_client_mcp = || {
+            cx.send_request(
+                NewSessionRequest::new(std::env::temp_dir()).mcp_servers(vec![client_mcp.clone()]),
+            )
+            .block_task()
+        };
+
+        // Today's behavior with client MCP but no registration or seed: the
+        // catalog gate ignores the available server and refuses the pin.
+        let unseeded = new_with_client_mcp().await?.session_id.0.to_string();
         let err = prompt_text(&cx, &unseeded, "check the error rate")
             .await
             .unwrap_err();
@@ -1007,24 +1018,30 @@ async fn env_seeded_catalogs_pin_a_session_that_never_registers_any() {
 
         // Same router process, same client, same absent notification — only the
         // host's env seed differs.
-        unsafe {
-            std::env::set_var(
-                "ROUTER_ACP_MCP_CATALOGS",
-                r#"{"telemetry":[{"type":"stdio","name":"telemetry-mcp","command":"/bin/true","args":[],"env":[]}]}"#,
-            )
-        };
-        let seeded = new_session(&cx).await?.session_id.0.to_string();
+        let seed = serde_json::json!({ "telemetry": [client_mcp] }).to_string();
+        unsafe { std::env::set_var("ROUTER_ACP_MCP_CATALOGS", seed) };
+        let seeded = new_with_client_mcp().await?.session_id.0.to_string();
         prompt_text(&cx, &seeded, "check the error rate").await?;
         unsafe { std::env::remove_var("ROUTER_ACP_MCP_CATALOGS") };
 
         assert!(!open_state(&state).get(&seeded).unwrap().agent.is_empty());
-        let attached = read_log(&log).into_iter().any(|event| {
+        let attached = read_log(&log).into_iter().find(|event| {
             event["event"] == "session_new"
                 && event["mcpServers"]
                     .as_array()
                     .is_some_and(|servers| servers.iter().any(|s| s == "telemetry-mcp"))
         });
-        assert!(attached, "the seeded catalog's server reached the agent");
+        let servers = attached
+            .and_then(|event| event["mcpServers"].as_array().cloned())
+            .expect("the seeded catalog's server reached the agent");
+        assert_eq!(
+            servers
+                .iter()
+                .filter(|server| *server == "telemetry-mcp")
+                .count(),
+            1,
+            "the client and catalog copies are structurally deduplicated"
+        );
         Ok(())
     })
     .await;
