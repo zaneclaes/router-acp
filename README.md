@@ -579,6 +579,10 @@ A later bounded `delegate_task` instead asks for `required_capabilities`; the
 router resolves and attaches them only to that delegate. Unknown capabilities,
 missing catalog registrations, and incomplete coverage fail closed. The router
 never defines capability meanings, endpoints, or credentials.
+When a confidence-qualified host pre-classifier dimension returns
+`required_capabilities`, the router unions those opaque strings into the core
+routing decision. This makes attachment deterministic even when the evaluator
+populates the configured host dimension but omits its duplicate in `routing`.
 
 Some clients never hold a live post-`session/new` connection into the session
 they created — a client that spawns the router as a subprocess only to relay

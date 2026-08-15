@@ -473,7 +473,7 @@ pub fn apply_thresholds(
     let mut dimensions = BTreeMap::new();
     let mut summary_dims = serde_json::Map::new();
 
-    let routing = parsed.get("routing").and_then(parse_routing);
+    let mut routing = parsed.get("routing").and_then(parse_routing);
     if let Some(ref decision) = routing {
         summary_dims.insert(
             "routing".into(),
@@ -542,6 +542,28 @@ pub fn apply_thresholds(
             .get("confidence")
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0);
+        if conf >= dim.min_confidence
+            && let Some(decision) = routing.as_mut()
+            && let Some(capabilities) = val.get("required_capabilities").and_then(Value::as_array)
+        {
+            for capability in capabilities
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if decision.required_capabilities.len() >= 16 {
+                    break;
+                }
+                if !decision
+                    .required_capabilities
+                    .iter()
+                    .any(|existing| existing == capability)
+                {
+                    decision.required_capabilities.push(capability.to_string());
+                }
+            }
+        }
         let acts = conf >= dim.min_confidence && act_when_matches(&dim.act_when, val);
         summary_dims.insert(
             dim.id.clone(),
@@ -567,6 +589,21 @@ pub fn apply_thresholds(
             if !dim.inject_prompt.trim().is_empty() {
                 injects.push(dim.inject_prompt.clone());
             }
+        }
+    }
+
+    if let Some(ref decision) = routing {
+        if let Some(Value::Object(summary)) = summary_dims.get_mut("routing") {
+            summary.insert(
+                "required_capabilities".into(),
+                json!(decision.required_capabilities),
+            );
+        }
+        if !decision.required_capabilities.is_empty() {
+            log.push_str(&format!(
+                "routing capabilities: {}\n",
+                decision.required_capabilities.join(",")
+            ));
         }
     }
 
@@ -1520,6 +1557,53 @@ pre_classifier:
                 .unwrap()
                 .effort,
             Some(EffortLevel::Xhigh)
+        );
+    }
+
+    #[test]
+    fn confidence_qualified_host_dimensions_supply_required_capabilities() {
+        let cfg = cfg_with_dims(vec![
+            PreClassDimension {
+                id: "host_tools".into(),
+                description: "host-defined tools".into(),
+                min_confidence: 0.7,
+                act_when: ActWhen::default(),
+                inject_prompt: String::new(),
+            },
+            PreClassDimension {
+                id: "uncertain_tools".into(),
+                description: "low-confidence tools".into(),
+                min_confidence: 0.7,
+                act_when: ActWhen::default(),
+                inject_prompt: String::new(),
+            },
+        ]);
+        let parsed = json!({
+            "routing": {
+                "task_class": "Ops",
+                "complexity": 0.2,
+                "confidence": 0.9,
+                "required_capabilities": ["metrics"]
+            },
+            "host_tools": {
+                "confidence": 0.9,
+                "required_capabilities": ["metrics", "monitors"]
+            },
+            "uncertain_tools": {
+                "confidence": 0.6,
+                "required_capabilities": ["ledgers"]
+            }
+        });
+
+        let result = apply_thresholds(&cfg, &parsed, Some("a/m1"), 1, "");
+
+        assert_eq!(
+            result.routing.unwrap().required_capabilities,
+            ["metrics", "monitors"]
+        );
+        assert_eq!(
+            result.summary["dimensions"]["routing"]["required_capabilities"],
+            json!(["metrics", "monitors"])
         );
     }
 
