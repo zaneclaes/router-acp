@@ -580,6 +580,18 @@ router resolves and attaches them only to that delegate. Unknown capabilities,
 missing catalog registrations, and incomplete coverage fail closed. The router
 never defines capability meanings, endpoints, or credentials.
 
+Some clients never hold a live post-`session/new` connection into the session
+they created — a client that spawns the router as a subprocess only to relay
+its stdout (for example a recipe runner driving `router-acp serve` through a
+provider slot) can never send that notification. For those, set
+`ROUTER_ACP_MCP_CATALOGS` to the same `catalogs` JSON shape
+(`{"<catalog>": [<McpServer>, ...]}`) before the router process starts; it
+seeds `delegate_mcp_catalogs` once at session creation, so the same
+`resolve_mcp_catalogs` gate has something to check against even though no
+notification ever arrives. It's an additive fallback only: absent or
+malformed content fails open to no catalogs (same as today when nothing
+registers), and a later live notification still overwrites the seed as usual.
+
 `delegation.inject_prompt: true` also prepends a one-shot directive to each
 ordinary downstream session that actually received those tools. It asks the
 parent to delegate only bounded, independent work whose briefing and
@@ -753,6 +765,7 @@ example.
 | `delegation.enabled` | `true` | Offer `delegate_task` to pinned sessions. |
 | `delegation.inject_prompt` | `false` | When the tools are actually attached to an ordinary primary session, inject one scoped instruction to use them for suitable bounded work. Re-injected after a model switch; suppressed for orchestration. |
 | `delegation.mcp_catalogs` | `[]` | Host-defined catalog-to-capability policy for first-prompt and bounded-delegate MCP attachment. |
+| `ROUTER_ACP_MCP_CATALOGS` (env) | unset | JSON seed for `delegate_mcp_catalogs` when no client connection can ever send the `router-acp/delegate_mcp_catalogs` notification. Fails open on absent/malformed content. |
 | `delegation.max_concurrent` | `3` | Concurrent delegated sub-sessions. |
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `headroom.window_secs` | `18000` | Sliding-window length (5 h). |

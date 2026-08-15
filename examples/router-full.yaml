@@ -29,6 +29,11 @@ delegation:
   # extension decides when they are required; the router owns neither meanings
   # nor credentials.
   mcp_catalogs: []
+  # A client that spawns router-acp but never holds a live post-`session/new`
+  # connection into the session it created (e.g. a recipe runner relaying only
+  # stdout) can never send `router-acp/delegate_mcp_catalogs`. Such a host sets
+  # the ROUTER_ACP_MCP_CATALOGS env var instead, with the same JSON shape as
+  # that notification's `catalogs` param, before starting the router process.
   max_concurrent: 3
 
 # Graceful degradation. Rate/usage-limited agents are cordoned until the

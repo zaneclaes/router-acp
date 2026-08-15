@@ -10,12 +10,12 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthenticateRequest, CancelNotification, CloseSessionRequest, ContentBlock, Error as AcpError,
-    ImageContent, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    StopReason,
+    ImageContent, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Channel, Client as ClientPeer, ConnectionTo, Responder,
@@ -965,6 +965,83 @@ async fn preclassifier_omitted_effort_falls_back_to_task_depth_recommendation() 
         let routing = open_state(&state).get(&sid).unwrap().routing.unwrap();
         assert_eq!(routing["effort"]["requested"], "xhigh");
         assert_eq!(routing["effort"]["provider_value"], "deep");
+        Ok(())
+    })
+    .await;
+}
+
+/// A client that never sends `router-acp/delegate_mcp_catalogs` (goose running
+/// a recipe holds no live connection into the session it created) used to fail
+/// every pin whose pre-classifier asked for a capability. The host-supplied
+/// env seed makes the same session pin and receive the catalog's servers.
+#[tokio::test]
+async fn env_seeded_catalogs_pin_a_session_that_never_registers_any() {
+    let state = temp_state_file("seeded-catalogs");
+    let log = temp_log("seeded-catalogs");
+    let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.2,"confidence":0.9,"reason":"needs telemetry","required_capabilities":["metrics"]}}"#;
+    let yaml = format!(
+        "state_file: {}\n\
+         delegation:\n  enabled: false\n  mcp_catalogs:\n    - catalog: telemetry\n      capabilities: [metrics]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1)],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", log.to_str().unwrap()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        // Goose already supplies this server in session/new from its native
+        // extension config. The separate catalog registration is still absent.
+        let client_mcp = McpServer::Stdio(McpServerStdio::new("telemetry-mcp", "/bin/true"));
+        let new_with_client_mcp = || {
+            cx.send_request(
+                NewSessionRequest::new(std::env::temp_dir()).mcp_servers(vec![client_mcp.clone()]),
+            )
+            .block_task()
+        };
+
+        // Today's behavior with client MCP but no registration or seed: the
+        // catalog gate ignores the available server and refuses the pin.
+        let unseeded = new_with_client_mcp().await?.session_id.0.to_string();
+        let err = prompt_text(&cx, &unseeded, "check the error rate")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("MCP catalog `telemetry` is not available in this session"),
+            "unseeded session still fails closed: {err}"
+        );
+
+        // Same router process, same client, same absent notification — only the
+        // host's env seed differs.
+        let seed = serde_json::json!({ "telemetry": [client_mcp] }).to_string();
+        unsafe { std::env::set_var("ROUTER_ACP_MCP_CATALOGS", seed) };
+        let seeded = new_with_client_mcp().await?.session_id.0.to_string();
+        prompt_text(&cx, &seeded, "check the error rate").await?;
+        unsafe { std::env::remove_var("ROUTER_ACP_MCP_CATALOGS") };
+
+        assert!(!open_state(&state).get(&seeded).unwrap().agent.is_empty());
+        let attached = read_log(&log).into_iter().find(|event| {
+            event["event"] == "session_new"
+                && event["mcpServers"]
+                    .as_array()
+                    .is_some_and(|servers| servers.iter().any(|s| s == "telemetry-mcp"))
+        });
+        let servers = attached
+            .and_then(|event| event["mcpServers"].as_array().cloned())
+            .expect("the seeded catalog's server reached the agent");
+        assert_eq!(
+            servers
+                .iter()
+                .filter(|server| *server == "telemetry-mcp")
+                .count(),
+            1,
+            "the client and catalog copies are structurally deduplicated"
+        );
         Ok(())
     })
     .await;

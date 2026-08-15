@@ -344,7 +344,7 @@ impl RouterSession {
             cwd: persisted.cwd.clone(),
             additional_directories: persisted.additional_directories.clone(),
             mcp_servers,
-            delegate_mcp_catalogs: HashMap::new(),
+            delegate_mcp_catalogs: seeded_mcp_catalogs(),
             required_mcp_capabilities: Vec::new(),
             strategy: cfg.router,
             candidate_override: None,
@@ -401,7 +401,7 @@ impl RouterSession {
             cwd: req.cwd.clone(),
             additional_directories: req.additional_directories.clone(),
             mcp_servers: req.mcp_servers.clone(),
-            delegate_mcp_catalogs: HashMap::new(),
+            delegate_mcp_catalogs: seeded_mcp_catalogs(),
             required_mcp_capabilities: Vec::new(),
             strategy: cfg.router,
             candidate_override: None,
@@ -3417,6 +3417,32 @@ fn mcp_servers_for_pin(
     Ok((servers, delegate_attached))
 }
 
+/// Host-supplied seed for `delegate_mcp_catalogs`, in the same shape as the
+/// `router-acp/delegate_mcp_catalogs` notification's `catalogs` param. It
+/// exists for sessions whose client holds no live post-`session/new`
+/// connection and therefore can never send that notification (a `goose run
+/// --recipe` subprocess, for example). Still opaque to the router.
+pub(crate) const MCP_CATALOGS_ENV: &str = "ROUTER_ACP_MCP_CATALOGS";
+
+/// Parse the seed. Absent, empty, or malformed content fails open to no
+/// catalogs — exactly the state a session is in today when nothing registers.
+pub(crate) fn parse_seeded_mcp_catalogs(raw: Option<&str>) -> HashMap<String, Vec<McpServer>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return HashMap::new();
+    };
+    match serde_json::from_str(raw) {
+        Ok(catalogs) => catalogs,
+        Err(err) => {
+            tracing::warn!("ignoring malformed {MCP_CATALOGS_ENV}: {err}");
+            HashMap::new()
+        }
+    }
+}
+
+fn seeded_mcp_catalogs() -> HashMap<String, Vec<McpServer>> {
+    parse_seeded_mcp_catalogs(std::env::var(MCP_CATALOGS_ENV).ok().as_deref())
+}
+
 /// Resolve opaque capability names to host-provided catalog entries. The
 /// generic router never defines capability meanings or concrete MCP servers.
 pub(crate) fn resolve_mcp_catalogs(
@@ -3458,7 +3484,7 @@ pub(crate) fn resolve_mcp_catalogs(
 
 #[cfg(test)]
 mod mcp_catalog_tests {
-    use super::resolve_mcp_catalogs;
+    use super::{parse_seeded_mcp_catalogs, resolve_mcp_catalogs};
     use crate::config::{Config, McpCatalogConfig};
     use agent_client_protocol::schema::v1::McpServer;
     use std::collections::HashMap;
@@ -3486,6 +3512,32 @@ mod mcp_catalog_tests {
         }];
         assert!(resolve_mcp_catalogs(&cfg, &["spans".into()], &HashMap::new()).is_err());
         assert!(resolve_mcp_catalogs(&cfg, &["series".into()], &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn seeds_catalogs_from_host_supplied_json() {
+        let raw = r#"{"telemetry":[{"type":"http","name":"obs","url":"https://example.test/mcp","headers":[]}]}"#;
+        let seeded = parse_seeded_mcp_catalogs(Some(raw));
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded["telemetry"].len(), 1);
+        // The seed resolves exactly like a notification-registered catalog.
+        let mut cfg = test_config();
+        cfg.delegation.mcp_catalogs = vec![McpCatalogConfig {
+            catalog: "telemetry".into(),
+            capabilities: vec!["metrics".into()],
+        }];
+        assert_eq!(
+            resolve_mcp_catalogs(&cfg, &["metrics".into()], &seeded).unwrap(),
+            ["telemetry"]
+        );
+    }
+
+    #[test]
+    fn absent_or_malformed_seed_fails_open_to_no_catalogs() {
+        assert!(parse_seeded_mcp_catalogs(None).is_empty());
+        assert!(parse_seeded_mcp_catalogs(Some("   ")).is_empty());
+        assert!(parse_seeded_mcp_catalogs(Some("{not json")).is_empty());
+        assert!(parse_seeded_mcp_catalogs(Some(r#"{"telemetry":"nope"}"#)).is_empty());
     }
 
     fn test_config() -> Config {
