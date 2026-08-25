@@ -64,7 +64,7 @@ Write `~/.config/router-acp/router.yaml`:
 
 ```yaml
 router: auto
-state_file: ~/.local/state/router-acp/sessions.json
+state_file: ~/.local/state/router-acp/sessions.db
 
 delegation:
   enabled: true
@@ -218,7 +218,8 @@ Validate:
 router-acp check-config --config ~/.config/router-acp/router.yaml
 ```
 
-Expected: `configuration OK: 2 agent(s)` plus the five candidate lines.
+Expected: `configuration OK: 2 agent(s)` plus one `candidate:` line per
+declared model (six with the config above).
 
 ## 3. Create the shim goose will spawn
 
@@ -238,12 +239,15 @@ the name `pi-acp` collides with nothing on your machine either way.
 
 ## 4. Register the slot with goose
 
-One additions to `~/.config/goose/config.yaml`:
-
-Mark the provider configured**, mirroring the shape of your existing
-`claude-acp` entry, plus the legacy flag goose's own setup instructions use:
+Two additions to `~/.config/goose/config.yaml`: point `GOOSE_SEARCH_PATHS` at
+the shim directory (so goose can resolve the `pi-acp` binary name there), and
+mark the provider configured, mirroring the shape of your existing
+`claude-acp` entry:
 
 ```yaml
+GOOSE_SEARCH_PATHS:
+  - ~/.config/router-acp/bin
+
 providers:
   claude-acp:            # unchanged
     enabled: true
@@ -446,12 +450,15 @@ by failover, refused-with-fallback on an explicit `[router: candidate=…]`, and
 shown disabled (with reason + reset time) in a client's model picker. Turn the
 whole thing off with `cordon: { enabled: false }`.
 
-Codex gets the same treatment via `usage_source: { type: codex-rollout }`, but
-by a different route: Codex has no pollable usage endpoint (its limits arrive in
-response headers, and the ChatGPT backend 403s any non-Codex client), so the
-router reads Codex's *own* on-disk rate-limit snapshot from its rollout files
-(`~/.codex/sessions/**/rollout-*.jsonl`). That's "last-known as of Codex's most
-recent turn" rather than live — the reactive cordon still backstops it.
+Codex gets the same treatment via `usage_source: { type: codex-rollout }`, by
+a different route: Codex exposes no HTTP usage endpoint a third-party client
+can call (its limits arrive in response headers, and the ChatGPT backend 403s
+any non-Codex client), so the router polls live through Codex's *own* binary —
+one `codex app-server` JSON-RPC round-trip (`account/rateLimits/read`), shared
+machine-wide via a snapshot cache. If that RPC fails (binary missing, signed
+out), it falls back to Codex's on-disk rate-limit snapshot from its rollout
+files (`~/.codex/sessions/**/rollout-*.jsonl`) — "last-known as of Codex's
+most recent turn" rather than live — and the reactive cordon backstops both.
 
 Grok needs **no** `usage_source` and has none in your config: xAI exposes no
 usage numbers anywhere in Grok's ACP stream (no percent-used, no reset time —
