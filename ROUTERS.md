@@ -487,7 +487,14 @@ This is orthogonal to the router choice — it works on top of `auto`,
 and a prompt reads as a **multi-part task list**, the router turns that session
 into an orchestrator instead of answering the list in one turn.
 
-What counts as a list (detection is permissive):
+Two things can decide that a prompt *is* a multi-part task list. With the LLM
+**pre-classifier** enabled (`pre_classifier.enabled` — one cheap evaluator call
+whose `orchestrate` verdict is gated on
+`pre_classifier.orchestrate_min_confidence`; see
+[ORCHESTRATION.md](ORCHESTRATION.md)), that verdict is authoritative. The
+built-in detector below is what runs when the pre-classifier is off.
+
+What counts as a list for the built-in detector (it is permissive):
 
 - markdown numbers — `1. … 2. … 3. …`
 - markdown bullets — `- … / * … / + …`
@@ -581,4 +588,4 @@ credentials, and incomplete coverage fails closed.
 - **Every decision is disclosed** on the console
   (`disclosure: chunk`, default) or in `_meta.router_acp`
   (`disclosure: meta`), and recorded with its weights in the state file
-  (`state_file`, self-pruning per `retention.*`) for post-hoc diagnosis.
+  (`state_file`, self-pruning per `history`) for post-hoc diagnosis.

@@ -112,7 +112,7 @@ Two ways to feed it more than the literal prompt:
   answering-questions exception, even `orchestration.enabled`) and runs the
   pipeline on whatever follows.
 - **Ticket context** — with `ticket_context` rules configured (pluggable:
-  `prefix` + a command for your ticketing system's CLI), "Fix HAI-1234" loads
+  `prefix` + a command for your ticketing system's CLI), "Fix ABC-1234" loads
   the ticket body into the prompt *before* detection. A ticket whose
   description is a work list orchestrates exactly as if you had pasted it, and
   the planner delegates its parts.
