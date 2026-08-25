@@ -1,22 +1,19 @@
 # router-acp
 
-*An ACP session router that picks, switches, and fails over between your coding-agent subscriptions automatically.*
+## What & Why
 
-## What & why
+You have a subscription account for claude, codex, etc... you want to get the most out of each model while keeping cost low.
 
-If you pay for `claude`, `codex`, or similar coding-agent CLI subscriptions, you already have real capacity sitting there — the hard part is spending it well. Left alone, that means tracking which plan is close to its cap, guessing up front how hard a task will actually be, and manually switching models when one turns out to be in over its head. Get it wrong and you either overpay for capability you didn't need, or burn a cheap model's turns re-doing work a stronger one would have gotten right the first time.
+> Tools like `OpenRouter` would require pay-per-token API calls. router-acp drives the CLIs you already pay for, so requests spend seat quota instead.
 
-router-acp is a single process that solves this by standing in for your coding agent. Any [ACP](https://agentclientprotocol.com/)-speaking client (goose, Zed, …) connects to it exactly as it would to `claude` or `codex` directly; behind that one connection, the router holds sessions open to every agent CLI you've configured and decides, per conversation and even per request, which one actually does the work.
+This repo:
 
-> Token-router services like OpenRouter solve an adjacent problem, but they proxy pay-per-token API calls. router-acp instead drives the vendor CLIs you already have a subscription for, so a routed request always spends *seat* quota — never a per-token bill. Where the two do overlap (trading quality against cost), router-acp borrows OpenRouter's one published knob, `cost_quality_tradeoff`, and nothing else — everything downstream of that dial is router-acp's own local heuristic.
-
-What that buys you, automatically:
-
-- **Picks the right model to start** — a task classifier reads the prompt (heuristically, or via an optional LLM pre-classifier) and balances quality-for-the-task against how much quota each seat has left.
-- **Hot-switches mid-conversation** — on request (`opus: take over from here`), automatically when a session is visibly struggling, or when a skill needs a stronger model — even across companies, by asking the outgoing model to summarize and re-pinning the conversation downstream.
-- **Fails over on its own** — a seat that hits its token limit, crashes, or times out is cordoned off and the session moves to the next-best candidate, with the reason always disclosed and the cordon lifted automatically once it clears.
-- **Delegates and orchestrates work** — the pinned model can hand off bounded subtasks to a cheaper session, and for a multi-part task list the router can run an entire plan → parallel-delegate → cross-lineage-review → submit pipeline in-process.
-- **Speaks plain ACP** — it's just another ACP agent process, so any ACP client can point at it directly. (goose's fixed provider slots need one small shim — see [`GOOSE.md`](GOOSE.md) — but that's a goose limitation, not a router-acp one.)
+- Automatically selects the best starting model
+- Hot-switches between models (even between different companies' models)
+- Changes models automatically (when out of tokens, during a downtime, or when a task is too complex)
+- Works right from the command line (delegating to your existing `claude` / `codex` CLI tools)
+- Hands small subtasks to cheaper models, and can run whole task lists itself (plan → parallel subtasks → review by a different company's model)
+- Tells you what it picked, why, and what it skipped
 
 ## Contents
 
@@ -57,7 +54,7 @@ goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp   
 
 Every new conversation is pinned to the best **candidate** — an `(agent, model)` pair like `claude/sonnet`. Candidates don't have to span providers (one adapter exposing several models yields several candidates), and a single-candidate config is a valid passthrough, with routing and delegation simply inert.
 
-This is deliberately **not** a token-router/LiteLLM architecture: subscription seats are reached through vendor agent CLIs speaking ACP over stdio, and the router never calls a provider's model API directly — even the optional [per-request proxy](#per-request-llm-routing) only rewrites the model field on requests your own CLI was already about to make.
+This is intentionally **not** a token-router/LiteLLM architecture. Subscription seats are accessed through vendor agent CLIs/adapters speaking ACP over stdio; the router never calls provider model APIs directly. (The optional [per-request proxy](#per-request-llm-routing) only rewrites the model name on requests the CLI was already making.)
 
 ## Install & quick start
 
@@ -82,7 +79,7 @@ router-acp serve --config router.yaml
      }
      ```
 3. Send a prompt. The first reply opens with a routing disclosure line, e.g. `[router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · …` — that line is your proof the router is serving the session.
-4. From there: let `auto` keep picking models, hot-switch anytime with a `model:` prefix (`gpt-5.5: continue this work`), and turn on [auto-orchestration](#auto-orchestration) once you're comfortable with ordinary [delegation](#in-session-delegation).
+4. From there: let it auto-decide what model to use for any given task, hot switch via a prompt (`gpt: continue this work`), and enable [auto-orchestration](#auto-orchestration) so multi-part task lists are decomposed, routed, and reviewed automatically.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
