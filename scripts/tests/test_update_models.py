@@ -139,7 +139,8 @@ class CatalogTest(unittest.TestCase):
         # "parked until scored" are represented.
         self.assertIn("grok/grok-code-fast-1", ids)
         self.assertFalse(catalog.model("grok/grok-code-fast-1").enabled)
-        self.assertTrue(catalog.model("grok/grok-4.5").enabled)
+        self.assertFalse(catalog.model("grok/grok-4.5").enabled)
+        self.assertTrue(catalog.model("grok/grok-4.6").enabled)
 
     def test_multiline_flow_maps_are_one_model(self):
         catalog = parse_catalog(CATALOG_PATH)

@@ -132,6 +132,18 @@ benchmark_scoring:
       - { benchmark: DeepSWE-v1.1, result: 73.6, source: "https://deepswe.datacurve.ai/" }
       - { benchmark: Terminal-Bench-2.1, result: 89.1, source: "https://artificialanalysis.ai/evaluations/terminalbench-v2-1" }
     "*grok*":
+      # Grok 4.6 launched 2026-08-12 (id bumped below; see witnesses/
+      # resolves_to/rank_exceptions/published_pricing). Evidence intentionally
+      # NOT yet rescored to 4.6's own results: its only two benchmarks with
+      # anchors here (DeepSWE-v1.1 65.9%, Terminal-Bench-2.1 88.4%, both
+      # https://x.ai/news/grok-4-6 / artificialanalysis.ai independent run)
+      # average above Opus's OUTPUT score and trip `at_most: grok <= opus` —
+      # even though Opus's own RAW evidence still wins both shared rows
+      # (DeepSWE 73.6 vs 65.9, Terminal-Bench-2.1 89.1 vs 88.4); the trip is
+      # the fable/opus compression stacked with Grok having only 2 of 3
+      # benchmark slots. Rescoring needs a human call (compression pair, more
+      # evidence, or relax the ceiling), so 4.6 inherits 4.5's rows unchanged
+      # per the tool's own unscored-rename behavior ("no score churn").
       - { benchmark: SWE-Bench-Pro, result: 64.7, source: "https://x.ai/news/grok-4-5" }
       - { benchmark: DeepSWE-v1.1, result: 53.0, source: "https://x.ai/news/grok-4-5" }
       - { benchmark: Terminal-Bench-2.1, result: 83.3, source: "https://x.ai/news/grok-4-5" }
@@ -179,7 +191,7 @@ cost:
         rank 4 (reserved for harder work) while 5.5 stays the rank-3 everyday
         codex model. Ranking Terra by list price would make it the default and
         spend frontier-grade capability on routine turns.
-    - candidate: "grok/grok-4.5"
+    - candidate: "grok/grok-4.6"
       why: >-
         Cheapest frontier on list price ($2/$6) but pinned at rank 5: the value
         is cross-lineage review (the planner/reviewer globs), the seat is
@@ -210,7 +222,7 @@ witnesses:
   sol: "codex/gpt-5.6-sol"
   terra: "codex/gpt-5.6-terra"
   luna: "codex/gpt-5.6-luna"
-  grok: "grok/grok-4.5"
+  grok: "grok/grok-4.6"
   grok_code: "grok/grok-code-fast-1"
   kimi: "kimi/kimi-k2"
   kimi_thinking: "kimi/kimi-k2-thinking"
@@ -257,7 +269,7 @@ invariants:
   at_most:
     - a: grok
       b: opus
-      why: current published benchmark aggregate places Grok 4.5 just under Opus
+      why: current published benchmark aggregate places Grok 4.6 just under Opus
   # Concrete id -> the score-table pattern that must win the first-match race.
   resolves_to:
     "codex/gpt-5.4-mini": "*mini*"
@@ -272,7 +284,7 @@ invariants:
     "claude/haiku": "*haiku*"
     "gemini/gemini-3-pro": "*gemini*pro*"
     "gemini/gemini-3-flash": "*gemini*flash*"
-    "grok/grok-4.5": "*grok*"
+    "grok/grok-4.6": "*grok*"
     "grok/grok-code-fast-1": "*grok*code*"
     "kimi/kimi-k2": "*kimi*"
     "kimi/kimi-k2-thinking": "*kimi*k2*thinking*"
@@ -295,7 +307,7 @@ published_pricing:
     "codex/gpt-5.6-luna": { input_per_mtok: 1.00, output_per_mtok: 6.00 }
     "codex/gpt-5.6-terra": { input_per_mtok: 2.50, output_per_mtok: 15.00 }
     "codex/gpt-5.6-sol": { input_per_mtok: 5.00, output_per_mtok: 30.00 }
-    "grok/grok-4.5":
+    "grok/grok-4.6":
       { input_per_mtok: 2.00, output_per_mtok: 6.00, cache_read_per_mtok: 0.50 }
     "kimi/kimi-k2": { input_per_mtok: 0.55, output_per_mtok: 2.20 }
 

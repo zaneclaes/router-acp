@@ -573,7 +573,7 @@ fails.
   is a native ACP agent (verified — valid `initialize`, `authMethods:[grok.com]`);
   model fixed per process via `grok agent --model <id> stdio` (spawn-config, args
   `["agent"]` + template `["--model","${model_id}","stdio"]`); `grok login`, only
-  `grok-4.5` confirmed. grok has no usage_source (no pollable/on-disk snapshot) —
+  `grok-4.6` confirmed. grok has no usage_source (no pollable/on-disk snapshot) —
   its subscription **access gate** drives a cordon instead (see the grok-gate
   invariant above). **kimi** (Moonshot `kimi-cli` v1.49.0, `uv tool install
   kimi-cli` → `~/.local/bin/kimi`): `kimi acp` is a native ACP agent (verified —
@@ -584,7 +584,7 @@ fails.
   (spawn-config, NO base args + template `["--model","${model_id}","acp"]`).
   `lineage: moonshot`; only `kimi-k2` configured (best-guess), score-table
   `*kimi*k2*thinking*`/`*kimi*` globs cover variants. No usage_source → reactive
-  cordon only. Score estimates in `data/scores.yaml` are BEST-GUESS (grok-4.5 ≈
+  cordon only. Score estimates in `data/scores.yaml` are BEST-GUESS (grok-4.6 ≈
   opus/sol tier; kimi-k2 ≈ sonnet coding tier, cheaper). Claude modes: `auto,
   default, acceptEdits, plan, dontAsk, bypassPermissions`; codex modes:
   `read-only, agent, agent-full-access`. To re-discover ids, declare a bogus model and
