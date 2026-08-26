@@ -285,10 +285,10 @@ availability_preference:
 orchestration:
   enabled: true
   min_items: 2                              # smallest list treated as multi-part
-  # Opus 5 outranks Grok 4.6 on quality (see data/scores.yaml); keep Fable /
+  # Opus 5 outranks Grok on quality (see data/scores.yaml); keep Fable /
   # Sol first as absolute frontiers, then Opus, then Grok as cross-lineage.
-  planner: ["*fable*", "*sol*", "*opus*", "*grok-4.6*"] # best first
-  reviewer: ["*sol*", "*opus*", "*fable*", "*grok-4.6*"] # different lineage preferred
+  planner: ["*fable*", "*sol*", "*opus*", "*grok*"] # best first
+  reviewer: ["*sol*", "*opus*", "*fable*", "*grok*"] # different lineage preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
@@ -361,5 +361,5 @@ ticket_context:
 # re-pin). Candidates are candidate globs in preference order.
 skill_routing:
   - pattern: ship-pr
-    # Opus 5 > Grok 4.6 on quality; prefer Opus when the Claude seat is free.
+    # Opus 5 > Grok on quality; prefer Opus when the Claude seat is free.
     candidates: ["*opus*", "*grok*", "*gpt-5.5*"]
