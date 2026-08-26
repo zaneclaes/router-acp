@@ -131,8 +131,8 @@ skill_routing:
 orchestration:
   enabled: true
   min_items: 2                              # smallest list treated as multi-part
-  planner: ["*fable*", "*sol*", "*grok-4.5*"] # best first
-  reviewer: ["*sol*", "*fable*", "*grok-4.5*"] # a different lineage will be preferred
+  planner: ["*fable*", "*sol*", "*grok*"] # best first
+  reviewer: ["*sol*", "*fable*", "*grok*"] # a different lineage will be preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
@@ -249,7 +249,7 @@ agents:
       process_template:
         args: ["--model", "${model_id}", "stdio"]
     models:
-      - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5 }
+      - { id: grok-4.6, display_name: Grok 4.6, cost_rank: 5 }
       # confirm ids with `grok models` after login; router-acp drops unknown ids
 
   # Moonshot Kimi — the CLI (`uv tool install kimi-cli`) is itself an ACP agent

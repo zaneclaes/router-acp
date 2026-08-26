@@ -178,10 +178,13 @@ agents:
       process_template:
         args: ["--model", "${model_id}", "stdio"]
     models:
-      - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 5,    # current frontier
+      - { id: grok-4.6, display_name: Grok 4.6, cost_rank: 5,    # current frontier
           pricing: { input_per_mtok: 2.00, output_per_mtok: 6.00,
                      cache_read_per_mtok: 0.50 } }
       # - { id: grok-code-fast-1, display_name: Grok Code Fast, cost_rank: 2 }
+      # discovered 2026-08-26: enable once it has benchmark evidence, a score, and a
+      # cost_rank you believe (`grok-4.5`).
+      # - { id: grok-4.5, display_name: Grok 4.5, cost_rank: 1 }
 
   # Moonshot Kimi. The CLI (`uv tool install kimi-cli`, executable `kimi`) is
   # itself an ACP agent — `kimi acp` — so no separate adapter is needed. Its own
@@ -282,10 +285,10 @@ availability_preference:
 orchestration:
   enabled: true
   min_items: 2                              # smallest list treated as multi-part
-  # Opus 5 outranks Grok 4.5 on quality (see data/scores.yaml); keep Fable /
+  # Opus 5 outranks Grok on quality (see data/scores.yaml); keep Fable /
   # Sol first as absolute frontiers, then Opus, then Grok as cross-lineage.
-  planner: ["*fable*", "*sol*", "*opus*", "*grok-4.5*"] # best first
-  reviewer: ["*sol*", "*opus*", "*fable*", "*grok-4.5*"] # different lineage preferred
+  planner: ["*fable*", "*sol*", "*opus*", "*grok*"] # best first
+  reviewer: ["*sol*", "*opus*", "*fable*", "*grok*"] # different lineage preferred
   submit: branch                            # never | branch | pr | merge
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
@@ -358,5 +361,5 @@ ticket_context:
 # re-pin). Candidates are candidate globs in preference order.
 skill_routing:
   - pattern: ship-pr
-    # Opus 5 > Grok 4.5 on quality; prefer Opus when the Claude seat is free.
+    # Opus 5 > Grok on quality; prefer Opus when the Claude seat is free.
     candidates: ["*opus*", "*grok*", "*gpt-5.5*"]

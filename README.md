@@ -47,7 +47,7 @@ goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp   
                           │
                           ├──────ACP──▶ codex-acp             (codex/gpt-5.5, codex/gpt-5.6-sol)
                           │
-                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.5)
+                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.6)
                           │
                           └──────ACP──▶ kimi acp              (kimi/kimi-k2)
 ```

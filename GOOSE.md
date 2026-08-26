@@ -192,7 +192,7 @@ Notes on this file:
 
   It's configured as `spawn-config` (`grok agent --model <id> stdio`), so the
   model is fixed per process. Until you `grok login`, grok sits auth-pending and
-  is simply skipped by routing (no error). Only `grok-4.5` is pre-configured;
+  is simply skipped by routing (no error). Only `grok-4.6` is pre-configured;
   add others once `grok models` shows them.
 
 - **Moonshot Kimi** is wired in as a fourth agent (`lineage: moonshot`), a fourth
