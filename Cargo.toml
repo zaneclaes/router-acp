@@ -14,7 +14,10 @@ name = "mock-agent"
 path = "src/bin/mock_agent.rs"
 
 [dependencies]
-agent-client-protocol = { version = "1.2", features = ["unstable_end_turn_token_usage"] }
+agent-client-protocol = { version = "1.2", features = [
+    "unstable_elicitation",
+    "unstable_end_turn_token_usage",
+] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
