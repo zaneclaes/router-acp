@@ -10,14 +10,15 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthenticateRequest, CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
-    ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities, Error as AcpError,
-    ImageContent, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest,
-    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOptionValue, SessionConfigSelectOptions, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason,
+    CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
+    CreateTerminalResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
+    ElicitationFormCapabilities, Error as AcpError, ImageContent, InitializeRequest,
+    InitializeResponse, McpServer, McpServerStdio, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionValue,
+    SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Channel, Client as ClientPeer, ConnectionTo, Responder,
@@ -42,6 +43,7 @@ struct Observed {
     permission_session_ids: Vec<String>,
     read_session_ids: Vec<String>,
     elicitation_session_ids: Vec<String>,
+    terminal_creates: Vec<(String, String, Vec<String>, Option<PathBuf>)>,
 }
 
 type ObservedHandle = Arc<Mutex<Observed>>;
@@ -82,6 +84,7 @@ where
     let o_perm = observed.clone();
     let o_read = observed.clone();
     let o_elicit = observed.clone();
+    let o_terminal = observed.clone();
 
     let client_result = tokio::time::timeout(
         Duration::from_secs(120),
@@ -162,6 +165,23 @@ where
                 },
                 on_receive_request!(),
             )
+            .on_receive_request(
+                move |req: CreateTerminalRequest,
+                      responder: Responder<CreateTerminalResponse>,
+                      _cx| {
+                    let observed = o_terminal.clone();
+                    async move {
+                        observed.lock().unwrap().terminal_creates.push((
+                            req.session_id.0.to_string(),
+                            req.command,
+                            req.args,
+                            req.cwd,
+                        ));
+                        responder.respond(CreateTerminalResponse::new("managed-terminal-1"))
+                    }
+                },
+                on_receive_request!(),
+            )
             .connect_with(channel_b, async |cx| {
                 test_fn(cx, observed.clone(), shared_for_test.clone()).await
             }),
@@ -180,6 +200,17 @@ async fn init(cx: &ConnectionTo<AgentPeer>) -> Result<InitializeResponse, AcpErr
     cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
         .block_task()
         .await
+}
+
+async fn init_with_terminals(
+    cx: &ConnectionTo<AgentPeer>,
+) -> Result<InitializeResponse, AcpError> {
+    cx.send_request(
+        InitializeRequest::new(ProtocolVersion::V1)
+            .client_capabilities(ClientCapabilities::new().terminal(true)),
+    )
+    .block_task()
+    .await
 }
 
 async fn new_session(cx: &ConnectionTo<AgentPeer>) -> Result<NewSessionResponse, AcpError> {
@@ -360,6 +391,44 @@ async fn permission_and_fs_callbacks_remap_to_router_session() {
         let observed = observed.lock().unwrap();
         assert_eq!(observed.permission_session_ids, vec![sid.clone()]);
         assert_eq!(observed.read_session_ids, vec![sid.clone()]);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
+    let state = temp_state_file("managed-background");
+    // The helper exe is this crate's router-acp binary.
+    // SAFETY: test-scoped env mutation; tests using this run in one process
+    // but the value is identical everywhere.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let resp = prompt_text(&cx, &sid, "BACKGROUND_START:echo managed").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("background-start:Background terminal managed-terminal-1 started"),
+            "managed terminal tool result expected, got: {text}"
+        );
+        assert_eq!(
+            observed.lock().unwrap().terminal_creates,
+            vec![(
+                sid,
+                "/bin/sh".to_string(),
+                vec!["-lc".to_string(), "echo managed".to_string()],
+                None,
+            )]
+        );
         Ok(())
     })
     .await;
