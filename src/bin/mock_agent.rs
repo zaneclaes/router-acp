@@ -29,6 +29,10 @@
 //!
 //! Prompt text directives:
 //! - `PERM` — request permission from the client, echo the outcome
+//! - `PLAN:<a,b!,c#>` — emit a plan (todo list) snapshot; bare entries are
+//!   pending, `!` marks in-progress, `#` marks completed
+//! - `ELICIT:<question>` — ask the client a single-select question via
+//!   `elicitation/create`, echo the outcome
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
 //! - `DELEGATE:<task>` — call the `delegate_task` tool on the MCP server
@@ -48,13 +52,16 @@ use serde_json::{Value, json};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, Error as AcpError, Implementation,
-    InitializeRequest, InitializeResponse, McpServer, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    CancelNotification, ContentBlock, ContentChunk, CreateElicitationRequest, ElicitationAction,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, EnumOption,
+    Error as AcpError, Implementation, InitializeRequest, InitializeResponse, McpServer,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
     ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
+    SetSessionConfigOptionResponse, StopReason, StringPropertySchema, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
     Agent as AgentRole, Client as ClientRole, ConnectionTo, Responder, on_receive_notification,
@@ -467,6 +474,71 @@ async fn run_prompt(
                 }
                 Err(err) => reply.push(format!("perm-error:{err}")),
             }
+        } else if let Some(entries) = line.strip_prefix("PLAN:") {
+            // Emit a plan (todo list) snapshot like TodoWrite-backed adapters
+            // do. `PLAN:a,b!,c#` — bare pending, `!` in progress, `#` done.
+            let entries: Vec<PlanEntry> = entries
+                .split(',')
+                .filter(|e| !e.is_empty())
+                .map(|entry| match entry.strip_suffix('!') {
+                    Some(content) => {
+                        PlanEntry::new(content, PlanEntryPriority::Medium, PlanEntryStatus::InProgress)
+                    }
+                    None => match entry.strip_suffix('#') {
+                        Some(content) => PlanEntry::new(
+                            content,
+                            PlanEntryPriority::Medium,
+                            PlanEntryStatus::Completed,
+                        ),
+                        None => {
+                            PlanEntry::new(entry, PlanEntryPriority::Medium, PlanEntryStatus::Pending)
+                        }
+                    },
+                })
+                .collect();
+            let count = entries.len();
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::Plan(Plan::new(entries)),
+            ));
+            reply.push(format!("plan:{count}"));
+        } else if let Some(question) = line.strip_prefix("ELICIT:") {
+            // Ask the client a single-select question, the shape adapters use
+            // to bridge Claude's AskUserQuestion / Codex's equivalent.
+            let request = CreateElicitationRequest::new(
+                ElicitationFormMode::new(
+                    ElicitationSessionScope::new(session_id.clone()),
+                    ElicitationSchema::new().property(
+                        "question_0",
+                        StringPropertySchema::new().one_of(vec![
+                            EnumOption::new("yes", "Yes"),
+                            EnumOption::new("no", "No"),
+                        ]),
+                        false,
+                    ),
+                ),
+                question.to_string(),
+            );
+            match cx.send_request(request).block_task().await {
+                Ok(resp) => {
+                    let outcome = match resp.action {
+                        ElicitationAction::Accept(accept) => format!(
+                            "accept:{}",
+                            accept
+                                .content
+                                .unwrap_or_default()
+                                .get("question_0")
+                                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                                .unwrap_or_else(|| "null".to_string())
+                        ),
+                        ElicitationAction::Decline => "decline".to_string(),
+                        ElicitationAction::Cancel => "cancel".to_string(),
+                        _ => "other".to_string(),
+                    };
+                    reply.push(format!("elicit:{outcome}"));
+                }
+                Err(err) => reply.push(format!("elicit-error:{err}")),
+            }
         } else if let Some(path) = line.strip_prefix("READFILE:") {
             let read = ReadTextFileRequest::new(session_id.clone(), path.to_string());
             match cx.send_request(read).block_task().await {
@@ -690,7 +762,17 @@ async fn main() {
                   cx: ConnectionTo<ClientRole>| {
                 let mock = m_init.clone();
                 async move {
-                    mock.log(json!({"event": "initialize"}));
+                    // Record the client capabilities the router forwarded, so
+                    // tests can assert a capability survived its typed
+                    // round-trip (elicitation is opt-in per client).
+                    mock.log(json!({
+                        "event": "initialize",
+                        "client_elicitation_form": req
+                            .client_capabilities
+                            .elicitation
+                            .as_ref()
+                            .is_some_and(|e| e.form.is_some()),
+                    }));
                     let session_caps = if mock.supports_lifecycle {
                         agent_client_protocol::schema::v1::SessionCapabilities::new()
                             .list(Some(Default::default()))

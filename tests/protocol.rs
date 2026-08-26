@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AuthenticateRequest, CancelNotification, CloseSessionRequest, ContentBlock, Error as AcpError,
+    AuthenticateRequest, CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
+    CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
+    ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities, Error as AcpError,
     ImageContent, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
@@ -39,6 +41,7 @@ struct Observed {
     updates: Vec<SessionNotification>,
     permission_session_ids: Vec<String>,
     read_session_ids: Vec<String>,
+    elicitation_session_ids: Vec<String>,
 }
 
 type ObservedHandle = Arc<Mutex<Observed>>;
@@ -78,6 +81,7 @@ where
     let o_updates = observed.clone();
     let o_perm = observed.clone();
     let o_read = observed.clone();
+    let o_elicit = observed.clone();
 
     let client_result = tokio::time::timeout(
         Duration::from_secs(120),
@@ -127,6 +131,33 @@ where
                             "FILECONTENT:{}",
                             req.path.display()
                         )))
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                move |req: CreateElicitationRequest,
+                      responder: Responder<CreateElicitationResponse>,
+                      _cx| {
+                    let observed = o_elicit.clone();
+                    async move {
+                        let session_id = match req.mode.scope() {
+                            agent_client_protocol::schema::v1::ElicitationScope::Session(s) => {
+                                s.session_id.0.to_string()
+                            }
+                            _ => String::new(),
+                        };
+                        observed.lock().unwrap().elicitation_session_ids.push(session_id);
+                        let mut content = std::collections::BTreeMap::new();
+                        content.insert(
+                            "question_0".to_string(),
+                            agent_client_protocol::schema::v1::ElicitationContentValue::String(
+                                "yes".to_string(),
+                            ),
+                        );
+                        responder.respond(CreateElicitationResponse::new(
+                            ElicitationAction::Accept(ElicitationAcceptAction::new().content(Some(content))),
+                        ))
                     }
                 },
                 on_receive_request!(),
@@ -329,6 +360,102 @@ async fn permission_and_fs_callbacks_remap_to_router_session() {
         let observed = observed.lock().unwrap();
         assert_eq!(observed.permission_session_ids, vec![sid.clone()]);
         assert_eq!(observed.read_session_ids, vec![sid.clone()]);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn plan_updates_pass_through_unmodified() {
+    // The router never special-cases `sessionUpdate: "plan"` — this pins that
+    // TodoWrite-style snapshots survive the generic notification forwarding
+    // (Milestone-1-era passthrough), which is what claude-agent-acp/codex-acp
+    // emit for the agent's todo list.
+    let state = temp_state_file("plan");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let resp = prompt_text(&cx, &sid, "PLAN:write tests,fix bug!,ship it#").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+        let plans: Vec<Vec<(String, String)>> = observed
+            .lock()
+            .unwrap()
+            .updates
+            .iter()
+            .filter(|n| n.session_id.0.as_ref() == sid)
+            .filter_map(|n| match &n.update {
+                SessionUpdate::Plan(plan) => Some(
+                    plan.entries
+                        .iter()
+                        .map(|e| (e.content.clone(), format!("{:?}", e.status)))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            plans,
+            vec![vec![
+                ("write tests".to_string(), "Pending".to_string()),
+                ("fix bug".to_string(), "InProgress".to_string()),
+                ("ship it".to_string(), "Completed".to_string()),
+            ]],
+            "plan entries/statuses must round-trip verbatim"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn elicitation_capability_round_trips_and_request_forwards() {
+    // The client's advertised elicitation support must survive the typed
+    // `initialize` round-trip to the downstream agent (this is what was
+    // silently dropped before `unstable_elicitation` was enabled), and a
+    // resulting `elicitation/create` request/response must forward like any
+    // other client-directed callback.
+    let state = temp_state_file("elicit");
+    let log = temp_log("elicit");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[("MOCK_LOG", log.to_str().unwrap())])
+    );
+    run_test(yaml, async |cx, observed| {
+        cx.send_request(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                ClientCapabilities::new()
+                    .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new())),
+            ),
+        )
+        .block_task()
+        .await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let resp = prompt_text(&cx, &sid, "ELICIT:Do you want fries with that?").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains(r#"elicit:accept:"yes""#), "got: {text}");
+
+        let logged = read_log(&log);
+        assert!(
+            logged
+                .iter()
+                .any(|e| e["event"] == "initialize" && e["client_elicitation_form"] == true),
+            "router must forward the real client's elicitation capability to the downstream agent, got: {logged:?}"
+        );
+
+        assert_eq!(observed.lock().unwrap().elicitation_session_ids, vec![sid]);
         Ok(())
     })
     .await;
