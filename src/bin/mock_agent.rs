@@ -42,6 +42,8 @@
 //!   (returns the immediate `b-…` ack; may repeat)
 //! - `AWAIT_DELEGATES` — call `delegate_await` (all pending jobs); an
 //!   optional `:<secs>` suffix sets `timeout_seconds`
+//! - `BACKGROUND_START:<shell>` — call the router-owned `background_start`
+//!   tool with `/bin/sh -lc <shell>`
 //! - otherwise — echo `echo:<model>:<text>`
 
 use std::collections::HashMap;
@@ -699,6 +701,51 @@ async fn run_prompt(
                 client.shutdown().await;
             }
             None => reply.push("delegate-bg-error:no router-delegate MCP server".to_string()),
+        }
+    }
+
+    for shell in text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("BACKGROUND_START:"))
+    {
+        let router_server = mcp_servers
+            .iter()
+            .find(|server| matches!(server, McpServer::Stdio(stdio) if stdio.name == "router-delegate"));
+        match router_server {
+            Some(server) => {
+                let mut client = match McpClient::spawn(server).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        reply.push(format!("background-start-error:{err}"));
+                        continue;
+                    }
+                };
+                let result = client
+                    .request(
+                        "tools/call",
+                        json!({
+                            "name": "background_start",
+                            "arguments": {
+                                "command": "/bin/sh",
+                                "args": ["-lc", shell],
+                            },
+                        }),
+                    )
+                    .await;
+                client.shutdown().await;
+                match result {
+                    Ok(value) => {
+                        let text = value["content"][0]["text"].as_str().unwrap_or("");
+                        let is_error = value["isError"].as_bool().unwrap_or(false);
+                        reply.push(format!(
+                            "background-start{}:{text}",
+                            if is_error { "-error" } else { "" }
+                        ));
+                    }
+                    Err(err) => reply.push(format!("background-start-error:{err}")),
+                }
+            }
+            None => reply.push("background-start-error:no router MCP server".to_string()),
         }
     }
 

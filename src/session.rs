@@ -3405,10 +3405,10 @@ fn mcp_servers_for_pin(
             merge_catalog_entries(&mut servers, entries);
         }
     }
-    let mut delegate_attached = false;
+    let delegate_attached =
+        crate::delegate_mcp::delegation_available(shared, router_sid, candidate);
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
-        delegate_attached = true;
     }
     Ok((servers, delegate_attached))
 }
@@ -3601,6 +3601,15 @@ fn build_delegation_instructions() -> String {
         .to_string()
 }
 
+fn build_background_instructions() -> String {
+    "[router-acp managed backgrounds]\n\
+     The router's `background_start` tool is available. Use it for every \
+     long-running watcher, monitor, server, or background shell instead of a \
+     provider-native `run_in_background` mode. It returns immediately while the \
+     ACP client keeps the process visible, inspectable, and cancellable."
+        .to_string()
+}
+
 /// Forward a prompt to the pinned downstream, failing over to the next best
 /// candidate when the pinned model is rate-limited or down — as long as no
 /// output has streamed for this turn and the client has not cancelled.
@@ -3691,6 +3700,9 @@ async fn send_prompt_with_failover(
             // Router role framing first (the full orchestration protocol or the
             // scoped ordinary-delegation directive), then host pre-class injects
             // (e.g. ui_planning), then switch handoff context, then the task.
+            if shared.upstream_client_capabilities().terminal {
+                blocks.push(ContentBlock::from(build_background_instructions()));
+            }
             if let Some(instr) = orchestration {
                 blocks.push(ContentBlock::from(instr));
             }
@@ -5618,18 +5630,16 @@ pub async fn serve_shared(
         None
     };
 
-    // Delegate MCP listener (Unix socket) runs independently of the ACP
-    // connection; aborted when serve returns.
-    let listener_task = if shared.cfg.delegation.enabled {
-        match crate::delegate_mcp::bind_listener(&shared) {
-            Ok(task) => Some(task),
-            Err(err) => {
-                tracing::warn!(%err, "delegation disabled: cannot bind delegate socket");
-                None
-            }
+    // Router-owned MCP listener (Unix socket) runs independently of the ACP
+    // connection; it serves delegation when configured and managed-background
+    // terminals when the upstream client advertises them. Bind eagerly because
+    // client capabilities arrive later during initialize.
+    let listener_task = match crate::delegate_mcp::bind_listener(&shared) {
+        Ok(task) => Some(task),
+        Err(err) => {
+            tracing::warn!(%err, "router-owned MCP tools disabled: cannot bind socket");
+            None
         }
-    } else {
-        None
     };
 
     // Proactive usage-cap cordoning: poll each usage-source agent's provider
@@ -7026,6 +7036,7 @@ mod escalation_signal_tests {
 
 #[cfg(test)]
 mod orchestration_unit_tests {
+    use super::build_background_instructions;
     use super::build_orchestration_instructions;
     use super::is_native_subagent_tool;
     use super::previous_turn_solicited_answers as solicited;
@@ -7059,6 +7070,14 @@ mod orchestration_unit_tests {
             text.contains("only AFTER every implementation subtask"),
             "review must be ordered after implementation: {text}"
         );
+    }
+
+    #[test]
+    fn managed_backgrounds_forbid_provider_private_shells() {
+        let text = build_background_instructions();
+        assert!(text.contains("background_start"), "{text}");
+        assert!(text.contains("run_in_background"), "{text}");
+        assert!(text.contains("visible, inspectable, and cancellable"), "{text}");
     }
 
     #[test]

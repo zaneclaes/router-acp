@@ -298,6 +298,16 @@ For **review → fix → re-review** loops, a delegated sub-session can be kept 
 
 For **parallel** subtasks there is a background mode: MCP clients execute tool calls one at a time, so N plain `delegate_task` calls run the subtasks serially no matter what the router allows. `delegate_task` with `background: true` instead returns a `b-…` job id immediately and runs the subtask on its own task; `delegate_await` collects results — it waits up to `timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default: all pending), returns every finished job's output exactly once, and lists the ones still running so the caller polls with short, idle-timeout-safe calls. `background` composes with `keep_open` (the collected result carries the `delegate_id`), and `delegation.max_concurrent` still bounds how many jobs execute at once.
 
+### Managed background terminals
+
+When the upstream ACP client advertises `terminal: true`, the router exposes a
+`background_start` MCP tool even when delegation is disabled or no cheaper
+candidate exists. The tool forwards its executable, arguments, optional cwd,
+and retained-output limit through ACP `terminal/create` and returns immediately.
+The router also instructs downstream models to use it instead of an adapter's
+private `run_in_background` mode, so the host client can persist the process,
+show its output and status, and cancel it independently of foreground turns.
+
 ## Auto-orchestration
 
 When a prompt reads as a **multi-part task list**, the router can run an entire plan → parallel-delegate → cross-lineage-review → submit pipeline itself, in-process, instead of answering the list in one turn. Turn it on with `orchestration.enabled` (off by default); it steers (pre-pin) or switches (mid-session) the session onto a **planner** frontier model and injects an orchestration protocol instructing that model to:

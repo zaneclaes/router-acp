@@ -16,8 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, Error as AcpError, McpServer, McpServerStdio, PromptRequest,
-    ResourceLink, SetSessionModeRequest, StopReason,
+    CancelNotification, ContentBlock, CreateTerminalRequest, Error as AcpError, McpServer,
+    McpServerStdio, PromptRequest, ResourceLink, SetSessionModeRequest, StopReason,
 };
 use agent_client_protocol::{
     ByteStreams, Responder, UntypedRole, on_receive_notification, on_receive_request,
@@ -37,6 +37,7 @@ pub const DELEGATE_TOOL_NAME: &str = "delegate_task";
 pub const DELEGATE_FOLLOWUP_TOOL_NAME: &str = "delegate_followup";
 pub const DELEGATE_CLOSE_TOOL_NAME: &str = "delegate_close";
 pub const DELEGATE_AWAIT_TOOL_NAME: &str = "delegate_await";
+pub const BACKGROUND_START_TOOL_NAME: &str = "background_start";
 
 const TOOL_DESCRIPTION: &str = "Delegate a small, self-contained subtask to a lower-cost agent \
      running in its own ephemeral session. Delegate only subtasks that do not need this \
@@ -52,6 +53,12 @@ const AWAIT_TOOL_DESCRIPTION: &str = "Collect the results of background delegate
      `delegate_ids` (default: all of this session's pending jobs); returns every finished \
      job's output and lists the ones still running — call again until none remain. Finished \
      results are consumed: each is returned exactly once.";
+
+const BACKGROUND_START_TOOL_DESCRIPTION: &str = "Start a long-running shell, watcher, server, \
+     or monitor in the ACP client's managed background-terminal lifecycle. Use this instead of \
+     provider-native run_in_background/background shell modes: the client can keep it alive \
+     across relay restarts and lets the user inspect its output or cancel it independently. \
+     Returns immediately after the process starts; do not wait for it to exit.";
 
 // ----------------------------------------------------------------------
 // MCP wire types (minimal, hand-typed over the SDK's JSON-RPC layer)
@@ -196,6 +203,19 @@ pub struct DelegateCloseArgs {
     pub delegate_id: String,
 }
 
+/// `background_start` tool input. Environment inherits from the ACP client;
+/// callers that need overrides can invoke `/usr/bin/env` explicitly.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackgroundStartArgs {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub output_byte_limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DelegateHints {
     #[serde(default)]
@@ -317,27 +337,61 @@ fn close_tool_definition() -> Value {
     })
 }
 
+fn background_start_tool_definition() -> Value {
+    json!({
+        "name": BACKGROUND_START_TOOL_NAME,
+        "description": BACKGROUND_START_TOOL_DESCRIPTION,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Executable to launch (not a shell command string)."
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Arguments passed directly to the executable."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional absolute working directory; defaults to the session checkout."
+                },
+                "output_byte_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional retained-output byte limit."
+                }
+            },
+            "required": ["command"]
+        }
+    })
+}
+
 // ----------------------------------------------------------------------
 // Injection decision
 // ----------------------------------------------------------------------
 
-/// Build the delegate MCP server entry for a session being pinned to
-/// `candidate`, or `None` when delegation would be pointless (disabled, one
-/// candidate, or no lower-cost candidate for this parent).
-pub fn delegate_server_entry(
+/// Whether the candidate can use router delegation for this session.
+pub fn delegation_available(
     shared: &Arc<Shared>,
     router_sid: &str,
     candidate: &CandidateId,
-) -> Option<McpServer> {
+) -> bool {
     if !shared.cfg.delegation.enabled {
-        return None;
+        return false;
     }
-    let socket = shared.delegate_socket.get()?.clone();
     let routeable = shared.routeable_candidates();
     if routeable.len() <= 1 {
-        return None;
+        return false;
     }
-    let parent_cost = routeable.iter().find(|c| &c.id == candidate)?.cost_rank;
+    let Some(parent_cost) = routeable
+        .iter()
+        .find(|c| &c.id == candidate)
+        .map(|c| c.cost_rank)
+    else {
+        return false;
+    };
     // Ordinary sessions only get the tool when a strictly-cheaper candidate
     // exists (delegation sheds cost). Orchestrating sessions get it whenever
     // there is any other candidate, so the planner can delegate to same-/higher-
@@ -345,9 +399,23 @@ pub fn delegate_server_entry(
     let orchestrating = shared
         .with_session(router_sid, |s| s.orchestrating)
         .unwrap_or(false);
-    if !orchestrating && !routeable.iter().any(|c| c.cost_rank < parent_cost) {
+    orchestrating || routeable.iter().any(|c| c.cost_rank < parent_cost)
+}
+
+/// Build the router-owned MCP server entry for a pinned session. The server is
+/// useful when either delegation is available or the upstream ACP client owns
+/// managed terminals; `tools/list` exposes only the applicable tools.
+pub fn delegate_server_entry(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    candidate: &CandidateId,
+) -> Option<McpServer> {
+    if !delegation_available(shared, router_sid, candidate)
+        && !shared.upstream_client_capabilities().terminal
+    {
         return None;
     }
+    let socket = shared.delegate_socket.get()?.clone();
 
     let token = uuid::Uuid::new_v4().to_string();
     shared
@@ -462,6 +530,15 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
 
     let call_shared = shared.clone();
     let call_sid = router_sid.clone();
+    let terminal_enabled = shared.upstream_client_capabilities().terminal;
+    let pinned_candidate = shared
+        .with_session(&router_sid, |session| {
+            session.pin.as_ref().map(|pin| pin.candidate.clone())
+        })
+        .flatten();
+    let delegation_enabled = pinned_candidate
+        .as_ref()
+        .is_some_and(|candidate| delegation_available(&shared, &router_sid, candidate));
     UntypedRole
         .builder()
         .name("delegate-mcp")
@@ -489,15 +566,22 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
             on_receive_request!(),
         )
         .on_receive_request(
-            |_req: McpToolsListRequest, responder: Responder<McpToolsListResult>, _cx| async move {
-                responder.respond(McpToolsListResult {
-                    tools: vec![
+            move |_req: McpToolsListRequest,
+                  responder: Responder<McpToolsListResult>,
+                  _cx| async move {
+                let mut tools = Vec::new();
+                if delegation_enabled {
+                    tools.extend([
                         tool_definition(),
                         await_tool_definition(),
                         followup_tool_definition(),
                         close_tool_definition(),
-                    ],
-                })
+                    ]);
+                }
+                if terminal_enabled {
+                    tools.push(background_start_tool_definition());
+                }
+                responder.respond(McpToolsListResult { tools })
             },
             on_receive_request!(),
         )
@@ -599,6 +683,26 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                                 Err(msg) => text_result(msg, true),
                             })
                         }
+                        BACKGROUND_START_TOOL_NAME => {
+                            let args: BackgroundStartArgs =
+                                match serde_json::from_value(req.arguments) {
+                                    Ok(args) => args,
+                                    Err(err) => {
+                                        return responder.respond(text_result(
+                                            format!("invalid background_start arguments: {err}"),
+                                            true,
+                                        ));
+                                    }
+                                };
+                            cx.spawn(async move {
+                                let result = run_background_start(&shared, &router_sid, args).await;
+                                let _ = responder.respond(match result {
+                                    Ok(text) => text_result(text, false),
+                                    Err(msg) => text_result(msg, true),
+                                });
+                                Ok(())
+                            })
+                        }
                         other => responder.respond_with_error(
                             AcpError::invalid_params().data(format!("unknown tool `{other}`")),
                         ),
@@ -617,6 +721,42 @@ fn text_result(text: String, is_error: bool) -> McpToolsCallResult {
         content: vec![json!({ "type": "text", "text": text })],
         is_error,
     }
+}
+
+async fn run_background_start(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: BackgroundStartArgs,
+) -> Result<String, String> {
+    if args.command.trim().is_empty() {
+        return Err("command must not be empty".to_string());
+    }
+    if !shared.upstream_client_capabilities().terminal {
+        return Err("the connected ACP client does not support managed terminals".to_string());
+    }
+    if shared.with_session(router_sid, |_| ()).is_none() {
+        return Err("parent session no longer exists".to_string());
+    }
+    let upstream = shared
+        .upstream()
+        .ok_or_else(|| "ACP client connection is unavailable".to_string())?;
+    let mut request =
+        CreateTerminalRequest::new(router_sid.to_string(), args.command).args(args.args);
+    if let Some(cwd) = args.cwd {
+        request = request.cwd(cwd);
+    }
+    if let Some(limit) = args.output_byte_limit {
+        request = request.output_byte_limit(limit);
+    }
+    let response = upstream
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|err| format!("ACP terminal/create failed: {err}"))?;
+    Ok(format!(
+        "Background terminal {} started. It continues independently; the user can inspect or cancel it from the client.",
+        response.terminal_id
+    ))
 }
 
 // ----------------------------------------------------------------------
@@ -1536,6 +1676,22 @@ mod tests {
         assert_eq!(def["name"], DELEGATE_AWAIT_TOOL_NAME);
         assert!(def["inputSchema"]["properties"]["delegate_ids"].is_object());
         assert!(def["inputSchema"]["properties"]["timeout_seconds"].is_object());
+    }
+
+    #[test]
+    fn background_start_tool_definition_requires_an_executable() {
+        let def = background_start_tool_definition();
+        assert_eq!(def["name"], BACKGROUND_START_TOOL_NAME);
+        assert_eq!(def["inputSchema"]["required"][0], "command");
+        assert_eq!(
+            def["inputSchema"]["properties"]["args"]["items"]["type"],
+            "string"
+        );
+        assert!(
+            def["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("run_in_background"))
+        );
     }
 
     #[test]
