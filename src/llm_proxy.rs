@@ -842,6 +842,29 @@ fn rewrite_top_level_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
     Some(rewritten)
 }
 
+/// Whether the request explicitly turns thinking off. An absent `thinking` is
+/// NOT disabled — the newer Anthropic models think by default — so only the
+/// explicit opt-out counts.
+fn thinking_disabled(body: &Value) -> bool {
+    body.get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("disabled"))
+}
+
+/// Anthropic rejects `output_config.effort` above `high` on a request that
+/// disables thinking, so the router's own effort cannot ride such a request
+/// verbatim. Claude Code issues its WebFetch/WebSearch model calls with
+/// thinking disabled: injecting a session effort of `max` there 400s the tool
+/// while the main loop, which thinks, is unaffected.
+fn anthropic_effort_for_thinking(value: &str, thinking_disabled: bool) -> &str {
+    if thinking_disabled && matches!(value, "xhigh" | "max") {
+        "high"
+    } else {
+        value
+    }
+}
+
 /// Shape the provider request after routing. This is intentionally distinct
 /// from `WireShape::effort`, which remains a boolean compatibility gate for
 /// already-shaped requests during request-level model rerouting.
@@ -851,6 +874,7 @@ fn shape_provider_request(
     effort: &EffortShape,
     protocol: LlmWireProtocol,
 ) -> Option<Vec<u8>> {
+    let thinking_off = thinking_disabled(body);
     let mut body = body.clone();
     let object = body.as_object_mut()?;
     if let Some(model) = model {
@@ -872,11 +896,12 @@ fn shape_provider_request(
             }
         }
         (LlmWireProtocol::Anthropic, EffortShape::Set(value)) => {
+            let value = anthropic_effort_for_thinking(value, thinking_off);
             let config = object
                 .entry("output_config")
                 .or_insert_with(|| Value::Object(Default::default()));
             let config = config.as_object_mut()?;
-            config.insert("effort".into(), Value::String(value.clone()));
+            config.insert("effort".into(), Value::String(value.into()));
         }
         (LlmWireProtocol::Openai, EffortShape::Set(value)) => {
             let reasoning = object
@@ -2534,6 +2559,53 @@ agents:
         let anthropic_omitted: Value = serde_json::from_slice(&anthropic_omitted).unwrap();
         assert!(anthropic_omitted["output_config"].get("effort").is_none());
         assert!(request_wire_shape(&anthropic).effort);
+    }
+
+    #[test]
+    fn anthropic_effort_is_capped_at_high_when_the_request_disables_thinking() {
+        // Claude Code's WebFetch/WebSearch model calls disable thinking, and
+        // Anthropic 400s `output_config.effort` above `high` on those. A session
+        // resolved to `max` used to take both tools out for the whole session.
+        for requested in ["max", "xhigh"] {
+            let capped = shape_provider_request(
+                &json!({"model": "claude", "thinking": {"type": "disabled"}}),
+                None,
+                &EffortShape::Set(requested.to_string()),
+                LlmWireProtocol::Anthropic,
+            )
+            .unwrap();
+            let capped: Value = serde_json::from_slice(&capped).unwrap();
+            assert_eq!(capped["output_config"]["effort"], "high");
+        }
+
+        // Thinking on, or simply unset (the newer models think by default):
+        // the resolved effort rides the request untouched.
+        for thinking in [json!({"type": "adaptive"}), Value::Null] {
+            let mut body = json!({"model": "claude"});
+            if !thinking.is_null() {
+                body["thinking"] = thinking;
+            }
+            let kept = shape_provider_request(
+                &body,
+                None,
+                &EffortShape::Set("max".to_string()),
+                LlmWireProtocol::Anthropic,
+            )
+            .unwrap();
+            let kept: Value = serde_json::from_slice(&kept).unwrap();
+            assert_eq!(kept["output_config"]["effort"], "max");
+        }
+
+        // The cap is Anthropic's rule; OpenAI-shaped requests keep their value.
+        let openai = shape_provider_request(
+            &json!({"model": "gpt", "thinking": {"type": "disabled"}}),
+            None,
+            &EffortShape::Set("max".to_string()),
+            LlmWireProtocol::Openai,
+        )
+        .unwrap();
+        let openai: Value = serde_json::from_slice(&openai).unwrap();
+        assert_eq!(openai["reasoning"]["effort"], "max");
     }
 
     #[test]
