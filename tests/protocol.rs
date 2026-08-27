@@ -251,6 +251,23 @@ fn agent_text(observed: &ObservedHandle, session_id: &str) -> String {
         .join("")
 }
 
+/// The `_meta.router_acp` routing-disclosure object attached to a session's
+/// pin — rides the FIRST forwarded `agent_message_chunk` of a generation
+/// (see session.rs's ordering note). Per-tool proxy attribution carries a
+/// narrower `router_acp` meta of its own, but on `tool_call` updates, not
+/// `agent_message_chunk`, so filtering to the latter is enough to land on
+/// the full disclosure.
+fn routing_meta_for(observed: &ObservedHandle, session_id: &str) -> Option<serde_json::Value> {
+    observed
+        .lock()
+        .unwrap()
+        .updates
+        .iter()
+        .filter(|n| n.session_id.0.as_ref() == session_id)
+        .filter(|n| matches!(n.update, SessionUpdate::AgentMessageChunk(_)))
+        .find_map(|n| n.meta.as_ref()?.get("router_acp").cloned())
+}
+
 fn temp_state_file(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "router-acp-test-{tag}-{}.db",
@@ -5521,6 +5538,56 @@ async fn ticket_fetch_failure_fails_open() {
         assert!(
             text.contains("echo:m1:Fix HAI-77 please"),
             "original prompt passed through unchanged: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ticket_enrichment_chars_rides_the_pin_and_resets_next_turn() {
+    // A host measuring fixed per-turn context (e.g. a startup-cost check)
+    // needs to tell "the ticket was big" apart from an actual settings
+    // regression — that's what this field exists for.
+    let state = temp_state_file("ticket-enrich-chars");
+    let log = temp_log("ticket-enrich-chars");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         ticket_context:\n\
+         \x20 - prefix: \"ABC-\"\n\
+         \x20   command: [\"/bin/sh\", \"-c\", \"printf 'body of $TICKET'\"]\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+
+        prompt_text(&cx, &sid, "Fix ABC-500").await?;
+        let expected_chars = router_acp::tickets::frame_ticket("ABC-500", "body of ABC-500").len();
+        let meta = routing_meta_for(&observed, &sid).expect("first chunk carries routing meta");
+        assert_eq!(
+            meta.get("ticket_enrichment_chars"),
+            Some(&serde_json::json!(expected_chars)),
+            "meta: {meta:?}"
+        );
+
+        // Same session, a turn that references no ticket at all. The full
+        // disclosure only rides a (re)pin, so assert the reset on session
+        // state directly: were a switch/failover to rebuild `details` on this
+        // turn, this is the value it would read.
+        prompt_text(&cx, &sid, "now just chatting").await?;
+        let pending = shared
+            .with_session(&sid, |s| s.pending_ticket_enrichment_chars)
+            .expect("session exists");
+        assert_eq!(
+            pending, None,
+            "must not carry the prior turn's enrichment forward"
         );
         Ok(())
     })
