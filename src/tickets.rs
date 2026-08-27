@@ -141,6 +141,10 @@ pub async fn enrich_prompt(
     router_sid: &str,
     req: PromptRequest,
 ) -> PromptRequest {
+    // Reset every turn regardless of outcome below — this must never carry a
+    // prior turn's enrichment (or lack of it) forward. Set again near the end
+    // only if this turn actually injects something.
+    shared.with_session(router_sid, |s| s.pending_ticket_enrichment_chars = None);
     let rules = &shared.cfg.ticket_context;
     if rules.is_empty() {
         return req;
@@ -160,6 +164,7 @@ pub async fn enrich_prompt(
     }
 
     let mut blocks: Vec<ContentBlock> = Vec::new();
+    let mut injected_chars = 0usize;
     for (rule_idx, id) in refs {
         // Once per session: a re-mention doesn't re-inject.
         let already = shared
@@ -208,11 +213,16 @@ pub async fn enrich_prompt(
                 body.len()
             ),
         );
-        blocks.push(ContentBlock::from(frame_ticket(&id, &body)));
+        let framed = frame_ticket(&id, &body);
+        injected_chars += framed.len();
+        blocks.push(ContentBlock::from(framed));
     }
     if blocks.is_empty() {
         return req;
     }
+    shared.with_session(router_sid, |s| {
+        s.pending_ticket_enrichment_chars = Some(injected_chars);
+    });
     blocks.extend(req.prompt.clone());
     let sid = sid_str(&req.session_id);
     PromptRequest::new(sid, blocks).meta(req.meta.clone())

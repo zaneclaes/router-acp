@@ -288,6 +288,12 @@ pub struct RouterSession {
     /// Ticket ids already injected into this session's context (a re-mention
     /// doesn't re-inject the same ticket).
     pub injected_tickets: HashSet<String>,
+    /// Chars of framed ticket content `enrich_prompt` injected on the
+    /// CURRENT turn (`None` when nothing was injected). Reset at the top of
+    /// every `enrich_prompt` call so a prior turn's value never carries
+    /// forward; read (not taken) when building `details` so it survives a
+    /// same-turn failover retry rebuilding that JSON more than once.
+    pub pending_ticket_enrichment_chars: Option<usize>,
     /// Why the current pin is *elevated* above what plain routing would pick
     /// ("escalation", "auto-upgrade", "skill `ship-pr`"), or `None` for an
     /// un-elevated pin. Explicit user picks never set this. Demotion
@@ -389,6 +395,7 @@ impl RouterSession {
             preclass_profile: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
+            pending_ticket_enrichment_chars: None,
             elevation: None,
             elevation_skill: None,
             quiet_turns: 0,
@@ -446,6 +453,7 @@ impl RouterSession {
             preclass_profile: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
+            pending_ticket_enrichment_chars: None,
             elevation: None,
             elevation_skill: None,
             quiet_turns: 0,
@@ -3193,6 +3201,16 @@ async fn pin_session(
                     "reason": rc.reason,
                     "weights": rc.weights,
                     "note": rc.note,
+                    // Chars of ticket content `enrich_prompt` injected into THIS
+                    // turn (absent when nothing was injected). Read, not taken —
+                    // `details` can be rebuilt more than once per turn across a
+                    // same-turn failover retry, and every rebuild describes the
+                    // same enriched prompt. A host measuring fixed per-turn
+                    // context can subtract this the same way it already
+                    // subtracts the user's own prompt chars.
+                    "ticket_enrichment_chars": shared
+                        .with_session(router_sid, |s| s.pending_ticket_enrichment_chars)
+                        .flatten(),
                     "failover": is_failover,
                     "skipped": skipped_json,
                     "cordoned": cordons_json,
