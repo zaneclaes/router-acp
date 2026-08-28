@@ -4320,8 +4320,8 @@ fn resolve_reviewers(
 /// multi-part task list is auto-detected. This recreates the goose orchestrate
 /// recipe entirely in-process: the planner decomposes the task, drives
 /// `delegate_task` sub-sessions (each routed per-complexity), has a
-/// different-lineage peer review the net result, adjudicates fixes, and submits
-/// per the configured gate. It is guidance to the model, not a hard state
+/// different-lineage peer review the net result, and adjudicates fixes. It is
+/// guidance to the model, not a hard state
 /// machine — the delegation pool relaxation (peer/same-tier) is what makes the
 /// cross-lineage review routeable, and the explicit reviewer ids + the ban on
 /// the model's built-in sub-agent tool are what keep the review off the
@@ -4340,37 +4340,18 @@ fn build_orchestration_instructions(
     } else {
         format!("The user's message below is a multi-part task ({parts} parts detected).")
     };
-    // The review pass is skippable in two ways — no cross-lineage reviewer
-    // exists, or the planner's stated confidence clears the configured bar —
-    // EXCEPT under `submit: merge`, where an approving review is the merge
-    // gate and is therefore never skipped.
-    let merging = o.submit == "merge";
-    let confidence_line = if merging {
-        "The review is MANDATORY here (submit: merge) — never skip it, regardless of confidence."
-            .to_string()
-    } else {
-        format!(
-            "EXCEPTION — confidence skip: if your stated confidence from step 1 (re-assessed \
-             after integration) is strictly greater than {:.2}, SKIP the review pass and say so \
-             in your final report (\"review skipped: confidence X > {:.2}\"); otherwise run it.",
-            o.review_confidence, o.review_confidence
-        )
-    };
+    let confidence_line = format!(
+        "EXCEPTION — confidence skip: if your stated confidence from step 1 (re-assessed \
+         after integration) is strictly greater than {:.2}, SKIP the review pass and say so \
+         in your final report (\"review skipped: confidence X > {:.2}\"); otherwise run it.",
+        o.review_confidence, o.review_confidence
+    );
     let review_line = if reviewers.is_empty() {
-        if merging {
-            format!(
-                "No candidate of a different lineage than your own (`{lineage}`) is currently \
-                 available, so review on the most capable OTHER model you can reach via \
-                 `delegate_task` (still not yourself). Note this constraint in your report. \
-                 {confidence_line}"
-            )
-        } else {
-            format!(
-                "No candidate of a different lineage than your own (`{lineage}`) is currently \
-                 available: SKIP the review pass entirely and note in your final report that it \
-                 was skipped for lack of a cross-lineage reviewer."
-            )
-        }
+        format!(
+            "No candidate of a different lineage than your own (`{lineage}`) is currently \
+             available: SKIP the review pass entirely and note in your final report that it \
+             was skipped for lack of a cross-lineage reviewer."
+        )
     } else {
         let ids = reviewers
             .iter()
@@ -4383,26 +4364,13 @@ fn build_orchestration_instructions(
              own `{lineage}` lineage. {confidence_line}"
         )
     };
-    let submit_line = match o.submit.as_str() {
-        "never" => {
-            "Do NOT push, open a PR, or merge. Report the branch (if any) and the review verdict."
-        }
-        "branch" => {
-            "Once the review approves (or was legitimately skipped per step 3), commit the work \
-             on a fresh branch off HEAD (never commit to main/master). Do not open a PR or merge."
-        }
-        "pr" => {
-            "Once the review approves (or was legitimately skipped per step 3), commit on a fresh \
-             branch and open/update a PR with `gh pr create` (body: the success criteria, a \
-             subtask→model table, and the reviewer verdict — or the review-skip reason). Do NOT \
-             merge."
-        }
-        "merge" => {
-            "Once — and only once — the review approves, commit on a fresh branch, open/update the \
-             PR, and as the FINAL action merge it (`gh pr merge`, honoring branch protection). \
-             Never merge before an approving review; never force-push; never push to main directly."
-        }
-        _ => "",
+    let host_instructions = if o.instructions.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "HOST-SUPPLIED ORCHESTRATION INSTRUCTIONS:\n{}\n",
+            o.instructions.trim()
+        )
     };
     let rounds = o.max_fix_rounds;
     format!(
@@ -4414,6 +4382,7 @@ fn build_orchestration_instructions(
          `spawn`) for these: those run inside your own model lineage and are invisible to the \
          router, which defeats both per-subtask model routing and the cross-lineage review. If \
          `delegate_task` is not loaded yet, load it first, then use it.\n\
+         {host_instructions}\
          CRITICAL — RUN INDEPENDENT SUBTASKS IN PARALLEL: your client executes tool calls one at \
          a time, so N plain `delegate_task` calls run the subtasks serially. Instead, dispatch \
          every independent subtask with `background: true` — each call returns a `b-…` id \
@@ -4443,13 +4412,9 @@ fn build_orchestration_instructions(
          4. ADJUDICATE (only if a review ran). For each blocking issue, delegate a targeted fix \
          and re-review. At most {rounds} fix rounds; if still not approved, stop and report what \
          remains.\n\
-         5. SUBMIT. {submit_line} Any skill or command the task names for the END of the work \
-         (shipping, opening/merging a PR, deploying) runs ONLY here — after the work is done and \
-         the review approves — never up front; a half-done change is not shippable.\n\
          Finally, report: the success criteria and how each is met; per-subtask outcomes (and \
          which model the router chose for each); the review verdict history — or the exact reason \
-         the review was skipped (no cross-lineage reviewer, or your confidence vs. the bar) — and \
-         what was submitted (or why not).\n\
+         the review was skipped (no cross-lineage reviewer, or your confidence vs. the bar).\n\
          [end orchestration protocol — the user's task follows]"
     )
 }
@@ -5006,7 +4971,7 @@ const HANDOFF_SUMMARY_INSTRUCTION: &str = "You are about to hand this conversati
 /// The terse counterpart, used by a `terse_handoff` skill route. The incoming
 /// model is about to run a named workflow that re-derives its own state, so a
 /// narrative summary is not just unnecessary — it is a liability: a long
-/// session may mention several PRs, branches and abandoned approaches, and the
+/// session may mention several identifiers and abandoned approaches, and the
 /// briefing is where the wrong one gets picked up. Ask for one referent, not a
 /// story, and make "unknown" an explicitly allowed answer so the outgoing
 /// model does not fill the slot with a guess.
@@ -5016,13 +4981,13 @@ const HANDOFF_TERSE_INSTRUCTION: &str = "You are about to hand this conversation
      lines:\n\
      1. TASK: the work to be done, in one line, naming the skill or workflow \
      if one is in play.\n\
-     2. SUBJECT: the single concrete identifier it operates on (PR number, \
-     branch, ticket) — write `unknown` if none is established. Never guess, \
+     2. SUBJECT: the single concrete identifier it operates on — write \
+     `unknown` if none is established. Never guess, \
      and never list more than one; if several came up, name only the one this \
      work is on.\n\
      3. NOT RE-DERIVABLE: any decision already made that the new model could \
-     NOT rediscover from the repository — e.g. a review finding judged a false \
-     positive, or a flaky test agreed to be re-run. Write `none` if there is \
+     NOT rediscover from authoritative host state — e.g. a review finding \
+     judged a false positive, or a flaky test agreed to be re-run. Write `none` if there is \
      nothing.\n\
      Omit files changed, commands run, and findings — the new model re-derives \
      those. Do not continue the task.";
@@ -5155,10 +5120,10 @@ fn frame_terse(from: &CandidateId, briefing: &str, transcript_cmd: &str) -> Stri
     format!(
         "[Handoff context — you are picking up work in progress from {from}. This is a \
          deliberately TERSE briefing, not a summary: it carries the task, its subject, and \
-         anything not re-derivable from the repository, and nothing else.\n\
-         Re-derive concrete state yourself (git status/log, `gh pr view` on the current branch, \
-         the ticket) rather than assuming it. Verify any identifier below before you act on it, \
-         and if it reads `unknown`, resolve it from the repository — do not guess.\n\
+         anything not re-derivable from authoritative host state, and nothing else.\n\
+         Re-derive concrete state from the host context and available tools rather than assuming \
+         it. Verify any identifier below before you act on it, and if it reads `unknown`, resolve \
+         it from authoritative host state — do not guess.\n\
          The full prior transcript, including tool calls, is available if you need detail this \
          briefing omits:\n\
          \x20   {transcript_cmd}\n\
@@ -6540,9 +6505,8 @@ async fn dispatch_prompt(
     };
 
     // Auto-orchestration runs next: a multi-part / pre-class-warranted task
-    // orchestrates even if it names a skill — the planner decides when to invoke
-    // that skill, and end-of-work skills (shipping, PRs) run last. Suppressed
-    // only by an explicit `[router: …]` directive or `model:` shorthand;
+    // orchestrates even if it names a skill. Suppressed only by an explicit
+    // `[router: …]` directive or `model:` shorthand;
     // FORCED unconditionally by the `orchestrate:` prefix.
     let orchestrating_now = if force_orchestrate || !explicit_routing {
         maybe_trigger_orchestration(
@@ -7056,6 +7020,7 @@ mod escalation_signal_tests {
 mod orchestration_unit_tests {
     use super::build_background_instructions;
     use super::build_orchestration_instructions;
+    use super::frame_terse;
     use super::is_native_subagent_tool;
     use super::previous_turn_solicited_answers as solicited;
     use crate::candidate::CandidateId;
@@ -7091,6 +7056,45 @@ mod orchestration_unit_tests {
     }
 
     #[test]
+    fn protocol_keeps_lifecycle_policy_host_owned() {
+        let cfg = cfg_with("  enabled: true\n  instructions: custom-host-rule");
+        let planner = CandidateId::new("claude", "sonnet");
+        let reviewer = CandidateId::new("codex", "gpt-5.5");
+        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
+
+        assert!(
+            text.contains("HOST-SUPPLIED ORCHESTRATION INSTRUCTIONS"),
+            "{text}"
+        );
+        assert!(text.contains("custom-host-rule"), "{text}");
+        for forbidden in [
+            "gh pr",
+            "pull request",
+            "commit and push",
+            "fresh branch",
+            "SUBMIT.",
+            "repository's required",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden:?} leaked into: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn terse_handoff_does_not_assume_repository_tools() {
+        let from = CandidateId::new("agent", "model");
+        let text = frame_terse(&from, "TASK: continue", "router-acp transcript");
+        for forbidden in ["git status", "gh pr", "current branch", "the ticket"] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden:?} leaked into: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn managed_backgrounds_forbid_provider_private_shells() {
         let text = build_background_instructions();
         assert!(text.contains("background_start"), "{text}");
@@ -7120,30 +7124,6 @@ mod orchestration_unit_tests {
             "no-lineage case must skip, not same-lineage review: {text}"
         );
         assert!(text.contains("lack of a cross-lineage reviewer"), "{text}");
-    }
-
-    #[test]
-    fn merge_submit_never_skips_the_review() {
-        let cfg = cfg_with("  enabled: true\n  submit: merge\n  review_confidence: 0.1");
-        let planner = CandidateId::new("claude", "sonnet");
-        let reviewer = CandidateId::new("codex", "gpt-5.5");
-        let with_reviewer = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
-        assert!(with_reviewer.contains("MANDATORY"), "{with_reviewer}");
-        assert!(
-            !with_reviewer.contains("SKIP the review pass and say so"),
-            "{with_reviewer}"
-        );
-        // Even with no cross-lineage reviewer, a merge submit reviews on the
-        // most capable other model rather than skipping.
-        let no_reviewer = build_orchestration_instructions(&cfg, 3, false, &planner, &[]);
-        assert!(
-            no_reviewer.contains("most capable OTHER model"),
-            "{no_reviewer}"
-        );
-        assert!(
-            !no_reviewer.contains("SKIP the review pass entirely"),
-            "{no_reviewer}"
-        );
     }
 
     #[test]

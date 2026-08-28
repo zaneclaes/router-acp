@@ -522,10 +522,9 @@ your enumerated reply as answers and relays normally), and with **no** explicit
    routeable. (Ordinary delegation stays cheaper-only.)
 
 Orchestration **takes precedence over `skill_routing`**: a multi-part task list
-orchestrates even if it names a skill (e.g. `ship-pr`). Skill routing only fires
-for a skill invocation that is *not* a multi-part task. Inside orchestration the
-planner decides when to invoke a named skill — end-of-work skills (shipping,
-opening/merging a PR) run last, after the work is done and reviewed.
+orchestrates even if it names a skill. Skill routing only fires for a skill
+invocation that is *not* a multi-part task. Host-owned workflow policy is not
+interpreted by router-acp.
 
 ```yaml
 orchestration:
@@ -533,9 +532,9 @@ orchestration:
   min_items: 2
   planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"]   # best first
   reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]             # a different lineage than the planner
-  submit: branch                # never | branch | pr | merge (merge only after review approves)
+  instructions: ""             # optional opaque host-owned workflow policy
   max_fix_rounds: 2
-  review_confidence: 0.8        # planner confidence above this skips the review (never under merge)
+  review_confidence: 0.8        # planner confidence above this skips the review
 ```
 
 The planner iterates on a subtask by keeping its sub-agent open

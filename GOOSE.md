@@ -479,14 +479,14 @@ orchestration:
   enabled: true
   planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"]
   reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]
-  submit: branch        # never | branch | pr | merge (merge only after review approves)
+  instructions: ""     # optional opaque host-owned workflow policy
 ```
 
 Then just type a multi-part task in any goose session — a markdown list,
 `(1)…(2)…`, or "first… then… finally…". The router pins a planner frontier
 model, decomposes the task, fans the parts out to routed sub-sessions via its
-`delegate_task` tool, has a different-lineage model review the result, and
-submits per `submit`. You'll see `router-acp · orchestrating a N-part task on …`
+`delegate_task` tool, and has a different-lineage model review the result.
+You'll see `router-acp · orchestrating a N-part task on …`
 inline; the planner and every subtask are recorded (sharing `run_label
 = orchestrate`) in `~/.local/state/router-acp/sessions.db`.
 

@@ -115,15 +115,14 @@ skill_routing:
 
 # Auto-orchestration of multi-part task lists. When a prompt reads as a list
 # (markdown bullets/numbers, inline "(1)(2)", or "first… then… finally…") the
-# router runs a plan→delegate→review→submit pipeline entirely in-process:
+# router runs a plan→delegate→review pipeline entirely in-process:
 # it steers/switches the session onto a `planner` frontier model and injects an
 # orchestration protocol telling that model to decompose the task, delegate the
 # independent parts IN PARALLEL via `delegate_task background: true` +
 # `delegate_await` (each routed per-complexity in its own sub-session), have a
 # DIFFERENT-lineage `reviewer` verify the net result — skipped with a note when
 # no other lineage is routeable or the planner's stated confidence exceeds
-# `review_confidence` (never skipped under `submit: merge`) — adjudicate fixes,
-# and submit per `submit`. Orchestrating sessions may delegate to same-/higher-
+# `review_confidence` — and adjudicate fixes. Orchestrating sessions may delegate to same-/higher-
 # tier peers (so the cross-lineage review is routeable), and the planner can
 # hold a sub-agent open across review→fix rounds (keep_open + delegate_followup).
 # An explicit `[router: …]` directive or `model:` shorthand suppresses it.
@@ -133,7 +132,7 @@ orchestration:
   min_items: 2                              # smallest list treated as multi-part
   planner: ["*fable*", "*sol*", "*grok*"] # best first
   reviewer: ["*sol*", "*fable*", "*grok*"] # a different lineage will be preferred
-  submit: branch                            # never | branch | pr | merge
+  instructions: ""                         # optional opaque host-owned workflow policy
   max_fix_rounds: 2
   review_confidence: 0.8                    # planner confidence above this skips the review
 

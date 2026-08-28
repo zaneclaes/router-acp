@@ -310,22 +310,21 @@ show its output and status, and cancel it independently of foreground turns.
 
 ## Auto-orchestration
 
-When a prompt reads as a **multi-part task list**, the router can run an entire plan → parallel-delegate → cross-lineage-review → submit pipeline itself, in-process, instead of answering the list in one turn. Turn it on with `orchestration.enabled` (off by default); it steers (pre-pin) or switches (mid-session) the session onto a **planner** frontier model and injects an orchestration protocol instructing that model to:
+When a prompt reads as a **multi-part task list**, the router can run an entire plan → parallel-delegate → cross-lineage-review pipeline itself, in-process, instead of answering the list in one turn. Turn it on with `orchestration.enabled` (off by default); it steers (pre-pin) or switches (mid-session) the session onto a **planner** frontier model and injects an orchestration protocol instructing that model to:
 
 1. **Plan** — restate the task as success criteria, split it into file-disjoint, self-contained subtasks, and state a confidence (0.0–1.0) that the plan will satisfy the criteria.
 2. **Delegate — in parallel** — dispatch independent subtasks via `delegate_task background: true` + `delegate_await`, each routed per-complexity in its own sub-session.
-3. **Review** — after every implementation subtask is collected, delegate an independent review to a candidate of a **different lineage** than the planner (`reviewer` globs), handing it the original task verbatim. Skipped, with a note, when no cross-lineage reviewer is available or the planner's stated confidence exceeds `review_confidence` — except under `submit: merge`, where the review is never skipped.
+3. **Review** — after every implementation subtask is collected, delegate an independent review to a candidate of a **different lineage** than the planner (`reviewer` globs), handing it the original task verbatim. Skipped, with a note, when no cross-lineage reviewer is available or the planner's stated confidence exceeds `review_confidence`.
 4. **Adjudicate** — fix blocking issues and re-review, bounded by `max_fix_rounds`.
-5. **Submit** — per the `submit` gate (`never | branch | pr | merge`); a merge is only permitted after an approving review.
 
-The one thing this needs beyond ordinary delegation is **peer delegation**: an orchestrating session may delegate to *same-* or *higher*-tier candidates, not just strictly-cheaper ones, so the cross-lineage reviewer is actually reachable. Everything else — the decomposition, the review, the submission gate — is the planner model following the injected protocol with its own tools plus `delegate_task`/`delegate_followup`.
+The one thing this needs beyond ordinary delegation is **peer delegation**: an orchestrating session may delegate to *same-* or *higher*-tier candidates, not just strictly-cheaper ones, so the cross-lineage reviewer is actually reachable. Everything else — decomposition and review — is the planner model following the injected protocol with its own tools plus `delegate_task`/`delegate_followup`. Lifecycle and integration policy belongs to the host; `orchestration.instructions` appends opaque host-owned text that router-acp does not interpret.
 
 **What decides a prompt is a task list** is one of two paths:
 
 - **The pre-classifier** (recommended — see [Task classification](#task-classification)), when `pre_classifier.enabled`: its `orchestrate` verdict (`warranted`, `confidence`, `estimated_parts`) decides, gated on `confidence >= pre_classifier.orchestrate_min_confidence` (default `0.65`). One evaluation covers this and any host dimensions in the same call.
 - **The legacy detector**, when the pre-classifier is off: `src/tasklist.rs` recognizes markdown numbers (`1. …`), markdown bullets (`- …`), inline enumeration (`… (1) … (2) …`), and ordered prose ("first … then … finally …"), triggering once a prompt reaches `orchestration.min_items` parts.
 
-Either way, orchestration fires on **any** prompt (fresh or mid-session), **takes precedence over `skill_routing`** (a multi-part list orchestrates even if it names a skill like `ship-pr` — the planner decides when to invoke that skill, and end-of-work skills like shipping run *after* the work is done and reviewed, never up front), and is **suppressed** by an explicit `[router: …]` directive or `model:` shorthand, and when the "list" is actually you answering the model's own enumerated questions (it asked "Open decisions: (1)… (2)…" and you replied with a matching list). Each trigger is disclosed (`router-acp · orchestrating a N-part task on …`).
+Either way, orchestration fires on **any** prompt (fresh or mid-session), **takes precedence over `skill_routing`**, and is **suppressed** by an explicit `[router: …]` directive or `model:` shorthand, and when the "list" is actually you answering the model's own enumerated questions (it asked "Open decisions: (1)… (2)…" and you replied with a matching list). Each trigger is disclosed (`router-acp · orchestrating a N-part task on …`).
 
 Two related prompt features:
 
@@ -413,13 +412,13 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `delegation.complexity_cap` | `0.6` | Ceiling on a delegated subtask's classified complexity, so a long, fully-specified brief doesn't misread as maximum difficulty and route every subtask to the priciest candidate. `1.0` disables it. |
 | `ROUTER_ACP_MCP_CATALOGS` (env) | unset | JSON seed for `delegate_mcp_catalogs` when no client connection can ever send the `router-acp/delegate_mcp_catalogs` notification. Fails open on absent/malformed content. |
-| `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review→submit protocol. |
+| `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review protocol. |
 | `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task (legacy detector only; the pre-classifier decides via `orchestrate_min_confidence` instead). |
 | `orchestration.planner[]` | frontier globs | Planner/orchestrator candidate globs — they define the pool; the pick is by preference-adjusted quality (`quality + agents[].preference`), glob order breaking ties. |
 | `orchestration.reviewer[]` | frontier globs | Preferred cross-lineage reviewer globs handed to the orchestrator (it should pick a different lineage than the planner). |
-| `orchestration.submit` | `branch` | Submission gate given to the orchestrator: `never \| branch \| pr \| merge` (a merge is only permitted after the review approves). |
+| `orchestration.instructions` | `""` | Opaque host-owned workflow instructions appended to the planner prompt; router-acp does not interpret them. |
 | `orchestration.max_fix_rounds` | `2` | Max review → fix → re-review rounds. |
-| `orchestration.review_confidence` | `0.8` | Planner self-confidence bar (0.0–1.0) for skipping the review pass: strictly above it, the review is skipped with a note. Ignored under `submit: merge` (a merge always requires an approving review). |
+| `orchestration.review_confidence` | `0.8` | Planner self-confidence bar (0.0–1.0) for skipping the review pass: strictly above it, the review is skipped with a note. |
 
 ### Per-request LLM proxy
 
