@@ -491,12 +491,12 @@ pub struct SkillRoute {
 
 /// Automatic orchestration. When a prompt reads as a multi-part task list
 /// (markdown list, inline `(1)(2)`, or "first … then … finally" ordering), the
-/// router runs a plan → delegate → review → submit pipeline entirely in-process:
+/// router runs a plan → delegate → review pipeline entirely in-process:
 /// it steers/switches the session to a `planner` model and injects an
 /// orchestration protocol instructing that model to decompose the task, delegate
 /// each part via `delegate_task` (routed per-complexity in isolated
-/// sub-sessions), have a different-lineage `reviewer` verify the net result, and
-/// submit per `submit`. Delegation in an orchestrating session is allowed to
+/// sub-sessions), and have a different-lineage `reviewer` verify the net result.
+/// Delegation in an orchestrating session is allowed to
 /// same-/higher-tier peers (so cross-lineage review works), unlike ordinary
 /// cost-shedding delegation. An explicit `[router: …]` directive or `model:`
 /// shorthand on the prompt suppresses auto-orchestration.
@@ -520,17 +520,18 @@ pub struct OrchestrationConfig {
     /// than the planner for the review pass.
     #[serde(default = "default_reviewer")]
     pub reviewer: Vec<String>,
-    /// Submission gate handed to the orchestrator: `never` | `branch` | `pr` |
-    /// `merge`. A merge is only permitted after the review pass approves.
-    #[serde(default = "default_submit")]
-    pub submit: String,
+    /// Opaque host-owned instructions appended to the orchestration protocol.
+    /// The router does not interpret this text; workflow policy belongs to the
+    /// host rather than router-acp.
+    #[serde(default)]
+    pub instructions: String,
     /// Maximum review → fix → re-review rounds.
     #[serde(default = "default_max_fix_rounds")]
     pub max_fix_rounds: u32,
     /// Planner self-confidence bar for skipping the review pass. After
     /// integrating, the planner states its confidence (0.0–1.0) that the
     /// implementation is correct; strictly above this bar the review is
-    /// skipped with a note. `submit: merge` always reviews regardless.
+    /// skipped with a note.
     #[serde(default = "default_review_confidence")]
     pub review_confidence: f64,
 }
@@ -560,10 +561,6 @@ fn default_reviewer() -> Vec<String> {
     ]
 }
 
-fn default_submit() -> String {
-    "branch".to_string()
-}
-
 fn default_max_fix_rounds() -> u32 {
     2
 }
@@ -579,7 +576,7 @@ impl Default for OrchestrationConfig {
             min_items: default_min_items(),
             planner: default_planner(),
             reviewer: default_reviewer(),
-            submit: default_submit(),
+            instructions: String::new(),
             max_fix_rounds: default_max_fix_rounds(),
             review_confidence: default_review_confidence(),
         }
@@ -1729,15 +1726,6 @@ impl Config {
                     "orchestration.min_items must be at least 2".into(),
                 ));
             }
-            if !matches!(
-                self.orchestration.submit.as_str(),
-                "never" | "branch" | "pr" | "merge"
-            ) {
-                return Err(ConfigError(format!(
-                    "orchestration.submit must be never|branch|pr|merge, got `{}`",
-                    self.orchestration.submit
-                )));
-            }
             if !(0.0..=1.0).contains(&self.orchestration.review_confidence) {
                 return Err(ConfigError(format!(
                     "orchestration.review_confidence must be within 0.0..=1.0, got `{}`",
@@ -1876,6 +1864,7 @@ agents:
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
         assert_eq!(cfg.orchestration.review_confidence, 0.8);
+        assert!(cfg.orchestration.instructions.is_empty());
         assert!(!cfg.llm_proxy.enabled);
         assert_eq!(cfg.llm_proxy.minimum_dwell_requests, 12);
     }
@@ -1905,6 +1894,16 @@ agents:
         );
         let cfg = Config::from_yaml(&yaml).unwrap();
         assert_eq!(cfg.orchestration.review_confidence, 0.95);
+    }
+
+    #[test]
+    fn parses_host_owned_orchestration_instructions() {
+        let yaml = format!(
+            "orchestration:\n  enabled: true\n  instructions: follow-host-policy\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.orchestration.instructions, "follow-host-policy");
     }
 
     #[test]

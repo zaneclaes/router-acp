@@ -423,8 +423,7 @@ SDK traps below, which were all discovered the hard way.
   detection. **Precedence:** it runs BEFORE `skill_routing`, and
   `skill_routing` is gated on `!orchestrating_now` — so a multi-part task list
   *always* orchestrates even if it names a skill; the planner decides when to
-  invoke that skill (end-of-work skills like shipping run last, per the injected
-  protocol's step 5). Skill routing only fires for a skill invocation that is
+  invoke that skill. Skill routing only fires for a skill invocation that is
   NOT a multi-part task. It is ALSO suppressed when the list answers the model's
   own questions: `previous_turn_solicited_answers` inspects the prior agent turn
   (`s.turn_output`, still the previous turn at `on_prompt` time — cleared later in
@@ -442,9 +441,11 @@ SDK traps below, which were all discovered the hard way.
   reviewer is routeable — this is the ONLY router-level change; the pipeline
   itself is the planner following the injected protocol with `delegate_task` +
   the multi-turn `keep_open`/`delegate_followup`/`delegate_close` tools. It
-  implements the plan → delegate → cross-lineage review → submit pipeline
+  implements the plan → delegate → cross-lineage review pipeline
   in-process (the former goose `orchestrate.yaml` recipe was removed — the router
-  owns this now), working from any ACP client.
+  owns this now), working from any ACP client. Lifecycle and integration policy
+  is host-owned opaque text in `orchestration.instructions`; router-acp does not
+  define or interpret it.
   `close_live_delegates_for` reaps kept-open sub-sessions on
   session/close|delete. `maybe_trigger_orchestration` also sets
   `run_label = "orchestrate"` (so the planner + its delegate rows group) and
@@ -603,7 +604,7 @@ fails.
   visibility, tuning table)
 - `examples/router-full.yaml`, `examples/router-preferred.yaml` — annotated configs
 - `ORCHESTRATION.md` — the router-native auto-orchestration pipeline
-  (plan → delegate → cross-lineage review → submit; there is no longer a goose recipe)
+  (plan → delegate → cross-lineage review; there is no longer a goose recipe)
 - `PLAN.md` — the active follow-on plan (the original build spec was
   completed and removed); post-spec deviations (failover, complexity-scaled
   tradeoff, preference, directives) are documented in README/AGENTS.

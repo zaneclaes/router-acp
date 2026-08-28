@@ -1,4 +1,4 @@
-# Orchestration: plan → parallel subtasks → cross-lineage review → submit
+# Orchestration: plan → parallel subtasks → cross-lineage review
 
 router-acp orchestrates compound tasks **itself**, in-process. When a prompt
 reads as a multi-part task list, the router pins a frontier **planner** model and
@@ -6,8 +6,8 @@ injects an orchestration protocol; the planner decomposes the work, fans it out
 **in parallel** to router-routed sub-sessions via the `delegate_task` tool
 (`background: true` + `delegate_await`), has a **different-lineage** model review
 the result — or skips the review, with a note, when no other lineage is
-routeable or its own confidence clears the configured bar — adjudicates fixes,
-and submits per a gate. No goose recipe, no `summon` extension, no wrapper script — it works from
+routeable or its own confidence clears the configured bar — and adjudicates
+fixes. No goose recipe, no `summon` extension, no wrapper script — it works from
 any ACP client (goose, Zed, a plain script) and even a plain chat turn.
 
 > This replaces the old goose `orchestrate.yaml` recipe (removed). The recipe
@@ -32,7 +32,7 @@ you: "Fix the bugs in issue X: (1)… (2)… (3)…"
 │ REVIEW  delegate_task(hints.candidate = a DIFFERENT lineage)                │
 │ re-derives criteria from the ORIGINAL task, diffs, runs tests → verdict     │
 │        ▼                                                                    │
-│ fix rounds (bounded, delegate_followup) → on approve: branch / PR / merge   │
+│ fix rounds (bounded, delegate_followup) → report outcome to the host        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -99,11 +99,9 @@ handoff). It is **not** triggered when:
   enumerated reply is treated as answers and relayed normally.
 
 Auto-orchestration **outranks `skill_routing`**: a multi-part task list
-orchestrates even if it names a skill (e.g. `ship-pr`). `skill_routing` only
-takes over for a skill invocation that is *not* a multi-part task. A skill the
-task wants at the end (shipping, opening/merging a PR) is the planner's to run —
-the protocol's step 5 tells it to do that only after the work is done and
-reviewed, never up front.
+orchestrates even if it names a skill. `skill_routing` only takes over for a
+skill invocation that is *not* a multi-part task. Host-owned workflow policy is
+not interpreted by router-acp.
 
 Two ways to feed it more than the literal prompt:
 
@@ -135,6 +133,7 @@ Every trigger is disclosed: `router-acp · orchestrating a N-part task on <model
    by reading *its* prompt, so the planner is told to describe difficulty
    honestly. Dependent subtasks start only after their prerequisites are
    collected.
+
 3. **Review (different lineage) — after all implementation subtasks are
    collected.** Delegate a review via `delegate_task`, passing `hints.candidate`
    set to a concrete candidate of a **different lineage** than the planner (the
@@ -143,15 +142,14 @@ Every trigger is disclosed: `router-acp · orchestrating a N-part task on <model
    **skips the review — noting the reason in its report** — when no
    cross-lineage reviewer is routeable, or when its stated confidence
    (re-assessed after integration) is strictly greater than
-   `orchestration.review_confidence`. Under `submit: merge` the review is never
-   skipped.
+   `orchestration.review_confidence`.
 4. **Adjudicate** (only if a review ran). Fix blocking issues (a targeted
    `delegate_task`, or `delegate_followup` to iterate on a kept-open sub-agent)
    and re-review, up to `max_fix_rounds`.
-5. **Submit.** Per `orchestration.submit` — `never | branch | pr | merge`. A
-   merge is only permitted **after** an approving review. Any end-of-work skill
-   the task named (shipping, opening/merging a PR, deploying) runs here — last,
-   never up front.
+
+The router stops at an implementation/review outcome. Hosts own lifecycle and
+integration policy. They may append opaque `orchestration.instructions`; the
+router passes that text to the planner without interpreting it.
 
 ## What the router provides vs. what is instruction
 
@@ -178,7 +176,7 @@ orchestration:
   min_items: 2                                        # smallest list treated as multi-part
   planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"] # best first; first eligible wins
   reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]          # preferred; a DIFFERENT lineage is enforced
-  submit: branch                                      # never | branch | pr | merge
+  instructions: ""                                   # optional opaque host policy
   max_fix_rounds: 2
   review_confidence: 0.8                              # skip the review above this planner confidence
 ```
@@ -190,17 +188,15 @@ orchestration:
   biases the planner seat. The reviewer is always forced onto a lineage other
   than the planner's when one is available; if only the planner's lineage is
   routeable, the review is skipped with a note (a same-lineage review shares
-  the planner's failure modes) — except under `submit: merge`, where it runs on
-  the most capable other model instead (disclosed).
+  the planner's failure modes).
 - **`review_confidence`** (default `0.8`) is the planner-confidence bar for
   skipping the review: the planner states a 0.0–1.0 confidence at plan time,
   re-assesses it after integrating the subtask results, and skips the review —
   noting the skip and the number in its report — when it is strictly above the
   bar. Set it to `1.0` to make the review effectively unconditional, or low to
-  review only shaky work. Ignored under `submit: merge`.
-- **`submit: merge`** always gates the merge on an approving review — the
-  confidence skip and the no-other-lineage skip both disable themselves. Set
-  `never` to keep everything local.
+  review only shaky work.
+- **`instructions`** is opaque host-owned text appended to the planner prompt.
+  Use it for workflow policy that router-acp must not know or interpret.
 
 ## Why each model ends up where it does
 
@@ -287,7 +283,7 @@ What each metric can and cannot tell you:
   follows; a model that ignores it degrades gracefully to a normal (non-
   orchestrated) turn rather than failing.
 - **Subtasks must be file-disjoint.** Parallel sub-sessions editing the same file
-  will race; the protocol instructs the planner to merge overlapping subtasks.
+  will race; the protocol instructs the planner to combine overlapping subtasks.
 - **Delegation depth is 1.** Delegated sub-sessions do not themselves get the
   delegate tool, so the tree is one level deep by design.
 
