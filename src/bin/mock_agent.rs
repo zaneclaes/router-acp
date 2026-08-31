@@ -16,6 +16,9 @@
 //! - `MOCK_CAPS_IMAGE=1`: advertise the image prompt capability
 //! - `MOCK_LOG`: append JSONL events (initialize/authenticate/new/
 //!   set_config/prompt/cancel) for test assertions
+//! - `MOCK_LIST_DELEGATE_TOOLS=1`: during `session/new`, call `tools/list` on
+//!   the `router-delegate` MCP server and log the names. This is the Codex
+//!   adapter's timing: list happens before the router commits `session.pin`.
 //! - `MOCK_PRECLASS_JSON`: when a prompt contains `[router-acp pre-classifier]`,
 //!   reply with this JSON body (pre-classifier evaluator tests)
 //! - `MOCK_PRECLASS_TOOL=1`: pre-classifier prompts emit a tool call before
@@ -55,11 +58,11 @@ use serde_json::{Value, json};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ContentBlock, ContentChunk, CreateElicitationRequest, ElicitationAction,
-    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, EnumOption,
-    Error as AcpError, Implementation, InitializeRequest, InitializeResponse, McpServer,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
-    ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, EnumOption, Error as AcpError,
+    Implementation, InitializeRequest, InitializeResponse, McpServer, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, StopReason, StringPropertySchema, ToolCall, ToolCallStatus,
@@ -103,6 +106,7 @@ struct Mock {
     fail_prompt_after: u32,
     caps_image: bool,
     log_path: Option<String>,
+    list_delegate_tools: bool,
     state: Mutex<MockState>,
 }
 
@@ -143,6 +147,7 @@ impl Mock {
                 .unwrap_or(0),
             caps_image: std::env::var("MOCK_CAPS_IMAGE").is_ok(),
             log_path: std::env::var("MOCK_LOG").ok(),
+            list_delegate_tools: std::env::var("MOCK_LIST_DELEGATE_TOOLS").is_ok(),
             state: Mutex::new(MockState {
                 authed: false,
                 new_successes: 0,
@@ -296,6 +301,24 @@ impl McpClient {
     async fn shutdown(mut self) {
         let _ = self.child.kill().await;
     }
+}
+
+async fn list_router_delegate_tools(servers: &[McpServer]) -> Result<Vec<String>, String> {
+    let server = servers
+        .iter()
+        .find(|s| matches!(s, McpServer::Stdio(stdio) if stdio.name == "router-delegate"))
+        .ok_or_else(|| "no router-delegate MCP server".to_string())?;
+    let mut client = McpClient::spawn(server).await?;
+    let result = client.request("tools/list", json!({})).await;
+    client.shutdown().await;
+    let result = result?;
+    Ok(result["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect())
 }
 
 async fn run_prompt(
@@ -483,18 +506,22 @@ async fn run_prompt(
                 .split(',')
                 .filter(|e| !e.is_empty())
                 .map(|entry| match entry.strip_suffix('!') {
-                    Some(content) => {
-                        PlanEntry::new(content, PlanEntryPriority::Medium, PlanEntryStatus::InProgress)
-                    }
+                    Some(content) => PlanEntry::new(
+                        content,
+                        PlanEntryPriority::Medium,
+                        PlanEntryStatus::InProgress,
+                    ),
                     None => match entry.strip_suffix('#') {
                         Some(content) => PlanEntry::new(
                             content,
                             PlanEntryPriority::Medium,
                             PlanEntryStatus::Completed,
                         ),
-                        None => {
-                            PlanEntry::new(entry, PlanEntryPriority::Medium, PlanEntryStatus::Pending)
-                        }
+                        None => PlanEntry::new(
+                            entry,
+                            PlanEntryPriority::Medium,
+                            PlanEntryStatus::Pending,
+                        ),
                     },
                 })
                 .collect();
@@ -708,9 +735,9 @@ async fn run_prompt(
         .lines()
         .filter_map(|line| line.trim().strip_prefix("BACKGROUND_START:"))
     {
-        let router_server = mcp_servers
-            .iter()
-            .find(|server| matches!(server, McpServer::Stdio(stdio) if stdio.name == "router-delegate"));
+        let router_server = mcp_servers.iter().find(
+            |server| matches!(server, McpServer::Stdio(stdio) if stdio.name == "router-delegate"),
+        );
         match router_server {
             Some(server) => {
                 let mut client = match McpClient::spawn(server).await {
@@ -912,6 +939,20 @@ async fn main() {
                                     _ => "other".to_string(),
                                 }).collect::<Vec<_>>(),
                             }));
+                            if mock.list_delegate_tools {
+                                match list_router_delegate_tools(&req.mcp_servers).await {
+                                    Ok(tools) => mock.log(json!({
+                                        "event": "delegate_tools",
+                                        "sessionId": sid,
+                                        "tools": tools,
+                                    })),
+                                    Err(error) => mock.log(json!({
+                                        "event": "delegate_tools",
+                                        "sessionId": sid,
+                                        "error": error,
+                                    })),
+                                }
+                            }
                             let option = mock.model_option(&mock.models[0]);
                             let mut resp =
                                 NewSessionResponse::new(sid).config_options(vec![option]);

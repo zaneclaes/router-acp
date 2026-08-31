@@ -150,7 +150,11 @@ where
                             }
                             _ => String::new(),
                         };
-                        observed.lock().unwrap().elicitation_session_ids.push(session_id);
+                        observed
+                            .lock()
+                            .unwrap()
+                            .elicitation_session_ids
+                            .push(session_id);
                         let mut content = std::collections::BTreeMap::new();
                         content.insert(
                             "question_0".to_string(),
@@ -159,7 +163,9 @@ where
                             ),
                         );
                         responder.respond(CreateElicitationResponse::new(
-                            ElicitationAction::Accept(ElicitationAcceptAction::new().content(Some(content))),
+                            ElicitationAction::Accept(
+                                ElicitationAcceptAction::new().content(Some(content)),
+                            ),
                         ))
                     }
                 },
@@ -202,9 +208,7 @@ async fn init(cx: &ConnectionTo<AgentPeer>) -> Result<InitializeResponse, AcpErr
         .await
 }
 
-async fn init_with_terminals(
-    cx: &ConnectionTo<AgentPeer>,
-) -> Result<InitializeResponse, AcpError> {
+async fn init_with_terminals(cx: &ConnectionTo<AgentPeer>) -> Result<InitializeResponse, AcpError> {
     cx.send_request(
         InitializeRequest::new(ProtocolVersion::V1)
             .client_capabilities(ClientCapabilities::new().terminal(true)),
@@ -1753,6 +1757,71 @@ async fn delegate_task_routes_to_lower_cost_candidate() {
                     .and_then(|d| d["text"].as_str())
                     .is_some_and(|text| text.contains("echo:haiku:fix button color"))
         }));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn parent_lists_delegate_tools_during_session_new_before_pin() {
+    // Codex lists MCP tools during session/new, which finishes before the
+    // router commits session.pin. If tools/list keyed off the pin, the parent
+    // would see only background_start.
+    let state = temp_state_file("delegate-tools-list");
+    let log = temp_log("delegate-tools-list");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let cheap = agent_yaml(
+        "cheap",
+        &[("haiku", 1)],
+        &[("MOCK_LOG", &log.display().to_string())],
+    );
+    let fancy = agent_yaml(
+        "fancy",
+        &[("opus", 3)],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_LIST_DELEGATE_TOOLS", "1"),
+        ],
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 3 }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        cheap,
+        fancy
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        // Pin opens the downstream session; Codex lists MCP tools inside
+        // that session/new, before the router commits session.pin.
+        prompt_text(&cx, &sid, "hard integration work").await?;
+        let events = read_log(&log);
+        // Probe sessions do not receive the delegate MCP server; the pinned
+        // session/new does, and that is the call that races the pin commit.
+        let listed = events
+            .iter()
+            .filter(|e| e["event"] == "delegate_tools")
+            .find(|e| e.get("error").is_none())
+            .expect("pinned session listed router-delegate tools during session/new");
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for required in [
+            "delegate_task",
+            "delegate_await",
+            "delegate_followup",
+            "delegate_close",
+        ] {
+            assert!(
+                names.contains(&required),
+                "session/new tools/list omitted {required}: {names:?}"
+            );
+        }
         Ok(())
     })
     .await;

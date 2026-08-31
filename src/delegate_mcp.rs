@@ -39,6 +39,22 @@ pub const DELEGATE_CLOSE_TOOL_NAME: &str = "delegate_close";
 pub const DELEGATE_AWAIT_TOOL_NAME: &str = "delegate_await";
 pub const BACKGROUND_START_TOOL_NAME: &str = "background_start";
 
+/// Per-session binding for the stdio helper handshake.
+///
+/// `delegation_enabled` is frozen when the MCP server is *injected* into
+/// downstream `session/new`, not when the helper later serves `tools/list`.
+/// Adapters (notably Codex) list MCP tools during `session/new`, which
+/// completes *before* the router commits `session.pin`. Reading the pin at
+/// list time therefore advertised only `background_start` (the server is
+/// still attached because the client has terminals) and omitted every
+/// `delegate_*` tool — even though cheaper workers existed and the router
+/// had already queued the delegation directive.
+#[derive(Clone, Debug)]
+pub struct DelegateBinding {
+    pub router_sid: String,
+    pub delegation_enabled: bool,
+}
+
 const TOOL_DESCRIPTION: &str = "Delegate a small, self-contained subtask to a lower-cost agent \
      running in its own ephemeral session. Delegate only subtasks that do not need this \
      session's full hidden context: simple UI tweaks, mechanical edits, isolated bug fixes, \
@@ -337,6 +353,22 @@ fn close_tool_definition() -> Value {
     })
 }
 
+fn listed_tools(delegation_enabled: bool, terminal_enabled: bool) -> Vec<Value> {
+    let mut tools = Vec::new();
+    if delegation_enabled {
+        tools.extend([
+            tool_definition(),
+            await_tool_definition(),
+            followup_tool_definition(),
+            close_tool_definition(),
+        ]);
+    }
+    if terminal_enabled {
+        tools.push(background_start_tool_definition());
+    }
+    tools
+}
+
 fn background_start_tool_definition() -> Value {
     json!({
         "name": BACKGROUND_START_TOOL_NAME,
@@ -418,11 +450,17 @@ pub fn delegate_server_entry(
     let socket = shared.delegate_socket.get()?.clone();
 
     let token = uuid::Uuid::new_v4().to_string();
-    shared
-        .delegate_tokens
-        .lock()
-        .unwrap()
-        .insert(token.clone(), router_sid.to_string());
+    // Freeze the decision against the candidate being pinned, not against
+    // `session.pin` — that pin is committed only *after* `session/new`
+    // returns, and tools/list runs inside that call.
+    let delegation_enabled = delegation_available(shared, router_sid, candidate);
+    shared.delegate_tokens.lock().unwrap().insert(
+        token.clone(),
+        DelegateBinding {
+            router_sid: router_sid.to_string(),
+            delegation_enabled,
+        },
+    );
     shared.with_session(router_sid, |s| s.delegate_token = Some(token.clone()));
 
     let exe = std::env::var("ROUTER_ACP_HELPER_EXE")
@@ -517,13 +555,15 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
         .get("token")
         .and_then(|t| t.as_str())
         .ok_or("handshake missing token")?;
-    let router_sid = shared
+    let binding = shared
         .delegate_tokens
         .lock()
         .unwrap()
         .get(token)
         .cloned()
         .ok_or("unknown delegate token")?;
+    let router_sid = binding.router_sid;
+    let delegation_enabled = binding.delegation_enabled;
     tracing::debug!(session = router_sid, "delegate MCP helper connected");
 
     let transport = ByteStreams::new(write_half.compat_write(), reader.compat());
@@ -531,14 +571,6 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
     let call_shared = shared.clone();
     let call_sid = router_sid.clone();
     let terminal_enabled = shared.upstream_client_capabilities().terminal;
-    let pinned_candidate = shared
-        .with_session(&router_sid, |session| {
-            session.pin.as_ref().map(|pin| pin.candidate.clone())
-        })
-        .flatten();
-    let delegation_enabled = pinned_candidate
-        .as_ref()
-        .is_some_and(|candidate| delegation_available(&shared, &router_sid, candidate));
     UntypedRole
         .builder()
         .name("delegate-mcp")
@@ -569,19 +601,9 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
             move |_req: McpToolsListRequest,
                   responder: Responder<McpToolsListResult>,
                   _cx| async move {
-                let mut tools = Vec::new();
-                if delegation_enabled {
-                    tools.extend([
-                        tool_definition(),
-                        await_tool_definition(),
-                        followup_tool_definition(),
-                        close_tool_definition(),
-                    ]);
-                }
-                if terminal_enabled {
-                    tools.push(background_start_tool_definition());
-                }
-                responder.respond(McpToolsListResult { tools })
+                responder.respond(McpToolsListResult {
+                    tools: listed_tools(delegation_enabled, terminal_enabled),
+                })
             },
             on_receive_request!(),
         )
@@ -1676,6 +1698,45 @@ mod tests {
         assert_eq!(def["name"], DELEGATE_AWAIT_TOOL_NAME);
         assert!(def["inputSchema"]["properties"]["delegate_ids"].is_object());
         assert!(def["inputSchema"]["properties"]["timeout_seconds"].is_object());
+    }
+
+    #[test]
+    fn listed_tools_include_delegate_family_without_a_pin() {
+        // Codex lists MCP tools during session/new, before session.pin exists.
+        // The list must still expose the four delegate tools when injection
+        // decided delegation was available.
+        let names = |tools: &[serde_json::Value]| -> Vec<String> {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let both = names(&listed_tools(true, true));
+        for required in [
+            DELEGATE_TOOL_NAME,
+            DELEGATE_AWAIT_TOOL_NAME,
+            DELEGATE_FOLLOWUP_TOOL_NAME,
+            DELEGATE_CLOSE_TOOL_NAME,
+            BACKGROUND_START_TOOL_NAME,
+        ] {
+            assert!(
+                both.iter().any(|n| n == required),
+                "pre-pin tools/list omitted {required}: {both:?}"
+            );
+        }
+        assert_eq!(
+            names(&listed_tools(true, false)),
+            [
+                DELEGATE_TOOL_NAME,
+                DELEGATE_AWAIT_TOOL_NAME,
+                DELEGATE_FOLLOWUP_TOOL_NAME,
+                DELEGATE_CLOSE_TOOL_NAME
+            ]
+        );
+        assert_eq!(
+            names(&listed_tools(false, true)),
+            [BACKGROUND_START_TOOL_NAME]
+        );
     }
 
     #[test]
