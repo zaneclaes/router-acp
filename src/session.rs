@@ -476,7 +476,7 @@ pub struct Shared {
     pub targets: Mutex<HashMap<ProcessKey, TargetRuntime>>,
     pub candidates: Mutex<Vec<CandidateRuntime>>,
     sid_map: Mutex<HashMap<(ProcessKey, String), DownstreamRoute>>,
-    pub delegate_tokens: Mutex<HashMap<String, String>>,
+    pub delegate_tokens: Mutex<HashMap<String, crate::delegate_mcp::DelegateBinding>>,
     /// Delegate sub-sessions kept alive for follow-up turns (orchestration),
     /// keyed by the short `delegate_id` returned to the orchestrator.
     pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
@@ -7099,7 +7099,10 @@ mod orchestration_unit_tests {
         let text = build_background_instructions();
         assert!(text.contains("background_start"), "{text}");
         assert!(text.contains("run_in_background"), "{text}");
-        assert!(text.contains("visible, inspectable, and cancellable"), "{text}");
+        assert!(
+            text.contains("visible, inspectable, and cancellable"),
+            "{text}"
+        );
     }
 
     #[test]
