@@ -41,6 +41,22 @@ pub struct CandidateView {
     pub on_overage: bool,
     /// Configured per-agent tie-break preference (`agents[].preference`).
     pub preference: f64,
+    /// The `model_version_pins` key this pool member stands in for, when `id`
+    /// is a substituted target. `id` is always the model that will serve; this
+    /// is only the alias it replaced — kept so config and user input that name
+    /// the moving alias keep matching, and so the routing disclosure can say
+    /// which spelling was asked for.
+    pub pinned_from: Option<CandidateId>,
+}
+
+impl CandidateView {
+    /// Every spelling this pool member answers to: the serving id first, then
+    /// the version-pin key it replaced. A glob or exclusion authored against
+    /// the moving alias (a skill route, a planner glob, `[router: exclude=…]`)
+    /// must keep designating the slot after a pin substitutes underneath it.
+    pub fn ids(&self) -> impl Iterator<Item = &CandidateId> {
+        std::iter::once(&self.id).chain(self.pinned_from.iter())
+    }
 }
 
 /// Free-plan residual small enough to treat as exhausted (matches
@@ -267,6 +283,7 @@ pub(crate) mod test_util {
             plan_headroom: None,
             on_overage: false,
             preference: 0.0,
+            pinned_from: None,
         }
     }
 

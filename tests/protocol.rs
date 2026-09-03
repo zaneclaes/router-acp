@@ -6571,7 +6571,12 @@ async fn preclass_hard_fails_on_unparseable_reply() {
 /// can carry `auto_eligible` / `downstream_id`) and the mock's model selector
 /// advertises exactly `advertised` — which is how a real adapter behaves: it
 /// offers a fixed alias set and refuses any other value.
-fn agent_yaml_models(name: &str, advertised: &[&str], model_lines: &str) -> String {
+fn agent_yaml_models(
+    name: &str,
+    advertised: &[&str],
+    env: &[(&str, &str)],
+    model_lines: &str,
+) -> String {
     let mut out = format!(
         "  - name: {name}\n    command:\n      type: stdio\n      command: {}\n      env:\n",
         mock_agent_exe()
@@ -6581,6 +6586,15 @@ fn agent_yaml_models(name: &str, advertised: &[&str], model_lines: &str) -> Stri
          \x20       - {{ name: MOCK_MODELS, value: \"{}\" }}\n",
         advertised.join(",")
     ));
+    for (key, value) in env {
+        let escaped = value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        out.push_str(&format!(
+            "        - {{ name: {key}, value: \"{escaped}\" }}\n"
+        ));
+    }
     out.push_str("    model_selection: { type: config-option }\n    models:\n");
     out.push_str(model_lines);
     out
@@ -6615,6 +6629,7 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
         agent_yaml_models(
             "a",
             &["m1", "legacy"],
+            &[],
             "      - { id: m1, cost_rank: 1 }\n\
              \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
         ),
@@ -6683,6 +6698,7 @@ async fn model_version_pins_substitute_the_target_and_disclose_it() {
         agent_yaml_models(
             "a",
             &["m1", "legacy"],
+            &[],
             "      - { id: m1, cost_rank: 1 }\n\
              \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
         ),
@@ -6759,6 +6775,7 @@ async fn downstream_id_selects_a_legacy_version_behind_a_known_good_alias() {
         agent_yaml_models(
             "a",
             &["m1"],
+            &[],
             "      - { id: m1, cost_rank: 1 }\n\
              \x20     - { id: legacy, cost_rank: 1, auto_eligible: false, downstream_id: m1 }\n",
         )
@@ -6794,6 +6811,192 @@ async fn downstream_id_selects_a_legacy_version_behind_a_known_good_alias() {
         assert!(
             sets.iter().any(|v| v == "m1") && !sets.iter().any(|v| v == "legacy"),
             "the selector must receive the alias, never the candidate id — {sets:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// A version pin must substitute on the AUTOMATIC resolution paths too, not
+/// only the session pin — a delegate, an evaluator, or a failover target that
+/// resolved the moving alias would run a version nobody asked for.
+#[tokio::test]
+async fn version_pin_substitutes_the_delegation_target() {
+    let state = temp_state_file("pin-delegate");
+    let log = temp_log("pin-delegate");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let cheap = agent_yaml_models(
+        "cheap",
+        &["haiku", "haiku-legacy"],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_SESSION_MODES", "default,bypassPermissions"),
+        ],
+        "      - { id: haiku, cost_rank: 1 }\n\
+         \x20     - { id: haiku-legacy, cost_rank: 1, auto_eligible: false }\n",
+    )
+    .replace(
+        "    models:\n",
+        "    mode_map: { auto: bypassPermissions }\n    models:\n",
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 3 }}\n\
+         model_version_pins:\n  \"cheap/haiku\": \"cheap/haiku-legacy\"\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        cheap,
+        agent_yaml("fancy", &[("opus", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "big work\nDELEGATE:tweak the css").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("router-acp · delegate_task → cheap/haiku-legacy"),
+            "the delegate must run the pinned version: {text}"
+        );
+        assert!(
+            !text.contains("delegate_task → cheap/haiku "),
+            "the alias must not be what the delegate opened: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn version_pin_substitutes_the_preclass_evaluator() {
+    let state = temp_state_file("pin-evaluator");
+    let eval_log = temp_log("pin-evaluator-eval");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-pin-evaluator-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // `main` outscores the evaluator agent so the PRIMARY pin lands there and
+    // the eval agent's request log records only evaluator traffic.
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'main/*', default_quality: 3.0 }\n\
+         \x20 - { pattern: 'eval/*', default_quality: 1.0 }\n",
+    )
+    .unwrap();
+    let preclass =
+        r#"{"routing":{"task_class":"Ops","complexity":0.2,"confidence":0.9,"reason":"ops work"}}"#;
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         model_version_pins:\n  \"eval/m1\": \"eval/m1-legacy\"\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"eval/*\"]\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "eval",
+            &["m1", "m1-legacy"],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", &eval_log.display().to_string()),
+                ("MOCK_SESSION_MODES", "preclass"),
+            ],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: m1-legacy, cost_rank: 1, auto_eligible: false }\n",
+        )
+        .replace(
+            "    model_selection:",
+            "    mode_map: { preclass: preclass }\n    model_selection:",
+        ),
+        agent_yaml("main", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "check the error rate on the ops dashboard").await?;
+        assert!(
+            agent_text(&observed, &sid).contains("→ main/m2"),
+            "primary pin stays on main so the eval log isolates the evaluator"
+        );
+        let selected: Vec<String> = read_log(&eval_log)
+            .into_iter()
+            .filter(|e| e["event"] == "set_config_option")
+            .map(|e| e["value"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            selected.iter().any(|v| v == "m1-legacy"),
+            "the evaluator must run the pinned version: {selected:?}"
+        );
+        assert!(
+            !selected.iter().any(|v| v == "m1"),
+            "the evaluator must never resolve the pin key itself: {selected:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Failover has to exclude the SERVED identity. Substituting after the pool is
+/// filtered leaves the pin key in it, and the key maps straight back to the
+/// candidate that just failed — a retry loop that burns every attempt instead
+/// of moving to a healthy candidate.
+#[tokio::test]
+async fn failover_off_a_pinned_target_does_not_route_back_through_its_key() {
+    let state = temp_state_file("pin-failover");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-pin-failover-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // `a` outscores `b`, so auto picks the pinned `a` slot first and only a
+    // correct exclusion can move the turn to `b`. The failure is a CONTEXT
+    // OVERFLOW on purpose: it deliberately cordons nothing and quarantines
+    // nothing, so the failed agent stays fully eligible and the `exclude`
+    // argument is the only thing keeping the turn off it — which is exactly
+    // the condition under which a stale pin key routes straight back.
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'a/*', default_quality: 3.0 }\n\
+         \x20 - { pattern: 'b/*', default_quality: 1.0 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         model_version_pins:\n  \"a/m1\": \"a/legacy\"\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "a",
+            &["m1", "legacy"],
+            &[("MOCK_FAIL_PROMPT_MSG", "prompt is too long")],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "implement the feature").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("→ a/legacy"),
+            "the first pin resolves the pinned version: {text}"
+        );
+        // The retry loop this guards: with the key still in the filtered pool,
+        // the first failover re-picks it and it maps straight back to the
+        // candidate that just failed, burning attempts before moving on.
+        assert!(
+            !text.contains("failover: auto → a/legacy"),
+            "failover re-pinned the candidate that just failed: {text}"
+        );
+        assert!(
+            text.contains("failover: auto → b/m2"),
+            "the first failover must reach a genuinely different candidate: {text}"
+        );
+        assert_eq!(
+            open_state(&state).get(&sid).unwrap().model,
+            "m2",
+            "the session must end on the healthy candidate"
         );
         Ok(())
     })

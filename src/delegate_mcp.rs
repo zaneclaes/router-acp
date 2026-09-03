@@ -413,7 +413,14 @@ pub fn delegation_available(
     if !shared.cfg.delegation.enabled {
         return false;
     }
-    let routeable = shared.routeable_candidates();
+    // Version pins applied: the delegate pool comes from `eligible_views`,
+    // which is built on the same substituted set, so availability has to be
+    // judged on the models that could actually take a subtask.
+    let routeable: Vec<_> = shared
+        .effective_candidates()
+        .into_iter()
+        .map(|effective| effective.runtime)
+        .collect();
     if routeable.len() <= 1 {
         return false;
     }
@@ -1842,6 +1849,7 @@ mod tests {
                 plan_headroom: None,
                 on_overage: false,
                 preference: 0.0,
+                pinned_from: None,
             }
         };
         vec![
