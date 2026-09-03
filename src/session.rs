@@ -952,15 +952,20 @@ impl Shared {
     /// The strategy view for ONE candidate, ignoring auto-eligibility — the
     /// question "may this specific candidate serve this prompt right now?",
     /// which an explicit pin has to be able to answer yes to.
+    ///
+    /// `id` is treated as a STATED reference and resolved through the
+    /// version-pin map first, so asking about a family's stable default id
+    /// answers about the version that would actually serve it.
     pub fn candidate_view(
         &self,
         id: &CandidateId,
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        self.eligible_views_inner(required, class, false, Some(id))
+        let wanted = self.cfg.resolve_stated_candidate(id);
+        self.eligible_views_inner(required, class, false, Some(&wanted))
             .into_iter()
-            .find(|v| &v.id == id)
+            .find(|v| v.id == wanted)
     }
 
     fn eligible_views_inner(
@@ -4362,7 +4367,10 @@ fn resolve_candidate_ref(
             .candidate_view(&id, &RequiredCaps::default(), class)
             .is_some()
     {
-        return Some(id);
+        // Return the RESOLVED id: a fully-qualified shorthand may name a
+        // family's stable default while a version pin points it elsewhere, and
+        // the caller logs/pins this value.
+        return Some(shared.cfg.resolve_stated_candidate(&id));
     }
     let needle = reference.to_lowercase();
     let has_slash = reference.contains('/');
