@@ -544,8 +544,12 @@ class CliTest(unittest.TestCase):
         # The existing ladder is untouched — nothing was rewritten to chase quality.
         self.assertNotIn("-      - { id:", catalog_diff)
         catalog = parse_catalog(CATALOG_PATH)
+        # The trailing 4 is the pinned legacy `claude-opus-4-6` entry, which
+        # shares Opus 5's rank because it shares its price. It is enabled (and
+        # so on the ladder) but `auto_eligible: false`, so it is reachable only
+        # by explicit selection or a `model_version_pins` target.
         self.assertEqual(
-            [model.cost_rank for model in catalog.agent("claude").enabled_models], [1, 2, 4, 5]
+            [model.cost_rank for model in catalog.agent("claude").enabled_models], [1, 2, 4, 5, 4]
         )
 
     def test_new_family_without_benchmarks_is_parked_unscored(self):

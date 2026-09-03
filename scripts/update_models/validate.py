@@ -270,10 +270,10 @@ class Validator:
     def _check_cache_ratios(self) -> None:
         assert self.catalog is not None
         for agent in self.catalog.agents:
-            ratios = self.policy.cache_ratio(agent.name)
-            if not ratios:
-                continue
             for model in agent.enabled_models:
+                ratios = self.policy.cache_ratio_for(agent.name, model.candidate)
+                if not ratios:
+                    continue
                 pricing = model.pricing or {}
                 base = pricing.get("input_per_mtok")
                 if base is None:
@@ -287,7 +287,7 @@ class Validator:
                         self._add(
                             WARN,
                             "cache-rate-off-ratio",
-                            f"`{model.candidate}` {key}={got} but {agent.name}'s published "
+                            f"`{model.candidate}` {key}={got} but its published "
                             f"{kind} rate is {ratios[kind]}× input (${want:.2f})",
                             "the cache-reprime break-even the demotion gate uses is computed "
                             "from these rates",
