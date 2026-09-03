@@ -62,12 +62,13 @@ llm_proxy:
   # the whole prefix on the cheaper model at its cache-WRITE rate (a one-time
   # cost). The router won't demote until the routine streak also clears the
   # per-pair break-even (⌈(target_write−pinned_read)/(pinned_read−target_read)⌉;
-  # below it you'll see `cache-hold` rows). Fable 5.1's cache READ is only
-  # $0.25/Mtok (0.025x input, against 0.1x everywhere else), so the per-warm-turn
-  # saving from demoting off it is tiny: Fable→Sonnet is ≈ 45 turns, and
-  # Fable→Opus saves nothing on reads at all ($0.50 > $0.25), which the gate
-  # reports as break-even 0 — cache economics stop holding that pair and
-  # `minimum_dwell_requests` is the only damper left. Keep
+  # below it you'll see `cache-hold` rows). On the fable DEFAULT (Fable 5, read
+  # $1.00) that is Fable→Sonnet = 2 turns and Fable→Opus = 11. Pin a session to
+  # Fable 5.1 and the arithmetic changes sharply: its read is $0.25/Mtok
+  # (0.025x input, against 0.1x everywhere else), so Fable→Sonnet stretches to
+  # 46 turns and Fable→Opus saves nothing on reads at all ($0.50 > $0.25) —
+  # the gate reports break-even 0 there, so cache economics stop holding that
+  # pair and `minimum_dwell_requests` is the only damper left. Keep
   # minimum_dwell_requests at/above the break-even you actually want enforced.
   minimum_dwell_requests: 12
   verdict_ttl_requests: 6
@@ -128,12 +129,14 @@ skill_routing:
 # be declared models of the SAME agent — the substitution swaps the model, not
 # the seat — and the load fails with a clear message otherwise. Naming the
 # target directly is unaffected. The target is normally an
-# `auto_eligible: false` legacy entry (see the claude models below), which is
-# what makes a pinned version reachable on purpose and never by accident.
+# `auto_eligible: false` pin-only entry (see the claude models below), which is
+# what makes a specific version reachable on purpose and never by accident.
 #
-# Commented out: the default is "run the current version".
+# The example below is the second way to flip a family's default: rather than
+# editing the entries, point the default's id at the pin-only version. Useful
+# for a reversible rollout — one line in, one line out.
 # model_version_pins:
-#   "claude/claude-fable-5[1m]": "claude/claude-fable-5"
+#   "claude/claude-fable-5[1m]": "claude/claude-fable-5-1"
 
 # Auto-orchestration of multi-part task lists. When a prompt reads as a list
 # (markdown bullets/numbers, inline "(1)(2)", or "first… then… finally…") the
@@ -205,32 +208,35 @@ agents:
         api_model: claude-opus-5
         cost_rank: 3
         pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }
-      # Claude Fable 5.1. `api_model` is the 5.1 wire id while the ACP `id`
-      # stays the selector alias the installed claude-agent-acp advertises
-      # (`claude-fable-5[1m]`); move the id when the selector ships a 5.1 one.
-      # Its cache READ is 0.025x input ($0.25) rather than the usual 0.1x, so
-      # state the rate — do not derive it.
+      # The fable DEFAULT serves Fable 5, deliberately not 5.1: the wire id
+      # `claude-fable-5-1` is gated server-side on Claude Code >= 2.1.251, so
+      # defaulting to it would 400 every fable-routed request (auto, planner
+      # globs, apex complexity) on any older CLI.
       - id: "claude-fable-5[1m]"
-        display_name: Claude Fable 5.1 1M
-        api_model: claude-fable-5-1
+        display_name: Claude Fable 5 1M
+        api_model: claude-fable-5
         cost_rank: 4
-        pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }
-      # A pinned LEGACY version: `auto_eligible: false` removes it from every
-      # automatic pool (strategies, escalation/demotion, pre-class evaluators,
-      # planner/reviewer globs, skill routes, failover, delegation, per-request
-      # proxy routing) while it stays listed in the model picker, selectable by
-      # name, and valid as a `model_version_pins` target.
+        pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }
+      # Claude Fable 5.1 — a PIN-ONLY version. `auto_eligible: false` removes it
+      # from every automatic pool (strategies, escalation/demotion, pre-class
+      # evaluators, planner/reviewer globs, skill routes, failover, delegation,
+      # per-request proxy routing) while it stays listed in the model picker,
+      # selectable by name, and valid as a `model_version_pins` target.
       # `downstream_id` is required whenever `id` is a bare API model id the
       # selector does not advertise: without it the probe drops the candidate
       # as "not offered by downstream model selector". The alias opens the
       # session; `api_model` decides what goes on the wire.
-      - id: claude-fable-5
-        display_name: Claude Fable 5 (legacy)
+      # Its cache READ is 0.025x input ($0.25) rather than the usual 0.1x, so
+      # state the rate — do not derive it.
+      # ONE-LINE DEFAULT FLIP once your CLI clears the floor: move
+      # `api_model: claude-fable-5-1` (and the 0.25 read) onto the entry above.
+      - id: claude-fable-5-1
+        display_name: Claude Fable 5.1 1M
         auto_eligible: false
         downstream_id: "claude-fable-5[1m]"
-        api_model: claude-fable-5
+        api_model: claude-fable-5-1
         cost_rank: 4
-        pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }
+        pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }
 
   - name: codex
     command:
