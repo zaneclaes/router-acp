@@ -180,6 +180,21 @@ cost:
   # quietly break the cache-reprime break-even the demotion gate computes.
   cache_ratios:
     claude: { read: 0.1, write: 1.25 }
+  # Per-candidate exceptions to the flat per-agent ratio above, applied by the
+  # same validation (`cache-rate-off-ratio`). Keyed by the score-table glob
+  # form, first match wins, and each key merges over the agent ratio so an
+  # override only has to state the rate that actually differs.
+  #
+  # Fable 5.1 is the first Claude model whose cache READ is not 0.1x input:
+  # $0.25 against $10 input is 0.025x — a 4x cheaper warm read than every
+  # other Claude model, which lengthens the cache-reprime break-even the
+  # demotion gate computes. Writes are unchanged (5m $12.50 = 1.25x).
+  #
+  # Scoped to the 5.1 ids only. The fable DEFAULT candidate
+  # (`claude-fable-5[1m]`) still serves Fable 5 at the standard 0.1x read, so
+  # it must keep being validated against the agent ratio.
+  cache_ratio_overrides:
+    "claude/claude-fable-5-1*": { read: 0.025 }
   # Ranks must be weakly monotonic in blended price WITHIN an agent: a cheaper
   # model must not carry a higher rank. Every exception is deliberate and lives
   # here with its reason, so a genuine mistake still shows up as an error.
@@ -213,7 +228,12 @@ cost:
 # ---------------------------------------------------------------------------
 witnesses:
   fable: "claude/claude-fable-5[1m]"
+  # Fable 5.1, a PIN-ONLY candidate — not the fable default. Its wire id is
+  # gated on Claude Code >= 2.1.251, so the default entry still serves Fable 5
+  # (see the fable entries in examples/router-preferred.yaml).
+  fable_5_1: "claude/claude-fable-5-1"
   opus: "claude/opus[1m]"
+  opus_legacy: "claude/claude-opus-4-6"
   sonnet: "claude/sonnet"
   haiku: "claude/haiku"
   mini: "codex/gpt-5.4-mini"
@@ -265,6 +285,20 @@ invariants:
   weak_desc:
     - chain: [grok, grok_code]
       why: frontier grok is never below the cheap coding-tuned grok
+    - chain: [fable_5_1, fable]
+      why: >-
+        Fable 5.1 INHERITS `*fable*`'s calibrated scores — a version bump keys
+        on the model line, so no re-score and no churn (the same treatment
+        grok 4.5 -> 4.6 got). Stated as a weak chain rather than an equality
+        because that is what the checker speaks: if a future narrower pattern
+        ever steals the 5.1 id and scores it differently, the chain breaks
+        instead of the difference going unnoticed.
+    - chain: [opus, opus_legacy]
+      why: >-
+        the pinned legacy Opus id inherits `*opus*` for the same reason. It is
+        `auto_eligible: false`, so it is only ever reached by an explicit pick
+        — which is exactly why it must still resolve to a real score rather
+        than the neutral 0.5 default.
   # Ceilings are used only where the benchmark-derived values support them.
   at_most:
     - a: grok
@@ -279,7 +313,19 @@ invariants:
     "codex/gpt-5.6-terra": "*terra*"
     "codex/gpt-5.6-luna": "*luna*"
     "claude/claude-fable-5[1m]": "*fable*"
+    # Fable 5.1 inherits Fable's calibrated scores: `*fable*` already matches
+    # every `claude-fable-5*` id, so a version bump is a no-score-churn rename
+    # (the same treatment grok 4.5 -> 4.6 got above). Pinned as an invariant so
+    # a future narrower pattern can't silently steal it. The bracketed spelling
+    # is listed too, for the day the adapter advertises a 5.1 alias.
+    "claude/claude-fable-5-1": "*fable*"
+    "claude/claude-fable-5-1[1m]": "*fable*"
     "claude/opus[1m]": "*opus*"
+    # Pinned legacy Claude versions (auto_eligible: false candidates) keep
+    # resolving to their family, so an explicit pin routes on a real score
+    # rather than the neutral 0.5 default.
+    "claude/claude-opus-4-6": "*opus*"
+    "claude/claude-sonnet-4-6": "*sonnet*"
     "claude/sonnet": "*sonnet*"
     "claude/haiku": "*haiku*"
     "gemini/gemini-3-pro": "*gemini*pro*"
@@ -296,12 +342,31 @@ invariants:
 # instead of quietly skewing cost routing. USD per Mtok.
 # ---------------------------------------------------------------------------
 published_pricing:
-  as_of: "2026-07"
+  as_of: "2026-09-03"
   models:
     "claude/haiku": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
-    "claude/sonnet": { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+    # Sonnet 5 is PERMANENTLY $2/$10: the increase to $3/$15 scheduled for
+    # 2026-09-01 was cancelled (note on Anthropic's pricing page). Sonnet 4.6
+    # and 4.5 remain $3/$15, which is why the rate lives on the candidate and
+    # not on a `*sonnet*` glob.
+    "claude/sonnet": { input_per_mtok: 2.00, output_per_mtok: 10.00 }
     "claude/opus[1m]": { input_per_mtok: 5.00, output_per_mtok: 25.00 }
-    "claude/claude-fable-5[1m]": { input_per_mtok: 10.00, output_per_mtok: 50.00 }
+    # The fable DEFAULT candidate serves Fable 5 — $10/$50 at the standard
+    # 0.1x cache read ($1.00). Deliberately NOT 5.1: that wire id is gated on
+    # Claude Code >= 2.1.251.
+    "claude/claude-fable-5[1m]":
+      { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 1.00 }
+    # Fable 5.1, the pin-only candidate: same $10/$50 list, but its cache read
+    # is $0.25/Mtok — a special 0.025x ratio (see cost.cache_ratio_overrides).
+    "claude/claude-fable-5-1":
+      { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 0.25 }
+    # Same rates under the bracketed spelling, for the day the adapter
+    # advertises a 5.1 alias and the candidate id can move.
+    "claude/claude-fable-5-1[1m]":
+      { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 0.25 }
+    # Pin-only legacy Claude versions. Same list prices as their successors.
+    "claude/claude-opus-4-6": { input_per_mtok: 5.00, output_per_mtok: 25.00 }
+    "claude/claude-sonnet-4-6": { input_per_mtok: 3.00, output_per_mtok: 15.00 }
     "codex/gpt-5.4-mini": { input_per_mtok: 0.75, output_per_mtok: 4.50 }
     "codex/gpt-5.5": { input_per_mtok: 5.00, output_per_mtok: 30.00 }
     "codex/gpt-5.6-luna": { input_per_mtok: 1.00, output_per_mtok: 6.00 }

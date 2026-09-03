@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from . import patterns as pat
+
 # TaskClass order, matching `TaskClass::ALL` in src/candidate.rs. Emitted in
 # this order so a generated block reads like the hand-written ones.
 TASK_CLASSES = [
@@ -79,6 +81,23 @@ class Policy:
         ratios = self.cost.get("cache_ratios", {}) or {}
         found = ratios.get(agent)
         return {key: float(value) for key, value in found.items()} if found else None
+
+    def cache_ratio_for(self, agent: str, candidate: str) -> dict[str, float] | None:
+        """The agent's cache ratios with any per-candidate override applied.
+
+        The flat per-agent ratio holds for a whole provider until one model
+        breaks it (Fable 5.1's 0.025x cache read). An override states only the
+        rate that differs and merges over the agent's, so the rest of the
+        family keeps being validated against one number.
+        """
+        base = self.cache_ratio(agent) or {}
+        overrides = self.cost.get("cache_ratio_overrides", {}) or {}
+        for pattern, ratios in overrides.items():
+            if pat.glob_match(pattern, candidate):
+                merged = dict(base)
+                merged.update({key: float(value) for key, value in ratios.items()})
+                return merged or None
+        return base or None
 
     def witness_id(self, name: str) -> str:
         try:

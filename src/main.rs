@@ -156,7 +156,16 @@ async fn main() -> anyhow::Result<()> {
             let cfg = Config::from_file(&config)?;
             println!("configuration OK: {} agent(s)", cfg.agents.len());
             for id in cfg.declared_candidates() {
-                println!("  candidate: {id}");
+                let manual = if cfg.auto_eligible(&id) {
+                    ""
+                } else {
+                    "  (explicit selection only)"
+                };
+                let pinned = match cfg.version_pin_target(&id) {
+                    Some(target) => format!("  → pinned to {target}"),
+                    None => String::new(),
+                };
+                println!("  candidate: {id}{manual}{pinned}");
             }
             Ok(())
         }

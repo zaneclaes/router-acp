@@ -245,13 +245,19 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
                 Some(option) => {
                     let values = select_values(&option);
                     let mut routeable = Vec::new();
+                    // The selector answers for `downstream_id` (which is `id`
+                    // unless the entry pins a legacy version behind a
+                    // known-good alias), while the candidate stays keyed on
+                    // `id` everywhere else.
                     for model in &spec.models {
-                        if values.iter().any(|v| v == &model.id) {
+                        let wanted = model.downstream_id();
+                        if values.iter().any(|v| v == wanted) {
                             routeable.push(model.id.clone());
                         } else {
                             tracing::warn!(
                                 agent = spec.agent_name,
                                 model = model.id,
+                                downstream_id = wanted,
                                 available = ?values,
                                 "declared model not offered by downstream model selector; \
                                  removing candidate from the pool"

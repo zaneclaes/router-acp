@@ -1072,11 +1072,22 @@ fn select_request_model(
     body: &Value,
 ) -> RequestDecision {
     let signals = inspect_request(body);
-    let candidates = shared.routeable_candidates();
+    // `model_version_pins` is applied here, not after selection: a pinned
+    // family must substitute in the per-request pool too, so an escalation or
+    // demotion target resolves to the version that will actually serve.
+    let candidates: Vec<_> = shared
+        .effective_candidates()
+        .into_iter()
+        .map(|effective| effective.runtime)
+        .collect();
     let mut headroom = shared.headroom.lock().unwrap();
     let mut models: Vec<ModelOption> = candidates
         .into_iter()
         .filter(|candidate| candidate.id.agent == active.candidate.agent)
+        // Per-request routing is automatic, so a pin-only legacy version is not
+        // an alternate here. The session's own pin is re-added below whatever
+        // this filter says, so an explicit pin still serves its own requests.
+        .filter(|candidate| candidate.auto_eligible)
         .filter(|candidate| {
             !headroom.is_quarantined(&candidate.id)
                 && headroom.cordon_active(&candidate.id.agent).is_none()
@@ -1373,10 +1384,22 @@ fn select_request_model(
     state.last_candidate = Some(selected.to_string());
     state.last_reason = Some(reason.clone());
     let upstream_model = if selected == active.candidate {
-        signals
-            .original_model
-            .clone()
-            .unwrap_or_else(|| configured_api_model(shared, &selected))
+        // Staying on the session's own model is NOT a licence to pass the
+        // adapter's model string through. With `downstream_id` aliasing, the
+        // adapter was configured via an alias (`opus[1m]`, `claude-fable-5[1m]`)
+        // and emits requests naming whatever that alias resolves to on ITS
+        // side — `claude-opus-5`, `claude-fable-5` — which for a pinned version
+        // is a DIFFERENT model from the one the session is attributed and
+        // priced as. So a declared `api_model` is authoritative and always
+        // written; the incoming string is only trusted when the candidate
+        // declares no `api_model`, where it is the sole valid wire id we have
+        // (rewriting to a bare CLI alias would 404).
+        declared_api_model(shared, &selected).unwrap_or_else(|| {
+            signals
+                .original_model
+                .clone()
+                .unwrap_or_else(|| selected.model.clone())
+        })
     } else {
         models
             .iter()
@@ -1400,20 +1423,21 @@ fn select_request_model(
     }
 }
 
-fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
+/// The candidate's DECLARED `api_model`, or `None` when it declares none.
+///
+/// The distinction from [`configured_api_model`] is load-bearing: "no declared
+/// api_model" means the router has no authoritative wire id for this candidate
+/// and must not invent one from the ACP selector id, which is often an alias
+/// the provider API rejects.
+fn declared_api_model(shared: &Shared, candidate: &CandidateId) -> Option<String> {
     shared
         .cfg
-        .agents
-        .iter()
-        .find(|agent| agent.name == candidate.agent)
-        .and_then(|agent| {
-            agent
-                .models
-                .iter()
-                .find(|model| model.id == candidate.model)
-        })
+        .model_config(candidate)
         .and_then(|model| model.api_model.clone())
-        .unwrap_or_else(|| candidate.model.clone())
+}
+
+fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
+    declared_api_model(shared, candidate).unwrap_or_else(|| candidate.model.clone())
 }
 
 fn strongest_model(models: &[ModelOption]) -> Option<CandidateId> {
@@ -2170,6 +2194,12 @@ agents:
     /// Score data (context windows, wire features) comes from the shipped
     /// `data/scores.yaml`, not from a test stub.
     fn kory_code_shared() -> (tempfile::TempDir, Arc<Shared>) {
+        kory_code_shared_with("")
+    }
+
+    /// `extra` is appended as top-level config (e.g. a `model_version_pins`
+    /// block), so pin behaviour can be exercised on the production shape.
+    fn kory_code_shared_with(extra: &str) -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
         let yaml = format!(
             r#"
@@ -2205,7 +2235,22 @@ agents:
         cost_rank: 5
         api_model: claude-fable-5
         pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }}
-"#,
+      # Pin-only legacy versions, reached through the alias the adapter really
+      # advertises. Their whole point is that `api_model` differs from what that
+      # alias resolves to downstream.
+      - id: claude-opus-4-6
+        cost_rank: 4
+        api_model: claude-opus-4-6
+        downstream_id: "opus[1m]"
+        auto_eligible: false
+        pricing: {{ input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }}
+      - id: claude-fable-5-1
+        cost_rank: 5
+        api_model: claude-fable-5-1
+        downstream_id: "claude-fable-5[1m]"
+        auto_eligible: false
+        pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }}
+{extra}"#,
             dir.path().join("state.db").display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
@@ -2217,6 +2262,8 @@ agents:
                 "sonnet".into(),
                 "opus[1m]".into(),
                 "claude-fable-5[1m]".into(),
+                "claude-opus-4-6".into(),
+                "claude-fable-5-1".into(),
             ],
         );
         (dir, shared)
@@ -3046,6 +3093,125 @@ agents:
         assert_eq!(decision.selected_model, "sonnet");
     }
 
+    /// The request `claude-agent-acp` emits for a session configured via an
+    /// ALIAS: the body names whatever that alias resolves to on the adapter's
+    /// side, which for a pinned version is not the model the router pinned.
+    fn aliased_request(adapter_model: &str) -> Value {
+        json!({
+            "model": adapter_model,
+            "messages": [{"role":"user","content":"continue"}]
+        })
+    }
+
+    #[test]
+    fn pinned_legacy_version_rewrites_the_wire_model_off_the_selector_alias() {
+        let (_dir, shared) = kory_code_shared();
+        // Session pinned to Opus 4.6, configured downstream via `opus[1m]` —
+        // so the adapter emits `claude-opus-5`. Passing that through would
+        // serve Opus 5 while the session is attributed and priced as 4.6.
+        let decision = select_request_model(
+            &shared,
+            &claude_active("claude-opus-4-6"),
+            &aliased_request("claude-opus-5"),
+        );
+        assert_eq!(
+            decision.model, "claude-opus-4-6",
+            "the pinned version must reach the wire, not the alias's resolution"
+        );
+        assert!(
+            decision.rewrite,
+            "the body has to be rewritten to get there"
+        );
+        assert_eq!(decision.selected_model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn pinned_fable_5_1_rewrites_the_wire_model_off_its_downstream_alias() {
+        let (_dir, shared) = kory_code_shared();
+        // `claude-fable-5-1` rides the `claude-fable-5[1m]` alias, which the
+        // adapter resolves to `claude-fable-5` — a different model at a
+        // different cache-read rate.
+        let decision = select_request_model(
+            &shared,
+            &claude_active("claude-fable-5-1"),
+            &aliased_request("claude-fable-5"),
+        );
+        assert_eq!(decision.model, "claude-fable-5-1");
+        assert!(decision.rewrite);
+    }
+
+    #[test]
+    fn unaliased_pin_still_passes_its_own_api_model_through_unrewritten() {
+        let (_dir, shared) = kory_code_shared();
+        // The ordinary case: `opus[1m]` declares api_model `claude-opus-5` and
+        // the adapter already emits exactly that. Same value either way, so no
+        // rewrite — the fix must not start touching bodies it used to leave alone.
+        let decision = select_request_model(
+            &shared,
+            &claude_active("opus[1m]"),
+            &aliased_request("claude-opus-5"),
+        );
+        assert_eq!(decision.model, "claude-opus-5");
+        assert!(!decision.rewrite);
+    }
+
+    #[test]
+    fn candidate_without_api_model_keeps_the_adapters_own_model_string() {
+        // No `api_model` declared means the router has no authoritative wire
+        // id: the incoming string is the only valid one, and inventing
+        // `candidate.model` from an ACP selector alias would 404.
+        let (_d, shared) = policy_shared_priced(0);
+        let decision = select_request_model(
+            &shared,
+            &active("opus"),
+            &aliased_request("some-provider-side-opus-variant"),
+        );
+        assert_eq!(decision.model, "some-provider-side-opus-variant");
+        assert!(!decision.rewrite);
+    }
+
+    #[test]
+    fn per_request_pool_substitutes_a_version_pinned_alternate() {
+        // The proxy's own candidate pool must honour `model_version_pins`, or a
+        // demotion/escalation target resolves to the alias and serves the
+        // wrong version. Fable is pinned to 5.1 here; a routine streak on the
+        // fable pin must demote onto a SUBSTITUTED cheaper model, and the
+        // fable slot itself must appear as 5.1 rather than the default.
+        let (_dir, shared) = kory_code_shared_with(
+            "model_version_pins:\n  \"claude/opus[1m]\": claude/claude-opus-4-6\n",
+        );
+        let pool: Vec<String> = shared
+            .effective_candidates()
+            .into_iter()
+            .map(|effective| effective.runtime.id.model)
+            .collect();
+        assert!(
+            pool.contains(&"claude-opus-4-6".to_string()),
+            "the pinned target must stand in for the alias: {pool:?}"
+        );
+        assert!(
+            !pool.contains(&"opus[1m]".to_string()),
+            "the alias must not remain selectable alongside its pin: {pool:?}"
+        );
+        // The substituted slot carries its OWN wire id into the pool, so any
+        // alternate the proxy picks from it lands on the pinned version. (The
+        // pool is what `select_request_model` ranks over; a per-request
+        // escalation cannot cross the pin's cost ceiling, so pool composition
+        // — not a demotion walk — is where this is observable.)
+        assert_eq!(
+            configured_api_model(&shared, &CandidateId::new("claude", "claude-opus-4-6")),
+            "claude-opus-4-6"
+        );
+        // A session pinned through the map serves the pinned version on the
+        // wire even though the adapter was configured via `opus[1m]`.
+        let decision = select_request_model(
+            &shared,
+            &claude_active("claude-opus-4-6"),
+            &aliased_request("claude-opus-5"),
+        );
+        assert_eq!(decision.model, "claude-opus-4-6");
+    }
+
     #[test]
     fn cache_reprime_break_even_matches_configured_rates() {
         let (_d, shared) = policy_shared_priced(0);
@@ -3362,6 +3528,135 @@ agents:
             )
             .unwrap();
         assert_eq!(fallback, ("mock/opus".into(), "proxy-fallback".into()));
+
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    /// End-to-end at the WIRE: a session pinned to a version that rides a
+    /// downstream alias must have the provider see that version's `api_model`,
+    /// not the model string the adapter emitted for the alias.
+    ///
+    /// This is the one assertion that cannot be satisfied by a correct
+    /// selector alias: the adapter is configured with `claude-fable-5[1m]` and
+    /// sends `claude-fable-5`, and only the proxy rewrite decides what the
+    /// provider actually runs.
+    #[tokio::test]
+    async fn proxy_puts_the_pinned_versions_api_model_on_the_wire() {
+        #[derive(Clone)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+
+        async fn upstream(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response<Body> {
+            seen.0
+                .lock()
+                .unwrap()
+                .push(body["model"].as_str().unwrap_or("").to_string());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(
+                    "event: message_start\n\
+                     data: {\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                ))
+                .unwrap()
+        }
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let seen = Seen(Arc::new(Mutex::new(Vec::new())));
+        let upstream_app = Router::new()
+            .route("/v1/messages", axum::routing::post(upstream))
+            .with_state(seen.clone());
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 99
+  minimum_dwell_requests: 0
+agents:
+  - name: claude
+    command: {{ type: stdio, command: claude-agent-acp }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: http://{upstream_addr}/v1
+    models:
+      - {{ id: "claude-fable-5[1m]", cost_rank: 5, api_model: claude-fable-5,
+           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
+      - {{ id: claude-fable-5-1, cost_rank: 5, api_model: claude-fable-5-1,
+           downstream_id: "claude-fable-5[1m]", auto_eligible: false,
+           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
+"#,
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("claude".to_string()),
+            vec!["claude-fable-5[1m]".into(), "claude-fable-5-1".into()],
+        );
+        shared.state.lock().unwrap().upsert(
+            "r1".to_string(),
+            PersistedSession {
+                agent: "claude".to_string(),
+                model: "claude-fable-5-1".to_string(),
+                downstream_session_id: "d1".to_string(),
+                cwd: dir.path().to_path_buf(),
+                kind: "primary".to_string(),
+                ..Default::default()
+            },
+        );
+        let proxy_task = shared.llm_proxy.bind(shared.clone()).await.unwrap();
+        let spec = shared
+            .target_spec(&ProcessKey("claude".to_string()))
+            .unwrap();
+        let proxy_base = shared
+            .llm_proxy
+            .process_env(&spec)
+            .into_iter()
+            .find(|(name, _)| name == "ANTHROPIC_BASE_URL")
+            .unwrap()
+            .1;
+        let _turn = shared.llm_proxy.begin_turn(
+            ProcessKey("claude".to_string()),
+            "r1".to_string(),
+            "r1".to_string(),
+            "d1".to_string(),
+            CandidateId::new("claude", "claude-fable-5-1"),
+            TaskClass::CodingGeneral,
+            None,
+        );
+
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/messages"))
+            .header("authorization", "Bearer secret")
+            // Exactly what claude-agent-acp emits for the `claude-fable-5[1m]`
+            // alias it was configured with.
+            .json(&json!({
+                "model": "claude-fable-5",
+                "messages": [{"role":"user","content":"continue"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.text().await.unwrap();
+
+        assert_eq!(
+            seen.0.lock().unwrap().clone(),
+            vec!["claude-fable-5-1".to_string()],
+            "the provider must run the pinned version, not the alias's resolution"
+        );
 
         proxy_task.abort();
         upstream_task.abort();
