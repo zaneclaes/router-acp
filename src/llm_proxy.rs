@@ -1077,6 +1077,10 @@ fn select_request_model(
     let mut models: Vec<ModelOption> = candidates
         .into_iter()
         .filter(|candidate| candidate.id.agent == active.candidate.agent)
+        // Per-request routing is automatic, so a pinned legacy version is not
+        // an alternate here. The session's own pin is re-added below whatever
+        // this filter says, so an explicit pin still serves its own requests.
+        .filter(|candidate| candidate.auto_eligible)
         .filter(|candidate| {
             !headroom.is_quarantined(&candidate.id)
                 && headroom.cordon_active(&candidate.id.agent).is_none()

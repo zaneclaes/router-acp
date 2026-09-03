@@ -428,10 +428,21 @@ pub fn delegation_available(
     // exists (delegation sheds cost). Orchestrating sessions get it whenever
     // there is any other candidate, so the planner can delegate to same-/higher-
     // tier peers (e.g. a cross-lineage reviewer).
+    //
+    // Only auto-eligible candidates count as delegation targets — the
+    // delegate pool is built from `eligible_views`, so a pinned legacy
+    // version cannot serve a subtask and must not be what advertises the tool.
+    let delegatable: Vec<_> = routeable
+        .iter()
+        .filter(|c| c.auto_eligible && c.id != *candidate)
+        .collect();
+    if delegatable.is_empty() {
+        return false;
+    }
     let orchestrating = shared
         .with_session(router_sid, |s| s.orchestrating)
         .unwrap_or(false);
-    orchestrating || routeable.iter().any(|c| c.cost_rank < parent_cost)
+    orchestrating || delegatable.iter().any(|c| c.cost_rank < parent_cost)
 }
 
 /// Build the router-owned MCP server entry for a pinned session. The server is

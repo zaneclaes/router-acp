@@ -44,7 +44,9 @@ use crate::downstream::{
 use crate::headroom::HeadroomTracker;
 use crate::relay;
 use crate::state::{PersistedSession, StateFile};
-use crate::strategies::{CandidateView, OverrideSource, RouteContext, make_strategy};
+use crate::strategies::{
+    CandidateView, OverrideSource, RankedCandidate, RouteContext, make_strategy,
+};
 
 /// Cap on the stored text of a logged prose turn (`user_prompt` /
 /// `agent_response`).
@@ -82,6 +84,9 @@ pub struct CandidateRuntime {
     pub config_index: usize,
     pub process_key: ProcessKey,
     pub status: CandidateStatus,
+    /// Mirrors `models[].auto_eligible`: false keeps the candidate out of
+    /// every automatic selection pool while leaving it explicitly selectable.
+    pub auto_eligible: bool,
 }
 
 /// Runtime state for one downstream process target.
@@ -545,6 +550,7 @@ impl Shared {
                     config_index,
                     process_key,
                     status: CandidateStatus::Unverified,
+                    auto_eligible: model.auto_eligible,
                 });
                 config_index += 1;
             }
@@ -821,19 +827,52 @@ impl Shared {
 
     /// Candidates that are routeable, unquarantined, and satisfy the prompt's
     /// required capabilities, as strategy views.
+    ///
+    /// This is the AUTOMATIC pool: `auto_eligible: false` candidates are
+    /// absent. Every automatic mechanism reads candidates through here, so
+    /// excluding them once — rather than at each of a dozen call sites — is
+    /// what makes "never picked by accident" hold for mechanisms added later.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, false)
+        self.eligible_views_inner(required, class, false, None)
     }
 
-    /// Like `eligible_views` but keeps usage-cordoned candidates in the pool.
-    /// Used only for the all-cordoned "least-bad" fallback, where every
-    /// candidate is usage-cordoned and the turn would otherwise fail.
+    /// `eligible_views` plus one named candidate that may be
+    /// `auto_eligible: false` — the session's EXPLICIT pin. Every other
+    /// eligibility gate (routeable, capabilities, quarantine, cordons, seat
+    /// budget) still applies to it.
+    pub fn eligible_views_admitting(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+        admit: Option<&CandidateId>,
+    ) -> Vec<CandidateView> {
+        self.eligible_views_inner(required, class, false, admit)
+    }
+
+    /// Like `eligible_views_admitting` but keeps usage-cordoned candidates in
+    /// the pool. Used only for the all-cordoned "least-bad" fallback, where
+    /// every candidate is usage-cordoned and the turn would otherwise fail.
     pub fn eligible_views_relaxed(
         &self,
         required: &RequiredCaps,
         class: TaskClass,
+        admit: Option<&CandidateId>,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, true)
+        self.eligible_views_inner(required, class, true, admit)
+    }
+
+    /// The strategy view for ONE candidate, ignoring auto-eligibility — the
+    /// question "may this specific candidate serve this prompt right now?",
+    /// which an explicit pin has to be able to answer yes to.
+    pub fn candidate_view(
+        &self,
+        id: &CandidateId,
+        required: &RequiredCaps,
+        class: TaskClass,
+    ) -> Option<CandidateView> {
+        self.eligible_views_inner(required, class, false, Some(id))
+            .into_iter()
+            .find(|v| &v.id == id)
     }
 
     fn eligible_views_inner(
@@ -841,12 +880,18 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
         ignore_usage_cordons: bool,
+        admit: Option<&CandidateId>,
     ) -> Vec<CandidateView> {
         let candidates = self.routeable_candidates();
         let mut headroom = self.headroom.lock().unwrap();
         let targets = self.targets.lock().unwrap();
         let mut views = Vec::new();
         for c in candidates {
+            // A pinned legacy version is reachable only on purpose: it stays
+            // out of the pool unless it IS the explicitly named candidate.
+            if !c.auto_eligible && admit != Some(&c.id) {
+                continue;
+            }
             let Some(target) = targets.get(&c.process_key) else {
                 continue;
             };
@@ -1032,6 +1077,13 @@ impl Shared {
                     let mut router_meta = json!({
                         "capabilities": { "effort": { "supported": supported } },
                     });
+                    // Pinned legacy versions stay listed — a picker is
+                    // explicit selection, which is the only way to reach
+                    // them — but are flagged so a client can mark them as
+                    // "manual only". Omitted when true: absent = eligible.
+                    if !c.auto_eligible {
+                        router_meta["auto_eligible"] = json!(false);
+                    }
                     if let Some(cordon) = usage_cordons.get(&c.id) {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(cordon.reason);
@@ -2167,15 +2219,23 @@ pub async fn open_downstream_session(
             return Err(AcpError::internal_error()
                 .data(format!("no model config option discovered for {candidate}")));
         };
+        // The selector speaks `downstream_id` (== `id` unless the entry pins a
+        // legacy version behind a known-good alias); the real wire model is
+        // then held by `api_model` through the per-request proxy.
+        let downstream_model = shared
+            .cfg
+            .model_config(candidate)
+            .map(|m| m.downstream_id().to_string())
+            .unwrap_or_else(|| candidate.model.clone());
         let set_req = SetSessionConfigOptionRequest::new(
             resp.session_id.clone(),
             config_id.clone(),
-            SessionConfigOptionValue::value_id(candidate.model.clone()),
+            SessionConfigOptionValue::value_id(downstream_model.clone()),
         );
         match conn.send_request(set_req).block_task().await {
             Ok(set_resp) => {
                 if let Err(msg) =
-                    verify_model_selected(&set_resp.config_options, &config_id, &candidate.model)
+                    verify_model_selected(&set_resp.config_options, &config_id, &downstream_model)
                 {
                     cleanup_failed_session(shared, &key, &conn, &downstream_sid);
                     return Err(AcpError::internal_error()
@@ -2757,6 +2817,32 @@ fn prefer_larger_context(
     if roomier.is_empty() { pool } else { roomier }
 }
 
+/// Substitute `model_version_pins` targets into a ranked fallback chain, one
+/// hop, noting each substitution so the disclosure explains the id the user
+/// did not ask for.
+///
+/// Deduplicates on the resulting id: two chain entries can collapse onto the
+/// same target, and the failover walk must not retry a candidate it already
+/// tried.
+fn apply_version_pins(cfg: &Config, ranked: &mut Vec<RankedCandidate>) {
+    if cfg.model_version_pins.is_empty() {
+        return;
+    }
+    for rc in ranked.iter_mut() {
+        let Some(target) = cfg.version_pin_target(&rc.candidate) else {
+            continue;
+        };
+        let note = format!("version pin: {} → {target}", rc.candidate);
+        rc.note = Some(match rc.note.take() {
+            Some(existing) => format!("{note}; {existing}"),
+            None => note,
+        });
+        rc.candidate = target;
+    }
+    let mut seen = HashSet::new();
+    ranked.retain(|rc| seen.insert(rc.candidate.clone()));
+}
+
 /// Pick a candidate for this session, open + verify its downstream session,
 /// commit the pin, apply any deferred/previous session mode, persist, and
 /// disclose the decision (and every skipped candidate) to the user.
@@ -2850,7 +2936,7 @@ async fn pin_session(
     let excluded_patterns = shared
         .with_session(router_sid, |s| s.excluded.clone())
         .unwrap_or_default();
-    let mut pool = shared.eligible_views(&required, profile.class);
+    let mut pool = shared.eligible_views_admitting(&required, profile.class, override_.as_ref());
     if let Some(exclude) = exclude {
         pool.retain(|v| &v.id != exclude);
     }
@@ -2871,7 +2957,8 @@ async fn pin_session(
     // rather than failing the turn.
     let mut all_cordoned_fallback: Option<String> = None;
     if pool.is_empty() {
-        let mut relaxed = shared.eligible_views_relaxed(&required, profile.class);
+        let mut relaxed =
+            shared.eligible_views_relaxed(&required, profile.class, override_.as_ref());
         if let Some(exclude) = exclude {
             relaxed.retain(|v| &v.id != exclude);
         }
@@ -2986,6 +3073,15 @@ async fn pin_session(
         });
         ranked.insert(0, rc);
     }
+
+    // Version pinning, applied to the whole fallback chain: every way a
+    // candidate can be resolved here — the strategy's winner, the explicit
+    // `candidate=` pin routed through `static`, a skill route, the configured
+    // static candidate — has already collapsed into `ranked`, so substituting
+    // once covers them all. `candidate` then carries the substituted id into
+    // the pin, the state row and the disclosure, so the user is told which
+    // model actually served the turn.
+    apply_version_pins(&shared.cfg, &mut ranked);
 
     // 4. Walk the ranked list until a candidate opens and verifies,
     //    remembering why each earlier candidate was skipped.
@@ -4116,11 +4212,15 @@ fn resolve_candidate_ref(
     excluded: &[String],
 ) -> Option<CandidateId> {
     let views = shared.eligible_views(&RequiredCaps::default(), class);
-    // Exact `agent/model` id wins outright.
+    // Exact `agent/model` id wins outright — and naming a full id is explicit
+    // selection, so it may name a pinned legacy version. The fuzzy matching
+    // below stays on the automatic pool: `opus:` must not land on a legacy
+    // version just because it scores a hair higher.
     if let Some(id) = CandidateId::parse(reference)
-        && views
-            .iter()
-            .any(|v| v.id == id && !is_excluded(&id, excluded))
+        && !is_excluded(&id, excluded)
+        && shared
+            .candidate_view(&id, &RequiredCaps::default(), class)
+            .is_some()
     {
         return Some(id);
     }
@@ -5145,6 +5245,13 @@ async fn switch_pin(
     reason: &str,
     style: HandoffStyle,
 ) -> Result<Vec<String>, AcpError> {
+    // Version pinning applies to re-pins too: a switch resolved by any route
+    // (user `switch=`, escalation, demotion, a skill re-route, a cordon
+    // redirect) lands on the pinned version, not the moving alias. Done first
+    // so the "already there" check below compares the substituted target.
+    let substituted = shared.cfg.version_pin_target(target);
+    let target = substituted.as_ref().unwrap_or(target);
+
     // Read the pin directly (not `pinned_route`, which requires a *live*
     // downstream): an outage may have killed the old process, and we still
     // want to switch away from it using the log-transcript fallback.
@@ -6552,10 +6659,12 @@ async fn dispatch_prompt(
                 .chain(route.also_acceptable.iter())
                 .any(|rc| candidate_matches(rc, c))
                 && !is_excluded(c, &excluded)
+                // "Is the CURRENT pin still serviceable?", not "would auto
+                // pick it?" — an explicitly pinned legacy version satisfies
+                // an approved skill pool and must not be switched away from.
                 && shared
-                    .eligible_views(&RequiredCaps::default(), class)
-                    .iter()
-                    .any(|v| &v.id == c)
+                    .candidate_view(c, &RequiredCaps::default(), class)
+                    .is_some()
         });
         if already_ok {
             // Re-invoking the skill on an already-compliant pin is an

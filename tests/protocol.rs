@@ -6562,3 +6562,240 @@ async fn preclass_hard_fails_on_unparseable_reply() {
     })
     .await;
 }
+
+// ======================================================================
+// Model version pinning: `auto_eligible: false` + `model_version_pins`
+// ======================================================================
+
+/// Like `agent_yaml`, but the model entries are written out verbatim (so they
+/// can carry `auto_eligible` / `downstream_id`) and the mock's model selector
+/// advertises exactly `advertised` — which is how a real adapter behaves: it
+/// offers a fixed alias set and refuses any other value.
+fn agent_yaml_models(name: &str, advertised: &[&str], model_lines: &str) -> String {
+    let mut out = format!(
+        "  - name: {name}\n    command:\n      type: stdio\n      command: {}\n      env:\n",
+        mock_agent_exe()
+    );
+    out.push_str(&format!(
+        "        - {{ name: MOCK_NAME, value: {name} }}\n\
+         \x20       - {{ name: MOCK_MODELS, value: \"{}\" }}\n",
+        advertised.join(",")
+    ));
+    out.push_str("    model_selection: { type: config-option }\n    models:\n");
+    out.push_str(model_lines);
+    out
+}
+
+/// A score table making `legacy` the strongest candidate, so a pure-quality
+/// `auto` would pick it if it were in the pool at all.
+fn legacy_scores(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "router-acp-{tag}-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &path,
+        "candidates:\n\
+         \x20 - { pattern: 'a/legacy', default_quality: 3.0 }\n\
+         \x20 - { pattern: 'a/*', default_quality: 1.0 }\n",
+    )
+    .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_never_auto_chosen() {
+    let state = temp_state_file("auto-ineligible");
+    let scores = legacy_scores("auto-ineligible");
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "a",
+            &["m1", "legacy"],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+
+        // Advertised in the picker (explicit selection is its only route in),
+        // flagged so a client can present it as manual-only.
+        let session = new_session(&cx).await?;
+        let options = serde_json::to_value(&session.config_options)
+            .unwrap()
+            .to_string();
+        let legacy_at = options
+            .find("a/legacy")
+            .unwrap_or_else(|| panic!("a/legacy must be advertised: {options}"));
+        assert!(
+            options[legacy_at..options.len().min(legacy_at + 400)]
+                .contains("\"auto_eligible\":false"),
+            "a/legacy must carry auto_eligible:false — {options}"
+        );
+        let m1_at = options.find("a/m1").expect("a/m1 advertised");
+        assert!(
+            !options[m1_at..legacy_at.max(m1_at)].contains("auto_eligible"),
+            "an auto-eligible candidate omits the key entirely: {options}"
+        );
+
+        // Pure-quality auto would pick `legacy` (quality 3.0 vs 1.0); it must
+        // not even be a candidate.
+        let sid = session.session_id.0.to_string();
+        prompt_text(&cx, &sid, "implement the feature").await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(
+            routed.contains("auto → a/m1"),
+            "auto must never choose an auto_eligible:false candidate — {routed}"
+        );
+
+        // Explicitly naming it still works.
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid2,
+            "[router: candidate=a/legacy]\nimplement the feature",
+        )
+        .await?;
+        let routed2 = agent_text(&observed, &sid2);
+        assert!(
+            routed2.contains("static → a/legacy"),
+            "an explicit directive must reach the legacy candidate — {routed2}"
+        );
+        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "legacy");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn model_version_pins_substitute_the_target_and_disclose_it() {
+    let state = temp_state_file("version-pins");
+    let scores = legacy_scores("version-pins");
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         model_version_pins:\n  \"a/m1\": \"a/legacy\"\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "a",
+            &["m1", "legacy"],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+
+        // 1. The auto winner is the pin KEY, so the session lands on the target.
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "implement the feature").await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(
+            routed.contains("auto → a/legacy"),
+            "the disclosure must name the substituted candidate — {routed}"
+        );
+        assert!(
+            routed.contains("version pin: a/m1 → a/legacy"),
+            "the substitution must be disclosed — {routed}"
+        );
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
+
+        // 2. An explicit directive naming the KEY is substituted too.
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid2,
+            "[router: candidate=a/m1]\nimplement the feature",
+        )
+        .await?;
+        let routed2 = agent_text(&observed, &sid2);
+        assert!(
+            routed2.contains("static → a/legacy"),
+            "an explicit key pin must resolve to the target — {routed2}"
+        );
+        assert!(
+            routed2.contains("version pin: a/m1 → a/legacy"),
+            "the substitution must be disclosed — {routed2}"
+        );
+        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "legacy");
+
+        // 3. Naming the TARGET directly is unchanged — no second hop, no note.
+        let sid3 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid3,
+            "[router: candidate=a/legacy]\nimplement the feature",
+        )
+        .await?;
+        let routed3 = agent_text(&observed, &sid3);
+        assert!(
+            routed3.contains("static → a/legacy"),
+            "naming the target keeps working — {routed3}"
+        );
+        assert!(
+            !routed3.contains("version pin:"),
+            "no substitution happened, so nothing to disclose — {routed3}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn downstream_id_selects_a_legacy_version_behind_a_known_good_alias() {
+    let state = temp_state_file("downstream-id");
+    let scores = legacy_scores("downstream-id");
+    let log = temp_log("downstream-id");
+    // The selector advertises only `m1` — exactly the real constraint that
+    // makes `downstream_id` necessary for a bare-API-id legacy candidate.
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "a",
+            &["m1"],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false, downstream_id: m1 }\n",
+        )
+        .replace(
+            "    model_selection:",
+            &format!(
+                "        - {{ name: MOCK_LOG, value: \"{}\" }}\n    model_selection:",
+                log.display()
+            ),
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/legacy]\nimplement the feature",
+        )
+        .await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(
+            routed.contains("static → a/legacy"),
+            "a candidate whose id the selector does not advertise stays routeable \
+             through downstream_id — {routed}"
+        );
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
+        let sets: Vec<String> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "set_config_option")
+            .map(|e| e["value"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            sets.iter().any(|v| v == "m1") && !sets.iter().any(|v| v == "legacy"),
+            "the selector must receive the alias, never the candidate id — {sets:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
