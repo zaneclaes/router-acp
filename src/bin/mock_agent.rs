@@ -38,6 +38,8 @@
 //!   `elicitation/create`, echo the outcome
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
+//! - `DELEGATE_HINT:<agent/model>` — attach `hints.candidate` to every
+//!   `DELEGATE:` call in the same prompt (exercises the hint resolution path).
 //! - `DELEGATE:<task>` — call the `delegate_task` tool on the MCP server
 //!   named `router-delegate` passed in session/new (may repeat; all
 //!   delegations run concurrently)
@@ -614,6 +616,10 @@ async fn run_prompt(
         .lines()
         .filter_map(|l| l.trim().strip_prefix("DELEGATE:"))
         .collect();
+    let delegate_hint: Option<String> = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("DELEGATE_HINT:"))
+        .map(|c| c.trim().to_string());
     if !delegate_tasks.is_empty() {
         let delegate_server = mcp_servers
             .iter()
@@ -625,12 +631,17 @@ async fn run_prompt(
                     .map(|task| {
                         let server = server.clone();
                         let task = task.to_string();
+                        let hint = delegate_hint.clone();
                         async move {
                             let mut client = McpClient::spawn(&server).await?;
+                            let mut arguments = json!({"task": task});
+                            if let Some(candidate) = hint {
+                                arguments["hints"] = json!({"candidate": candidate});
+                            }
                             let result = client
                                 .request(
                                     "tools/call",
-                                    json!({"name": "delegate_task", "arguments": {"task": task}}),
+                                    json!({"name": "delegate_task", "arguments": arguments}),
                                 )
                                 .await;
                             client.shutdown().await;

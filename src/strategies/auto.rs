@@ -71,15 +71,19 @@ impl RouterStrategy for AutoStrategy {
         ctx: &RouteContext,
         candidates: &[CandidateView],
     ) -> Result<Vec<RankedCandidate>, RouteError> {
-        // 1. allowed_candidates globs.
+        // 1. allowed_candidates globs. Matched against every spelling the pool
+        // member answers to: an allowlist naming a family's stable default id
+        // must keep permitting it after a version pin substitutes underneath.
         let mut pool: Vec<&CandidateView> = candidates
             .iter()
             .filter(|c| {
-                let key = c.id.to_string();
-                self.cfg
-                    .allowed_candidates
-                    .iter()
-                    .any(|p| glob_match(p, &key))
+                c.ids().any(|id| {
+                    let key = id.to_string();
+                    self.cfg
+                        .allowed_candidates
+                        .iter()
+                        .any(|p| glob_match(p, &key))
+                })
             })
             .collect();
         if pool.is_empty() {
@@ -345,6 +349,31 @@ mod tests {
         p[1].headroom = 1.0;
         let ranked = s.rank(&ctx(), &p).unwrap();
         assert_ne!(ranked[0].candidate.to_string(), "claude/haiku");
+    }
+
+    /// The fourth stated-reference seam: `allowed_candidates` is authored
+    /// against a family's stable default id, but a version pin substitutes the
+    /// served id into the pool. Matching only the served id would silently
+    /// drop the candidate the allowlist meant to permit.
+    #[test]
+    fn allowed_candidates_matches_a_pinned_slot_under_its_configured_key() {
+        let mut cfg = cfg(0.0);
+        cfg.allowed_candidates = vec!["claude/opus[1m]".to_string()];
+        let strategy = AutoStrategy::new(cfg);
+        let mut pinned = view(
+            "claude",
+            "claude-opus-4-6",
+            4,
+            0,
+            0.9,
+            CodingTier::High,
+            1.0,
+        );
+        pinned.pinned_from = Some(crate::candidate::CandidateId::new("claude", "opus[1m]"));
+        let ranked = strategy
+            .rank(&ctx(), &[pinned])
+            .expect("the allowlist's configured key still permits its pinned slot");
+        assert_eq!(ranked[0].candidate.to_string(), "claude/claude-opus-4-6");
     }
 
     #[test]

@@ -7002,3 +7002,162 @@ async fn failover_off_a_pinned_target_does_not_route_back_through_its_key() {
     })
     .await;
 }
+
+// ======================================================================
+// Stated-reference seams: a configured/typed candidate id names the family
+// DEFAULT, while `effective_candidates` substitutes before filtering, so the
+// pool holds target ids only. Every seam that compares a stated reference
+// against the pool has to resolve it first.
+// ======================================================================
+
+#[tokio::test]
+async fn static_route_configured_with_a_pinned_key_routes_to_the_target() {
+    let state = temp_state_file("pin-static");
+    let scores = legacy_scores("pin-static");
+    // `routers.static.candidate` names the stable default id, which is exactly
+    // what a config author writes; the pin points it at `a/legacy`.
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         router: static\nrouters:\n  static: {{ candidate: a/m1 }}\n\
+         model_version_pins:\n  \"a/m1\": \"a/legacy\"\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "a",
+            &["m1", "legacy"],
+            &[],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "implement the feature").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("static → a/legacy"),
+            "the configured static route must resolve its pin, not report \
+             not-routeable or fall through: {text}"
+        );
+        assert!(
+            !text.contains("→ b/m2"),
+            "must not fall through to an unrelated candidate: {text}"
+        );
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn fully_qualified_shorthand_naming_a_pinned_key_pins_the_target() {
+    let state = temp_state_file("pin-shorthand");
+    let scores = legacy_scores("pin-shorthand");
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         model_version_pins:\n  \"a/m1\": \"a/legacy\"\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml_models(
+            "a",
+            &["m1", "legacy"],
+            &[],
+            "      - { id: m1, cost_rank: 1 }\n\
+             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+        ),
+        // `b` outscores nothing here; it exists so an unrecognized shorthand
+        // would visibly route elsewhere instead of coincidentally landing right.
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // A fully-qualified `agent/model:` shorthand naming the stable default.
+        // Unresolved, `candidate_view` misses and this reads as plain prose.
+        prompt_text(&cx, &sid, "a/m1: implement the feature").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("static → a/legacy"),
+            "a fully-qualified pinned-key shorthand must still be recognized \
+             and must pin the target: {text}"
+        );
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
+        // The prefix is consumed, not left in the prompt.
+        assert!(!text.contains("a/m1:"), "shorthand prefix stripped: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn delegation_hint_naming_a_pinned_key_opens_the_target() {
+    let state = temp_state_file("pin-hint");
+    let log = temp_log("pin-hint");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-pin-hint-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // `other` outscores the pinned target at the same cost, so a DROPPED hint
+    // visibly lands somewhere else. Without it the delegate would reach
+    // `haiku-legacy` on ranking alone and the test would pass vacuously.
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'cheap/other', default_quality: 2.0 }\n\
+         \x20 - { pattern: 'cheap/*', default_quality: 1.0 }\n\
+         \x20 - { pattern: 'fancy/*', default_quality: 3.0 }\n",
+    )
+    .unwrap();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let cheap = agent_yaml_models(
+        "cheap",
+        &["haiku", "haiku-legacy", "other"],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_SESSION_MODES", "default,bypassPermissions"),
+        ],
+        "      - { id: haiku, cost_rank: 1 }\n\
+         \x20     - { id: haiku-legacy, cost_rank: 1, auto_eligible: false }\n\
+         \x20     - { id: other, cost_rank: 1 }\n",
+    )
+    .replace(
+        "    models:\n",
+        "    mode_map: { auto: bypassPermissions }\n    models:\n",
+    );
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\n\
+         delegation: {{ enabled: true, max_concurrent: 3 }}\n\
+         model_version_pins:\n  \"cheap/haiku\": \"cheap/haiku-legacy\"\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        scores.display(),
+        cheap,
+        agent_yaml("fancy", &[("opus", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // The parent names the candidate by the stable id it knows. Compared
+        // unsubstituted, the hint matches nothing in the pool and is dropped.
+        prompt_text(
+            &cx,
+            &sid,
+            "big work\nDELEGATE_HINT:cheap/haiku\nDELEGATE:tweak the css",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("router-acp · delegate_task → cheap/haiku-legacy"),
+            "a hint naming the pinned key must open the target: {text}"
+        );
+        assert!(
+            !text.contains("delegate_task → cheap/other"),
+            "an unresolved hint is dropped and ranks `other` instead: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}

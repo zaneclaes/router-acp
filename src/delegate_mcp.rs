@@ -1093,7 +1093,16 @@ pub async fn run_delegate_task(
     let orchestrating = shared
         .with_session(router_sid, |s| s.orchestrating)
         .unwrap_or(false);
-    let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
+    // The hint is a STATED reference (a parent model names a candidate by the
+    // id it knows), so resolve it through the version-pin map — otherwise a
+    // hint naming the stable default id matches nothing in the pool and is
+    // silently dropped.
+    let hinted = args
+        .hints
+        .candidate
+        .as_deref()
+        .and_then(CandidateId::parse)
+        .map(|stated| shared.cfg.resolve_stated_candidate(&stated));
     let mut pool = scope_delegate_pool(
         shared.eligible_views(&RequiredCaps::default(), profile.class),
         parent_cost,

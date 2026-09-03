@@ -1939,6 +1939,22 @@ impl Config {
             .and_then(|target| CandidateId::parse(target))
     }
 
+    /// Resolve a STATED candidate reference — one a human or a config file
+    /// wrote down — to the id routing will actually use. Single hop.
+    ///
+    /// Every seam that compares a stated reference against a live candidate
+    /// pool must go through this. Pools are built by
+    /// `Shared::effective_candidates`, which substitutes version pins BEFORE
+    /// filtering, so a pool holds target ids only; comparing a raw pin key
+    /// against it silently misses and the reference reads as unknown —
+    /// a not-routeable static route, an unrecognized `agent/model:` shorthand,
+    /// an ignored delegation hint. Stated references keep naming the stable
+    /// default id, so that miss is the normal case, not an edge one.
+    pub fn resolve_stated_candidate(&self, stated: &CandidateId) -> CandidateId {
+        self.version_pin_target(stated)
+            .unwrap_or_else(|| stated.clone())
+    }
+
     /// All declared candidate ids in config order.
     pub fn declared_candidates(&self) -> Vec<CandidateId> {
         let mut out = Vec::new();

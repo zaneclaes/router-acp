@@ -198,7 +198,17 @@ pub trait RouterStrategy: Send + Sync {
 /// Instantiate the named strategy from config.
 pub fn make_strategy(kind: StrategyKind, cfg: &Config) -> Box<dyn RouterStrategy> {
     match kind {
-        StrategyKind::Static => Box::new(StaticStrategy::new(cfg.routers.static_.clone())),
+        StrategyKind::Static => {
+            // `routers.static.candidate` is a CONFIG-STATED reference, so it
+            // needs the version-pin map applied like any other: the pool holds
+            // served ids, and a raw pin key would report the configured route
+            // as not-routeable (or fall through to an unrelated candidate).
+            let mut scfg = cfg.routers.static_.clone();
+            if let Some(stated) = scfg.candidate.as_deref().and_then(CandidateId::parse) {
+                scfg.candidate = Some(cfg.resolve_stated_candidate(&stated).to_string());
+            }
+            Box::new(StaticStrategy::new(scfg))
+        }
         StrategyKind::Auto => Box::new(AutoStrategy::with_cost_aversion(
             cfg.routers.auto.clone(),
             cfg.availability_preference.cost_aversion,

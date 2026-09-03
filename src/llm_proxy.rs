@@ -534,8 +534,35 @@ async fn proxy_request(
     };
 
     if upstream.status().is_client_error() || upstream.status().is_server_error() {
-        let retry_pinned = decision.as_ref().is_some_and(|decision| decision.rewrite);
-        if retry_pinned {
+        // A rejected PIN rewrite is never recovered by retrying the original
+        // body. The original names whatever the downstream alias resolves to,
+        // so the retry would serve a different model while the session stays
+        // attributed and priced as the pinned one — and because the pinned
+        // candidate bypasses the `rejected_api_models` filter, it would do
+        // that on every single request. Fail loudly and once instead: cordon
+        // the candidate with the provider's own reason (so the picker shows it
+        // unavailable, automatic routing drops it, and a pin to it is
+        // redirected with a visible disclosure), tell the session, and hand
+        // the provider's actionable error back to the adapter.
+        if let (Some(active), Some(pin_decision)) = (
+            attributed.as_ref(),
+            decision.as_ref().filter(|decision| decision.honors_pin),
+        ) {
+            return reject_pinned_rewrite(
+                &state,
+                &target,
+                active,
+                pin_decision,
+                upstream,
+                &rest,
+                &body,
+                &request_id,
+                started,
+            )
+            .await;
+        }
+        let retry_alternate = decision.as_ref().is_some_and(|decision| decision.rewrite);
+        if retry_alternate {
             let failed_status = upstream.status();
             // 404/400 on a rewritten request means this target cannot serve it —
             // an api model id the provider doesn't recognise, or a parameter it
@@ -596,6 +623,7 @@ async fn proxy_request(
                                 }),
                             selected_model: active.candidate.model.clone(),
                             rewrite: false,
+                            honors_pin: false,
                             reason: format!(
                                 "alternate model `{attempted}` returned HTTP {failed_status}; \
                                  retried unchanged on {} (not retried again this session)",
@@ -685,6 +713,145 @@ fn build_upstream_request(
         }
     }
     request
+}
+
+/// A provider rejection of a PIN rewrite: cordon the pinned candidate with the
+/// provider's own reason, tell the session, record the request, and return the
+/// provider's response verbatim.
+///
+/// The two invariants this exists for: never serve a model other than the
+/// explicit pin (so no original-body retry), and never do it again next
+/// request (so the candidate is cordoned rather than left in rotation). The
+/// cordon reuses the reactive per-candidate machinery, so the candidate is
+/// dropped from automatic pools, advertised unavailable with its reason in the
+/// model picker, and an explicit pin to it is redirected with a disclosure.
+///
+/// Only 400/404 cordon: those say the provider will not serve this model id.
+/// Transient codes (429, 5xx) say nothing about its suitability, so they are
+/// surfaced without sidelining the candidate — but they are still never
+/// silently retried on a different model.
+#[allow(clippy::too_many_arguments)]
+async fn reject_pinned_rewrite(
+    state: &ProxyServerState,
+    target: &ProxyTarget,
+    active: &ActiveTurn,
+    decision: &RequestDecision,
+    upstream: reqwest::Response,
+    rest: &str,
+    body: &[u8],
+    request_id: &str,
+    started: Instant,
+) -> Response<Body> {
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    // Read the error body: it carries the message the user can act on (for a
+    // version-gated model id, literally "run `claude update`"), and we are
+    // returning it rather than streaming a replacement.
+    let payload = upstream.bytes().await.unwrap_or_default();
+    let detail = provider_error_message(&payload);
+    let cordoned = matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST);
+
+    if cordoned {
+        let reset = std::time::Duration::from_secs(state.shared.cfg.headroom.cordon_default_secs);
+        let reason = format!("provider rejected `{}`: {detail}", decision.model);
+        state.shared.headroom.lock().unwrap().cordon_candidate(
+            &active.candidate,
+            reason,
+            std::time::SystemTime::now() + reset,
+        );
+        tracing::warn!(
+            target = %target.key,
+            candidate = %active.candidate,
+            api_model = decision.model,
+            %status,
+            cordon_secs = reset.as_secs(),
+            "pinned model rejected by provider; cordoned instead of serving a \
+             different model"
+        );
+    } else {
+        tracing::warn!(
+            target = %target.key,
+            candidate = %active.candidate,
+            api_model = decision.model,
+            %status,
+            "pinned model request failed; surfacing the provider error unchanged"
+        );
+    }
+
+    let tail = if cordoned {
+        format!(
+            " — cordoned for {} so the next turn routes elsewhere instead of \
+             silently serving a different version",
+            crate::limits::humanize(std::time::Duration::from_secs(
+                state.shared.cfg.headroom.cordon_default_secs
+            ))
+        )
+    } else {
+        String::new()
+    };
+    crate::session::notify_user(
+        &state.shared,
+        &active.parent_router_sid,
+        format!(
+            "router-acp · {} rejected by the provider (HTTP {}): {detail}{tail}",
+            active.candidate,
+            status.as_u16(),
+        ),
+    );
+
+    let completion = start_request_record(
+        state,
+        target,
+        Some(active),
+        Some(decision),
+        rest,
+        body,
+        request_id,
+        started,
+    );
+    if let Some(context) = completion {
+        complete_request(
+            &state.shared,
+            &state.runtime,
+            context,
+            status.as_u16(),
+            &[],
+            Some(format!(
+                "provider rejected pinned model `{}`: {detail}",
+                decision.model
+            )),
+        );
+    }
+
+    let mut response = Response::builder().status(status);
+    if let Some(response_headers) = response.headers_mut() {
+        copy_response_headers(&headers, response_headers);
+    }
+    response
+        .body(Body::from(payload))
+        .unwrap_or_else(|_| error_response(status, &detail))
+}
+
+/// The human-readable message out of a provider error body
+/// (`{"error":{"message":…}}` on both wires), else a truncated raw body.
+fn provider_error_message(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    let message = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| text.trim().to_string());
+    let mut message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if message.is_empty() {
+        message = "no message in the provider response".to_string();
+    }
+    message.truncate(300);
+    message
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -991,6 +1158,16 @@ struct RequestDecision {
     /// Configured candidate model used for attribution/pricing.
     selected_model: String,
     rewrite: bool,
+    /// The rewrite exists only to put the SESSION PIN's own `api_model` on the
+    /// wire — the model the session is attributed and priced as — rather than
+    /// to route to a router-chosen alternate.
+    ///
+    /// It gates the alternate-fallback path: retrying the untouched original
+    /// body is a legitimate recovery for a rejected ALTERNATE (the pinned
+    /// model is what the adapter asked for anyway), but on a pin rewrite the
+    /// original names whatever the downstream ALIAS resolves to, so retrying
+    /// it would serve a different model under the pin's identity.
+    honors_pin: bool,
     reason: String,
     event: String,
     estimated_input: u64,
@@ -1407,13 +1584,15 @@ fn select_request_model(
             .map(|model| model.api_model.clone())
             .unwrap_or_else(|| configured_api_model(shared, &selected))
     };
+    let rewrite = signals
+        .original_model
+        .as_ref()
+        .map_or(selected != active.candidate, |original| {
+            original != &upstream_model
+        });
     RequestDecision {
-        rewrite: signals
-            .original_model
-            .as_ref()
-            .map_or(selected != active.candidate, |original| {
-                original != &upstream_model
-            }),
+        rewrite,
+        honors_pin: rewrite && selected == active.candidate,
         model: upstream_model,
         selected_model: selected.model.clone(),
         reason,
@@ -3170,6 +3349,44 @@ agents:
         assert!(!decision.rewrite);
     }
 
+    /// The discriminator the fallback path keys on. A router-chosen alternate
+    /// keeps the legitimate retry-the-original recovery (see
+    /// `proxy_streams_rewrites_preserves_auth_and_accounts_requests`, which
+    /// exercises it end to end); only a pin rewrite loses it.
+    #[test]
+    fn only_a_pin_rewrite_is_flagged_as_honoring_the_pin() {
+        let (_dir, shared) = kory_code_shared();
+        // Pin rewrite: staying on the session's own candidate, but its
+        // api_model differs from the alias string the adapter emitted.
+        let pin = select_request_model(
+            &shared,
+            &claude_active("claude-opus-4-6"),
+            &aliased_request("claude-opus-5"),
+        );
+        assert!(pin.rewrite && pin.honors_pin);
+
+        // Router-chosen alternate: a demotion off the pin. Rewritten too, but
+        // the original body is still a valid request for the pinned model, so
+        // the alternate-fallback path stays available.
+        let routine = json!({
+            "model": "claude-fable-5",
+            "messages": [{"role":"user","content":[{
+                "type":"tool_result","content":"git status clean","status":"completed"
+            }]}]
+        });
+        let mut alternate =
+            select_request_model(&shared, &claude_active("claude-fable-5[1m]"), &routine);
+        for _ in 0..4 {
+            alternate =
+                select_request_model(&shared, &claude_active("claude-fable-5[1m]"), &routine);
+        }
+        assert_eq!(alternate.event, "demotion", "reason: {}", alternate.reason);
+        assert!(
+            alternate.rewrite && !alternate.honors_pin,
+            "an alternate rewrite must keep its fallback: {alternate:?}"
+        );
+    }
+
     #[test]
     fn per_request_pool_substitutes_a_version_pinned_alternate() {
         // The proxy's own candidate pool must honour `model_version_pins`, or a
@@ -3528,6 +3745,210 @@ agents:
             )
             .unwrap();
         assert_eq!(fallback, ("mock/opus".into(), "proxy-fallback".into()));
+
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    /// A provider rejection of a PIN rewrite must never be "recovered" by
+    /// replaying the untouched original body: that body names the downstream
+    /// ALIAS's own model, so the retry would serve a different version under
+    /// the pin's identity — and, because the pinned candidate bypasses the
+    /// `rejected_api_models` filter, it would do so on every request.
+    #[tokio::test]
+    async fn rejected_pinned_rewrite_cordons_instead_of_serving_the_alias() {
+        #[derive(Clone)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+
+        async fn upstream(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response<Body> {
+            let model = body["model"].as_str().unwrap_or("").to_string();
+            seen.0.lock().unwrap().push(model.clone());
+            // The real below-the-floor rejection, verbatim in shape.
+            if model == "claude-fable-5-1" {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Claude Code 2.1.246 does not support this model; version 2.1.251 or newer is required. Run `claude update`."}}"#,
+                    ))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(
+                    "event: message_start\n\
+                     data: {\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                ))
+                .unwrap()
+        }
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let seen = Seen(Arc::new(Mutex::new(Vec::new())));
+        let upstream_app = Router::new()
+            .route("/v1/messages", axum::routing::post(upstream))
+            .with_state(seen.clone());
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 99
+  minimum_dwell_requests: 0
+agents:
+  - name: claude
+    command: {{ type: stdio, command: claude-agent-acp }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: http://{upstream_addr}/v1
+    models:
+      - {{ id: "claude-fable-5[1m]", cost_rank: 5, api_model: claude-fable-5,
+           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
+      - {{ id: claude-fable-5-1, cost_rank: 5, api_model: claude-fable-5-1,
+           downstream_id: "claude-fable-5[1m]", auto_eligible: false,
+           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
+"#,
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg.clone()).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("claude".to_string()),
+            vec!["claude-fable-5[1m]".into(), "claude-fable-5-1".into()],
+        );
+        let pinned = CandidateId::new("claude", "claude-fable-5-1");
+        shared.state.lock().unwrap().upsert(
+            "r1".to_string(),
+            PersistedSession {
+                agent: "claude".to_string(),
+                model: pinned.model.clone(),
+                downstream_session_id: "d1".to_string(),
+                cwd: dir.path().to_path_buf(),
+                kind: "primary".to_string(),
+                ..Default::default()
+            },
+        );
+        // A live session so the user-facing notice has somewhere to land.
+        shared.sessions.lock().unwrap().insert(
+            "r1".to_string(),
+            RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new()),
+        );
+        let proxy_task = shared.llm_proxy.bind(shared.clone()).await.unwrap();
+        let spec = shared
+            .target_spec(&ProcessKey("claude".to_string()))
+            .unwrap();
+        let proxy_base = shared
+            .llm_proxy
+            .process_env(&spec)
+            .into_iter()
+            .find(|(name, _)| name == "ANTHROPIC_BASE_URL")
+            .unwrap()
+            .1;
+
+        // Exactly what claude-agent-acp emits for the alias it was configured
+        // with; the proxy rewrites it to the pinned api_model.
+        let adapter_body = json!({
+            "model": "claude-fable-5",
+            "messages": [{"role":"user","content":"continue"}]
+        });
+        let post = |base: String, body: Value| async move {
+            reqwest::Client::new()
+                .post(format!("{base}/messages"))
+                .header("authorization", "Bearer secret")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        };
+
+        let turn = shared.llm_proxy.begin_turn(
+            ProcessKey("claude".to_string()),
+            "r1".to_string(),
+            "r1".to_string(),
+            "d1".to_string(),
+            pinned.clone(),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        let response = post(proxy_base.clone(), adapter_body.clone()).await;
+
+        // (a) The provider's actionable error reaches the adapter unchanged
+        //     rather than being swallowed by a silent retry.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(
+            text.contains("claude update"),
+            "provider error relayed: {text}"
+        );
+
+        // (b) No original-body retry: the alias's model never went upstream.
+        assert_eq!(
+            seen.0.lock().unwrap().clone(),
+            vec!["claude-fable-5-1".to_string()],
+            "a rejected pin must not fall back onto the alias's own model"
+        );
+
+        // (c) The candidate is cordoned, with the provider's reason, so the
+        //     picker shows it unavailable and routing drops it.
+        let cordon = shared
+            .headroom
+            .lock()
+            .unwrap()
+            .usage_cordon(&pinned)
+            .cloned()
+            .expect("pinned candidate cordoned after the rejection");
+        assert!(
+            cordon.reason.contains("claude update"),
+            "cordon carries the provider reason: {}",
+            cordon.reason
+        );
+
+        // (d) The session is told, in terms it can act on.
+        let notice = shared
+            .with_session("r1", |session| session.pending_disclosure.join("\n"))
+            .unwrap_or_default();
+        assert!(
+            notice.contains("rejected by the provider") && notice.contains("claude update"),
+            "user notified: {notice}"
+        );
+
+        // (e) No attempt storm: the next request does not pay another failing
+        //     round trip on the pinned model. It routes to a real alternate,
+        //     which is a DISCLOSED switch (selected_model changes), not the
+        //     pin silently serving something else.
+        drop(turn);
+        let _turn2 = shared.llm_proxy.begin_turn(
+            ProcessKey("claude".to_string()),
+            "r1".to_string(),
+            "r1".to_string(),
+            "d1".to_string(),
+            pinned.clone(),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        let second = post(proxy_base, adapter_body).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = second.text().await.unwrap();
+        let models = seen.0.lock().unwrap().clone();
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| *model == "claude-fable-5-1")
+                .count(),
+            1,
+            "the rejected pinned model must be tried once, not per request: {models:?}"
+        );
 
         proxy_task.abort();
         upstream_task.abort();
