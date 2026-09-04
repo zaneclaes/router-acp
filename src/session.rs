@@ -3853,6 +3853,14 @@ fn build_background_instructions() -> String {
         .to_string()
 }
 
+fn build_question_instructions() -> String {
+    "[router-acp questions]\n\
+     Whenever you need an answer, choice, confirmation, or approval from the user, use the \
+     structured question-asking tool/mechanism exposed by your agent harness so the ACP client \
+     can render its question UI. Do not ask the user only in prose."
+        .to_string()
+}
+
 /// Forward a prompt to the pinned downstream, failing over to the next best
 /// candidate when the pinned model is rate-limited or down — as long as no
 /// output has streamed for this turn and the client has not cancelled.
@@ -3940,9 +3948,12 @@ async fn send_prompt_with_failover(
             .unwrap_or((None, None, Vec::new(), None));
         let effective_prompt = {
             let mut blocks = Vec::new();
-            // Router role framing first (the full orchestration protocol or the
-            // scoped ordinary-delegation directive), then host pre-class injects
-            // (e.g. ui_planning), then switch handoff context, then the task.
+            // Router framing first (background contract, then the full
+            // orchestration protocol or scoped ordinary-delegation directive),
+            // followed by host pre-class injects (e.g. ui_planning), switch
+            // handoff context, and the task. The short question policy closes
+            // the prompt so it is both recent and does not disturb the task's
+            // established first-content-block transport semantics.
             if shared.upstream_client_capabilities().terminal {
                 blocks.push(ContentBlock::from(build_background_instructions()));
             }
@@ -3980,6 +3991,7 @@ async fn send_prompt_with_failover(
                 blocks.push(ContentBlock::from(ctx));
             }
             blocks.extend(req.prompt.clone());
+            blocks.push(ContentBlock::from(build_question_instructions()));
             blocks
         };
         shared
@@ -7270,6 +7282,7 @@ mod escalation_signal_tests {
 mod orchestration_unit_tests {
     use super::build_background_instructions;
     use super::build_orchestration_instructions;
+    use super::build_question_instructions;
     use super::frame_terse;
     use super::is_native_subagent_tool;
     use super::previous_turn_solicited_answers as solicited;
@@ -7353,6 +7366,15 @@ mod orchestration_unit_tests {
             text.contains("visible, inspectable, and cancellable"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn question_guidance_requires_the_structured_agent_mechanism() {
+        let text = build_question_instructions();
+        assert!(text.contains("[router-acp questions]"), "{text}");
+        assert!(text.contains("structured question-asking"), "{text}");
+        assert!(text.contains("ACP client"), "{text}");
+        assert!(text.contains("Do not ask the user only in prose"), "{text}");
     }
 
     #[test]

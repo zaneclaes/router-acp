@@ -1521,6 +1521,46 @@ async fn downstream_crash_after_pin_surfaces_error() {
 // ======================================================================
 
 #[tokio::test]
+async fn question_guidance_is_injected_on_every_prompt() {
+    let log = temp_log("question-guidance");
+    let yaml = format!(
+        "agents:\n{}",
+        agent_yaml(
+            "mock",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "first task").await?;
+        prompt_text(&cx, &sid, "second task").await?;
+
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|event| event["event"] == "prompt")
+            .filter_map(|event| event["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "expected both downstream prompts: {prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|text| {
+                text.contains("[router-acp questions]")
+                    && text.contains("structured question-asking tool/mechanism")
+                    && text.contains("Do not ask the user only in prose")
+            }),
+            "question guidance must survive every turn: {prompts:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn ordinary_delegation_directive_is_scoped_one_shot_and_reinjected_after_switch() {
     let state = temp_state_file("delegate-prompt");
     let log = temp_log("delegate-prompt");
@@ -2815,7 +2855,10 @@ async fn directive_pins_explicit_candidate_and_is_stripped() {
             .map(|e| e["text"].as_str().unwrap().to_string())
             .collect();
         assert!(
-            prompts.iter().any(|p| p == "do the thing"),
+            prompts.iter().any(|p| {
+                p.starts_with("do the thing\n[router-acp questions]")
+                    && p.contains("Do not ask the user only in prose")
+            }),
             "directive stripped: {prompts:?}"
         );
         assert!(
