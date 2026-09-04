@@ -97,6 +97,12 @@ Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_a
    (a visible message chunk by default, or `_meta.router_acp` metadata under `disclosure: meta`; delegated-task routing is disclosed the same way.)
 4. **Every later prompt and callback** for that session relays to the same downstream session. ACP has no transcript-handoff primitive, so a model change is never silent — it only happens through [failover](#token-limits-outages-and-failover) or an explicit/automatic [switch](#switching-models-mid-session), which summarizes the work and re-pins onto a fresh session.
 
+Every forwarded prompt also carries a short router policy telling the selected
+agent to use its structured question mechanism whenever user input is required.
+That lets ACP clients render their native question UI instead of relying on a
+question embedded only in prose; clients should still keep their own fallback
+for agents that do not follow the instruction.
+
 ### Strategies
 
 Four routers ("strategies") decide the initial pick. Whichever runs, candidates go through the same eligibility filter first (verified, capability-matched, not cordoned, not quarantined), ties break by higher score → lower effective cost → preference → config order, and the decision is deterministic — identical inputs and state always produce the same pin. Plain-language walkthroughs, the exact formulas, and tuning guidance live in [`ROUTERS.md`](ROUTERS.md); here's the map:
