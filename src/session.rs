@@ -4357,6 +4357,68 @@ fn select_route_target(
     }
 }
 
+/// Pick a replacement when the current pin is usage-cordoned.
+///
+/// This is an escape from a dead seat, not a quality upgrade. A glob of `*`
+/// fed to [`first_eligible_candidate`] crowned the fleet's highest-scoring
+/// model (Fable → Sol) after a pin-rewrite 400 cordoned the incumbent — two
+/// equal-quality models, a full summarize+re-pin, for no capability gain.
+///
+/// Skill-elevated pins stay inside that skill's `candidates` (same contract
+/// as demotion). Otherwise: drop quality-peers of the dead pin (normalized
+/// gap ≤ 0.05) when anything else is eligible, then pick max quality among
+/// what's left. If only peers remain, pick the cheapest so a lateral swap
+/// does not climb cost.
+fn cordon_escape_target(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    current: &CandidateId,
+    class: TaskClass,
+    excluded: &[String],
+) -> Option<CandidateId> {
+    let (elevation_skill, current_q) = shared
+        .with_session(router_sid, |s| {
+            (s.elevation_skill.clone(), s.pinned_quality)
+        })
+        .unwrap_or((None, 0.0));
+    if let Some(pattern) = elevation_skill.as_deref()
+        && let Some(route) = shared
+            .cfg
+            .skill_routing
+            .iter()
+            .find(|r| r.pattern == pattern)
+    {
+        return select_route_target(shared, route, class, excluded).filter(|t| t != current);
+    }
+    let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
+    pool.retain(|v| v.id != *current && !view_excluded(v, excluded));
+    if pool.is_empty() {
+        return None;
+    }
+    const PEER_MARGIN: f64 = 0.05;
+    let current_u = crate::candidate::quality_utility(current_q);
+    let non_peers: Vec<&CandidateView> = pool
+        .iter()
+        .filter(|v| (crate::candidate::quality_utility(v.quality) - current_u).abs() > PEER_MARGIN)
+        .collect();
+    let pick_max = |xs: &[&CandidateView]| {
+        xs.iter()
+            .max_by(|a, b| {
+                a.quality
+                    .partial_cmp(&b.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|v| v.id.clone())
+    };
+    if !non_peers.is_empty() {
+        pick_max(&non_peers)
+    } else {
+        pool.iter()
+            .min_by_key(|v| v.cost_rank)
+            .map(|v| v.id.clone())
+    }
+}
+
 /// Resolve a loose model reference (from the `model:` shorthand) to the best
 /// eligible candidate: an exact `agent/model` id, a bare model id (`sonnet`),
 /// a family/prefix (`gpt`, `claude/opus`), or any substring — highest quality
@@ -4923,17 +4985,32 @@ fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
 /// So when nothing clears the margin, fall back to the best strictly-better
 /// candidate instead of returning nothing.
 fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
-    let (class, current, current_q, excluded) = shared.with_session(router_sid, |s| {
-        (
-            s.task_class.unwrap_or(TaskClass::CodingGeneral),
-            s.pin.as_ref().map(|p| p.candidate.clone()),
-            s.pinned_quality,
-            s.excluded.clone(),
-        )
-    })?;
+    let (class, current, current_q, excluded, elevation_skill) =
+        shared.with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+                s.pinned_quality,
+                s.excluded.clone(),
+                s.elevation_skill.clone(),
+            )
+        })?;
     let current = current?;
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     pool.retain(|v| v.id != current && !view_excluded(v, &excluded));
+    // A skill pin's switch-target contract is `candidates`, not the global
+    // quality ladder. Without this, auto-upgrade from a grok ship-pr pin
+    // crowned Sol (highest score, `also_acceptable` only) the moment
+    // confidence dipped.
+    if let Some(pattern) = elevation_skill.as_deref()
+        && let Some(route) = shared
+            .cfg
+            .skill_routing
+            .iter()
+            .find(|r| r.pattern == pattern)
+    {
+        pool.retain(|v| route.candidates.iter().any(|rc| view_matches(rc, v)));
+    }
     let best_above = |margin: f64| {
         pool.iter()
             .filter(|v| {
@@ -6825,11 +6902,19 @@ async fn dispatch_prompt(
             // the demotion clock kept counting from the FIRST invocation, so
             // a second `/ship-pr` mid-flow did nothing to stop an elevated
             // pin expiring under it.
+            //
+            // Also drop a queued switch (auto-upgrade / demotion / cordon
+            // escape) that would leave this pin. Observed: grok was the
+            // session pin, `/finalize-pr` matched `already_ok` (grok is in
+            // `candidates`), then `send_prompt_with_failover` consumed a
+            // leftover auto-upgrade to Sol — `also_acceptable`, never a
+            // switch target — and the skill's pin was discarded.
             let pattern = route.pattern.clone();
             shared.with_session(&router_sid, |s| {
                 s.elevation = Some(format!("skill `{pattern}`"));
                 s.elevation_skill = Some(pattern.clone());
                 s.quiet_turns = 0;
+                s.pending_switch = None;
             });
         } else {
             match select_route_target(&shared, route, class, &excluded) {
@@ -6913,10 +6998,12 @@ async fn dispatch_prompt(
         if !has_pending && let Some(cur) = current.as_ref() {
             let cordon = shared.headroom.lock().unwrap().usage_cordon(cur).cloned();
             if let Some(c) = cordon {
-                // Prefer any eligible candidate (not limited to a skill class).
-                let target =
-                    first_eligible_candidate(&shared, &["*".to_string()], class, &excluded)
-                        .filter(|t| t != cur);
+                // Escaping a dead seat is not a quality upgrade. The previous
+                // `*` + max-quality pick crowned the fleet champion (Fable →
+                // Sol) after a pin-rewrite 400 cordoned the incumbent — a
+                // lateral swap of two equal-quality models. Skill-elevated
+                // pins stay inside that skill's `candidates`.
+                let target = cordon_escape_target(&shared, &router_sid, cur, class, &excluded);
                 if let Some(target) = target {
                     let reason = format!(
                         "usage cordon: {} (resets {}) — switching off {}",
