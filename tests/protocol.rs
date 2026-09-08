@@ -3396,6 +3396,71 @@ async fn skill_routing_never_switches_to_an_also_acceptable_model() {
     .await;
 }
 
+/// Live bug: grok was the pin, `/finalize-pr` matched `already_ok` (grok is
+/// in `candidates`), then a leftover auto-upgrade to Sol (`also_acceptable`)
+/// still fired in `send_prompt_with_failover`. Re-invoking an already-ok
+/// skill must drop that queued switch.
+#[tokio::test]
+async fn skill_routing_already_ok_cancels_queued_switch_to_also_acceptable() {
+    let state = temp_state_file("skill-cancel-upgrade");
+    let log = temp_log("skill-cancel-upgrade");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"c/*\", default_quality: 0.90 }\n\
+         \x20 - { pattern: \"b/*\", default_quality: 0.70 }\n\
+         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: finalize-pr\n    candidates: [\"*m1*\", \"*m2*\"]\n\
+         \x20   also_acceptable: [\"*m3*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Pin the skill-approved but under-powered model. Auto-upgrade will
+        // queue a switch to c/m3 (highest score, also_acceptable only).
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+        let resp = prompt_text(&cx, &sid, "please run finalize-pr on this branch").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("switched a/m1 → c/m3") && !text.contains("echo:m3:"),
+            "skill already-ok must not consume a queued switch onto also_acceptable: {text}"
+        );
+        assert!(
+            text.contains("echo:m1:please run finalize-pr"),
+            "finalize-pr must stay on the already-ok m1 pin: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// `selection: first-match` picks the FIRST candidates glob with an eligible
 /// seat behind it, even when a later glob scores strictly higher quality —
 /// the whole point of the setting. Without it (the default `best-quality`),
@@ -3718,6 +3783,83 @@ async fn usage_cordoned_pin_switches_proactively() {
         assert!(
             text.contains("echo:m2:"),
             "turn must land on non-cordoned b/m2: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Live bug: a Fable pin-rewrite 400 cordoned the incumbent, then the
+/// proactive escape used `*` + max-quality and landed on Sol — two
+/// equal-quality models. Escaping a dead seat must skip quality-peers when
+/// a real alternative exists.
+#[tokio::test]
+async fn usage_cordon_escape_skips_equal_quality_peer() {
+    let state = temp_state_file("proactive-cordon-peer");
+    let log = temp_log("proactive-cordon-peer");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // a/m1 (incumbent) and b/m2 (peer, +0.02 raw ≈ 0.007 normalized) sit in
+    // the same quality band. c/m3 is a real step down. Cordon m1 → must
+    // land on m3, not the quality-max peer m2.
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"b/*\", default_quality: 2.92 }\n\
+         \x20 - { pattern: \"a/*\", default_quality: 2.90 }\n\
+         \x20 - { pattern: \"c/*\", default_quality: 2.00 }\n",
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         agents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+
+        let mut cordons = std::collections::HashMap::new();
+        cordons.insert(
+            router_acp::candidate::CandidateId::new("a", "m1"),
+            router_acp::headroom::UsageCordon {
+                reason: "provider rejected pin rewrite".to_string(),
+                resets_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+            },
+        );
+        shared.headroom.lock().unwrap().set_usage_cordons(cordons);
+
+        let resp = prompt_text(&cx, &sid, "continue the work").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("echo:m2:") && !text.contains("switched a/m1 → b/m2"),
+            "must not swap onto an equal-quality peer: {text}"
+        );
+        assert!(
+            text.contains("echo:m3:") || text.contains("switched a/m1 → c/m3"),
+            "escape must land on the non-peer alternative: {text}"
         );
         Ok(())
     })

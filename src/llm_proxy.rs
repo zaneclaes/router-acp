@@ -2181,10 +2181,14 @@ fn collect_usage(value: &Value, protocol: LlmWireProtocol, usage: &mut LlmReques
     }
 }
 
-fn response_difficulty(body: &[u8], status: u16) -> Option<String> {
-    if status >= 400 {
-        return Some(format!("upstream returned HTTP {status}"));
-    }
+fn response_difficulty(body: &[u8], _status: u16) -> Option<String> {
+    // HTTP 4xx/5xx is a wire, config, or availability failure — not a signal
+    // that the TASK is hard. Treating every 400 as difficulty escalated the
+    // next request onto a different model (observed: a Fable 5.1 pin-rewrite
+    // 400 on a below-floor CLI was read as "struggle" and the following
+    // request landed on Sol). Rate limits and outages already have a failover
+    // path; pin-rewrite rejections already cordon the candidate. Difficulty
+    // is only max-tokens / refusal / content-filter in the response body.
     let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
     if lower.contains("\"stop_reason\":\"max_tokens\"")
         || lower.contains("\"finish_reason\":\"length\"")
@@ -2613,6 +2617,21 @@ agents:
             "input": [{"type":"function_call_output","exit_code":1,"output":"tests failed"}]
         });
         assert!(inspect_request(&failed).difficulty.is_some());
+    }
+
+    #[test]
+    fn http_errors_are_not_task_difficulty() {
+        assert!(
+            super::response_difficulty(b"bad request", 400).is_none(),
+            "a pin-rewrite 400 is config/wire failure, not struggle"
+        );
+        assert!(super::response_difficulty(b"not found", 404).is_none());
+        assert!(super::response_difficulty(b"rate limited", 429).is_none());
+        assert!(super::response_difficulty(b"unavailable", 503).is_none());
+        assert!(
+            super::response_difficulty(br#"{"stop_reason":"max_tokens"}"#, 200).is_some(),
+            "max-tokens in the body is still difficulty"
+        );
     }
 
     #[test]
