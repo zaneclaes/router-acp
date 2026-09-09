@@ -98,10 +98,13 @@ Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_a
 4. **Every later prompt and callback** for that session relays to the same downstream session. ACP has no transcript-handoff primitive, so a model change is never silent — it only happens through [failover](#token-limits-outages-and-failover) or an explicit/automatic [switch](#switching-models-mid-session), which summarizes the work and re-pins onto a fresh session.
 
 Every forwarded prompt also carries a short router policy telling the selected
-agent to use its structured question mechanism whenever user input is required.
-That lets ACP clients render their native question UI instead of relying on a
-question embedded only in prose; clients should still keep their own fallback
-for agents that do not follow the instruction.
+agent to prefer its structured question mechanism whenever user input is
+required, falling back to a direct prose question if that mechanism is
+unavailable in the agent's current mode. That lets ACP clients render their
+native question UI when possible, without pushing an agent whose structured
+tool is mode-gated (e.g. Codex's `request_user_input`, rejected outside its
+own Plan mode) into retrying a call that will keep failing; clients should
+still keep their own fallback for agents that skip the instruction entirely.
 
 ### Strategies
 

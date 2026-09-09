@@ -1603,7 +1603,7 @@ async fn question_guidance_is_injected_on_every_prompt() {
             prompts.iter().all(|text| {
                 text.contains("[router-acp questions]")
                     && text.contains("structured question-asking tool/mechanism")
-                    && text.contains("Do not ask the user only in prose")
+                    && text.contains("ask directly in prose instead of retrying the same call")
             }),
             "question guidance must survive every turn: {prompts:?}"
         );
@@ -2909,7 +2909,7 @@ async fn directive_pins_explicit_candidate_and_is_stripped() {
         assert!(
             prompts.iter().any(|p| {
                 p.starts_with("do the thing\n[router-acp questions]")
-                    && p.contains("Do not ask the user only in prose")
+                    && p.contains("ask directly in prose instead of retrying the same call")
             }),
             "directive stripped: {prompts:?}"
         );

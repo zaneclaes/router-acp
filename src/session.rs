@@ -3855,9 +3855,10 @@ fn build_background_instructions() -> String {
 
 fn build_question_instructions() -> String {
     "[router-acp questions]\n\
-     Whenever you need an answer, choice, confirmation, or approval from the user, use the \
+     Whenever you need an answer, choice, confirmation, or approval from the user, prefer the \
      structured question-asking tool/mechanism exposed by your agent harness so the ACP client \
-     can render its question UI. Do not ask the user only in prose."
+     can render its question UI. If that mechanism is unavailable in your current mode, or a \
+     call to it is rejected, ask directly in prose instead of retrying the same call."
         .to_string()
 }
 
@@ -7456,12 +7457,20 @@ mod orchestration_unit_tests {
     }
 
     #[test]
-    fn question_guidance_requires_the_structured_agent_mechanism() {
+    fn question_guidance_prefers_the_structured_mechanism_with_a_prose_fallback() {
         let text = build_question_instructions();
         assert!(text.contains("[router-acp questions]"), "{text}");
         assert!(text.contains("structured question-asking"), "{text}");
         assert!(text.contains("ACP client"), "{text}");
-        assert!(text.contains("Do not ask the user only in prose"), "{text}");
+        // Some downstream agents gate their structured tool by an internal mode
+        // router-acp cannot see or control (e.g. Codex's `request_user_input` is
+        // rejected outside its own "Plan" collaboration mode). An unconditional
+        // "never prose" ban left those agents retrying a call guaranteed to keep
+        // failing instead of using the working prose fallback.
+        assert!(
+            text.contains("unavailable in your current mode") && text.contains("ask directly in prose"),
+            "{text}"
+        );
     }
 
     #[test]
