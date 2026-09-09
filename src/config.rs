@@ -2014,11 +2014,11 @@ agents:
     #[test]
     fn parses_delegate_mcp_catalog_policy() {
         let yaml = format!(
-            "delegation:\n  mcp_catalogs:\n    - catalog: observability\n      capabilities: [metrics, traces]\n{}",
+            "delegation:\n  mcp_catalogs:\n    - catalog: telemetry\n      capabilities: [metrics, traces]\n{}",
             minimal_yaml()
         );
         let cfg = Config::from_yaml(&yaml).unwrap();
-        assert_eq!(cfg.delegation.mcp_catalogs[0].catalog, "observability");
+        assert_eq!(cfg.delegation.mcp_catalogs[0].catalog, "telemetry");
     }
 
     #[test]

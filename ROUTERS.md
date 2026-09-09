@@ -549,9 +549,10 @@ so it works from any ACP client and plain chat.
 
 The host registers concrete bundles per router session, while
 `delegation.mcp_catalogs` maps each catalog to opaque capabilities. A
-pluggable pre-classifier extension defines those capability terms and returns
-`routing.required_capabilities`; the router resolves them before opening the
-first downstream session. Later, the primary requests
+pluggable pre-classifier extension dimension defines those capability terms
+and returns `required_capabilities`; the base routing object cannot invent
+them from prompt text. The router resolves them before opening the first
+downstream session. Later, the primary requests
 `delegate_task.required_capabilities` for a bounded subtask. The router stays
 integration-agnostic: it does not define capability meanings, endpoints, or
 credentials, and incomplete coverage fails closed.
