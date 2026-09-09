@@ -94,9 +94,9 @@ pub struct RoutingDecision {
     /// Human-facing domains such as UX, frontend, database, infrastructure.
     #[serde(default)]
     pub categories: Vec<String>,
-    /// Opaque host-defined capabilities needed to begin this task. Their
-    /// definitions come from a configured classifier extension, never router
-    /// source code.
+    /// Opaque host-defined capabilities needed to begin this task. Only
+    /// configured classifier dimensions may populate this list; free-form
+    /// evaluator output cannot invent a catalog requirement.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
     /// 0.0 (mechanical/trivial) to 1.0 (long-horizon/high-risk).
@@ -215,7 +215,7 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          xhigh for ambiguous cross-system reasoning, and max only for novel or severe-risk work.\n\
          Return:\n\
          \"routing\": { \"task_class\": string, \"task_classes\": [strings], \
-         \"categories\": [strings], \"required_capabilities\": [strings], \"complexity\": 0.0-1.0, \
+         \"categories\": [strings], \"complexity\": 0.0-1.0, \
          \"confidence\": 0.0-1.0, \"effort\": \"low|medium|high|xhigh|max\", \"reason\": string }\n\n",
     );
     schema_keys.push("routing".into());
@@ -420,22 +420,15 @@ fn parse_routing(v: &Value) -> Option<RoutingDecision> {
         .take(8)
         .map(ToString::to_string)
         .collect();
-    let required_capabilities = obj
-        .get("required_capabilities")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .take(16)
-        .map(ToString::to_string)
-        .collect();
     Some(RoutingDecision {
         task_class,
         task_classes,
         categories,
-        required_capabilities,
+        // Capability names have meaning only inside host-configured
+        // dimensions. Accepting arbitrary names from the base routing object
+        // lets a prompt such as "call mcp__datadog__" manufacture
+        // `mcp_datadog`, then fail because no catalog defines it.
+        required_capabilities: Vec::new(),
         complexity: complexity.clamp(0.0, 1.0),
         confidence: confidence.clamp(0.0, 1.0),
         effort,
@@ -1583,7 +1576,7 @@ pre_classifier:
                 "task_class": "Ops",
                 "complexity": 0.2,
                 "confidence": 0.9,
-                "required_capabilities": ["metrics"]
+                "required_capabilities": ["mcp_datadog"]
             },
             "host_tools": {
                 "confidence": 0.9,
@@ -1604,6 +1597,27 @@ pre_classifier:
         assert_eq!(
             result.summary["dimensions"]["routing"]["required_capabilities"],
             json!(["metrics", "monitors"])
+        );
+    }
+
+    #[test]
+    fn base_routing_cannot_invent_mcp_catalog_requirements() {
+        let cfg = cfg_with_dims(vec![]);
+        let parsed = json!({
+            "routing": {
+                "task_class": "Ops",
+                "complexity": 0.2,
+                "confidence": 0.9,
+                "required_capabilities": ["mcp_datadog"]
+            }
+        });
+
+        let result = apply_thresholds(&cfg, &parsed, Some("a/m1"), 1, "");
+
+        assert!(result.routing.unwrap().required_capabilities.is_empty());
+        assert_eq!(
+            result.summary["dimensions"]["routing"]["required_capabilities"],
+            json!([])
         );
     }
 

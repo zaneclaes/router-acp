@@ -1195,11 +1195,11 @@ async fn preclassifier_omitted_effort_falls_back_to_task_depth_recommendation() 
 async fn env_seeded_catalogs_pin_a_session_that_never_registers_any() {
     let state = temp_state_file("seeded-catalogs");
     let log = temp_log("seeded-catalogs");
-    let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.2,"confidence":0.9,"reason":"needs telemetry","required_capabilities":["metrics"]}}"#;
+    let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.2,"confidence":0.9,"reason":"needs telemetry"},"host_tools":{"confidence":0.9,"required_capabilities":["metrics"]}}"#;
     let yaml = format!(
         "state_file: {}\n\
          delegation:\n  enabled: false\n  mcp_catalogs:\n    - catalog: telemetry\n      capabilities: [metrics]\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  dimensions:\n    - id: host_tools\n      description: host-defined tools\n      min_confidence: 0.7\nagents:\n{}",
         state.display(),
         agent_yaml(
             "mock",
@@ -1258,6 +1258,58 @@ async fn env_seeded_catalogs_pin_a_session_that_never_registers_any() {
                 .count(),
             1,
             "the client and catalog copies are structurally deduplicated"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// The evaluator used to be allowed to invent arbitrary base-routing
+/// capabilities. A prompt that literally named `mcp__datadog__` caused it to
+/// emit `mcp_datadog`; with no matching host catalog, the router rejected the
+/// turn before the already-attached client MCP could reach the downstream
+/// agent. Only configured dimensions may create catalog requirements.
+#[tokio::test]
+async fn evaluator_cannot_invent_a_catalog_gate_for_client_mcp() {
+    let state = temp_state_file("no-invented-catalog");
+    let log = temp_log("no-invented-catalog");
+    let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.2,"confidence":0.9,"reason":"call the requested tool","required_capabilities":["mcp_datadog"]}}"#;
+    let yaml = format!(
+        "state_file: {}\n\
+         delegation:\n  enabled: false\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1)],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", log.to_str().unwrap()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let datadog = McpServer::Stdio(McpServerStdio::new("datadog", "/bin/true"));
+        let sid = cx
+            .send_request(NewSessionRequest::new(std::env::temp_dir()).mcp_servers(vec![datadog]))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+
+        prompt_text(&cx, &sid, "Call mcp__datadog__search_datadog_monitors").await?;
+
+        let attached = read_log(&log).into_iter().find(|event| {
+            event["event"] == "session_new"
+                && event["mcpServers"]
+                    .as_array()
+                    .is_some_and(|servers| servers.iter().any(|server| server == "datadog"))
+        });
+        assert!(
+            attached.is_some(),
+            "the client Datadog MCP must reach the agent"
         );
         Ok(())
     })
