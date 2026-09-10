@@ -237,6 +237,12 @@ pub struct ScoreEntryRaw {
     /// independent from the canonical level support below.
     #[serde(default)]
     pub effort: Option<bool>,
+    /// Whether the model accepts mid-conversation `role: "system"` turns
+    /// (Claude Code's `mid-conversation-system` beta). Versions that predate
+    /// it 400 on the turn; the proxy folds such turns into user turns before
+    /// sending when this is false.
+    #[serde(default)]
+    pub system_turns: Option<bool>,
     /// Canonical effort levels this candidate supports. Omitted means the
     /// candidate does not advertise level-based effort control.
     #[serde(default)]
@@ -281,6 +287,7 @@ pub struct ResolvedScores {
     pub max_output_tokens: Option<u64>,
     pub adaptive_thinking: bool,
     pub effort: bool,
+    pub system_turns: bool,
     pub effort_levels: Vec<EffortLevel>,
     pub effort_mapping: BTreeMap<EffortLevel, String>,
     pub tags: Vec<String>,
@@ -328,6 +335,7 @@ impl Default for ResolvedScores {
             max_output_tokens: None,
             adaptive_thinking: true,
             effort: true,
+            system_turns: true,
             effort_levels: Vec::new(),
             effort_mapping: BTreeMap::new(),
             tags: Vec::new(),
@@ -410,6 +418,7 @@ impl ScoreTable {
                     max_output_tokens: raw_entry.max_output_tokens,
                     adaptive_thinking: raw_entry.adaptive_thinking.unwrap_or(true),
                     effort: raw_entry.effort.unwrap_or(true),
+                    system_turns: raw_entry.system_turns.unwrap_or(true),
                     effort_levels: raw_entry.effort_levels.unwrap_or_default(),
                     effort_mapping: raw_entry.effort_mapping,
                     tags: raw_entry.tags,

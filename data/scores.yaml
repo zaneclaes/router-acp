@@ -5,7 +5,7 @@
 # (1=minimal, 2=standard, 3=frontier), a coding
 # tier + percentile band (router-acp's own coding-frontier scheme, not a
 # documented OpenRouter algorithm), context window, the wire features the model
-# accepts (`max_output_tokens`, `adaptive_thinking`, `effort` — consulted by the
+# accepts (`max_output_tokens`, `adaptive_thinking`, `effort`, `system_turns` — consulted by the
 # per-request proxy, which forwards every request byte but the model name, so a
 # reroute target has to accept the incoming request's shape), and optional tags.
 # Updating routing quality is a data edit, not a
@@ -129,6 +129,57 @@ candidates:
   # that need to reach Fable at genuine extremes. The updater regenerates
   # this block from that pairing; do not hand-edit it back to the raw
   # evidence numbers (they're recorded, uncompressed, in model-policy.yaml).
+  # Legacy Claude versions that predate mid-conversation `role: "system"`
+  # turns (Claude Code's `mid-conversation-system` beta; the CLI's own model
+  # catalog lists `mid_conv_system` for Opus 4.8 / Opus 5 / Sonnet 5 / Fable
+  # and not for these). Claude Code decides to send those turns from the alias
+  # it was configured with (`opus[1m]` → Opus 5), so a version pin onto one of
+  # these would ship a turn the model 400s on every new session. With
+  # `system_turns: false` the proxy folds the turns into user turns and drops
+  # the beta token before sending. Pin-only versions: quality mirrors the
+  # family entry below and is never ranked.
+  - pattern: "*opus-4-6*"
+    system_turns: false
+    coding_tier: high
+    coding_percentile: 0.93
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
+    default_quality: 2.62
+    quality:
+      UiTweak: 2.62
+      BugFix: 2.97
+      Feature: 2.97
+      Refactor: 2.97
+      Algorithms: 2.62
+      Architecture: 2.62
+      Research: 2.62
+      Writing: 2.62
+      Ops: 2.62
+      CodingGeneral: 2.88
+
+  - pattern: "*opus-4-7*"
+    system_turns: false
+    coding_tier: high
+    coding_percentile: 0.93
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
+    default_quality: 2.62
+    quality:
+      UiTweak: 2.62
+      BugFix: 2.97
+      Feature: 2.97
+      Refactor: 2.97
+      Algorithms: 2.62
+      Architecture: 2.62
+      Research: 2.62
+      Writing: 2.62
+      Ops: 2.62
+      CodingGeneral: 2.88
+
   - pattern: "*opus*"
     coding_tier: high
     coding_percentile: 0.93
@@ -148,6 +199,27 @@ candidates:
       Writing: 2.62
       Ops: 2.62
       CodingGeneral: 2.88
+
+  - pattern: "*sonnet-4-6*"
+    system_turns: false
+    coding_tier: high
+    coding_percentile: 0.8
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
+    default_quality: 1.39
+    quality:
+      UiTweak: 1.39
+      BugFix: 1.39
+      Feature: 1.39
+      Refactor: 1.39
+      Algorithms: 1.39
+      Architecture: 1.39
+      Research: 1.39
+      Writing: 1.39
+      Ops: 1.39
+      CodingGeneral: 1.39
 
   - pattern: "*sonnet*"
     coding_tier: high

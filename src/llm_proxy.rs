@@ -485,9 +485,17 @@ async fn proxy_request(
             decision.rewrite.then_some(decision.model.as_str()),
             &decision.effort,
             target.config.protocol,
+            decision.fold_system_turns,
         )
         .unwrap_or_else(|| body.to_vec()),
         _ => body.to_vec(),
+    };
+    // A version without system turns gets neither the turns nor the beta
+    // tokens that announce them — a beta the model lacks is itself a 400.
+    let outbound_headers = if decision.as_ref().is_some_and(|d| d.fold_system_turns) {
+        strip_system_turn_betas(&parts.headers)
+    } else {
+        parts.headers.clone()
     };
 
     let upstream_url = match upstream_url(&target, &rest, &parts.uri) {
@@ -500,7 +508,7 @@ async fn proxy_request(
         &state.runtime.client,
         &parts.method,
         upstream_url.clone(),
-        &parts.headers,
+        &outbound_headers,
         outbound_body,
     );
     let mut upstream = match first_request.send().await {
@@ -630,6 +638,7 @@ async fn proxy_request(
                                 active.candidate
                             ),
                             event: "proxy-fallback".to_string(),
+                            fold_system_turns: false,
                             estimated_input,
                             effort: request_effort(
                                 &state.shared,
@@ -1073,17 +1082,143 @@ fn anthropic_effort_for_thinking(value: &str, thinking_disabled: bool) -> &str {
 /// Shape the provider request after routing. This is intentionally distinct
 /// from `WireShape::effort`, which remains a boolean compatibility gate for
 /// already-shaped requests during request-level model rerouting.
+/// Whether an Anthropic-wire request carries a mid-conversation `role:
+/// "system"` turn (Claude Code's `mid-conversation-system` beta).
+fn has_system_turn(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| messages.iter().any(is_system_turn))
+}
+
+fn is_system_turn(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("system")
+}
+
+/// `anthropic-beta` tokens that only mean anything alongside `role: "system"`
+/// turns: the turns themselves, and the per-turn effort statement that rides
+/// on one. Dropped together with the turns.
+const SYSTEM_TURN_BETA_PREFIXES: &[&str] = &["mid-conversation-system", "per-turn-control"];
+
+/// Fold Claude Code's mid-conversation `role: "system"` turns into the shape
+/// a model without that capability accepts.
+///
+/// Claude Code picks the wire shape from the alias it was configured with
+/// (`opus[1m]` → Opus 5, which has the capability); the proxy then rewrites
+/// the model to a pinned legacy version that does not. Left alone, every new
+/// session pinned to such a version opened with a 400 that the adapter had to
+/// probe, absorb and retry. Instead: an empty turn (a per-turn effort
+/// statement — `output_config` on the turn — carries no text) is dropped, and
+/// a text-only turn becomes user text, appended to the preceding user turn
+/// when there is one, otherwise a user turn of its own. Per-turn
+/// `output_config` is dropped with the turn; the request's own top-level
+/// effort stands. A turn carrying non-text blocks (tool additions) has no
+/// user-turn equivalent, so the body is left untouched and the provider's
+/// rejection drives the adapter's own fallback.
+fn fold_system_turns_into_user(object: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(messages) = object.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    if !messages.iter().any(is_system_turn) {
+        return false;
+    }
+    let text_only = |message: &Value| match message.get("content") {
+        None | Some(Value::String(_)) => true,
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) == Some("text")),
+        Some(_) => false,
+    };
+    if !messages.iter().filter(|m| is_system_turn(m)).all(text_only) {
+        return false;
+    }
+    let mut folded: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages.clone() {
+        if !is_system_turn(&message) {
+            folded.push(message);
+            continue;
+        }
+        let blocks: Vec<Value> = match message.get("content") {
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                vec![json!({"type": "text", "text": text})]
+            }
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|block| {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        if blocks.is_empty() {
+            continue;
+        }
+        match folded.last_mut().and_then(Value::as_object_mut) {
+            Some(previous) if previous.get("role").and_then(Value::as_str) == Some("user") => {
+                let mut content = match previous.remove("content") {
+                    Some(Value::String(text)) => vec![json!({"type": "text", "text": text})],
+                    Some(Value::Array(existing)) => existing,
+                    _ => Vec::new(),
+                };
+                content.extend(blocks);
+                previous.insert("content".into(), Value::Array(content));
+            }
+            _ => folded.push(json!({"role": "user", "content": blocks})),
+        }
+    }
+    object.insert("messages".into(), Value::Array(folded));
+    true
+}
+
+/// The request headers with the system-turn beta tokens removed from every
+/// `anthropic-beta` value (a header left empty is dropped).
+fn strip_system_turn_betas(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if name.as_str().eq_ignore_ascii_case("anthropic-beta") {
+            let kept: Vec<&str> = value
+                .to_str()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|token| {
+                    !token.is_empty()
+                        && !SYSTEM_TURN_BETA_PREFIXES
+                            .iter()
+                            .any(|prefix| token.starts_with(prefix))
+                })
+                .collect();
+            if kept.is_empty() {
+                continue;
+            }
+            if let Ok(joined) = axum::http::HeaderValue::from_str(&kept.join(",")) {
+                out.append(name.clone(), joined);
+            }
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
+}
+
 fn shape_provider_request(
     body: &Value,
     model: Option<&str>,
     effort: &EffortShape,
     protocol: LlmWireProtocol,
+    fold_system_turns: bool,
 ) -> Option<Vec<u8>> {
     let thinking_off = thinking_disabled(body);
     let mut body = body.clone();
     let object = body.as_object_mut()?;
     if let Some(model) = model {
         object.insert("model".into(), Value::String(model.into()));
+    }
+    if fold_system_turns && protocol == LlmWireProtocol::Anthropic {
+        fold_system_turns_into_user(object);
     }
     match (protocol, effort) {
         (_, EffortShape::Preserve) => {}
@@ -1171,11 +1306,14 @@ struct RequestSignals {
 struct WireShape {
     adaptive_thinking: bool,
     effort: bool,
+    /// The request carries a mid-conversation `role: "system"` turn.
+    system_turns: bool,
     max_output: u64,
 }
 
 fn request_wire_shape(body: &Value) -> WireShape {
     WireShape {
+        system_turns: has_system_turn(body),
         adaptive_thinking: body
             .get("thinking")
             .and_then(|thinking| thinking.get("type"))
@@ -1211,6 +1349,9 @@ struct RequestDecision {
     estimated_input: u64,
     /// Candidate-resolved provider-native effort handling for this request.
     effort: EffortShape,
+    /// The model on the wire predates mid-conversation `role: "system"` turns:
+    /// fold them into user turns and drop the beta tokens before sending.
+    fold_system_turns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1258,6 +1399,7 @@ struct ModelOption {
     max_output_tokens: Option<u64>,
     adaptive_thinking: bool,
     effort: bool,
+    system_turns: bool,
 }
 
 impl ModelOption {
@@ -1268,6 +1410,9 @@ impl ModelOption {
             return false;
         }
         if wire.effort && !self.effort {
+            return false;
+        }
+        if wire.system_turns && !self.system_turns {
             return false;
         }
         if wire.max_output > 0
@@ -1321,6 +1466,7 @@ fn select_request_model(
                 max_output_tokens: scores.max_output_tokens,
                 adaptive_thinking: scores.adaptive_thinking,
                 effort: scores.effort,
+                system_turns: scores.system_turns,
             }
         })
         .collect();
@@ -1349,6 +1495,7 @@ fn select_request_model(
             max_output_tokens: scores.max_output_tokens,
             adaptive_thinking: scores.adaptive_thinking,
             effort: scores.effort,
+            system_turns: scores.system_turns,
         });
     }
     let mut policy = shared.llm_proxy.policy.lock().unwrap();
@@ -1637,6 +1784,7 @@ fn select_request_model(
         event,
         estimated_input: signals.estimated_input,
         effort: request_effort(shared, &active.parent_router_sid, &selected),
+        fold_system_turns: !shared.scores.lookup(&selected).system_turns,
     }
 }
 
@@ -2817,6 +2965,7 @@ agents:
             Some("new"),
             &EffortShape::Set("intensive".to_string()),
             LlmWireProtocol::Anthropic,
+            false,
         )
         .unwrap();
         let anthropic: Value = serde_json::from_slice(&anthropic).unwrap();
@@ -2828,6 +2977,7 @@ agents:
             None,
             &EffortShape::Preserve,
             LlmWireProtocol::Openai,
+            false,
         )
         .unwrap();
         let openai: Value = serde_json::from_slice(&openai).unwrap();
@@ -2837,6 +2987,7 @@ agents:
             None,
             &EffortShape::Omit,
             LlmWireProtocol::Anthropic,
+            false,
         )
         .unwrap();
         let anthropic_omitted: Value = serde_json::from_slice(&anthropic_omitted).unwrap();
@@ -2855,6 +3006,7 @@ agents:
                 None,
                 &EffortShape::Set(requested.to_string()),
                 LlmWireProtocol::Anthropic,
+                false,
             )
             .unwrap();
             let capped: Value = serde_json::from_slice(&capped).unwrap();
@@ -2873,6 +3025,7 @@ agents:
                 None,
                 &EffortShape::Set("max".to_string()),
                 LlmWireProtocol::Anthropic,
+                false,
             )
             .unwrap();
             let kept: Value = serde_json::from_slice(&kept).unwrap();
@@ -2885,6 +3038,7 @@ agents:
             None,
             &EffortShape::Set("max".to_string()),
             LlmWireProtocol::Openai,
+            false,
         )
         .unwrap();
         let openai: Value = serde_json::from_slice(&openai).unwrap();
@@ -2963,6 +3117,7 @@ agents:
             Some(&decision.model),
             &decision.effort,
             LlmWireProtocol::Anthropic,
+            false,
         )
         .unwrap();
         let shaped: Value = serde_json::from_slice(&shaped).unwrap();
@@ -3042,6 +3197,7 @@ agents:
             max_output_tokens: Some(64_000),
             adaptive_thinking: false,
             effort: false,
+            system_turns: true,
         };
         let sonnet = ModelOption {
             adaptive_thinking: true,
@@ -3813,6 +3969,78 @@ agents:
     /// the pin's identity — and, because the pinned candidate bypasses the
     /// `rejected_api_models` filter, it would do so on every request.
     #[test]
+    fn system_turns_fold_into_user_turns_and_effort_only_turns_drop() {
+        let mut body = json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role":"user","content":"continue"},
+                {"role":"system","content":[],"output_config":{"effort":"high"}},
+                {"role":"system","content":[{"type":"text","text":"Tools changed.","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":"ok"},
+                {"role":"system","content":"final note"}
+            ]
+        });
+        assert!(fold_system_turns_into_user(body.as_object_mut().unwrap()));
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role":"user","content":[
+                    {"type":"text","text":"continue"},
+                    {"type":"text","text":"Tools changed.","cache_control":{"type":"ephemeral"}}
+                ]},
+                {"role":"assistant","content":"ok"},
+                {"role":"user","content":[{"type":"text","text":"final note"}]}
+            ])
+        );
+        assert!(
+            body.get("output_config").is_none(),
+            "per-turn effort is dropped"
+        );
+
+        // Nothing to fold → untouched, reports false.
+        let mut plain = json!({"messages": [{"role":"user","content":"hi"}]});
+        assert!(!fold_system_turns_into_user(plain.as_object_mut().unwrap()));
+
+        // A structured block has no user-turn equivalent → left for the
+        // provider to reject and the adapter to heal.
+        let mut structured = json!({"messages": [
+            {"role":"user","content":"hi"},
+            {"role":"system","content":[{"type":"tool_addition","name":"Read"}]}
+        ]});
+        let before = structured.clone();
+        assert!(!fold_system_turns_into_user(
+            structured.as_object_mut().unwrap()
+        ));
+        assert_eq!(structured, before);
+    }
+
+    #[test]
+    fn system_turn_betas_are_stripped_from_the_beta_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            "mid-conversation-system-2026-04-07, per-turn-control-2026-07-01,context-1m-2025-08-07"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-other", "keep".parse().unwrap());
+        let stripped = strip_system_turn_betas(&headers);
+        assert_eq!(stripped["anthropic-beta"], "context-1m-2025-08-07");
+        assert_eq!(stripped["x-other"], "keep");
+
+        let mut only = HeaderMap::new();
+        only.insert(
+            "anthropic-beta",
+            "mid-conversation-system-2026-04-07".parse().unwrap(),
+        );
+        assert!(
+            strip_system_turn_betas(&only)
+                .get("anthropic-beta")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn request_shape_rejections_are_told_apart_from_model_rejections() {
         // Verbatim provider messages from live sessions.
         assert!(is_request_shape_rejection(
@@ -3829,12 +4057,187 @@ agents:
 
     /// Live bug: every new session pinned to Opus 4.6 opened with a 400 —
     /// Claude Code's mid-conversation `role: "system"` beta, which that
-    /// version lacks. The adapter heals this itself (retries without the
-    /// system turn), but the proxy read the 400 as "model unavailable",
-    /// cordoned the pin for 15 minutes and served the healed retry on a
-    /// different model. A feature rejection must leave the pin in place.
+    /// version lacks. Claude Code shapes the request for the alias it was
+    /// configured with (Opus 5); the proxy, which knows the wire model, must
+    /// fold the turn away and drop the beta token so the pinned version is
+    /// never asked something it cannot do.
     #[tokio::test]
-    async fn rejected_request_feature_keeps_the_pin_for_the_adapters_retry() {
+    async fn legacy_version_pin_folds_system_turns_before_sending() {
+        #[derive(Clone)]
+        struct Seen(Arc<Mutex<Vec<(String, bool, String)>>>);
+
+        async fn upstream(
+            State(seen): State<Seen>,
+            headers: HeaderMap,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response<Body> {
+            let model = body["model"].as_str().unwrap_or("").to_string();
+            let has_system_turn = body["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|msg| msg["role"] == "system"));
+            let betas = headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            seen.0
+                .lock()
+                .unwrap()
+                .push((model.clone(), has_system_turn, betas));
+            if model == "claude-opus-4-6" && has_system_turn {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"role 'system' is not supported on this model"}}"#,
+                    ))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(
+                    "event: message_start\n\
+                     data: {\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                ))
+                .unwrap()
+        }
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let seen = Seen(Arc::new(Mutex::new(Vec::new())));
+        let upstream_app = Router::new()
+            .route("/v1/messages", axum::routing::post(upstream))
+            .with_state(seen.clone());
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 99
+  minimum_dwell_requests: 0
+agents:
+  - name: claude
+    command: {{ type: stdio, command: claude-agent-acp }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: http://{upstream_addr}/v1
+    models:
+      - {{ id: "opus[1m]", cost_rank: 4, api_model: claude-opus-5,
+           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
+      - {{ id: claude-opus-4-6, cost_rank: 4, api_model: claude-opus-4-6,
+           downstream_id: "opus[1m]", auto_eligible: false,
+           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
+"#,
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg.clone()).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("claude".to_string()),
+            vec!["opus[1m]".into(), "claude-opus-4-6".into()],
+        );
+        let pinned = CandidateId::new("claude", "claude-opus-4-6");
+        shared.state.lock().unwrap().upsert(
+            "r1".to_string(),
+            PersistedSession {
+                agent: "claude".to_string(),
+                model: pinned.model.clone(),
+                downstream_session_id: "d1".to_string(),
+                cwd: dir.path().to_path_buf(),
+                kind: "primary".to_string(),
+                ..Default::default()
+            },
+        );
+        shared.sessions.lock().unwrap().insert(
+            "r1".to_string(),
+            RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new()),
+        );
+        let proxy_task = shared.llm_proxy.bind(shared.clone()).await.unwrap();
+        let spec = shared
+            .target_spec(&ProcessKey("claude".to_string()))
+            .unwrap();
+        let proxy_base = shared
+            .llm_proxy
+            .process_env(&spec)
+            .into_iter()
+            .find(|(name, _)| name == "ANTHROPIC_BASE_URL")
+            .unwrap()
+            .1;
+
+        // Claude Code's first request, shaped for Opus 5: a per-turn effort
+        // statement (empty system turn) and a text system turn, plus the betas
+        // that announce them.
+        let shaped_for_opus_5 = json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role":"user","content":"continue"},
+                {"role":"system","content":[],"output_config":{"effort":"high"}},
+                {"role":"system","content":[{"type":"text","text":"Tools changed: Read added."}]}
+            ]
+        });
+        let _turn = shared.llm_proxy.begin_turn(
+            ProcessKey("claude".to_string()),
+            "r1".to_string(),
+            "r1".to_string(),
+            "d1".to_string(),
+            pinned.clone(),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/messages"))
+            .header("authorization", "Bearer secret")
+            .header(
+                "anthropic-beta",
+                "mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,context-1m-2025-08-07",
+            )
+            .json(&shaped_for_opus_5)
+            .send()
+            .await
+            .unwrap();
+
+        // The pinned version was asked only what it can do: no system turn,
+        // no system-turn betas, first try.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            seen.0.lock().unwrap().clone(),
+            vec![(
+                "claude-opus-4-6".to_string(),
+                false,
+                "context-1m-2025-08-07".to_string()
+            )],
+            "system turn folded and betas stripped before the wire"
+        );
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&pinned)
+                .is_none(),
+            "nothing to cordon: the request never failed"
+        );
+
+        drop(proxy_task);
+        upstream_task.abort();
+    }
+
+    /// A system turn the proxy cannot fold (a structured `tool_addition`
+    /// block has no user-turn equivalent) still reaches the provider and is
+    /// rejected. The adapter heals that itself — it retries without the turn
+    /// and sticky-disables the beta — so the proxy must relay the 400 and
+    /// keep the pin, not cordon the version for 15 minutes and serve the
+    /// healed retry on a different model (the live failure before the fold).
+    #[tokio::test]
+    async fn unfoldable_request_feature_rejection_keeps_the_pin_for_the_adapters_retry() {
         #[derive(Clone)]
         struct Seen(Arc<Mutex<Vec<(String, bool)>>>);
 
@@ -3947,12 +4350,12 @@ agents:
                 .unwrap()
         };
 
-        // Claude Code's first request with the mid-conversation system beta on.
+        // A system turn carrying a late tool addition: not foldable.
         let with_system_turn = json!({
             "model": "claude-opus-5",
             "messages": [
                 {"role":"user","content":"continue"},
-                {"role":"system","content":"per-turn effort: high"}
+                {"role":"system","content":[{"type":"tool_addition","name":"Read","input_schema":{}}]}
             ]
         });
         let turn = shared.llm_proxy.begin_turn(
