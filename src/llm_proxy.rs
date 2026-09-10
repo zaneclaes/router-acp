@@ -729,7 +729,10 @@ fn build_upstream_request(
 /// Only 400/404 cordon: those say the provider will not serve this model id.
 /// Transient codes (429, 5xx) say nothing about its suitability, so they are
 /// surfaced without sidelining the candidate — but they are still never
-/// silently retried on a different model.
+/// silently retried on a different model. A 400 that rejects a FEATURE of the
+/// request rather than the model ([`is_request_shape_rejection`]) does not
+/// cordon either: the adapter owns the body and re-sends it without the
+/// feature, and the pin serves that retry.
 #[allow(clippy::too_many_arguments)]
 async fn reject_pinned_rewrite(
     state: &ProxyServerState,
@@ -749,9 +752,19 @@ async fn reject_pinned_rewrite(
     // returning it rather than streaming a replacement.
     let payload = upstream.bytes().await.unwrap_or_default();
     let detail = provider_error_message(&payload);
-    let cordoned = matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST);
+    let shape_rejection = status == StatusCode::BAD_REQUEST && is_request_shape_rejection(&detail);
+    let cordoned =
+        !shape_rejection && matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST);
 
-    if cordoned {
+    if shape_rejection {
+        tracing::info!(
+            target = %target.key,
+            candidate = %active.candidate,
+            api_model = decision.model,
+            detail,
+            "pinned model rejected a request feature; the adapter retries without it — pin kept"
+        );
+    } else if cordoned {
         let reset = std::time::Duration::from_secs(state.shared.cfg.headroom.cordon_default_secs);
         let reason = format!("provider rejected `{}`: {detail}", decision.model);
         state.shared.headroom.lock().unwrap().cordon_candidate(
@@ -778,7 +791,11 @@ async fn reject_pinned_rewrite(
         );
     }
 
-    let tail = if cordoned {
+    let tail = if shape_rejection {
+        " — a request feature this version lacks, not the model; the adapter retries \
+         without it and the pin is kept"
+            .to_string()
+    } else if cordoned {
         format!(
             " — cordoned for {} so the next turn routes elsewhere instead of \
              silently serving a different version",
@@ -830,6 +847,27 @@ async fn reject_pinned_rewrite(
     response
         .body(Body::from(payload))
         .unwrap_or_else(|_| error_response(status, &detail))
+}
+
+/// A 400 whose message says the REQUEST used a feature this model lacks — not
+/// that the model id is unavailable. Claude Code probes newer wire features
+/// (mid-conversation `role: "system"` turns, per-turn effort statements, tool
+/// additions) as betas and heals this exact rejection itself: it re-sends the
+/// body without the feature and sticky-disables the beta for the session. So
+/// the pin serves the retry fine — cordoning it instead handed every healed
+/// retry to a different model for `cordon_default_secs` on every new session
+/// pinned to a legacy version (observed: Opus 4.6 on `role 'system' is not
+/// supported on this model`, once per session, 14 times in three days).
+/// The version-gate rejection ("… does not support this model … run `claude
+/// update`") is about the model id and keeps cordoning.
+fn is_request_shape_rejection(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("not supported on this model")
+        || lower.contains("requires a model that supports")
+        || lower.contains("role 'system'")
+        || lower.contains("unexpected role")
+        || lower.contains("input tag 'tool_")
+        || lower.contains("cache_control")
 }
 
 /// The human-readable message out of a provider error body
@@ -3774,6 +3812,220 @@ agents:
     /// ALIAS's own model, so the retry would serve a different version under
     /// the pin's identity — and, because the pinned candidate bypasses the
     /// `rejected_api_models` filter, it would do so on every request.
+    #[test]
+    fn request_shape_rejections_are_told_apart_from_model_rejections() {
+        // Verbatim provider messages from live sessions.
+        assert!(is_request_shape_rejection(
+            "role 'system' is not supported on this model"
+        ));
+        assert!(!is_request_shape_rejection(
+            "Claude Code 2.1.246 does not support this model; version 2.1.251 or newer \
+             is required. Run `claude update`."
+        ));
+        assert!(!is_request_shape_rejection(
+            "model: claude-opus-4-6 not found"
+        ));
+    }
+
+    /// Live bug: every new session pinned to Opus 4.6 opened with a 400 —
+    /// Claude Code's mid-conversation `role: "system"` beta, which that
+    /// version lacks. The adapter heals this itself (retries without the
+    /// system turn), but the proxy read the 400 as "model unavailable",
+    /// cordoned the pin for 15 minutes and served the healed retry on a
+    /// different model. A feature rejection must leave the pin in place.
+    #[tokio::test]
+    async fn rejected_request_feature_keeps_the_pin_for_the_adapters_retry() {
+        #[derive(Clone)]
+        struct Seen(Arc<Mutex<Vec<(String, bool)>>>);
+
+        async fn upstream(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response<Body> {
+            let model = body["model"].as_str().unwrap_or("").to_string();
+            let has_system_turn = body["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|msg| msg["role"] == "system"));
+            seen.0
+                .lock()
+                .unwrap()
+                .push((model.clone(), has_system_turn));
+            if model == "claude-opus-4-6" && has_system_turn {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"role 'system' is not supported on this model"}}"#,
+                    ))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(
+                    "event: message_start\n\
+                     data: {\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                ))
+                .unwrap()
+        }
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let seen = Seen(Arc::new(Mutex::new(Vec::new())));
+        let upstream_app = Router::new()
+            .route("/v1/messages", axum::routing::post(upstream))
+            .with_state(seen.clone());
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+state_file: {}
+llm_proxy:
+  enabled: true
+  routine_streak: 99
+  minimum_dwell_requests: 0
+agents:
+  - name: claude
+    command: {{ type: stdio, command: claude-agent-acp }}
+    model_selection: {{ type: config-option }}
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: http://{upstream_addr}/v1
+    models:
+      - {{ id: "opus[1m]", cost_rank: 4, api_model: claude-opus-5,
+           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
+      - {{ id: claude-opus-4-6, cost_rank: 4, api_model: claude-opus-4-6,
+           downstream_id: "opus[1m]", auto_eligible: false,
+           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
+"#,
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg.clone()).unwrap();
+        shared.set_models_routeable(
+            &ProcessKey("claude".to_string()),
+            vec!["opus[1m]".into(), "claude-opus-4-6".into()],
+        );
+        let pinned = CandidateId::new("claude", "claude-opus-4-6");
+        shared.state.lock().unwrap().upsert(
+            "r1".to_string(),
+            PersistedSession {
+                agent: "claude".to_string(),
+                model: pinned.model.clone(),
+                downstream_session_id: "d1".to_string(),
+                cwd: dir.path().to_path_buf(),
+                kind: "primary".to_string(),
+                ..Default::default()
+            },
+        );
+        shared.sessions.lock().unwrap().insert(
+            "r1".to_string(),
+            RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new()),
+        );
+        let proxy_task = shared.llm_proxy.bind(shared.clone()).await.unwrap();
+        let spec = shared
+            .target_spec(&ProcessKey("claude".to_string()))
+            .unwrap();
+        let proxy_base = shared
+            .llm_proxy
+            .process_env(&spec)
+            .into_iter()
+            .find(|(name, _)| name == "ANTHROPIC_BASE_URL")
+            .unwrap()
+            .1;
+        let post = |base: String, body: Value| async move {
+            reqwest::Client::new()
+                .post(format!("{base}/messages"))
+                .header("authorization", "Bearer secret")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        };
+
+        // Claude Code's first request with the mid-conversation system beta on.
+        let with_system_turn = json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role":"user","content":"continue"},
+                {"role":"system","content":"per-turn effort: high"}
+            ]
+        });
+        let turn = shared.llm_proxy.begin_turn(
+            ProcessKey("claude".to_string()),
+            "r1".to_string(),
+            "r1".to_string(),
+            "d1".to_string(),
+            pinned.clone(),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        let response = post(proxy_base.clone(), with_system_turn).await;
+
+        // (a) The provider's rejection reaches the adapter unchanged — it is
+        //     what triggers the adapter's own beta fallback.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(
+            text.contains("role 'system'"),
+            "provider error relayed: {text}"
+        );
+
+        // (b) The pin is NOT cordoned: the model is fine, the request wasn't.
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&pinned)
+                .is_none(),
+            "a request-feature rejection must not cordon the pinned version"
+        );
+
+        // (c) The session is told, without being told the model is gone.
+        let notice = shared
+            .with_session("r1", |session| session.pending_disclosure.join("\n"))
+            .unwrap_or_default();
+        assert!(
+            notice.contains("pin is kept") && !notice.contains("cordoned"),
+            "user notified that the pin survives: {notice}"
+        );
+
+        // (d) The adapter's healed retry — same alias, no system turn — is
+        //     served by the pinned version itself, not by an alternate.
+        drop(turn);
+        let _turn2 = shared.llm_proxy.begin_turn(
+            ProcessKey("claude".to_string()),
+            "r1".to_string(),
+            "r1".to_string(),
+            "d1".to_string(),
+            pinned.clone(),
+            TaskClass::CodingGeneral,
+            None,
+        );
+        let healed = json!({
+            "model": "claude-opus-5",
+            "messages": [{"role":"user","content":"continue"}]
+        });
+        let second = post(proxy_base, healed).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            seen.0.lock().unwrap().clone(),
+            vec![
+                ("claude-opus-4-6".to_string(), true),
+                ("claude-opus-4-6".to_string(), false)
+            ],
+            "both the probe and the healed retry went to the pinned version"
+        );
+
+        drop(proxy_task);
+        upstream_task.abort();
+    }
+
     #[tokio::test]
     async fn rejected_pinned_rewrite_cordons_instead_of_serving_the_alias() {
         #[derive(Clone)]
