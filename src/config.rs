@@ -380,12 +380,17 @@ fn default_history() -> String {
 /// Auto-upgrade: when a session's estimated confidence drops below the
 /// threshold (the pinned model looks under-powered for how the session is
 /// going), switch it up to a more capable candidate mid-session.
+///
+/// Off by default. A live pin should move on a cordon/outage, a skill route,
+/// or an explicit request — a quality verdict re-pinning a session is a full
+/// summarize + re-pin that forfeits the live context, and in practice it fired
+/// on ordinary struggle (a long tool-heavy turn) rather than real trouble.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoUpgradeConfig {
-    /// Master switch. When false, sessions never auto-upgrade (explicit
-    /// `[router: switch=...]` still works).
-    #[serde(default = "default_true")]
+    /// Master switch, off by default. When false, sessions never auto-upgrade
+    /// (explicit `[router: switch=...]` still works).
+    #[serde(default)]
     pub enabled: bool,
     /// Confidence in [0, 1] below which a session upgrades. Higher = more
     /// eager to upgrade; 1.0 upgrades almost always; 0.0 effectively never.
@@ -400,7 +405,7 @@ fn default_confidence_threshold() -> f64 {
 impl Default for AutoUpgradeConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             confidence_threshold: default_confidence_threshold(),
         }
     }

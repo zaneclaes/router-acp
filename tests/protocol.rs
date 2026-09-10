@@ -4416,7 +4416,8 @@ async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
     )
     .unwrap();
     let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: true }}\nagents:\n{}{}",
         state.display(),
         scores.display(),
         agent_yaml("a", &[("m1", 1)], &[]),
@@ -4469,7 +4470,8 @@ async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_q
     )
     .unwrap();
     let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: true }}\nagents:\n{}{}",
         state.display(),
         scores.display(),
         agent_yaml("a", &[("m1", 1)], &[]),
@@ -4492,7 +4494,11 @@ async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_q
 }
 
 #[tokio::test]
-async fn auto_upgrade_disabled_keeps_the_pinned_model() {
+async fn auto_upgrade_is_off_by_default_and_keeps_the_pinned_model() {
+    // Live bug: a Grok pin was auto-upgraded to Opus on an automated relay
+    // nudge ("confidence 0.25 below threshold 0.40") — a full summarize +
+    // re-pin that dropped the live context onto a model the provider then
+    // rejected. The engine is opt-in now: no `auto_upgrade` key, no switch.
     let state = temp_state_file("noupgrade");
     let scores = std::env::temp_dir().join(format!(
         "router-acp-scores-{}.yaml",
@@ -4506,8 +4512,7 @@ async fn auto_upgrade_disabled_keeps_the_pinned_model() {
     )
     .unwrap();
     let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\nagents:\n{}{}",
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
         state.display(),
         scores.display(),
         agent_yaml("a", &[("m1", 1)], &[]),
@@ -4520,7 +4525,10 @@ async fn auto_upgrade_disabled_keeps_the_pinned_model() {
         let resp = prompt_text(&cx, &sid, "second turn").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(!text.contains("switched"), "no upgrade happened: {text}");
+        assert!(
+            !text.contains("below threshold") && !text.contains("switched"),
+            "no upgrade happened: {text}"
+        );
         assert!(text.contains("echo:m1:second turn"), "stayed on m1: {text}");
         Ok(())
     })

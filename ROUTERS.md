@@ -23,7 +23,8 @@ can still change the model:
   hand the conversation to a different model (see *Switching models
   mid-session* below);
 - **auto-upgrade** — the router itself switches up to a more capable model
-  when a session's confidence drops (tunable; off with `auto_upgrade`).
+  when a session's confidence drops (opt-in via `auto_upgrade.enabled: true`;
+  off by default).
 
 Whichever router runs, the decision is printed to your console and recorded
 in the state file, including the math, so you never have to guess why a
@@ -388,11 +389,15 @@ Three ways it happens:
 
    ```yaml
    auto_upgrade:
-     enabled: true               # false disables auto-upgrade entirely
+     enabled: true               # opt in — off by default
      confidence_threshold: 0.55  # higher = upgrades more eagerly; 0 ≈ never
    ```
 
-   Explicit `switch=` always works even with `auto_upgrade.enabled: false`.
+   Off by default: a live pin should move on a cordon/outage, a skill route,
+   or an explicit request, and a confidence dip is usually ordinary struggle
+   (one long tool-heavy turn), not a session in trouble — yet the switch is a
+   full summarize + re-pin that forfeits the live context. Explicit `switch=`
+   always works regardless of this setting.
 
 3. **A skill demands a model class.** Some skills should always run on capable
    models. `skill_routing` maps a skill pattern to a preferred set of candidate
