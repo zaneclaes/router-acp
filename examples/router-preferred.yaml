@@ -388,7 +388,7 @@ demotion:
 # refusals, repeated tool failures). Explicit `[router: switch=agent/model]`
 # always works regardless of this setting.
 auto_upgrade:
-  enabled: true                 # false disables automatic upgrades entirely
+  enabled: false                # off by default; true opts in
   confidence_threshold: 0.55    # upgrade below this; higher = more eager
 
 # Ticket context (pluggable). When a prompt mentions <prefix><digits> (e.g.
