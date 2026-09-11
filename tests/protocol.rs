@@ -2587,6 +2587,57 @@ async fn unauthenticated_agent_is_not_spawned_and_auto_routes_live_peer() {
 }
 
 #[tokio::test]
+async fn static_pin_to_unauthenticated_agent_reports_auth_required_with_live_peer() {
+    let state = temp_state_file("auth-static-pin");
+    let claude_log = temp_log("auth-static-pin-claude");
+    let codex_log = temp_log("auth-static-pin-codex");
+    let claude = agent_yaml(
+        "claude",
+        &[("fable", 5)],
+        &[("MOCK_LOG", &claude_log.display().to_string())],
+    )
+    .replace(
+        "    model_selection:",
+        "    auth_probe:\n      command: /bin/sh\n      args: [\"-c\", \"echo Claude is not signed in >&2; exit 1\"]\n    model_selection:",
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        claude,
+        agent_yaml(
+            "codex",
+            &[("gpt", 2)],
+            &[("MOCK_LOG", &codex_log.display().to_string())],
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.candidate".to_string(),
+            SessionConfigOptionValue::value_id("claude/fable"),
+        ))
+        .block_task()
+        .await?;
+        let err = prompt_text(&cx, &sid, "use fable").await.unwrap_err();
+        assert_eq!(err.code, AcpError::auth_required().code, "got: {err}");
+        let text = format!("{err}");
+        assert!(text.contains("claude/fable"), "candidate named: {text}");
+        assert!(
+            text.contains("sign in to `claude`"),
+            "heal path named: {text}"
+        );
+        assert!(
+            read_log(&claude_log).is_empty(),
+            "definitely logged-out Claude must not be spawned"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn authenticated_agent_remains_eligible_for_preclass_and_ops_pin() {
     let state = temp_state_file("auth-preflight-ok");
     let claude_log = temp_log("auth-preflight-ok-claude");

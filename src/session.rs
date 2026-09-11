@@ -3177,6 +3177,36 @@ async fn pin_session(
     } else {
         strategy
     };
+
+    // Static routing is an exact request, so preserve an authentication
+    // failure as authentication state instead of letting the strategy flatten
+    // it into "candidate not routeable" (which becomes Invalid params). Other
+    // agents may still be healthy, so the earlier empty-pool auth check cannot
+    // catch this mixed-provider case.
+    if strategy_kind == StrategyKind::Static && !shared.cfg.routers.static_.allow_fallback {
+        let static_candidate = override_.clone().or_else(|| {
+            shared
+                .cfg
+                .routers
+                .static_
+                .candidate
+                .as_deref()
+                .and_then(CandidateId::parse)
+                .map(|candidate| shared.cfg.resolve_stated_candidate(&candidate))
+        });
+        if let Some(candidate) = static_candidate
+            && let Some(reason) = shared
+                .auth
+                .lock()
+                .unwrap()
+                .unauthenticated(&candidate.agent)
+        {
+            return Err(AcpError::auth_required().data(format!(
+                "static candidate `{candidate}` requires authentication ({reason}); sign in to `{}` and retry",
+                candidate.agent
+            )));
+        }
+    }
     let mut ranked = make_strategy(strategy_kind, &shared.cfg)
         .rank(&ctx, &pool)
         .map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
