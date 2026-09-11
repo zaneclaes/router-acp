@@ -311,11 +311,11 @@ routers:
 **In one sentence:** always use the candidate you named.
 
 The session's explicit `router.candidate` selection wins; otherwise
-`routers.static.candidate` from config. If that candidate isn't routeable
-(unverified, cordoned, missing capability) you get an **actionable error**
-rather than a silent substitute — unless you opt into substitution with
-`allow_fallback: true`, which appends the remaining candidates in config
-order.
+`routers.static.candidate` from config. If that candidate's provider is signed
+out, the router returns ACP `auth_required`; if it is otherwise unavailable
+(unverified, cordoned, missing capability), you get an **actionable error**.
+Neither silently substitutes unless you opt into substitution with
+`allow_fallback: true`, which appends the remaining candidates in config order.
 
 **Config that matters:**
 
