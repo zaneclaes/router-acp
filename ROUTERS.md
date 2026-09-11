@@ -306,6 +306,86 @@ routers:
     max_escalations: 3
 ```
 
+## `planner` — two-phase routing (plan → implement)
+
+**In one sentence:** frontier models plan, workhorse models build; the
+session upgrades monotonically from planning to implementation.
+
+The `planner` strategy splits a session into two phases, each with its own
+candidate pool:
+
+| Phase | Pool globs | When |
+|---|---|---|
+| **Planning** (default) | `routers.planner.planning_candidates` | Session start; designing, speccing, refining |
+| **Implementation** | `routers.planner.implementation_candidates` | Plan is ready; building, shipping |
+
+Within each phase, ranking delegates to `auto` (same `routers.auto` /
+`cost_aversion` config — no parallel tuning surface). The phase determines
+*which* candidates enter the pool; the quality/cost tradeoff picks *which
+one*.
+
+### Crossover
+
+At the extremes, models from the other phase's pool are admitted:
+
+- **Implementation** + `complexity ≥ apex_complexity` → planning candidates
+  also enter (frontier for genuinely hard execution).
+- **Planning** + `complexity ≤ floor_complexity` → implementation candidates
+  also enter (workhorse for trivial planning).
+
+### Model boosts
+
+`model_boosts` adds a per-model additive score to a specific phase. A boost
+of +2.0 dwarfs the auto utility range (~0–1.1) and reliably wins.
+
+```yaml
+model_boosts:
+  - pattern: "*grok*"
+    implementation: 2.0  # grok always wins implementation phase
+    planning: 0.0
+```
+
+### Phase transitions
+
+Transitions are **monotonic** — once `Implementation`, never reverted.
+
+1. **Skill signal** — `marks_implementation_phase: true` on a
+   `skill_routing` entry definitively upgrades (e.g. `/ship-pr`).
+2. **Pre-classifier** — the `planner_phase` dimension returns `{phase,
+   confidence, plan_ready}`; upgrades when `phase=implementation`,
+   `confidence ≥ phase_upgrade_confidence`, and `plan_ready=true`.
+3. **Heuristic** — high-precision keyword phrases ("implement it", "build
+   this", "ship it") in the prompt text.
+4. **Directive** — `[router: phase=implementation]` always applies;
+   `[router: phase=planning]` is rejected if already implementing.
+
+When the phase upgrades post-pin, the router queues a `pending_switch` to
+the best implementation-phase candidate (same summarize-and-re-pin as any
+other switch).
+
+### Empty pool
+
+If the filtered pool for the current phase is empty (every candidate
+cordoned, excluded, or not declared), the strategy falls back to ranking the
+**full** candidate set via `auto` and notes the degradation.
+
+### Config
+
+```yaml
+router: planner
+routers:
+  planner:
+    planning_candidates: ["*sol*", "*astra*", "*fable*"]
+    implementation_candidates: ["*terra*", "*opus*", "*grok*"]
+    model_boosts:
+      - pattern: "*grok*"
+        implementation: 2.0
+        planning: 0.0
+    phase_upgrade_confidence: 0.7
+    apex_complexity: 0.85
+    floor_complexity: 0.15
+```
+
 ## `static` — no routing at all
 
 **In one sentence:** always use the candidate you named.

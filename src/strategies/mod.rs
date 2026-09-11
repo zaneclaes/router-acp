@@ -1,4 +1,4 @@
-//! Routing strategies: `static`, `auto`, `pareto-code`.
+//! Routing strategies: `static`, `auto`, `pareto-code`, `escalation`, `planner`.
 //!
 //! All strategies share the [`RouterStrategy`] trait and return a
 //! deterministic ranked fallback chain. Tie-break order everywhere is:
@@ -7,16 +7,18 @@
 mod auto;
 mod escalation;
 mod pareto_code;
+pub mod planner;
 mod static_;
 
 pub use auto::AutoStrategy;
 pub use escalation::EscalationStrategy;
 pub use pareto_code::ParetoCodeStrategy;
+pub use planner::PlannerStrategy;
 pub use static_::StaticStrategy;
 
 use crate::candidate::{CandidateId, CodingTier, RequiredCaps};
 use crate::classifier::TaskProfile;
-use crate::config::{Config, StrategyKind};
+use crate::config::{Config, PlannerPhase, StrategyKind};
 
 /// Everything a strategy may consider about one eligible candidate.
 /// The pool given to `rank` is already filtered for routeability, required
@@ -159,6 +161,10 @@ pub struct RouteContext {
     pub explicit_candidate: Option<CandidateId>,
     /// Provenance of `explicit_candidate`, so the reason string is honest.
     pub explicit_source: Option<OverrideSource>,
+    /// Current planner phase, when `router: planner` is active. `None` for
+    /// non-planner strategies (ignored) or when the phase hasn't been
+    /// determined yet (defaults to `Planning` inside `PlannerStrategy`).
+    pub planner_phase: Option<PlannerPhase>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +233,11 @@ pub fn make_strategy(kind: StrategyKind, cfg: &Config) -> Box<dyn RouterStrategy
                 _ => Box::new(EscalationStrategy::new(ecfg)),
             }
         }
+        StrategyKind::Planner => Box::new(PlannerStrategy::new(
+            cfg.routers.planner.clone(),
+            cfg.routers.auto.clone(),
+            cfg.availability_preference.cost_aversion,
+        )),
     }
 }
 
@@ -484,6 +495,7 @@ pub(crate) mod test_util {
             required_caps: RequiredCaps::default(),
             explicit_candidate: None,
             explicit_source: None,
+            planner_phase: None,
         }
     }
 }

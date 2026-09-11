@@ -88,6 +88,7 @@ fn route(prompt: &str) -> Outcome {
         required_caps: RequiredCaps::default(),
         explicit_candidate: None,
         explicit_source: None,
+        planner_phase: None,
     };
     let ranked = AutoStrategy::new(auto_cfg())
         .rank(&ctx, &views)

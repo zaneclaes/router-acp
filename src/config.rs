@@ -15,6 +15,7 @@ pub enum StrategyKind {
     Auto,
     ParetoCode,
     Escalation,
+    Planner,
 }
 
 impl StrategyKind {
@@ -24,6 +25,7 @@ impl StrategyKind {
             StrategyKind::Auto => "auto",
             StrategyKind::ParetoCode => "pareto-code",
             StrategyKind::Escalation => "escalation",
+            StrategyKind::Planner => "planner",
         }
     }
 
@@ -33,9 +35,18 @@ impl StrategyKind {
             "auto" => Some(StrategyKind::Auto),
             "pareto-code" => Some(StrategyKind::ParetoCode),
             "escalation" => Some(StrategyKind::Escalation),
+            "planner" => Some(StrategyKind::Planner),
             _ => None,
         }
     }
+}
+
+/// Two-phase routing: planning (frontier) then implementation (workhorse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlannerPhase {
+    Planning,
+    Implementation,
 }
 
 /// How far the `escalation` router jumps when it escalates.
@@ -492,6 +503,10 @@ pub struct SkillRoute {
     /// the outgoing model's.
     #[serde(default)]
     pub terse_handoff: bool,
+    /// When true, invoking this skill upgrades a `planner` session to
+    /// `Implementation` phase. Inert for non-planner routers.
+    #[serde(default)]
+    pub marks_implementation_phase: bool,
 }
 
 /// Automatic orchestration. When a prompt reads as a multi-part task list
@@ -1142,6 +1157,99 @@ impl Default for EscalationRouterConfig {
     }
 }
 
+/// Per-model additive score boost for the `planner` router, applied only in
+/// the designated phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerModelBoost {
+    /// Candidate glob (e.g. `*grok*`).
+    pub pattern: String,
+    /// Additive utility boost during the `Implementation` phase.
+    #[serde(default)]
+    pub implementation: f64,
+    /// Additive utility boost during the `Planning` phase.
+    #[serde(default)]
+    pub planning: f64,
+}
+
+fn default_planning_candidates() -> Vec<String> {
+    vec![
+        "*sol*".to_string(),
+        "*astra*".to_string(),
+        "*fable*".to_string(),
+    ]
+}
+
+fn default_implementation_candidates() -> Vec<String> {
+    vec![
+        "*terra*".to_string(),
+        "*opus*".to_string(),
+        "*grok*".to_string(),
+    ]
+}
+
+fn default_phase_upgrade_confidence() -> f64 {
+    0.7
+}
+
+fn default_planner_apex_complexity() -> f64 {
+    0.85
+}
+
+fn default_planner_floor_complexity() -> f64 {
+    0.15
+}
+
+/// Two-phase routing: separate candidate pools for planning (frontier) and
+/// implementation (workhorse), with complexity-gated crossover and per-model
+/// score boosts. Ranking within each pool delegates to `AutoStrategy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerRouterConfig {
+    /// Candidate globs for the planning (frontier) phase.
+    #[serde(default = "default_planning_candidates")]
+    pub planning_candidates: Vec<String>,
+    /// Candidate globs for the implementation (workhorse) phase.
+    #[serde(default = "default_implementation_candidates")]
+    pub implementation_candidates: Vec<String>,
+    /// Per-model additive score boosts, applied only in the matching phase.
+    #[serde(default)]
+    pub model_boosts: Vec<PlannerModelBoost>,
+    /// Pre-classifier confidence bar to auto-upgrade from planning to
+    /// implementation.
+    #[serde(default = "default_phase_upgrade_confidence")]
+    pub phase_upgrade_confidence: f64,
+    /// Complexity at or above which implementation-phase routing also admits
+    /// planning candidates (frontier for genuinely hard execution work).
+    #[serde(default = "default_planner_apex_complexity")]
+    pub apex_complexity: f64,
+    /// Complexity at or below which planning-phase routing also admits
+    /// implementation candidates (workhorse for trivial planning).
+    #[serde(default = "default_planner_floor_complexity")]
+    pub floor_complexity: f64,
+    /// Opaque host-owned instructions injected into the agent's context when
+    /// the session enters the planning phase. The router does not interpret
+    /// this text; workflow policy (ticket decomposition, session-spawning
+    /// protocol, coordination rules) belongs to the host. Analogous to
+    /// `orchestration.instructions`.
+    #[serde(default)]
+    pub planning_instructions: String,
+}
+
+impl Default for PlannerRouterConfig {
+    fn default() -> Self {
+        Self {
+            planning_candidates: default_planning_candidates(),
+            implementation_candidates: default_implementation_candidates(),
+            model_boosts: Vec::new(),
+            phase_upgrade_confidence: default_phase_upgrade_confidence(),
+            apex_complexity: default_planner_apex_complexity(),
+            floor_complexity: default_planner_floor_complexity(),
+            planning_instructions: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutersConfig {
@@ -1153,6 +1261,8 @@ pub struct RoutersConfig {
     pub pareto_code: ParetoCodeRouterConfig,
     #[serde(default)]
     pub escalation: EscalationRouterConfig,
+    #[serde(default)]
+    pub planner: PlannerRouterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

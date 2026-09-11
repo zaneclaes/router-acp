@@ -70,6 +70,10 @@ pub struct PreClassResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingDecision>,
     pub orchestrate: Option<OrchestrateDecision>,
+    /// Planner phase decision (planning vs implementation) when the router
+    /// is `planner`. `None` for non-planner configs or missing evaluator output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_phase: Option<PlannerPhaseDecision>,
     /// Extension dimension id → raw JSON object the evaluator returned.
     #[serde(default)]
     pub dimensions: BTreeMap<String, Value>,
@@ -120,6 +124,19 @@ pub struct OrchestrateDecision {
 
 fn default_parts() -> usize {
     1
+}
+
+/// Pre-classifier decision on the planner phase (planning vs implementation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerPhaseDecision {
+    pub phase: crate::config::PlannerPhase,
+    pub confidence: f64,
+    /// Whether the attached plan/ticket is concrete enough for a workhorse
+    /// model to execute without further design calls.
+    #[serde(default)]
+    pub plan_ready: bool,
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// The workspace the evaluator's throwaway session should open with: the host's
@@ -241,6 +258,25 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
              \"estimated_parts\": int >= 1, \"reason\": string }\n\n",
         );
         schema_keys.push("orchestrate".into());
+    }
+
+    if cfg.router == crate::config::StrategyKind::Planner {
+        out.push_str(
+            "## Dimension: planner_phase\n\
+             Decide whether this prompt is asking to PLAN or to IMPLEMENT.\n\
+             PLANNING = designing, proposing, writing a spec/RFC, or refining a plan that is \
+             still too thin to hand to an implementer.\n\
+             IMPLEMENTATION = a sufficiently detailed plan/ticket already exists (in this \
+             conversation or attached context) and the user wants it built.\n\
+             plan_ready = true only when the attached plan/ticket is concrete enough — steps, \
+             files/systems named, no open design questions — for a workhorse model to execute \
+             without further design calls. If phase is implementation but plan_ready is false, \
+             the plan needs more refinement before it should be handed off.\n\
+             Return:\n\
+             \"planner_phase\": { \"phase\": \"planning\"|\"implementation\", \
+             \"confidence\": 0.0-1.0, \"plan_ready\": bool, \"reason\": string }\n\n",
+        );
+        schema_keys.push("planner_phase".into());
     }
 
     for dim in &cfg.pre_classifier.dimensions {
@@ -377,6 +413,34 @@ fn parse_orchestrate(v: &Value) -> Option<OrchestrateDecision> {
         warranted,
         confidence,
         estimated_parts,
+        reason,
+    })
+}
+
+fn parse_planner_phase(v: &Value) -> Option<PlannerPhaseDecision> {
+    let obj = v.as_object()?;
+    let phase = obj
+        .get("phase")
+        .and_then(Value::as_str)
+        .and_then(|s| match s {
+            "planning" => Some(crate::config::PlannerPhase::Planning),
+            "implementation" => Some(crate::config::PlannerPhase::Implementation),
+            _ => None,
+        })?;
+    let confidence = obj.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+    let plan_ready = obj
+        .get("plan_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reason = obj
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(PlannerPhaseDecision {
+        phase,
+        confidence: confidence.clamp(0.0, 1.0),
+        plan_ready,
         reason,
     })
 }
@@ -524,6 +588,37 @@ pub fn apply_thresholds(
         }
     }
 
+    let planner_phase = if cfg.router == crate::config::StrategyKind::Planner {
+        parsed.get("planner_phase").and_then(parse_planner_phase)
+    } else {
+        None
+    };
+    if let Some(ref p) = planner_phase {
+        let phase_str = match p.phase {
+            crate::config::PlannerPhase::Planning => "planning",
+            crate::config::PlannerPhase::Implementation => "implementation",
+        };
+        summary_dims.insert(
+            "planner_phase".into(),
+            json!({
+                "phase": phase_str,
+                "confidence": p.confidence,
+                "plan_ready": p.plan_ready,
+                "reason": p.reason,
+            }),
+        );
+        log.push_str(&format!(
+            "planner_phase: phase={} conf={:.2} plan_ready={} — {}\n",
+            phase_str, p.confidence, p.plan_ready, p.reason
+        ));
+    } else if cfg.router == crate::config::StrategyKind::Planner {
+        summary_dims.insert(
+            "planner_phase".into(),
+            json!({ "present": false, "fallback": "heuristic" }),
+        );
+        log.push_str("planner_phase: missing/invalid — heuristic fallback\n");
+    }
+
     for dim in &cfg.pre_classifier.dimensions {
         let Some(val) = parsed.get(&dim.id) else {
             summary_dims.insert(dim.id.clone(), json!({ "present": false, "acts": false }));
@@ -622,6 +717,7 @@ pub fn apply_thresholds(
         latency_ms,
         routing,
         orchestrate,
+        planner_phase,
         dimensions,
         acted_modes,
         injects,
@@ -684,6 +780,7 @@ fn fail_open(
         latency_ms,
         routing: None,
         orchestrate: None,
+        planner_phase: None,
         dimensions: BTreeMap::new(),
         acted_modes: Vec::new(),
         injects: Vec::new(),
@@ -1251,6 +1348,22 @@ pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
         ));
     } else {
         lines.push("Routing assessment: unavailable; static classifier fallback.".to_string());
+    }
+
+    if let Some(p) = result.planner_phase.as_ref() {
+        let phase_str = match p.phase {
+            crate::config::PlannerPhase::Planning => "planning",
+            crate::config::PlannerPhase::Implementation => "implementation",
+        };
+        lines.push(format!(
+            "Planner phase: {phase_str} (confidence={:.2}, plan_ready={}). Reason: {}",
+            p.confidence, p.plan_ready, p.reason
+        ));
+    } else if cfg.router == crate::config::StrategyKind::Planner {
+        lines.push(
+            "Planner phase: unavailable from the evaluator; heuristic phrase-match decides."
+                .to_string(),
+        );
     }
 
     for dim in &cfg.pre_classifier.dimensions {
