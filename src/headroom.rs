@@ -108,11 +108,7 @@ impl SeatAvailability {
 
     /// Like [`Self::seat_budget`] with an explicit overage weight in [0, 1].
     /// Fleet config passes `availability_preference.overage_budget_weight`.
-    pub fn seat_budget_with_overage_weight(
-        &self,
-        scale_dollars: f64,
-        overage_weight: f64,
-    ) -> f64 {
+    pub fn seat_budget_with_overage_weight(&self, scale_dollars: f64, overage_weight: f64) -> f64 {
         let scale = scale_dollars.max(f64::MIN_POSITIVE);
         let plan = self.plan_headroom.clamp(0.0, 1.0);
         let overage_signal = self
@@ -844,8 +840,6 @@ mod tests {
             "plan_remaining_dollars must not affect seat_budget"
         );
     }
-
-
 
     // The user's exact complaint: percent-of-own-cap comparison hides real
     // dollar gaps between differently-sized caps and can invert the ranking.

@@ -353,6 +353,11 @@ pub struct RouterSession {
     /// `usage_update.cost` — turn-end pricing synthesis then stays out of
     /// the way (synthesized and reported figures must not mix).
     pub saw_adapter_cost: bool,
+    // ---- planner two-phase routing ----
+    /// Current planner phase when `router: planner` is active. `None` for
+    /// non-planner sessions. Only meaningful when `strategy == Planner`.
+    /// Monotonic: once `Implementation`, never reverted.
+    pub planner_phase: Option<crate::config::PlannerPhase>,
 }
 
 /// What the outgoing model is asked to write when handing a session off.
@@ -441,6 +446,7 @@ impl RouterSession {
             elevation_skill: None,
             quiet_turns: 0,
             saw_adapter_cost: false,
+            planner_phase: None,
         }
     }
 
@@ -499,6 +505,7 @@ impl RouterSession {
             elevation_skill: None,
             quiet_turns: 0,
             saw_adapter_cost: false,
+            planner_phase: None,
         }
     }
 }
@@ -2466,6 +2473,8 @@ pub struct PromptDirectives {
     pub exclude: Vec<String>,
     pub label: Option<String>,
     pub effort: Option<EffortLevel>,
+    /// `[router: phase=planning|implementation]` — planner phase override.
+    pub phase: Option<crate::config::PlannerPhase>,
 }
 
 /// Parse (and strip) a routing directive from the prompt.
@@ -2578,10 +2587,21 @@ pub fn parse_prompt_directives(
                     )
                 })?);
             }
+            "phase" => {
+                directives.phase = Some(match value {
+                    "planning" => crate::config::PlannerPhase::Planning,
+                    "implementation" => crate::config::PlannerPhase::Implementation,
+                    _ => {
+                        return Err(format!(
+                            "directive phase `{value}` must be planning or implementation"
+                        ));
+                    }
+                });
+            }
             other => {
                 return Err(format!(
                     "unknown routing directive key `{other}` \
-                     (keys: candidate, prefer, switch, strategy, exclude, label, effort)"
+                     (keys: candidate, prefer, switch, strategy, exclude, label, effort, phase)"
                 ));
             }
         }
@@ -2972,21 +2992,31 @@ async fn pin_session(
     larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
     crate::auth::refresh_before_selection(shared).await;
-    let (cwd, dirs, client_mcp, strategy, override_, override_source, effort_request, run_label) =
-        shared
-            .with_session(router_sid, |s| {
-                (
-                    s.cwd.clone(),
-                    s.additional_directories.clone(),
-                    s.mcp_servers.clone(),
-                    s.strategy,
-                    s.candidate_override.clone(),
-                    s.candidate_override_source.clone(),
-                    s.effort_request,
-                    s.run_label.clone(),
-                )
-            })
-            .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
+    let (
+        cwd,
+        dirs,
+        client_mcp,
+        strategy,
+        override_,
+        override_source,
+        effort_request,
+        run_label,
+        planner_phase,
+    ) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.cwd.clone(),
+                s.additional_directories.clone(),
+                s.mcp_servers.clone(),
+                s.strategy,
+                s.candidate_override.clone(),
+                s.candidate_override_source.clone(),
+                s.effort_request,
+                s.run_label.clone(),
+                s.planner_phase,
+            )
+        })
+        .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     // Substitute the version pin on the explicit override FIRST, before any
     // check consults it. The pool is already built on served identities
     // (`effective_candidates`), so an override still naming the alias would
@@ -3051,6 +3081,7 @@ async fn pin_session(
         required_caps: required,
         explicit_candidate: override_.clone(),
         explicit_source: override_source,
+        planner_phase,
     };
 
     // Cordons active right now (shown to the user so exclusions are visible).
@@ -4811,6 +4842,175 @@ fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
     // Did the agent itself enumerate the options/questions?
     let enumerated = crate::tasklist::detect_task_list(text).is_some();
     has_phrase || questions >= 2 || (questions >= 1 && enumerated)
+}
+
+/// Determine the planner phase for this turn and apply a monotonic upgrade
+/// to the session when warranted. Called from `dispatch_prompt` right
+/// alongside orchestration/skill-routing.
+///
+/// Sources (checked in order):
+///
+/// 1. Skill signal — `SkillRoute.marks_implementation_phase` on a matched
+///    route definitively upgrades.
+/// 2. Pre-classifier `planner_phase` dimension (first turn only).
+/// 3. Heuristic keyword phrases in the prompt text.
+///
+/// The session's `planner_phase` is monotonic: once `Implementation`, it
+/// stays there. Returns `true` when a mid-session switch to a new
+/// implementation-phase model should be queued.
+fn maybe_update_planner_phase(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    prompt: &[ContentBlock],
+    skill_route: Option<&crate::config::SkillRoute>,
+    preclass: Option<&crate::pre_classifier::PreClassResult>,
+) -> bool {
+    use crate::config::{PlannerPhase, StrategyKind};
+
+    let (strategy, current) =
+        match shared.with_session(router_sid, |s| (s.strategy, s.planner_phase)) {
+            Some(v) => v,
+            None => return false,
+        };
+    if strategy != StrategyKind::Planner {
+        return false;
+    }
+    // Already implementation — monotonic, nothing to do.
+    if current == Some(PlannerPhase::Implementation) {
+        return false;
+    }
+
+    // 1. Skill signal (definitive).
+    if let Some(route) = skill_route
+        && route.marks_implementation_phase
+    {
+        let was_none = current.is_none();
+        shared.with_session(router_sid, |s| {
+            s.planner_phase = Some(PlannerPhase::Implementation);
+        });
+        notify_user(
+            shared,
+            router_sid,
+            format!(
+                "router-acp · planner: skill `{}` → implementation phase",
+                route.pattern
+            ),
+        );
+        // If the session already has a pin, we need a mid-session switch.
+        return !was_none;
+    }
+
+    // 2. Pre-classifier decision (first turn, when available).
+    if let Some(pre) = preclass
+        && let Some(ref dec) = pre.planner_phase
+    {
+        let cfg = &shared.cfg.routers.planner;
+        if dec.phase == PlannerPhase::Implementation
+            && dec.confidence >= cfg.phase_upgrade_confidence
+            && dec.plan_ready
+        {
+            shared.with_session(router_sid, |s| {
+                s.planner_phase = Some(PlannerPhase::Implementation);
+            });
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · planner: pre-class → implementation phase \
+                         (confidence={:.2}, plan_ready=true). {}",
+                    dec.confidence, dec.reason
+                ),
+            );
+            return current.is_some(); // need switch if already pinned
+        }
+        if dec.phase == PlannerPhase::Implementation && !dec.plan_ready {
+            // Plan exists but is not detailed enough — stay in planning,
+            // inject a note asking the frontier model to confirm with
+            // the user whether to proceed or keep refining.
+            shared.with_session(router_sid, |s| {
+                s.planner_phase = Some(PlannerPhase::Planning);
+                s.pending_injects.push(
+                    "[router-acp planner note] The pre-classifier detected this as \
+                         implementation work, but the plan/ticket is not yet detailed enough \
+                         for a workhorse model to execute without further design calls. \
+                         Please confirm with the user: should we proceed to implementation \
+                         with the current plan, or refine it further first?"
+                        .to_string(),
+                );
+            });
+            notify_user(
+                shared,
+                router_sid,
+                "router-acp · planner: staying in planning — plan needs refinement",
+            );
+            return false;
+        }
+        // Pre-class says planning — set it and stay.
+        shared.with_session(router_sid, |s| {
+            s.planner_phase = Some(PlannerPhase::Planning);
+        });
+        return false;
+    }
+
+    // 3. Heuristic phrase match.
+    let text = prompt_display_text(prompt);
+    if crate::strategies::planner::heuristic_signals_implementation(&text) {
+        shared.with_session(router_sid, |s| {
+            s.planner_phase = Some(PlannerPhase::Implementation);
+        });
+        notify_user(
+            shared,
+            router_sid,
+            "router-acp · planner: heuristic → implementation phase",
+        );
+        return current.is_some(); // need switch if already pinned
+    }
+
+    // Default: stay in / set to planning.
+    if current.is_none() {
+        let instructions = shared.cfg.routers.planner.planning_instructions.clone();
+        shared.with_session(router_sid, |s| {
+            s.planner_phase = Some(PlannerPhase::Planning);
+            if !instructions.is_empty() {
+                s.pending_injects.push(instructions);
+            }
+        });
+    }
+    false
+}
+
+/// Pick the best candidate for a planner phase via the planner strategy.
+/// Used for mid-session switches when the phase upgrades post-pin.
+fn select_planner_target(
+    shared: &Arc<Shared>,
+    phase: crate::config::PlannerPhase,
+    class: crate::candidate::TaskClass,
+    excluded: &[String],
+) -> Option<CandidateId> {
+    let profile = crate::classifier::TaskProfile {
+        class,
+        complexity: 0.5, // neutral default
+        languages: vec![],
+        effort: None,
+    };
+    let ctx = RouteContext {
+        profile,
+        required_caps: RequiredCaps::default(),
+        explicit_candidate: None,
+        explicit_source: None,
+        planner_phase: Some(phase),
+    };
+    let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
+    if !excluded.is_empty() {
+        pool.retain(|v| !view_excluded(v, excluded));
+    }
+    let strategy = crate::strategies::make_strategy(StrategyKind::Planner, &shared.cfg);
+    strategy
+        .rank(&ctx, &pool)
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|r| r.candidate)
 }
 
 /// If auto-orchestration is enabled and the prompt warrants multi-track work,
@@ -6666,6 +6866,31 @@ fn on_prompt(
                     });
                 }
             }
+            // `phase=` sets the planner phase (valid pre- and post-pin).
+            // Implementation always applies; planning is rejected when the
+            // session is already in implementation (monotonic upgrade).
+            if let Some(phase) = directives.phase {
+                use crate::config::PlannerPhase;
+                let current = shared
+                    .with_session(&router_sid, |s| s.planner_phase)
+                    .unwrap_or(None);
+                match (current, phase) {
+                    (Some(PlannerPhase::Implementation), PlannerPhase::Planning) => {
+                        notify_user(
+                            &shared,
+                            &router_sid,
+                            "router-acp · rejected: cannot downgrade from implementation to \
+                             planning — phase transitions are one-way. Start a new session \
+                             to plan again.",
+                        );
+                    }
+                    _ => {
+                        shared.with_session(&router_sid, |s| {
+                            s.planner_phase = Some(phase);
+                        });
+                    }
+                }
+            }
             // Effort may change on a live pin; the remaining routing directives
             // only shape the still-unmade routing decision.
             let has_pre_pin_directives = directives.strategy.is_some()
@@ -6871,6 +7096,51 @@ async fn dispatch_prompt(
         None
     };
 
+    // Hoist skill detection so both the planner phase logic and
+    // orchestration/skill-routing can reuse the result without a second
+    // pattern-matching pass.
+    let detected_skill = detect_skill_route(&shared.cfg, &req.prompt);
+
+    // Planner phase (when router == planner): update the monotonic phase,
+    // potentially queuing a mid-session switch to an implementation model.
+    let planner_needs_switch = if !explicit_routing {
+        maybe_update_planner_phase(
+            &shared,
+            &router_sid,
+            &req.prompt,
+            detected_skill,
+            preclass.as_ref(),
+        )
+    } else {
+        false
+    };
+    if planner_needs_switch {
+        let (class, excluded) = shared
+            .with_session(&router_sid, |s| {
+                (
+                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                    s.excluded.clone(),
+                )
+            })
+            .unwrap_or((TaskClass::CodingGeneral, Vec::new()));
+        if let Some(target) = select_planner_target(
+            &shared,
+            crate::config::PlannerPhase::Implementation,
+            class,
+            &excluded,
+        ) {
+            shared.with_session(&router_sid, |s| {
+                if s.pending_switch.is_none() {
+                    s.pending_switch = Some(SwitchRequest {
+                        target,
+                        reason: "planner phase upgrade → implementation".to_string(),
+                        handoff: HandoffStyle::Full,
+                    });
+                }
+            });
+        }
+    }
+
     // Auto-orchestration runs next: a multi-part / pre-class-warranted task
     // orchestrates even if it names a skill. Suppressed only by an explicit
     // `[router: …]` directive or `model:` shorthand;
@@ -6902,7 +7172,7 @@ async fn dispatch_prompt(
     // target `candidates`. Collapsing the two (the pre-`also_acceptable`
     // behaviour) force-switches an already-better pin onto a lesser model for
     // no reason other than its absence from the target pool.
-    if !orchestrating_now && let Some(route) = detect_skill_route(&shared.cfg, &req.prompt) {
+    if !orchestrating_now && let Some(route) = detected_skill {
         let (class, excluded, current) = shared
             .with_session(&router_sid, |s| {
                 (
