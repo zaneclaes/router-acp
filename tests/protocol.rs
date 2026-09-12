@@ -7457,3 +7457,206 @@ async fn delegation_hint_naming_a_pinned_key_opens_the_target() {
     })
     .await;
 }
+
+// ======================================================================
+// Planner strategy: plan-first protocol and phase-directive handoff
+// ======================================================================
+
+fn planner_user_prompts(log: &PathBuf) -> Vec<String> {
+    read_log(log)
+        .into_iter()
+        .filter(|event| event["event"] == "prompt")
+        .filter_map(|event| event["text"].as_str().map(str::to_string))
+        .filter(|text| !text.contains("[router-acp pre-classifier]"))
+        .collect()
+}
+
+#[tokio::test]
+async fn planner_plan_ready_false_injects_protocol_not_current_plan_question() {
+    // First-turn path that reproduced the defect: pre-class says
+    // implementation + plan_ready=false, so maybe_update_planner_phase used
+    // to inject "proceed with the current plan?" and return before host
+    // planning_instructions. Both the built-in protocol and the host text
+    // must land, and the premature question must not.
+    let state = temp_state_file("planner-plan-ready-false");
+    let log = temp_log("planner-plan-ready-false");
+    let preclass = r#"{"routing":{"task_class":"BugFix","complexity":0.4,"confidence":0.9,"reason":"fix the bug"},"planner_phase":{"phase":"implementation","confidence":0.9,"plan_ready":false,"reason":"no plan attached"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*sol*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n    \
+         planning_instructions: HOST-PLAN-INSTRUCTIONS-MARKER\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 1)],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", log.to_str().unwrap()),
+            ]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "fix the login bug").await?;
+
+        let phase = shared.with_session(&sid, |s| s.planner_phase).flatten();
+        assert_eq!(
+            phase,
+            Some(router_acp::config::PlannerPhase::Planning),
+            "implementation + plan_ready=false must stay in planning"
+        );
+
+        let prompts = planner_user_prompts(&log);
+        assert_eq!(prompts.len(), 1, "one downstream user prompt: {prompts:?}");
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains(router_acp::strategies::planner::PLAN_PROTOCOL_HEADER),
+            "built-in plan-first protocol missing: {prompt}"
+        );
+        assert!(
+            prompt.contains(router_acp::strategies::planner::HANDOFF_PROCEED),
+            "stable proceed choice missing: {prompt}"
+        );
+        assert!(
+            prompt.contains(router_acp::strategies::planner::HANDOFF_REFINE),
+            "stable refine choice missing: {prompt}"
+        );
+        assert!(
+            prompt.contains("HOST-PLAN-INSTRUCTIONS-MARKER"),
+            "host planning_instructions skipped: {prompt}"
+        );
+        assert!(
+            !prompt.contains("with the current plan"),
+            "premature current-plan question must be absent: {prompt}"
+        );
+        assert!(
+            !prompt.contains("should we proceed to implementation"),
+            "premature approval question must be absent: {prompt}"
+        );
+
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:sol:"),
+            "planning candidate should serve the first turn: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_planning_preclass_also_injects_protocol_and_host_instructions() {
+    let state = temp_state_file("planner-planning-preclass");
+    let log = temp_log("planner-planning-preclass");
+    let preclass = r#"{"routing":{"task_class":"Feature","complexity":0.5,"confidence":0.9,"reason":"design first"},"planner_phase":{"phase":"planning","confidence":0.95,"plan_ready":false,"reason":"user asked for a plan"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*sol*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n    \
+         planning_instructions: HOST-PLAN-INSTRUCTIONS-MARKER\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 1)],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", log.to_str().unwrap()),
+            ]
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "draft a plan for the feature").await?;
+        let prompts = planner_user_prompts(&log);
+        let prompt = prompts.last().expect("downstream prompt");
+        assert!(
+            prompt.contains(router_acp::strategies::planner::PLAN_PROTOCOL_HEADER),
+            "planning preclass must still inject the protocol: {prompt}"
+        );
+        assert!(
+            prompt.contains("HOST-PLAN-INSTRUCTIONS-MARKER"),
+            "planning preclass must still inject host instructions: {prompt}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_phase_implementation_directive_switches_pinned_session() {
+    // The Kory handoff queues `[router: phase=implementation]` after the
+    // planning turn. That directive used to set the phase and then skip
+    // maybe_update_planner_phase (explicit_routing), so the pin stayed on
+    // the planning model. It must summarize-and-re-pin onto implementation.
+    let state = temp_state_file("planner-phase-directive-switch");
+    let log = temp_log("planner-phase-directive-switch");
+    let preclass = r#"{"routing":{"task_class":"BugFix","complexity":0.4,"confidence":0.9,"reason":"fix the bug"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"needs a plan"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*sol*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 1)],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", log.to_str().unwrap()),
+            ]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "fix the login bug").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        assert!(
+            agent_text(&observed, &sid).contains("echo:sol:"),
+            "first turn on the planning candidate"
+        );
+
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\n[planner-handoff] start the work",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:opus:"),
+            "phase=implementation must switch onto the implementation candidate: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}

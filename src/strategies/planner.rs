@@ -181,6 +181,46 @@ pub fn heuristic_signals_implementation(text: &str) -> bool {
         .any(|phrase| lower.contains(phrase))
 }
 
+/// Stable labels for the planning-phase structured handoff question.
+/// The ACP client and Kory Code relay match these strings exactly.
+pub const HANDOFF_PROCEED: &str = "Proceed with implementation";
+pub const HANDOFF_REFINE: &str = "Refine the plan";
+
+/// Header the planning-phase inject starts with — tests and log greps key on it.
+pub const PLAN_PROTOCOL_HEADER: &str = "[router-acp planner protocol]";
+
+/// Built-in plan-first protocol injected whenever a planner session enters
+/// Planning. Host `planning_instructions` are appended separately.
+pub fn planner_plan_protocol() -> String {
+    format!(
+        "{PLAN_PROTOCOL_HEADER}\n\
+         You are in the PLANNING phase. Investigate the request and present a \
+         concrete, reviewable plan before asking for implementation approval.\n\
+         \n\
+         Required order:\n\
+         1. Investigate (read the code, tickets, and docs) until you can name \
+         the files, steps, and risks.\n\
+         2. Present that plan in this turn as a reviewable artifact: goal, \
+         approach, files/systems to change, sequenced steps, open questions, \
+         and what done looks like.\n\
+         3. Only AFTER the plan is in the conversation, ask one structured \
+         question whose only choices are exactly:\n\
+         - \"{HANDOFF_PROCEED}\"\n\
+         - \"{HANDOFF_REFINE}\"\n\
+         4. Do not ask for implementation approval against a plan you have \
+         not presented.\n\
+         \n\
+         Forbidden in this planning turn:\n\
+         - Editing, creating, or deleting implementation files\n\
+         - Asking for implementation approval before the plan is presented\n\
+         - Starting implementation after a \"{HANDOFF_PROCEED}\" answer. End \
+         the turn without editing; a follow-up user prompt performs the \
+         router switch onto the implementation model.\n\
+         \n\
+         Do not paraphrase the choice labels."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +439,19 @@ mod tests {
         assert!(!heuristic_signals_implementation(
             "discuss the implementation approach"
         ));
+    }
+
+    #[test]
+    fn plan_protocol_names_stable_handoff_choices() {
+        let protocol = planner_plan_protocol();
+        assert!(protocol.starts_with(PLAN_PROTOCOL_HEADER));
+        assert!(protocol.contains(HANDOFF_PROCEED));
+        assert!(protocol.contains(HANDOFF_REFINE));
+        assert!(protocol.contains("before asking for implementation approval"));
+        assert!(
+            !protocol.contains("with the current plan"),
+            "must not revive the premature current-plan question: {protocol}"
+        );
     }
 
     #[test]
