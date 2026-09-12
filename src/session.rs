@@ -4844,6 +4844,29 @@ fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
     has_phrase || questions >= 2 || (questions >= 1 && enumerated)
 }
 
+/// Enter Planning. On first entry, inject the built-in plan-first protocol
+/// and any host `planning_instructions`. Idempotent once the session is
+/// already in Planning so follow-up turns do not re-stack the injects.
+fn enter_planning_phase(shared: &Arc<Shared>, router_sid: &str) {
+    use crate::config::PlannerPhase;
+    let already = shared
+        .with_session(router_sid, |s| s.planner_phase)
+        .flatten()
+        == Some(PlannerPhase::Planning);
+    if already {
+        return;
+    }
+    let protocol = crate::strategies::planner::planner_plan_protocol();
+    let host = shared.cfg.routers.planner.planning_instructions.clone();
+    shared.with_session(router_sid, |s| {
+        s.planner_phase = Some(PlannerPhase::Planning);
+        s.pending_injects.push(protocol);
+        if !host.is_empty() {
+            s.pending_injects.push(host);
+        }
+    });
+}
+
 /// Determine the planner phase for this turn and apply a monotonic upgrade
 /// to the session when warranted. Called from `dispatch_prompt` right
 /// alongside orchestration/skill-routing.
@@ -4853,7 +4876,13 @@ fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
 /// 1. Skill signal — `SkillRoute.marks_implementation_phase` on a matched
 ///    route definitively upgrades.
 /// 2. Pre-classifier `planner_phase` dimension (first turn only).
+///    `implementation` + `plan_ready=false` stays in Planning and injects
+///    the plan-first protocol — never a "current plan" approval question.
 /// 3. Heuristic keyword phrases in the prompt text.
+///
+/// Every path that remains in (or first enters) Planning goes through
+/// [`enter_planning_phase`] so the built-in protocol and host
+/// `planning_instructions` always land together.
 ///
 /// The session's `planner_phase` is monotonic: once `Implementation`, it
 /// stays there. Returns `true` when a mid-session switch to a new
@@ -4924,31 +4953,20 @@ fn maybe_update_planner_phase(
             return current.is_some(); // need switch if already pinned
         }
         if dec.phase == PlannerPhase::Implementation && !dec.plan_ready {
-            // Plan exists but is not detailed enough — stay in planning,
-            // inject a note asking the frontier model to confirm with
-            // the user whether to proceed or keep refining.
-            shared.with_session(router_sid, |s| {
-                s.planner_phase = Some(PlannerPhase::Planning);
-                s.pending_injects.push(
-                    "[router-acp planner note] The pre-classifier detected this as \
-                         implementation work, but the plan/ticket is not yet detailed enough \
-                         for a workhorse model to execute without further design calls. \
-                         Please confirm with the user: should we proceed to implementation \
-                         with the current plan, or refine it further first?"
-                        .to_string(),
-                );
-            });
+            // Classified as implementation work, but no reviewable plan exists
+            // yet. Stay in planning and inject the plan-first protocol — do
+            // not ask whether to proceed with a plan that has not been
+            // presented.
+            enter_planning_phase(shared, router_sid);
             notify_user(
                 shared,
                 router_sid,
-                "router-acp · planner: staying in planning — plan needs refinement",
+                "router-acp · planner: staying in planning — present a plan before handoff",
             );
             return false;
         }
-        // Pre-class says planning — set it and stay.
-        shared.with_session(router_sid, |s| {
-            s.planner_phase = Some(PlannerPhase::Planning);
-        });
+        // Pre-class says planning — enter it (protocol + host instructions).
+        enter_planning_phase(shared, router_sid);
         return false;
     }
 
@@ -4966,16 +4984,8 @@ fn maybe_update_planner_phase(
         return current.is_some(); // need switch if already pinned
     }
 
-    // Default: stay in / set to planning.
-    if current.is_none() {
-        let instructions = shared.cfg.routers.planner.planning_instructions.clone();
-        shared.with_session(router_sid, |s| {
-            s.planner_phase = Some(PlannerPhase::Planning);
-            if !instructions.is_empty() {
-                s.pending_injects.push(instructions);
-            }
-        });
-    }
+    // Default: stay in / enter planning.
+    enter_planning_phase(shared, router_sid);
     false
 }
 
@@ -6778,6 +6788,9 @@ fn on_prompt(
     // Set by an `orchestrate:` / `orchestrator:` prefix — forces orchestration
     // regardless of list detection.
     let mut force_orchestrate = false;
+    // Set when a `[router: phase=implementation]` directive upgrades a pinned
+    // planning session — the same summarize-and-re-pin as a detected upgrade.
+    let mut planner_needs_switch = false;
 
     // Routing directives: `[router: ...]` anywhere in the prompt. Always
     // stripped (the downstream model never sees them); only applied before
@@ -6869,11 +6882,18 @@ fn on_prompt(
             // `phase=` sets the planner phase (valid pre- and post-pin).
             // Implementation always applies; planning is rejected when the
             // session is already in implementation (monotonic upgrade).
+            // Entering Planning injects the plan-first protocol. Upgrading a
+            // pinned session to Implementation queues a summarize-and-re-pin
+            // so the configured implementation candidate actually takes over
+            // (the elicitation answer itself never leaves the planning turn).
             if let Some(phase) = directives.phase {
                 use crate::config::PlannerPhase;
                 let current = shared
                     .with_session(&router_sid, |s| s.planner_phase)
                     .unwrap_or(None);
+                let pinned = shared
+                    .with_session(&router_sid, |s| s.pin.is_some() || s.pinning)
+                    .unwrap_or(false);
                 match (current, phase) {
                     (Some(PlannerPhase::Implementation), PlannerPhase::Planning) => {
                         notify_user(
@@ -6884,10 +6904,22 @@ fn on_prompt(
                              to plan again.",
                         );
                     }
-                    _ => {
+                    (_, PlannerPhase::Planning) => {
+                        enter_planning_phase(&shared, &router_sid);
+                    }
+                    (_, PlannerPhase::Implementation) => {
                         shared.with_session(&router_sid, |s| {
-                            s.planner_phase = Some(phase);
+                            s.planner_phase = Some(PlannerPhase::Implementation);
                         });
+                        if pinned && current != Some(PlannerPhase::Implementation) {
+                            planner_needs_switch = true;
+                            notify_user(
+                                &shared,
+                                &router_sid,
+                                "router-acp · planner: [router: phase=implementation] → \
+                                 implementation phase",
+                            );
+                        }
                     }
                 }
             }
@@ -6989,6 +7021,7 @@ fn on_prompt(
             responder,
             explicit_routing,
             force_orchestrate,
+            planner_needs_switch,
         )
         .await
     })
@@ -7004,6 +7037,7 @@ async fn dispatch_prompt(
     responder: Responder<PromptResponse>,
     explicit_routing: bool,
     force_orchestrate: bool,
+    mut planner_needs_switch: bool,
 ) -> Result<(), AcpError> {
     crate::auth::refresh_before_selection(&shared).await;
     // Pre-classifier (when enabled): one cheap ACP evaluation covering
@@ -7103,17 +7137,18 @@ async fn dispatch_prompt(
 
     // Planner phase (when router == planner): update the monotonic phase,
     // potentially queuing a mid-session switch to an implementation model.
-    let planner_needs_switch = if !explicit_routing {
-        maybe_update_planner_phase(
+    // A `[router: phase=…]` directive already ran above (`explicit_routing`);
+    // skip the classifier/heuristic pass so it cannot fight the directive,
+    // but keep a directive-driven implementation upgrade on `planner_needs_switch`.
+    if !explicit_routing {
+        planner_needs_switch |= maybe_update_planner_phase(
             &shared,
             &router_sid,
             &req.prompt,
             detected_skill,
             preclass.as_ref(),
-        )
-    } else {
-        false
-    };
+        );
+    }
     if planner_needs_switch {
         let (class, excluded) = shared
             .with_session(&router_sid, |s| {

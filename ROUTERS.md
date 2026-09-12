@@ -354,14 +354,36 @@ Transitions are **monotonic** — once `Implementation`, never reverted.
 2. **Pre-classifier** — the `planner_phase` dimension returns `{phase,
    confidence, plan_ready}`; upgrades when `phase=implementation`,
    `confidence ≥ phase_upgrade_confidence`, and `plan_ready=true`.
+   `implementation` + `plan_ready=false` stays in Planning: the work looks
+   like a build, but no reviewable plan exists yet.
 3. **Heuristic** — high-precision keyword phrases ("implement it", "build
    this", "ship it") in the prompt text.
 4. **Directive** — `[router: phase=implementation]` always applies;
    `[router: phase=planning]` is rejected if already implementing.
 
-When the phase upgrades post-pin, the router queues a `pending_switch` to
-the best implementation-phase candidate (same summarize-and-re-pin as any
-other switch).
+**Entering Planning always injects two things**, on every path that first
+sets the phase (pre-classifier `planning`, `implementation` +
+`plan_ready=false`, heuristic miss, `[router: phase=planning]`, or the
+default first turn):
+
+1. The built-in **plan-first protocol** (`[router-acp planner protocol]`):
+   investigate, present a concrete reviewable plan, then ask one structured
+   question whose only choices are exactly `Proceed with implementation` and
+   `Refine the plan`. Implementation edits are forbidden in that turn. The
+   approval question is forbidden until the plan has been presented — there
+   is no "proceed with the current plan?" prompt when no plan exists.
+2. Host `planning_instructions`, if configured.
+
+A structured "Proceed" answer is resolved inside the planning model's
+current ACP turn, so it cannot itself switch the pin. The host (Kory Code)
+queues a follow-up user prompt `[router: phase=implementation]` after that
+turn ends. On a pinned planning session that directive upgrades the phase
+**and** queues a `pending_switch` to the best implementation-phase
+candidate (same summarize-and-re-pin as any other switch). Declining or
+choosing `Refine the plan` does not change phase.
+
+When any other source upgrades the phase post-pin, the router likewise
+queues a `pending_switch` to the best implementation-phase candidate.
 
 ### Empty pool
 
