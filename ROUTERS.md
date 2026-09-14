@@ -89,7 +89,9 @@ And for `auto`, each candidate carries three numbers:
   provider API; included-plan windows have no dollar field on either
   provider, so the router estimates them from its own metered spend vs the
   window's percent. Model-scoped caps, such as Claude Fable's weekly window,
-  apply only to that model. Agents with no usage meter (Grok, Kimi) have no
+  apply only to that model. Grok's `_x.ai/ask_user_question` is translated to
+  ACP `elicitation/create` when the client advertises form elicitation.
+  Agents with no usage meter (Grok, Kimi) have no
   reported plan headroom; while **any metered seat still has free included
   plan**, their effective headroom is capped at that best free metered
   residual so a fake 100% does not beat free Claude/Codex on the quota term.

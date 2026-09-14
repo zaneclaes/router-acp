@@ -21,8 +21,8 @@ use agent_client_protocol::schema::v1::{
     StopReason,
 };
 use agent_client_protocol::{
-    Agent as AgentPeer, Channel, Client as ClientPeer, ConnectionTo, Responder,
-    on_receive_notification, on_receive_request,
+    Agent as AgentPeer, Channel, Client as ClientPeer, ConnectionTo, Dispatch, Handled, Responder,
+    on_receive_dispatch, on_receive_notification, on_receive_request,
 };
 
 use router_acp::config::Config;
@@ -43,6 +43,7 @@ struct Observed {
     permission_session_ids: Vec<String>,
     read_session_ids: Vec<String>,
     elicitation_session_ids: Vec<String>,
+    xai_ask_session_ids: Vec<String>,
     terminal_creates: Vec<(String, String, Vec<String>, Option<PathBuf>)>,
 }
 
@@ -84,6 +85,7 @@ where
     let o_perm = observed.clone();
     let o_read = observed.clone();
     let o_elicit = observed.clone();
+    let o_xai = observed.clone();
     let o_terminal = observed.clone();
 
     let client_result = tokio::time::timeout(
@@ -187,6 +189,63 @@ where
                     }
                 },
                 on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                move |message: Dispatch, _cx| {
+                    let observed = o_xai.clone();
+                    async move {
+                        match message {
+                            Dispatch::Request(msg, responder) => {
+                                if msg.method() == "_x.ai/ask_user_question" {
+                                    let sid = msg
+                                        .params()
+                                        .get("sessionId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    observed.lock().unwrap().xai_ask_session_ids.push(sid);
+                                    let mut answers = serde_json::Map::new();
+                                    if let Some(questions) =
+                                        msg.params().get("questions").and_then(|v| v.as_array())
+                                    {
+                                        for question in questions {
+                                            let Some(text) =
+                                                question.get("question").and_then(|v| v.as_str())
+                                            else {
+                                                continue;
+                                            };
+                                            let label = question
+                                                .get("options")
+                                                .and_then(|v| v.as_array())
+                                                .and_then(|arr| arr.first())
+                                                .and_then(|v| v.get("label"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Yes");
+                                            answers.insert(
+                                                text.to_string(),
+                                                serde_json::json!([label]),
+                                            );
+                                        }
+                                    }
+                                    responder.respond(serde_json::json!({
+                                        "outcome": "accepted",
+                                        "answers": answers
+                                    }))?;
+                                    return Ok(Handled::Yes);
+                                }
+                                Ok(Handled::No {
+                                    message: Dispatch::Request(msg, responder),
+                                    retry: false,
+                                })
+                            }
+                            other => Ok(Handled::No {
+                                message: other,
+                                retry: false,
+                            }),
+                        }
+                    }
+                },
+                on_receive_dispatch!(),
             )
             .connect_with(channel_b, async |cx| {
                 test_fn(cx, observed.clone(), shared_for_test.clone()).await
@@ -546,6 +605,90 @@ async fn elicitation_capability_round_trips_and_request_forwards() {
         );
 
         assert_eq!(observed.lock().unwrap().elicitation_session_ids, vec![sid]);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn xai_ask_user_question_translates_to_elicitation_when_client_has_form() {
+    // Grok emits `_x.ai/ask_user_question`. A form-capable client must see
+    // `elicitation/create` under the router session id; the mock agent gets
+    // Grok's `{outcome, answers}` shape back.
+    let state = temp_state_file("xai-ask");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        cx.send_request(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                ClientCapabilities::new().elicitation(
+                    ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+                ),
+            ),
+        )
+        .block_task()
+        .await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let resp = prompt_text(&cx, &sid, "XAI_ASK:Which color?").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains(r#""outcome":"accepted""#),
+            "mock should echo Grok's accepted outcome, got: {text}"
+        );
+        assert!(
+            text.contains("Which color?"),
+            "accepted answers should be keyed by the question text, got: {text}"
+        );
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.elicitation_session_ids, vec![sid.clone()]);
+        assert!(
+            observed.xai_ask_session_ids.is_empty(),
+            "form-capable client must not see the raw vendor method, got: {:?}",
+            observed.xai_ask_session_ids
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn xai_ask_user_question_forwards_raw_without_form_capability() {
+    // Clients that do not advertise form elicitation keep the raw Grok method.
+    let state = temp_state_file("xai-ask-raw");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let resp = prompt_text(&cx, &sid, "XAI_ASK:Which color?").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains(r#""outcome":"accepted""#),
+            "raw-forwarded vendor method should still complete, got: {text}"
+        );
+
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed.elicitation_session_ids.is_empty(),
+            "client without form elicitation must not receive elicitation/create, got: {:?}",
+            observed.elicitation_session_ids
+        );
+        assert_eq!(observed.xai_ask_session_ids, vec![sid]);
         Ok(())
     })
     .await;
