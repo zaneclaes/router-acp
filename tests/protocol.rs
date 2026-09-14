@@ -515,6 +515,43 @@ async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
 }
 
 #[tokio::test]
+async fn grok_combined_terminal_create_is_split_before_the_client() {
+    // Grok sends `/bin/bash -lc '…'` as the `command` string with no args.
+    // A spec-compliant client spawn()s that whole string as the executable
+    // and ENOENTs. The router must split it on the way through.
+    let state = temp_state_file("grok-terminal");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+
+        let resp = prompt_text(&cx, &sid, "TERMINAL_GROK:echo hello-repro").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("terminal:managed-terminal-1"),
+            "grok-style terminal create should succeed, got: {text}"
+        );
+        assert_eq!(
+            observed.lock().unwrap().terminal_creates,
+            vec![(
+                sid,
+                "/bin/bash".to_string(),
+                vec!["-lc".to_string(), "echo hello-repro".to_string()],
+                None,
+            )]
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn plan_updates_pass_through_unmodified() {
     // The router never special-cases `sessionUpdate: "plan"` — this pins that
     // TodoWrite-style snapshots survive the generic notification forwarding
