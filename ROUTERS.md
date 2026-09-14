@@ -368,10 +368,17 @@ default first turn):
 
 1. The built-in **plan-first protocol** (`[router-acp planner protocol]`):
    investigate, present a concrete reviewable plan, then ask one structured
-   question whose only choices are exactly `Proceed with implementation` and
-   `Refine the plan`. Implementation edits are forbidden in that turn. The
-   approval question is forbidden until the plan has been presented — there
-   is no "proceed with the current plan?" prompt when no plan exists.
+   question. Offer exactly one pair — never both Proceed and Spawn in the
+   same question:
+   - This session will do the work: `Proceed with implementation` and
+     `Refine the plan`.
+   - The plan delegates to separate ticket-bound sessions:
+     `Spawn sessions and coordinate` **instead of** Proceed, plus
+     `Refine the plan`. Coordinating stays in Planning; there is no
+     phase switch.
+   Implementation edits are forbidden in that turn. The approval question
+   is forbidden until the plan has been presented — there is no "proceed
+   with the current plan?" prompt when no plan exists.
 2. Host `planning_instructions`, if configured.
 
 A structured "Proceed" answer is resolved inside the planning model's
@@ -380,7 +387,9 @@ queues a follow-up user prompt `[router: phase=implementation]` after that
 turn ends. On a pinned planning session that directive upgrades the phase
 **and** queues a `pending_switch` to the best implementation-phase
 candidate (same summarize-and-re-pin as any other switch). Declining or
-choosing `Refine the plan` does not change phase.
+choosing `Refine the plan` does not change phase. Choosing
+`Spawn sessions and coordinate` also stays in Planning: the host queues a
+spawn-and-coordinate brief **without** a `[router: phase=…]` directive.
 
 When any other source upgrades the phase post-pin, the router likewise
 queues a `pending_switch` to the best implementation-phase candidate.
