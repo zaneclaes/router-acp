@@ -2129,7 +2129,8 @@ pub fn handle_downstream_dispatch(
                     forward_xai_ask(shared, &upstream, parsed, responder, &router_sid)?;
                     return Ok(Handled::Yes);
                 }
-                let fwd = relay::with_session_id(&msg, &router_sid)?;
+                let fwd =
+                    relay::normalize_terminal_create(&relay::with_session_id(&msg, &router_sid)?)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;
                 Ok(Handled::Yes)
             }
@@ -2209,7 +2210,10 @@ pub fn handle_downstream_dispatch(
                     forward_xai_ask(shared, &upstream, parsed, responder, &parent_router_sid)?;
                     return Ok(Handled::Yes);
                 }
-                let fwd = relay::with_session_id(&msg, &parent_router_sid)?;
+                let fwd = relay::normalize_terminal_create(&relay::with_session_id(
+                    &msg,
+                    &parent_router_sid,
+                )?)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;
                 Ok(Handled::Yes)
             }

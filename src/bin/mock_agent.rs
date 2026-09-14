@@ -51,6 +51,9 @@
 //!   optional `:<secs>` suffix sets `timeout_seconds`
 //! - `BACKGROUND_START:<shell>` — call the router-owned `background_start`
 //!   tool with `/bin/sh -lc <shell>`
+//! - `TERMINAL_GROK:<script>` — send ACP `terminal/create` the way Grok
+//!   does: the entire `/bin/bash -lc '<script>'` string in `command`, no
+//!   `args`. The router must split this before the client spawn()s it.
 //! - otherwise — echo `echo:<model>:<text>`
 
 use std::collections::HashMap;
@@ -61,16 +64,16 @@ use serde_json::{Value, json};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, CreateElicitationRequest, ElicitationAction,
-    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, EnumOption, Error as AcpError,
-    Implementation, InitializeRequest, InitializeResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, StringPropertySchema, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolKind,
+    CancelNotification, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateTerminalRequest, ElicitationAction, ElicitationFormMode, ElicitationSchema,
+    ElicitationSessionScope, EnumOption, Error as AcpError, Implementation, InitializeRequest,
+    InitializeResponse, McpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
+    PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    StringPropertySchema, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
     Agent as AgentRole, Client as ClientRole, ConnectionTo, Responder, UntypedMessage,
@@ -597,6 +600,14 @@ async fn run_prompt(
                     serde_json::to_string(&resp).unwrap_or_else(|_| "null".to_string())
                 )),
                 Err(err) => reply.push(format!("xai-ask-error:{err}")),
+            }
+        } else if let Some(script) = line.strip_prefix("TERMINAL_GROK:") {
+            // Grok's wire format: one string in `command`, no `args`.
+            let request =
+                CreateTerminalRequest::new(session_id.clone(), format!("/bin/bash -lc '{script}'"));
+            match cx.send_request(request).block_task().await {
+                Ok(resp) => reply.push(format!("terminal:{}", resp.terminal_id.0)),
+                Err(err) => reply.push(format!("terminal-error:{err}")),
             }
         } else if let Some(path) = line.strip_prefix("READFILE:") {
             let read = ReadTextFileRequest::new(session_id.clone(), path.to_string());
