@@ -36,6 +36,8 @@
 //!   pending, `!` marks in-progress, `#` marks completed
 //! - `ELICIT:<question>` — ask the client a single-select question via
 //!   `elicitation/create`, echo the outcome
+//! - `XAI_ASK:<question>` — send Grok's raw `_x.ai/ask_user_question`
+//!   extension request and echo the raw reply
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
 //! - `DELEGATE_HINT:<agent/model>` — attach `hints.candidate` to every
@@ -71,8 +73,8 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
-    Agent as AgentRole, Client as ClientRole, ConnectionTo, Responder, on_receive_notification,
-    on_receive_request,
+    Agent as AgentRole, Client as ClientRole, ConnectionTo, Responder, UntypedMessage,
+    on_receive_notification, on_receive_request,
 };
 
 struct SessionState {
@@ -569,6 +571,32 @@ async fn run_prompt(
                     reply.push(format!("elicit:{outcome}"));
                 }
                 Err(err) => reply.push(format!("elicit-error:{err}")),
+            }
+        } else if let Some(question) = line.strip_prefix("XAI_ASK:") {
+            // Grok's vendor question method. The router should translate this
+            // into elicitation/create when the client advertises form support.
+            let request = UntypedMessage::new(
+                "_x.ai/ask_user_question",
+                json!({
+                    "sessionId": session_id,
+                    "toolCallId": "xai-ask-1",
+                    "questions": [{
+                        "question": question,
+                        "options": [
+                            {"label": "Yes", "description": "affirm"},
+                            {"label": "No", "description": "deny"}
+                        ],
+                        "multiSelect": false
+                    }],
+                    "mode": "default"
+                }),
+            )?;
+            match cx.send_request(request).block_task().await {
+                Ok(resp) => reply.push(format!(
+                    "xai-ask:{}",
+                    serde_json::to_string(&resp).unwrap_or_else(|_| "null".to_string())
+                )),
+                Err(err) => reply.push(format!("xai-ask-error:{err}")),
             }
         } else if let Some(path) = line.strip_prefix("READFILE:") {
             let read = ReadTextFileRequest::new(session_id.clone(), path.to_string());

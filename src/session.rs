@@ -1791,6 +1791,57 @@ fn xai_gate_reason(params: &serde_json::Value) -> Option<String> {
     })
 }
 
+fn client_has_form_elicitation(shared: &Shared) -> bool {
+    shared
+        .upstream_client_capabilities()
+        .elicitation
+        .as_ref()
+        .is_some_and(|caps| caps.form.is_some())
+}
+
+/// Translate Grok's `_x.ai/ask_user_question` into `elicitation/create` and
+/// map the client's form result back into Grok's `{outcome, answers}` shape.
+fn forward_xai_ask(
+    shared: &Arc<Shared>,
+    upstream: &ConnectionTo<ClientPeer>,
+    parsed: crate::xai_questions::XaiAskRequest,
+    responder: Responder<serde_json::Value>,
+    router_sid: &str,
+) -> Result<(), AcpError> {
+    let request = crate::xai_questions::to_elicitation(&parsed, router_sid);
+    shared.state.lock().unwrap().log(
+        router_sid,
+        &crate::state::LogEntry {
+            kind: "xai_ask_user_question".to_string(),
+            role: "tool".to_string(),
+            summary: "_x.ai/ask_user_question".to_string(),
+            tokens_estimated: true,
+            ..Default::default()
+        },
+    );
+    tracing::info!(
+        session = router_sid,
+        questions = parsed.questions.len(),
+        "translating _x.ai/ask_user_question to elicitation/create"
+    );
+    let questions = parsed.questions;
+    upstream
+        .send_request(request)
+        .on_receiving_result(move |result| async move {
+            match result {
+                Ok(resp) => {
+                    let value = crate::xai_questions::from_elicitation(&resp, &questions);
+                    let _ = responder.respond(value);
+                }
+                Err(err) => {
+                    let _ = responder.respond_with_error(err);
+                }
+            }
+            Ok(())
+        })?;
+    Ok(())
+}
+
 fn note_xai_gate(shared: &Arc<Shared>, key: &ProcessKey, params: &serde_json::Value) {
     if !shared.cfg.cordon.enabled {
         return;
@@ -2071,6 +2122,13 @@ pub fn handle_downstream_dispatch(
                         },
                     );
                 }
+                if method == "_x.ai/ask_user_question"
+                    && client_has_form_elicitation(shared)
+                    && let Some(parsed) = crate::xai_questions::parse_request(msg.params())
+                {
+                    forward_xai_ask(shared, &upstream, parsed, responder, &router_sid)?;
+                    return Ok(Handled::Yes);
+                }
                 let fwd = relay::with_session_id(&msg, &router_sid)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;
                 Ok(Handled::Yes)
@@ -2137,12 +2195,19 @@ pub fn handle_downstream_dispatch(
                         &crate::state::LogEntry {
                             kind: method.replace('/', "_"),
                             role: "tool".to_string(),
-                            summary: method,
+                            summary: method.clone(),
                             detail: Some(msg.params().clone()),
                             tokens_estimated: true,
                             ..Default::default()
                         },
                     );
+                }
+                if method == "_x.ai/ask_user_question"
+                    && client_has_form_elicitation(shared)
+                    && let Some(parsed) = crate::xai_questions::parse_request(msg.params())
+                {
+                    forward_xai_ask(shared, &upstream, parsed, responder, &parent_router_sid)?;
+                    return Ok(Handled::Yes);
                 }
                 let fwd = relay::with_session_id(&msg, &parent_router_sid)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;

@@ -49,6 +49,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/tasklist.rs` | `detect_task_list(text) -> Option<usize>` — recognizes multi-part task lists (markdown numbers/bullets, inline `(1)(2)`, semantic "first…then…finally" ordering) for auto-orchestration; pure + unit-tested |
 | `src/tickets.rs` | ticket-context loading: `find_ticket_refs` (configured `prefix` at word start + digits), `fetch_ticket` (rule's argv with `$TICKET` substituted, no shell, 20s timeout, output capped), `enrich_prompt` (prepends framed ticket content BEFORE orchestration detection/classification; per-session dedup via `injected_tickets`, 5-min global `ticket_cache`, fail-open, disclosed). Pluggable across ticketing systems (linear/jira/gh CLIs) |
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment |
+| `src/xai_questions.rs` | Grok `_x.ai/ask_user_question` ↔ ACP `elicitation/create` translation (pure; `session.rs` intercepts) |
 | `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
 | `src/bin/mock_agent.rs` | scripted downstream for tests (below) |
 | `data/*.yaml` | score table + classifier rules, embedded via `include_str!`, overridable by config path |
@@ -168,6 +169,11 @@ SDK traps below, which were all discovered the hard way.
   `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
+- **Grok `ask_user_question`** (`src/xai_questions.rs`): Grok emits vendor
+  `_x.ai/ask_user_question` instead of `elicitation/create`. When the upstream
+  client advertises form elicitation, `handle_downstream_dispatch` translates
+  the request (pinned and delegate) and maps the form result back to Grok's
+  `{outcome, answers}` shape; otherwise the raw method is forwarded.
 - **Grok subscription-gate cordon** (`note_xai_gate`/`xai_gate_reason` in
   `src/session.rs`): xAI Grok has NO numeric usage meter — a live-frame capture
   (July 2026) found no used-percent/reset/quota anywhere in its ACP stream
