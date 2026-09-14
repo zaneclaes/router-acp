@@ -367,9 +367,11 @@ sets the phase (pre-classifier `planning`, `implementation` +
 default first turn):
 
 1. The built-in **plan-first protocol** (`[router-acp planner protocol]`):
-   investigate, present a concrete reviewable plan, then ask one structured
-   question. Offer exactly one pair — never both Proceed and Spawn in the
-   same question:
+   investigate, present a concrete reviewable plan, capture it on a Linear
+   ticket (the planner writes that ticket — never the implementation
+   agent), then ask one structured question. The handoff question is
+   forbidden until the session is ticket-bound. Offer exactly one pair —
+   never both Proceed and Spawn in the same question:
    - This session will do the work: `Proceed with implementation` and
      `Refine the plan`.
    - The plan delegates to separate ticket-bound sessions:

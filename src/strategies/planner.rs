@@ -204,20 +204,28 @@ pub fn planner_plan_protocol() -> String {
          2. Present that plan in this turn as a reviewable artifact: goal, \
          approach, files/systems to change, sequenced steps, open questions, \
          and what done looks like.\n\
-         3. Only AFTER the plan is in the conversation, ask one structured \
-         question. Offer exactly one of these pairs — never both Proceed and \
-         Spawn in the same question:\n\
+         3. Capture the plan on a Linear ticket BEFORE asking for approval. \
+         If this session is not already ticket-bound, create the ticket now \
+         (linear CLI) with the plan as its body. Tickets are how the work is \
+         captured; the planner writes that ticket, never the implementation \
+         agent. Do not ask the handoff question until the session is \
+         ticket-bound.\n\
+         4. Only AFTER the plan is in the conversation AND the session is \
+         ticket-bound, ask one structured question. Offer exactly one of \
+         these pairs — never both Proceed and Spawn in the same question:\n\
          - This session will do the work: \"{HANDOFF_PROCEED}\" and \
          \"{HANDOFF_REFINE}\"\n\
          - The plan delegates to separate ticket-bound sessions: \
          \"{HANDOFF_COORDINATE}\" instead of \"{HANDOFF_PROCEED}\", plus \
          \"{HANDOFF_REFINE}\"\n\
-         4. Do not ask for implementation approval against a plan you have \
-         not presented.\n\
+         5. Do not ask for implementation approval against a plan you have \
+         not presented, or against a session with no Linear ticket.\n\
          \n\
          Forbidden in this planning turn:\n\
          - Editing, creating, or deleting implementation files\n\
          - Asking for implementation approval before the plan is presented\n\
+         - Asking for implementation approval before this session is \
+         ticket-bound\n\
          - Starting implementation after a \"{HANDOFF_PROCEED}\" answer. End \
          the turn without editing; a follow-up user prompt performs the \
          router switch onto the implementation model.\n\
@@ -458,6 +466,8 @@ mod tests {
         assert!(protocol.contains(HANDOFF_COORDINATE));
         assert!(protocol.contains("separate ticket-bound sessions"));
         assert!(protocol.contains("without a phase switch"));
+        assert!(protocol.contains("ticket-bound"));
+        assert!(protocol.contains("never the implementation agent"));
         assert!(protocol.contains("before asking for implementation approval"));
         assert!(
             !protocol.contains("with the current plan"),
