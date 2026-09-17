@@ -3355,6 +3355,7 @@ async fn pin_session(
             return Ok(PinOutcome::Cancelled);
         }
         let candidate = rc.candidate.clone();
+        let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
         let (mcp_servers, delegate_attached) =
             mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp)?;
         match open_downstream_session(
@@ -3716,10 +3717,11 @@ async fn pin_session(
                     "candidate failed pre-prompt; walking fallback chain"
                 );
                 let why = if is_auth_required(&err) {
-                    crate::auth::note_unauthenticated(
-                        &shared.auth,
+                    crate::auth::note_auth_failure_for_request(
+                        shared,
                         &candidate.agent,
                         format!("{} is not signed in", candidate.agent),
+                        request_generation.as_deref(),
                     );
                     if let Some(rt) = shared.candidate_runtime(&candidate) {
                         shared.set_target_auth_pending(&rt.process_key);
@@ -4147,6 +4149,7 @@ async fn send_prompt_with_failover(
             class,
             req.meta.as_ref(),
         );
+        let request_generation = crate::auth::request_access_generation(&shared, &candidate.agent);
         let sent = conn
             .send_request(fwd)
             .forward_cancellation_from(responder.cancellation());
@@ -4257,10 +4260,11 @@ async fn send_prompt_with_failover(
                 // other agent is still able to serve the turn.
                 let auth_rejected = is_auth_required(&err);
                 if auth_rejected {
-                    crate::auth::note_unauthenticated(
-                        &shared.auth,
+                    crate::auth::note_auth_failure_for_request(
+                        &shared,
                         &candidate.agent,
                         format!("{} is not signed in", candidate.agent),
+                        request_generation.as_deref(),
                     );
                 }
 

@@ -899,6 +899,7 @@ pub async fn evaluate(
             continue;
         }
 
+        let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
         let outcome = evaluate_on_candidate(
             shared,
             router_sid,
@@ -933,10 +934,11 @@ pub async fn evaluate(
             // over to the next evaluator — exactly as a pinned turn would.
             Err(err) => {
                 if crate::downstream::is_auth_required(&err) {
-                    crate::auth::note_unauthenticated(
-                        &shared.auth,
+                    crate::auth::note_auth_failure_for_request(
+                        shared,
                         &candidate.agent,
                         format!("{} is not signed in", candidate.agent),
+                        request_generation.as_deref(),
                     );
                 }
                 let class = crate::limits::classify_failure(&err);

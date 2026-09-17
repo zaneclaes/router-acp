@@ -174,11 +174,6 @@ agents:
     budget_prompts_5h: 400
     usage_source:               # proactive cordons from the Anthropic usage API
       type: anthropic-oauth     # (reads the CLI OAuth token; see `cordon` above)
-    auth_probe:                 # a logged-out Claude still advertises every
-      command: claude           # model, so ask the CLI instead of trusting the
-      args: ["auth", "status"]  # advertisement. Unreadable output = fail open.
-      timeout_ms: 3000
-      unauthenticated_patterns: ['"loggedin": false']
     llm_proxy:
       protocol: anthropic
       base_url_env: ANTHROPIC_BASE_URL

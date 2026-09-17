@@ -137,7 +137,7 @@ async fn poll_all(
                         .await;
                 match cached {
                     crate::usage_cache::CachedUsage::Success(payload) => {
-                        crate::auth::note_authenticated(&shared.auth, &agent.name);
+                        crate::auth::note_authenticated_from_usage(&shared.auth, &agent.name);
                         (
                             anthropic_cordons(&payload, &candidates, SystemTime::now()),
                             anthropic_availability_with_spend(
@@ -148,12 +148,48 @@ async fn poll_all(
                             ),
                         )
                     }
-                    crate::usage_cache::CachedUsage::AuthRejected(reason) => {
-                        crate::auth::note_unauthenticated(&shared.auth, &agent.name, reason);
+                    crate::usage_cache::CachedUsage::SuccessWithGeneration {
+                        payload,
+                        access_generation,
+                    } => {
+                        crate::auth::note_authenticated_from_usage_with_generation(
+                            &shared.auth,
+                            &agent.name,
+                            &access_generation,
+                        );
+                        (
+                            anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                            anthropic_availability_with_spend(
+                                &payload,
+                                &candidates,
+                                Some(&spend_lookup),
+                                SystemTime::now(),
+                            ),
+                        )
+                    }
+                    crate::usage_cache::CachedUsage::AuthRejectedWithGeneration {
+                        reason,
+                        access_generation,
+                    } => {
+                        crate::auth::note_unauthenticated_from_usage_with_generation(
+                            &shared.auth,
+                            &agent.name,
+                            reason,
+                            &access_generation,
+                        );
                         continue;
                     }
                     crate::usage_cache::CachedUsage::Unknown(payload) => {
                         let Some(payload) = payload else {
+                            if crate::auth::clear_generation_if_credentials_missing(
+                                shared,
+                                &agent.name,
+                            ) {
+                                tracing::debug!(
+                                    agent = %agent.name,
+                                    "no usable Claude credentials; cleared generation-tied auth"
+                                );
+                            }
                             tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
                             continue;
                         };
@@ -175,11 +211,30 @@ async fn poll_all(
                         .await;
                 let mut snapshots = match cached {
                     crate::usage_cache::CachedUsage::Success(payload) => {
-                        crate::auth::note_authenticated(&shared.auth, &agent.name);
+                        crate::auth::note_authenticated_from_usage(&shared.auth, &agent.name);
                         codex_pools_from_payload(&payload)
                     }
-                    crate::usage_cache::CachedUsage::AuthRejected(reason) => {
-                        crate::auth::note_unauthenticated(&shared.auth, &agent.name, reason);
+                    crate::usage_cache::CachedUsage::SuccessWithGeneration {
+                        payload,
+                        access_generation,
+                    } => {
+                        crate::auth::note_authenticated_from_usage_with_generation(
+                            &shared.auth,
+                            &agent.name,
+                            &access_generation,
+                        );
+                        codex_pools_from_payload(&payload)
+                    }
+                    crate::usage_cache::CachedUsage::AuthRejectedWithGeneration {
+                        reason,
+                        access_generation,
+                    } => {
+                        crate::auth::note_unauthenticated_from_usage_with_generation(
+                            &shared.auth,
+                            &agent.name,
+                            reason,
+                            &access_generation,
+                        );
                         continue;
                     }
                     crate::usage_cache::CachedUsage::Unknown(payload) => payload
@@ -293,6 +348,7 @@ async fn curl_with_config(config: &str) -> Result<String, String> {
 pub(crate) struct OauthCredentials {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    pub expires_at: Option<u64>,
 }
 
 /// Read the Claude CLI OAuth credentials: first `~/.claude/.credentials.json`
@@ -325,11 +381,20 @@ pub(crate) fn anthropic_oauth_credentials() -> Option<OauthCredentials> {
     None
 }
 
+pub(crate) fn anthropic_access_generation() -> Option<String> {
+    anthropic_oauth_credentials().map(|creds| crate::usage_cache::fingerprint(&creds.access_token))
+}
+
 fn credentials_from_json(text: &str) -> Option<OauthCredentials> {
     let v: Value = serde_json::from_str(text.trim()).ok()?;
     let oauth = v.get("claudeAiOauth")?;
+    let access_token = oauth.get("accessToken")?.as_str()?;
+    let expires_at = oauth.get("expiresAt").and_then(Value::as_u64);
+    if access_token.trim().is_empty() || expires_at == Some(0) {
+        return None;
+    }
     Some(OauthCredentials {
-        access_token: oauth.get("accessToken")?.as_str()?.to_string(),
+        access_token: access_token.to_string(),
         // Node's reader does `refreshToken || accessToken` — an empty string
         // is falsy there, so treat it as absent to keep fingerprints aligned.
         refresh_token: oauth
@@ -337,6 +402,7 @@ fn credentials_from_json(text: &str) -> Option<OauthCredentials> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        expires_at,
     })
 }
 
@@ -1478,6 +1544,32 @@ mod tests {
         .unwrap();
         assert_eq!(real.refresh_token.as_deref(), Some("ref-tok"));
         assert_ne!(fp(&real), fp(&without));
+    }
+
+    #[test]
+    fn oauth_credentials_preserve_expiry_and_refresh_presence() {
+        let credentials = credentials_from_json(
+            r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh","expiresAt":1234}}"#,
+        )
+        .unwrap();
+        assert_eq!(credentials.expires_at, Some(1234));
+        assert!(credentials.refresh_token.is_some());
+
+        let missing_expiry =
+            credentials_from_json(r#"{"claudeAiOauth":{"accessToken":"access"}}"#).unwrap();
+        assert_eq!(missing_expiry.expires_at, None);
+    }
+
+    #[test]
+    fn missing_malformed_and_empty_access_credentials_are_unknown() {
+        assert!(credentials_from_json("{}").is_none());
+        assert!(credentials_from_json("not json").is_none());
+        assert!(credentials_from_json(r#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
+        assert!(credentials_from_json(r#"{"claudeAiOauth":{"accessToken":"   "}}"#).is_none());
+        assert!(
+            credentials_from_json(r#"{"claudeAiOauth":{"accessToken":"access","expiresAt":0}}"#)
+                .is_none()
+        );
     }
 
     fn cands() -> Vec<(CandidateId, String)> {

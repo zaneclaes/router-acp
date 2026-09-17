@@ -1166,6 +1166,7 @@ pub async fn run_delegate_task(
     let mut last_err = None;
     for rc in ranked {
         let candidate = rc.candidate.clone();
+        let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
         match open_downstream_session(
             shared,
             &candidate,
@@ -1468,10 +1469,11 @@ pub async fn run_delegate_task(
             Err(err) => {
                 tracing::warn!(candidate = %candidate, error = %err, "delegate candidate failed");
                 if crate::downstream::is_auth_required(&err) {
-                    crate::auth::note_unauthenticated(
-                        &shared.auth,
+                    crate::auth::note_auth_failure_for_request(
+                        shared,
                         &candidate.agent,
                         format!("{} is not signed in", candidate.agent),
+                        request_generation.as_deref(),
                     );
                 }
                 let class = crate::limits::classify_failure(&err);
