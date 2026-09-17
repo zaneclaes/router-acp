@@ -66,15 +66,6 @@ agents:
     # token) and mark a candidate unroutable when its weekly cap is exhausted
     # with no overage/credit headroom — before the router even tries it.
     usage_source: { type: anthropic-oauth }
-    # Auth-as-availability: a logged-out Claude still advertises every model, so
-    # ask the CLI rather than trust the advertisement. Logged out prints
-    # `"loggedIn": false`; anything unreadable (missing binary, timeout) is
-    # unknown and fails open.
-    auth_probe:
-      command: claude
-      args: ["auth", "status"]
-      timeout_ms: 3000
-      unauthenticated_patterns: ['"loggedin": false']
     llm_proxy:
       protocol: anthropic
       base_url_env: ANTHROPIC_BASE_URL

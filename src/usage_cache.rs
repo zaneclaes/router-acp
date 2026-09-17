@@ -15,6 +15,7 @@
 //! {
 //!   "source": "anthropic-oauth",
 //!   "account": "<sha256 hex of the OAuth refresh (or access) token>",
+//!   "access_generation": "<sha256 hex of the access token>",
 //!   "fetched_at": 1753142400,
 //!   "attempted_at": 1753142460,
 //!   "consecutive_failures": 0,
@@ -30,7 +31,8 @@
 //!
 //! Two snapshots exist today. `anthropic-oauth.json`: `payload` is the raw
 //! `oauth/usage` endpoint JSON, `account` fingerprints the Claude CLI OAuth
-//! refresh (or access) token. `codex.json`: `payload` is the raw
+//! refresh (or access) token and `access_generation` fingerprints the access
+//! token used for that fetch. `codex.json`: `payload` is the raw
 //! `account/rateLimits/read` result from a `codex app-server` JSON-RPC
 //! round-trip (`{rateLimits, rateLimitsByLimitId, rateLimitResetCredits}`,
 //! camelCase), `account` fingerprints `~/.codex/auth.json`'s account id (or
@@ -66,6 +68,9 @@ const CODEX_SOURCE: &str = "codex";
 pub struct Snapshot {
     pub source: String,
     pub account: String,
+    /// Optional for backwards compatibility with older snapshots.
+    #[serde(default)]
+    pub access_generation: Option<String>,
     pub fetched_at: u64,
     pub attempted_at: u64,
     pub consecutive_failures: u32,
@@ -76,7 +81,14 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub enum CachedUsage {
     Success(Value),
-    AuthRejected(String),
+    SuccessWithGeneration {
+        payload: Value,
+        access_generation: String,
+    },
+    AuthRejectedWithGeneration {
+        reason: String,
+        access_generation: String,
+    },
     Unknown(Option<Value>),
 }
 
@@ -85,14 +97,47 @@ impl CachedUsage {
         let Some(snapshot) = snapshot else {
             return Self::Unknown(None);
         };
-        if let Some(error) = snapshot.last_error.as_deref()
-            && crate::auth::error_is_auth_rejection(error)
-        {
-            return Self::AuthRejected(error.to_string());
-        }
         match snapshot.payload {
             Some(payload) if snapshot.last_error.is_none() => Self::Success(payload),
             payload => Self::Unknown(payload),
+        }
+    }
+
+    /// Interpret a snapshot against the current credential. A legacy or
+    /// non-401 auth error is never authentication evidence for today's token.
+    fn from_snapshot_for(snapshot: Option<Snapshot>, request: &CacheRequest) -> Self {
+        let Some(snapshot) = snapshot else {
+            return Self::Unknown(None);
+        };
+        if let Some(error) = snapshot.last_error.as_deref()
+            && crate::auth::error_is_http_401(error)
+        {
+            if snapshot.access_generation.as_deref() == request.access_generation.as_deref()
+                && request.access_generation.is_some()
+                && http_401_is_durable(request, unix_now_millis())
+            {
+                return Self::AuthRejectedWithGeneration {
+                    reason: error.to_string(),
+                    access_generation: request.access_generation.clone().unwrap_or_default(),
+                };
+            }
+            return Self::Unknown(snapshot.payload);
+        }
+        let Some(payload) = snapshot.payload else {
+            return Self::Unknown(None);
+        };
+        if snapshot.last_error.is_some()
+            || snapshot.access_generation.as_deref() != request.access_generation.as_deref()
+            || request.access_generation.is_none()
+        {
+            // A generation-less snapshot, or one produced by another access
+            // credential, is still usable as stale quota data but cannot prove
+            // that the current credential authenticates successfully.
+            return Self::Unknown(Some(payload));
+        }
+        Self::SuccessWithGeneration {
+            payload,
+            access_generation: request.access_generation.clone().unwrap_or_default(),
         }
     }
 }
@@ -133,11 +178,42 @@ pub fn should_fetch(
         .saturating_add(next_attempt_wait(min_refresh, snap.consecutive_failures))
 }
 
+/// Account replacement and access-token rotation both require a fresh read.
+/// Backoff and quota payloads remain scoped to the account fingerprint.
+pub fn should_fetch_with_access_generation(
+    cache: Option<&Snapshot>,
+    now: u64,
+    account: &str,
+    access_generation: Option<&str>,
+    min_refresh: u64,
+) -> bool {
+    let Some(snap) = cache else {
+        return true;
+    };
+    if snap.account != account || snap.access_generation.as_deref() != access_generation {
+        return true;
+    }
+    now >= snap
+        .attempted_at
+        .saturating_add(next_attempt_wait(min_refresh, snap.consecutive_failures))
+}
+
 /// Snapshot after a successful fetch: fresh payload, failure state cleared.
 pub fn on_success(source: &str, fingerprint: &str, now: u64, payload: Value) -> Snapshot {
+    on_success_with_access_generation(source, fingerprint, None, now, payload)
+}
+
+pub fn on_success_with_access_generation(
+    source: &str,
+    account: &str,
+    access_generation: Option<&str>,
+    now: u64,
+    payload: Value,
+) -> Snapshot {
     Snapshot {
         source: source.to_string(),
-        account: fingerprint.to_string(),
+        account: account.to_string(),
+        access_generation: access_generation.map(str::to_string),
         fetched_at: now,
         attempted_at: now,
         consecutive_failures: 0,
@@ -157,16 +233,31 @@ pub fn on_failure(
     now: u64,
     error: String,
 ) -> Snapshot {
+    on_failure_with_access_generation(source, prev, fingerprint, None, now, error)
+}
+
+pub fn on_failure_with_access_generation(
+    source: &str,
+    prev: Option<Snapshot>,
+    account: &str,
+    access_generation: Option<&str>,
+    now: u64,
+    error: String,
+) -> Snapshot {
     match prev {
-        Some(p) if p.account == fingerprint => Snapshot {
+        Some(p) if p.account == account => Snapshot {
             attempted_at: now,
             consecutive_failures: p.consecutive_failures.saturating_add(1),
             last_error: Some(error),
+            access_generation: access_generation
+                .map(str::to_string)
+                .or(p.access_generation),
             ..p
         },
         _ => Snapshot {
             source: source.to_string(),
-            account: fingerprint.to_string(),
+            account: account.to_string(),
+            access_generation: access_generation.map(str::to_string),
             fetched_at: 0,
             attempted_at: now,
             consecutive_failures: 1,
@@ -317,6 +408,25 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn unix_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// A 401 is durable only when the credential is definitely the current,
+/// unexpired access token, or when an explicitly expired token has no refresh
+/// material and is therefore a nonrefreshable sentinel. Missing expiry is
+/// deliberately unknown: opaque tokens cannot prove that they are current.
+fn http_401_is_durable(request: &CacheRequest, now_ms: u64) -> bool {
+    match request.access_expires_at {
+        Some(expires_at) if expires_at > now_ms => true,
+        Some(_) => !request.has_refresh_token,
+        None => false,
+    }
+}
+
 /// Curl's fail mode reports HTTP errors as e.g. "The requested URL returned
 /// error: 429" on stderr (exit 22) — surface the interesting one distinctly.
 fn classify_error(err: &str) -> String {
@@ -331,21 +441,22 @@ fn classify_error(err: &str) -> String {
 /// freshest payload available (possibly stale on failure or lock contention),
 /// or `None` when there's nothing usable (fail open, as before).
 pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> CachedUsage {
-    let Some(creds) = crate::usage::anthropic_oauth_credentials() else {
-        return CachedUsage::AuthRejected("Claude is not signed in".to_string());
+    let Some(initial) = anthropic_cache_request() else {
+        return CachedUsage::Unknown(None);
     };
-    let fp = fingerprint(
-        creds
-            .refresh_token
-            .as_deref()
-            .unwrap_or(&creds.access_token),
-    );
     cached_usage(
         ANTHROPIC_SOURCE,
         "anthropic-oauth.json",
-        &fp,
+        initial,
         min_refresh_secs,
-        || crate::usage::fetch_anthropic_usage(&creds.access_token),
+        true,
+        anthropic_cache_request,
+        |token| async move {
+            let Some(token) = token else {
+                return Err("Claude access credential is unavailable".to_string());
+            };
+            crate::usage::fetch_anthropic_usage(&token).await
+        },
     )
     .await
 }
@@ -357,33 +468,119 @@ pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> CachedUsage {
 /// work, and the snapshot is what the relay reads.
 pub async fn cached_codex_usage(min_refresh_secs: u64) -> CachedUsage {
     let Some(fp) = crate::usage::codex_account_fingerprint() else {
-        return CachedUsage::AuthRejected("Codex is not signed in".to_string());
+        return CachedUsage::Unknown(None);
     };
-    cached_usage(CODEX_SOURCE, "codex.json", &fp, min_refresh_secs, || {
-        crate::usage::fetch_codex_usage()
-    })
+    cached_usage(
+        CODEX_SOURCE,
+        "codex.json",
+        CacheRequest {
+            account: fp,
+            access_generation: None,
+            access_expires_at: None,
+            has_refresh_token: false,
+            access_token: None,
+        },
+        min_refresh_secs,
+        false,
+        || {
+            crate::usage::codex_account_fingerprint().map(|account| CacheRequest {
+                account,
+                access_generation: None,
+                access_expires_at: None,
+                has_refresh_token: false,
+                access_token: None,
+            })
+        },
+        |_token| async { crate::usage::fetch_codex_usage().await },
+    )
     .await
 }
 
+#[derive(Clone)]
+struct CacheRequest {
+    account: String,
+    access_generation: Option<String>,
+    access_expires_at: Option<u64>,
+    has_refresh_token: bool,
+    /// Held only in memory; snapshots contain fingerprints, never credentials.
+    access_token: Option<String>,
+}
+
+fn anthropic_cache_request() -> Option<CacheRequest> {
+    let creds = crate::usage::anthropic_oauth_credentials()?;
+    let account = fingerprint(
+        creds
+            .refresh_token
+            .as_deref()
+            .unwrap_or(&creds.access_token),
+    );
+    Some(CacheRequest {
+        account,
+        access_generation: Some(fingerprint(&creds.access_token)),
+        access_expires_at: creds.expires_at,
+        has_refresh_token: creds.refresh_token.is_some(),
+        access_token: Some(creds.access_token),
+    })
+}
+
 /// Shared cache-mediated fetch. `fetch` runs only under the cross-process
-/// lock, after the under-lock re-read still says a refresh is due.
-async fn cached_usage<F, Fut>(
+/// lock, after the under-lock credential re-read still says a refresh is due.
+async fn cached_usage<R, F, Fut>(
     source: &'static str,
     file_name: &str,
-    fp: &str,
+    initial: CacheRequest,
     min_refresh_secs: u64,
+    generation_aware: bool,
+    reread: R,
     fetch: F,
 ) -> CachedUsage
 where
-    F: FnOnce() -> Fut,
+    R: Fn() -> Option<CacheRequest>,
+    F: Fn(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
     let Some(path) = snapshot_path(file_name) else {
         return CachedUsage::Unknown(None);
     };
+    cached_usage_at(
+        path,
+        source,
+        initial,
+        min_refresh_secs,
+        generation_aware,
+        reread,
+        fetch,
+    )
+    .await
+}
+
+async fn cached_usage_at<R, F, Fut>(
+    path: PathBuf,
+    source: &'static str,
+    initial: CacheRequest,
+    min_refresh_secs: u64,
+    generation_aware: bool,
+    reread: R,
+    fetch: F,
+) -> CachedUsage
+where
+    R: Fn() -> Option<CacheRequest>,
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
     let snap = read_snapshot(&path);
-    if !should_fetch(snap.as_ref(), unix_now(), fp, min_refresh_secs) {
-        return CachedUsage::from_snapshot(snap);
+    if !should_fetch_with_access_generation(
+        snap.as_ref(),
+        unix_now(),
+        &initial.account,
+        initial.access_generation.as_deref(),
+        min_refresh_secs,
+    ) {
+        return if generation_aware {
+            CachedUsage::from_snapshot_for(snap, &initial)
+        } else {
+            CachedUsage::from_snapshot(snap)
+        };
     }
     let lock_path = path.with_extension("json.lock");
     let Some(_lock) = acquire_lock(
@@ -398,32 +595,90 @@ where
             source,
             "usage fetch lock held by another process; using cached snapshot"
         );
-        return CachedUsage::from_snapshot(snap.filter(|s| s.account == fp));
+        let snap = snap.filter(|s| s.account == initial.account);
+        return if generation_aware {
+            CachedUsage::from_snapshot_for(snap, &initial)
+        } else {
+            CachedUsage::from_snapshot(snap)
+        };
     };
     // Re-read under the lock: another process may have completed its own
     // attempt between our first read and the lock acquisition. Its outcome —
     // not our pre-lock view — is what the fetch decision and any failure
     // merge must run against; otherwise we'd fetch redundantly, and a failure
     // here could overwrite a sibling's fresher success.
+    let Some(request) = reread() else {
+        return CachedUsage::Unknown(None);
+    };
     let snap = read_snapshot(&path);
-    if !should_fetch(snap.as_ref(), unix_now(), fp, min_refresh_secs) {
-        return CachedUsage::from_snapshot(snap);
+    if !should_fetch_with_access_generation(
+        snap.as_ref(),
+        unix_now(),
+        &request.account,
+        request.access_generation.as_deref(),
+        min_refresh_secs,
+    ) {
+        return if generation_aware {
+            CachedUsage::from_snapshot_for(snap, &request)
+        } else {
+            CachedUsage::from_snapshot(snap)
+        };
     }
-    match fetch().await {
+
+    let mut used = request;
+    let mut outcome = fetch(used.access_token.clone()).await;
+    // A 401 can be the delayed result of an access-token rotation. Re-read
+    // only for that authoritative error and retry at most once with the new
+    // credential. Transient, 429, and 5xx failures remain Unknown.
+    if outcome
+        .as_ref()
+        .is_err_and(|err| crate::auth::error_is_http_401(err))
+        && let Some(current) = reread()
+        && current.access_token != used.access_token
+        && current.access_token.is_some()
+    {
+        used = current;
+        outcome = fetch(used.access_token.clone()).await;
+    }
+    match outcome {
         Ok(payload) => {
-            let s = on_success(source, fp, unix_now(), payload.clone());
+            let s = on_success_with_access_generation(
+                source,
+                &used.account,
+                used.access_generation.as_deref(),
+                unix_now(),
+                payload.clone(),
+            );
             if let Err(e) = write_snapshot(&path, &s) {
                 tracing::debug!(error = %e, "cannot persist usage snapshot");
             }
-            CachedUsage::Success(payload)
+            if generation_aware {
+                CachedUsage::SuccessWithGeneration {
+                    payload,
+                    access_generation: used.access_generation.unwrap_or_default(),
+                }
+            } else {
+                CachedUsage::Success(payload)
+            }
         }
         Err(err) => {
             tracing::debug!(source, %err, "usage fetch failed; keeping last-good snapshot");
-            let s = on_failure(source, snap, fp, unix_now(), classify_error(&err));
+            let s = on_failure_with_access_generation(
+                source,
+                snap,
+                &used.account,
+                used.access_generation.as_deref(),
+                unix_now(),
+                classify_error(&err),
+            );
             if let Err(e) = write_snapshot(&path, &s) {
                 tracing::debug!(error = %e, "cannot persist usage snapshot");
             }
-            CachedUsage::from_snapshot(Some(s))
+            if generation_aware {
+                CachedUsage::from_snapshot_for(Some(s), &used)
+            } else {
+                CachedUsage::from_snapshot(Some(s))
+            }
         }
     }
 }
@@ -437,6 +692,7 @@ mod tests {
         Snapshot {
             source: ANTHROPIC_SOURCE.to_string(),
             account: account.to_string(),
+            access_generation: None,
             fetched_at: attempted_at,
             attempted_at,
             consecutive_failures: failures,
@@ -446,19 +702,20 @@ mod tests {
     }
 
     #[test]
-    fn usage_evidence_separates_auth_rejection_from_ordinary_failure() {
+    fn usage_evidence_requires_current_credential_metadata() {
         // A clean read is positive authentication evidence.
         assert!(matches!(
             CachedUsage::from_snapshot(Some(snap("acct", 10, 0))),
             CachedUsage::Success(_)
         ));
-        // A credential rejection is negative evidence even though the stale
-        // payload survives for quota purposes.
+        // A cached credential rejection has no current expiry metadata, so it
+        // remains unknown even though the stale payload survives for quota
+        // purposes.
         let mut rejected = snap("acct", 10, 1);
         rejected.last_error = Some("usage fetch failed: HTTP 401 Unauthorized".to_string());
         assert!(matches!(
             CachedUsage::from_snapshot(Some(rejected)),
-            CachedUsage::AuthRejected(_)
+            CachedUsage::Unknown(Some(_))
         ));
         // Every other failure says nothing about authentication; the last-good
         // payload still comes back so cordoning keeps working.
@@ -584,6 +841,398 @@ mod tests {
         assert_eq!(f.consecutive_failures, 1);
         assert!(f.payload.is_none());
         assert_eq!(f.fetched_at, 0);
+    }
+
+    #[test]
+    fn access_rotation_busts_cache_without_changing_account_scope() {
+        let s = on_success_with_access_generation(
+            ANTHROPIC_SOURCE,
+            "account",
+            Some("old-access"),
+            1000,
+            json!({"limits": []}),
+        );
+        assert!(should_fetch_with_access_generation(
+            Some(&s),
+            1001,
+            "account",
+            Some("new-access"),
+            3600,
+        ));
+        assert!(should_fetch_with_access_generation(
+            Some(&s),
+            1001,
+            "replacement-account",
+            Some("new-access"),
+            3600,
+        ));
+        assert!(!should_fetch_with_access_generation(
+            Some(&s),
+            1001,
+            "account",
+            Some("old-access"),
+            3600,
+        ));
+    }
+
+    #[test]
+    fn legacy_snapshot_and_legacy_auth_failure_are_unknown() {
+        let legacy: Snapshot = serde_json::from_value(json!({
+            "source": "anthropic-oauth",
+            "account": "account",
+            "fetched_at": 1000,
+            "attempted_at": 1000,
+            "consecutive_failures": 1,
+            "last_error": "HTTP 401 Unauthorized",
+            "payload": {"limits": []}
+        }))
+        .unwrap();
+        assert!(legacy.access_generation.is_none());
+        assert!(matches!(
+            CachedUsage::from_snapshot_for(
+                Some(legacy),
+                &CacheRequest {
+                    account: "account".to_string(),
+                    access_generation: Some("current-access".to_string()),
+                    access_expires_at: Some(u64::MAX),
+                    has_refresh_token: false,
+                    access_token: None,
+                },
+            ),
+            CachedUsage::Unknown(Some(_))
+        ));
+        let legacy_success = snap("account", 1000, 0);
+        assert!(matches!(
+            CachedUsage::from_snapshot_for(
+                Some(legacy_success),
+                &CacheRequest {
+                    account: "account".to_string(),
+                    access_generation: Some("current-access".to_string()),
+                    access_expires_at: Some(u64::MAX),
+                    has_refresh_token: false,
+                    access_token: None,
+                },
+            ),
+            CachedUsage::Unknown(Some(_))
+        ));
+        assert!(serde_json::from_str::<Snapshot>("not json").is_err());
+    }
+
+    #[test]
+    fn http_401_requires_known_expiry_or_nonrefreshable_expired_sentinel() {
+        assert!(http_401_is_durable(
+            &CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("current".to_string()),
+                access_expires_at: Some(u64::MAX),
+                has_refresh_token: false,
+                access_token: None,
+            },
+            1,
+        ));
+        assert!(http_401_is_durable(
+            &CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("expired".to_string()),
+                access_expires_at: Some(1),
+                has_refresh_token: false,
+                access_token: None,
+            },
+            2,
+        ));
+        assert!(!http_401_is_durable(
+            &CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("refreshable".to_string()),
+                access_expires_at: Some(1),
+                has_refresh_token: true,
+                access_token: None,
+            },
+            2,
+        ));
+        assert!(!http_401_is_durable(
+            &CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("unknown".to_string()),
+                access_expires_at: None,
+                has_refresh_token: false,
+                access_token: None,
+            },
+            2,
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_rejection_retries_once_after_access_rotation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reread_count = Arc::new(AtomicUsize::new(0));
+        let reread_calls = reread_count.clone();
+        let rereads = move || {
+            let generation = if reread_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "old-access"
+            } else {
+                "new-access"
+            };
+            let token = if generation == "old-access" {
+                "old-token"
+            } else {
+                "new-token"
+            };
+            Some(CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some(generation.to_string()),
+                access_expires_at: Some(u64::MAX),
+                has_refresh_token: false,
+                access_token: Some(token.to_string()),
+            })
+        };
+        let fetch_calls = calls.clone();
+        let result = cached_usage_at(
+            path,
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("old-access".to_string()),
+                access_expires_at: Some(u64::MAX),
+                has_refresh_token: false,
+                access_token: Some("old-token".to_string()),
+            },
+            0,
+            true,
+            rereads,
+            move |_| {
+                let call = fetch_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Err("HTTP 401 Unauthorized".to_string())
+                    } else {
+                        Ok(json!({"limits": []}))
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, CachedUsage::SuccessWithGeneration { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_auth_rejection_is_bounded_to_one_retry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reread_count = Arc::new(AtomicUsize::new(0));
+        let reread_calls = reread_count.clone();
+        let fetch_calls = calls.clone();
+        let result = cached_usage_at(
+            path,
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("old-access".to_string()),
+                access_expires_at: Some(u64::MAX),
+                has_refresh_token: false,
+                access_token: Some("old-token".to_string()),
+            },
+            0,
+            true,
+            move || {
+                let (generation, token) = if reread_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ("old-access", "old-token")
+                } else {
+                    ("new-access", "new-token")
+                };
+                Some(CacheRequest {
+                    account: "account".to_string(),
+                    access_generation: Some(generation.to_string()),
+                    access_expires_at: Some(u64::MAX),
+                    has_refresh_token: false,
+                    access_token: Some(token.to_string()),
+                })
+            },
+            move |_| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<Value, _>("HTTP 401 Unauthorized".to_string()) }
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            CachedUsage::AuthRejectedWithGeneration { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn non_401_auth_wording_does_not_retry_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch_calls = calls.clone();
+        let result = cached_usage_at(
+            path,
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("old-access".to_string()),
+                access_expires_at: Some(u64::MAX),
+                has_refresh_token: false,
+                access_token: Some("old-token".to_string()),
+            },
+            0,
+            true,
+            || {
+                Some(CacheRequest {
+                    account: "account".to_string(),
+                    access_generation: Some("new-access".to_string()),
+                    access_expires_at: Some(u64::MAX),
+                    has_refresh_token: false,
+                    access_token: Some("new-token".to_string()),
+                })
+            },
+            move |_| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err::<Value, _>("authentication required".to_string()) }
+            },
+        )
+        .await;
+        assert!(matches!(result, CachedUsage::Unknown(None)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_access_with_refresh_401_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = cached_usage_at(
+            dir.path().join("usage.json"),
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("expired".to_string()),
+                access_expires_at: Some(0),
+                has_refresh_token: true,
+                access_token: Some("expired-token".to_string()),
+            },
+            0,
+            true,
+            || {
+                Some(CacheRequest {
+                    account: "account".to_string(),
+                    access_generation: Some("expired".to_string()),
+                    access_expires_at: Some(0),
+                    has_refresh_token: true,
+                    access_token: Some("expired-token".to_string()),
+                })
+            },
+            |_| async { Err::<Value, _>("HTTP 401 Unauthorized".to_string()) },
+        )
+        .await;
+        assert!(matches!(result, CachedUsage::Unknown(None)));
+    }
+
+    #[tokio::test]
+    async fn missing_expiry_401_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = cached_usage_at(
+            dir.path().join("usage.json"),
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("opaque".to_string()),
+                access_expires_at: None,
+                has_refresh_token: false,
+                access_token: Some("opaque-token".to_string()),
+            },
+            0,
+            true,
+            || {
+                Some(CacheRequest {
+                    account: "account".to_string(),
+                    access_generation: Some("opaque".to_string()),
+                    access_expires_at: None,
+                    has_refresh_token: false,
+                    access_token: Some("opaque-token".to_string()),
+                })
+            },
+            |_| async { Err::<Value, _>("HTTP 401 Unauthorized".to_string()) },
+        )
+        .await;
+        assert!(matches!(result, CachedUsage::Unknown(None)));
+    }
+
+    #[tokio::test]
+    async fn cache_contention_returns_without_fetching() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        write_snapshot(&path, &snap("account", 0, 0)).unwrap();
+        std::fs::write(path.with_extension("json.lock"), b"another-owner").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = calls.clone();
+        let result = cached_usage_at(
+            path,
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: None,
+                access_expires_at: None,
+                has_refresh_token: false,
+                access_token: None,
+            },
+            0,
+            false,
+            || None,
+            move |_| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({"unexpected": true})) }
+            },
+        )
+        .await;
+        assert!(matches!(result, CachedUsage::Success(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_contention_does_not_authenticate_from_old_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let mut snapshot = snap("account", 0, 0);
+        snapshot.access_generation = Some("old-access".to_string());
+        write_snapshot(&path, &snapshot).unwrap();
+        std::fs::write(path.with_extension("json.lock"), b"another-owner").unwrap();
+        let result = cached_usage_at(
+            path,
+            ANTHROPIC_SOURCE,
+            CacheRequest {
+                account: "account".to_string(),
+                access_generation: Some("new-access".to_string()),
+                access_expires_at: Some(u64::MAX),
+                has_refresh_token: false,
+                access_token: Some("new-token".to_string()),
+            },
+            0,
+            true,
+            || None,
+            |_| async { Ok(json!({"unexpected": true})) },
+        )
+        .await;
+        assert!(matches!(result, CachedUsage::Unknown(Some(_))));
     }
 
     #[test]
