@@ -38,6 +38,11 @@ you: "Fix the bugs in issue X: (1)… (2)… (3)…"
 
 ## How it triggers
 
+Automatic orchestration runs only when the session strategy is `auto`.
+`router: planner` uses `planner_phase` instead and must not be auto-steered
+onto `orchestration.planner`. An explicit `orchestrate:` prefix is the opt-in
+override on any strategy.
+
 Two authority paths — pick with config:
 
 ### A. Pre-classifier (recommended when enabled)

@@ -330,6 +330,8 @@ The one thing this needs beyond ordinary delegation is **peer delegation**: an o
 - **The pre-classifier** (recommended — see [Task classification](#task-classification)), when `pre_classifier.enabled`: its `orchestrate` verdict (`warranted`, `confidence`, `estimated_parts`) decides, gated on `confidence >= pre_classifier.orchestrate_min_confidence` (default `0.65`). One evaluation covers this and any host dimensions in the same call.
 - **The legacy detector**, when the pre-classifier is off: `src/tasklist.rs` recognizes markdown numbers (`1. …`), markdown bullets (`- …`), inline enumeration (`… (1) … (2) …`), and ordered prose ("first … then … finally …"), triggering once a prompt reaches `orchestration.min_items` parts.
 
+Automatic orchestration applies only to `router: auto`. `router: planner` already owns plan-vs-implement routing and is not auto-steered onto `orchestration.planner`; other strategies skip the automatic path too. An explicit `orchestrate:` prefix remains the opt-in override on any strategy.
+
 Either way, orchestration fires on **any** prompt (fresh or mid-session), **takes precedence over `skill_routing`**, and is **suppressed** by an explicit `[router: …]` directive or `model:` shorthand, and when the "list" is actually you answering the model's own enumerated questions (it asked "Open decisions: (1)… (2)…" and you replied with a matching list). Each trigger is disclosed (`router-acp · orchestrating a N-part task on …`).
 
 Two related prompt features:

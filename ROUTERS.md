@@ -421,6 +421,9 @@ routers:
     floor_complexity: 0.15
 ```
 
+Automatic orchestration does not apply: an implementation-ready prompt
+stays in the implementation pool. Use `orchestrate:` to opt in.
+
 ## `static` — no routing at all
 
 **In one sentence:** always use the candidate you named.
@@ -602,8 +605,13 @@ put with a visible note. Each switch is recorded in the state file with its
 
 ## Auto-orchestration of task lists
 
-This is orthogonal to the router choice — it works on top of `auto`,
-`pareto-code`, `escalation`, or `static`. When `orchestration.enabled` is set
+Automatic orchestration applies only to `router: auto`. `router: planner`
+already has its own planning/implementation phase router and is never
+auto-steered onto `orchestration.planner`. Other strategies (`pareto-code`,
+`escalation`, `static`) likewise skip the automatic path. An explicit
+`orchestrate:` prefix remains a deliberate override on any strategy.
+
+When `router: auto` is active and `orchestration.enabled` is set
 and a prompt reads as a **multi-part task list**, the router turns that session
 into an orchestrator instead of answering the list in one turn.
 

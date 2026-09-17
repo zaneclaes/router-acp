@@ -5098,12 +5098,13 @@ fn select_planner_target(
 /// when it fired.
 ///
 /// Authority for the auto path:
+/// - session strategy must be `Auto` (planner/static/escalation/pareto-code skip)
 /// - `pre_classifier.enabled` → LLM pre-class `orchestrate` decision (fail-open
 ///   means no auto-orchestrate). Legacy `tasklist::detect_task_list` is not used.
 /// - pre-classifier off → `tasklist::detect_task_list` + `min_items` (legacy).
 ///
 /// An explicit `orchestrate:` prefix overrides every auto gate (including
-/// `enabled`). Runs BEFORE `skill_routing`.
+/// `enabled` and the strategy check). Runs BEFORE `skill_routing`.
 fn maybe_trigger_orchestration(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -5116,6 +5117,22 @@ fn maybe_trigger_orchestration(
     // including `enabled` — the user asked for it by name.
     if !forced && !cfg.enabled {
         return false;
+    }
+    // Automatic orchestration is an `auto`-router concern. Planner already
+    // owns plan-vs-implement routing; other strategies must not be overwritten
+    // by `orchestration.planner`. Forced `orchestrate:` still applies.
+    if !forced {
+        let strategy = shared
+            .with_session(router_sid, |s| s.strategy)
+            .unwrap_or(shared.cfg.router);
+        if strategy != StrategyKind::Auto {
+            tracing::debug!(
+                session = router_sid,
+                ?strategy,
+                "auto-orchestration skipped: session strategy is not auto"
+            );
+            return false;
+        }
     }
     let text = prompt_display_text(prompt);
     let (parts, why_auto) = if forced {
@@ -7245,9 +7262,10 @@ async fn dispatch_prompt(
         }
     }
 
-    // Auto-orchestration runs next: a multi-part / pre-class-warranted task
-    // orchestrates even if it names a skill. Suppressed only by an explicit
-    // `[router: …]` directive or `model:` shorthand;
+    // Auto-orchestration runs next, but only for `router: auto`: a multi-part /
+    // pre-class-warranted task orchestrates even if it names a skill.
+    // Suppressed by an explicit `[router: …]` directive, `model:` shorthand,
+    // or any non-auto strategy (planner owns its own phase router).
     // FORCED unconditionally by the `orchestrate:` prefix.
     let orchestrating_now = if force_orchestrate || !explicit_routing {
         maybe_trigger_orchestration(

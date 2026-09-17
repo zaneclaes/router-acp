@@ -7844,3 +7844,130 @@ async fn planner_phase_implementation_directive_switches_pinned_session() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn planner_stray_orchestrate_does_not_auto_orchestrate_and_picks_implementation() {
+    // Live-shaped: router: planner, implementation pool terra/opus/grok with a
+    // +2 grok boost, orchestration.enabled with planner=*sol*. A stale
+    // evaluator `orchestrate: warranted=true` must NOT steal the pin onto
+    // orchestration.planner; implementation + plan_ready routes to grok.
+    let state = temp_state_file("planner-no-auto-orch");
+    let log = temp_log("planner-no-auto-orch");
+    let preclass = r#"{"routing":{"task_class":"Architecture","task_classes":["Architecture"],"categories":["backend"],"complexity":0.55,"confidence":0.9,"reason":"implementation-ready ticket"},"planner_phase":{"phase":"implementation","confidence":0.95,"plan_ready":true,"reason":"ticket is ready to build"},"orchestrate":{"warranted":true,"confidence":0.95,"estimated_parts":3,"reason":"stale auto-orchestrate"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*sol*\"]\n    \
+         implementation_candidates: [\"*terra*\", \"*opus*\", \"*grok*\"]\n    \
+         model_boosts:\n      - {{ pattern: \"*grok*\", implementation: 2.0, planning: 0.0 }}\n    \
+         phase_upgrade_confidence: 0.7\n    apex_complexity: 0.85\n    floor_complexity: 0.15\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*sol*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n  disclose: true\n\
+         \x20 orchestrate_min_confidence: 0.65\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "codex",
+            &[("sol", 1)],
+            &[
+                ("MOCK_PRECLASS_JSON", preclass),
+                ("MOCK_LOG", log.to_str().unwrap()),
+            ]
+        ),
+        agent_yaml(
+            "claude",
+            &[("terra", 2), ("opus", 3)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "grok",
+            &[("grok", 4)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "Implement the attached ticket").await?;
+
+        let (phase, orchestrating) = shared
+            .with_session(&sid, |s| (s.planner_phase, s.orchestrating))
+            .expect("session");
+        assert_eq!(
+            phase,
+            Some(router_acp::config::PlannerPhase::Implementation),
+            "ready implementation plan must enter implementation phase"
+        );
+        assert!(
+            !orchestrating,
+            "planner must not auto-orchestrate from a stray orchestrate verdict"
+        );
+
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("orchestrating"),
+            "no auto-orchestration disclosure: {text}"
+        );
+        assert!(
+            !text.contains("you are the ORCHESTRATOR"),
+            "orchestration protocol must not be injected: {text}"
+        );
+        assert!(
+            text.contains("echo:grok:"),
+            "implementation + grok boost must pin grok, not sol: {text}"
+        );
+        assert!(
+            !text.contains("echo:sol:"),
+            "orchestration planner must not steal the pin: {text}"
+        );
+
+        let prompts = planner_user_prompts(&log);
+        let prompt = prompts
+            .iter()
+            .find(|p| !p.contains("[router-acp pre-classifier]"))
+            .expect("downstream user prompt");
+        assert!(
+            !prompt.contains("you are the ORCHESTRATOR"),
+            "downstream prompt must not carry the orchestration protocol: {prompt}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_explicit_orchestrate_prefix_still_forces_orchestration() {
+    let state = temp_state_file("planner-force-orch");
+    let preclass = r#"{"routing":{"task_class":"CodingGeneral","complexity":0.4,"confidence":0.9,"reason":"bounded work"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"no plan"},"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*sol*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n\
+         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*sol*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n  disclose: true\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("codex", &[("sol", 1)], &[("MOCK_PRECLASS_JSON", preclass)]),
+        agent_yaml("claude", &[("opus", 2)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "orchestrate: ship the release notes").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("orchestrating"),
+            "explicit orchestrate: must still force orchestration under planner: {text}"
+        );
+        assert!(
+            text.contains("you are the ORCHESTRATOR"),
+            "forced orchestration must inject the protocol: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
