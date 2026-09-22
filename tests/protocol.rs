@@ -6439,6 +6439,72 @@ async fn preclass_mode_less_evaluator_runs_without_set_mode() {
 }
 
 #[tokio::test]
+async fn preclass_mode_less_tool_violation_falls_back_to_static_classifier() {
+    // A mode-less evaluator (Grok) that fires a tool_call during pre-class is
+    // a structural miss, not a service failure: cancel the tool, do not cordon,
+    // and fall back to the static keyword classifier so session start is not
+    // hard-blocked. The same seat remains eligible to take the real turn.
+    let state = temp_state_file("preclass-modeless-tool");
+    let log = temp_log("preclass-modeless-tool");
+    let agent = agent_yaml(
+        "grok",
+        &[("grok-4.5", 1)],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_PRECLASS_TOOL", "1"),
+        ],
+    )
+    .replace(
+        "        - { name: MOCK_SESSION_MODES, value: preclass }\n",
+        "",
+    )
+    .replace("    mode_map: { preclass: preclass }\n", "");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nauto_upgrade: {{ enabled: false }}\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*grok*\"]\n  disclose: true\n\
+         agents:\n{}",
+        state.display(),
+        agent
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(
+            &cx,
+            &sid,
+            "Fix the login bug on the settings page and add a regression test",
+        )
+        .await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(
+            read_log(&log)
+                .iter()
+                .any(|event| event["event"] == "cancel"),
+            "tool attempt must cancel the evaluator"
+        );
+        let entry = open_state(&state).get(&sid).expect("session row");
+        assert_eq!(
+            entry.agent, "grok",
+            "session must pin to the mode-less seat"
+        );
+        let routing = entry.routing.expect("static-fallback routing persisted");
+        assert_eq!(routing["candidate"], "grok/grok-4.5", "{routing}");
+        assert!(routing.get("class").is_some(), "{routing}");
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("static fallback"),
+            "disclosure must mention static fallback: {text}"
+        );
+        assert!(
+            !text.contains("could not classify"),
+            "mode-less tool violation must not hard-fail session start: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn preclass_stalled_evaluator_fails_over_instead_of_hanging() {
     // Regression: an evaluator that opens fine, then never answers and streams
     // nothing, used to hang the prompt forever — the turn never started and the
@@ -6624,14 +6690,22 @@ async fn preclass_requires_an_explicit_advertised_safe_mode_before_prompting() {
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        let err = prompt_text(&cx, &sid, "classify this").await.unwrap_err();
-        assert!(format!("{err}").contains("could not classify"));
+        let resp = prompt_text(&cx, &sid, "classify this").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
         assert!(
-            !read_log(&log)
-                .iter()
-                .any(|event| event["event"] == "prompt"),
+            !read_log(&log).iter().any(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[router-acp pre-classifier]"))
+            }),
             "no classifier prompt may be sent without mode_map.preclass"
         );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("static-fallback routing persisted");
+        assert!(routing.get("class").is_some(), "{routing}");
         Ok(())
     })
     .await;
@@ -6736,14 +6810,11 @@ async fn preclass_true_multi_track_still_orchestrates() {
 }
 
 #[tokio::test]
-async fn preclass_hard_fails_when_classifier_returns_no_routing() {
-    // The classifier is mandatory when enabled: if no evaluator produces a
-    // routing decision, the turn HARD FAILS with a clear error — it never
-    // silently falls back to the static heuristic, and never loops (exactly one
-    // bounded attempt per prompt, so a failing classifier cannot cascade into an
-    // unbounded retry / deadlock).
-    let state = temp_state_file("preclass-hardfail");
-    // Valid JSON, but no `routing` block → no classification result.
+async fn preclass_no_routing_falls_back_to_static_classifier() {
+    // Valid JSON with no `routing` block: the LLM walk yields no classification.
+    // Session start proceeds on the static keyword classifier rather than
+    // hard-failing.
+    let state = temp_state_file("preclass-no-routing");
     let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"n/a"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
@@ -6753,13 +6824,29 @@ async fn preclass_hard_fails_when_classifier_returns_no_routing() {
         state.display(),
         agent_yaml("a", &[("m1", 1)], &[("MOCK_PRECLASS_JSON", preclass_json)]),
     );
-    run_test(yaml, async |cx, _observed| {
+    run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        let err = prompt_text(&cx, &sid, "do the thing").await.unwrap_err();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "Fix the login bug on the settings page and add a regression test",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("static-fallback routing persisted");
+        assert!(routing.get("class").is_some(), "{routing}");
+        let text = agent_text(&observed, &sid);
         assert!(
-            format!("{err}").contains("could not classify"),
-            "classifier exhaustion must hard-fail the turn: {err}"
+            text.contains("static fallback"),
+            "disclosure must mention static fallback: {text}"
+        );
+        assert!(
+            !text.contains("could not classify"),
+            "missing routing must not hard-fail: {text}"
         );
         Ok(())
     })
@@ -6984,11 +7071,10 @@ async fn preclass_force_orchestrate_still_works() {
 }
 
 #[tokio::test]
-async fn preclass_hard_fails_on_unparseable_reply() {
-    // An unparseable evaluator reply yields no classification. Previously this
-    // failed OPEN (proceeded on the static heuristic); the classifier is now
-    // mandatory when enabled, so with no other evaluator to fail over to the
-    // turn HARD FAILS rather than silently mis-routing.
+async fn preclass_unparseable_reply_falls_back_to_static_classifier() {
+    // An unparseable evaluator reply yields no classification from the LLM
+    // walk. With no other evaluator to fail over to, routing falls back to the
+    // static keyword classifier instead of hard-failing the turn.
     let state = temp_state_file("preclass-badjson");
     let malformed_reply = "Shipping PR regression sentinel\n\n## Rollout\n\n- Verify the canary\n- Watch the deploy logs";
     let yaml = format!(
@@ -7006,13 +7092,21 @@ async fn preclass_hard_fails_on_unparseable_reply() {
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        let err = prompt_text(&cx, &sid, "add a flag and wire it up")
-            .await
-            .unwrap_err();
+        let resp = prompt_text(&cx, &sid, "add a flag and wire it up").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|session| session.routing)
+            .expect("static-fallback routing persisted");
+        assert!(routing.get("class").is_some(), "{routing}");
         let parent_transcript = agent_text(&observed, &sid);
         assert!(
-            format!("{err}").contains("could not classify"),
-            "unparseable classifier reply must hard-fail: {err}"
+            !parent_transcript.contains("could not classify"),
+            "unparseable classifier reply must not hard-fail: {parent_transcript}"
+        );
+        assert!(
+            parent_transcript.contains("static fallback"),
+            "disclosure must mention static fallback: {parent_transcript}"
         );
         assert!(
             !parent_transcript.contains("raw reply:"),
@@ -7025,10 +7119,6 @@ async fn preclass_hard_fails_on_unparseable_reply() {
         assert!(
             parent_transcript.contains("parse failed: JSON parse failed"),
             "compact parse-failure metadata must remain in parent transcript: {parent_transcript}"
-        );
-        assert!(
-            parent_transcript.contains("could not classify"),
-            "classifier failure metadata must remain in parent transcript: {parent_transcript}"
         );
         assert!(
             !parent_transcript.contains("parse failure: evaluator reply was not valid JSON"),

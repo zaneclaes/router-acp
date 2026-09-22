@@ -4,9 +4,14 @@
 //! When enabled, this is the authority for auto-orchestration (replacing
 //! `tasklist::detect_task_list`) and for host injects such as Kory's
 //! `ui_planning` dimension. Prefer the configured `evaluator` globs (cheap
-//! seats first); if none are eligible, fall back to any available model. The
-//! only way evaluation is allowed to report "no evaluator candidate" is when
-//! the session has zero eligible models of any kind.
+//! seats first); if none are eligible, fall back to any available model. A
+//! failed evaluator is cordoned and the next eligible one is tried. If none
+//! produce a routing decision — including the zero-models case, a mode-less
+//! evaluator that attempted tool use, or an unparseable reply — routing falls
+//! back to the static keyword classifier (`classifier.rs`) rather than
+//! hard-failing session start. Client cancellation still aborts without that
+//! fallback. `dispatch_prompt` keeps a backstop that refuses to pin when
+//! routing is still missing after this walk.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::candidate::{CandidateId, EffortLevel, TaskClass};
+use crate::classifier::{ClassifyInput, TaskProfile, classify, cwd_language_fingerprint};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
     DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
@@ -813,8 +819,10 @@ fn fail_open(
 /// eligible `evaluator` candidate. Fail-open on any error. Tries each matching
 /// evaluator in preference order (a timed-out/broken haiku does not sink the
 /// whole pre-class). When the preferred pool is empty or exhausted, widens to
-/// **any** eligible model — only reports "no evaluator candidate" when the
-/// session has zero models of any kind.
+/// **any** eligible model. If the walk produces no routing decision — including
+/// when the session has zero models of any kind — fall back to the static
+/// keyword classifier so the turn can still pin. Client cancellation is the
+/// exception: it returns without that fallback.
 pub async fn evaluate(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -847,6 +855,9 @@ pub async fn evaluate(
             Vec::new(),
         ));
 
+    // Static fallback classifies against the session's own cwd even when the
+    // evaluator throwaway session is pointed at `evaluator_cwd`.
+    let session_cwd = cwd.clone();
     let (cwd, dirs) = evaluator_workspace(pcfg, cwd, dirs);
 
     let mut attempts: Vec<String> = Vec::new();
@@ -960,29 +971,113 @@ pub async fn evaluate(
         excluded.push(cand_str);
     }
 
-    // No evaluator produced a classification. This is a fail result (routing is
-    // None); the caller decides the terminal policy (hard-fail when the
-    // pre-classifier is enabled — see `dispatch_prompt`). "no evaluator
-    // candidate available" is reserved for the zero-models case only.
+    // No evaluator produced a classification — including the zero-models case.
+    // Supply routing from the static keyword classifier so session start is
+    // not hard-blocked. `dispatch_prompt` still refuses to pin if routing is
+    // missing after this (client cancel is the remaining `routing: None` path).
     let latency_ms = started.elapsed().as_millis() as u64;
-    if let Some(mut fail) = last_fail {
-        fail.latency_ms = latency_ms;
-        fail.log
-            .push_str(&format!("tried evaluators: {}\n", attempts.join(", ")));
-        return fail;
+    static_fallback(
+        shared,
+        prompt,
+        session_cwd,
+        last_fail,
+        &attempts,
+        latency_ms,
+    )
+    .await
+}
+
+/// Map a static-classifier `TaskProfile` onto a pre-class `RoutingDecision`.
+/// Confidence is 0 so later routing treats this as a keyword guess, not an
+/// LLM verdict. `languages` stays on the profile (cwd fingerprint) and is
+/// not a routing field.
+fn routing_from_static_profile(profile: &TaskProfile, skip_reason: &str) -> RoutingDecision {
+    RoutingDecision {
+        task_class: profile.class,
+        task_classes: Vec::new(),
+        categories: Vec::new(),
+        required_capabilities: Vec::new(),
+        complexity: profile.complexity,
+        confidence: 0.0,
+        effort: profile.effort,
+        reason: format!("static keyword classifier fallback: {skip_reason}"),
     }
-    fail_open("no evaluator candidate available", None, latency_ms, "")
+}
+
+/// Last-resort routing when every evaluator miss (or the pool is empty).
+/// Classifies against the session's own cwd, never `evaluator_cwd`.
+async fn static_fallback(
+    shared: &Arc<Shared>,
+    prompt: &[ContentBlock],
+    session_cwd: PathBuf,
+    last_fail: Option<PreClassResult>,
+    attempts: &[String],
+    latency_ms: u64,
+) -> PreClassResult {
+    let skip_reason = match last_fail.as_ref() {
+        Some(fail) => fail
+            .skip_reason
+            .clone()
+            .unwrap_or_else(|| "no routing decision".to_string()),
+        None => "no evaluator candidate available".to_string(),
+    };
+    let cwd_langs = cwd_language_fingerprint(&shared.rules, &session_cwd);
+    let input = ClassifyInput::from_prompt(prompt, cwd_langs);
+    let profile = classify(&shared.cfg.classifier, &shared.rules, &input).await;
+    let routing = routing_from_static_profile(&profile, &skip_reason);
+
+    tracing::info!(
+        skip_reason = %skip_reason,
+        class = %routing.task_class.as_str(),
+        complexity = routing.complexity,
+        "pre-class: no evaluator classified; using static keyword classifier"
+    );
+
+    let mut log = last_fail.map(|fail| fail.log).unwrap_or_default();
+    if !attempts.is_empty() {
+        log.push_str(&format!("tried evaluators: {}\n", attempts.join(", ")));
+    }
+    log.push_str(&format!(
+        "router-acp · pre-class · static fallback · class={} complexity={:.2} · {skip_reason}\n",
+        routing.task_class.as_str(),
+        routing.complexity
+    ));
+
+    PreClassResult {
+        ok: true,
+        skip_reason: Some(skip_reason.clone()),
+        evaluator: Some("static-classifier".into()),
+        latency_ms,
+        routing: Some(routing),
+        orchestrate: None,
+        planner_phase: None,
+        dimensions: BTreeMap::new(),
+        acted_modes: Vec::new(),
+        injects: Vec::new(),
+        log,
+        summary: json!({
+            "ok": true,
+            "evaluator": "static-classifier",
+            "latency_ms": latency_ms,
+            "fallback": "static",
+            "skip_reason": skip_reason,
+            "acted_modes": ["none"],
+        }),
+    }
 }
 
 /// One evaluator attempt: open in the safe preclass mode when the adapter has
 /// modes, then prompt → close → parse.
 ///
 /// Returns `Ok(PreClassResult)` when the evaluator model responded (the result
-/// may still lack a routing decision on a parse failure) or the session could
-/// not be established (fail-open, failover to the next evaluator). Returns
-/// `Err(AcpError)` when the model's prompt turn itself failed — a real service
-/// failure (down / rate-limited / out of credits) that the caller runs through
-/// the router's known failure handling and cordons before failing over.
+/// may still lack a routing decision on a parse failure), the session could
+/// not be established (fail-open, failover to the next evaluator), or a
+/// **mode-less** evaluator attempted tool use (structural miss: not cordoned).
+/// Returns `Err(AcpError)` when the model's prompt turn itself failed — a real
+/// service failure (down / rate-limited / out of credits) that the caller runs
+/// through the router's known failure handling and cordons before failing over
+/// — or when a **mode-advertising** evaluator attempted tool use (the preclass
+/// mode was supposed to prevent that).
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_on_candidate(
     shared: &Arc<Shared>,
@@ -1037,6 +1132,12 @@ async fn evaluate_on_candidate(
         Ok(Ok(opened)) => opened,
     };
 
+    let mode_less = opened
+        .modes
+        .as_ref()
+        .map(|m| m.available_modes.is_empty())
+        .unwrap_or(true);
+
     // Phase 2 — the classifier LLM generation. Still NO *total* wall-clock
     // timeout: core infrastructure that must be allowed to run to completion,
     // so a slow-but-working evaluator is never cut off. What IS bounded now is
@@ -1072,6 +1173,18 @@ async fn evaluate_on_candidate(
     let latency_ms = started.elapsed().as_millis() as u64;
 
     if violation.load(Ordering::Acquire) {
+        if mode_less {
+            // Grok (and other mode-less adapters) have no preclass permission
+            // gate. A tool_call here is a structural miss, not a service
+            // failure: do not cordon, so the same seat can still take the
+            // real turn after static-classifier fallback.
+            return Ok(fail_open(
+                "mode-less evaluator attempted tool use (structural, not cordoned)",
+                Some(cand_str),
+                latency_ms,
+                "",
+            ));
+        }
         return Err(AcpError::internal_error().data("evaluator attempted tool use"));
     }
 
@@ -1533,6 +1646,31 @@ pre_classifier:
         )
         .unwrap();
         assert!(without.pre_classifier.evaluator_cwd.is_none());
+    }
+
+    #[test]
+    fn routing_from_static_profile_maps_task_profile_fields() {
+        let profile = TaskProfile {
+            class: TaskClass::BugFix,
+            complexity: 0.42,
+            languages: vec!["rust".into()],
+            effort: Some(EffortLevel::High),
+        };
+        let routing = routing_from_static_profile(
+            &profile,
+            "mode-less evaluator attempted tool use (structural, not cordoned)",
+        );
+        assert_eq!(routing.task_class, TaskClass::BugFix);
+        assert!(routing.task_classes.is_empty());
+        assert!(routing.categories.is_empty());
+        assert!(routing.required_capabilities.is_empty());
+        assert_eq!(routing.complexity, 0.42);
+        assert_eq!(routing.confidence, 0.0);
+        assert_eq!(routing.effort, Some(EffortLevel::High));
+        assert_eq!(
+            routing.reason,
+            "static keyword classifier fallback: mode-less evaluator attempted tool use (structural, not cordoned)"
+        );
     }
 
     #[test]
