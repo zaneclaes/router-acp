@@ -67,9 +67,9 @@ Auto-orchestrate only if `warranted && confidence >= orchestrate_min_confidence`
 (default `0.65`). Hosts can register extra dimensions under
 `pre_classifier.dimensions` (e.g. Kory Code's `ui_planning`); one call covers all.
 Fail-open on parse/service failure after every eligible model was tried → do
-**not** orchestrate; when enabled the pre-classifier is mandatory for routing
-and a total classification miss hard-fails the turn (disclosed via
-`router-acp · pre-class …`).
+**not** orchestrate. A total classification miss falls back to the static
+keyword classifier (confidence 0) so the session can still start (disclosed
+via `router-acp · pre-class · static fallback …`).
 
 v1 runs the pre-class once per session on the first eligible turn (not every
 mid-session message). `orchestrate:` force still works anytime without needing a

@@ -7158,14 +7158,14 @@ async fn dispatch_prompt(
         )
         .await;
 
-        // Mandatory classifier: when the pre-classifier is enabled it is the
-        // authority for routing. If no evaluator produced a routing decision
-        // (every candidate down / out of credits / unparseable, after failover),
-        // we MUST NOT silently fall back to the static heuristic — the turn hard
-        // fails with a clear error. `preclass_done` stays false so a later
-        // client retry re-attempts classification once a model recovers; there
-        // is exactly one bounded classification attempt per prompt, so a failing
-        // classifier can never cascade into an unbounded router-side retry loop.
+        // Backstop: `evaluate()` already falls back to the static keyword
+        // classifier when the LLM walk produces no routing. If routing is
+        // *still* missing (client cancel, or a future path that returns
+        // `routing: None`), refuse to pin rather than invent a class here.
+        // `preclass_done` stays false so a later client retry re-attempts
+        // classification; there is exactly one bounded classification attempt
+        // per prompt, so a failing classifier can never cascade into an
+        // unbounded router-side retry loop.
         if result.routing.is_none() {
             crate::pre_classifier::disclose(&shared, &router_sid, &result);
             let msg = format!(
