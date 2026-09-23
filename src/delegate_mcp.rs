@@ -1138,6 +1138,7 @@ pub async fn run_delegate_task(
         explicit_candidate: None,
         explicit_source: None,
         planner_phase: None,
+        planner_difficulty: None,
     };
     let ranked = make_strategy(strategy_kind, &shared.cfg)
         .rank(&ctx, &pool)

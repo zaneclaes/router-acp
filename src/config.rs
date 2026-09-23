@@ -49,6 +49,16 @@ pub enum PlannerPhase {
     Implementation,
 }
 
+/// Per-prompt planner-pool override from a `hard:` / `easy:` prefix.
+/// Unprefixed prompts keep the full planning pool (auto + apex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerDifficulty {
+    /// Restrict planning to Opus / Sol (`easy: ` prefix).
+    Easy,
+    /// Restrict planning to Astra / Fable (`hard: ` prefix).
+    Hard,
+}
+
 /// How far the `escalation` router jumps when it escalates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -1175,7 +1185,11 @@ pub struct PlannerModelBoost {
 }
 
 fn default_planning_candidates() -> Vec<String> {
+    // Everyday planning is Opus (currently 5.5) and Sol. Fable/Astra stay in
+    // the pool so auto's apex_complexity (pure quality) can reach them for
+    // exceptionally hard plans. Ranking is auto, not glob order.
     vec![
+        "*opus*".to_string(),
         "*sol*".to_string(),
         "*astra*".to_string(),
         "*fable*".to_string(),
@@ -1200,6 +1214,14 @@ fn default_planner_apex_complexity() -> f64 {
 
 fn default_planner_floor_complexity() -> f64 {
     0.15
+}
+
+fn default_easy_planning_candidates() -> Vec<String> {
+    vec!["*opus*".to_string(), "*sol*".to_string()]
+}
+
+fn default_hard_planning_candidates() -> Vec<String> {
+    vec!["*astra*".to_string(), "*fable*".to_string()]
 }
 
 /// Two-phase routing: separate candidate pools for planning (frontier) and
@@ -1229,6 +1251,13 @@ pub struct PlannerRouterConfig {
     /// implementation candidates (workhorse for trivial planning).
     #[serde(default = "default_planner_floor_complexity")]
     pub floor_complexity: f64,
+    /// Planning-pool subset for an `easy:` prefix. Intersected with
+    /// `planning_candidates`; empty intersection falls back to the full pool.
+    #[serde(default = "default_easy_planning_candidates")]
+    pub easy_planning_candidates: Vec<String>,
+    /// Planning-pool subset for a `hard:` prefix. Same intersection rule.
+    #[serde(default = "default_hard_planning_candidates")]
+    pub hard_planning_candidates: Vec<String>,
     /// Opaque host-owned instructions injected into the agent's context when
     /// the session enters the planning phase. The router does not interpret
     /// this text; workflow policy (ticket decomposition, session-spawning
@@ -1247,6 +1276,8 @@ impl Default for PlannerRouterConfig {
             phase_upgrade_confidence: default_phase_upgrade_confidence(),
             apex_complexity: default_planner_apex_complexity(),
             floor_complexity: default_planner_floor_complexity(),
+            easy_planning_candidates: default_easy_planning_candidates(),
+            hard_planning_candidates: default_hard_planning_candidates(),
             planning_instructions: String::new(),
         }
     }

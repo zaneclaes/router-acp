@@ -199,7 +199,7 @@ agents:
       upstream_base_url: https://api.anthropic.com
     models:
       - id: opus
-        api_model: claude-opus-5  # only if the ACP id is an API-invalid alias
+        api_model: claude-opus-5-5  # only if the ACP id is an API-invalid alias
         cost_rank: 3
       - { id: sonnet, cost_rank: 2 }
 ```
@@ -270,6 +270,8 @@ Three triggers:
   ```
 
   The reference can be a full `agent/model` id, a bare model id, a family/prefix, or a suffix-less id (`claude/opus` → `claude/opus[1m]`); it resolves to the best eligible matching candidate (highest quality on ambiguity), and a token that names no candidate is left alone as ordinary prose. Pre-pin, the same syntax steers the initial pin instead of switching.
+
+  Under `router: planner`, two reserved prefixes subset the planning pool instead of pinning a named model: `hard:` → Astra/Fable, `easy:` → Opus/Sol. No prefix keeps auto ranking (Astra/Fable only at apex complexity). The prefix is stripped.
 - **Auto-upgrade** — after each turn the router scores the session's *confidence* (the pinned model's quality for the task class minus a *struggle* score that rises on token-ceiling hits, refusals, and repeated in-turn tool failures). Below `auto_upgrade.confidence_threshold` it upgrades to the best strictly-more-capable eligible candidate on the next prompt. **Opt-in** (`auto_upgrade.enabled: true`): off by default, because a confidence dip re-pinning a live session forfeits its context for what is usually ordinary struggle; explicit `switch=` always works.
 - **Skill routing** — `skill_routing` forces a named skill onto a class of candidates: when a prompt invokes a configured skill (as `/name` or a standalone token) and the pin isn't already in that skill's `candidates` or `also_acceptable` globs, the session switches to the best `candidates` match (pre-pin, it steers the initial routing instead). `also_acceptable` models are fine to stay pinned on but are never a switch *target* — the split is what stops a session already on something better than `candidates` from being force-downgraded onto it. Re-invoking the skill re-arms the elevation, and an elevated skill pin expires like any other elevation (`demotion.after_quiet_turns`) once the run goes quiet, stepping back down within that skill's own `candidates`.
 

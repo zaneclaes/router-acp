@@ -8061,3 +8061,83 @@ async fn planner_explicit_orchestrate_prefix_still_forces_orchestration() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn planner_hard_prefix_pins_fable_not_opus() {
+    let state = temp_state_file("planner-hard-prefix");
+    let preclass = r#"{"routing":{"task_class":"Architecture","complexity":0.4,"confidence":0.9,"reason":"plan"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"no plan"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*opus*\", \"*fable*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n    \
+         easy_planning_candidates: [\"*opus*\"]\n    \
+         hard_planning_candidates: [\"*fable*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*opus*\"]\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml(
+            "claude",
+            &[("opus", 4), ("fable", 5)],
+            &[("MOCK_PRECLASS_JSON", preclass)]
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hard: redesign the auth stack").await?;
+        let pin = shared
+            .with_session(&sid, |s| s.pin.as_ref().map(|p| p.candidate.to_string()))
+            .flatten();
+        assert!(
+            pin.as_deref().is_some_and(|p| p.contains("fable")),
+            "hard: must pin fable, got {pin:?}"
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("`hard:` prefix"),
+            "disclosure should name the prefix: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_easy_prefix_pins_opus_even_at_apex_complexity() {
+    let state = temp_state_file("planner-easy-prefix");
+    let preclass = r#"{"routing":{"task_class":"Architecture","complexity":0.95,"confidence":0.9,"reason":"hard plan"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"no plan"}}"#;
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  auto:\n    apex_complexity: 0.9\n  planner:\n    \
+         planning_candidates: [\"*opus*\", \"*fable*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n    \
+         easy_planning_candidates: [\"*opus*\"]\n    \
+         hard_planning_candidates: [\"*fable*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*opus*\"]\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml(
+            "claude",
+            &[("opus", 4), ("fable", 5)],
+            &[("MOCK_PRECLASS_JSON", preclass)]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "easy: list the endpoints").await?;
+        let pin = shared
+            .with_session(&sid, |s| s.pin.as_ref().map(|p| p.candidate.to_string()))
+            .flatten();
+        assert!(
+            pin.as_deref().is_some_and(|p| p.contains("opus")),
+            "easy: must pin opus even at apex complexity, got {pin:?}"
+        );
+        Ok(())
+    })
+    .await;
+}

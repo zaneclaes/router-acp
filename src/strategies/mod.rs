@@ -165,6 +165,9 @@ pub struct RouteContext {
     /// non-planner strategies (ignored) or when the phase hasn't been
     /// determined yet (defaults to `Planning` inside `PlannerStrategy`).
     pub planner_phase: Option<PlannerPhase>,
+    /// Per-prompt `hard:` / `easy:` prefix. `None` keeps the full planning
+    /// pool (auto + apex). Ignored by non-planner strategies.
+    pub planner_difficulty: Option<crate::config::PlannerDifficulty>,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +499,7 @@ pub(crate) mod test_util {
             explicit_candidate: None,
             explicit_source: None,
             planner_phase: None,
+            planner_difficulty: None,
         }
     }
 }
