@@ -310,6 +310,11 @@ routers:
   planner:
     planning_candidates: ["*opus*", "*sol*", "*astra*", "*fable*"]
     implementation_candidates: ["*terra*", "*opus*", "*grok*"]
+    # Per-prompt prefixes (stripped, never reach the model):
+    #   easy:  → opus/sol     hard: → astra/fable
+    # No prefix keeps auto ranking (astra/fable only at apex_complexity).
+    easy_planning_candidates: ["*opus*", "*sol*"]
+    hard_planning_candidates: ["*astra*", "*fable*"]
 
 # Proactive usage-cap cordoning (on by default; inert unless an agent declares a
 # `usage_source` above). Polls the provider usage API and marks a model

@@ -358,6 +358,9 @@ pub struct RouterSession {
     /// non-planner sessions. Only meaningful when `strategy == Planner`.
     /// Monotonic: once `Implementation`, never reverted.
     pub planner_phase: Option<crate::config::PlannerPhase>,
+    /// Per-prompt `hard:` / `easy:` planner-pool override. Reset at the
+    /// start of every prompt; set only when that prompt carries the prefix.
+    pub planner_difficulty: Option<crate::config::PlannerDifficulty>,
 }
 
 /// What the outgoing model is asked to write when handing a session off.
@@ -447,6 +450,7 @@ impl RouterSession {
             quiet_turns: 0,
             saw_adapter_cost: false,
             planner_phase: None,
+            planner_difficulty: None,
         }
     }
 
@@ -506,6 +510,7 @@ impl RouterSession {
             quiet_turns: 0,
             saw_adapter_cost: false,
             planner_phase: None,
+            planner_difficulty: None,
         }
     }
 }
@@ -3145,12 +3150,16 @@ async fn pin_session(
     // Dropping the override (failover exclude, cordon redirect) drops its
     // provenance with it.
     let override_source = override_source.filter(|_| override_.is_some());
+    let planner_difficulty = shared
+        .with_session(router_sid, |s| s.planner_difficulty)
+        .flatten();
     let ctx = RouteContext {
         profile: profile.clone(),
         required_caps: required,
         explicit_candidate: override_.clone(),
         explicit_source: override_source,
         planner_phase,
+        planner_difficulty,
     };
 
     // Cordons active right now (shown to the user so exclusions are visible).
@@ -5069,6 +5078,7 @@ fn select_planner_target(
     phase: crate::config::PlannerPhase,
     class: crate::candidate::TaskClass,
     excluded: &[String],
+    planner_difficulty: Option<crate::config::PlannerDifficulty>,
 ) -> Option<CandidateId> {
     let profile = crate::classifier::TaskProfile {
         class,
@@ -5082,6 +5092,7 @@ fn select_planner_target(
         explicit_candidate: None,
         explicit_source: None,
         planner_phase: Some(phase),
+        planner_difficulty,
     };
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     if !excluded.is_empty() {
@@ -6878,6 +6889,8 @@ fn on_prompt(
     // Set by an `orchestrate:` / `orchestrator:` prefix — forces orchestration
     // regardless of list detection.
     let mut force_orchestrate = false;
+    // Per-prompt `hard:` / `easy:` — reset so a prior prefix cannot stick.
+    shared.with_session(&router_sid, |s| s.planner_difficulty = None);
     // Set when a `[router: phase=implementation]` directive upgrades a pinned
     // planning session — the same summarize-and-re-pin as a detected upgrade.
     let mut planner_needs_switch = false;
@@ -6891,8 +6904,9 @@ fn on_prompt(
             // `codex/gpt-5.5:`, `sonnet: fix this`) is a switch (post-pin) or a
             // pin steer (pre-pin) to the referenced candidate. Resolution gates
             // it — a token that doesn't name an eligible candidate is left as
-            // ordinary prose. The reserved tokens `orchestrate:`/`orchestrator:`
-            // instead force auto-orchestration on the rest of the prompt.
+            // ordinary prose. Reserved tokens: `orchestrate:`/`orchestrator:`
+            // force auto-orchestration; `hard:`/`easy:` subset the planner
+            // pool (astra/fable vs opus/sol) without pinning a named model.
             if let Some((ref_str, stripped)) = split_model_shorthand(&req.prompt) {
                 let lower_ref = ref_str.to_lowercase();
                 if lower_ref == "orchestrate" || lower_ref == "orchestrator" {
@@ -6900,6 +6914,60 @@ fn on_prompt(
                     req =
                         PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
                     tracing::info!(session = router_sid, "orchestration forced via prefix");
+                } else if let Some(diff) = match lower_ref.as_str() {
+                    "hard" => Some(crate::config::PlannerDifficulty::Hard),
+                    "easy" => Some(crate::config::PlannerDifficulty::Easy),
+                    _ => None,
+                } {
+                    req =
+                        PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
+                    shared.with_session(&router_sid, |s| s.planner_difficulty = Some(diff));
+                    let pool_label = match diff {
+                        crate::config::PlannerDifficulty::Hard => "astra/fable",
+                        crate::config::PlannerDifficulty::Easy => "opus/sol",
+                    };
+                    notify_user(
+                        &shared,
+                        &router_sid,
+                        format!("router-acp · planner: `{lower_ref}:` prefix → {pool_label} pool"),
+                    );
+                    tracing::info!(
+                        session = router_sid,
+                        prefix = %lower_ref,
+                        "planner difficulty prefix"
+                    );
+                    // Mid-session, still in planning: switch if the current
+                    // pin is outside the requested pool.
+                    let (pinned, phase, class, excluded, current) = shared
+                        .with_session(&router_sid, |s| {
+                            (
+                                s.pin.is_some() || s.pinning,
+                                s.planner_phase,
+                                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                                s.excluded.clone(),
+                                s.pin.as_ref().map(|p| p.candidate.clone()),
+                            )
+                        })
+                        .unwrap_or((false, None, TaskClass::CodingGeneral, Vec::new(), None));
+                    if pinned && phase != Some(crate::config::PlannerPhase::Implementation) {
+                        if let Some(target) = select_planner_target(
+                            &shared,
+                            crate::config::PlannerPhase::Planning,
+                            class,
+                            &excluded,
+                            Some(diff),
+                        ) {
+                            if current.as_ref() != Some(&target) {
+                                shared.with_session(&router_sid, |s| {
+                                    s.pending_switch = Some(SwitchRequest {
+                                        target: target.clone(),
+                                        reason: format!("requested via `{lower_ref}:` prefix"),
+                                        handoff: HandoffStyle::Full,
+                                    });
+                                });
+                            }
+                        }
+                    }
                 } else if let Some(target) = {
                     let (class, excluded) = shared
                         .with_session(&router_sid, |s| {
@@ -7253,6 +7321,7 @@ async fn dispatch_prompt(
             crate::config::PlannerPhase::Implementation,
             class,
             &excluded,
+            None,
         ) {
             shared.with_session(&router_sid, |s| {
                 if s.pending_switch.is_none() {
@@ -8140,6 +8209,17 @@ mod directive_tests {
             out.contains("what now?") && !out.contains("gpt:"),
             "stripped: {out}"
         );
+
+        let (r, s) =
+            split_model_shorthand(&[ContentBlock::from("hard: redesign auth".to_string())])
+                .unwrap();
+        assert_eq!(r, "hard");
+        assert_eq!(text(&s), "redesign auth");
+        let (r, s) =
+            split_model_shorthand(&[ContentBlock::from("easy: list the endpoints".to_string())])
+                .unwrap();
+        assert_eq!(r, "easy");
+        assert_eq!(text(&s), "list the endpoints");
     }
 
     /// The note the Kory Code client appends to the first prompt of every

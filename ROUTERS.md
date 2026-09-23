@@ -329,6 +329,17 @@ stay in the planning pool so `auto`'s `apex_complexity` (pure quality) can
 reach them for exceptionally hard plans. Implementation workers remain
 Opus, Terra, and Grok.
 
+Prefix a planning prompt with `hard: ` or `easy: ` to override that
+automatic split for that message (the prefix is stripped; the model never
+sees it):
+
+- `hard: redesign auth` — planning pool is Astra / Fable only
+- `easy: list the endpoints` — planning pool is Opus / Sol only
+- no prefix — current auto ranking, Astra / Fable only at apex complexity
+
+A prefix on a pinned planning session switches if the current pin is
+outside the requested pool. It is ignored in the implementation phase.
+
 ### Crossover
 
 At the extremes, models from the other phase's pool are admitted:
@@ -415,6 +426,8 @@ routers:
   planner:
     planning_candidates: ["*opus*", "*sol*", "*astra*", "*fable*"]
     implementation_candidates: ["*terra*", "*opus*", "*grok*"]
+    easy_planning_candidates: ["*opus*", "*sol*"]
+    hard_planning_candidates: ["*astra*", "*fable*"]
     model_boosts:
       - pattern: "*grok*"
         implementation: 2.0

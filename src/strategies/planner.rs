@@ -8,7 +8,7 @@
 //! `router: auto` (no parallel tuning surface).
 
 use crate::candidate::glob_match;
-use crate::config::{AutoRouterConfig, PlannerPhase, PlannerRouterConfig};
+use crate::config::{AutoRouterConfig, PlannerDifficulty, PlannerPhase, PlannerRouterConfig};
 
 use super::{
     AutoStrategy, CandidateView, RankedCandidate, RouteContext, RouteError, RouterStrategy,
@@ -51,15 +51,25 @@ impl RouterStrategy for PlannerStrategy {
         let complexity = ctx.profile.complexity.clamp(0.0, 1.0);
         let cfg = &self.planner_cfg;
 
-        // 1. Assemble the pool for this phase.
-        let (primary, crossover_ok) = match phase {
-            PlannerPhase::Planning => {
-                let cross = complexity <= cfg.floor_complexity;
-                (&cfg.planning_candidates, cross)
-            }
+        // 1. Assemble the pool for this phase. A `hard:` / `easy:` prefix
+        //    subsets the planning pool and skips floor crossover — the
+        //    prefix is an explicit pool choice, not "also admit workers".
+        let (primary, crossover_ok, difficulty_tag) = match phase {
+            PlannerPhase::Planning => match ctx.planner_difficulty {
+                Some(PlannerDifficulty::Easy) => {
+                    (&cfg.easy_planning_candidates, false, " · easy: prefix")
+                }
+                Some(PlannerDifficulty::Hard) => {
+                    (&cfg.hard_planning_candidates, false, " · hard: prefix")
+                }
+                None => {
+                    let cross = complexity <= cfg.floor_complexity;
+                    (&cfg.planning_candidates, cross, "")
+                }
+            },
             PlannerPhase::Implementation => {
                 let cross = complexity >= cfg.apex_complexity;
-                (&cfg.implementation_candidates, cross)
+                (&cfg.implementation_candidates, cross, "")
             }
         };
         let secondary = match phase {
@@ -72,6 +82,18 @@ impl RouterStrategy for PlannerStrategy {
             .filter(|c| matches_any(c, primary) || (crossover_ok && matches_any(c, secondary)))
             .cloned()
             .collect();
+        // Prefix globs that match nothing in the live catalog (e.g. `*astra*`
+        // when Astra isn't configured) must not empty the pool — fall back
+        // to the full planning set and say so.
+        let mut difficulty_tag = difficulty_tag.to_string();
+        if pool.is_empty() && phase == PlannerPhase::Planning && ctx.planner_difficulty.is_some() {
+            pool = candidates
+                .iter()
+                .filter(|c| matches_any(c, &cfg.planning_candidates))
+                .cloned()
+                .collect();
+            difficulty_tag.push_str(" (empty subset; full planning pool)");
+        }
 
         // 2. Apply per-model phase boosts.
         for view in &mut pool {
@@ -133,7 +155,7 @@ impl RouterStrategy for PlannerStrategy {
                 .unwrap_or_default();
             r.reason = format!(
                 "planner → {} · phase={phase_str} \
-                 (pool: {phase_str}_candidates{crossover_tag}{boost_note}) · {}",
+                 (pool: {phase_str}_candidates{crossover_tag}{difficulty_tag}{boost_note}) · {}",
                 r.candidate, r.reason
             );
         }
@@ -253,6 +275,8 @@ mod tests {
             phase_upgrade_confidence: 0.7,
             apex_complexity: 0.85,
             floor_complexity: 0.15,
+            easy_planning_candidates: vec!["*opus*".into(), "*sol*".into()],
+            hard_planning_candidates: vec!["*astra*".into(), "*fable*".into()],
             planning_instructions: String::new(),
         }
     }
@@ -280,6 +304,7 @@ mod tests {
             explicit_candidate: None,
             explicit_source: None,
             planner_phase: Some(phase),
+            planner_difficulty: None,
         }
     }
 
@@ -406,6 +431,75 @@ mod tests {
         );
     }
 
+    fn ctx_with_difficulty(difficulty: PlannerDifficulty) -> RouteContext {
+        let mut ctx = ctx_with_phase(PlannerPhase::Planning, 0.5);
+        ctx.planner_difficulty = Some(difficulty);
+        ctx
+    }
+
+    #[test]
+    fn easy_prefix_restricts_planning_pool_to_opus_and_sol() {
+        let s = PlannerStrategy::new(PlannerRouterConfig::default(), auto_cfg(), 0.1);
+        let ranked = s
+            .rank(&ctx_with_difficulty(PlannerDifficulty::Easy), &pool())
+            .unwrap();
+        assert!(
+            ranked.iter().all(|r| {
+                let id = r.candidate.to_string();
+                id.contains("opus") || id.contains("sol")
+            }),
+            "easy: must not admit fable: {:?}",
+            ranked
+                .iter()
+                .map(|r| r.candidate.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ranked.iter().any(|r| r.reason.contains("easy: prefix")),
+            "{}",
+            ranked[0].reason
+        );
+        assert!(!ranked.is_empty());
+    }
+
+    #[test]
+    fn hard_prefix_restricts_planning_pool_to_fable() {
+        let s = PlannerStrategy::new(PlannerRouterConfig::default(), auto_cfg(), 0.1);
+        let ranked = s
+            .rank(&ctx_with_difficulty(PlannerDifficulty::Hard), &pool())
+            .unwrap();
+        assert_eq!(ranked.len(), 1, "astra isn't in the pool; fable only");
+        assert!(ranked[0].candidate.to_string().contains("fable"));
+        assert!(
+            ranked[0].reason.contains("hard: prefix"),
+            "{}",
+            ranked[0].reason
+        );
+    }
+
+    #[test]
+    fn no_prefix_keeps_full_planning_pool() {
+        let s = PlannerStrategy::new(PlannerRouterConfig::default(), auto_cfg(), 0.1);
+        let ranked = s
+            .rank(&ctx_with_phase(PlannerPhase::Planning, 0.5), &pool())
+            .unwrap();
+        assert!(
+            ranked
+                .iter()
+                .any(|r| r.candidate.to_string().contains("opus"))
+        );
+        assert!(
+            ranked
+                .iter()
+                .any(|r| r.candidate.to_string().contains("fable"))
+        );
+        assert!(
+            ranked
+                .iter()
+                .all(|r| !r.reason.contains("easy: prefix") && !r.reason.contains("hard: prefix"))
+        );
+    }
+
     #[test]
     fn default_planning_pool_includes_opus() {
         let cfg = PlannerRouterConfig::default();
@@ -460,6 +554,7 @@ mod tests {
             explicit_candidate: None,
             explicit_source: None,
             planner_phase: None,
+            planner_difficulty: None,
         };
         let ranked = s.rank(&ctx, &pool()).unwrap();
         assert!(ranked.iter().all(|r| {
