@@ -1175,7 +1175,11 @@ pub struct PlannerModelBoost {
 }
 
 fn default_planning_candidates() -> Vec<String> {
+    // Everyday planning is Opus (currently 5.5) and Sol. Fable/Astra stay in
+    // the pool so auto's apex_complexity (pure quality) can reach them for
+    // exceptionally hard plans. Ranking is auto, not glob order.
     vec![
+        "*opus*".to_string(),
         "*sol*".to_string(),
         "*astra*".to_string(),
         "*fable*".to_string(),

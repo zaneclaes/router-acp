@@ -407,6 +407,46 @@ mod tests {
     }
 
     #[test]
+    fn default_planning_pool_includes_opus() {
+        let cfg = PlannerRouterConfig::default();
+        assert!(
+            cfg.planning_candidates.iter().any(|p| p == "*opus*"),
+            "opus is an everyday planner: {:?}",
+            cfg.planning_candidates
+        );
+        assert!(
+            cfg.implementation_candidates.iter().any(|p| p == "*opus*"),
+            "opus remains a workhorse: {:?}",
+            cfg.implementation_candidates
+        );
+        let s = PlannerStrategy::new(cfg, auto_cfg(), 0.1);
+        let ctx = ctx_with_phase(PlannerPhase::Planning, 0.5);
+        let ranked = s.rank(&ctx, &pool()).unwrap();
+        assert!(
+            ranked
+                .iter()
+                .any(|r| r.candidate.to_string().contains("opus")),
+            "planning phase must admit opus: {:?}",
+            ranked
+                .iter()
+                .map(|r| r.candidate.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ranked.iter().all(|r| {
+                let id = r.candidate.to_string();
+                id.contains("opus") || id.contains("fable") || id.contains("sol")
+            }),
+            "grok stays an implementation worker: {:?}",
+            ranked
+                .iter()
+                .map(|r| r.candidate.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ranked.len(), 3);
+    }
+
+    #[test]
     fn default_phase_is_planning() {
         let s = PlannerStrategy::new(planner_cfg(), auto_cfg(), 0.1);
         let ctx = RouteContext {

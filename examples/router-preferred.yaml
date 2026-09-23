@@ -303,6 +303,14 @@ routers:
     # itself at genuine extremes, not only via explicit pins/planner globs.
     apex_complexity: 0.9
 
+  # Two-phase routing (used when `router: planner`). Everyday planning is
+  # Opus 5.5 / Sol; Fable and Astra stay in the pool so auto's
+  # apex_complexity (pure quality) can reach them for exceptionally hard
+  # plans. Implementation workers stay Opus / Terra / Grok.
+  planner:
+    planning_candidates: ["*opus*", "*sol*", "*astra*", "*fable*"]
+    implementation_candidates: ["*terra*", "*opus*", "*grok*"]
+
 # Proactive usage-cap cordoning (on by default; inert unless an agent declares a
 # `usage_source` above). Polls the provider usage API and marks a model
 # unroutable while its cap is exhausted with no overage/credit headroom — so
