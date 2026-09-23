@@ -113,31 +113,34 @@ candidates:
       Ops: 2.02
       CodingGeneral: 2.02
 
-  # Claude Opus 5 (`claude-opus-5` / CLI alias `opus[1m]`). Real Opus 5
-  # evidence (card published 2026-07-24) replaced the Opus 4.8 proxy this
-  # entry launched with, but the resulting raw gap vs Fable does not survive
-  # scrutiny as a genuine capability difference: the one same-table row
-  # (SWE-Bench-Pro) has Fable narrowly ahead (80.0 vs 79.2), the DeepSWE error
-  # bars overlap (70+/-4 vs 74+/-4, and Anthropic's own launch tables
-  # reportedly favor Fable there), and the Terminal-Bench comparison is
-  # cross-harness (Opus alone spans 84.6-89.1 across published harnesses).
-  # This is a declared compression pair (`benchmark_scoring.compression` in
-  # model-policy.yaml): Fable keeps its own calibrated scores and this OUTPUT
-  # is pinned to Fable - 0.02/class, so cost_rank (4 vs 5) routes everyday
-  # AND hard work to Opus at half the price, while the tiny residual gap
-  # preserves the marketing-consistent order for the apex/escalation paths
-  # that need to reach Fable at genuine extremes. The updater regenerates
-  # this block from that pairing; do not hand-edit it back to the raw
-  # evidence numbers (they're recorded, uncompressed, in model-policy.yaml).
+  # Claude Opus family (`opus[1m]` currently wires to `claude-opus-5-5`).
+  # Real Opus 5 evidence (card published 2026-07-24) replaced the Opus 4.8
+  # proxy this entry launched with. Opus 5.5 has no published benchmark card
+  # yet, so it inherits these Opus 5 rows (no score churn — the
+  # `opus[1m]` → `opus-next[1m]` case in docs/model-updater.md). The resulting
+  # raw gap vs Fable does not survive scrutiny as a genuine capability
+  # difference: the one same-table row (SWE-Bench-Pro) has Fable narrowly
+  # ahead (80.0 vs 79.2), the DeepSWE error bars overlap (70+/-4 vs 74+/-4,
+  # and Anthropic's own launch tables reportedly favor Fable there), and the
+  # Terminal-Bench comparison is cross-harness (Opus alone spans 84.6-89.1
+  # across published harnesses). This is a declared compression pair
+  # (`benchmark_scoring.compression` in model-policy.yaml): Fable keeps its
+  # own calibrated scores and this OUTPUT is pinned to Fable - 0.02/class, so
+  # cost_rank (4 vs 5) routes everyday AND hard work to Opus at half the
+  # price, while the tiny residual gap preserves the marketing-consistent
+  # order for the apex/escalation paths that need to reach Fable at genuine
+  # extremes. The updater regenerates this block from that pairing; do not
+  # hand-edit it back to the raw evidence numbers (they're recorded,
+  # uncompressed, in model-policy.yaml).
   # Legacy Claude versions that predate mid-conversation `role: "system"`
   # turns (Claude Code's `mid-conversation-system` beta; the CLI's own model
-  # catalog lists `mid_conv_system` for Opus 4.8 / Opus 5 / Sonnet 5 / Fable
-  # and not for these). Claude Code decides to send those turns from the alias
-  # it was configured with (`opus[1m]` → Opus 5), so a version pin onto one of
-  # these would ship a turn the model 400s on every new session. With
-  # `system_turns: false` the proxy folds the turns into user turns and drops
-  # the beta token before sending. Pin-only versions: quality mirrors the
-  # family entry below and is never ranked.
+  # catalog lists `mid_conv_system` for Opus 4.8 / Opus 5 / Opus 5.5 /
+  # Sonnet 5 / Fable and not for these). Claude Code decides to send those
+  # turns from the alias it was configured with (`opus[1m]` → Opus 5.5), so a
+  # version pin onto one of these would ship a turn the model 400s on every
+  # new session. With `system_turns: false` the proxy folds the turns into
+  # user turns and drops the beta token before sending. Pin-only versions:
+  # quality mirrors the family entry below and is never ranked.
   - pattern: "*opus-4-6*"
     system_turns: false
     coding_tier: high

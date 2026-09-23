@@ -120,14 +120,17 @@ benchmark_scoring:
       - { benchmark: Terminal-Bench-2.1, result: 85.6, source: "https://openai.com/index/gpt-5-6/" }
     "*opus*":
       # Real Claude Opus 5 rows (card published 2026-07-24), replacing the
-      # Opus 4.8 proxy this entry launched with. SWE-Bench-Pro comes from the
-      # same system-card comparison table as the Fable 80.0 / Sol 64.6 rows
-      # above. Terminal-Bench is Artificial Analysis's independent max-effort
-      # run (Vals.ai's harness reports 84.6 with a refusal-fallback caveat —
-      # harness variance, not a typo). DeepSWE is the same public v1.1
-      # leaderboard the Fable 69.7 / Sol 72.7 rows trace to. No AA-Coding-Agent
-      # row: AA's current coding-agent index publishes on a points scale that
-      # does not map onto this benchmark's raw-result anchors.
+      # Opus 4.8 proxy this entry launched with. Opus 5.5 has no published
+      # benchmark card yet, so it inherits these Opus 5 rows (no score churn —
+      # the `opus[1m]` → `opus-next[1m]` case in docs/model-updater.md).
+      # SWE-Bench-Pro comes from the same system-card comparison table as the
+      # Fable 80.0 / Sol 64.6 rows above. Terminal-Bench is Artificial
+      # Analysis's independent max-effort run (Vals.ai's harness reports 84.6
+      # with a refusal-fallback caveat — harness variance, not a typo). DeepSWE
+      # is the same public v1.1 leaderboard the Fable 69.7 / Sol 72.7 rows
+      # trace to. No AA-Coding-Agent row: AA's current coding-agent index
+      # publishes on a points scale that does not map onto this benchmark's
+      # raw-result anchors.
       - { benchmark: SWE-Bench-Pro, result: 79.2, source: "https://www.anthropic.com/news/claude-opus-5" }
       - { benchmark: DeepSWE-v1.1, result: 73.6, source: "https://deepswe.datacurve.ai/" }
       - { benchmark: Terminal-Bench-2.1, result: 89.1, source: "https://artificialanalysis.ai/evaluations/terminalbench-v2-1" }
@@ -185,16 +188,19 @@ cost:
   # form, first match wins, and each key merges over the agent ratio so an
   # override only has to state the rate that actually differs.
   #
-  # Fable 5.1 is the first Claude model whose cache READ is not 0.1x input:
-  # $0.25 against $10 input is 0.025x — a 4x cheaper warm read than every
-  # other Claude model, which lengthens the cache-reprime break-even the
-  # demotion gate computes. Writes are unchanged (5m $12.50 = 1.25x).
+  # Two Claude models break the 0.1x cache READ: Fable 5.1 ($0.25 against
+  # $10 input is 0.025x) and Opus 5.5 ($0.20 against $4 input is 0.05x).
+  # Both lengthen the cache-reprime break-even the demotion gate computes.
+  # Writes are unchanged (1.25x).
   #
-  # Scoped to the 5.1 ids only. The fable DEFAULT candidate
+  # Fable 5.1 is scoped to the 5.1 ids only: the fable DEFAULT candidate
   # (`claude-fable-5[1m]`) still serves Fable 5 at the standard 0.1x read, so
-  # it must keep being validated against the agent ratio.
+  # it must keep being validated against the agent ratio. Opus 5.5 is the
+  # `opus[1m]` family default; the pin-only `claude/claude-opus-5` row stays
+  # on the 0.1x agent ratio.
   cache_ratio_overrides:
     "claude/claude-fable-5-1*": { read: 0.025 }
+    "claude/opus[1m]": { read: 0.05 }
   # Ranks must be weakly monotonic in blended price WITHIN an agent: a cheaper
   # model must not carry a higher rank. Every exception is deliberate and lives
   # here with its reason, so a genuine mistake still shows up as an error.
@@ -233,6 +239,9 @@ witnesses:
   # (see the fable entries in examples/router-preferred.yaml).
   fable_5_1: "claude/claude-fable-5-1"
   opus: "claude/opus[1m]"
+  # Opus 5, a PIN-ONLY candidate — not the opus default. The default entry
+  # now serves Opus 5.5 (see the opus entries in examples/router-preferred.yaml).
+  opus_5_legacy: "claude/claude-opus-5"
   opus_legacy: "claude/claude-opus-4-6"
   sonnet: "claude/sonnet"
   haiku: "claude/haiku"
@@ -293,6 +302,12 @@ invariants:
         because that is what the checker speaks: if a future narrower pattern
         ever steals the 5.1 id and scores it differently, the chain breaks
         instead of the difference going unnoticed.
+    - chain: [opus, opus_5_legacy]
+      why: >-
+        Opus 5.5 INHERITS `*opus*`'s calibrated Opus 5 scores — no published
+        5.5 card yet, so a version bump keys on the model line with no
+        re-score and no churn (same treatment Fable 5.1 and grok 4.5 -> 4.6
+        got). The pin-only Opus 5 id must keep resolving to that family.
     - chain: [opus, opus_legacy]
       why: >-
         the pinned legacy Opus id inherits `*opus*` for the same reason. It is
@@ -321,11 +336,16 @@ invariants:
     "claude/claude-fable-5-1": "*fable*"
     "claude/claude-fable-5-1[1m]": "*fable*"
     "claude/opus[1m]": "*opus*"
+    # Opus 5.5 (the current `opus[1m]` wire id) and pin-only Opus 5 inherit
+    # the family glob until a 5.5 card is published.
+    "claude/claude-opus-5-5": "*opus*"
+    "claude/claude-opus-5": "*opus*"
     # Pinned legacy Claude versions (auto_eligible: false candidates) keep
-    # resolving to their family, so an explicit pin routes on a real score
-    # rather than the neutral 0.5 default.
-    "claude/claude-opus-4-6": "*opus*"
-    "claude/claude-sonnet-4-6": "*sonnet*"
+    # resolving to a real score rather than the neutral 0.5 default. 4.6
+    # versions have their own narrower patterns (`system_turns: false`)
+    # above the family globs, so first-match lands there.
+    "claude/claude-opus-4-6": "*opus-4-6*"
+    "claude/claude-sonnet-4-6": "*sonnet-4-6*"
     "claude/sonnet": "*sonnet*"
     "claude/haiku": "*haiku*"
     "gemini/gemini-3-pro": "*gemini*pro*"
@@ -342,7 +362,7 @@ invariants:
 # instead of quietly skewing cost routing. USD per Mtok.
 # ---------------------------------------------------------------------------
 published_pricing:
-  as_of: "2026-09-03"
+  as_of: "2026-09-23"
   models:
     "claude/haiku": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
     # Sonnet 5 is PERMANENTLY $2/$10: the increase to $3/$15 scheduled for
@@ -350,7 +370,12 @@ published_pricing:
     # and 4.5 remain $3/$15, which is why the rate lives on the candidate and
     # not on a `*sonnet*` glob.
     "claude/sonnet": { input_per_mtok: 2.00, output_per_mtok: 10.00 }
-    "claude/opus[1m]": { input_per_mtok: 5.00, output_per_mtok: 25.00 }
+    # Opus 5.5 is the `opus[1m]` family default: $4/$20, cache read 0.05x
+    # ($0.20). See cost.cache_ratio_overrides.
+    "claude/opus[1m]":
+      { input_per_mtok: 4.00, output_per_mtok: 20.00, cache_read_per_mtok: 0.20 }
+    # Pin-only Opus 5: previous family default, still $5/$25 at 0.1x cache.
+    "claude/claude-opus-5": { input_per_mtok: 5.00, output_per_mtok: 25.00 }
     # The fable DEFAULT candidate serves Fable 5 — $10/$50 at the standard
     # 0.1x cache read ($1.00). Deliberately NOT 5.1: that wire id is gated on
     # Claude Code >= 2.1.251.
