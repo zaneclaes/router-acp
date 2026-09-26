@@ -537,7 +537,10 @@ Three ways it happens:
    models. `skill_routing` maps a skill pattern to a preferred set of candidate
    globs; when a prompt invokes that skill (as `/name` or a standalone token)
    and the pinned model is not already acceptable, the session switches to the
-   best available match. Before the pin it steers the initial routing instead.
+   best available match. Before the pin it steers the initial routing instead,
+   unless `candidate_override_source` is already `UserPick` (an explicit
+   `[router: candidate=…]` / spawn `model` wins on prompt 1). A later skill
+   turn on a pinned session still switches.
 
    ```yaml
    skill_routing:
