@@ -3805,6 +3805,113 @@ async fn skill_routing_first_match_selection_overrides_quality_order() {
     .await;
 }
 
+/// Live bug (Kory Code spawn): `POST /api/agent/sessions` with
+/// `model: claude/sonnet` (rendered as `[router: candidate=…]`) plus a brief
+/// that names ship-pr/finalize-pr applied UserPick, then the pre-pin skill
+/// steer overwrote it because `current` pin was still None. Explicit
+/// candidate must win on prompt 1.
+#[tokio::test]
+async fn skill_routing_does_not_overwrite_pre_pin_user_pick() {
+    let state = temp_state_file("skill-userpick-prepin");
+    let log = temp_log("skill-userpick-prepin");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    selection: first-match\n\
+         \x20   candidates: [\"*m2*\", \"*m3*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // First prompt: explicit candidate AND a skill mention. m1 is in
+        // neither skill list, so the old pre-pin branch would steer to m2.
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/m1, phase=implementation]\nplease run ship-pr on this branch",
+        )
+        .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:m1:"),
+            "explicit UserPick must pin a/m1 on prompt 1: {text}"
+        );
+        assert!(
+            !text.contains("echo:m2:") && !text.contains("skill `ship-pr` steering"),
+            "pre-pin skill steer must not overwrite UserPick: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// The other half: a plain `/ship-pr` (or skill token) on an unpinned session
+/// with no UserPick still follows skill routing. Do not skip the pre-pin
+/// steer just because the session has not pinned yet.
+#[tokio::test]
+async fn skill_routing_still_steers_unpinned_session_without_user_pick() {
+    let state = temp_state_file("skill-unpinned-steer");
+    let log = temp_log("skill-unpinned-steer");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: ship-pr\n    selection: first-match\n\
+         \x20   candidates: [\"*m2*\", \"*m3*\"]\n\
+         agents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "c",
+            &[("m3", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "please run ship-pr on this branch").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:m2:") || text.contains("skill `ship-pr` steering"),
+            "unpinned /ship-pr with no UserPick must still skill-steer: {text}"
+        );
+        assert!(
+            !text.contains("echo:m1:please run ship-pr"),
+            "must not fall through to the default first agent: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// `terse_handoff: true` sends the terse briefing instruction instead of the
 /// full summary prompt, and the new model's seeded context is framed as a
 /// terse briefing (not "a summary of the conversation").

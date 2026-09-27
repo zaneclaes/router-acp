@@ -7443,22 +7443,48 @@ async fn dispatch_prompt(
                         });
                         tracing::info!(session = router_sid, skill = %pattern, %target, "skill switch queued");
                     } else {
-                        shared.with_session(&router_sid, |s| {
-                            s.candidate_override = Some(target.clone());
-                            s.candidate_override_source =
-                                Some(OverrideSource::Skill(pattern.clone()));
-                            s.elevation = Some(format!("skill `{pattern}`"));
-                            s.elevation_skill = Some(pattern.clone());
-                            s.quiet_turns = 0;
-                        });
-                        notify_user(
-                            &shared,
-                            &router_sid,
-                            format!(
-                                "router-acp · skill `{pattern}` steering this session to {target}"
-                            ),
-                        );
-                        tracing::info!(session = router_sid, skill = %pattern, %target, "skill pin steered");
+                        // Pre-pin: an explicit UserPick (`[router: candidate=…]`,
+                        // `model:` shorthand, `router.candidate` config) already
+                        // chose the seat. Skill routing used to overwrite that
+                        // override because `already_ok` is false when `current`
+                        // pin is None, so spawn `model: claude/sonnet` plus a
+                        // brief that names ship-pr/finalize-pr silently pinned
+                        // grok. A later `/ship-pr` on a pinned session still
+                        // switches via the `current.is_some()` arm above; a
+                        // plain unpinned `/ship-pr` with no UserPick still
+                        // steers (this skip is UserPick-only).
+                        let keep_user_pick = shared
+                            .with_session(&router_sid, |s| {
+                                matches!(
+                                    s.candidate_override_source,
+                                    Some(OverrideSource::UserPick)
+                                )
+                            })
+                            .unwrap_or(false);
+                        if keep_user_pick {
+                            tracing::info!(
+                                session = router_sid,
+                                skill = %pattern,
+                                "skill steer skipped: user pick already set"
+                            );
+                        } else {
+                            shared.with_session(&router_sid, |s| {
+                                s.candidate_override = Some(target.clone());
+                                s.candidate_override_source =
+                                    Some(OverrideSource::Skill(pattern.clone()));
+                                s.elevation = Some(format!("skill `{pattern}`"));
+                                s.elevation_skill = Some(pattern.clone());
+                                s.quiet_turns = 0;
+                            });
+                            notify_user(
+                                &shared,
+                                &router_sid,
+                                format!(
+                                    "router-acp · skill `{pattern}` steering this session to {target}"
+                                ),
+                            );
+                            tracing::info!(session = router_sid, skill = %pattern, %target, "skill pin steered");
+                        }
                     }
                 }
                 None => notify_user(
