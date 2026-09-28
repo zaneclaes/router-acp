@@ -1302,6 +1302,54 @@ pub(crate) fn prompt_display_text(prompt: &[ContentBlock]) -> String {
     out
 }
 
+/// Build the temporary session title from the first user-authored text block.
+/// Ticket enrichment prepends router-framed blocks, which remain part of the
+/// downstream prompt but must not replace the user's opening words here.
+fn placeholder_title(prompt: &[ContentBlock]) -> Option<String> {
+    prompt.iter().find_map(|block| match block {
+        ContentBlock::Text(text) if !crate::tickets::is_injected_ticket_block(&text.text) => {
+            let one_line = text.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut title: String = one_line.chars().take(80).collect();
+            if one_line.chars().count() > 80 {
+                title.push('…');
+            }
+            (!title.is_empty()).then_some(title)
+        }
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod placeholder_title_tests {
+    use super::placeholder_title;
+    use crate::tickets::frame_ticket;
+    use agent_client_protocol::schema::v1::ContentBlock;
+
+    #[test]
+    fn skips_only_router_injected_ticket_blocks() {
+        let prompt = vec![
+            ContentBlock::from(frame_ticket("HAI-1", "router context")),
+            ContentBlock::from(" \n\t ".to_string()),
+            ContentBlock::from("[Ticket HAI-2] user-authored text\n  continues".to_string()),
+        ];
+
+        assert_eq!(
+            placeholder_title(&prompt).as_deref(),
+            Some("[Ticket HAI-2] user-authored text continues")
+        );
+    }
+
+    #[test]
+    fn folds_whitespace_and_truncates_unicode_safely() {
+        let prompt = vec![ContentBlock::from(format!("  {}\n", "é".repeat(81)))];
+
+        assert_eq!(
+            placeholder_title(&prompt),
+            Some(format!("{}…", "é".repeat(80)))
+        );
+    }
+}
+
 /// Log downstream tool-use / callback session updates that arrive on a
 /// primary session (best-effort observability of "tool usage").
 fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_json::Value) {
@@ -3469,19 +3517,9 @@ async fn pin_session(
                         ),
                     }
                 }
-                // Title: opening words of the first prompt; replaced later by
+                // Title: opening words of the user's prompt; replaced later by
                 // the downstream's own session_info_update title if one comes.
-                let prompt_title = prompt.iter().find_map(|b| match b {
-                    ContentBlock::Text(t) => {
-                        let one_line = t.text.split_whitespace().collect::<Vec<_>>().join(" ");
-                        let mut title: String = one_line.chars().take(80).collect();
-                        if one_line.chars().count() > 80 {
-                            title.push('…');
-                        }
-                        (!title.is_empty()).then_some(title)
-                    }
-                    _ => None,
-                });
+                let prompt_title = placeholder_title(prompt);
                 shared
                     .headroom
                     .lock()
