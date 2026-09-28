@@ -6112,6 +6112,7 @@ async fn partial_plan_headroom_changes_effective_cost() {
 #[tokio::test]
 async fn ticket_reference_enriches_prompt_and_triggers_orchestration() {
     let state = temp_state_file("ticket-orch");
+    let state_path = state.clone();
     let log = temp_log("ticket-orch");
     // The fetch command emits a multi-part work list — so the bare prompt
     // "Fix HAI-1234" becomes rich enough to trigger orchestration.
@@ -6135,7 +6136,7 @@ async fn ticket_reference_enriches_prompt_and_triggers_orchestration() {
             &[("MOCK_LOG", &log.display().to_string())]
         ),
     );
-    run_test(yaml, async |cx, observed| {
+    run_test_shared(yaml, async |cx, observed, _shared| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         // Bare mention — no list in the user's own text.
@@ -6155,6 +6156,15 @@ async fn ticket_reference_enriches_prompt_and_triggers_orchestration() {
             "ticket's work list triggered orchestration: {text}"
         );
         assert!(text.contains("echo:m2:"), "pinned the planner: {text}");
+        assert_eq!(
+            open_state(&state_path)
+                .get(&sid)
+                .expect("session persisted")
+                .title
+                .as_deref(),
+            Some("Fix HAI-1234"),
+            "the placeholder title must use the user prompt, not injected ticket context"
+        );
         Ok(())
     })
     .await;
