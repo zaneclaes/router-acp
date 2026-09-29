@@ -396,7 +396,7 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
     }
     out.push_str("    models:\n");
     for (id, cost) in models {
-        out.push_str(&format!("      - {{ id: {id}, cost_rank: {cost} }}\n"));
+        out.push_str(&format!("      - {{ id: \"{id}\", cost_rank: {cost} }}\n"));
     }
     out
 }
@@ -847,6 +847,102 @@ async fn declared_model_missing_downstream_is_removed() {
         assert!(
             !values.contains(&"mock/bogus".to_string()),
             "values: {values:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn opus_1m_catalog_routes_when_selector_offers_bare_opus() {
+    let state = temp_state_file("opus-1m-synonym");
+    let log = temp_log("opus-1m-synonym");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nrouter: static\n\
+         routers:\n  static: {{ candidate: \"mock/opus[1m]\" }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("opus[1m]", 4)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+        .replace(
+            "MOCK_MODELS, value: \"opus[1m]\"",
+            "MOCK_MODELS, value: \"opus\""
+        )
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let options = session.config_options.clone().unwrap_or_default();
+        let candidate_opt = options
+            .iter()
+            .find(|o| o.id.0.as_ref() == "router.candidate")
+            .expect("router.candidate option");
+        let SessionConfigKind::Select(select) = &candidate_opt.kind else {
+            panic!("router.candidate must be a select");
+        };
+        let values: Vec<String> = match &select.options {
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|g| g.options.iter().map(|o| o.value.0.to_string()))
+                .collect(),
+            SessionConfigSelectOptions::Ungrouped(opts) => {
+                opts.iter().map(|o| o.value.0.to_string()).collect()
+            }
+            _ => vec![],
+        };
+        assert!(
+            values.contains(&"mock/opus[1m]".to_string()),
+            "catalog id stays on the picker: {values:?}"
+        );
+        let sid = session.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "hello").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert!(
+            agent_text(&observed, &sid).contains("echo:opus:hello"),
+            "got: {}",
+            agent_text(&observed, &sid)
+        );
+        let set_events: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "set_config_option")
+            .collect();
+        assert!(
+            set_events.iter().any(|e| e["value"] == "opus"),
+            "adapter must receive the offered spelling `opus`, not `opus[1m]`: {set_events:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn static_unrouteable_error_names_selector_miss() {
+    let state = temp_state_file("opus-selector-miss");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nrouter: static\n\
+         routers:\n  static: {{ candidate: \"mock/opus[1m]\" }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("opus[1m]", 4), ("sonnet", 2)], &[]).replace(
+            "MOCK_MODELS, value: \"opus[1m],sonnet\"",
+            "MOCK_MODELS, value: \"sonnet\""
+        )
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        let err = prompt_text(&cx, &sid, "should fail").await.unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("not offered by downstream model selector"),
+            "expected selector-miss reason, got: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("authenticate")
+                && !text.to_lowercase().contains("sign in"),
+            "must not suggest re-auth when the miss is a selector spelling: {text}"
         );
         Ok(())
     })
