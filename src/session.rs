@@ -38,8 +38,9 @@ use crate::config::{
     Config, DisclosureMode, EscalationPath, RouteSelection, SkillRoute, StrategyKind,
 };
 use crate::downstream::{
-    ProcessKey, ProcessTargetSpec, SelectionKind, build_targets, is_auth_required, probe_target,
-    start_downstream, verify_model_selected,
+    ProcessKey, ProcessTargetSpec, SelectionKind, build_targets, find_model_option,
+    is_auth_required, probe_target, select_values, selector_value_to_send, start_downstream,
+    verify_model_selected,
 };
 use crate::headroom::HeadroomTracker;
 use crate::relay;
@@ -894,6 +895,10 @@ impl Shared {
             .iter()
             .find(|c| &c.id == id)
             .cloned()
+    }
+
+    pub fn candidate_status(&self, id: &CandidateId) -> Option<CandidateStatus> {
+        self.candidate_runtime(id).map(|c| c.status)
     }
 
     // ------------------------------------------------------------------
@@ -2515,13 +2520,18 @@ pub async fn open_downstream_session(
                 .data(format!("no model config option discovered for {candidate}")));
         };
         // The selector speaks `downstream_id` (== `id` unless the entry pins a
-        // legacy version behind a known-good alias); the real wire model is
-        // then held by `api_model` through the per-request proxy.
-        let downstream_model = shared
+        // legacy version behind a known-good alias), or a `[1m]` synonym the
+        // adapter actually listed; the real wire model is then held by
+        // `api_model` through the per-request proxy.
+        let wanted = shared
             .cfg
             .model_config(candidate)
             .map(|m| m.downstream_id().to_string())
             .unwrap_or_else(|| candidate.model.clone());
+        let selector_values = find_model_option(resp.config_options.as_deref().unwrap_or(&[]))
+            .map(|option| select_values(&option))
+            .unwrap_or_default();
+        let downstream_model = selector_value_to_send(&selector_values, &wanted, &candidate.model);
         let set_req = SetSessionConfigOptionRequest::new(
             resp.session_id.clone(),
             config_id.clone(),
@@ -3453,7 +3463,14 @@ async fn pin_session(
     }
     let mut ranked = make_strategy(strategy_kind, &shared.cfg)
         .rank(&ctx, &pool)
-        .map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
+        .map_err(|e| {
+            let message = if strategy_kind == StrategyKind::Static {
+                static_unrouteable_message(shared, &e.0, override_.as_ref())
+            } else {
+                e.to_string()
+            };
+            AcpError::invalid_params().data(message)
+        })?;
 
     // Soft preference (`[router: prefer=...]`): if the preferred candidate
     // survived filtering, move it to the front of the fallback chain; if it
@@ -5977,6 +5994,44 @@ fn frame_terse(from: &CandidateId, briefing: &str, transcript_cmd: &str) -> Stri
 /// and close the old session. Context does not transfer via ACP, so the
 /// briefing IS the handoff. `style` chooses how much of it to carry — see
 /// `HandoffStyle`. Returns the switch disclosure lines.
+/// Name the candidate's actual status instead of the generic
+/// "not verified, quarantined, or lacking a required capability" + re-auth
+/// hint. Auth failures are handled before rank; this is the Invalid / Down path.
+fn static_unrouteable_message(
+    shared: &Shared,
+    err: &str,
+    override_: Option<&CandidateId>,
+) -> String {
+    let chosen = override_.cloned().or_else(|| {
+        shared
+            .cfg
+            .routers
+            .static_
+            .candidate
+            .as_deref()
+            .and_then(CandidateId::parse)
+            .map(|candidate| shared.cfg.resolve_stated_candidate(&candidate))
+    });
+    let Some(id) = chosen else {
+        return err.to_string();
+    };
+    match shared.candidate_status(&id) {
+        Some(CandidateStatus::Invalid(reason)) => {
+            format!("static candidate `{id}` is not routeable ({reason})")
+        }
+        Some(CandidateStatus::Down(reason)) => {
+            format!("static candidate `{id}` is not routeable (downstream down: {reason})")
+        }
+        Some(CandidateStatus::AuthPending) => {
+            format!("static candidate `{id}` is not routeable (authentication pending)")
+        }
+        Some(CandidateStatus::Unverified) => {
+            format!("static candidate `{id}` is not routeable (not yet verified)")
+        }
+        Some(CandidateStatus::Routeable) | None => err.to_string(),
+    }
+}
+
 /// A coordinator only leaves `planning_candidates` on a human pick. Anything
 /// else (planner upgrade, skill route, orchestration, escalation, demotion) is
 /// refused and disclosed; the session stays on its current model.

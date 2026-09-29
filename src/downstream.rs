@@ -248,20 +248,36 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
                     // The selector answers for `downstream_id` (which is `id`
                     // unless the entry pins a legacy version behind a
                     // known-good alias), while the candidate stays keyed on
-                    // `id` everywhere else.
+                    // `id` everywhere else. Claude has dropped `[1m]` from
+                    // natively-1M families (`opus[1m]` → `opus`); accept either
+                    // spelling so a server-side picker rename cannot empty
+                    // the pool.
                     for model in &spec.models {
                         let wanted = model.downstream_id();
-                        if values.iter().any(|v| v == wanted) {
+                        if offered_selector_value(&values, wanted).is_some()
+                            || offered_selector_value(&values, &model.id).is_some()
+                        {
                             routeable.push(model.id.clone());
                         } else {
-                            tracing::warn!(
-                                agent = spec.agent_name,
-                                model = model.id,
-                                downstream_id = wanted,
-                                available = ?values,
-                                "declared model not offered by downstream model selector; \
-                                 removing candidate from the pool"
-                            );
+                            if model.auto_eligible {
+                                tracing::error!(
+                                    agent = spec.agent_name,
+                                    model = model.id,
+                                    downstream_id = wanted,
+                                    available = ?values,
+                                    "auto-eligible model not offered by downstream model selector; \
+                                     removing candidate from the pool"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    agent = spec.agent_name,
+                                    model = model.id,
+                                    downstream_id = wanted,
+                                    available = ?values,
+                                    "declared model not offered by downstream model selector; \
+                                     removing candidate from the pool"
+                                );
+                            }
                             shared.set_model_invalid(
                                 key,
                                 &model.id,
@@ -294,6 +310,42 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
     }
 
     ProbeOutcome::Routeable
+}
+
+/// Selector spellings a catalog `id` / `downstream_id` may be offered as.
+/// Claude dropped the `[1m]` suffix from natively-1M families (`opus[1m]` → `opus`).
+pub fn selector_aliases(id: &str) -> [String; 2] {
+    let alt = match id.strip_suffix("[1m]") {
+        Some(stripped) => stripped.to_string(),
+        None => format!("{id}[1m]"),
+    };
+    [id.to_string(), alt]
+}
+
+/// First value in `values` that names `wanted` (exact match, then `[1m]` synonym).
+pub fn offered_selector_value<'a>(values: &'a [String], wanted: &str) -> Option<&'a str> {
+    for alias in selector_aliases(wanted) {
+        if let Some(v) = values.iter().find(|v| v.as_str() == alias) {
+            return Some(v.as_str());
+        }
+    }
+    None
+}
+
+/// Value to send to a config-option model selector for this catalog entry.
+/// Prefers a spelling the selector actually listed; falls back to `wanted`
+/// so a miss still fails verification instead of inventing a third id.
+pub fn selector_value_to_send(values: &[String], wanted: &str, id: &str) -> String {
+    offered_selector_value(values, wanted)
+        .or_else(|| {
+            if id != wanted {
+                offered_selector_value(values, id)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(wanted)
+        .to_string()
 }
 
 /// Find the model selector among config options: a `select` option with
@@ -476,5 +528,51 @@ agents:
         )
         .category(SessionConfigOptionCategory::Mode);
         assert!(find_model_option(&[option]).is_none());
+    }
+
+    #[test]
+    fn selector_aliases_round_trip_the_1m_suffix() {
+        assert_eq!(
+            selector_aliases("opus[1m]"),
+            ["opus[1m]".to_string(), "opus".to_string()]
+        );
+        assert_eq!(
+            selector_aliases("opus"),
+            ["opus".to_string(), "opus[1m]".to_string()]
+        );
+        assert_eq!(
+            selector_aliases("claude-fable-5-1[1m]"),
+            [
+                "claude-fable-5-1[1m]".to_string(),
+                "claude-fable-5-1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn offered_selector_value_prefers_exact_then_1m_synonym() {
+        let both = vec!["opus[1m]".into(), "opus".into(), "sonnet".into()];
+        assert_eq!(offered_selector_value(&both, "opus[1m]"), Some("opus[1m]"));
+        assert_eq!(offered_selector_value(&both, "opus"), Some("opus"));
+        let bare = vec!["opus".into(), "sonnet".into()];
+        assert_eq!(offered_selector_value(&bare, "opus[1m]"), Some("opus"));
+        let suffixed = vec!["opus[1m]".into(), "sonnet".into()];
+        assert_eq!(offered_selector_value(&suffixed, "opus"), Some("opus[1m]"));
+        assert_eq!(offered_selector_value(&bare, "haiku"), None);
+    }
+
+    #[test]
+    fn selector_value_to_send_uses_the_offered_spelling() {
+        let bare = vec!["opus".into(), "sonnet".into()];
+        assert_eq!(
+            selector_value_to_send(&bare, "opus[1m]", "opus[1m]"),
+            "opus"
+        );
+        assert_eq!(selector_value_to_send(&bare, "opus[1m]", "opus"), "opus");
+        let missing = vec!["sonnet".into()];
+        assert_eq!(
+            selector_value_to_send(&missing, "opus[1m]", "opus[1m]"),
+            "opus[1m]"
+        );
     }
 }
