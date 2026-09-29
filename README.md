@@ -227,6 +227,8 @@ Relay-generated automation can bypass the routine streak by attaching this to th
 
 Accepted hints are `ci-poll`, `ship-nudge`, and `automation`.
 
+A host can mark a planning-only session with `{"_meta":{"router_acp":{"session_role":"coordinator"}}}` on `session/new` or any `session/prompt`. Proxy alternates for that session are limited to `routers.planner.planning_candidates`; the pinned model itself still serves. See ROUTERS.md § "Coordinator sessions" for the full contract (phase lock, failover, human picks).
+
 Every attributed call is written to `llm_requests`, including pinned and selected model, reason/event, endpoint, latency, HTTP status, exact usage, cache read/write tokens, and API-equivalent cost. `tool_calls` tracks tool lifecycle and the `active_tool_calls` view exposes the model currently serving in-flight tools:
 
 ```sql

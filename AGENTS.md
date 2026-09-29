@@ -133,6 +133,19 @@ SDK traps below, which were all discovered the hard way.
   If you add a decision point, disclose it.
 - Deterministic routing: no randomness; tie-breaks are score → effective
   cost → preference → config order.
+- **Coordinator sessions never leave the planning pool automatically.**
+  `_meta.router_acp.session_role: "coordinator"` (sticky, `session/new` or
+  any `session/prompt`) sets `RouterSession.coordinator`. The chokepoints are
+  `Shared::coordinator_blocks` / `in_planning_pool` (planning_candidates),
+  checked in `maybe_update_planner_phase`, the `phase=implementation`
+  directive, `refuse_coordinator_switch` (every queued `pending_switch` and
+  mid-turn escalation), the escalation/upgrade/demotion targets, the
+  `pin_session` pool (initial pin, failover, crossover, all-cordoned
+  fallback; empty → error), and `llm_proxy::select_request_model`. Only
+  `SwitchRequest.user_pick` / `OverrideSource::UserPick` pass, and
+  `pin_user_pick` (persisted as `routing.user_pick`) keeps a human's pick in
+  place. A new routing path that can move a pin must go through the same
+  check. Tests: `coordinator_*` in `tests/protocol.rs`.
 - **Proactive usage cordons** (`cordon.*` + per-agent `usage_source`;
   `src/usage.rs`): a periodic poll (`spawn_usage_poller` in `serve_shared`,
   aborted on return) reads the provider usage API and marks exhausted candidates

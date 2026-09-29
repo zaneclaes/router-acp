@@ -412,6 +412,34 @@ spawn-and-coordinate brief **without** a `[router: phase=…]` directive.
 When any other source upgrades the phase post-pin, the router likewise
 queues a `pending_switch` to the best implementation-phase candidate.
 
+### Coordinator sessions
+
+A host marks a session that must only plan (an epic's parent that spawns
+and supervises implementation sessions) with
+`_meta.router_acp.session_role: "coordinator"` on `session/new` or any
+`session/prompt`. The role is sticky: a later prompt without it does not
+clear it. A coordinator:
+
+- stays in **Planning**. Skill `marks_implementation_phase`, the
+  pre-classifier, the phrase heuristic, and `[router: phase=implementation]`
+  are all ignored (the directive is rejected with a notice). A coordinator
+  already in Implementation is pulled back.
+- only pins, fails over, crosses over, escalates, demotes, or follows a skill
+  route or orchestration steer onto a `planning_candidates` match. Per-request
+  proxy alternates are filtered the same way. Refusals are disclosed
+  (`router-acp · coordinator: refused switch to …`).
+- fails the turn (`no planning candidate is routeable`) when nothing in the
+  planning pool can serve, instead of widening to an implementation model.
+- still honors an **explicit human pick**: `router.candidate`,
+  `[router: candidate=…]` / `switch=…`, and the `model:` shorthand. The pick
+  is recorded (`routing.user_pick`, survives session/load) and later prompts
+  leave it alone. A pin outside the pool that no human chose is switched back
+  to the planning pool on the next coordinator prompt.
+
+Because `switch=` counts as a human pick, a host must not send its own
+`switch=` to keep a coordinator on the pool. Send the role and let the router
+enforce it.
+
 ### Empty pool
 
 If the filtered pool for the current phase is empty (every candidate
