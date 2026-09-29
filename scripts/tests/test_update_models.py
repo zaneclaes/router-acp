@@ -574,7 +574,8 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("-      - { id:", catalog_diff)
         catalog = parse_catalog(CATALOG_PATH)
         self.assertEqual(
-            [model.cost_rank for model in catalog.agent("codex").enabled_models], [1, 3, 2, 4, 5]
+            [model.cost_rank for model in catalog.agent("codex").enabled_models],
+            [1, 3, 2, 4, 5, 2, 5, 5],
         )
 
     def test_unauthed_probe_produces_no_retirement_diff(self):

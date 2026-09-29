@@ -705,6 +705,32 @@ mod score_resolution_tests {
         // luna must not collide with any real id, and terra/luna beat the
         // generic gpt-5 fallback only where intended (terra yes, luna no).
         assert!(q("codex/gpt-5.6-terra") > q("codex/gpt-5.5"));
+        // GPT-6 version bumps inherit family quality (no score churn) but
+        // take the 1.05M window and native xhigh/max. `*gpt-6-sol*` must
+        // not swallow `gpt-6.1-sol`.
+        for id in ["codex/gpt-6-sol", "codex/gpt-6.1-sol"] {
+            assert_eq!(q(id), q("codex/gpt-5.6-sol"), "{id} inherits *sol* quality");
+            let resolved = t.lookup(&CandidateId::parse(id).unwrap());
+            assert_eq!(resolved.context_window, Some(1_050_000), "{id} window");
+            assert_eq!(resolved.max_output_tokens, Some(128_000), "{id} max out");
+            let xhigh = resolved.resolve_effort(EffortLevel::Xhigh);
+            assert_eq!(xhigh.resolved, Some(EffortLevel::Xhigh), "{id} native xhigh");
+            assert_eq!(xhigh.provider_value.as_deref(), Some("xhigh"));
+        }
+        assert_eq!(q("codex/gpt-6-luna"), q("codex/gpt-5.6-luna"));
+        let luna6 = t.lookup(&CandidateId::parse("codex/gpt-6-luna").unwrap());
+        assert_eq!(luna6.context_window, Some(1_050_000));
+        let luna_xhigh = luna6.resolve_effort(EffortLevel::Xhigh);
+        assert_eq!(luna_xhigh.resolved, Some(EffortLevel::Xhigh));
+        assert_eq!(luna_xhigh.provider_value.as_deref(), Some("xhigh"));
+        // 5.6 Sol still collapses xhigh to the provider value `high` — the
+        // family entry is unchanged. Canonical resolved stays Xhigh because
+        // the level is advertised; only the wire value is remapped.
+        let sol56 = t
+            .lookup(&CandidateId::parse("codex/gpt-5.6-sol").unwrap())
+            .resolve_effort(EffortLevel::Xhigh);
+        assert_eq!(sol56.resolved, Some(EffortLevel::Xhigh));
+        assert_eq!(sol56.provider_value.as_deref(), Some("high"));
     }
 
     #[test]

@@ -201,6 +201,24 @@ agents:
           pricing: { input_per_mtok: 2.50, output_per_mtok: 15.00 } }
       - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5,
           pricing: { input_per_mtok: 5.00, output_per_mtok: 30.00 } }
+      # GPT-6 Luna (2026-09-22): $0.10/$0.50, 1.05M, effort low..max. Cheaper
+      # than mini on list price; held at Luna's rank 2 (see rank_exceptions).
+      # Codex 0.159.0 advertises this id. Cache is the standard 0.1x / 1.25x.
+      - { id: gpt-6-luna, display_name: GPT-6 Luna, cost_rank: 2,
+          pricing: { input_per_mtok: 0.10, output_per_mtok: 0.50,
+                     cache_read_per_mtok: 0.01, cache_write_per_mtok: 0.125 } }
+      # GPT-6 Sol (2026-09-22): $2/$10, 1.05M, native xhigh/max. Advertised on
+      # Codex 0.159.0. Rank 5 with the Sol family despite beating Terra on
+      # list price (rank_exceptions).
+      - { id: gpt-6-sol, display_name: GPT-6 Sol, cost_rank: 5,
+          pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
+                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 } }
+      # GPT-6.1 Sol (2026-09-29): $2/$10, 0.05x cache read ($0.10), 1.05M,
+      # native xhigh/max. Near-Astra. Codex 0.159.0 does not advertise this
+      # id yet (Codex v6.1); probe_target drops it until the CLI updates.
+      - { id: gpt-6.1-sol, display_name: GPT-6.1 Sol, cost_rank: 5,
+          pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
+                     cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 } }
 
   # xAI Grok. The official CLI (`npm i -g @xai-official/grok`) is itself an ACP
   # agent — `grok agent stdio` — so no separate adapter is needed. Its own

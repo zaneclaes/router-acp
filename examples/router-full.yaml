@@ -268,6 +268,9 @@ agents:
       - { id: gpt-5.6-luna, display_name: GPT Luna, cost_rank: 2 }
       - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4 }
       - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5 }
+      - { id: gpt-6-luna, display_name: GPT-6 Luna, cost_rank: 2 }
+      - { id: gpt-6-sol, display_name: GPT-6 Sol, cost_rank: 5 }
+      - { id: gpt-6.1-sol, display_name: GPT-6.1 Sol, cost_rank: 5 }
 
   # xAI Grok — the official CLI (`@xai-official/grok`) is itself an ACP agent
   # (`grok agent stdio`); no separate adapter needed. Own company/lineage, so it

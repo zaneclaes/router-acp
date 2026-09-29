@@ -37,6 +37,74 @@ candidates:
       Ops: 2.64
       CodingGeneral: 2.90
 
+  # GPT-6 Sol / Luna version bumps of the 5.6 lines. Quality is copied from
+  # the family entries below (no score churn — the `opus[1m]` → `opus-next[1m]`
+  # case): OpenAI has not published a same-harness four-benchmark card for
+  # 6.x yet. What DID change is the wire shape — 1.05M context, 128k max
+  # output, and native xhigh/max (5.6 Sol maps those down to high; 5.6 Luna
+  # has no xhigh). Narrower than `*sol*`/`*luna*` so first-match wins; the
+  # `*gpt-6-sol*` glob does not match `gpt-6.1-sol` (`gpt-6-sol` is not a
+  # substring of `gpt-6.1-sol`).
+  - pattern: "*gpt-6.1-sol*"
+    coding_tier: high
+    coding_percentile: 0.96
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }
+    default_quality: 2.81
+    quality:
+      UiTweak: 2.81
+      BugFix: 2.39
+      Feature: 2.39
+      Refactor: 2.39
+      Algorithms: 2.81
+      Architecture: 2.81
+      Research: 2.81
+      Writing: 2.81
+      Ops: 2.81
+      CodingGeneral: 2.81
+
+  - pattern: "*gpt-6-sol*"
+    coding_tier: high
+    coding_percentile: 0.96
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }
+    default_quality: 2.81
+    quality:
+      UiTweak: 2.81
+      BugFix: 2.39
+      Feature: 2.39
+      Refactor: 2.39
+      Algorithms: 2.81
+      Architecture: 2.81
+      Research: 2.81
+      Writing: 2.81
+      Ops: 2.81
+      CodingGeneral: 2.81
+
+  - pattern: "*gpt-6-luna*"
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }
+    default_quality: 2.02
+    quality:
+      UiTweak: 2.02
+      BugFix: 2.02
+      Feature: 2.02
+      Refactor: 2.02
+      Algorithms: 2.02
+      Architecture: 2.02
+      Research: 2.02
+      Writing: 2.02
+      Ops: 2.02
+      CodingGeneral: 2.02
+
   # GPT "sol / terra / luna" lines (ids like `gpt-5.6-sol`). Kept above the
   # `*gpt-5*` patterns so a `gpt-5.6-sol` id doesn't fall through to the generic
   # gpt-5 entry (first match wins). The `sol`/`terra`/`luna` substrings don't
