@@ -361,6 +361,18 @@ pub struct RouterSession {
     /// Per-prompt `hard:` / `easy:` planner-pool override. Reset at the
     /// start of every prompt; set only when that prompt carries the prefix.
     pub planner_difficulty: Option<crate::config::PlannerDifficulty>,
+    /// Host-declared coordinator role (`_meta.router_acp.session_role:
+    /// "coordinator"` on `session/new` or any `session/prompt`). Sticky: a
+    /// later prompt without the tag does not clear it. A coordinator stays in
+    /// the Planning phase and on `planning_candidates`; only an explicit user
+    /// pick may move it elsewhere (`Shared::coordinator_blocks`).
+    pub coordinator: bool,
+    /// The current pin came from an explicit human pick (`router.candidate`,
+    /// `[router: candidate=…]` / `switch=…`, `model:` shorthand). Persisted as
+    /// `routing.user_pick` so it survives session/load. A coordinator on a
+    /// human-picked model is left there; any other off-pool pin is switched
+    /// back to `planning_candidates`.
+    pub pin_user_pick: bool,
 }
 
 /// What the outgoing model is asked to write when handing a session off.
@@ -385,6 +397,9 @@ pub struct SwitchRequest {
     /// How much context to carry across. Every switch except a `terse_handoff`
     /// skill route wants `Full`.
     pub handoff: HandoffStyle,
+    /// A human asked for this target (`[router: switch=…]`, `model:`
+    /// shorthand). Only these may move a coordinator off the planning pool.
+    pub user_pick: bool,
 }
 
 impl RouterSession {
@@ -451,6 +466,13 @@ impl RouterSession {
             saw_adapter_cost: false,
             planner_phase: None,
             planner_difficulty: None,
+            coordinator: false,
+            pin_user_pick: persisted
+                .routing
+                .as_ref()
+                .and_then(|r| r.get("user_pick"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         }
     }
 
@@ -511,8 +533,18 @@ impl RouterSession {
             saw_adapter_cost: false,
             planner_phase: None,
             planner_difficulty: None,
+            coordinator: meta_marks_coordinator(req.meta.as_ref()),
+            pin_user_pick: false,
         }
     }
+}
+
+/// True when request `_meta.router_acp.session_role` is `"coordinator"`.
+pub fn meta_marks_coordinator(meta: Option<&agent_client_protocol::schema::v1::Meta>) -> bool {
+    meta.and_then(|m| m.get("router_acp"))
+        .and_then(|r| r.get("session_role"))
+        .and_then(|v| v.as_str())
+        == Some("coordinator")
 }
 
 /// Router-wide shared state. All mutexes are short-lived and never held
@@ -903,6 +935,25 @@ impl Shared {
             .and_then(|s| s.pin.clone())?;
         let conn = self.target_conn(&pin.process_key)?;
         Some((conn, pin.downstream_sid, pin.candidate))
+    }
+
+    /// True when `router_sid` is a coordinator and `target` is outside the
+    /// planner's `planning_candidates`. Callers skip this check only for an
+    /// explicit user pick.
+    pub fn coordinator_blocks(&self, router_sid: &str, target: &CandidateId) -> bool {
+        self.with_session(router_sid, |s| s.coordinator)
+            .unwrap_or(false)
+            && !self.in_planning_pool(target)
+    }
+
+    /// `target` (or the alias it was version-pinned from) matches a
+    /// `routers.planner.planning_candidates` glob.
+    pub fn in_planning_pool(&self, target: &CandidateId) -> bool {
+        let patterns = &self.cfg.routers.planner.planning_candidates;
+        let key = target.to_string();
+        patterns
+            .iter()
+            .any(|p| crate::candidate::glob_match(p, &key))
     }
 
     pub fn with_session<R>(
@@ -1677,6 +1728,7 @@ fn note_tool_activity(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, ro
             target: target.clone(),
             reason: format!("escalation: {n}+ tool calls in one turn without finishing"),
             handoff: HandoffStyle::Full,
+            user_pick: false,
         });
     });
     if let Some(conn) = shared.target_conn(key) {
@@ -1714,6 +1766,7 @@ fn note_tool_failure(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, rou
             target: target.clone(),
             reason: format!("escalation: {n}+ tool failures mid-turn — the model is struggling"),
             handoff: HandoffStyle::Full,
+            user_pick: false,
         });
     });
     if let Some(conn) = shared.target_conn(key) {
@@ -1727,6 +1780,15 @@ fn note_tool_failure(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, rou
 /// candidate; `leap` = the strongest. `None` if nothing more capable is
 /// eligible.
 fn escalation_target(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    path: EscalationPath,
+) -> Option<CandidateId> {
+    ranked_escalation_target(shared, router_sid, path)
+        .filter(|t| !shared.coordinator_blocks(router_sid, t))
+}
+
+fn ranked_escalation_target(
     shared: &Arc<Shared>,
     router_sid: &str,
     path: EscalationPath,
@@ -1804,6 +1866,7 @@ fn note_investigation(shared: &Arc<Shared>, key: &ProcessKey, down_sid: &str, ro
                 "escalation: {reads}+ investigation reads before any output — deeper than it looked"
             ),
             handoff: HandoffStyle::Full,
+            user_pick: false,
         });
     });
     // Interrupt the in-flight cheap turn; the failover loop takes over.
@@ -3194,10 +3257,27 @@ async fn pin_session(
     // With Model=Auto, an explicit effort is a routing requirement rather
     // than a post-selection preference. A concrete candidate remains allowed
     // to normalize to its nearest provider-supported level.
+    // A coordinator keeps a non-human override (skill route, orchestration
+    // planner) only when it names a planning candidate.
+    let coordinator = shared
+        .with_session(router_sid, |s| s.coordinator)
+        .unwrap_or(false);
+    let user_pick = matches!(override_source, Some(OverrideSource::UserPick));
+    let override_ =
+        override_.filter(|cand| !coordinator || user_pick || shared.in_planning_pool(cand));
     let auto_effort = override_.is_none().then_some(effort_request).flatten();
     // Dropping the override (failover exclude, cordon redirect) drops its
     // provenance with it.
     let override_source = override_source.filter(|_| override_.is_some());
+    // Coordinator pool: planning candidates, plus the human-picked override.
+    // Failover and crossover therefore never land on an implementation-only
+    // model; an empty pool fails the turn below rather than widening.
+    let picked = override_.clone().filter(|_| user_pick);
+    let coordinator_admits = |v: &CandidateView| {
+        !coordinator
+            || v.ids().any(|id| shared.in_planning_pool(id))
+            || picked.as_ref() == Some(&v.id)
+    };
     let planner_difficulty = shared
         .with_session(router_sid, |s| s.planner_difficulty)
         .flatten();
@@ -3225,6 +3305,7 @@ async fn pin_session(
     if !excluded_patterns.is_empty() {
         pool.retain(|v| !view_excluded(v, &excluded_patterns));
     }
+    pool.retain(|v| coordinator_admits(v));
     if let Some(min) = larger_context_than {
         pool = prefer_larger_context(&shared.scores, pool, min);
     }
@@ -3244,6 +3325,7 @@ async fn pin_session(
         if let Some(exclude) = exclude {
             relaxed.retain(|v| &v.id != exclude);
         }
+        relaxed.retain(|v| coordinator_admits(v));
         if !excluded_patterns.is_empty() {
             relaxed.retain(|v| !view_excluded(v, &excluded_patterns));
         }
@@ -3276,7 +3358,12 @@ async fn pin_session(
         }
     }
     if pool.is_empty() {
-        return Err(if let Some(effort) = auto_effort {
+        return Err(if coordinator {
+            AcpError::internal_error().data(
+                "coordinator session: no planning candidate is routeable; refusing to fall back \
+                 to an implementation model",
+            )
+        } else if let Some(effort) = auto_effort {
             AcpError::invalid_params().data(format!(
                 "no routeable candidates support the explicitly requested effort `{}` while Model=Auto",
                 effort.as_str()
@@ -3454,6 +3541,7 @@ async fn pin_session(
                             downstream_sid: opened.downstream_sid.clone(),
                             available_modes: available_modes.clone(),
                         });
+                        s.pin_user_pick = picked.as_ref() == Some(&candidate);
                         // Each pin opens a fresh downstream session. Queue its
                         // delegation instruction only if that session actually
                         // received the router tools.
@@ -3592,6 +3680,7 @@ async fn pin_session(
                 let details = json!({
                     "strategy": strategy_kind.as_str(),
                     "candidate": candidate.to_string(),
+                    "user_pick": picked.as_ref() == Some(&candidate),
                     "class": profile.class.as_str(),
                     "complexity": (profile.complexity * 100.0).round() / 100.0,
                     "effort": {
@@ -4057,8 +4146,18 @@ async fn send_prompt_with_failover(
     if let Some(sw) = shared
         .with_session(&router_sid, |s| s.pending_switch.take())
         .flatten()
+        .filter(|sw| !refuse_coordinator_switch(&shared, &router_sid, sw))
     {
-        match switch_pin(&shared, &router_sid, &sw.target, &sw.reason, sw.handoff).await {
+        match switch_pin(
+            &shared,
+            &router_sid,
+            &sw.target,
+            &sw.reason,
+            sw.handoff,
+            sw.user_pick,
+        )
+        .await
+        {
             Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
             Ok(_) => {}
             Err(e) => notify_user(
@@ -4216,6 +4315,7 @@ async fn send_prompt_with_failover(
         if let Some(esc) = shared
             .with_session(&router_sid, |s| s.escalation_requested.take())
             .flatten()
+            .filter(|esc| !refuse_coordinator_switch(&shared, &router_sid, esc))
         {
             shared.with_session(&router_sid, |s| {
                 s.escalations_done += 1;
@@ -4223,7 +4323,16 @@ async fn send_prompt_with_failover(
                 s.elevation_skill = None;
                 s.quiet_turns = 0;
             });
-            match switch_pin(&shared, &router_sid, &esc.target, &esc.reason, esc.handoff).await {
+            match switch_pin(
+                &shared,
+                &router_sid,
+                &esc.target,
+                &esc.reason,
+                esc.handoff,
+                false,
+            )
+            .await
+            {
                 Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
                 Ok(_) => {}
                 Err(e) => notify_user(
@@ -5024,6 +5133,15 @@ fn maybe_update_planner_phase(
     if strategy != StrategyKind::Planner {
         return false;
     }
+    // A coordinator never leaves Planning: skill, pre-class, and heuristic
+    // upgrades are all ignored.
+    if shared
+        .with_session(router_sid, |s| s.coordinator)
+        .unwrap_or(false)
+    {
+        enter_planning_phase(shared, router_sid);
+        return false;
+    }
     // Already implementation — monotonic, nothing to do.
     if current == Some(PlannerPhase::Implementation) {
         return false;
@@ -5326,6 +5444,7 @@ fn maybe_trigger_orchestration(
                     target: planner2,
                     reason: format!("orchestration of {what} ({why})"),
                     handoff: HandoffStyle::Full,
+                    user_pick: false,
                 });
             });
             notify_user(
@@ -5364,6 +5483,10 @@ fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
 /// So when nothing clears the margin, fall back to the best strictly-better
 /// candidate instead of returning nothing.
 fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
+    ranked_upgrade_target(shared, router_sid).filter(|t| !shared.coordinator_blocks(router_sid, t))
+}
+
+fn ranked_upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
     let (class, current, current_q, excluded, elevation_skill) =
         shared.with_session(router_sid, |s| {
             (
@@ -5418,6 +5541,10 @@ fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId>
 /// `grok` but demotion, unaware of that contract, switched a live ship to
 /// `codex/gpt-5.6-terra` because it scored higher than grok at lower cost).
 fn demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
+    ranked_demotion_target(shared, router_sid).filter(|t| !shared.coordinator_blocks(router_sid, t))
+}
+
+fn ranked_demotion_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
     let (class, complexity, current, excluded, struggle, strategy, elevation_skill) = shared
         .with_session(router_sid, |s| {
             (
@@ -5500,6 +5627,7 @@ fn maybe_demote(shared: &Arc<Shared>, router_sid: &str) {
             target: target.clone(),
             reason: reason.clone(),
             handoff: HandoffStyle::Full,
+            user_pick: false,
         });
         s.elevation = None;
         s.elevation_skill = None;
@@ -5590,6 +5718,7 @@ fn update_confidence_and_maybe_upgrade(
                     "auto-upgrade: confidence {confidence:.2} below threshold {threshold:.2}"
                 ),
                 handoff: HandoffStyle::Full,
+                user_pick: false,
             });
             s.elevation = Some("auto-upgrade".to_string());
             s.elevation_skill = None;
@@ -5655,6 +5784,7 @@ fn escalation_post_turn(
             target: target.clone(),
             reason: reason.clone(),
             handoff: HandoffStyle::Full,
+            user_pick: false,
         });
         s.escalations_done += 1;
         s.elevation = Some("escalation".to_string());
@@ -5847,12 +5977,32 @@ fn frame_terse(from: &CandidateId, briefing: &str, transcript_cmd: &str) -> Stri
 /// and close the old session. Context does not transfer via ACP, so the
 /// briefing IS the handoff. `style` chooses how much of it to carry — see
 /// `HandoffStyle`. Returns the switch disclosure lines.
+/// A coordinator only leaves `planning_candidates` on a human pick. Anything
+/// else (planner upgrade, skill route, orchestration, escalation, demotion) is
+/// refused and disclosed; the session stays on its current model.
+fn refuse_coordinator_switch(shared: &Arc<Shared>, router_sid: &str, sw: &SwitchRequest) -> bool {
+    if sw.user_pick || !shared.coordinator_blocks(router_sid, &sw.target) {
+        return false;
+    }
+    notify_user(
+        shared,
+        router_sid,
+        format!(
+            "router-acp · coordinator: refused switch to {} ({}) — coordinator sessions stay \
+             on planning_candidates unless a human picks the model",
+            sw.target, sw.reason
+        ),
+    );
+    true
+}
+
 async fn switch_pin(
     shared: &Arc<Shared>,
     router_sid: &str,
     target: &CandidateId,
     reason: &str,
     style: HandoffStyle,
+    user_pick: bool,
 ) -> Result<Vec<String>, AcpError> {
     // Version pinning applies to re-pins too: a switch resolved by any route
     // (user `switch=`, escalation, demotion, a skill re-route, a cordon
@@ -6057,6 +6207,8 @@ async fn switch_pin(
         }
     }
 
+    shared.with_session(router_sid, |s| s.pin_user_pick = user_pick);
+
     // 5. Persist + close the old session.
     shared.state.lock().unwrap().upsert(
         router_sid.to_string(),
@@ -6078,6 +6230,7 @@ async fn switch_pin(
                 "candidate": target.to_string(),
                 "from": old_candidate.to_string(),
                 "reason": reason,
+                "user_pick": user_pick,
             })),
             ..Default::default()
         },
@@ -6929,6 +7082,54 @@ fn on_prompt(
     let mut force_orchestrate = false;
     // Per-prompt `hard:` / `easy:` — reset so a prior prefix cannot stick.
     shared.with_session(&router_sid, |s| s.planner_difficulty = None);
+    // Coordinator role is sticky: a tagged prompt sets it, an untagged one
+    // never clears it. A coordinator found in Implementation (tagged late, or
+    // upgraded before this guard existed) is pulled back to Planning.
+    let (coordinator, planner_session) = shared
+        .with_session(&router_sid, |s| {
+            s.coordinator |= meta_marks_coordinator(req.meta.as_ref());
+            (s.coordinator, s.strategy == StrategyKind::Planner)
+        })
+        .unwrap_or((false, false));
+    if coordinator && planner_session {
+        enter_planning_phase(&shared, &router_sid);
+    }
+    // An off-pool pin that no human chose (an automatic upgrade before the
+    // role arrived, or a pre-guard session) goes back to the planning pool.
+    // A directive or shorthand parsed below replaces this queued switch.
+    if coordinator {
+        let (pin, user_pick, class, excluded) = shared
+            .with_session(&router_sid, |s| {
+                (
+                    s.pin.as_ref().map(|p| p.candidate.clone()),
+                    s.pin_user_pick,
+                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                    s.excluded.clone(),
+                )
+            })
+            .unwrap_or((None, false, TaskClass::CodingGeneral, Vec::new()));
+        if let Some(pin) = pin
+            && !user_pick
+            && !shared.in_planning_pool(&pin)
+            && let Some(target) = select_planner_target(
+                &shared,
+                crate::config::PlannerPhase::Planning,
+                class,
+                &excluded,
+                None,
+            )
+            .filter(|t| shared.in_planning_pool(t))
+        {
+            shared.with_session(&router_sid, |s| {
+                s.pending_switch = Some(SwitchRequest {
+                    target,
+                    reason: format!("coordinator returns from {pin} to planning_candidates"),
+                    handoff: HandoffStyle::Full,
+                    user_pick: false,
+                });
+            });
+        }
+    }
     // Set when a `[router: phase=implementation]` directive upgrades a pinned
     // planning session — the same summarize-and-re-pin as a detected upgrade.
     let mut planner_needs_switch = false;
@@ -7001,6 +7202,7 @@ fn on_prompt(
                                         target: target.clone(),
                                         reason: format!("requested via `{lower_ref}:` prefix"),
                                         handoff: HandoffStyle::Full,
+                                        user_pick: false,
                                     });
                                 });
                             }
@@ -7030,6 +7232,7 @@ fn on_prompt(
                                 target: target.clone(),
                                 reason: format!("requested via `{ref_str}:` shorthand"),
                                 handoff: HandoffStyle::Full,
+                                user_pick: true,
                             });
                         });
                     } else {
@@ -7065,6 +7268,7 @@ fn on_prompt(
                             target: target.clone(),
                             reason: "requested via [router: switch=…]".to_string(),
                             handoff: HandoffStyle::Full,
+                            user_pick: true,
                         });
                     });
                     tracing::info!(session = router_sid, %target, "mid-session switch requested");
@@ -7102,6 +7306,18 @@ fn on_prompt(
                     }
                     (_, PlannerPhase::Planning) => {
                         enter_planning_phase(&shared, &router_sid);
+                    }
+                    (_, PlannerPhase::Implementation)
+                        if shared
+                            .with_session(&router_sid, |s| s.coordinator)
+                            .unwrap_or(false) =>
+                    {
+                        notify_user(
+                            &shared,
+                            &router_sid,
+                            "router-acp · coordinator: rejected [router: phase=implementation] \
+                             — coordinator sessions stay in planning",
+                        );
                     }
                     (_, PlannerPhase::Implementation) => {
                         shared.with_session(&router_sid, |s| {
@@ -7367,6 +7583,7 @@ async fn dispatch_prompt(
                         target,
                         reason: "planner phase upgrade → implementation".to_string(),
                         handoff: HandoffStyle::Full,
+                        user_pick: false,
                     });
                 }
             });
@@ -7474,6 +7691,7 @@ async fn dispatch_prompt(
                                     "skill `{pattern}` requires a {target}-class model"
                                 ),
                                 handoff,
+                                user_pick: false,
                             });
                             s.elevation = Some(format!("skill `{pattern}`"));
                             s.elevation_skill = Some(pattern.clone());
@@ -7573,6 +7791,7 @@ async fn dispatch_prompt(
                             target: target.clone(),
                             reason: reason.clone(),
                             handoff: HandoffStyle::Full,
+                            user_pick: false,
                         });
                         // Not an elevation: this is escaping a dead seat, not
                         // climbing the capability ladder.

@@ -8258,3 +8258,328 @@ async fn planner_easy_prefix_pins_opus_even_at_apex_complexity() {
     })
     .await;
 }
+
+// ======================================================================
+// Coordinator role: `_meta.router_acp.session_role = "coordinator"` pins
+// the session to Planning / planning_candidates on every automatic path.
+// Only an explicit human pick moves it.
+// ======================================================================
+
+fn coordinator_meta() -> agent_client_protocol::schema::v1::Meta {
+    let mut meta = agent_client_protocol::schema::v1::Meta::new();
+    meta.insert(
+        "router_acp".to_string(),
+        serde_json::json!({"session_role": "coordinator"}),
+    );
+    meta
+}
+
+async fn new_coordinator_session(cx: &ConnectionTo<AgentPeer>) -> Result<String, AcpError> {
+    let resp = cx
+        .send_request(NewSessionRequest::new(std::env::temp_dir()).meta(coordinator_meta()))
+        .block_task()
+        .await?;
+    Ok(resp.session_id.0.to_string())
+}
+
+async fn coordinator_prompt(
+    cx: &ConnectionTo<AgentPeer>,
+    session_id: &str,
+    text: &str,
+) -> Result<PromptResponse, AcpError> {
+    cx.send_request(
+        PromptRequest::new(
+            session_id.to_string(),
+            vec![ContentBlock::from(text.to_string())],
+        )
+        .meta(coordinator_meta()),
+    )
+    .block_task()
+    .await
+}
+
+/// `router: planner` with a planning `plan/sol` and an implementation-only
+/// `work/opus`. `extra` is appended top-level config; `preclass` drives the
+/// evaluator (served by sol).
+fn coordinator_yaml(name: &str, preclass: &str, extra: &str, sol_env: &[(&str, &str)]) -> String {
+    let state = temp_state_file(name);
+    let mut env = vec![("MOCK_PRECLASS_JSON", preclass)];
+    env.extend_from_slice(sol_env);
+    format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         router: planner\n\
+         routers:\n  planner:\n    planning_candidates: [\"*sol*\", \"*fable*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n\
+         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\", \"*fable*\"]\n\
+         {extra}agents:\n{}{}",
+        state.display(),
+        agent_yaml("plan", &[("sol", 1)], &env),
+        agent_yaml("work", &[("opus", 2)], &[("MOCK_PRECLASS_JSON", preclass)]),
+    )
+}
+
+const IMPL_READY_PRECLASS: &str = r#"{"routing":{"task_class":"BugFix","complexity":0.5,"confidence":0.9,"reason":"review"},"planner_phase":{"phase":"implementation","confidence":0.9,"plan_ready":true,"reason":"plan is ready"}}"#;
+const PLANNING_PRECLASS: &str = r#"{"routing":{"task_class":"BugFix","complexity":0.5,"confidence":0.9,"reason":"plan"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"needs a plan"}}"#;
+
+#[tokio::test]
+async fn coordinator_ignores_implementation_preclass_directive_and_heuristic() {
+    // The live incident: an automated "Review Sub-tasks" nudge classified
+    // implementation / plan_ready=true and re-pinned the parent onto the
+    // workhorse. A coordinator must stay in Planning on every such signal.
+    let yaml = coordinator_yaml("coord-phase", IMPL_READY_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        let planning = Some(router_acp::config::PlannerPhase::Planning);
+
+        coordinator_prompt(&cx, &sid, "Review Sub-tasks: two children have PRs").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            planning
+        );
+
+        coordinator_prompt(&cx, &sid, "[router: phase=implementation]\nstart the work").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            planning
+        );
+
+        coordinator_prompt(&cx, &sid, "ok, implement the plan").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            planning
+        );
+
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("echo:opus:"),
+            "coordinator reached the workhorse: {text}"
+        );
+        assert!(
+            text.contains("coordinator: rejected [router: phase=implementation]"),
+            "the rejected directive is disclosed: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn non_coordinator_control_upgrades_on_the_same_preclass() {
+    // Control for the test above: without the role, the same pre-class
+    // moves the session onto the implementation pool.
+    let yaml = coordinator_yaml("coord-control", IMPL_READY_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "Review Sub-tasks: two children have PRs").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_role_on_a_prompt_is_sticky_and_pulls_back_to_planning() {
+    // Untagged session/new; the first tagged prompt sets the role, and a
+    // later untagged prompt does not clear it.
+    let yaml = coordinator_yaml("coord-sticky", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        coordinator_prompt(&cx, &sid, "plan the epic").await?;
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        prompt_text(&cx, &sid, "go ahead and build it").await?;
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        assert!(!agent_text(&observed, &sid).contains("echo:opus:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_refuses_a_skill_route_to_an_implementation_model() {
+    let yaml = coordinator_yaml(
+        "coord-skill",
+        PLANNING_PRECLASS,
+        "skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*opus*\"]\n    \
+         marks_implementation_phase: true\n",
+        &[],
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        coordinator_prompt(&cx, &sid, "plan the epic").await?;
+        coordinator_prompt(&cx, &sid, "please run ship-pr on the child").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("echo:opus:"),
+            "skill moved the coordinator: {text}"
+        );
+        assert!(
+            text.contains("coordinator: refused switch to work/opus"),
+            "refusal is disclosed: {text}"
+        );
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_honors_explicit_human_picks() {
+    // The model chip (`[router: switch=…]`) and the `model:` shorthand are
+    // human picks and still move a coordinator anywhere.
+    let yaml = coordinator_yaml("coord-user-pick", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        coordinator_prompt(&cx, &sid, "plan the epic").await?;
+        coordinator_prompt(&cx, &sid, "opus: take this one yourself").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched plan/sol → work/opus — requested via `opus:` shorthand"),
+            "shorthand pick honored: {text}"
+        );
+        coordinator_prompt(&cx, &sid, "[router: switch=plan/sol]\nback to planning").await?;
+        coordinator_prompt(&cx, &sid, "[router: switch=work/opus]\nagain").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched plan/sol → work/opus — requested via [router: switch=…]"),
+            "switch= pick honored: {text}"
+        );
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_honors_a_pre_pin_model_chip() {
+    let yaml = coordinator_yaml("coord-chip", PLANNING_PRECLASS, "", &[]);
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.candidate".to_string(),
+            SessionConfigOptionValue::value_id("work/opus"),
+        ))
+        .block_task()
+        .await?;
+        coordinator_prompt(&cx, &sid, "plan the epic").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_failover_fails_visibly_instead_of_leaving_the_planning_pool() {
+    // The only planning candidate is rate-limited. A normal session would
+    // fail over to work/opus; a coordinator errors instead.
+    let yaml = coordinator_yaml(
+        "coord-failover",
+        PLANNING_PRECLASS,
+        "",
+        &[("MOCK_FAIL_PROMPT_MSG", "rate limit")],
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        let result = coordinator_prompt(&cx, &sid, "plan the epic").await;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("echo:opus:"),
+            "failover left the pool: {text}"
+        );
+        let err = result.expect_err("no planner candidate → the turn fails");
+        assert!(
+            format!("{err:?}").contains("rate limit")
+                || format!("{err:?}").contains("no planning candidate"),
+            "{err:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn non_coordinator_control_fails_over_to_the_workhorse() {
+    // Control for the failover test above: without the role the same
+    // rate-limited planner fails over onto work/opus.
+    let yaml = coordinator_yaml(
+        "coord-failover-control",
+        PLANNING_PRECLASS,
+        "",
+        &[("MOCK_FAIL_PROMPT_MSG", "rate limit")],
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "plan the epic").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_keeps_a_human_pick_across_later_prompts() {
+    // The model chip is a one-message `[router: switch=…]`. Later coordinator
+    // prompts (nudges included) must not pull the session back.
+    let yaml = coordinator_yaml("coord-pick-sticks", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        coordinator_prompt(&cx, &sid, "plan the epic").await?;
+        coordinator_prompt(&cx, &sid, "[router: switch=work/opus]\nyou take it").await?;
+        coordinator_prompt(&cx, &sid, "[router: phase=planning]\nReview Sub-tasks").await?;
+        coordinator_prompt(&cx, &sid, "and another nudge").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("work/opus → plan/sol"),
+            "human pick undone: {text}"
+        );
+        assert!(shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_role_pulls_an_automatic_workhorse_pin_back_to_planning() {
+    // The incident shape: an untagged turn auto-upgraded onto work/opus. The
+    // next tagged prompt switches back to the planning pool.
+    let yaml = coordinator_yaml("coord-pull-back", IMPL_READY_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "Review Sub-tasks").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        coordinator_prompt(&cx, &sid, "Review Sub-tasks again").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched work/opus → plan/sol — coordinator returns"),
+            "coordinator pulled back: {text}"
+        );
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        Ok(())
+    })
+    .await;
+}

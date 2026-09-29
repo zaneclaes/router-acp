@@ -1432,6 +1432,11 @@ fn select_request_model(
     body: &Value,
 ) -> RequestDecision {
     let signals = inspect_request(body);
+    // A coordinator's requests only move within `planning_candidates`; its
+    // own pin is re-added below regardless (a human may have picked it).
+    let coordinator = shared
+        .with_session(&active.state_sid, |s| s.coordinator)
+        .unwrap_or(false);
     // `model_version_pins` is applied here, not after selection: a pinned
     // family must substitute in the per-request pool too, so an escalation or
     // demotion target resolves to the version that will actually serve.
@@ -1448,6 +1453,7 @@ fn select_request_model(
         // an alternate here. The session's own pin is re-added below whatever
         // this filter says, so an explicit pin still serves its own requests.
         .filter(|candidate| candidate.auto_eligible)
+        .filter(|candidate| !coordinator || shared.in_planning_pool(&candidate.id))
         .filter(|candidate| {
             !headroom.is_quarantined(&candidate.id)
                 && headroom.cordon_active(&candidate.id.agent).is_none()
@@ -2733,6 +2739,28 @@ agents:
                 ("demotion", "claude-sonnet-5"),
             ]
         );
+    }
+
+    #[test]
+    fn coordinator_request_never_demotes_off_the_planning_pool() {
+        // Same request as the Fable->Sonnet demotion above, but on a
+        // coordinator session: Sonnet and Haiku are outside the default
+        // planning_candidates, so every request stays on the Fable pin.
+        let (_dir, shared) = kory_code_shared();
+        let cfg = shared.cfg.clone();
+        let mut session = RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new());
+        session.coordinator = true;
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".to_string(), session);
+        let turn = claude_active("claude-fable-5[1m]");
+        let body = kory_code_request(120, "$ ls\nsrc/main.rs\nsrc/lib.rs");
+        for _ in 0..6 {
+            let decision = select_request_model(&shared, &turn, &body);
+            assert_eq!(decision.model, "claude-fable-5", "event {}", decision.event);
+        }
     }
 
     #[test]
