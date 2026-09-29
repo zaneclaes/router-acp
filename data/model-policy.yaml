@@ -201,6 +201,8 @@ cost:
   cache_ratio_overrides:
     "claude/claude-fable-5-1*": { read: 0.025 }
     "claude/opus[1m]": { read: 0.05 }
+    # GPT-6.1 Sol: $0.10 cache read on $2 input is 0.05× (Sol 6.0 stays 0.1×).
+    "codex/gpt-6.1-sol": { read: 0.05 }
   # Ranks must be weakly monotonic in blended price WITHIN an agent: a cheaper
   # model must not carry a higher rank. Every exception is deliberate and lives
   # here with its reason, so a genuine mistake still shows up as an error.
@@ -212,6 +214,23 @@ cost:
         rank 4 (reserved for harder work) while 5.5 stays the rank-3 everyday
         codex model. Ranking Terra by list price would make it the default and
         spend frontier-grade capability on routine turns.
+    - candidate: "codex/gpt-6-sol"
+      why: >-
+        GPT-6 Sol is $2/$10 — cheaper than Terra ($2.50/$15) and 5.5 ($5/$30) —
+        but it is the Sol-class seat (native xhigh/max, 1.05M). Ranking it by
+        list price would make it the default for routine turns. Held at rank 5
+        with the Sol family.
+    - candidate: "codex/gpt-6.1-sol"
+      why: >-
+        GPT-6.1 Sol is $2/$10 (0.05× cache) with near-Astra quality. Same
+        Sol-rank-5 hold as gpt-6-sol: list-price ranking would spend Sol-class
+        capability on everyday work.
+    - candidate: "codex/gpt-6-luna"
+      over: "codex/gpt-5.4-mini"
+      why: >-
+        GPT-6 Luna lists cheaper than mini ($0.10/$0.50 vs $0.75/$4.50) but is
+        the Luna-class mid-tier worker, not a haiku-class small model. Rank 1
+        would pull trivial traffic onto it.
     - candidate: "grok/grok-4.6"
       why: >-
         Cheapest frontier on list price ($2/$6) but pinned at rank 5: the value
@@ -249,8 +268,11 @@ witnesses:
   gpt5: "codex/gpt-5.5"
   gpt5_codex: "codex/gpt-5.5-codex"
   sol: "codex/gpt-5.6-sol"
+  sol_6: "codex/gpt-6-sol"
+  sol_6_1: "codex/gpt-6.1-sol"
   terra: "codex/gpt-5.6-terra"
   luna: "codex/gpt-5.6-luna"
+  luna_6: "codex/gpt-6-luna"
   grok: "grok/grok-4.6"
   grok_code: "grok/grok-code-fast-1"
   kimi: "kimi/kimi-k2"
@@ -314,6 +336,22 @@ invariants:
         `auto_eligible: false`, so it is only ever reached by an explicit pick
         — which is exactly why it must still resolve to a real score rather
         than the neutral 0.5 default.
+    - chain: [sol_6_1, sol]
+      why: >-
+        GPT-6.1 Sol INHERITS the Sol family's calibrated 5.6 scores — no
+        same-harness 6.1 card yet, so a version bump keys on the model line
+        with no re-score and no churn. Stated as a weak chain: if a future
+        narrower pattern ever scores 6.1 differently, the chain breaks instead
+        of the difference going unnoticed.
+    - chain: [sol_6, sol]
+      why: >-
+        GPT-6 Sol inherits the same `*sol*` family scores as 6.1, via its own
+        `*gpt-6-sol*` wire-shape pattern (1.05M / native xhigh). Equality with
+        the 5.6 witness is the inherit-until-recalibrated contract.
+    - chain: [luna_6, luna]
+      why: >-
+        GPT-6 Luna inherits `*luna*` quality the same way. Its own pattern
+        only changes the wire shape (1.05M, native xhigh/max).
   # Ceilings are used only where the benchmark-derived values support them.
   at_most:
     - a: grok
@@ -327,6 +365,9 @@ invariants:
     "codex/gpt-5.6-sol": "*sol*"
     "codex/gpt-5.6-terra": "*terra*"
     "codex/gpt-5.6-luna": "*luna*"
+    "codex/gpt-6-sol": "*gpt-6-sol*"
+    "codex/gpt-6.1-sol": "*gpt-6.1-sol*"
+    "codex/gpt-6-luna": "*gpt-6-luna*"
     "claude/claude-fable-5[1m]": "*fable*"
     # Fable 5.1 inherits Fable's calibrated scores: `*fable*` already matches
     # every `claude-fable-5*` id, so a version bump is a no-score-churn rename
@@ -362,7 +403,7 @@ invariants:
 # instead of quietly skewing cost routing. USD per Mtok.
 # ---------------------------------------------------------------------------
 published_pricing:
-  as_of: "2026-09-23"
+  as_of: "2026-09-29"
   models:
     "claude/haiku": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
     # Sonnet 5 is PERMANENTLY $2/$10: the increase to $3/$15 scheduled for
@@ -397,6 +438,12 @@ published_pricing:
     "codex/gpt-5.6-luna": { input_per_mtok: 1.00, output_per_mtok: 6.00 }
     "codex/gpt-5.6-terra": { input_per_mtok: 2.50, output_per_mtok: 15.00 }
     "codex/gpt-5.6-sol": { input_per_mtok: 5.00, output_per_mtok: 30.00 }
+    "codex/gpt-6-luna":
+      { input_per_mtok: 0.10, output_per_mtok: 0.50, cache_read_per_mtok: 0.01 }
+    "codex/gpt-6-sol":
+      { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.20 }
+    "codex/gpt-6.1-sol":
+      { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.10 }
     "grok/grok-4.6":
       { input_per_mtok: 2.00, output_per_mtok: 6.00, cache_read_per_mtok: 0.50 }
     "kimi/kimi-k2": { input_per_mtok: 0.55, output_per_mtok: 2.20 }
