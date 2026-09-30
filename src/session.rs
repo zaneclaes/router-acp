@@ -841,7 +841,23 @@ impl Shared {
     /// whose target is down or invalid is unavailable, and normal failover
     /// picks something else — it never silently degrades to serving the alias.
     pub fn effective_candidates(&self) -> Vec<EffectiveCandidate> {
-        let routeable = self.routeable_candidates();
+        self.effective_candidates_inner(false)
+    }
+
+    /// `include_down` also admits candidates whose process died (`Down`) —
+    /// only for an explicit pick, which revives the process before use.
+    fn effective_candidates_inner(&self, include_down: bool) -> Vec<EffectiveCandidate> {
+        let routeable: Vec<CandidateRuntime> = self
+            .candidates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.status == CandidateStatus::Routeable
+                    || (include_down && matches!(c.status, CandidateStatus::Down(_)))
+            })
+            .cloned()
+            .collect();
         if self.cfg.model_version_pins.is_empty() {
             return routeable
                 .into_iter()
@@ -989,7 +1005,35 @@ impl Shared {
     /// excluding them once — rather than at each of a dozen call sites — is
     /// what makes "never picked by accident" hold for mechanisms added later.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, false, None)
+        self.eligible_views_inner(required, class, false, None, false)
+    }
+
+    /// `eligible_views` for resolving an EXPLICIT user pick: also keeps
+    /// candidates whose downstream process died (the switch revives it) and
+    /// ignores outage quarantine (a penalty on automatic routing, not a veto
+    /// on a human's choice). Without this a crash made the named model
+    /// unresolvable, which silently demoted `opus:` to prose and let a cordon
+    /// escape pick some other model.
+    pub fn eligible_views_revivable(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+    ) -> Vec<CandidateView> {
+        self.eligible_views_inner(required, class, false, None, true)
+    }
+
+    /// `candidate_view` with the same dead-process allowance as
+    /// `eligible_views_revivable`.
+    pub fn candidate_view_revivable(
+        &self,
+        id: &CandidateId,
+        required: &RequiredCaps,
+        class: TaskClass,
+    ) -> Option<CandidateView> {
+        let wanted = self.cfg.resolve_stated_candidate(id);
+        self.eligible_views_inner(required, class, false, Some(&wanted), true)
+            .into_iter()
+            .find(|v| v.id == wanted)
     }
 
     /// `eligible_views` plus one named candidate that may be
@@ -1002,7 +1046,7 @@ impl Shared {
         class: TaskClass,
         admit: Option<&CandidateId>,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, false, admit)
+        self.eligible_views_inner(required, class, false, admit, false)
     }
 
     /// Like `eligible_views_admitting` but keeps usage-cordoned candidates in
@@ -1014,7 +1058,7 @@ impl Shared {
         class: TaskClass,
         admit: Option<&CandidateId>,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, true, admit)
+        self.eligible_views_inner(required, class, true, admit, false)
     }
 
     /// The strategy view for ONE candidate, ignoring auto-eligibility — the
@@ -1031,7 +1075,7 @@ impl Shared {
         class: TaskClass,
     ) -> Option<CandidateView> {
         let wanted = self.cfg.resolve_stated_candidate(id);
-        self.eligible_views_inner(required, class, false, Some(&wanted))
+        self.eligible_views_inner(required, class, false, Some(&wanted), false)
             .into_iter()
             .find(|v| v.id == wanted)
     }
@@ -1042,10 +1086,11 @@ impl Shared {
         class: TaskClass,
         ignore_usage_cordons: bool,
         admit: Option<&CandidateId>,
+        explicit_pick: bool,
     ) -> Vec<CandidateView> {
         // Version pins are already applied (see `effective_candidates`), so
         // every check below runs on the model that will actually serve.
-        let candidates = self.effective_candidates();
+        let candidates = self.effective_candidates_inner(explicit_pick);
         let mut headroom = self.headroom.lock().unwrap();
         let targets = self.targets.lock().unwrap();
         let mut views = Vec::new();
@@ -1065,7 +1110,7 @@ impl Shared {
             let Some(target) = targets.get(&c.process_key) else {
                 continue;
             };
-            if target.conn.is_none() {
+            if target.conn.is_none() && !(explicit_pick && target.dead.is_some()) {
                 continue;
             }
             if self
@@ -1082,7 +1127,7 @@ impl Shared {
                 .as_ref()
                 .map(|i| required.satisfied_by(&i.agent_capabilities.prompt_capabilities))
                 .unwrap_or(false);
-            if !caps_ok || headroom.is_quarantined(&c.id) {
+            if !caps_ok || (!explicit_pick && headroom.is_quarantined(&c.id)) {
                 continue;
             }
             // Agents cordoned by a token/usage limit sit out until reset.
@@ -3112,6 +3157,39 @@ async fn revive_dead_targets(shared: &Arc<Shared>) {
     }
 }
 
+/// Respawn and re-probe ONE dead target now, ignoring the respawn cooldown.
+/// Used when a switch names a candidate whose process died: the switch must
+/// land on that candidate, not wait out a cooldown on the model it is leaving.
+async fn revive_target_now(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), String> {
+    let dead = {
+        let mut targets = shared.targets.lock().unwrap();
+        match targets.get_mut(key) {
+            Some(t) if t.conn.is_some() => return Ok(()),
+            Some(t) => {
+                t.last_respawn = Some(std::time::Instant::now());
+                t.dead.clone()
+            }
+            None => return Err(format!("unknown target {key}")),
+        }
+    };
+    let Some(dead) = dead else {
+        return Err("its process is not running".to_string());
+    };
+    tracing::info!(target = %key, %dead, "reviving dead downstream for a switch");
+    start_downstream(shared, key)
+        .await
+        .map_err(|err| format!("its process died ({dead}) and restarting it failed: {err}"))?;
+    match probe_target(shared, key).await {
+        crate::downstream::ProbeOutcome::Routeable => Ok(()),
+        crate::downstream::ProbeOutcome::AuthPending => {
+            Err("it restarted but is not signed in".to_string())
+        }
+        crate::downstream::ProbeOutcome::Failed(why) => {
+            Err(format!("it restarted but failed its probe: {why}"))
+        }
+    }
+}
+
 /// Narrow a routing pool to candidates whose context window is strictly larger
 /// than `min`. Returns the pool untouched when nothing is roomier (or no window
 /// is known), so a context-overflow re-pin degrades to normal ranking instead of
@@ -4177,6 +4255,22 @@ async fn send_prompt_with_failover(
         {
             Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
             Ok(_) => {}
+            // The human named a model: running the turn on the model they
+            // picked away from is never the answer. Fail it, naming why the
+            // pick could not start.
+            Err(e) if sw.user_pick => {
+                notify_user(
+                    &shared,
+                    &router_sid,
+                    format!(
+                        "router-acp · switch to {} failed — {e}; this turn was not run on the \
+                         previous model",
+                        sw.target
+                    ),
+                );
+                flush_pending_disclosure(&shared, &router_sid);
+                return responder.respond_with_error(e);
+            }
             Err(e) => notify_user(
                 &shared,
                 &router_sid,
@@ -4495,13 +4589,22 @@ async fn send_prompt_with_failover(
                     format!("router-acp · {candidate} {symptom} — {human}{tail}"),
                 );
 
-                // An overflow is only recovered by a session that does not carry
-                // the transcript that overflowed — but the fresh pin would then
-                // start blind, so seed it with the same log-transcript handoff
-                // `switch_pin` uses when the outgoing model cannot summarize.
-                // That transcript is budget-capped, so it cannot re-overflow.
+                // The fresh pin would start blind, so seed it with the same
+                // log-transcript handoff `switch_pin` uses when the outgoing
+                // model cannot summarize — the failed model is in no state to
+                // brief it. That transcript is budget-capped, so it cannot
+                // re-overflow a context-overflow re-pin either.
                 let overflowed = matches!(class, FailureClass::ContextOverflow);
-                if overflowed {
+                // A first-turn failover has nothing to carry but the prompt it
+                // is about to replay.
+                let had_prior_turn = shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .log_for(&router_sid, 500)
+                    .iter()
+                    .any(|e| e.kind == "agent_response");
+                if overflowed || had_prior_turn {
                     let transcript = transcript_from_logs(&shared, &router_sid);
                     if !transcript.trim().is_empty() {
                         let cmd = transcript_command(&shared, &router_sid);
@@ -4737,7 +4840,7 @@ fn resolve_candidate_ref(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let views = shared.eligible_views(&RequiredCaps::default(), class);
+    let views = shared.eligible_views_revivable(&RequiredCaps::default(), class);
     // Exact `agent/model` id wins outright — and naming a full id is explicit
     // selection, so it may name a pinned legacy version. The fuzzy matching
     // below stays on the automatic pool: `opus:` must not land on a legacy
@@ -4745,7 +4848,7 @@ fn resolve_candidate_ref(
     if let Some(id) = CandidateId::parse(reference)
         && !is_excluded(&id, excluded)
         && shared
-            .candidate_view(&id, &RequiredCaps::default(), class)
+            .candidate_view_revivable(&id, &RequiredCaps::default(), class)
             .is_some()
     {
         // Return the RESOLVED id: a fully-qualified shorthand may name a
@@ -6096,12 +6199,30 @@ async fn switch_pin(
         )));
     }
 
+    // A target whose process died is revived here rather than refused: the
+    // routing pool drops dead targets, so without this a switch onto one
+    // could never succeed and the session stayed on the model it was leaving.
+    if let Some(key) = shared.candidate_runtime(target).map(|r| r.process_key)
+        && shared.target_conn(&key).is_none()
+    {
+        revive_target_now(shared, &key).await.map_err(|why| {
+            AcpError::internal_error().data(format!("cannot start {target}: {why}"))
+        })?;
+    }
+
     // 1. Build the handoff. Preferred path: ask the outgoing model to
     //    summarize (capturing its text instead of relaying it). If that model
     //    is offline/rate-limited/crashed, or refuses, or produces nothing,
     //    fall back to a transcript reconstructed from the state-DB logs — which
-    //    needs nothing from the old model.
-    let live_conn = shared.target_conn(&old_process_key);
+    //    needs nothing from the old model. A model that cannot serve right now
+    //    (cordoned, quarantined, exhausted, dead) is not asked at all.
+    let class = shared
+        .with_session(router_sid, |session| session.task_class)
+        .flatten()
+        .unwrap_or(TaskClass::CodingGeneral);
+    let live_conn = shared
+        .candidate_view(&old_candidate, &RequiredCaps::default(), class)
+        .and_then(|_| shared.target_conn(&old_process_key));
     let summary = if let Some(conn) = &live_conn {
         let buffer = Arc::new(Mutex::new(String::new()));
         shared.with_session(router_sid, |s| s.capturing_summary = Some(buffer.clone()));
@@ -6113,10 +6234,6 @@ async fn switch_pin(
             old_down_sid.clone(),
             vec![ContentBlock::from(instruction.to_string())],
         );
-        let class = shared
-            .with_session(router_sid, |session| session.task_class)
-            .flatten()
-            .unwrap_or(TaskClass::CodingGeneral);
         let _llm_turn = shared.llm_proxy.begin_turn(
             old_process_key.clone(),
             router_sid.to_string(),
@@ -6128,6 +6245,12 @@ async fn switch_pin(
         );
         let result = conn.send_request(summary_prompt).block_task().await;
         shared.with_session(router_sid, |s| s.capturing_summary = None);
+        // A refused summary is still a real failure of the outgoing model
+        // (a spend cap, a usage limit): record it so the model is cordoned.
+        if let Err(err) = &result {
+            let failure = crate::limits::classify_failure(err);
+            apply_failure(shared, &old_candidate, err, &failure);
+        }
         let captured = buffer.lock().unwrap().clone();
         // Accept only a real summary; a too-short/empty capture or an error
         // means the model didn't actually summarize.
@@ -6147,7 +6270,7 @@ async fn switch_pin(
         tracing::warn!(
             session = router_sid,
             from = %old_candidate,
-            "outgoing model has no live process; using log-transcript handoff"
+            "outgoing model cannot serve; using log-transcript handoff"
         );
         None
     };
@@ -7507,6 +7630,10 @@ async fn dispatch_prompt(
     mut planner_needs_switch: bool,
 ) -> Result<(), AcpError> {
     crate::auth::refresh_before_selection(&shared).await;
+    // Mid-session routing (cordon escapes, skill and planner switches) picks
+    // from live targets only; give dead ones their cooldown-gated respawn
+    // first, as the initial pin does.
+    revive_dead_targets(&shared).await;
     // Pre-classifier (when enabled): one cheap ACP evaluation covering
     // orchestrate + host dimensions. v1 = first eligible turn per session.
     // Fail-open. Explicit `[router:…]` / `model:` suppress the auto path;

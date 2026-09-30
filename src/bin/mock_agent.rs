@@ -40,6 +40,9 @@
 //!   extension request and echo the raw reply
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
+//! - `EXIT_NOW:<model>` — crash on this prompt if it reached `<model>` (a
+//!   respawned process is healthy; a failover replay to another model is not
+//!   killed)
 //! - `DELEGATE_HINT:<agent/model>` — attach `hints.candidate` to every
 //!   `DELEGATE:` call in the same prompt (exercises the hint resolution path).
 //! - `DELEGATE:<task>` — call the `delegate_task` tool on the MCP server
@@ -360,6 +363,11 @@ async fn run_prompt(
 
     if mock.exit_on_prompt {
         // Simulate a crash mid-turn.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::process::exit(1);
+    }
+
+    if text.contains(&format!("EXIT_NOW:{model}")) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         std::process::exit(1);
     }

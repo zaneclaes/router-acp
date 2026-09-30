@@ -645,7 +645,9 @@ Three ways it happens:
    pin, the session simply stays put.
 
 All three degrade gracefully: if the target is unavailable the session stays
-put with a visible note. Each switch is recorded in the state file with its
+put with a visible note. An explicit human pick (`switch=`, `model:`) does
+not: a dead target is revived first, and if it still cannot serve, the turn
+fails with that reason instead of running on the model the human left. Each switch is recorded in the state file with its
 `from`, `to`, and reason.
 
 ---

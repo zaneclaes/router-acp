@@ -25,6 +25,7 @@ use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request,
 };
 
+use router_acp::candidate::CandidateId;
 use router_acp::config::Config;
 use router_acp::session::{Shared, serve_shared};
 
@@ -2555,9 +2556,11 @@ async fn mid_session_rate_limit_fails_over_on_later_prompt() {
             text.contains("failover: auto → cheap/haiku"),
             "mid-session failover disclosed: {text}"
         );
+        // The replacement is seeded with the transcript, then the turn.
+        let answer = text.rsplit("echo:haiku:").next().unwrap_or_default();
         assert!(
-            text.contains("echo:haiku:turn two"),
-            "answer arrived: {text}"
+            answer.contains("turn one") && answer.contains("turn two"),
+            "answer arrived with prior context: {text}"
         );
         Ok(())
     })
@@ -3482,9 +3485,10 @@ async fn model_shorthand_switches_mid_session_and_leaves_prose_alone() {
 }
 
 #[tokio::test]
-async fn switch_to_unknown_candidate_stays_put_and_keeps_working() {
+async fn switch_to_unknown_candidate_fails_the_turn_and_keeps_the_session() {
     // `switch=a/bogus` (undeclared) must not break the session: no wasted
-    // summary turn, a clear notice, and the pinned model keeps answering.
+    // summary turn and a clear notice. The picked-away-from model must not
+    // silently answer the turn, but it keeps serving the next one.
     let state = temp_state_file("switch-bad");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
@@ -3496,15 +3500,20 @@ async fn switch_to_unknown_candidate_stays_put_and_keeps_working() {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
-        let resp = prompt_text(&cx, &sid, "[router: switch=a/bogus] keep going").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let failed = prompt_text(&cx, &sid, "[router: switch=a/bogus] keep going").await;
+        assert!(failed.is_err(), "failed pick fails the turn: {failed:?}");
         let text = agent_text(&observed, &sid);
         assert!(
             text.contains("switch to a/bogus failed"),
             "failure disclosed: {text}"
         );
-        // Still on the original model, and the task text was forwarded to it.
-        assert!(text.contains("echo:m1:keep going"), "stayed on m1: {text}");
+        assert!(
+            !text.contains("echo:m1:keep going"),
+            "turn not run on the old model: {text}"
+        );
+        let resp = prompt_text(&cx, &sid, "next").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert!(agent_text(&observed, &sid).contains("echo:m1:next"));
         Ok(())
     })
     .await;
@@ -3558,6 +3567,187 @@ async fn switch_falls_back_to_log_transcript_when_summary_fails() {
         assert!(
             lower.contains("transcript") || lower.contains("recovered from logs"),
             "fallback disclosed: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+const CODEX_SPEND_CAP: &str = r#"{"message":"You hit your spend cap set by the owner of your workspace.","codexErrorInfo":"usageLimitExceeded"}"#;
+
+/// Wait until `id`'s downstream process is gone (the watchdog marks it dead).
+async fn wait_for_dead(shared: &Shared, id: &CandidateId) {
+    let key = shared.candidate_runtime(id).unwrap().process_key;
+    for _ in 0..100 {
+        if shared.target_conn(&key).is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{id} never died");
+}
+
+#[tokio::test]
+async fn model_shorthand_revives_a_dead_target_and_switches_to_it() {
+    // The live deadlock: the picked model's process had died, so `opus:` did
+    // not resolve (dead targets are in no routing view) and `switch=` failed
+    // with "no live downstream process". Both left the session on the model
+    // the human was leaving. A pick revives the process, cooldown or not.
+    let state = temp_state_file("switch-revive");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         failover: {{ respawn_cooldown_secs: 3600 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nremember 4271").await?;
+
+        // Crash b from another session, inside its respawn cooldown so no
+        // automatic revive brings it back.
+        let b = CandidateId::parse("b/m2").unwrap();
+        let b_key = shared.candidate_runtime(&b).unwrap().process_key;
+        shared
+            .targets
+            .lock()
+            .unwrap()
+            .get_mut(&b_key)
+            .unwrap()
+            .last_respawn = Some(std::time::Instant::now());
+        let other = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &other, "[router: candidate=b/m2]\nEXIT_NOW:m2").await?;
+        wait_for_dead(&shared, &b).await;
+
+        let resp = prompt_text(&cx, &sid, "m2: what was the code?").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("switched a/m1 → b/m2"), "switched: {text}");
+        assert!(text.contains("echo:m2:"), "ran on b/m2: {text}");
+        assert!(
+            text.contains("what was the code?"),
+            "prompt continued: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn spend_capped_model_is_cordoned_and_handoff_uses_the_transcript() {
+    // The live failure: Sol's plan hit codex's workspace spend cap, so its
+    // handoff summary errored. The switch must still land, seeded from the
+    // log transcript, and the capped model must be cordoned.
+    let state = temp_state_file("switch-spend-cap");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_FAIL_PROMPT_MSG", CODEX_SPEND_CAP),
+                ("MOCK_FAIL_PROMPT_AFTER", "1"),
+            ],
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/m1]\nremember the code is 4271",
+        )
+        .await?;
+
+        let resp = prompt_text(&cx, &sid, "m2: what was the code?").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("switched a/m1 → b/m2"), "switched: {text}");
+        assert!(text.contains("echo:m2:"), "ran on b/m2: {text}");
+        assert!(text.contains("4271"), "transcript carried context: {text}");
+        let a = CandidateId::parse("a/m1").unwrap();
+        assert!(
+            shared.headroom.lock().unwrap().usage_cordon(&a).is_some(),
+            "spend-capped model cordoned"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn spend_cap_failover_carries_the_transcript_to_the_new_model() {
+    // Failover off a capped pin used to start the replacement blind (only a
+    // context overflow seeded the transcript), so it could not continue.
+    let state = temp_state_file("failover-transcript");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml(
+            "fancy",
+            &[("opus", 3)],
+            &[
+                ("MOCK_FAIL_PROMPT_MSG", CODEX_SPEND_CAP),
+                ("MOCK_FAIL_PROMPT_AFTER", "1"),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "remember the code is 4271").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+
+        let resp = prompt_text(&cx, &sid, "what was the code?").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("spend limit"), "cap recognized: {text}");
+        let answer = text.rsplit("echo:haiku:").next().unwrap_or_default();
+        assert!(
+            answer.contains("4271"),
+            "replacement got the transcript: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pick_of_a_model_that_cannot_serve_fails_loudly_not_on_the_old_model() {
+    // b refuses every session (not signed in): the pick cannot land, and the
+    // turn must say so instead of quietly running on the model left behind.
+    let state = temp_state_file("switch-cannot-serve");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[("MOCK_AUTH_REQUIRED", "1")]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
+
+        let failed = prompt_text(&cx, &sid, "[router: switch=b/m2] keep going").await;
+        assert!(failed.is_err(), "turn fails: {failed:?}");
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switch to b/m2 failed"),
+            "failure named: {text}"
+        );
+        assert!(
+            !text.contains("echo:m1:keep going"),
+            "never ran on the old model: {text}"
         );
         Ok(())
     })
