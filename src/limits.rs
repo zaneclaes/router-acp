@@ -76,6 +76,7 @@ pub fn is_rate_limit_text(lower: &str) -> bool {
         || lower.contains("limit reached")
         || lower.contains("out of credits")
         || lower.contains("credits_exhausted")
+        || lower.contains("usagelimitexceeded")
         || is_spend_limit_text(lower)
 }
 
@@ -85,6 +86,7 @@ pub fn is_rate_limit_text(lower: &str) -> bool {
 /// no failover happened at all.
 pub fn is_spend_limit_text(lower: &str) -> bool {
     lower.contains("spend limit")
+        || lower.contains("spend cap")
         || lower.contains("spending limit")
         || lower.contains("monthly limit")
         || lower.contains("credit limit")
@@ -128,6 +130,12 @@ pub fn is_outage_text(lower: &str) -> bool {
         || lower.contains("529")
         || lower.contains("internal server error")
         || lower.contains("service is temporarily")
+        // An adapter the provider refuses to serve until it is upgraded
+        // (grok: "API error (status 426 Upgrade Required): Your Grok CLI
+        // version … is outdated"). Every turn fails the same way, so it must
+        // fail over rather than dead-end.
+        || lower.contains("upgrade required")
+        || lower.contains("status 426")
 }
 
 struct ResetPatterns {
@@ -422,6 +430,41 @@ mod tests {
         assert!(!is_spend_limit_text(
             "claude ai usage limit reached|1752530400"
         ));
+    }
+
+    #[test]
+    fn codex_workspace_spend_cap_is_a_spend_scoped_rate_limit() {
+        // The live codex-acp error. Neither "spend cap" nor the
+        // `usageLimitExceeded` code matched before, so it classified as
+        // `Other`: no cordon, no failover, and every turn re-hit the cap.
+        let err = AcpError::internal_error().data(
+            r#"{"message":"You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.","codexErrorInfo":"usageLimitExceeded"}"#,
+        );
+        assert_eq!(
+            classify_failure(&err),
+            FailureClass::RateLimited {
+                retry_after: None,
+                spend_scoped: true
+            }
+        );
+
+        // The bare code is a plan-window limit: agent-scoped.
+        let bare = AcpError::internal_error().data(r#"{"codexErrorInfo":"usageLimitExceeded"}"#);
+        assert_eq!(
+            classify_failure(&bare),
+            FailureClass::RateLimited {
+                retry_after: None,
+                spend_scoped: false
+            }
+        );
+    }
+
+    #[test]
+    fn outdated_adapter_426_is_an_outage() {
+        let err = AcpError::internal_error().data(
+            r#"{"message":"API error (status 426 Upgrade Required): Your Grok CLI version (0.2.106) is outdated. Please update to version 1.0.13 or later","http_status":426}"#,
+        );
+        assert_eq!(classify_failure(&err), FailureClass::Outage);
     }
 
     #[test]
