@@ -136,6 +136,9 @@ pub struct TargetRuntime {
     pub dead: Option<String>,
     /// Last respawn attempt for a dead target (cooldown bookkeeping).
     pub last_respawn: Option<std::time::Instant>,
+    /// Held only across a cold start + probe, so two sessions opening the
+    /// same missing process start it once.
+    pub start_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Where messages from a downstream session should be routed.
@@ -647,6 +650,7 @@ impl Shared {
                     auth_pending: false,
                     dead: None,
                     last_respawn: None,
+                    start_gate: Arc::default(),
                 },
             );
         }
@@ -737,6 +741,9 @@ impl Shared {
         if let Some(t) = self.targets.lock().unwrap().get_mut(key) {
             t.conn = Some(conn);
             t.dead = None;
+            // A new process has not answered initialize yet.
+            t.init = None;
+            t.model_config_id = None;
         }
     }
 
@@ -775,6 +782,8 @@ impl Shared {
         tracing::warn!(target = %key, reason, "downstream target died");
         if let Some(t) = self.targets.lock().unwrap().get_mut(key) {
             t.conn = None;
+            // `init` stays until a new process connects (`set_target_conn`):
+            // an explicit pick of a dead target still needs its capabilities.
             t.dead = Some(reason.to_string());
         }
         let reason = reason.to_string();
@@ -2514,6 +2523,7 @@ pub async fn open_downstream_session(
         .candidate_runtime(candidate)
         .ok_or_else(|| AcpError::invalid_params().data(format!("unknown candidate {candidate}")))?;
     let key = runtime.process_key.clone();
+    ensure_target_ready(shared, candidate, &key).await?;
     let conn = shared.target_conn(&key).ok_or_else(|| {
         AcpError::internal_error().data(format!("no live downstream process for {candidate}"))
     })?;
@@ -3145,6 +3155,19 @@ async fn revive_dead_targets(shared: &Arc<Shared>) {
             .collect()
     };
     for key in keys {
+        let Some(gate) = shared
+            .targets
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|t| t.start_gate.clone())
+        else {
+            continue;
+        };
+        let _gate = gate.lock().await;
+        if shared.target_conn(&key).is_some() {
+            continue; // a session open already restarted it
+        }
         tracing::info!(target = %key, "attempting downstream respawn after outage");
         match start_downstream(shared, &key).await {
             Ok(()) => {
@@ -3157,36 +3180,69 @@ async fn revive_dead_targets(shared: &Arc<Shared>) {
     }
 }
 
-/// Respawn and re-probe ONE dead target now, ignoring the respawn cooldown.
-/// Used when a switch names a candidate whose process died: the switch must
-/// land on that candidate, not wait out a cooldown on the model it is leaving.
-async fn revive_target_now(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), String> {
-    let dead = {
+/// Make sure `candidate`'s process is running, initialized, and signed in
+/// before a session is opened on it. A target never spawned (startup skips
+/// agents its auth probe called logged out) or dead (cooldown ignored) is
+/// started and probed now; the fresh probe, not the boot auth flag, decides.
+/// A live initialized target returns without waiting on anything.
+pub(crate) async fn ensure_target_ready(
+    shared: &Arc<Shared>,
+    candidate: &CandidateId,
+    key: &ProcessKey,
+) -> Result<(), AcpError> {
+    let ready = |shared: &Arc<Shared>| -> Result<bool, AcpError> {
+        let targets = shared.targets.lock().unwrap();
+        let t = targets
+            .get(key)
+            .ok_or_else(|| AcpError::internal_error().data(format!("unknown target {key}")))?;
+        Ok(t.conn.is_some() && t.init.is_some() && !t.auth_pending)
+    };
+    if ready(shared)? {
+        return Ok(());
+    }
+    let gate = shared
+        .targets
+        .lock()
+        .unwrap()
+        .get(key)
+        .map(|t| t.start_gate.clone())
+        .expect("target checked above");
+    let _gate = gate.lock().await;
+    if ready(shared)? {
+        return Ok(());
+    }
+    let (needs_start, dead) = {
         let mut targets = shared.targets.lock().unwrap();
-        match targets.get_mut(key) {
-            Some(t) if t.conn.is_some() => return Ok(()),
-            Some(t) => {
-                t.last_respawn = Some(std::time::Instant::now());
-                t.dead.clone()
-            }
-            None => return Err(format!("unknown target {key}")),
+        let t = targets.get_mut(key).expect("target checked above");
+        if t.conn.is_none() {
+            t.last_respawn = Some(std::time::Instant::now());
         }
+        (t.conn.is_none(), t.dead.clone())
     };
-    let Some(dead) = dead else {
-        return Err("its process is not running".to_string());
-    };
-    tracing::info!(target = %key, %dead, "reviving dead downstream for a switch");
-    start_downstream(shared, key)
-        .await
-        .map_err(|err| format!("its process died ({dead}) and restarting it failed: {err}"))?;
+    if needs_start {
+        tracing::info!(target = %key, ?dead, "starting downstream for a session open");
+        start_downstream(shared, key).await.map_err(|err| {
+            let why = match &dead {
+                Some(dead) => format!("its process died ({dead}) and restarting it failed: {err}"),
+                None => format!("starting its process failed: {err}"),
+            };
+            AcpError::internal_error().data(format!("cannot start {candidate}: {why}"))
+        })?;
+    }
     match probe_target(shared, key).await {
-        crate::downstream::ProbeOutcome::Routeable => Ok(()),
+        crate::downstream::ProbeOutcome::Routeable => {
+            crate::auth::note_authenticated(&shared.auth, &candidate.agent);
+            Ok(())
+        }
         crate::downstream::ProbeOutcome::AuthPending => {
-            Err("it restarted but is not signed in".to_string())
+            Err(AcpError::auth_required().data(format!(
+                "cannot start {candidate}: `{}` is not signed in; sign in to `{}` and retry",
+                candidate.agent, candidate.agent
+            )))
         }
-        crate::downstream::ProbeOutcome::Failed(why) => {
-            Err(format!("it restarted but failed its probe: {why}"))
-        }
+        crate::downstream::ProbeOutcome::Failed(why) => Err(AcpError::internal_error().data(
+            format!("cannot start {candidate}: it failed its probe: {why}"),
+        )),
     }
 }
 
@@ -6199,15 +6255,12 @@ async fn switch_pin(
         )));
     }
 
-    // A target whose process died is revived here rather than refused: the
-    // routing pool drops dead targets, so without this a switch onto one
+    // A target whose process is missing (died, or never spawned because the
+    // boot auth probe said logged out) is started here, before the summary:
+    // the routing pool drops such targets, so without this a switch onto one
     // could never succeed and the session stayed on the model it was leaving.
-    if let Some(key) = shared.candidate_runtime(target).map(|r| r.process_key)
-        && shared.target_conn(&key).is_none()
-    {
-        revive_target_now(shared, &key).await.map_err(|why| {
-            AcpError::internal_error().data(format!("cannot start {target}: {why}"))
-        })?;
+    if let Some(key) = shared.candidate_runtime(target).map(|r| r.process_key) {
+        ensure_target_ready(shared, target, &key).await?;
     }
 
     // 1. Build the handoff. Preferred path: ask the outgoing model to

@@ -3409,6 +3409,100 @@ async fn switch_directive_hands_off_to_new_model_mid_session() {
     .await;
 }
 
+/// Agent `b` whose boot auth probe says logged out, so init never spawns it.
+fn logged_out_at_boot_yaml(
+    state: &std::path::Path,
+    a_log: &std::path::Path,
+    b_log: &std::path::Path,
+    b_env: &[(&str, &str)],
+) -> String {
+    let b_log = b_log.display().to_string();
+    let mut env = vec![("MOCK_LOG", b_log.as_str())];
+    env.extend_from_slice(b_env);
+    let b = agent_yaml("b", &[("m2", 2)], &env).replace(
+        "    model_selection:",
+        "    auth_probe:\n      command: /bin/sh\n      args: [\"-c\", \"echo not signed in >&2; exit 1\"]\n    model_selection:",
+    );
+    format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[("MOCK_LOG", &a_log.display().to_string())]
+        ),
+        b,
+    )
+}
+
+#[tokio::test]
+async fn switch_starts_a_target_skipped_at_boot_and_hands_off() {
+    // The live failure: the router booted while Claude was logged out, so
+    // Claude was never spawned. After sign-in, a chip pick of Opus failed
+    // "no live downstream process" after the outgoing model's summary.
+    let state = temp_state_file("switch-boot-skipped");
+    let a_log = temp_log("switch-boot-skipped-a");
+    let b_log = temp_log("switch-boot-skipped-b");
+    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, &[]);
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        assert!(read_log(&b_log).is_empty(), "b not spawned at boot");
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart the work").await?;
+
+        let resp = prompt_text(&cx, &sid, "[router: switch=b/m2] continue the work").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("switched a/m1 → b/m2"), "switched: {text}");
+        assert!(text.contains("echo:m2:"), "new model answered: {text}");
+        assert!(!text.contains("no live downstream"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn switch_to_a_still_signed_out_target_fails_before_the_summary() {
+    let state = temp_state_file("switch-boot-signed-out");
+    let a_log = temp_log("switch-boot-signed-out-a");
+    let b_log = temp_log("switch-boot-signed-out-b");
+    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, &[("MOCK_AUTH_REQUIRED", "1")]);
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart the work").await?;
+
+        let failed = prompt_text(&cx, &sid, "[router: switch=b/m2] continue the work").await;
+        assert!(failed.is_err(), "turn fails: {failed:?}");
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switch to b/m2 failed"),
+            "failure named: {text}"
+        );
+        assert!(text.contains("not signed in"), "sign-in named: {text}");
+        assert!(!text.contains("no live downstream"), "{text}");
+        assert!(
+            !read_log(&a_log).iter().any(|e| e["event"] == "prompt"
+                && e["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("hand this conversation off")),
+            "a was not asked to summarize"
+        );
+
+        // Still on a/m1.
+        prompt_text(&cx, &sid, "still here").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("echo:m1:still here"),
+            "stayed on a/m1: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn switch_directive_alone_switches_and_the_new_model_responds() {
     // A bare `[router: switch=…]` with no task must still switch and produce a
