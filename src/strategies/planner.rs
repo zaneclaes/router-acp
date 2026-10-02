@@ -207,6 +207,9 @@ pub fn heuristic_signals_implementation(text: &str) -> bool {
 /// The ACP client and Kory Code relay match these strings exactly.
 pub const HANDOFF_PROCEED: &str = "Proceed with implementation";
 pub const HANDOFF_REFINE: &str = "Refine the plan";
+pub const HANDOFF_CREATE_EPIC: &str = "Create EPIC";
+/// Legacy synonym for [`HANDOFF_CREATE_EPIC`]. The protocol no longer offers
+/// it, but hosts still accept it from older sessions.
 pub const HANDOFF_COORDINATE: &str = "Spawn sessions and coordinate";
 
 /// Header the planning-phase inject starts with — tests and log greps key on it.
@@ -234,12 +237,18 @@ pub fn planner_plan_protocol() -> String {
          ticket-bound.\n\
          4. Only AFTER the plan is in the conversation AND the session is \
          ticket-bound, ask one structured question. Offer exactly one of \
-         these pairs — never both Proceed and Spawn in the same question:\n\
-         - This session will do the work: \"{HANDOFF_PROCEED}\" and \
-         \"{HANDOFF_REFINE}\"\n\
-         - The plan delegates to separate ticket-bound sessions: \
-         \"{HANDOFF_COORDINATE}\" instead of \"{HANDOFF_PROCEED}\", plus \
-         \"{HANDOFF_REFINE}\"\n\
+         these pairs — never both \"{HANDOFF_PROCEED}\" and \
+         \"{HANDOFF_CREATE_EPIC}\" in the same question:\n\
+         - Default — anything that is not a single PR you are highly \
+         confident in: \"{HANDOFF_CREATE_EPIC}\" and \"{HANDOFF_REFINE}\". \
+         This session becomes the epic parent and the work runs in separate \
+         ticket-bound child sessions.\n\
+         - Only when the plan is one PR you are highly confident in: \
+         \"{HANDOFF_PROCEED}\" and \"{HANDOFF_REFINE}\". This session does \
+         the work.\n\
+         The choice is yours and defaults to \"{HANDOFF_CREATE_EPIC}\". Any \
+         complexity or confidence estimate from the router is advisory, not \
+         a gate.\n\
          5. Do not ask for implementation approval against a plan you have \
          not presented, or against a session with no Linear ticket.\n\
          \n\
@@ -251,9 +260,9 @@ pub fn planner_plan_protocol() -> String {
          - Starting implementation after a \"{HANDOFF_PROCEED}\" answer. End \
          the turn without editing; a follow-up user prompt performs the \
          router switch onto the implementation model.\n\
-         - Leaving the PLANNING phase after a \"{HANDOFF_COORDINATE}\" \
+         - Leaving the PLANNING phase after a \"{HANDOFF_CREATE_EPIC}\" \
          answer. End the turn without editing and without a phase switch; \
-         a follow-up user prompt carries the spawn-and-coordinate brief.\n\
+         a follow-up user prompt carries the epic coordination brief.\n\
          \n\
          Do not paraphrase the choice labels."
     )
@@ -598,8 +607,15 @@ mod tests {
         assert!(protocol.starts_with(PLAN_PROTOCOL_HEADER));
         assert!(protocol.contains(HANDOFF_PROCEED));
         assert!(protocol.contains(HANDOFF_REFINE));
-        assert!(protocol.contains(HANDOFF_COORDINATE));
-        assert!(protocol.contains("separate ticket-bound sessions"));
+        assert!(protocol.contains(HANDOFF_CREATE_EPIC));
+        assert!(
+            !protocol.contains(HANDOFF_COORDINATE),
+            "legacy coordinate label must not be offered: {protocol}"
+        );
+        assert!(protocol.contains("defaults to \"Create EPIC\""));
+        assert!(protocol.contains("one PR you are highly confident in"));
+        assert!(protocol.contains("advisory, not a gate"));
+        assert!(protocol.contains("separate ticket-bound child sessions"));
         assert!(protocol.contains("without a phase switch"));
         assert!(protocol.contains("ticket-bound"));
         assert!(protocol.contains("never the implementation agent"));

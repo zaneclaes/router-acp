@@ -8299,8 +8299,8 @@ async fn planner_plan_ready_false_injects_protocol_not_current_plan_question() {
             "stable refine choice missing: {prompt}"
         );
         assert!(
-            prompt.contains(router_acp::strategies::planner::HANDOFF_COORDINATE),
-            "stable coordinate choice missing: {prompt}"
+            prompt.contains(router_acp::strategies::planner::HANDOFF_CREATE_EPIC),
+            "stable Create EPIC choice missing: {prompt}"
         );
         assert!(
             prompt.contains("HOST-PLAN-INSTRUCTIONS-MARKER"),
