@@ -387,13 +387,18 @@ default first turn):
    ticket (the planner writes that ticket — never the implementation
    agent), then ask one structured question. The handoff question is
    forbidden until the session is ticket-bound. Offer exactly one pair —
-   never both Proceed and Spawn in the same question:
-   - This session will do the work: `Proceed with implementation` and
-     `Refine the plan`.
-   - The plan delegates to separate ticket-bound sessions:
-     `Spawn sessions and coordinate` **instead of** Proceed, plus
-     `Refine the plan`. Coordinating stays in Planning; there is no
+   never both Proceed and Create EPIC in the same question:
+   - Default — anything that is not a single PR the planner is highly
+     confident in: `Create EPIC` and `Refine the plan`. The planning
+     session becomes the epic parent; children run in separate
+     ticket-bound sessions. Coordinating stays in Planning; there is no
      phase switch.
+   - Only for one PR the planner is highly confident in:
+     `Proceed with implementation` and `Refine the plan`.
+   The choice is the planner's and defaults to Create EPIC; the router's
+   complexity and confidence numbers are advisory, never a gate. The
+   former coordinate label `Spawn sessions and coordinate` is no longer
+   offered; hosts keep accepting it as a legacy synonym.
    Implementation edits are forbidden in that turn. The approval question
    is forbidden until the plan has been presented — there is no "proceed
    with the current plan?" prompt when no plan exists.
@@ -406,8 +411,9 @@ turn ends. On a pinned planning session that directive upgrades the phase
 **and** queues a `pending_switch` to the best implementation-phase
 candidate (same summarize-and-re-pin as any other switch). Declining or
 choosing `Refine the plan` does not change phase. Choosing
-`Spawn sessions and coordinate` also stays in Planning: the host queues a
-spawn-and-coordinate brief **without** a `[router: phase=…]` directive.
+`Create EPIC` (or the legacy `Spawn sessions and coordinate`) also stays in
+Planning: the host queues an epic coordination brief **without** a
+`[router: phase=…]` directive.
 
 When any other source upgrades the phase post-pin, the router likewise
 queues a `pending_switch` to the best implementation-phase candidate.
