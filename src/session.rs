@@ -90,42 +90,6 @@ pub struct CandidateRuntime {
     pub auto_eligible: bool,
 }
 
-/// A routeable candidate as ROUTING should see it: the model that will
-/// actually serve the turn, plus the `model_version_pins` key it stands in
-/// for (if any).
-///
-/// Substituting here — before any eligibility check, ranking, exclusion or
-/// failover decision — is what makes a version pin total. Every consumer
-/// downstream (the strategies, escalation/demotion targets, pre-classifier
-/// evaluators, skill routes, orchestration globs, delegation, the per-request
-/// proxy) then sees the identity that will really answer, so the capability /
-/// cordon / quarantine / effort checks run on it, failover excludes it, and no
-/// path can resolve the alias and open the wrong model.
-#[derive(Debug, Clone)]
-pub struct EffectiveCandidate {
-    /// The runtime that will serve: the version-pin TARGET when `pinned_from`
-    /// is set, otherwise the candidate itself.
-    pub runtime: CandidateRuntime,
-    /// The pin KEY this stands in for; `None` when no substitution applied.
-    pub pinned_from: Option<CandidateId>,
-}
-
-impl EffectiveCandidate {
-    fn direct(runtime: CandidateRuntime) -> Self {
-        Self {
-            runtime,
-            pinned_from: None,
-        }
-    }
-
-    /// True when `id` names this pool member under either spelling — the model
-    /// that will serve, or the alias it replaced. An explicit pick, an
-    /// exclusion, or a config glob may legitimately use either.
-    pub fn answers_to(&self, id: &CandidateId) -> bool {
-        &self.runtime.id == id || self.pinned_from.as_ref() == Some(id)
-    }
-}
-
 /// Runtime state for one downstream process target.
 pub struct TargetRuntime {
     pub spec: ProcessTargetSpec,
@@ -593,7 +557,8 @@ impl Shared {
                 ScoreTable::from_file(path).map_err(|e| AcpError::invalid_params().data(e))?
             }
             None => ScoreTable::builtin(),
-        };
+        }
+        .with_pinned_versions(&cfg);
         let rules = match &cfg.classifier.rules_file {
             Some(path) => {
                 ClassifierRules::from_file(path).map_err(|e| AcpError::invalid_params().data(e))?
@@ -837,27 +802,10 @@ impl Shared {
             .collect()
     }
 
-    /// Routeable candidates with `model_version_pins` applied — the single
-    /// place the substitution happens, so every routing path inherits it.
-    ///
-    /// A candidate whose id is a pin KEY is replaced by its TARGET's runtime,
-    /// keeping the key's automatic selectability and config position: the pin
-    /// is meant to be transparent to routing, so the slot still participates
-    /// wherever the alias did (and `auto_eligible: false` on the target — the
-    /// normal case — must not remove it).
-    ///
-    /// A pinned slot exists only while the TARGET is itself routeable. A pin
-    /// whose target is down or invalid is unavailable, and normal failover
-    /// picks something else — it never silently degrades to serving the alias.
-    pub fn effective_candidates(&self) -> Vec<EffectiveCandidate> {
-        self.effective_candidates_inner(false)
-    }
-
     /// `include_down` also admits candidates whose process died (`Down`) —
     /// only for an explicit pick, which revives the process before use.
-    fn effective_candidates_inner(&self, include_down: bool) -> Vec<EffectiveCandidate> {
-        let routeable: Vec<CandidateRuntime> = self
-            .candidates
+    fn routeable_candidates_inner(&self, include_down: bool) -> Vec<CandidateRuntime> {
+        self.candidates
             .lock()
             .unwrap()
             .iter()
@@ -866,43 +814,7 @@ impl Shared {
                     || (include_down && matches!(c.status, CandidateStatus::Down(_)))
             })
             .cloned()
-            .collect();
-        if self.cfg.model_version_pins.is_empty() {
-            return routeable
-                .into_iter()
-                .map(EffectiveCandidate::direct)
-                .collect();
-        }
-        let mut out: Vec<EffectiveCandidate> = Vec::new();
-        for c in &routeable {
-            let Some(target_id) = self.cfg.version_pin_target(&c.id) else {
-                continue;
-            };
-            let Some(target) = routeable.iter().find(|t| t.id == target_id) else {
-                continue;
-            };
-            out.push(EffectiveCandidate {
-                runtime: CandidateRuntime {
-                    auto_eligible: c.auto_eligible,
-                    config_index: c.config_index,
-                    ..target.clone()
-                },
-                pinned_from: Some(c.id.clone()),
-            });
-        }
-        // A pin target that is ALSO declared in its own right collapses onto
-        // one pool entry: keep the substituted one, since it carries the key's
-        // automatic selectability (which is the whole point of the pin).
-        for c in &routeable {
-            if self.cfg.version_pin_target(&c.id).is_some()
-                || out.iter().any(|e| e.runtime.id == c.id)
-            {
-                continue;
-            }
-            out.push(EffectiveCandidate::direct(c.clone()));
-        }
-        out.sort_by_key(|e| e.runtime.config_index);
-        out
+            .collect()
     }
 
     pub fn has_auth_pending(&self) -> bool {
@@ -1039,10 +951,9 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        let wanted = self.cfg.resolve_stated_candidate(id);
-        self.eligible_views_inner(required, class, false, Some(&wanted), true)
+        self.eligible_views_inner(required, class, false, Some(id), true)
             .into_iter()
-            .find(|v| v.id == wanted)
+            .find(|v| &v.id == id)
     }
 
     /// `eligible_views` plus one named candidate that may be
@@ -1073,20 +984,15 @@ impl Shared {
     /// The strategy view for ONE candidate, ignoring auto-eligibility — the
     /// question "may this specific candidate serve this prompt right now?",
     /// which an explicit pin has to be able to answer yes to.
-    ///
-    /// `id` is treated as a STATED reference and resolved through the
-    /// version-pin map first, so asking about a family's stable default id
-    /// answers about the version that would actually serve it.
     pub fn candidate_view(
         &self,
         id: &CandidateId,
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        let wanted = self.cfg.resolve_stated_candidate(id);
-        self.eligible_views_inner(required, class, false, Some(&wanted), false)
+        self.eligible_views_inner(required, class, false, Some(id), false)
             .into_iter()
-            .find(|v| v.id == wanted)
+            .find(|v| &v.id == id)
     }
 
     fn eligible_views_inner(
@@ -1097,25 +1003,16 @@ impl Shared {
         admit: Option<&CandidateId>,
         explicit_pick: bool,
     ) -> Vec<CandidateView> {
-        // Version pins are already applied (see `effective_candidates`), so
-        // every check below runs on the model that will actually serve.
-        let candidates = self.effective_candidates_inner(explicit_pick);
+        let candidates = self.routeable_candidates_inner(explicit_pick);
         let mut headroom = self.headroom.lock().unwrap();
         let targets = self.targets.lock().unwrap();
         let mut views = Vec::new();
-        for effective in candidates {
-            // A pin-only version is reachable only on purpose: it stays out
-            // of the pool unless it IS the explicitly named candidate (under
-            // either spelling — the pin key or the target itself).
-            if !effective.runtime.auto_eligible
-                && !admit.is_some_and(|wanted| effective.answers_to(wanted))
-            {
+        for c in candidates {
+            // An explicit-only candidate stays out of the pool unless it IS
+            // the explicitly named candidate.
+            if !c.auto_eligible && admit != Some(&c.id) {
                 continue;
             }
-            let EffectiveCandidate {
-                runtime: c,
-                pinned_from,
-            } = effective;
             let Some(target) = targets.get(&c.process_key) else {
                 continue;
             };
@@ -1209,7 +1106,6 @@ impl Shared {
                 preference,
                 on_overage,
                 id: c.id,
-                pinned_from,
             });
         }
         // Unmetered seats (no plan signal) must not look "more free" than a
@@ -2585,19 +2481,13 @@ pub async fn open_downstream_session(
             return Err(AcpError::internal_error()
                 .data(format!("no model config option discovered for {candidate}")));
         };
-        // The selector speaks `downstream_id` (== `id` unless the entry pins a
-        // legacy version behind a known-good alias), or a `[1m]` synonym the
+        // The selector speaks the candidate's `id`, or a `[1m]` synonym the
         // adapter actually listed; the real wire model is then held by
-        // `api_model` through the per-request proxy.
-        let wanted = shared
-            .cfg
-            .model_config(candidate)
-            .map(|m| m.downstream_id().to_string())
-            .unwrap_or_else(|| candidate.model.clone());
+        // `api_model` (or a pinned version) through the per-request proxy.
         let selector_values = find_model_option(resp.config_options.as_deref().unwrap_or(&[]))
             .map(|option| select_values(&option))
             .unwrap_or_default();
-        let downstream_model = selector_value_to_send(&selector_values, &wanted, &candidate.model);
+        let downstream_model = selector_value_to_send(&selector_values, &candidate.model);
         let set_req = SetSessionConfigOptionRequest::new(
             resp.session_id.clone(),
             config_id.clone(),
@@ -2988,14 +2878,7 @@ fn model_pricing<'a>(
     cfg: &'a crate::config::Config,
     candidate: &CandidateId,
 ) -> Option<&'a crate::config::PricingConfig> {
-    cfg.agents
-        .iter()
-        .find(|a| a.name == candidate.agent)?
-        .models
-        .iter()
-        .find(|m| m.id == candidate.model)?
-        .pricing
-        .as_ref()
+    cfg.model_pricing(candidate)
 }
 
 /// Synthesize the USD cost of one turn from configured `pricing`. `None`
@@ -3280,34 +3163,14 @@ fn prefer_larger_context(
     if roomier.is_empty() { pool } else { roomier }
 }
 
-/// Note each `model_version_pins` substitution on the ranked chain, so the
-/// disclosure names the alias that was asked for alongside the version that
-/// actually serves.
-///
-/// This only ANNOTATES. The substitution itself already happened when the pool
-/// was built (`Shared::effective_candidates`), which is what lets every
-/// eligibility check, exclusion and failover decision run on the served
-/// identity rather than the alias it replaced.
-/// `requested` is the candidate the user named BEFORE substitution: when they
-/// asked for the served version by name there is nothing they did not ask for,
-/// so the note would only add an alias they never mentioned.
-fn note_version_pins(
-    pool: &[CandidateView],
-    ranked: &mut [RankedCandidate],
-    requested: Option<&CandidateId>,
-) {
+/// Name the pinned version on each ranked candidate that runs one, so the
+/// disclosure says which model actually serves.
+fn note_pinned_versions(cfg: &crate::config::Config, ranked: &mut [RankedCandidate]) {
     for rc in ranked.iter_mut() {
-        if requested == Some(&rc.candidate) {
-            continue;
-        }
-        let Some(key) = pool
-            .iter()
-            .find(|v| v.id == rc.candidate)
-            .and_then(|v| v.pinned_from.clone())
-        else {
+        let Some(version) = cfg.pinned_version(&rc.candidate) else {
             continue;
         };
-        let note = format!("version pin: {key} → {}", rc.candidate);
+        let note = format!("pinned version {}", version.api_model);
         rc.note = Some(match rc.note.take() {
             Some(existing) => format!("{note}; {existing}"),
             None => note,
@@ -3357,19 +3220,6 @@ async fn pin_session(
             )
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
-    // Substitute the version pin on the explicit override FIRST, before any
-    // check consults it. The pool is already built on served identities
-    // (`effective_candidates`), so an override still naming the alias would
-    // not be found in it — and, more importantly, the cordon check and the
-    // failover exclusion below have to be evaluated against the model that
-    // will actually run, not the alias standing in front of it.
-    let requested_override = override_.clone();
-    let override_ = override_.map(|cand| {
-        shared
-            .cfg
-            .version_pin_target(&cand)
-            .unwrap_or_else(|| cand.clone())
-    });
     // pin_session only ever creates primary (top-level) sessions; delegated
     // sub-agent rows are written by the delegation path with a parent link.
     let parent_session_id: Option<String> = None;
@@ -3429,9 +3279,7 @@ async fn pin_session(
     // model; an empty pool fails the turn below rather than widening.
     let picked = override_.clone().filter(|_| user_pick);
     let coordinator_admits = |v: &CandidateView| {
-        !coordinator
-            || v.ids().any(|id| shared.in_planning_pool(id))
-            || picked.as_ref() == Some(&v.id)
+        !coordinator || shared.in_planning_pool(&v.id) || picked.as_ref() == Some(&v.id)
     };
     let planner_difficulty = shared
         .with_session(router_sid, |s| s.planner_difficulty)
@@ -3591,7 +3439,6 @@ async fn pin_session(
                 .candidate
                 .as_deref()
                 .and_then(CandidateId::parse)
-                .map(|candidate| shared.cfg.resolve_stated_candidate(&candidate))
         });
         if let Some(candidate) = static_candidate
             && let Some(reason) = shared
@@ -3623,15 +3470,7 @@ async fn pin_session(
     // the fallback — no error, unlike a hard `candidate=` pin.
     let preferred = shared
         .with_session(router_sid, |s| s.preferred_candidate.clone())
-        .flatten()
-        // Same substitution as the hard override: a preference naming a pinned
-        // family has to compare against the served identity in `ranked`.
-        .map(|pref| {
-            shared
-                .cfg
-                .version_pin_target(&pref)
-                .unwrap_or_else(|| pref.clone())
-        });
+        .flatten();
     if let Some(pref) = &preferred
         && let Some(pos) = ranked.iter().position(|r| &r.candidate == pref)
     {
@@ -3643,10 +3482,7 @@ async fn pin_session(
         ranked.insert(0, rc);
     }
 
-    // Disclose any version-pin substitution. The pool already carries the
-    // served identity, so `ranked` needs no rewriting here — only the note
-    // naming the alias the strategy (or the user) actually asked for.
-    note_version_pins(&pool, &mut ranked, requested_override.as_ref());
+    note_pinned_versions(&shared.cfg, &mut ranked);
 
     // 4. Walk the ranked list until a candidate opens and verifies,
     //    remembering why each earlier candidate was skipped.
@@ -4734,20 +4570,12 @@ fn candidate_matches(pattern: &str, candidate: &CandidateId) -> bool {
         || crate::candidate::glob_match(pattern, &candidate.to_string())
 }
 
-/// `candidate_matches` over every spelling a pool member answers to (see
-/// [`CandidateView::ids`]). Config that names a family's moving alias — a
-/// skill route, a planner/reviewer glob — must keep designating the slot after
-/// a `model_version_pins` entry substitutes a specific version underneath it.
 fn view_matches(pattern: &str, view: &CandidateView) -> bool {
-    view.ids().any(|id| candidate_matches(pattern, id))
+    candidate_matches(pattern, &view.id)
 }
 
-/// `is_excluded` over every spelling a pool member answers to. An exclusion
-/// authored against either the pin key or the served version removes the slot,
-/// which is also what makes failover terminate: excluding a failed target
-/// cannot leave its alias behind to route straight back to it.
 fn view_excluded(view: &CandidateView, patterns: &[String]) -> bool {
-    view.ids().any(|id| is_excluded(id, patterns))
+    is_excluded(&view.id, patterns)
 }
 
 /// The best eligible candidate matching any of `patterns` — not cordoned,
@@ -4918,10 +4746,7 @@ fn resolve_candidate_ref(
             .candidate_view_revivable(&id, &RequiredCaps::default(), class)
             .is_some()
     {
-        // Return the RESOLVED id: a fully-qualified shorthand may name a
-        // family's stable default while a version pin points it elsewhere, and
-        // the caller logs/pins this value.
-        return Some(shared.cfg.resolve_stated_candidate(&id));
+        return Some(id);
     }
     let needle = reference.to_lowercase();
     let has_slash = reference.contains('/');
@@ -6180,7 +6005,6 @@ fn static_unrouteable_message(
             .candidate
             .as_deref()
             .and_then(CandidateId::parse)
-            .map(|candidate| shared.cfg.resolve_stated_candidate(&candidate))
     });
     let Some(id) = chosen else {
         return err.to_string();
@@ -6229,13 +6053,6 @@ async fn switch_pin(
     style: HandoffStyle,
     user_pick: bool,
 ) -> Result<Vec<String>, AcpError> {
-    // Version pinning applies to re-pins too: a switch resolved by any route
-    // (user `switch=`, escalation, demotion, a skill re-route, a cordon
-    // redirect) lands on the pinned version, not the moving alias. Done first
-    // so the "already there" check below compares the substituted target.
-    let substituted = shared.cfg.version_pin_target(target);
-    let target = substituted.as_ref().unwrap_or(target);
-
     // Read the pin directly (not `pinned_route`, which requires a *live*
     // downstream): an outage may have killed the old process, and we still
     // want to switch away from it using the log-transcript fallback.

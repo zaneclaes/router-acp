@@ -42,18 +42,15 @@ delegation:
   # worker routing; 1.0 disables.
   complexity_cap: 0.6
 
-# Version pinning: hold a family's traffic on a specific released version while
-# its default alias moves on. Whenever candidate resolution lands on a KEY —
-# the strategy's winner, an explicit `candidate=`/`switch=` naming the key, a
-# skill route, the static router's candidate — the session pins to the TARGET
-# instead, and the routing disclosure names the target so the user sees which
-# model actually served the turn. One hop only: a target that is itself a key
-# is not followed. Both sides must be declared models of the SAME agent, and
-# the target is normally an `auto_eligible: false` legacy entry (below).
+# Version pinning: run an older provider version of a model while its default
+# moves on. The value is `default` (the model's `api_model`) or one of that
+# model's `versions[].api_model`. Routing never sees it — the candidate keeps
+# its id everywhere — and the proxy sends the pinned version on the wire,
+# priced and scored as that version. The routing disclosure names it.
 #
 # Commented out because the default here is "run the current version".
-# model_version_pins:
-#   "claude/opus[1m]": "claude/claude-opus-4-6"
+# pinned_versions:
+#   "claude/opus[1m]": claude-opus-4-6
 
 agents:
   - name: claude
@@ -116,55 +113,39 @@ agents:
       # model off the 0.1× read ratio (Fable 5.1 is 0.025×). CLI alias remains
       # `opus[1m]` (1M context is the only Opus 5.5 window). The adapter's
       # `latest_per_family.opus` already resolves to 5.5.
+      # Older versions are selectable only through `pinned_versions`. Opus 5
+      # and 4.6 are $5/$25 with the standard 0.1× cache.
       - { id: "opus[1m]", display_name: Claude Opus 5.5 1M, cost_rank: 4,
           api_model: claude-opus-5-5,
           pricing: { input_per_mtok: 4.00, output_per_mtok: 20.00,
-                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 5.00 } }
-      # Legacy Opus 5 — pin-only. Same $5/$25 as 4.8/4.6, standard 0.1× cache.
-      - { id: claude-opus-5, display_name: Claude Opus 5, cost_rank: 4,
-          auto_eligible: false, downstream_id: "opus[1m]",
-          api_model: claude-opus-5,
-          pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
-                     cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
+                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 5.00 },
+          versions: [
+            { api_model: claude-opus-5,
+              pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
+                         cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } },
+            { api_model: claude-opus-4-6,
+              pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
+                         cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } } ] }
       # The fable DEFAULT still serves Fable 5. `claude-fable-5-1` is gated
       # server-side on Claude Code >= 2.1.251 (older CLIs get a 400 telling
       # them to update), so making 5.1 the automatic default here would 400
       # every fable-routed request — auto, planner globs, apex complexity — for
-      # any consumer below that floor. 5.1 is the pin-only entry below.
+      # any consumer below that floor. 5.1 is a pinnable version for now.
+      #
+      # Fable 5.1 is the same $10/$50 list as Fable 5, but its CACHE READ is
+      # $0.25/Mtok: 0.025x input, where every other Claude model is 0.1x. A 4x
+      # cheaper warm read lengthens the cache-reprime break-even, so the rate
+      # has to be stated, not derived. Once your CLI clears the floor, pin it
+      # (`"claude/claude-fable-5[1m]": claude-fable-5-1`) or make it the
+      # `api_model`.
       - { id: "claude-fable-5[1m]", display_name: Claude Fable 5 1M, cost_rank: 5,
           api_model: claude-fable-5,
           pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
-                     cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 } }
-      # Claude Fable 5.1 — pin-only FOR NOW. Same $10/$50 list as Fable 5, but
-      # its CACHE READ is $0.25/Mtok: 0.025x input, where every other Claude
-      # model is 0.1x. A 4x cheaper warm read lengthens the cache-reprime
-      # break-even, so the rate has to be stated, not derived.
-      #
-      # TO MAKE 5.1 THE DEFAULT once your CLI clears the floor: move
-      # `api_model: claude-fable-5-1` (and the 0.25 cache read) onto the entry
-      # above and delete this one — or, to keep 5 reachable, swap the two
-      # entries' `api_model`/`auto_eligible` values.
-      - { id: claude-fable-5-1, display_name: Claude Fable 5.1 1M, cost_rank: 5,
-          auto_eligible: false, downstream_id: "claude-fable-5[1m]",
-          api_model: claude-fable-5-1,
-          pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
-                     cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 } }
-      # A pinned LEGACY version. `auto_eligible: false` keeps it out of every
-      # automatic pool (strategies, escalation/demotion, pre-class evaluators,
-      # planner/reviewer globs, skill routes, failover, delegation, per-request
-      # proxy routing) while leaving it listed in the model picker and
-      # selectable by name — `[router: candidate=claude/claude-opus-4-6]` — and
-      # usable as a `model_version_pins` target.
-      #
-      # `downstream_id` is what makes that work: the selector never advertises
-      # a bare API id, so without it the probe drops this candidate as "not
-      # offered by downstream model selector". The alias opens the session;
-      # `api_model` pins what actually goes on the wire.
-      - { id: claude-opus-4-6, display_name: Claude Opus 4.6, cost_rank: 4,
-          auto_eligible: false, downstream_id: "opus[1m]",
-          api_model: claude-opus-4-6,
-          pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
-                     cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
+                     cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 },
+          versions: [
+            { api_model: claude-fable-5-1,
+              pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
+                         cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 } } ] }
 
   - name: codex
     command:

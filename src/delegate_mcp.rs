@@ -413,14 +413,7 @@ pub fn delegation_available(
     if !shared.cfg.delegation.enabled {
         return false;
     }
-    // Version pins applied: the delegate pool comes from `eligible_views`,
-    // which is built on the same substituted set, so availability has to be
-    // judged on the models that could actually take a subtask.
-    let routeable: Vec<_> = shared
-        .effective_candidates()
-        .into_iter()
-        .map(|effective| effective.runtime)
-        .collect();
+    let routeable = shared.routeable_candidates();
     if routeable.len() <= 1 {
         return false;
     }
@@ -437,8 +430,8 @@ pub fn delegation_available(
     // tier peers (e.g. a cross-lineage reviewer).
     //
     // Only auto-eligible candidates count as delegation targets — the
-    // delegate pool is built from `eligible_views`, so a pinned legacy
-    // version cannot serve a subtask and must not be what advertises the tool.
+    // delegate pool is built from `eligible_views`, so an explicit-only
+    // candidate cannot serve a subtask and must not be what advertises the tool.
     let delegatable: Vec<_> = routeable
         .iter()
         .filter(|c| c.auto_eligible && c.id != *candidate)
@@ -1097,12 +1090,7 @@ pub async fn run_delegate_task(
     // id it knows), so resolve it through the version-pin map — otherwise a
     // hint naming the stable default id matches nothing in the pool and is
     // silently dropped.
-    let hinted = args
-        .hints
-        .candidate
-        .as_deref()
-        .and_then(CandidateId::parse)
-        .map(|stated| shared.cfg.resolve_stated_candidate(&stated));
+    let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
     let mut pool = scope_delegate_pool(
         shared.eligible_views(&RequiredCaps::default(), profile.class),
         parent_cost,
@@ -1862,7 +1850,6 @@ mod tests {
                 plan_headroom: None,
                 on_overage: false,
                 preference: 0.0,
-                pinned_from: None,
             }
         };
         vec![

@@ -855,18 +855,12 @@ pub struct ModelConfig {
     /// Defaults to `id`.
     #[serde(default)]
     pub api_model: Option<String>,
-    /// Optional value sent to a `config-option` adapter's model selector,
-    /// when it differs from `id`. Defaults to `id`.
-    ///
-    /// This exists for pinned legacy versions. An adapter's model selector
-    /// advertises a small alias set (`opus[1m]`, `sonnet`, …) and REFUSES any
-    /// other value, so a candidate whose `id` is a bare API model id
-    /// (`claude-opus-4-6`) can never be selected downstream — the probe drops
-    /// it from the pool before selection is even attempted. Pointing
-    /// `downstream_id` at a known-good alias keeps the candidate selectable
-    /// while `api_model` pins the real wire model the proxy rewrites to.
+    /// Older provider versions of this model that `pinned_versions` may
+    /// select instead of `api_model`. The candidate, its selector value and
+    /// its downstream process stay the same; only the wire model (and the
+    /// pricing and scores that follow it) change.
     #[serde(default)]
-    pub downstream_id: Option<String>,
+    pub versions: Vec<ModelVersion>,
     /// 1 = cheapest/least scarce; larger = more expensive/scarce.
     pub cost_rank: u32,
     /// Whether any AUTOMATIC mechanism may choose this candidate. `false`
@@ -875,10 +869,7 @@ pub struct ModelConfig {
     /// orchestration planner/reviewer globs, skill routes, failover, delegate
     /// scoping and per-request proxy routing — while leaving it explicitly
     /// selectable (`router.candidate`, `[router: candidate=…]`,
-    /// `[router: switch=…]`) and a valid `model_version_pins` target.
-    ///
-    /// That is what a pinned legacy version needs: reachable on purpose,
-    /// never by accident.
+    /// `[router: switch=…]`): reachable on purpose, never by accident.
     #[serde(default = "default_true")]
     pub auto_eligible: bool,
     /// Optional API-equivalent pricing. It prices every interposed provider
@@ -888,12 +879,18 @@ pub struct ModelConfig {
     pub pricing: Option<PricingConfig>,
 }
 
-impl ModelConfig {
-    /// The value to send to a `config-option` adapter's model selector.
-    pub fn downstream_id(&self) -> &str {
-        self.downstream_id.as_deref().unwrap_or(&self.id)
-    }
+/// One selectable older version of a model (see `ModelConfig::versions`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelVersion {
+    /// Provider API model id the proxy puts on the wire, e.g. `claude-opus-4-6`.
+    pub api_model: String,
+    #[serde(default)]
+    pub pricing: Option<PricingConfig>,
 }
+
+/// `pinned_versions` value meaning "the model's current `api_model`".
+pub const DEFAULT_VERSION: &str = "default";
 
 /// USD per million tokens, mirroring the provider's published API rates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1336,21 +1333,12 @@ pub struct Config {
     /// Skill → model-class routing rules.
     #[serde(default)]
     pub skill_routing: Vec<SkillRoute>,
-    /// Version pinning: `agent/model-id` → `agent/model-id`. Whenever
-    /// candidate resolution lands on a KEY of this map — the strategy's
-    /// winner, an explicit `candidate=`/`switch=` naming the key, a skill
-    /// route, the static router's configured candidate — the session is
-    /// pinned to the TARGET instead.
-    ///
-    /// The point is to hold a family's traffic on a specific released
-    /// version while its default alias moves on: the key stays the id
-    /// everything already names, and the target is normally an
-    /// `auto_eligible: false` legacy entry. Substitution is a single hop (a
-    /// target that is itself a key is NOT followed) and the disclosure names
-    /// the target, so the user sees which model actually served the turn.
-    /// Naming the target directly is unaffected.
+    /// Version pinning: `agent/model-id` → `default` or one of that model's
+    /// `versions[].api_model`. Routing never sees it — the candidate stays
+    /// `agent/model-id` everywhere — and the proxy sends the pinned version on
+    /// the wire, priced and scored as that version.
     #[serde(default)]
-    pub model_version_pins: HashMap<String, String>,
+    pub pinned_versions: HashMap<String, String>,
     /// Ticket-reference → context-loading rules (prefix + fetch command).
     #[serde(default)]
     pub ticket_context: Vec<TicketRule>,
@@ -1841,60 +1829,53 @@ impl Config {
                         agent.name, model.id
                     )));
                 }
-                if model
-                    .downstream_id
-                    .as_ref()
-                    .is_some_and(|id| id.trim().is_empty())
-                {
-                    return Err(ConfigError(format!(
-                        "agents.{}.models.{}.downstream_id must not be empty",
-                        agent.name, model.id
-                    )));
-                }
-                if let Some(pricing) = &model.pricing
-                    && (pricing.input_per_mtok < 0.0
-                        || pricing.output_per_mtok < 0.0
-                        || pricing.cache_read_per_mtok.is_some_and(|v| v < 0.0)
-                        || pricing.cache_write_per_mtok.is_some_and(|v| v < 0.0))
+                let negative = |p: &PricingConfig| {
+                    p.input_per_mtok < 0.0
+                        || p.output_per_mtok < 0.0
+                        || p.cache_read_per_mtok.is_some_and(|v| v < 0.0)
+                        || p.cache_write_per_mtok.is_some_and(|v| v < 0.0)
+                };
+                if model.pricing.as_ref().is_some_and(negative)
+                    || model
+                        .versions
+                        .iter()
+                        .any(|v| v.pricing.as_ref().is_some_and(negative))
                 {
                     return Err(ConfigError(format!(
                         "agents.{}.models.{}.pricing rates must be non-negative",
                         agent.name, model.id
                     )));
                 }
+                let current = model.api_model.as_deref().unwrap_or(&model.id);
+                let mut seen = std::collections::HashSet::new();
+                for version in &model.versions {
+                    let api = version.api_model.trim();
+                    if api.is_empty()
+                        || api == DEFAULT_VERSION
+                        || api == current
+                        || !seen.insert(api)
+                    {
+                        return Err(ConfigError(format!(
+                            "agents.{}.models.{}.versions: `{}` must be a non-empty, unique \
+                             api_model other than `{DEFAULT_VERSION}` and the current `{current}`",
+                            agent.name, model.id, version.api_model
+                        )));
+                    }
+                }
             }
         }
-        // Version pins are resolved on every routing decision, so a typo has
-        // to fail the load rather than silently leave the key routing to
-        // itself. Both sides must be declared candidates of the SAME agent:
-        // the substitution replaces only the model, keeping the seat, its
-        // plan, and its downstream process.
-        for (key, target) in &self.model_version_pins {
-            let declared = |raw: &str, side: &str| -> Result<CandidateId, ConfigError> {
-                let id = CandidateId::parse(raw).ok_or_else(|| {
-                    ConfigError(format!(
-                        "model_version_pins {side} `{raw}` must have the form `agent/model-id`"
-                    ))
-                })?;
-                if self.model_config(&id).is_none() {
-                    return Err(ConfigError(format!(
-                        "model_version_pins {side} `{raw}` does not match any declared agent/model"
-                    )));
-                }
-                Ok(id)
-            };
-            let from = declared(key, "key")?;
-            let to = declared(target, &format!("target for `{key}`"))?;
-            if from.agent != to.agent {
+        // A typo'd pin must fail the load rather than silently serve latest.
+        for (key, version) in &self.pinned_versions {
+            let Some(model) = CandidateId::parse(key).and_then(|id| self.model_config(&id)) else {
                 return Err(ConfigError(format!(
-                    "model_version_pins `{key}` -> `{target}` crosses agents (`{}` -> `{}`); a \
-                     version pin substitutes the model within one agent",
-                    from.agent, to.agent
+                    "pinned_versions `{key}` does not match any declared agent/model"
                 )));
-            }
-            if from == to {
+            };
+            if version != DEFAULT_VERSION && !model.versions.iter().any(|v| &v.api_model == version)
+            {
                 return Err(ConfigError(format!(
-                    "model_version_pins `{key}` maps to itself; remove the entry"
+                    "pinned_versions `{key}`: `{version}` is not `{DEFAULT_VERSION}` or one of its \
+                     declared versions"
                 )));
             }
         }
@@ -2078,29 +2059,32 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// The `model_version_pins` substitution for a candidate: the mapped
-    /// target when `id` is a key of the map, else `None`. Single hop by
-    /// design — see the field's docs.
-    pub fn version_pin_target(&self, id: &CandidateId) -> Option<CandidateId> {
-        self.model_version_pins
-            .get(&id.to_string())
-            .and_then(|target| CandidateId::parse(target))
+    /// The `pinned_versions` entry in force for a candidate; `None` when it
+    /// runs its current `api_model`.
+    pub fn pinned_version(&self, id: &CandidateId) -> Option<&ModelVersion> {
+        let version = self.pinned_versions.get(&id.to_string())?;
+        self.model_config(id)?
+            .versions
+            .iter()
+            .find(|v| &v.api_model == version)
     }
 
-    /// Resolve a STATED candidate reference — one a human or a config file
-    /// wrote down — to the id routing will actually use. Single hop.
-    ///
-    /// Every seam that compares a stated reference against a live candidate
-    /// pool must go through this. Pools are built by
-    /// `Shared::effective_candidates`, which substitutes version pins BEFORE
-    /// filtering, so a pool holds target ids only; comparing a raw pin key
-    /// against it silently misses and the reference reads as unknown —
-    /// a not-routeable static route, an unrecognized `agent/model:` shorthand,
-    /// an ignored delegation hint. Stated references keep naming the stable
-    /// default id, so that miss is the normal case, not an edge one.
-    pub fn resolve_stated_candidate(&self, stated: &CandidateId) -> CandidateId {
-        self.version_pin_target(stated)
-            .unwrap_or_else(|| stated.clone())
+    /// The model id the proxy puts on the wire for a candidate.
+    pub fn wire_api_model(&self, id: &CandidateId) -> String {
+        if let Some(version) = self.pinned_version(id) {
+            return version.api_model.clone();
+        }
+        self.model_config(id)
+            .and_then(|m| m.api_model.clone())
+            .unwrap_or_else(|| id.model.clone())
+    }
+
+    /// Pricing of the version a candidate actually runs.
+    pub fn model_pricing(&self, id: &CandidateId) -> Option<&PricingConfig> {
+        match self.pinned_version(id) {
+            Some(version) => version.pricing.as_ref(),
+            None => self.model_config(id)?.pricing.as_ref(),
+        }
     }
 
     /// All declared candidate ids in config order.
@@ -2206,69 +2190,69 @@ agents:
     command: { type: stdio, command: mock-agent }
     model_selection: { type: config-option }
     models:
-      - { id: "opus[1m]", cost_rank: 4 }
-      - { id: claude-opus-4-6, cost_rank: 4, auto_eligible: false, downstream_id: "opus[1m]" }
+      - { id: opus, cost_rank: 4, api_model: claude-opus-5-5,
+          pricing: { input_per_mtok: 4.0, output_per_mtok: 20.0 },
+          versions: [ { api_model: claude-opus-4-6,
+                        pricing: { input_per_mtok: 5.0, output_per_mtok: 25.0 } } ] }
 "#
     }
 
     #[test]
-    fn models_are_auto_eligible_by_default_and_downstream_id_falls_back_to_id() {
+    fn an_unpinned_model_runs_its_current_api_model() {
         let cfg = Config::from_yaml(versioned_yaml()).unwrap();
-        let default_entry = &cfg.agents[0].models[0];
-        assert!(default_entry.auto_eligible);
-        assert_eq!(default_entry.downstream_id(), "opus[1m]");
-        let legacy = &cfg.agents[0].models[1];
-        assert!(!legacy.auto_eligible);
-        assert_eq!(legacy.downstream_id(), "opus[1m]");
-        assert!(cfg.model_version_pins.is_empty());
+        let opus = CandidateId::new("claude", "opus");
+        assert!(cfg.pinned_version(&opus).is_none());
+        assert_eq!(cfg.wire_api_model(&opus), "claude-opus-5-5");
+        assert_eq!(cfg.model_pricing(&opus).unwrap().input_per_mtok, 4.0);
+        let pinned_default = format!(
+            "pinned_versions:\n  claude/opus: default\n{}",
+            versioned_yaml()
+        );
+        let cfg = Config::from_yaml(&pinned_default).unwrap();
+        assert_eq!(cfg.wire_api_model(&opus), "claude-opus-5-5");
     }
 
     #[test]
-    fn resolves_a_version_pin_one_hop() {
+    fn a_pinned_version_changes_only_the_wire_model_and_its_pricing() {
         let yaml = format!(
-            "model_version_pins:\n  \"claude/opus[1m]\": claude/claude-opus-4-6\n{}",
+            "pinned_versions:\n  claude/opus: claude-opus-4-6\n{}",
             versioned_yaml()
         );
         let cfg = Config::from_yaml(&yaml).unwrap();
-        let key = CandidateId::new("claude", "opus[1m]");
-        let target = CandidateId::new("claude", "claude-opus-4-6");
-        assert_eq!(cfg.version_pin_target(&key), Some(target.clone()));
-        // The target is not itself a key, so there is no second hop to take.
-        assert_eq!(cfg.version_pin_target(&target), None);
-        assert!(cfg.auto_eligible(&key));
-        assert!(!cfg.auto_eligible(&target));
+        let opus = CandidateId::new("claude", "opus");
+        assert_eq!(cfg.declared_candidates(), vec![opus.clone()]);
+        assert_eq!(cfg.wire_api_model(&opus), "claude-opus-4-6");
+        assert_eq!(cfg.model_pricing(&opus).unwrap().input_per_mtok, 5.0);
     }
 
     #[test]
-    fn rejects_a_version_pin_target_that_is_not_declared() {
+    fn rejects_a_pin_to_an_undeclared_version_or_model() {
         let yaml = format!(
-            "model_version_pins:\n  \"claude/opus[1m]\": claude/claude-opus-4-9\n{}",
+            "pinned_versions:\n  claude/opus: claude-opus-4-9\n{}",
             versioned_yaml()
         );
         let err = Config::from_yaml(&yaml).unwrap_err();
         assert!(err.0.contains("claude-opus-4-9"), "{}", err.0);
+        let yaml = format!(
+            "pinned_versions:\n  claude/sonnet: default\n{}",
+            versioned_yaml()
+        );
+        let err = Config::from_yaml(&yaml).unwrap_err();
         assert!(err.0.contains("does not match any declared"), "{}", err.0);
     }
 
     #[test]
-    fn rejects_a_version_pin_that_crosses_agents() {
-        let yaml = r#"
-model_version_pins:
-  "claude/opus[1m]": codex/gpt-5.5
-agents:
-  - name: claude
-    command: { type: stdio, command: mock-agent }
-    model_selection: { type: config-option }
-    models:
-      - { id: "opus[1m]", cost_rank: 4 }
-  - name: codex
-    command: { type: stdio, command: mock-codex }
-    model_selection: { type: config-option }
-    models:
-      - { id: gpt-5.5, cost_rank: 3 }
-"#;
-        let err = Config::from_yaml(yaml).unwrap_err();
-        assert!(err.0.contains("crosses agents"), "{}", err.0);
+    fn rejects_a_version_that_repeats_the_current_api_model() {
+        let yaml =
+            versioned_yaml().replace("api_model: claude-opus-4-6", "api_model: claude-opus-5-5");
+        let err = Config::from_yaml(&yaml).unwrap_err();
+        assert!(err.0.contains("versions"), "{}", err.0);
+    }
+
+    #[test]
+    fn rejects_the_retired_downstream_id_field() {
+        let yaml = versioned_yaml().replace("cost_rank: 4,", "cost_rank: 4, downstream_id: opus,");
+        assert!(Config::from_yaml(&yaml).is_err());
     }
 
     #[test]

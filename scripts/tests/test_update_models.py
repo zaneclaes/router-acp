@@ -550,7 +550,7 @@ class CliTest(unittest.TestCase):
         # (Opus 5 is same-rank as 5.5 even though 5.5 is cheaper — weakly
         # monotonic). They are enabled (and so on the ladder) but
         # `auto_eligible: false`, so they are reachable only by explicit
-        # selection or as a `model_version_pins` target.
+        # selection.
         self.assertEqual(
             [model.cost_rank for model in catalog.agent("claude").enabled_models],
             [1, 2, 4, 4, 5, 5, 4],
