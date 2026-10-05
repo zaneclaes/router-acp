@@ -75,6 +75,13 @@ struct RequestPolicyState {
     /// the client renders it inside the tool-call card instead of as chat text.
     last_candidate: Option<String>,
     last_reason: Option<String>,
+    /// The latest thinking-enabled request asked for `thinking.display:
+    /// "omitted"`. Such a response returns the model's reasoning as empty,
+    /// signature-only blocks, so the only thinking text it can carry is the
+    /// server's narration: its summary of the prose the model wrote for the
+    /// user between tool calls. Read by the relay path to forward that text as
+    /// a message instead of a thought.
+    thinking_text_is_narration: bool,
 }
 
 /// Shared proxy runtime. Constructed with `Shared`, bound when `serve_shared`
@@ -293,6 +300,17 @@ impl LlmProxyRuntime {
         let state = policy.get(state_sid)?;
         let candidate = state.last_candidate.clone()?;
         Some((candidate, state.last_reason.clone().unwrap_or_default()))
+    }
+
+    /// Whether thinking text streamed for this session is the server's
+    /// narration of the model's user-facing prose rather than its reasoning
+    /// (see `RequestPolicyState::thinking_text_is_narration`).
+    pub fn thinking_text_is_narration(&self, state_sid: &str) -> bool {
+        self.policy
+            .lock()
+            .unwrap()
+            .get(state_sid)
+            .is_some_and(|s| s.thinking_text_is_narration)
     }
 
     pub fn current_model(&self, state_sid: &str) -> Option<String> {
@@ -1066,6 +1084,19 @@ fn thinking_disabled(body: &Value) -> bool {
         .is_some_and(|kind| kind.eq_ignore_ascii_case("disabled"))
 }
 
+/// Whether a thinking-enabled request omits the reasoning text from its
+/// response (`thinking.display: "omitted"`, which Claude Code sends). `None`
+/// when the request says nothing about it: no `thinking` config, or thinking
+/// disabled (Claude Code's WebFetch/WebSearch side calls), whose responses
+/// carry no thinking blocks at all.
+fn thinking_display_omitted(body: &Value) -> Option<bool> {
+    let thinking = body.get("thinking")?;
+    if thinking_disabled(body) {
+        return None;
+    }
+    Some(thinking.get("display").and_then(Value::as_str) == Some("omitted"))
+}
+
 /// Anthropic rejects `output_config.effort` above `high` on a request that
 /// disables thinking, so the router's own effort cannot ride such a request
 /// verbatim. Claude Code issues its WebFetch/WebSearch model calls with
@@ -1751,6 +1782,9 @@ fn select_request_model(
     // Record the decision for per-tool-call attribution in the client.
     state.last_candidate = Some(selected.to_string());
     state.last_reason = Some(reason.clone());
+    if let Some(omitted) = thinking_display_omitted(body) {
+        state.thinking_text_is_narration = omitted;
+    }
     let upstream_model = if selected == active.candidate {
         // Staying on the session's own model is NOT a licence to pass the
         // adapter's model string through. With `downstream_id` aliasing, the
@@ -2984,6 +3018,31 @@ agents:
         let (candidate, reason) = shared.llm_proxy.last_attribution("r1").unwrap();
         assert_eq!(candidate, "claude/sonnet");
         assert!(reason.contains("routine tool-result streak"), "{reason}");
+    }
+
+    #[test]
+    fn omitted_thinking_display_marks_thinking_text_as_narration() {
+        // Claude Code asks for `display: "omitted"`, so the only thinking text
+        // its responses carry is the server's narration of the model's prose.
+        let (_dir, shared) = kory_code_shared();
+        let turn = claude_active("claude-fable-5[1m]");
+        assert!(!shared.llm_proxy.thinking_text_is_narration("r1"));
+
+        select_request_model(&shared, &turn, &kory_code_request(1, "ok"));
+        assert!(shared.llm_proxy.thinking_text_is_narration("r1"));
+
+        // A WebFetch-style side call with thinking disabled says nothing about
+        // the main loop's thinking, so it leaves the flag alone.
+        let mut side = kory_code_request(1, "ok");
+        side["thinking"] = json!({"type": "disabled"});
+        select_request_model(&shared, &turn, &side);
+        assert!(shared.llm_proxy.thinking_text_is_narration("r1"));
+
+        // A request that returns reasoning text makes thinking text reasoning.
+        let mut summarized = kory_code_request(1, "ok");
+        summarized["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+        select_request_model(&shared, &turn, &summarized);
+        assert!(!shared.llm_proxy.thinking_text_is_narration("r1"));
     }
 
     #[test]

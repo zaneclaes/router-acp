@@ -148,6 +148,29 @@ pub fn is_agent_text_chunk(msg: &UntypedMessage) -> bool {
             == Some("text")
 }
 
+/// Re-label an `agent_thought_chunk` carrying text as an `agent_message_chunk`.
+/// Claude streams the server's narration — its summary of the prose the model
+/// wrote for the user between tool calls — as thinking blocks, and
+/// claude-agent-acp forwards every thinking block as a thought. When the
+/// request omitted reasoning text, that narration is the only text a thought
+/// can carry, and it belongs in the message the user reads: otherwise the
+/// explanation written right before a question never reaches them. Returns
+/// `msg` unchanged for any other frame.
+pub fn narration_as_message(msg: &UntypedMessage) -> Result<UntypedMessage, Error> {
+    let mut params = msg.params().clone();
+    if let Some(update) = params.get_mut("update")
+        && update.get("sessionUpdate").and_then(|k| k.as_str()) == Some("agent_thought_chunk")
+        && update
+            .get("content")
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| !t.is_empty())
+    {
+        update["sessionUpdate"] = Value::String("agent_message_chunk".to_string());
+    }
+    UntypedMessage::new(msg.method(), params)
+}
+
 /// Prepend `prefix` to the text of an `agent_message_chunk`. Used to ride the
 /// routing disclosure on the model's own first response chunk, because goose
 /// (and similar clients) drop separate router-originated `session/update`s.
@@ -275,6 +298,44 @@ mod tests {
         }));
         assert!(!is_agent_text_chunk(&tool));
         let out = prepend_agent_text(&tool, "> x\n\n").unwrap();
+        assert_eq!(out.params()["update"]["sessionUpdate"], "tool_call");
+    }
+
+    #[test]
+    fn narration_thought_becomes_a_message_chunk() {
+        let thought = msg(json!({
+            "sessionId": "s",
+            "update": {"sessionUpdate": "agent_thought_chunk",
+                       "content": {"type": "text", "text": "Here is the design."}}
+        }));
+        let out = narration_as_message(&thought).unwrap();
+        assert_eq!(
+            out.params()["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(
+            out.params()["update"]["content"]["text"],
+            "Here is the design."
+        );
+        assert!(is_agent_text_chunk(&out));
+
+        // A signature-only (empty) thought stays a thought, and other frames
+        // pass through untouched.
+        let empty = msg(json!({
+            "sessionId": "s",
+            "update": {"sessionUpdate": "agent_thought_chunk",
+                       "content": {"type": "text", "text": ""}}
+        }));
+        let out = narration_as_message(&empty).unwrap();
+        assert_eq!(
+            out.params()["update"]["sessionUpdate"],
+            "agent_thought_chunk"
+        );
+        let tool = msg(json!({
+            "sessionId": "s",
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "t", "title": "x"}
+        }));
+        let out = narration_as_message(&tool).unwrap();
         assert_eq!(out.params()["update"]["sessionUpdate"], "tool_call");
     }
 
