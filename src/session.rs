@@ -2091,6 +2091,17 @@ pub fn handle_downstream_dispatch(
     match route {
         DownstreamRoute::Primary { router_sid } => match message {
             Dispatch::Notification(msg) => {
+                // Claude's narration of its user-facing prose arrives as
+                // thinking; relay it as the message it is (see
+                // `relay::narration_as_message`), before anything below reads
+                // the frame's text.
+                let msg = if msg.method() == "session/update"
+                    && shared.llm_proxy.thinking_text_is_narration(&router_sid)
+                {
+                    relay::narration_as_message(&msg)?
+                } else {
+                    msg
+                };
                 // Mid-session switch: while the outgoing model writes its
                 // handoff summary, buffer everything it emits instead of
                 // relaying it — the client should not see the summary turn.
