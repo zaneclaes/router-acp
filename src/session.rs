@@ -3071,6 +3071,15 @@ pub(crate) fn apply_failure(
             reason
         }
         FailureClass::Outage => {
+            if crate::limits::is_provider_terms_gate_text(&format!("{err}").to_lowercase()) {
+                let reason = "provider requires accepting updated terms in claude.ai".to_string();
+                shared
+                    .headroom
+                    .lock()
+                    .unwrap()
+                    .cordon(&candidate.agent, None, reason.clone());
+                return reason;
+            }
             shared
                 .headroom
                 .lock()
@@ -7457,25 +7466,25 @@ fn on_prompt(
                             )
                         })
                         .unwrap_or((false, None, TaskClass::CodingGeneral, Vec::new(), None));
-                    if pinned && phase != Some(crate::config::PlannerPhase::Implementation) {
-                        if let Some(target) = select_planner_target(
+                    if pinned
+                        && phase != Some(crate::config::PlannerPhase::Implementation)
+                        && let Some(target) = select_planner_target(
                             &shared,
                             crate::config::PlannerPhase::Planning,
                             class,
                             &excluded,
                             Some(diff),
-                        ) {
-                            if current.as_ref() != Some(&target) {
-                                shared.with_session(&router_sid, |s| {
-                                    s.pending_switch = Some(SwitchRequest {
-                                        target: target.clone(),
-                                        reason: format!("requested via `{lower_ref}:` prefix"),
-                                        handoff: HandoffStyle::Full,
-                                        user_pick: false,
-                                    });
-                                });
-                            }
-                        }
+                        )
+                        && current.as_ref() != Some(&target)
+                    {
+                        shared.with_session(&router_sid, |s| {
+                            s.pending_switch = Some(SwitchRequest {
+                                target: target.clone(),
+                                reason: format!("requested via `{lower_ref}:` prefix"),
+                                handoff: HandoffStyle::Full,
+                                user_pick: false,
+                            });
+                        });
                     }
                 } else if let Some(target) = {
                     let (class, excluded) = shared

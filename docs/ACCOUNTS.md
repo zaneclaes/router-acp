@@ -84,6 +84,13 @@ Automatic routing and failover can choose either account's candidates. Hot
 failover carries partial text and tool status through the failure path to the
 replacement account. Cancellation never triggers failover.
 
+A provider can still refuse prompts after authentication succeeds. For example,
+Claude may require accepting updated Consumer Terms and Privacy Policy in
+`claude.ai` for one account. The router treats that account as unavailable,
+temporarily cordons its models, and continues on another eligible account/model.
+Accept the terms with the affected login to restore its access; the router does
+not accept them for you.
+
 ## Reserves and cordons
 
 `reserve_capacity` is per account. Each value is a percentage from 0 through

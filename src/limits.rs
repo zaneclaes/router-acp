@@ -136,6 +136,16 @@ pub fn is_outage_text(lower: &str) -> bool {
         // fail over rather than dead-end.
         || lower.contains("upgrade required")
         || lower.contains("status 426")
+        || is_provider_terms_gate_text(lower)
+}
+
+/// Claude can accept OAuth credentials while refusing every model until the
+/// account accepts updated legal terms. This gate affects the whole account.
+pub fn is_provider_terms_gate_text(lower: &str) -> bool {
+    (lower.contains("consumer terms")
+        && lower.contains("privacy policy")
+        && lower.contains("accept"))
+        || lower.contains("accept them in claude.ai")
 }
 
 struct ResetPatterns {
@@ -469,6 +479,14 @@ mod tests {
     fn outdated_adapter_426_is_an_outage() {
         let err = AcpError::internal_error().data(
             r#"{"message":"API error (status 426 Upgrade Required): Your Grok CLI version (0.2.106) is outdated. Please update to version 1.0.13 or later","http_status":426}"#,
+        );
+        assert_eq!(classify_failure(&err), FailureClass::Outage);
+    }
+
+    #[test]
+    fn provider_terms_gate_is_an_outage() {
+        let err = AcpError::internal_error().data(
+            "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai to continue.",
         );
         assert_eq!(classify_failure(&err), FailureClass::Outage);
     }

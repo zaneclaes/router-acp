@@ -6213,6 +6213,37 @@ async fn native_accounts_fail_over_without_cordoning_the_other_login() {
 }
 
 #[tokio::test]
+async fn provider_terms_gate_fails_over_to_another_native_account() {
+    let state = temp_state_file("account-terms");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{}    accounts:\n      - name: gated\n        env: [{{name: MOCK_FAIL_PROMPT_MSG, value: \"API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai to continue.\"}}]\n      - name: ready\n        env: []\n",
+        state.display(),
+        agent_yaml("claude", &[("sonnet", 2), ("opus", 3)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@gated/sonnet]\nComplete the task",
+        )
+        .await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("failover: auto → claude@ready/"),
+            "terms-gated account must fail over: {text}"
+        );
+        let mut headroom = shared.headroom.lock().unwrap();
+        assert!(headroom.cordon_active("claude@gated").is_some());
+        assert!(headroom.cordon_active("claude@ready").is_none());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn all_usage_cordoned_returns_unavailable_without_prompting_any_model() {
     let state = temp_state_file("all-cordoned");
     let log = temp_log("all-cordoned");
