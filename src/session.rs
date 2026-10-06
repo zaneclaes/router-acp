@@ -154,6 +154,29 @@ pub struct LiveDelegate {
     pub capture: Arc<Mutex<String>>,
     /// State-DB row id for this delegate, for follow-up logging.
     pub sub_sid: String,
+    /// The start event sent to `delegation.lifecycle_hook`, if one is
+    /// configured; its stop event is sent when the delegate is closed.
+    pub lifecycle: Option<crate::delegate_hook::DelegateEvent>,
+    /// Router worker id (`b-…`/`w-…`), also the `worker_handoffs` key.
+    pub worker_id: String,
+    /// Turns completed so far, for `delegate_turn_end` events.
+    pub turns: u32,
+}
+
+impl LiveDelegate {
+    /// Release per-delegate state and report the stop to the lifecycle hook.
+    pub fn finish(&self, shared: &Arc<Shared>, outcome: &str) {
+        shared.delegate_effort.lock().unwrap().remove(&self.sub_sid);
+        shared
+            .worker_handoffs
+            .lock()
+            .unwrap()
+            .remove(&self.worker_id);
+        crate::delegate_mcp::drop_worker_tokens(shared, &self.worker_id);
+        if let Some(event) = &self.lifecycle {
+            crate::delegate_hook::deliver(shared, &event.stopped(outcome, None));
+        }
+    }
 }
 
 /// A `delegate_task background: true` job. The subtask runs on its own tokio
@@ -552,6 +575,16 @@ pub struct Shared {
     /// Signaled whenever any background delegate finishes, waking waiters in
     /// `delegate_await`.
     pub background_notify: tokio::sync::Notify,
+    /// Per-delegate effort from `delegate_task` `hints.effort`, keyed by the
+    /// delegate's state-session id. The LLM proxy reads it in place of the
+    /// parent session's effort while that delegate runs.
+    pub delegate_effort: Mutex<HashMap<String, crate::candidate::EffortLevel>>,
+    /// Per-agent delegate slots for agents with `max_delegates`, beside the
+    /// global `delegate_semaphore`.
+    pub agent_delegate_slots: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// Each worker's latest `worker_handoff`, keyed by worker id; reported
+    /// with its next `delegate_turn_end` and cleared when the next turn starts.
+    pub worker_handoffs: Mutex<HashMap<String, crate::delegate_hook::Handoff>>,
     /// Short-TTL cache of fetched ticket content (ticket id → (fetched-at,
     /// body)), so concurrent sessions share one fetch.
     pub ticket_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
@@ -636,6 +669,14 @@ impl Shared {
         }
 
         let max_concurrent = cfg.delegation.max_concurrent;
+        let agent_delegate_slots = cfg
+            .agents
+            .iter()
+            .filter_map(|a| {
+                a.max_delegates
+                    .map(|n| (a.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
+            })
+            .collect();
         Ok(Arc::new(Self {
             account_config: Mutex::new(cfg.clone()),
             account_menus: Mutex::default(),
@@ -658,6 +699,9 @@ impl Shared {
             live_delegates: Mutex::new(HashMap::new()),
             background_delegates: Mutex::new(HashMap::new()),
             background_notify: tokio::sync::Notify::new(),
+            delegate_effort: Mutex::new(HashMap::new()),
+            agent_delegate_slots,
+            worker_handoffs: Mutex::new(HashMap::new()),
             ticket_cache: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             delegate_socket: OnceLock::new(),
@@ -2710,6 +2754,7 @@ pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
     };
     for d in orphans {
         close_downstream_session(shared, &d.process_key, &d.downstream_sid);
+        d.finish(shared, "closed");
     }
     // Drop the session's background jobs too: finished results nobody will
     // collect, and completion markers for still-running jobs (which notice the
@@ -3728,7 +3773,7 @@ async fn pin_session(
                 });
                 let mode_to_apply = shared
                     .with_session(router_sid, |s| {
-                        s.pin = Some(PinInfo {
+                        let previous = s.pin.replace(PinInfo {
                             candidate: candidate.clone(),
                             process_key: opened.process_key.clone(),
                             downstream_sid: opened.downstream_sid.clone(),
@@ -3754,9 +3799,26 @@ async fn pin_session(
                         s.struggle = 0.0;
                         // Deferred pre-pin mode wins; on failover re-apply
                         // whatever the client had set for this session.
-                        s.pending_mode.take().or_else(|| s.applied_mode.clone())
+                        (
+                            s.pending_mode.take().or_else(|| s.applied_mode.clone()),
+                            previous,
+                        )
                     })
-                    .flatten();
+                    .unwrap_or((None, None));
+                let (mode_to_apply, previous_pin) = mode_to_apply;
+                // A failover re-pin moved the parent to a new provider session.
+                if let Some(previous) = previous_pin {
+                    report_repin(
+                        shared,
+                        router_sid,
+                        &previous.candidate,
+                        &previous.downstream_sid,
+                        &candidate,
+                        &opened.downstream_sid,
+                        "failover",
+                    )
+                    .await;
+                }
 
                 // Apply the session mode (deferred pre-pin, or carried across
                 // a failover). Best effort: an unsupported mode leaves the
@@ -4085,7 +4147,7 @@ async fn pin_session(
 
 /// The MCP servers to hand a new pinned session: the client's own servers
 /// plus the router delegate endpoint when delegation is enabled and useful.
-fn mcp_servers_for_pin(
+pub(crate) fn mcp_servers_for_pin(
     shared: &Arc<Shared>,
     router_sid: &str,
     candidate: &CandidateId,
@@ -4289,18 +4351,43 @@ mod mcp_catalog_tests {
     }
 }
 
-fn build_delegation_instructions() -> String {
-    "[router-acp delegation]\n\
-     The router's `delegate_task`, `delegate_await`, `delegate_followup`, and \
-     `delegate_close` tools are available for cheaper sub-sessions. Proactively \
-     delegate only bounded, independent work when the briefing and verification \
-     overhead is lower than doing it yourself. Do not delegate work that depends \
-     on hidden conversation context, tightly coupled integration, or overlapping \
-     file edits. Give each delegate a complete brief, verify its result, and \
-     integrate it yourself. Use only the router-owned delegation tools; never use \
-     provider-native Task/spawn/subagent tools. If no suitable subtask exists, \
-     continue directly."
-        .to_string()
+fn build_delegation_instructions(policy: crate::config::NativeSubagentPolicy) -> String {
+    let native = match policy {
+        crate::config::NativeSubagentPolicy::Forbid => {
+            "Use only the router-owned delegation tools; never use provider-native \
+             Task/spawn/subagent tools."
+        }
+        // The host's own workflow decides when a native subagent is right.
+        crate::config::NativeSubagentPolicy::Allow => {
+            "Provider-native subagent tools remain available when your instructions call \
+             for them; use the router-owned tools when a different model should do the work."
+        }
+    };
+    format!(
+        "[router-acp delegation]\n\
+         The router's `delegate_task`, `delegate_await`, `delegate_followup`, and \
+         `delegate_close` tools are available for cheaper sub-sessions. Proactively \
+         delegate only bounded, independent work when the briefing and verification \
+         overhead is lower than doing it yourself. Do not delegate work that depends \
+         on hidden conversation context, tightly coupled integration, or overlapping \
+         file edits. Give each delegate a complete brief, verify its result, and \
+         integrate it yourself. {native} If no suitable subtask exists, continue directly."
+    )
+}
+
+#[cfg(test)]
+mod delegation_directive_tests {
+    use super::build_delegation_instructions;
+    use crate::config::NativeSubagentPolicy;
+
+    #[test]
+    fn native_subagent_policy_controls_the_directive() {
+        let forbid = build_delegation_instructions(NativeSubagentPolicy::Forbid);
+        assert!(forbid.contains("never use provider-native Task/spawn/subagent tools"));
+        let allow = build_delegation_instructions(NativeSubagentPolicy::Allow);
+        assert!(!allow.contains("never use provider-native"), "{allow}");
+        assert!(allow.contains("Provider-native subagent tools remain available"));
+    }
 }
 
 fn build_background_instructions() -> String {
@@ -4546,7 +4633,9 @@ async fn send_prompt_with_failover(
                 blocks.push(ContentBlock::from(instr));
             }
             if let Some(directive_candidate) = delegation {
-                blocks.push(ContentBlock::from(build_delegation_instructions()));
+                blocks.push(ContentBlock::from(build_delegation_instructions(
+                    shared.cfg.delegation.native_subagents,
+                )));
                 shared.with_session(&router_sid, |s| {
                     s.delegation_directive_active = true;
                 });
@@ -5246,6 +5335,39 @@ pub fn agent_lineage(cfg: &Config, agent: &str) -> String {
         .find(|a| a.name == agent)
         .and_then(|a| a.lineage.clone())
         .unwrap_or_else(|| agent.to_string())
+}
+
+/// Tell `delegation.lifecycle_hook` that a session's pin moved to a new
+/// provider session (failover, switch, escalation, demotion, ...), so a host
+/// that bound work to the old provider session id can follow it. Awaited so
+/// the host has rebound before the new session's first turn; a failed
+/// delivery stays in the outbox.
+async fn report_repin(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    previous: &CandidateId,
+    previous_downstream_sid: &str,
+    candidate: &CandidateId,
+    downstream_sid: &str,
+    reason: &str,
+) {
+    if shared.cfg.delegation.lifecycle_hook.is_none() || previous_downstream_sid == downstream_sid {
+        return;
+    }
+    let (router_pid, router_started_at_ms) = crate::delegate_hook::process_identity();
+    let event = crate::delegate_hook::RepinEvent {
+        event: "parent_repinned",
+        parent_router_session_id: router_sid.to_string(),
+        previous_downstream_session_id: previous_downstream_sid.to_string(),
+        previous_candidate: previous.to_string(),
+        downstream_session_id: downstream_sid.to_string(),
+        candidate: candidate.to_string(),
+        lineage: agent_lineage(&shared.cfg, &candidate.agent),
+        reason: reason.to_string(),
+        router_pid,
+        router_started_at_ms,
+    };
+    crate::delegate_hook::deliver_now(shared, &event).await;
 }
 
 /// Resolve concrete reviewer candidates of a DIFFERENT lineage (company) than
@@ -6621,6 +6743,16 @@ async fn switch_pin(
             s.pending_delegation_directive = Some(target.clone());
         }
     });
+    report_repin(
+        shared,
+        router_sid,
+        &old_candidate,
+        &old_down_sid,
+        target,
+        &opened.downstream_sid,
+        reason,
+    )
+    .await;
 
     // 4. Re-apply the session mode on the new downstream (best effort).
     if let Some(requested) = applied_mode {
@@ -6932,6 +7064,13 @@ pub async fn serve_shared(
     // usage API on an interval and cordon exhausted candidates.
     let usage_task = crate::usage::spawn_usage_poller(&shared);
 
+    // Lifecycle-hook events carry this process's identity; fix it now so the
+    // reported start time is the router's own. Then redeliver anything a
+    // previous router left in the outbox.
+    crate::delegate_hook::process_identity();
+    let outbox_task =
+        crate::delegate_hook::spawn_outbox_flusher(&shared, std::time::Duration::from_secs(30));
+
     let result = build_agent(shared.clone()).connect_to(transport).await;
     crate::accounts::cancel_all(&shared);
 
@@ -6939,6 +7078,9 @@ pub async fn serve_shared(
         task.abort();
     }
     if let Some(task) = usage_task {
+        task.abort();
+    }
+    if let Some(task) = outbox_task {
         task.abort();
     }
     if let Some(task) = llm_proxy_task {

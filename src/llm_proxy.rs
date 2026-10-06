@@ -714,6 +714,7 @@ async fn proxy_request(
                             effort: request_effort(
                                 &state.shared,
                                 &active.parent_router_sid,
+                                &active.state_sid,
                                 state
                                     .shared
                                     .with_session(&active.state_sid, |s| s.version_request.clone())
@@ -1456,17 +1457,27 @@ enum EffortShape {
 fn request_effort(
     shared: &Shared,
     parent_router_sid: &str,
+    state_sid: &str,
     version: Option<&str>,
     candidate: &CandidateId,
 ) -> EffortShape {
-    let requested = shared
-        .with_session(parent_router_sid, |session| {
-            session
-                .resolved_effort
-                .as_ref()
-                .map(|resolution| resolution.requested)
-        })
-        .flatten();
+    // A delegate's own `hints.effort` wins over the parent session's effort.
+    let delegate = shared
+        .delegate_effort
+        .lock()
+        .unwrap()
+        .get(state_sid)
+        .copied();
+    let requested = delegate.or_else(|| {
+        shared
+            .with_session(parent_router_sid, |session| {
+                session
+                    .resolved_effort
+                    .as_ref()
+                    .map(|resolution| resolution.requested)
+            })
+            .flatten()
+    });
     match requested {
         None => EffortShape::Preserve,
         Some(level) => turn_scores(shared, version, candidate)
@@ -1874,7 +1885,13 @@ fn select_request_model(
         reason,
         event,
         estimated_input: signals.estimated_input,
-        effort: request_effort(shared, &active.parent_router_sid, version, &selected),
+        effort: request_effort(
+            shared,
+            &active.parent_router_sid,
+            &active.state_sid,
+            version,
+            &selected,
+        ),
         fold_system_turns: !turn_scores(shared, version, &selected).system_turns,
     }
 }
@@ -3277,6 +3294,57 @@ agents:
         let shaped: Value = serde_json::from_slice(&shaped).unwrap();
         assert_eq!(shaped["model"], "subtool");
         assert_eq!(shaped["output_config"]["effort"], "subtool-high");
+    }
+
+    #[test]
+    fn a_delegate_effort_hint_replaces_the_parent_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let scores = dir.path().join("scores.yaml");
+        std::fs::write(
+            &scores,
+            "candidates:\n\
+             \x20 - { pattern: 'mock/worker', default_quality: 3.0, context_window: 400000, effort_levels: [low, max], effort_mapping: { low: worker-low, max: worker-max } }\n",
+        )
+        .unwrap();
+        let yaml = format!(
+            "state_file: {}\nscore_table: {}\nagents:\n  - name: mock\n    command: {{ type: stdio, command: mock-agent }}\n    model_selection: {{ type: config-option }}\n    models:\n      - {{ id: worker, cost_rank: 1 }}\n",
+            dir.path().join("state.db").display(),
+            scores.display(),
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let shared = Shared::new(cfg.clone()).unwrap();
+        let mut parent = RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new());
+        parent.resolved_effort = Some(
+            shared
+                .scores
+                .lookup(&CandidateId::new("mock", "worker"))
+                .resolve_effort(EffortLevel::Max),
+        );
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".to_string(), parent);
+        let worker = CandidateId::new("mock", "worker");
+        // Without a hint the delegate inherits the parent's max.
+        assert_eq!(
+            request_effort(&shared, "r1", "r1::delegate-d1", None, &worker),
+            EffortShape::Set("worker-max".to_string())
+        );
+        shared
+            .delegate_effort
+            .lock()
+            .unwrap()
+            .insert("r1::delegate-d1".to_string(), EffortLevel::Low);
+        assert_eq!(
+            request_effort(&shared, "r1", "r1::delegate-d1", None, &worker),
+            EffortShape::Set("worker-low".to_string())
+        );
+        // The parent's own requests are unaffected.
+        assert_eq!(
+            request_effort(&shared, "r1", "r1", None, &worker),
+            EffortShape::Set("worker-max".to_string())
+        );
     }
 
     #[test]

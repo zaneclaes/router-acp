@@ -216,6 +216,20 @@ pub struct ProcessTransport {
     pub env: Vec<(String, String)>,
 }
 
+/// Environment every downstream adapter process inherits from this router
+/// (`ROUTER_ACP_CONFIG`, `ROUTER_ACP_BIN`), so tools running inside an adapter
+/// — a host's hooks — can tell they are router-hosted and find this config.
+static ROUTER_ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Set once at startup by `serve`; later calls are ignored.
+pub fn set_router_env(env: Vec<(String, String)>) {
+    let _ = ROUTER_ENV.set(env);
+}
+
+pub fn router_env() -> &'static [(String, String)] {
+    ROUTER_ENV.get().map(Vec::as_slice).unwrap_or_default()
+}
+
 impl<R: Role> ConnectTo<R> for ProcessTransport {
     async fn connect_to(
         self,
@@ -236,6 +250,9 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
             for key in crate::accounts::AUTH_ENV {
                 cmd.env_remove(key);
             }
+        }
+        for (k, v) in router_env() {
+            cmd.env(k, v);
         }
         for (k, v) in &self.env {
             cmd.env(k, v);

@@ -153,6 +153,66 @@ pub struct DelegationConfig {
     /// 1.0 disables the cap.
     #[serde(default = "default_delegate_complexity_cap")]
     pub complexity_cap: f64,
+    /// How a `delegate_task` `hints.candidate` is treated. `prefer` (default)
+    /// honors the hint only inside the cost-scoped pool and otherwise ranks
+    /// that pool as usual. `exact` lets the hint address any eligible
+    /// candidate, whatever its tier or agent, and fails the call instead of
+    /// substituting another model — for hosts whose workflow requires a
+    /// specific worker model (e.g. a Sol parent with a Grok worker).
+    #[serde(default)]
+    pub candidate_hints: CandidateHintMode,
+    /// Whether the injected delegation directive forbids provider-native
+    /// Task/spawn/subagent tools (`forbid`, default) or leaves them to the
+    /// host's own workflow (`allow`).
+    #[serde(default)]
+    pub native_subagents: NativeSubagentPolicy,
+    /// Optional external command run when a delegate starts and stops, so a
+    /// host can account for router-owned workers it cannot otherwise see.
+    #[serde(default)]
+    pub lifecycle_hook: Option<DelegateLifecycleHook>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CandidateHintMode {
+    #[default]
+    Prefer,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeSubagentPolicy {
+    #[default]
+    Forbid,
+    Allow,
+}
+
+/// A command the router runs (no shell) with one JSON event on stdin (see
+/// `delegate_hook`). `delegate_start` runs after the delegate session opens
+/// and before its prompt; a non-zero exit or timeout refuses the delegate.
+/// `delegate_turn_end` runs when each delegate turn ends; exit 2 sends the
+/// hook's stderr back to that delegate as its next prompt, at most
+/// `max_continuations` times per turn. `delegate_stop` and `parent_repinned`
+/// are delivered durably through the state DB's outbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateLifecycleHook {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_continuations")]
+    pub max_continuations: u32,
+}
+
+fn default_lifecycle_hook_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_max_continuations() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +243,9 @@ impl Default for DelegationConfig {
             max_concurrent: default_max_concurrent(),
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
+            candidate_hints: CandidateHintMode::default(),
+            native_subagents: NativeSubagentPolicy::default(),
+            lifecycle_hook: None,
         }
     }
 }
@@ -943,6 +1006,12 @@ pub struct AgentConfig {
     /// Deleted membership keeps an adapter template for adding a new login.
     #[serde(default)]
     pub account_disabled: bool,
+    /// Most delegated sub-sessions this agent runs at once, beside the global
+    /// `delegation.max_concurrent`. Each account seat gets its own limit, so
+    /// adding accounts or agents adds delegate capacity. Unset: only the
+    /// global limit applies.
+    #[serde(default)]
+    pub max_delegates: Option<usize>,
     /// Independently authenticated instances of this adapter. Expanded into
     /// `name@account` agents before validation; empty keeps the original agent.
     #[serde(default)]
@@ -1691,6 +1760,12 @@ impl Config {
             }
         }
         cfg.agents = agents;
+        if let Some(hook) = &mut cfg.delegation.lifecycle_hook {
+            hook.command = expand_tilde_str(&hook.command);
+            for arg in &mut hook.args {
+                *arg = expand_tilde_str(arg);
+            }
+        }
         // Downstream adapters are spawned via `Command::new` (no shell), so a
         // leading `~` in a command path or arg would never be expanded and the
         // spawn would fail — expand it here the same way we do for state paths.
@@ -1878,6 +1953,24 @@ impl Config {
             return Err(ConfigError(
                 "delegation.complexity_cap must be between 0 and 1".into(),
             ));
+        }
+        if let Some(hook) = &self.delegation.lifecycle_hook {
+            if hook.command.trim().is_empty() {
+                return Err(ConfigError(
+                    "delegation.lifecycle_hook.command must not be empty".into(),
+                ));
+            }
+            if hook.timeout_ms == 0 {
+                return Err(ConfigError(
+                    "delegation.lifecycle_hook.timeout_ms must be positive".into(),
+                ));
+            }
+        }
+        if let Some(agent) = self.agents.iter().find(|a| a.max_delegates == Some(0)) {
+            return Err(ConfigError(format!(
+                "agent `{}`: max_delegates must be positive (omit it for no per-agent limit)",
+                agent.name
+            )));
         }
         if self.llm_proxy.enabled {
             let listen: std::net::SocketAddr = self.llm_proxy.listen.parse().map_err(|_| {
@@ -2293,6 +2386,50 @@ agents:
         let yaml = format!("delegation:\n  inject_prompt: true\n{}", minimal_yaml());
         let cfg = Config::from_yaml(&yaml).unwrap();
         assert!(cfg.delegation.inject_prompt);
+    }
+
+    #[test]
+    fn parses_delegate_worker_controls() {
+        let cfg = Config::from_yaml(minimal_yaml()).unwrap();
+        assert_eq!(cfg.delegation.candidate_hints, CandidateHintMode::Prefer);
+        assert_eq!(
+            cfg.delegation.native_subagents,
+            NativeSubagentPolicy::Forbid
+        );
+        assert!(cfg.delegation.lifecycle_hook.is_none());
+
+        let yaml = format!(
+            "delegation:\n  candidate_hints: exact\n  native_subagents: allow\n  \
+             lifecycle_hook: {{ command: ~/bin/hook, args: [\"~/x\"] }}\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.delegation.candidate_hints, CandidateHintMode::Exact);
+        assert_eq!(cfg.delegation.native_subagents, NativeSubagentPolicy::Allow);
+        let hook = cfg.delegation.lifecycle_hook.as_ref().unwrap();
+        assert!(!hook.command.starts_with('~'), "command is tilde-expanded");
+        assert!(!hook.args[0].starts_with('~'), "args are tilde-expanded");
+        assert_eq!(hook.timeout_ms, 30_000);
+        assert_eq!(hook.max_continuations, 3);
+
+        let empty = format!(
+            "delegation:\n  lifecycle_hook: {{ command: \"\" }}\n{}",
+            minimal_yaml()
+        );
+        assert!(Config::from_yaml(&empty).is_err());
+    }
+
+    #[test]
+    fn max_delegates_is_per_account_seat_and_positive() {
+        let yaml = format!(
+            "{}\n    max_delegates: 4\n    accounts:\n      - name: work\n      - name: personal\n",
+            minimal_yaml().trim_end()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert!(cfg.agents.iter().all(|a| a.max_delegates == Some(4)));
+        assert_eq!(cfg.agents.len(), 2, "each seat carries its own limit");
+        let zero = format!("{}\n    max_delegates: 0\n", minimal_yaml().trim_end());
+        assert!(Config::from_yaml(&zero).is_err());
     }
 
     #[test]

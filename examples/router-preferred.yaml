@@ -41,6 +41,10 @@ delegation:
   # subtask lands on the most expensive candidate. Cap restores cost-aware
   # worker routing; 1.0 disables.
   complexity_cap: 0.6
+  # Set `candidate_hints: exact`, `native_subagents: allow` and a
+  # `lifecycle_hook` when a host workflow assigns whole tasks to named worker
+  # models (README → Host-directed workers).
+  candidate_hints: prefer
 
 # Version pinning: run an older provider version of a model while its default
 # moves on. The value is `default` (the model's `api_model`) or one of that

@@ -309,6 +309,15 @@ impl StateFile {
                    started_at, updated_at, detail
             FROM tool_calls
             WHERE completed_at IS NULL;
+        -- Lifecycle-hook events (`delegate_stop`, `parent_repinned`) not yet
+        -- accepted by the host. Every router process sharing this DB flushes
+        -- it, so an event survives a hook failure or a router restart.
+        CREATE TABLE IF NOT EXISTS hook_outbox (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload    TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 0
+        );
         "#;
         if let Err(err) = self.conn.execute_batch(sql) {
             tracing::error!(%err, "failed to initialize state schema");
@@ -907,8 +916,53 @@ impl StateFile {
         self.prune_at(now_epoch())
     }
 
+    /// Queue a lifecycle-hook event; returns its outbox id.
+    pub fn outbox_push(&self, payload: &str) -> Option<i64> {
+        match self.conn.execute(
+            "INSERT INTO hook_outbox (payload, created_at) VALUES (?1, ?2)",
+            params![payload, now_epoch() as i64],
+        ) {
+            Ok(_) => Some(self.conn.last_insert_rowid()),
+            Err(err) => {
+                tracing::error!(%err, "cannot queue lifecycle-hook event");
+                None
+            }
+        }
+    }
+
+    /// Undelivered events, oldest first.
+    pub fn outbox_pending(&self, limit: usize) -> Vec<(i64, String)> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT id, payload FROM hook_outbox ORDER BY id LIMIT ?1")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map(params![limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn outbox_done(&self, id: i64) {
+        let _ = self
+            .conn
+            .execute("DELETE FROM hook_outbox WHERE id = ?1", params![id]);
+    }
+
+    pub fn outbox_attempted(&self, id: i64) {
+        let _ = self.conn.execute(
+            "UPDATE hook_outbox SET attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        );
+    }
+
     pub fn prune_at(&self, now: u64) -> usize {
         let cutoff = now.saturating_sub(self.retention.max_age.as_secs()) as i64;
+        // An event the host never accepted within the history window is moot.
+        let _ = self.conn.execute(
+            "DELETE FROM hook_outbox WHERE created_at < ?1",
+            params![cutoff],
+        );
         match self.conn.execute(
             "DELETE FROM sessions WHERE updated_at IS NOT NULL AND updated_at < ?1",
             params![cutoff],

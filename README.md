@@ -347,6 +347,39 @@ For **review → fix → re-review** loops, a delegated sub-session can be kept 
 
 For **parallel** subtasks there is a background mode: MCP clients execute tool calls one at a time, so N plain `delegate_task` calls run the subtasks serially no matter what the router allows. `delegate_task` with `background: true` instead returns a `b-…` job id immediately and runs the subtask on its own task; `delegate_await` collects results — it waits up to `timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default: all pending), returns every finished job's output exactly once, and lists the ones still running so the caller polls with short, idle-timeout-safe calls. `background` composes with `keep_open` (the collected result carries the `delegate_id`), and `delegation.max_concurrent` still bounds how many jobs execute at once.
 
+### Host-directed workers
+
+Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:
+
+- **`candidate_hints: exact`** — `hints.candidate` addresses *any* eligible candidate by name, whatever its cost tier, agent or account (so a Sol parent can hand a task to `grok/grok-4.7` or `claude@personal/opus[1m]`). If that candidate is unknown, not offered by its adapter, signed out, cordoned or quarantined, the call fails and says why; it never substitutes another model. With the default `prefer`, a hint is honored only inside the cost-scoped pool (strictly cheaper, same agent first) and otherwise falls back silently, as before. In `exact` mode the tools are offered whenever any other candidate exists.
+- **Capacity.** `delegation.max_concurrent` bounds all delegates at once, and `agents[].max_delegates` bounds one agent (each account seat separately), so adding agents and accounts adds capacity up to the global limit. A full agent is skipped while another ranked candidate remains, otherwise the delegate waits for its slot.
+- **`hints.effort`** (`low` … `max`) on `delegate_task` sets that delegate's reasoning effort, which the [per-request proxy](#per-request-llm-routing) applies instead of the parent's. It needs `llm_proxy` enabled for the delegate's agent; without the proxy, delegates keep the adapter's own effort.
+- **`native_subagents: allow`** drops the "never use provider-native Task/spawn/subagent tools" sentence from the injected delegation directive, for hosts whose own instructions decide when a native subagent is right. The default `forbid` keeps it.
+- **Long-running workers.** Start a worker with `background: true, keep_open: true`; answer it with `delegate_followup`, which also takes `background: true` so the parent keeps supervising others while one worker runs its next turn; collect with `delegate_await`. `delegate_result` re-reads any delegate's latest output from the state DB by its `b-…`, `w-…` or `d-…` id, including results `delegate_await` already returned (after a compaction, or from a resumed parent).
+- **`lifecycle_hook`** runs a command (no shell) with one JSON event on stdin:
+  - `delegate_start` — after the delegate's session opens, before its prompt. A non-zero exit or timeout (`timeout_ms`, default 30 s) refuses the delegate with the hook's stderr, so a host can refuse a worker it could not register. A refused start is followed by a `delegate_stop` with outcome `aborted`, in case the host recorded it before timing out.
+  - `delegate_turn_end` — whenever a delegate turn ends, with `turn`, `last_message` and the worker's latest structured `handoff`. Exit 2 with a message on stderr sends that message back to the same delegate as its next prompt, at most `max_continuations` (default 3) times per turn — the router equivalent of a provider's subagent-stop hook keeping a worker going. Any other result releases the turn.
+  - `delegate_stop` — `completed`, `cancelled` or `failed`, or `closed` when a `keep_open` delegate is closed.
+  - `parent_repinned` — a session's pin moved to a new provider session (failover, including hot failover between accounts; an explicit switch; escalation; demotion), with `previous_downstream_session_id`/`previous_candidate`, the new `downstream_session_id`/`candidate`, and `reason`. It is delivered before the new session's first turn, so a host that bound work to the old provider session can follow the parent onto the new model.
+  
+  `delegate_stop` and `parent_repinned` go through a `hook_outbox` table in the state DB: an event the hook did not accept stays queued, and every router process sharing that DB retries it every 30 s and at startup. Delegate events carry `worker_id` (the `b-…` job id for a background delegate, else a `w-…` id), `parent_router_session_id`, `parent_downstream_session_id` (the id the provider's own hooks report for the parent), `parent_candidate`, `candidate`, `lineage`, `downstream_session_id`, `state_session_id`, `cwd`, `effort`, `background`, `keep_open` and `task_summary`; every event carries `router_pid` and `router_started_at_ms`, so a host can treat a dead router's workers as stopped even if no stop event arrives.
+- **Worker tools.** While a hook is configured, each delegate gets a `router-worker` MCP server: `worker_whoami` returns its worker id, model and parent session, and `worker_handoff {kind, message}` records a structured handoff (`commit_paths_ready`, `waiting`, `lease_requested`, `ownership_requested`, `staging_gate_request`, `round_verified`, `round_failed`, `reassignment_required`) that the turn-end event carries. The delegate's prompt also opens with `[router-acp delegate] worker id: … · model: … · parent session: …`, and the tool result names the worker (`[delegated to grok/grok-4.7, worker b-…]`).
+- **Resuming a parent without its client.** `router-acp prompt --config <file> --session <id> --mode auto --message <text>` reopens a router session (`session/resume`, else `session/load`) and sends one message with no ACP client attached, streaming the reply to stdout. `--session` takes a router id or the provider session id the router pinned it to — what the provider's own hooks recorded — so a supervisor can wake a parent whose goose is gone. A reloaded or resumed session gets its router tools back. Every adapter the router spawns inherits `ROUTER_ACP_CONFIG` and `ROUTER_ACP_BIN`, so a host's hooks can tell they run under the router and build that command.
+
+Delegates still end when their router exits: the router kills every adapter when its client disconnects or is interrupted, so a worker cannot outlive the goose session that started it. Committed work survives; a host recovers the rest through its stop events, the router-pid liveness check, `delegate_result` and `router-acp prompt`.
+
+```yaml
+delegation:
+  candidate_hints: exact
+  native_subagents: allow
+  max_concurrent: 20
+  lifecycle_hook:
+    command: /path/to/host/worker-ledger   # reads one JSON event on stdin
+    args: ["router-delegate"]
+    timeout_ms: 120000
+    max_continuations: 3
+```
+
 ### Managed background terminals
 
 When the upstream ACP client advertises `terminal: true`, the router exposes a
@@ -469,6 +502,10 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `delegation.max_concurrent` | `3` | Concurrent delegated sub-sessions. |
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `delegation.complexity_cap` | `0.6` | Ceiling on a delegated subtask's classified complexity, so a long, fully-specified brief doesn't misread as maximum difficulty and route every subtask to the priciest candidate. `1.0` disables it. |
+| `delegation.candidate_hints` | `prefer` | `exact`: `hints.candidate` addresses any eligible candidate regardless of tier or agent and fails rather than substituting. See [Host-directed workers](#host-directed-workers). |
+| `delegation.native_subagents` | `forbid` | `allow` removes the ban on provider-native subagent tools from the injected delegation directive. |
+| `delegation.lifecycle_hook` | unset | `{ command, args, timeout_ms, max_continuations }` run with a JSON `delegate_start` / `delegate_turn_end` / `delegate_stop` / `parent_repinned` event on stdin; a failed start refuses the delegate, exit 2 at a turn end sends the worker back. See [Host-directed workers](#host-directed-workers). |
+| `agents[].max_delegates` | unset | Concurrent delegates for this agent (each account seat separately), beside `delegation.max_concurrent`. |
 | `ROUTER_ACP_MCP_CATALOGS` (env) | unset | JSON seed for `delegate_mcp_catalogs` when no client connection can ever send the `router-acp/delegate_mcp_catalogs` notification. Fails open on absent/malformed content. |
 | `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review protocol. |
 | `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task (legacy detector only; the pre-classifier decides via `orchestrate_min_confidence` instead). |
@@ -554,7 +591,7 @@ Tip: adapters usually persist auth in your home directory, so it is often easies
 `session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are implemented end-to-end and advertised **only when at least one downstream supports them**:
 
 - `list` merges downstream lists, rewriting downstream ids to router ids via the state file (sessions the router can't route back are omitted).
-- `load`/`resume` require a known router session id in the state file, route to the owning downstream only, rehydrate the pin before any prompt, and relay replayed transcript updates under the router id.
+- `load`/`resume` require a known router session id in the state file, route to the owning downstream only, rehydrate the pin before any prompt, reattach the router's own tools (delegation, managed terminals), and relay replayed transcript updates under the router id. `router-acp prompt --session` does the same without a client (see [Host-directed workers](#host-directed-workers)).
 - `delete` routes to the owning downstream, then removes router state.
 - `close` closes the live downstream session (state-file entries survive so `load`/`resume` keep working when the downstream persists sessions).
 

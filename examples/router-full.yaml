@@ -35,6 +35,24 @@ delegation:
   # the ROUTER_ACP_MCP_CATALOGS env var instead, with the same JSON shape as
   # that notification's `catalogs` param, before starting the router process.
   max_concurrent: 3
+  # Host-directed workers (README → Host-directed workers). `prefer` keeps a
+  # `hints.candidate` inside the cheaper pool; `exact` lets it name any
+  # eligible model and fails instead of substituting.
+  candidate_hints: prefer
+  # `forbid` tells delegating parents never to use provider-native subagent
+  # tools; `allow` leaves that to the host's own workflow.
+  native_subagents: forbid
+  # Run a host command with a JSON delegate_start / delegate_turn_end /
+  # delegate_stop / parent_repinned event on stdin. A failed start refuses the
+  # delegate; exit 2 at a turn end sends the worker back with the hook's
+  # stderr (at most max_continuations times). Stops and repins are retried
+  # from the state DB's outbox until accepted.
+  # lifecycle_hook:
+  #   command: /path/to/host/worker-ledger
+  #   args: ["router-delegate"]
+  #   timeout_ms: 30000
+  #   max_continuations: 3
+  # Per-agent delegate limits go on the agent: `agents[].max_delegates`.
 
 # Graceful degradation. Rate/usage-limited agents are cordoned until the
 # reset time parsed from the model's error (or cordon_default_secs when the

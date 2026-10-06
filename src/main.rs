@@ -32,6 +32,27 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Send one message to a router session with no ACP client attached and
+    /// stream the reply to stdout — e.g. a supervisor waking a parent session
+    /// whose client is gone. The session keeps its provider session and the
+    /// router's delegate tools.
+    Prompt {
+        #[arg(long)]
+        config: PathBuf,
+        /// Router session id (`rtr-…`) or the provider session id one is
+        /// pinned to. Omit to open a new session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Working directory for a new or reloaded session (default: cwd).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Session mode to apply first, as a client would (e.g. `auto`).
+        #[arg(long)]
+        mode: Option<String>,
+        /// The message to send.
+        #[arg(long)]
+        message: String,
+    },
     /// Internal: stdio<->socket bridge for the delegate MCP server.
     /// Spawned by downstream agents as a stdio MCP server.
     McpDelegate {
@@ -134,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr)
                 .init();
             let cfg = Config::from_file(&config)?;
+            export_router_env(&config);
             // Downstream agents run with workspace write access; they must die
             // when the router does. On a signal (goose's Ctrl+C) neither
             // destructors nor `kill_on_drop` run, so an in-flight agent can keep
@@ -178,6 +200,45 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(unix))]
             router_acp::usage::monitor(config).await
+        }
+        Command::Prompt {
+            config,
+            session,
+            cwd,
+            mode,
+            message,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "router_acp=warn".into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            let cfg = Config::from_file(&config)?;
+            export_router_env(&config);
+            let cwd = match cwd {
+                Some(cwd) => cwd,
+                None => std::env::current_dir()?,
+            };
+            let result = router_acp::headless::run(
+                cfg,
+                router_acp::headless::PromptOptions {
+                    session,
+                    cwd,
+                    message,
+                    mode,
+                },
+            )
+            .await;
+            router_acp::transport::kill_all_downstreams();
+            match result {
+                Ok(stop) => {
+                    eprintln!("router-acp: turn ended ({stop:?})");
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!("prompt failed: {e}")),
+            }
         }
         Command::McpDelegate { socket, token } => {
             router_acp::delegate_mcp::run_helper(&socket, &token)
@@ -575,4 +636,18 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Tell every adapter this router spawns where it came from, so tools running
+/// inside an adapter (a host's hooks) can recognize a router-hosted session and
+/// wake it again through `router-acp prompt --config <this config>`.
+fn export_router_env(config: &std::path::Path) {
+    let mut env = Vec::new();
+    if let Ok(path) = std::fs::canonicalize(config) {
+        env.push(("ROUTER_ACP_CONFIG".to_string(), path.display().to_string()));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        env.push(("ROUTER_ACP_BIN".to_string(), exe.display().to_string()));
+    }
+    router_acp::transport::set_router_env(env);
 }
