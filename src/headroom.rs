@@ -261,8 +261,7 @@ impl HeadroomTracker {
         }
     }
 
-    /// All candidates currently usage-cordoned, for advertising and the
-    /// all-cordoned "least-bad" fallback.
+    /// All candidates currently usage-cordoned, for availability disclosures.
     pub fn active_usage_cordons(&self) -> Vec<(CandidateId, UsageCordon)> {
         let now = SystemTime::now();
         let mut ids: Vec<CandidateId> = self

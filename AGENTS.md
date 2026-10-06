@@ -120,8 +120,14 @@ SDK traps below, which were all discovered the hard way.
   `spawn-config` exists for per-model argv/env.
 - Route once per session; pin for life. The deliberate exception (added at
   user request, post-plan): failover when the pinned model is rate-limited
-  or down **and the turn has produced no output** (`turn_saw_output`) and
-  the client hasn't cancelled. Context loss is disclosed.
+  or down, or its account/model becomes cordoned, and the client hasn't
+  cancelled. Partial text and tool statuses are carried to the replacement
+  with continuation instructions; completed actions must not be blindly replayed.
+  The continuation flag survives silent failures between replacements: always
+  rebuild the transcript while continuing, even without an `agent_response` row
+  (a tools-only interrupted turn has none). A process death invalidates its
+  session routes; respawning the adapter does not revive old downstream IDs.
+  Tests: `chained_hot_failover_*`, `downstream_death_between_turns_*`.
 - Relaying is raw-JSON with only `sessionId` rewritten; `_meta` is
   preserved; router metadata lives under `_meta.router_acp` only.
 - Delegation: strictly lower `cost_rank` than the parent, depth capped at 1
@@ -140,8 +146,8 @@ SDK traps below, which were all discovered the hard way.
   checked in `maybe_update_planner_phase`, the `phase=implementation`
   directive, `refuse_coordinator_switch` (every queued `pending_switch` and
   mid-turn escalation), the escalation/upgrade/demotion targets, the
-  `pin_session` pool (initial pin, failover, crossover, all-cordoned
-  fallback; empty → error), and `llm_proxy::select_request_model`. Only
+  `pin_session` pool (initial pin, failover, crossover; empty → error), and
+  `llm_proxy::select_request_model`. Only
   `SwitchRequest.user_pick` / `OverrideSource::UserPick` pass, and
   `pin_user_pick` (persisted as `routing.user_pick`) keeps a human's pick in
   place. A new routing path that can move a pin must go through the same
@@ -153,9 +159,8 @@ SDK traps below, which were all discovered the hard way.
   excludes them (so `auto`/failover never pick them); an explicit pin to a
   cordoned candidate is refused in `pin_session` (`cordon_redirect` clears the
   override → best non-cordoned candidate, disclosed in the failover-line format
-  + `details.cordon_redirect`); if the pool is empty ONLY because everything is
-  usage-cordoned, `eligible_views_relaxed` + soonest-`resets_at` picks the
-  least-bad rather than failing (`all_cordoned_fallback`); `router_config_options`
+  + `details.cordon_redirect`); an empty eligible pool returns an unavailable
+  error, never a bypass of usage cordons or reserves; `router_config_options`
   keeps cordoned candidates in the `router.candidate` picker but tags them
   `_meta.router_acp.{available:false,unavailable_reason,resets_at}`; and every
   turn's routing metadata carries `details.usage_cordons`
@@ -164,7 +169,8 @@ SDK traps below, which were all discovered the hard way.
   availability mid-session — the picker option is only re-advertised at
   session creation, but cordons can appear/lift during a long session. **Invariants:**
   generic (models discovered from the API, never hardcoded — the cordon gate is
-  a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*);
+  a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*, or
+  a configured positive `reserve_capacity` ceiling regardless of overage);
   **fail-open** (any poll/token/parse error → no cordon; the reactive per-agent
   cordon is the safety net); self-lifts at absolute `resets_at`. Codex has no
   third-party-pollable endpoint (limits arrive in response headers;
@@ -558,7 +564,7 @@ serves fs reads, collects `session/update`s). Mock behavior is env-driven:
 Prompt-text directives the mock obeys: `PERM`, `READFILE:<path>`,
 `SLEEP:<ms>` (cancel-aware), `TITLE:<t>` (emits session_info_update),
 `DELEGATE:<task>` (spawns and drives the delegate MCP server),
-`CHUNK_THEN_EXIT` (output then crash — must NOT fail over). Delegation tests
+`CHUNK_THEN_EXIT` (output then crash — exercises hot failover). Delegation tests
 set `ROUTER_ACP_HELPER_EXE=env!("CARGO_BIN_EXE_router-acp")` because
 `current_exe()` is the test binary.
 

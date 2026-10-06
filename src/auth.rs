@@ -184,13 +184,13 @@ pub async fn refresh_before_selection(shared: &Arc<Shared>) {
             agent
                 .auth_probe
                 .clone()
-                .map(|probe| (agent.name.clone(), probe))
+                .map(|probe| (agent.name.clone(), probe, agent.command.env.clone()))
         })
         .collect();
     let probe_results = futures::future::join_all(
         probes
             .into_iter()
-            .map(|(agent, probe)| async move { (agent, run_probe(&probe).await) }),
+            .map(|(agent, probe, env)| async move { (agent, run_probe(&probe, &env).await) }),
     );
     let (results, ()) = tokio::join!(probe_results, crate::usage::refresh_and_install(shared));
     let mut tracker = shared.auth.lock().unwrap();
@@ -207,9 +207,14 @@ pub async fn refresh_before_selection(shared: &Arc<Shared>) {
     tracker.mark_refreshed();
 }
 
-async fn run_probe(probe: &AuthProbeConfig) -> AuthAvailability {
+async fn run_probe(
+    probe: &AuthProbeConfig,
+    env: &[crate::config::EnvVarConfig],
+) -> AuthAvailability {
     let mut cmd = tokio::process::Command::new(&probe.command);
-    cmd.args(&probe.args).kill_on_drop(true);
+    cmd.args(&probe.args)
+        .envs(env.iter().map(|v| (&v.name, &v.value)))
+        .kill_on_drop(true);
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(probe.timeout_ms),
         cmd.output(),
@@ -378,9 +383,12 @@ fn uses_claude_credentials(shared: &Arc<Shared>, agent: &str) -> bool {
 /// Capture the credential generation before an ACP request begins. This is a
 /// passive local read; it never invokes a provider login/status command.
 pub fn request_access_generation(shared: &Arc<Shared>, agent: &str) -> Option<String> {
-    uses_claude_credentials(shared, agent)
-        .then(crate::usage::anthropic_access_generation)
-        .flatten()
+    shared
+        .cfg
+        .agents
+        .iter()
+        .find(|a| a.name == agent && uses_claude_credentials(shared, agent))
+        .and_then(crate::usage::anthropic_access_generation)
 }
 
 /// A missing credential store is live negative information, unlike an
@@ -674,6 +682,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_probe_uses_the_account_environment() {
+        let probe = AuthProbeConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "test \"$ROUTER_ACCOUNT_TEST_LOGIN\" = work".into(),
+            ],
+            timeout_ms: 1000,
+            unauthenticated_patterns: vec!["not signed in".into()],
+        };
+        let env = vec![crate::config::EnvVarConfig {
+            name: "ROUTER_ACCOUNT_TEST_LOGIN".into(),
+            value: "work".into(),
+        }];
+        assert_eq!(
+            run_probe(&probe, &env).await,
+            AuthAvailability::Authenticated
+        );
+        assert_eq!(run_probe(&probe, &[]).await, AuthAvailability::Unknown);
+    }
+
+    #[tokio::test]
     async fn probe_is_tri_state_and_fail_open() {
         let cfg = |args: &[&str]| AuthProbeConfig {
             command: "/bin/sh".to_string(),
@@ -682,19 +712,19 @@ mod tests {
             unauthenticated_patterns: vec!["not signed in".to_string()],
         };
         assert_eq!(
-            run_probe(&cfg(&["-c", "exit 0"])).await,
+            run_probe(&cfg(&["-c", "exit 0"]), &[]).await,
             AuthAvailability::Authenticated
         );
         assert!(matches!(
-            run_probe(&cfg(&["-c", "echo not signed in >&2; exit 1"])).await,
+            run_probe(&cfg(&["-c", "echo not signed in >&2; exit 1"]), &[]).await,
             AuthAvailability::Unauthenticated { .. }
         ));
         assert_eq!(
-            run_probe(&cfg(&["-c", "echo network error >&2; exit 1"])).await,
+            run_probe(&cfg(&["-c", "echo network error >&2; exit 1"]), &[]).await,
             AuthAvailability::Unknown
         );
         assert_eq!(
-            run_probe(&cfg(&["-c", "sleep 1"])).await,
+            run_probe(&cfg(&["-c", "sleep 1"]), &[]).await,
             AuthAvailability::Unknown
         );
     }

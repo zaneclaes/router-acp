@@ -419,7 +419,7 @@ always-available record is the state DB: `router-acp sessions --config
 When Claude or Codex hits its **token/usage limit**, the router parses the
 reset time from the model's own error (Claude Code reports
 `usage limit reached|<epoch>`; Codex reports `try again in …`), cordons that
-agent until the reset, and — if this happens mid-prompt before any output —
+account until the reset, and — including during an active prompt —
 fails the session over to the next best candidate:
 
 ```
@@ -433,10 +433,17 @@ Later sessions show active cordons too
 the cordoned agent automatically rejoins the pool when its limit resets.
 **Outages** (adapter crash, connection loss) behave the same way, plus the
 dead adapter process is respawned in the background so it can rejoin once
-healthy. Failover never happens after the turn has already streamed output
-(that could duplicate side effects) — in that case the error is surfaced
-with a note explaining why. Tune with `failover.{enabled,max_attempts,
+healthy. After partial output, the router transfers partial text and tool
+statuses and asks the replacement to continue, inspect uncertain effects and
+avoid repeating completed actions. Client cancellation never fails over.
+If no eligible account/model remains, the router reports its inability. Tune with `failover.{enabled,max_attempts,
 respawn_cooldown_secs}` and `headroom.cordon_default_secs` in `router.yaml`.
+
+For two Claude logins, follow [Managing multiple accounts](docs/ACCOUNTS.md):
+keep the default login, authenticate the second with its own
+`CLAUDE_CONFIG_DIR`, and configure `agents[].accounts`. Each account can set
+`reserve_capacity: {weekly: 10, session: 20}` to cordon at 90% weekly or 80%
+session usage, even with paid overage. This works in Goose without Kory Code.
 
 **Proactive cordons (no failed turn needed).** With `usage_source:
 { type: anthropic-oauth }` on the claude agent (already in your config), the

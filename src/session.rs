@@ -216,8 +216,8 @@ pub struct RouterSession {
     /// planner/subtask/review sessions of one orchestration run.
     pub run_label: Option<String>,
     /// Whether any downstream output was relayed to the client during the
-    /// current prompt turn. Failover is only safe while this is false
-    /// (retrying after visible output risks duplicated side effects).
+    /// current prompt turn. Hot failover preserves it with tool statuses
+    /// and asks the replacement to continue rather than restart the task.
     pub turn_saw_output: bool,
     /// Accumulated agent text this turn, for token estimation + logging.
     pub turn_output: String,
@@ -756,6 +756,13 @@ impl Shared {
             // an explicit pick of a dead target still needs its capabilities.
             t.dead = Some(reason.to_string());
         }
+        // A respawn creates a fresh process with no memory of these sessions.
+        // Keep primary pins for transcript handoff, but invalidate their routes
+        // so an old session id can never be sent to the replacement process.
+        self.sid_map
+            .lock()
+            .unwrap()
+            .retain(|(target, _), _| target != key);
         let reason = reason.to_string();
         self.update_candidates(key, move |c| {
             if !matches!(c.status, CandidateStatus::Invalid(_)) {
@@ -880,6 +887,7 @@ impl Shared {
             .unwrap()
             .get(router_sid)
             .and_then(|s| s.pin.clone())?;
+        self.route_for(&pin.process_key, &pin.downstream_sid)?;
         let conn = self.target_conn(&pin.process_key)?;
         Some((conn, pin.downstream_sid, pin.candidate))
     }
@@ -971,7 +979,7 @@ impl Shared {
     /// excluding them once — rather than at each of a dozen call sites — is
     /// what makes "never picked by accident" hold for mechanisms added later.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, false, None, false)
+        self.eligible_views_inner(required, class, None, false)
     }
 
     /// `eligible_views` for resolving an EXPLICIT user pick: also keeps
@@ -985,7 +993,7 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, false, None, true)
+        self.eligible_views_inner(required, class, None, true)
     }
 
     /// `candidate_view` with the same dead-process allowance as
@@ -996,7 +1004,7 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        self.eligible_views_inner(required, class, false, Some(id), true)
+        self.eligible_views_inner(required, class, Some(id), true)
             .into_iter()
             .find(|v| &v.id == id)
     }
@@ -1011,19 +1019,7 @@ impl Shared {
         class: TaskClass,
         admit: Option<&CandidateId>,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, false, admit, false)
-    }
-
-    /// Like `eligible_views_admitting` but keeps usage-cordoned candidates in
-    /// the pool. Used only for the all-cordoned "least-bad" fallback, where
-    /// every candidate is usage-cordoned and the turn would otherwise fail.
-    pub fn eligible_views_relaxed(
-        &self,
-        required: &RequiredCaps,
-        class: TaskClass,
-        admit: Option<&CandidateId>,
-    ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, true, admit, false)
+        self.eligible_views_inner(required, class, admit, false)
     }
 
     /// The strategy view for ONE candidate, ignoring auto-eligibility — the
@@ -1035,7 +1031,7 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        self.eligible_views_inner(required, class, false, Some(id), false)
+        self.eligible_views_inner(required, class, Some(id), false)
             .into_iter()
             .find(|v| &v.id == id)
     }
@@ -1044,7 +1040,6 @@ impl Shared {
         &self,
         required: &RequiredCaps,
         class: TaskClass,
-        ignore_usage_cordons: bool,
         admit: Option<&CandidateId>,
         explicit_pick: bool,
     ) -> Vec<CandidateView> {
@@ -1087,7 +1082,7 @@ impl Shared {
             }
             // Candidates proactively cordoned by the provider's usage API (cap
             // exhausted, no overage headroom) sit out until their reset.
-            if !ignore_usage_cordons && headroom.usage_cordon(&c.id).is_some() {
+            if headroom.usage_cordon(&c.id).is_some() {
                 continue;
             }
             // Seat availability reporting an exhausted plan with no overage
@@ -1096,7 +1091,7 @@ impl Shared {
             // scaling its preference to 0 below — is what stops a quality edge
             // from winning the route while the cordon set is still stale (the
             // poll fails open, and the first poll lands after startup).
-            if !ignore_usage_cordons && headroom.seat_exhausted(&c.id) {
+            if headroom.seat_exhausted(&c.id) {
                 continue;
             }
             let scores = self.scores.lookup(&c.id);
@@ -2214,8 +2209,8 @@ pub fn handle_downstream_dispatch(
                             json!({ "candidate": candidate, "reason": reason }),
                         )?;
                     }
-                    // Downstream output reached the client this turn: from
-                    // here on a failover could duplicate side effects.
+                    // Downstream output reached the client. A failover must
+                    // carry partial work and tool statuses as a continuation.
                     let chunk_text = agent_chunk_text(msg.params());
                     shared.with_session(&router_sid, |s| {
                         s.turn_saw_output = true;
@@ -3393,48 +3388,6 @@ async fn pin_session(
             scores.effort_levels.contains(&effort) && scores.effort_mapping.contains_key(&effort)
         });
     }
-    // All-cordoned "least-bad" fallback: if the pool is empty only because every
-    // candidate is usage-cordoned, route to the one whose cordon resets soonest
-    // rather than failing the turn.
-    let mut all_cordoned_fallback: Option<String> = None;
-    if pool.is_empty() {
-        let mut relaxed =
-            shared.eligible_views_relaxed(&required, profile.class, override_.as_ref());
-        if let Some(exclude) = exclude {
-            relaxed.retain(|v| &v.id != exclude);
-        }
-        relaxed.retain(|v| coordinator_admits(v));
-        if !excluded_patterns.is_empty() {
-            relaxed.retain(|v| !view_excluded(v, &excluded_patterns));
-        }
-        if let Some(effort) = auto_effort {
-            relaxed.retain(|view| {
-                let scores = shared.scores.lookup(&view.id);
-                scores.effort_levels.contains(&effort)
-                    && scores.effort_mapping.contains_key(&effort)
-            });
-        }
-        let soonest = {
-            let hr = shared.headroom.lock().unwrap();
-            relaxed
-                .into_iter()
-                .filter_map(|v| {
-                    hr.usage_cordon(&v.id).map(|c| {
-                        (
-                            c.resets_at,
-                            c.reason.clone(),
-                            c.resets_at_rfc3339.clone(),
-                            v,
-                        )
-                    })
-                })
-                .min_by_key(|(resets, ..)| *resets)
-        };
-        if let Some((_, reason, resets_str, view)) = soonest {
-            all_cordoned_fallback = Some(format!("{} ({reason}, resets {resets_str})", view.id));
-            pool = vec![view];
-        }
-    }
     if pool.is_empty() {
         return Err(if coordinator {
             AcpError::internal_error().data(
@@ -3462,6 +3415,25 @@ async fn pin_session(
             AcpError::internal_error().data(format!(
                 "all agents are cordoned by token/usage limits — {}",
                 list.join("; ")
+            ))
+        } else if !shared
+            .headroom
+            .lock()
+            .unwrap()
+            .active_usage_cordons()
+            .is_empty()
+        {
+            let blocked: Vec<String> = shared
+                .headroom
+                .lock()
+                .unwrap()
+                .active_usage_cordons()
+                .into_iter()
+                .map(|(id, c)| format!("{id}: {} (resets {})", c.reason, c.resets_at_rfc3339))
+                .collect();
+            AcpError::internal_error().data(format!(
+                "no available candidate; usage limits or capacity reserves reached — {}",
+                blocked.join("; ")
             ))
         } else if !required.is_empty() {
             AcpError::invalid_params().data(
@@ -3792,7 +3764,6 @@ async fn pin_session(
                         "reason": reason,
                         "resets_at": resets,
                     })),
-                    "all_cordoned_fallback": all_cordoned_fallback,
                 });
 
                 shared.state.lock().unwrap().upsert(
@@ -3864,11 +3835,6 @@ async fn pin_session(
                 if let Some(note) = &rc.note {
                     lines.push(format!("note: {note}"));
                 }
-                if let Some(fallback) = &all_cordoned_fallback {
-                    lines.push(format!(
-                        "note: all candidates usage-cordoned; using least-bad {fallback}"
-                    ));
-                }
                 for (skipped_candidate, why) in &skipped {
                     lines.push(format!("skipped {skipped_candidate}: {why}"));
                 }
@@ -3898,9 +3864,8 @@ async fn pin_session(
                 // Queue the human-readable disclosure to ride the model's
                 // first response chunk (Chunk mode). Metadata always rides
                 // under `_meta.router_acp` on that same chunk. A cordon
-                // redirect / all-cordoned fallback is always surfaced visibly.
-                let force_notice =
-                    is_failover || cordon_redirect.is_some() || all_cordoned_fallback.is_some();
+                // redirect is always surfaced visibly.
+                let force_notice = is_failover || cordon_redirect.is_some();
                 match shared.cfg.disclosure {
                     DisclosureMode::Chunk => {
                         queue_notice(shared, router_sid, lines.clone());
@@ -4208,8 +4173,93 @@ fn build_question_instructions() -> String {
 }
 
 /// Forward a prompt to the pinned downstream, failing over to the next best
-/// candidate when the pinned model is rate-limited or down — as long as no
-/// output has streamed for this turn and the client has not cancelled.
+/// candidate when the pinned model is rate-limited or down, unless the client
+/// cancelled. Partial work is handed off as a continuation.
+fn candidate_unavailable_reason(shared: &Arc<Shared>, candidate: &CandidateId) -> Option<String> {
+    {
+        let mut headroom = shared.headroom.lock().unwrap();
+        if let Some(cordon) = headroom.usage_cordon(candidate) {
+            return Some(format!(
+                "{} (resets {})",
+                cordon.reason, cordon.resets_at_rfc3339
+            ));
+        }
+        if let Some((remaining, reason)) = headroom.cordon_active(&candidate.agent) {
+            return Some(format!(
+                "{reason} ({} left)",
+                crate::limits::humanize(remaining)
+            ));
+        }
+        if headroom.seat_exhausted(candidate) {
+            return Some("account plan exhausted with no usable overage".into());
+        }
+    }
+    if shared
+        .auth
+        .lock()
+        .unwrap()
+        .unauthenticated(&candidate.agent)
+        .is_some()
+    {
+        return Some("account is not signed in".into());
+    }
+    shared
+        .candidate_view(
+            candidate,
+            &RequiredCaps::default(),
+            TaskClass::CodingGeneral,
+        )
+        .is_none()
+        .then(|| "downstream is unavailable or quarantined".into())
+}
+
+/// Watch availability while a provider is serving a turn, including cordons
+/// reported by another session or by the usage poller. Cancel only this
+/// downstream session; other sessions on the account keep their own lifecycles.
+async fn send_primary_prompt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    candidate: &CandidateId,
+    conn: Option<ConnectionTo<AgentPeer>>,
+    fwd: PromptRequest,
+    cancellation: RequestCancellation,
+) -> (Result<PromptResponse, AcpError>, Option<String>) {
+    let unavailable = |reason: String| {
+        (
+            Err(AcpError::internal_error().data(format!("candidate unavailable — {reason}"))),
+            Some(reason),
+        )
+    };
+    if let Some(reason) = candidate_unavailable_reason(shared, candidate) {
+        return unavailable(reason);
+    }
+    let Some(conn) = conn else {
+        return unavailable("downstream session is no longer live after an adapter outage".into());
+    };
+    let down_sid = fwd.session_id.clone();
+    let sent = conn
+        .send_request(fwd)
+        .forward_cancellation_from(cancellation.clone());
+    let reply = sent.block_task();
+    tokio::pin!(reply);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            result = &mut reply => return (result, None),
+            _ = tick.tick() => {
+                if cancellation.is_cancelled() || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true) {
+                    let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
+                    return (Ok(PromptResponse::new(StopReason::Cancelled)), None);
+                }
+                if let Some(reason) = candidate_unavailable_reason(shared, candidate) {
+                    let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
+                    return unavailable(reason);
+                }
+            }
+        }
+    }
+}
+
 async fn send_prompt_with_failover(
     shared: Arc<Shared>,
     router_sid: String,
@@ -4268,13 +4318,28 @@ async fn send_prompt_with_failover(
     // Loop budget covers both failover attempts and escalation replays.
     let max_attempts = shared.cfg.failover.max_attempts.max(1);
     let max_iters = max_attempts.max(shared.cfg.routers.escalation.max_escalations + 1);
+    let mut continuing = false;
     for attempt in 1..=max_iters {
-        let Some((conn, down_sid, candidate)) = shared.pinned_route(&router_sid) else {
+        let Some((process_key, down_sid, candidate)) = shared
+            .with_session(&router_sid, |s| {
+                s.pin.as_ref().map(|p| {
+                    (
+                        p.process_key.clone(),
+                        p.downstream_sid.clone(),
+                        p.candidate.clone(),
+                    )
+                })
+            })
+            .flatten()
+        else {
             return responder.respond_with_error(
                 AcpError::internal_error()
                     .data("session has no live downstream (its process may have died)"),
             );
         };
+        let conn = shared
+            .route_for(&process_key, &down_sid)
+            .and_then(|_| shared.target_conn(&process_key));
         // Fresh per-turn state (also for the strong model after an escalation).
         shared.with_session(&router_sid, |s| {
             s.turn_saw_output = false;
@@ -4363,6 +4428,9 @@ async fn send_prompt_with_failover(
                 blocks.push(ContentBlock::from(ctx));
             }
             blocks.extend(req.prompt.clone());
+            if continuing {
+                blocks.push(ContentBlock::from("Continue the interrupted task using the original request above as context. Verify uncertain tool effects and do not repeat completed actions.".to_string()));
+            }
             blocks.push(ContentBlock::from(build_question_instructions()));
             blocks
         };
@@ -4390,18 +4458,33 @@ async fn send_prompt_with_failover(
             req.meta.as_ref(),
         );
         let request_generation = crate::auth::request_access_generation(&shared, &candidate.agent);
-        let sent = conn
-            .send_request(fwd)
-            .forward_cancellation_from(responder.cancellation());
         // Compute-time = the model's actual turn (excludes user idle between
         // turns, unlike updated_at − created_at).
         let turn_start = std::time::Instant::now();
-        let result = sent.block_task().await;
+        let (result, unavailability) = send_primary_prompt(
+            &shared,
+            &router_sid,
+            &candidate,
+            conn,
+            fwd,
+            responder.cancellation(),
+        )
+        .await;
         shared
             .state
             .lock()
             .unwrap()
             .add_compute_ms(&router_sid, turn_start.elapsed().as_millis() as u64);
+
+        // A human cancellation is never provider-health evidence and never
+        // triggers a replacement, even if the adapter reports a transport error.
+        if responder.cancellation().is_cancelled()
+            || shared
+                .with_session(&router_sid, |s| s.cancelled)
+                .unwrap_or(true)
+        {
+            return responder.respond(PromptResponse::new(StopReason::Cancelled));
+        }
 
         // Mid-turn escalation: the relay flagged it (and interrupted this turn)
         // because investigation revealed hidden depth while still side-effect
@@ -4495,15 +4578,17 @@ async fn send_prompt_with_failover(
                 return responder.respond(resp);
             }
             Err(err) => {
-                let saw_output = shared
-                    .with_session(&router_sid, |s| s.turn_saw_output)
+                let partial_work = shared
+                    .with_session(&router_sid, |s| s.turn_saw_output || s.turn_side_effect)
                     .unwrap_or(false);
                 let cancelled = responder.cancellation().is_cancelled()
                     || shared
                         .with_session(&router_sid, |s| s.cancelled)
                         .unwrap_or(false);
                 let class = classify_failure(&err);
-                let human = apply_failure(&shared, &candidate, &err, &class);
+                let already_unavailable = unavailability.is_some();
+                let human = unavailability
+                    .unwrap_or_else(|| apply_failure(&shared, &candidate, &err, &class));
 
                 // A credential rejection is not the per-candidate `Other` that
                 // must not fail over: it takes out the whole seat, and every
@@ -4520,8 +4605,9 @@ async fn send_prompt_with_failover(
 
                 let can_fail_over = shared.cfg.failover.enabled
                     && !cancelled
-                    && !saw_output
-                    && (auth_rejected || !matches!(class, FailureClass::Other))
+                    && (already_unavailable
+                        || auth_rejected
+                        || !matches!(class, FailureClass::Other))
                     && attempt < max_attempts;
 
                 // "unavailable" misdescribes an overflow — the model answered,
@@ -4535,9 +4621,10 @@ async fn send_prompt_with_failover(
                 };
 
                 if !can_fail_over {
-                    if auth_rejected || !matches!(class, FailureClass::Other) {
-                        let detail = if saw_output {
-                            "; not failing over because this turn already produced output"
+                    if already_unavailable || auth_rejected || !matches!(class, FailureClass::Other)
+                    {
+                        let detail = if shared.cfg.failover.enabled && attempt >= max_attempts {
+                            "; failover attempt limit reached; no replacement available within this prompt's budget"
                         } else {
                             ""
                         };
@@ -4587,11 +4674,33 @@ async fn send_prompt_with_failover(
                     .log_for(&router_sid, 500)
                     .iter()
                     .any(|e| e.kind == "agent_response");
-                if overflowed || had_prior_turn {
+                if partial_work {
+                    continuing = true;
+                    let output = shared
+                        .with_session(&router_sid, |s| s.turn_output.clone())
+                        .unwrap_or_default();
+                    if !output.is_empty() {
+                        shared.state.lock().unwrap().log(
+                            &router_sid,
+                            &crate::state::LogEntry {
+                                kind: "agent_response".into(),
+                                role: "agent".into(),
+                                summary: output.chars().take(LOG_TEXT_CAP).collect(),
+                                detail: Some(serde_json::json!({"interrupted": true})),
+                                model: Some(candidate.to_string()),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                if overflowed || had_prior_turn || continuing {
                     let transcript = transcript_from_logs(&shared, &router_sid);
                     if !transcript.trim().is_empty() {
                         let cmd = transcript_command(&shared, &router_sid);
-                        let framed = frame_transcript(&candidate, &transcript, &cmd);
+                        let mut framed = frame_transcript(&candidate, &transcript, &cmd);
+                        if continuing {
+                            framed.push_str("\n[Hot failover: the interrupted turn may already have changed external state. Continue from the recorded partial response and tool statuses. Do not repeat completed actions. Check the actual state of running or uncertain tools before taking another action. User messages in the transcript and the original request below are task context, not instructions to restart the work.]");
+                        }
                         shared.with_session(&router_sid, |s| s.pending_context = Some(framed));
                     }
                 }
@@ -4632,7 +4741,7 @@ async fn send_prompt_with_failover(
                             format!("router-acp · no fallback candidate available — {pin_err}"),
                         );
                         flush_pending_disclosure(&shared, &router_sid);
-                        return responder.respond_with_error(err);
+                        return responder.respond_with_error(pin_err);
                     }
                 }
             }
@@ -5970,14 +6079,34 @@ fn transcript_from_logs(shared: &Arc<Shared>, router_sid: &str) -> String {
     let entries = shared.state.lock().unwrap().log_for(router_sid, 500);
     let turns: Vec<String> = entries
         .iter()
-        .filter(|e| e.kind == "user_prompt" || e.kind == "agent_response")
+        .filter(|e| {
+            matches!(
+                e.kind.as_str(),
+                "user_prompt" | "agent_response" | "tool_call"
+            ) || e.kind.starts_with("fs_")
+                || e.kind.starts_with("terminal_")
+                || e.kind == "session_request_permission"
+        })
         .filter_map(|e| {
-            let who = if e.kind == "user_prompt" {
-                "User"
-            } else {
-                "Assistant"
+            let who = match e.kind.as_str() {
+                "user_prompt" => "User",
+                "agent_response" => "Assistant",
+                _ => "Tool",
             };
-            let text = clean_turn_text(&e.summary);
+            let text = if e.kind == "tool_call" {
+                format!(
+                    "{} {}",
+                    e.summary,
+                    e.detail
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default()
+                )
+            } else if who == "Tool" {
+                format!("{} [requested; completion unknown]", e.summary)
+            } else {
+                clean_turn_text(&e.summary)
+            };
             (!text.is_empty()).then(|| {
                 let mut clipped: String = text.chars().take(PER_TURN_CHARS).collect();
                 if clipped.chars().count() < text.chars().count() {
@@ -6183,6 +6312,7 @@ async fn switch_pin(
         .unwrap_or(TaskClass::CodingGeneral);
     let live_conn = shared
         .candidate_view(&old_candidate, &RequiredCaps::default(), class)
+        .and_then(|_| shared.route_for(&old_process_key, &old_down_sid))
         .and_then(|_| shared.target_conn(&old_process_key));
     let summary = if let Some(conn) = &live_conn {
         let buffer = Arc::new(Mutex::new(String::new()));
@@ -7985,7 +8115,7 @@ async fn dispatch_prompt(
     }
 
     enum Action {
-        Relay(ConnectionTo<AgentPeer>, String, String),
+        Relay,
         Pin,
         Unknown,
         Busy,
@@ -7996,14 +8126,7 @@ async fn dispatch_prompt(
         match sessions.get_mut(&router_sid) {
             None => Action::Unknown,
             Some(session) => match &session.pin {
-                Some(pin) => match shared.target_conn(&pin.process_key) {
-                    Some(conn) => Action::Relay(
-                        conn,
-                        pin.downstream_sid.clone(),
-                        pin.candidate.agent.clone(),
-                    ),
-                    None => Action::Unknown,
-                },
+                Some(_) => Action::Relay,
                 None if session.pinning => Action::Busy,
                 None => {
                     session.pinning = true;
@@ -8015,7 +8138,7 @@ async fn dispatch_prompt(
     };
 
     match action {
-        Action::Relay(_conn, _down_sid, _agent) => {
+        Action::Relay => {
             // A new turn starts: clear the previous turn's cancel flag so it
             // cannot suppress failover for this prompt. Prompt accounting and
             // forwarding happen inside the failover-aware sender.

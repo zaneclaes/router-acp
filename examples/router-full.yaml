@@ -39,7 +39,8 @@ delegation:
 # Graceful degradation. Rate/usage-limited agents are cordoned until the
 # reset time parsed from the model's error (or cordon_default_secs when the
 # model reported none); outages fail over to the next best candidate with a
-# visible notice and dead adapters are respawned automatically.
+# visible notice and dead adapters are respawned automatically. Partial output
+# and tool statuses are handed off for continuation. Client cancellation stops.
 headroom:
   cordon_default_secs: 900
 failover:
@@ -78,6 +79,8 @@ llm_proxy:
 # Proactive usage-cap cordoning. On top of the reactive (error-driven) cordons
 # above, poll each agent's provider usage API and mark a candidate unroutable
 # BEFORE it's tried when its cap is exhausted with no overage/credit headroom.
+# Per-account reserve_capacity cordons earlier even with overage; see
+# router-accounts.yaml for independent logins and reserve examples.
 # Generic: which models are exhausted is read from the API, never hardcoded.
 # Enable per-agent with `usage_source` (see the claude agent below). Cordoned
 # candidates are excluded from auto, skipped by failover, refused (with a

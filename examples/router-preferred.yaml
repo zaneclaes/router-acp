@@ -321,6 +321,8 @@ routers:
 # auto/failover skip it, an explicit pin to it falls back, and a client's model
 # picker can show it disabled. Generic (models discovered from the API) and
 # fail-open (a usage-endpoint hiccup never makes a model unroutable).
+# Per-account reserves cordon earlier even with overage; router-accounts.yaml
+# shows how to keep independent logins and set their reserve_capacity values.
 cordon:
   enabled: true
   poll_secs: 300
