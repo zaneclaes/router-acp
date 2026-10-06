@@ -661,6 +661,11 @@ async fn proxy_request(
                             effort: request_effort(
                                 &state.shared,
                                 &active.parent_router_sid,
+                                state
+                                    .shared
+                                    .with_session(&active.state_sid, |s| s.version_request.clone())
+                                    .flatten()
+                                    .as_deref(),
                                 &active.candidate,
                             ),
                         });
@@ -1398,6 +1403,7 @@ enum EffortShape {
 fn request_effort(
     shared: &Shared,
     parent_router_sid: &str,
+    version: Option<&str>,
     candidate: &CandidateId,
 ) -> EffortShape {
     let requested = shared
@@ -1410,9 +1416,7 @@ fn request_effort(
         .flatten();
     match requested {
         None => EffortShape::Preserve,
-        Some(level) => shared
-            .scores
-            .lookup(candidate)
+        Some(level) => turn_scores(shared, version, candidate)
             .resolve_effort(level)
             .provider_value
             .map(EffortShape::Set)
@@ -1465,17 +1469,13 @@ fn select_request_model(
     let signals = inspect_request(body);
     // A coordinator's requests only move within `planning_candidates`; its
     // own pin is re-added below regardless (a human may have picked it).
-    let coordinator = shared
-        .with_session(&active.state_sid, |s| s.coordinator)
-        .unwrap_or(false);
-    // `model_version_pins` is applied here, not after selection: a pinned
-    // family must substitute in the per-request pool too, so an escalation or
-    // demotion target resolves to the version that will actually serve.
-    let candidates: Vec<_> = shared
-        .effective_candidates()
-        .into_iter()
-        .map(|effective| effective.runtime)
-        .collect();
+    let (coordinator, version) = shared
+        .with_session(&active.state_sid, |s| {
+            (s.coordinator, s.version_request.clone())
+        })
+        .unwrap_or((false, None));
+    let version = version.as_deref();
+    let candidates = shared.routeable_candidates();
     let mut headroom = shared.headroom.lock().unwrap();
     let mut models: Vec<ModelOption> = candidates
         .into_iter()
@@ -1492,8 +1492,8 @@ fn select_request_model(
                 && !headroom.seat_exhausted(&candidate.id)
         })
         .map(|candidate| {
-            let scores = shared.scores.lookup(&candidate.id);
-            let api_model = configured_api_model(shared, &candidate.id);
+            let scores = turn_scores(shared, version, &candidate.id);
+            let api_model = turn_api_model(shared, version, &candidate.id);
             ModelOption {
                 id: candidate.id,
                 api_model,
@@ -1522,10 +1522,10 @@ fn select_request_model(
             .candidate_runtime(&active.candidate)
             .map(|candidate| candidate.cost_rank)
             .unwrap_or(u32::MAX);
-        let scores = shared.scores.lookup(&active.candidate);
+        let scores = turn_scores(shared, version, &active.candidate);
         models.push(ModelOption {
             id: active.candidate.clone(),
-            api_model: configured_api_model(shared, &active.candidate),
+            api_model: turn_api_model(shared, version, &active.candidate),
             cost_rank,
             quality: scores.quality(active.class),
             context_window: scores.context_window,
@@ -1684,8 +1684,8 @@ fn select_request_model(
             // — otherwise a short routine blip that escalates right back is a net
             // loss (and thrash pays the write twice). No-op when cache pricing is
             // absent (OpenAI/Responses wire).
-            let break_even =
-                cache_reprime_break_even(shared, &active.candidate, &cheap).unwrap_or(0) as u32;
+            let break_even = cache_reprime_break_even(shared, version, &active.candidate, &cheap)
+                .unwrap_or(0) as u32;
             let required = shared.cfg.llm_proxy.routine_streak.max(break_even);
             if cheap == active.candidate {
                 (
@@ -1787,16 +1787,14 @@ fn select_request_model(
     }
     let upstream_model = if selected == active.candidate {
         // Staying on the session's own model is NOT a licence to pass the
-        // adapter's model string through. With `downstream_id` aliasing, the
-        // adapter was configured via an alias (`opus[1m]`, `claude-fable-5[1m]`)
-        // and emits requests naming whatever that alias resolves to on ITS
-        // side — `claude-opus-5`, `claude-fable-5` — which for a pinned version
-        // is a DIFFERENT model from the one the session is attributed and
-        // priced as. So a declared `api_model` is authoritative and always
-        // written; the incoming string is only trusted when the candidate
-        // declares no `api_model`, where it is the sole valid wire id we have
-        // (rewriting to a bare CLI alias would 404).
-        declared_api_model(shared, &selected).unwrap_or_else(|| {
+        // adapter's model string through: the adapter names whatever its
+        // alias resolves to on ITS side, which for a pinned version is a
+        // DIFFERENT model from the one the session is attributed and priced
+        // as. So a declared wire id (pinned version or `api_model`) is
+        // authoritative and always written; the incoming string is only
+        // trusted when neither is declared, where it is the sole valid wire
+        // id we have (rewriting to a bare CLI alias would 404).
+        declared_api_model(shared, version, &selected).unwrap_or_else(|| {
             signals
                 .original_model
                 .clone()
@@ -1807,7 +1805,7 @@ fn select_request_model(
             .iter()
             .find(|model| model.id == selected)
             .map(|model| model.api_model.clone())
-            .unwrap_or_else(|| configured_api_model(shared, &selected))
+            .unwrap_or_else(|| turn_api_model(shared, version, &selected))
     };
     let rewrite = signals
         .original_model
@@ -1823,18 +1821,26 @@ fn select_request_model(
         reason,
         event,
         estimated_input: signals.estimated_input,
-        effort: request_effort(shared, &active.parent_router_sid, &selected),
-        fold_system_turns: !shared.scores.lookup(&selected).system_turns,
+        effort: request_effort(shared, &active.parent_router_sid, version, &selected),
+        fold_system_turns: !turn_scores(shared, version, &selected).system_turns,
     }
 }
 
-/// The candidate's DECLARED `api_model`, or `None` when it declares none.
+/// The candidate's DECLARED wire id — its pinned version, else its
+/// `api_model` — or `None` when it declares neither.
 ///
 /// The distinction from [`configured_api_model`] is load-bearing: "no declared
 /// api_model" means the router has no authoritative wire id for this candidate
 /// and must not invent one from the ACP selector id, which is often an alias
 /// the provider API rejects.
-fn declared_api_model(shared: &Shared, candidate: &CandidateId) -> Option<String> {
+fn declared_api_model(
+    shared: &Shared,
+    version: Option<&str>,
+    candidate: &CandidateId,
+) -> Option<String> {
+    if let Some(version) = shared.cfg.resolve_version(candidate, version) {
+        return Some(version.api_model.clone());
+    }
     shared
         .cfg
         .model_config(candidate)
@@ -1842,7 +1848,41 @@ fn declared_api_model(shared: &Shared, candidate: &CandidateId) -> Option<String
 }
 
 fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
-    declared_api_model(shared, candidate).unwrap_or_else(|| candidate.model.clone())
+    shared.cfg.wire_api_model(candidate)
+}
+
+/// The wire model `candidate` runs under this turn's `[router: version=…]`.
+fn turn_api_model(shared: &Shared, version: Option<&str>, candidate: &CandidateId) -> String {
+    match shared.cfg.resolve_version(candidate, version) {
+        Some(v) => v.api_model.clone(),
+        None => shared.cfg.wire_api_model_unpinned(candidate),
+    }
+}
+
+/// Scores of the version `candidate` runs under this turn's request.
+fn turn_scores(
+    shared: &Shared,
+    version: Option<&str>,
+    candidate: &CandidateId,
+) -> crate::candidate::ResolvedScores {
+    match shared.cfg.resolve_version(candidate, version) {
+        Some(v) => shared
+            .scores
+            .lookup_exact(&CandidateId::new(&candidate.agent, &v.api_model)),
+        None => shared.scores.lookup_exact(candidate),
+    }
+}
+
+/// Pricing of the version `candidate` runs under this turn's request.
+fn turn_pricing<'a>(
+    shared: &'a Shared,
+    version: Option<&str>,
+    candidate: &CandidateId,
+) -> Option<&'a crate::config::PricingConfig> {
+    match shared.cfg.resolve_version(candidate, version) {
+        Some(v) => v.pricing.as_ref(),
+        None => shared.cfg.model_config(candidate)?.pricing.as_ref(),
+    }
 }
 
 fn strongest_model(models: &[ModelOption]) -> Option<CandidateId> {
@@ -2291,7 +2331,13 @@ fn complete_request(
     error: Option<String>,
 ) {
     let usage = parse_response_usage(captured, context.protocol);
-    let cost = request_cost(shared, &context.model, context.protocol, &usage);
+    let cost = request_cost(
+        shared,
+        &context.state_sid,
+        &context.model,
+        context.protocol,
+        &usage,
+    );
     let response_difficulty = response_difficulty(captured, status);
     let duration_ms = context.started.elapsed().as_millis() as u64;
     {
@@ -2443,28 +2489,15 @@ fn response_difficulty(body: &[u8], _status: u16) -> Option<String> {
 /// so Codex/Grok/Kimi behavior is unchanged.
 fn cache_reprime_break_even(
     shared: &Shared,
+    version: Option<&str>,
     pinned: &CandidateId,
     target: &CandidateId,
 ) -> Option<u64> {
     if pinned == target {
         return Some(0);
     }
-    let pricing = |candidate: &CandidateId| {
-        shared
-            .cfg
-            .agents
-            .iter()
-            .find(|agent| agent.name == candidate.agent)
-            .and_then(|agent| {
-                agent
-                    .models
-                    .iter()
-                    .find(|model| model.id == candidate.model)
-            })
-            .and_then(|model| model.pricing.clone())
-    };
-    let pinned = pricing(pinned)?;
-    let target = pricing(target)?;
+    let pinned = turn_pricing(shared, version, pinned)?;
+    let target = turn_pricing(shared, version, target)?;
     let pinned_read = pinned.cache_read_per_mtok?;
     let target_read = target.cache_read_per_mtok?;
     let target_write = target.cache_write_per_mtok?;
@@ -2478,23 +2511,12 @@ fn cache_reprime_break_even(
 
 fn request_cost(
     shared: &Arc<Shared>,
+    state_sid: &str,
     candidate: &CandidateId,
     protocol: LlmWireProtocol,
     usage: &LlmRequestUsage,
 ) -> f64 {
-    let Some(pricing) = shared
-        .cfg
-        .agents
-        .iter()
-        .find(|agent| agent.name == candidate.agent)
-        .and_then(|agent| {
-            agent
-                .models
-                .iter()
-                .find(|model| model.id == candidate.model)
-        })
-        .and_then(|model| model.pricing.as_ref())
-    else {
+    let Some(pricing) = shared.pricing_for(state_sid, candidate) else {
         return 0.0;
     };
     let cache_read_rate = pricing
@@ -2606,7 +2628,7 @@ agents:
         kory_code_shared_with("")
     }
 
-    /// `extra` is appended as top-level config (e.g. a `model_version_pins`
+    /// `extra` is appended as top-level config (e.g. a `pinned_versions`
     /// block), so pin behaviour can be exercised on the production shape.
     fn kory_code_shared_with(extra: &str) -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
@@ -2636,29 +2658,22 @@ agents:
         cost_rank: 2
         api_model: claude-sonnet-5
         pricing: {{ input_per_mtok: 3.0, output_per_mtok: 15.0, cache_read_per_mtok: 0.30, cache_write_per_mtok: 3.75 }}
+      # Older versions `pinned_versions` may select. Their whole point is that
+      # the wire model differs from what the selector alias resolves to.
       - id: "opus[1m]"
         cost_rank: 4
         api_model: claude-opus-5
         pricing: {{ input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }}
+        versions:
+          - api_model: claude-opus-4-6
+            pricing: {{ input_per_mtok: 6.0, output_per_mtok: 30.0, cache_read_per_mtok: 0.60, cache_write_per_mtok: 7.50 }}
       - id: "claude-fable-5[1m]"
         cost_rank: 5
         api_model: claude-fable-5
         pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }}
-      # Pin-only legacy versions, reached through the alias the adapter really
-      # advertises. Their whole point is that `api_model` differs from what that
-      # alias resolves to downstream.
-      - id: claude-opus-4-6
-        cost_rank: 4
-        api_model: claude-opus-4-6
-        downstream_id: "opus[1m]"
-        auto_eligible: false
-        pricing: {{ input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }}
-      - id: claude-fable-5-1
-        cost_rank: 5
-        api_model: claude-fable-5-1
-        downstream_id: "claude-fable-5[1m]"
-        auto_eligible: false
-        pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }}
+        versions:
+          - api_model: claude-fable-5-1
+            pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }}
 {extra}"#,
             dir.path().join("state.db").display()
         );
@@ -2671,8 +2686,6 @@ agents:
                 "sonnet".into(),
                 "opus[1m]".into(),
                 "claude-fable-5[1m]".into(),
-                "claude-opus-4-6".into(),
-                "claude-fable-5-1".into(),
             ],
         );
         (dir, shared)
@@ -3582,15 +3595,16 @@ agents:
         })
     }
 
+    const OPUS_PINNED: &str = "pinned_versions:\n  \"claude/opus[1m]\": claude-opus-4-6\n";
+
     #[test]
-    fn pinned_legacy_version_rewrites_the_wire_model_off_the_selector_alias() {
-        let (_dir, shared) = kory_code_shared();
-        // Session pinned to Opus 4.6, configured downstream via `opus[1m]` —
-        // so the adapter emits `claude-opus-5`. Passing that through would
-        // serve Opus 5 while the session is attributed and priced as 4.6.
+    fn pinned_version_rewrites_the_wire_model_off_the_selector_alias() {
+        let (_dir, shared) = kory_code_shared_with(OPUS_PINNED);
+        // The adapter resolves `opus[1m]` to `claude-opus-5`. Passing that
+        // through would serve Opus 5 while the session is priced as 4.6.
         let decision = select_request_model(
             &shared,
-            &claude_active("claude-opus-4-6"),
+            &claude_active("opus[1m]"),
             &aliased_request("claude-opus-5"),
         );
         assert_eq!(
@@ -3601,22 +3615,63 @@ agents:
             decision.rewrite,
             "the body has to be rewritten to get there"
         );
-        assert_eq!(decision.selected_model, "claude-opus-4-6");
+        assert_eq!(
+            decision.selected_model, "opus[1m]",
+            "the candidate never changes"
+        );
     }
 
     #[test]
-    fn pinned_fable_5_1_rewrites_the_wire_model_off_its_downstream_alias() {
-        let (_dir, shared) = kory_code_shared();
-        // `claude-fable-5-1` rides the `claude-fable-5[1m]` alias, which the
-        // adapter resolves to `claude-fable-5` — a different model at a
-        // different cache-read rate.
+    fn pinned_fable_5_1_rewrites_the_wire_model_off_its_selector_alias() {
+        let (_dir, shared) = kory_code_shared_with(
+            "pinned_versions:\n  \"claude/claude-fable-5[1m]\": claude-fable-5-1\n",
+        );
         let decision = select_request_model(
             &shared,
-            &claude_active("claude-fable-5-1"),
+            &claude_active("claude-fable-5[1m]"),
             &aliased_request("claude-fable-5"),
         );
         assert_eq!(decision.model, "claude-fable-5-1");
         assert!(decision.rewrite);
+    }
+
+    #[test]
+    fn a_session_version_takes_effect_on_the_next_request() {
+        let (_dir, shared) = kory_code_shared();
+        let cfg = shared.cfg.clone();
+        let session = RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new());
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".to_string(), session);
+        let opus = claude_active("opus[1m]");
+        let before = select_request_model(&shared, &opus, &aliased_request("claude-opus-5"));
+        assert_eq!(before.model, "claude-opus-5");
+        shared.with_session("r1", |s| s.version_request = Some("claude-opus-4-6".into()));
+        let after = select_request_model(&shared, &opus, &aliased_request("claude-opus-5"));
+        assert_eq!(after.model, "claude-opus-4-6");
+        assert!(after.rewrite && after.honors_pin);
+        assert_eq!(
+            shared
+                .pricing_for("r1", &opus.candidate)
+                .unwrap()
+                .input_per_mtok,
+            6.0
+        );
+    }
+
+    #[test]
+    fn a_pinned_version_is_priced_as_itself() {
+        let (_dir, shared) = kory_code_shared_with(OPUS_PINNED);
+        let opus = CandidateId::new("claude", "opus[1m]");
+        assert_eq!(shared.cfg.model_pricing(&opus).unwrap().input_per_mtok, 6.0);
+        assert_eq!(configured_api_model(&shared, &opus), "claude-opus-4-6");
+        let (_dir, unpinned) = kory_code_shared();
+        assert_eq!(
+            unpinned.cfg.model_pricing(&opus).unwrap().input_per_mtok,
+            5.0
+        );
     }
 
     #[test]
@@ -3655,12 +3710,12 @@ agents:
     /// exercises it end to end); only a pin rewrite loses it.
     #[test]
     fn only_a_pin_rewrite_is_flagged_as_honoring_the_pin() {
-        let (_dir, shared) = kory_code_shared();
+        let (_dir, shared) = kory_code_shared_with(OPUS_PINNED);
         // Pin rewrite: staying on the session's own candidate, but its
-        // api_model differs from the alias string the adapter emitted.
+        // pinned version differs from the alias string the adapter emitted.
         let pin = select_request_model(
             &shared,
-            &claude_active("claude-opus-4-6"),
+            &claude_active("opus[1m]"),
             &aliased_request("claude-opus-5"),
         );
         assert!(pin.rewrite && pin.honors_pin);
@@ -3688,48 +3743,6 @@ agents:
     }
 
     #[test]
-    fn per_request_pool_substitutes_a_version_pinned_alternate() {
-        // The proxy's own candidate pool must honour `model_version_pins`, or a
-        // demotion/escalation target resolves to the alias and serves the
-        // wrong version. Fable is pinned to 5.1 here; a routine streak on the
-        // fable pin must demote onto a SUBSTITUTED cheaper model, and the
-        // fable slot itself must appear as 5.1 rather than the default.
-        let (_dir, shared) = kory_code_shared_with(
-            "model_version_pins:\n  \"claude/opus[1m]\": claude/claude-opus-4-6\n",
-        );
-        let pool: Vec<String> = shared
-            .effective_candidates()
-            .into_iter()
-            .map(|effective| effective.runtime.id.model)
-            .collect();
-        assert!(
-            pool.contains(&"claude-opus-4-6".to_string()),
-            "the pinned target must stand in for the alias: {pool:?}"
-        );
-        assert!(
-            !pool.contains(&"opus[1m]".to_string()),
-            "the alias must not remain selectable alongside its pin: {pool:?}"
-        );
-        // The substituted slot carries its OWN wire id into the pool, so any
-        // alternate the proxy picks from it lands on the pinned version. (The
-        // pool is what `select_request_model` ranks over; a per-request
-        // escalation cannot cross the pin's cost ceiling, so pool composition
-        // — not a demotion walk — is where this is observable.)
-        assert_eq!(
-            configured_api_model(&shared, &CandidateId::new("claude", "claude-opus-4-6")),
-            "claude-opus-4-6"
-        );
-        // A session pinned through the map serves the pinned version on the
-        // wire even though the adapter was configured via `opus[1m]`.
-        let decision = select_request_model(
-            &shared,
-            &claude_active("claude-opus-4-6"),
-            &aliased_request("claude-opus-5"),
-        );
-        assert_eq!(decision.model, "claude-opus-4-6");
-    }
-
-    #[test]
     fn cache_reprime_break_even_matches_configured_rates() {
         let (_d, shared) = policy_shared_priced(0);
         // (target_write 3.75 − pinned_read 1.00) / (pinned_read 1.00 − target_read 0.30)
@@ -3737,6 +3750,7 @@ agents:
         assert_eq!(
             cache_reprime_break_even(
                 &shared,
+                None,
                 &CandidateId::new("mock", "opus"),
                 &CandidateId::new("mock", "haiku"),
             ),
@@ -3747,6 +3761,7 @@ agents:
         assert_eq!(
             cache_reprime_break_even(
                 &plain,
+                None,
                 &CandidateId::new("mock", "opus"),
                 &CandidateId::new("mock", "haiku"),
             ),
@@ -4218,20 +4233,18 @@ agents:
       upstream_base_url: http://{upstream_addr}/v1
     models:
       - {{ id: "opus[1m]", cost_rank: 4, api_model: claude-opus-5,
-           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
-      - {{ id: claude-opus-4-6, cost_rank: 4, api_model: claude-opus-4-6,
-           downstream_id: "opus[1m]", auto_eligible: false,
-           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
+           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }},
+           versions: [ {{ api_model: claude-opus-4-6,
+                          pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }} ] }}
+pinned_versions:
+  "claude/opus[1m]": claude-opus-4-6
 "#,
             dir.path().join("state.db").display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg.clone()).unwrap();
-        shared.set_models_routeable(
-            &ProcessKey("claude".to_string()),
-            vec!["opus[1m]".into(), "claude-opus-4-6".into()],
-        );
-        let pinned = CandidateId::new("claude", "claude-opus-4-6");
+        shared.set_models_routeable(&ProcessKey("claude".to_string()), vec!["opus[1m]".into()]);
+        let pinned = CandidateId::new("claude", "opus[1m]");
         shared.state.lock().unwrap().upsert(
             "r1".to_string(),
             PersistedSession {
@@ -4387,20 +4400,18 @@ agents:
       upstream_base_url: http://{upstream_addr}/v1
     models:
       - {{ id: "opus[1m]", cost_rank: 4, api_model: claude-opus-5,
-           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
-      - {{ id: claude-opus-4-6, cost_rank: 4, api_model: claude-opus-4-6,
-           downstream_id: "opus[1m]", auto_eligible: false,
-           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }}
+           pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }},
+           versions: [ {{ api_model: claude-opus-4-6,
+                          pricing: {{ input_per_mtok: 5, output_per_mtok: 25 }} }} ] }}
+pinned_versions:
+  "claude/opus[1m]": claude-opus-4-6
 "#,
             dir.path().join("state.db").display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg.clone()).unwrap();
-        shared.set_models_routeable(
-            &ProcessKey("claude".to_string()),
-            vec!["opus[1m]".into(), "claude-opus-4-6".into()],
-        );
-        let pinned = CandidateId::new("claude", "claude-opus-4-6");
+        shared.set_models_routeable(&ProcessKey("claude".to_string()), vec!["opus[1m]".into()]);
+        let pinned = CandidateId::new("claude", "opus[1m]");
         shared.state.lock().unwrap().upsert(
             "r1".to_string(),
             PersistedSession {
@@ -4574,11 +4585,14 @@ agents:
       base_url_env: ANTHROPIC_BASE_URL
       upstream_base_url: http://{upstream_addr}/v1
     models:
+      - {{ id: sonnet, cost_rank: 2, api_model: claude-sonnet-5,
+           pricing: {{ input_per_mtok: 2, output_per_mtok: 10 }} }}
       - {{ id: "claude-fable-5[1m]", cost_rank: 5, api_model: claude-fable-5,
-           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
-      - {{ id: claude-fable-5-1, cost_rank: 5, api_model: claude-fable-5-1,
-           downstream_id: "claude-fable-5[1m]", auto_eligible: false,
-           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
+           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }},
+           versions: [ {{ api_model: claude-fable-5-1,
+                          pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }} ] }}
+pinned_versions:
+  "claude/claude-fable-5[1m]": claude-fable-5-1
 "#,
             dir.path().join("state.db").display()
         );
@@ -4586,9 +4600,9 @@ agents:
         let shared = Shared::new(cfg.clone()).unwrap();
         shared.set_models_routeable(
             &ProcessKey("claude".to_string()),
-            vec!["claude-fable-5[1m]".into(), "claude-fable-5-1".into()],
+            vec!["sonnet".into(), "claude-fable-5[1m]".into()],
         );
-        let pinned = CandidateId::new("claude", "claude-fable-5-1");
+        let pinned = CandidateId::new("claude", "claude-fable-5[1m]");
         shared.state.lock().unwrap().upsert(
             "r1".to_string(),
             PersistedSession {
@@ -4773,11 +4787,14 @@ agents:
       base_url_env: ANTHROPIC_BASE_URL
       upstream_base_url: http://{upstream_addr}/v1
     models:
+      - {{ id: sonnet, cost_rank: 2, api_model: claude-sonnet-5,
+           pricing: {{ input_per_mtok: 2, output_per_mtok: 10 }} }}
       - {{ id: "claude-fable-5[1m]", cost_rank: 5, api_model: claude-fable-5,
-           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
-      - {{ id: claude-fable-5-1, cost_rank: 5, api_model: claude-fable-5-1,
-           downstream_id: "claude-fable-5[1m]", auto_eligible: false,
-           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }}
+           pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }},
+           versions: [ {{ api_model: claude-fable-5-1,
+                          pricing: {{ input_per_mtok: 10, output_per_mtok: 50 }} }} ] }}
+pinned_versions:
+  "claude/claude-fable-5[1m]": claude-fable-5-1
 "#,
             dir.path().join("state.db").display()
         );
@@ -4785,7 +4802,7 @@ agents:
         let shared = Shared::new(cfg).unwrap();
         shared.set_models_routeable(
             &ProcessKey("claude".to_string()),
-            vec!["claude-fable-5[1m]".into(), "claude-fable-5-1".into()],
+            vec!["sonnet".into(), "claude-fable-5[1m]".into()],
         );
         shared.state.lock().unwrap().upsert(
             "r1".to_string(),
@@ -4814,7 +4831,7 @@ agents:
             "r1".to_string(),
             "r1".to_string(),
             "d1".to_string(),
-            CandidateId::new("claude", "claude-fable-5-1"),
+            CandidateId::new("claude", "claude-fable-5[1m]"),
             TaskClass::CodingGeneral,
             None,
         );

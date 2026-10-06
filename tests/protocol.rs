@@ -7627,11 +7627,11 @@ async fn preclass_unparseable_reply_falls_back_to_static_classifier() {
 }
 
 // ======================================================================
-// Model version pinning: `auto_eligible: false` + `model_version_pins`
+// Explicit-only candidates and `pinned_versions`
 // ======================================================================
 
 /// Like `agent_yaml`, but the model entries are written out verbatim (so they
-/// can carry `auto_eligible` / `downstream_id`) and the mock's model selector
+/// can carry `auto_eligible` / `versions`) and the mock's model selector
 /// advertises exactly `advertised` — which is how a real adapter behaves: it
 /// offers a fixed alias set and refuses any other value.
 fn agent_yaml_models(
@@ -7750,476 +7750,58 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
 }
 
 #[tokio::test]
-async fn model_version_pins_substitute_the_target_and_disclose_it() {
-    let state = temp_state_file("version-pins");
-    let scores = legacy_scores("version-pins");
+async fn pinned_version_keeps_the_candidate_and_discloses_the_version() {
+    let state = temp_state_file("pinned-versions");
+    let scores = legacy_scores("pinned-versions");
     let yaml = format!(
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         model_version_pins:\n  \"a/m1\": \"a/legacy\"\nagents:\n{}",
-        state.display(),
-        scores.display(),
-        agent_yaml_models(
-            "a",
-            &["m1", "legacy"],
-            &[],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-
-        // 1. The auto winner is the pin KEY, so the session lands on the target.
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "implement the feature").await?;
-        let routed = agent_text(&observed, &sid);
-        assert!(
-            routed.contains("auto → a/legacy"),
-            "the disclosure must name the substituted candidate — {routed}"
-        );
-        assert!(
-            routed.contains("version pin: a/m1 → a/legacy"),
-            "the substitution must be disclosed — {routed}"
-        );
-        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
-
-        // 2. An explicit directive naming the KEY is substituted too.
-        let sid2 = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(
-            &cx,
-            &sid2,
-            "[router: candidate=a/m1]\nimplement the feature",
-        )
-        .await?;
-        let routed2 = agent_text(&observed, &sid2);
-        assert!(
-            routed2.contains("static → a/legacy"),
-            "an explicit key pin must resolve to the target — {routed2}"
-        );
-        assert!(
-            routed2.contains("version pin: a/m1 → a/legacy"),
-            "the substitution must be disclosed — {routed2}"
-        );
-        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "legacy");
-
-        // 3. Naming the TARGET directly is unchanged — no second hop, no note.
-        let sid3 = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(
-            &cx,
-            &sid3,
-            "[router: candidate=a/legacy]\nimplement the feature",
-        )
-        .await?;
-        let routed3 = agent_text(&observed, &sid3);
-        assert!(
-            routed3.contains("static → a/legacy"),
-            "naming the target keeps working — {routed3}"
-        );
-        assert!(
-            !routed3.contains("version pin:"),
-            "no substitution happened, so nothing to disclose — {routed3}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn downstream_id_selects_a_legacy_version_behind_a_known_good_alias() {
-    let state = temp_state_file("downstream-id");
-    let scores = legacy_scores("downstream-id");
-    let log = temp_log("downstream-id");
-    // The selector advertises only `m1` — exactly the real constraint that
-    // makes `downstream_id` necessary for a bare-API-id legacy candidate.
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+         pinned_versions:\n  \"a/m1\": m1-old\nagents:\n{}",
         state.display(),
         scores.display(),
         agent_yaml_models(
             "a",
             &["m1"],
             &[],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false, downstream_id: m1 }\n",
-        )
-        .replace(
-            "    model_selection:",
-            &format!(
-                "        - {{ name: MOCK_LOG, value: \"{}\" }}\n    model_selection:",
-                log.display()
-            ),
+            "      - { id: m1, cost_rank: 1, versions: [ { api_model: m1-old } ] }\n",
         ),
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(
-            &cx,
-            &sid,
-            "[router: candidate=a/legacy]\nimplement the feature",
-        )
-        .await?;
+        let session = new_session(&cx).await?;
+        let options = serde_json::to_value(&session.config_options)
+            .unwrap()
+            .to_string();
+        assert!(
+            options.contains(r#""api_model":"m1""#) && options.contains(r#""versions":["m1-old"]"#),
+            "the picker is told which versions it can select — {options}"
+        );
+        let sid = session.session_id.0.to_string();
+        prompt_text(&cx, &sid, "implement the feature").await?;
         let routed = agent_text(&observed, &sid);
         assert!(
-            routed.contains("static → a/legacy"),
-            "a candidate whose id the selector does not advertise stays routeable \
-             through downstream_id — {routed}"
+            routed.contains("auto → a/m1"),
+            "routing never sees the pin — {routed}"
         );
-        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
-        let sets: Vec<String> = read_log(&log)
-            .into_iter()
-            .filter(|e| e["event"] == "set_config_option")
-            .map(|e| e["value"].as_str().unwrap_or_default().to_string())
-            .collect();
         assert!(
-            sets.iter().any(|v| v == "m1") && !sets.iter().any(|v| v == "legacy"),
-            "the selector must receive the alias, never the candidate id — {sets:?}"
+            routed.contains("pinned version m1-old"),
+            "the disclosure names the version that serves — {routed}"
         );
-        Ok(())
-    })
-    .await;
-}
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "m1");
 
-/// A version pin must substitute on the AUTOMATIC resolution paths too, not
-/// only the session pin — a delegate, an evaluator, or a failover target that
-/// resolved the moving alias would run a version nobody asked for.
-#[tokio::test]
-async fn version_pin_substitutes_the_delegation_target() {
-    let state = temp_state_file("pin-delegate");
-    let log = temp_log("pin-delegate");
-    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
-    let cheap = agent_yaml_models(
-        "cheap",
-        &["haiku", "haiku-legacy"],
-        &[
-            ("MOCK_LOG", &log.display().to_string()),
-            ("MOCK_SESSION_MODES", "default,bypassPermissions"),
-        ],
-        "      - { id: haiku, cost_rank: 1 }\n\
-         \x20     - { id: haiku-legacy, cost_rank: 1, auto_eligible: false }\n",
-    )
-    .replace(
-        "    models:\n",
-        "    mode_map: { auto: bypassPermissions }\n    models:\n",
-    );
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 3 }}\n\
-         model_version_pins:\n  \"cheap/haiku\": \"cheap/haiku-legacy\"\n\
-         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
-        state.display(),
-        cheap,
-        agent_yaml("fancy", &[("opus", 3)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "big work\nDELEGATE:tweak the css").await?;
-        let text = agent_text(&observed, &sid);
+        // A live pin changes version on the next message, without a switch.
+        prompt_text(&cx, &sid, "[router: version=default]\nkeep going").await?;
+        let routed = agent_text(&observed, &sid);
         assert!(
-            text.contains("router-acp · delegate_task → cheap/haiku-legacy"),
-            "the delegate must run the pinned version: {text}"
+            routed.contains("version: a/m1 runs m1"),
+            "the version change is disclosed — {routed}"
         );
+        prompt_text(&cx, &sid, "[router: version=m9]\nkeep going").await?;
+        let routed = agent_text(&observed, &sid);
         assert!(
-            !text.contains("delegate_task → cheap/haiku "),
-            "the alias must not be what the delegate opened: {text}"
+            routed.contains("m9 is not a version of a/m1; it runs m1-old"),
+            "an undeclared version is named, not hidden — {routed}"
         );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn version_pin_substitutes_the_preclass_evaluator() {
-    let state = temp_state_file("pin-evaluator");
-    let eval_log = temp_log("pin-evaluator-eval");
-    let scores = std::env::temp_dir().join(format!(
-        "router-acp-pin-evaluator-scores-{}.yaml",
-        uuid::Uuid::new_v4().simple()
-    ));
-    // `main` outscores the evaluator agent so the PRIMARY pin lands there and
-    // the eval agent's request log records only evaluator traffic.
-    std::fs::write(
-        &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'main/*', default_quality: 3.0 }\n\
-         \x20 - { pattern: 'eval/*', default_quality: 1.0 }\n",
-    )
-    .unwrap();
-    let preclass =
-        r#"{"routing":{"task_class":"Ops","complexity":0.2,"confidence":0.9,"reason":"ops work"}}"#;
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         model_version_pins:\n  \"eval/m1\": \"eval/m1-legacy\"\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"eval/*\"]\n\
-         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
-        state.display(),
-        scores.display(),
-        agent_yaml_models(
-            "eval",
-            &["m1", "m1-legacy"],
-            &[
-                ("MOCK_PRECLASS_JSON", preclass),
-                ("MOCK_LOG", &eval_log.display().to_string()),
-                ("MOCK_SESSION_MODES", "preclass"),
-            ],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: m1-legacy, cost_rank: 1, auto_eligible: false }\n",
-        )
-        .replace(
-            "    model_selection:",
-            "    mode_map: { preclass: preclass }\n    model_selection:",
-        ),
-        agent_yaml("main", &[("m2", 2)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "check the error rate on the ops dashboard").await?;
-        assert!(
-            agent_text(&observed, &sid).contains("→ main/m2"),
-            "primary pin stays on main so the eval log isolates the evaluator"
-        );
-        let selected: Vec<String> = read_log(&eval_log)
-            .into_iter()
-            .filter(|e| e["event"] == "set_config_option")
-            .map(|e| e["value"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert!(
-            selected.iter().any(|v| v == "m1-legacy"),
-            "the evaluator must run the pinned version: {selected:?}"
-        );
-        assert!(
-            !selected.iter().any(|v| v == "m1"),
-            "the evaluator must never resolve the pin key itself: {selected:?}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-/// Failover has to exclude the SERVED identity. Substituting after the pool is
-/// filtered leaves the pin key in it, and the key maps straight back to the
-/// candidate that just failed — a retry loop that burns every attempt instead
-/// of moving to a healthy candidate.
-#[tokio::test]
-async fn failover_off_a_pinned_target_does_not_route_back_through_its_key() {
-    let state = temp_state_file("pin-failover");
-    let scores = std::env::temp_dir().join(format!(
-        "router-acp-pin-failover-scores-{}.yaml",
-        uuid::Uuid::new_v4().simple()
-    ));
-    // `a` outscores `b`, so auto picks the pinned `a` slot first and only a
-    // correct exclusion can move the turn to `b`. The failure is a CONTEXT
-    // OVERFLOW on purpose: it deliberately cordons nothing and quarantines
-    // nothing, so the failed agent stays fully eligible and the `exclude`
-    // argument is the only thing keeping the turn off it — which is exactly
-    // the condition under which a stale pin key routes straight back.
-    std::fs::write(
-        &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'a/*', default_quality: 3.0 }\n\
-         \x20 - { pattern: 'b/*', default_quality: 1.0 }\n",
-    )
-    .unwrap();
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         model_version_pins:\n  \"a/m1\": \"a/legacy\"\n\
-         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
-        state.display(),
-        scores.display(),
-        agent_yaml_models(
-            "a",
-            &["m1", "legacy"],
-            &[("MOCK_FAIL_PROMPT_MSG", "prompt is too long")],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
-        ),
-        agent_yaml("b", &[("m2", 2)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "implement the feature").await?;
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("→ a/legacy"),
-            "the first pin resolves the pinned version: {text}"
-        );
-        // The retry loop this guards: with the key still in the filtered pool,
-        // the first failover re-picks it and it maps straight back to the
-        // candidate that just failed, burning attempts before moving on.
-        assert!(
-            !text.contains("failover: auto → a/legacy"),
-            "failover re-pinned the candidate that just failed: {text}"
-        );
-        assert!(
-            text.contains("failover: auto → b/m2"),
-            "the first failover must reach a genuinely different candidate: {text}"
-        );
-        assert_eq!(
-            open_state(&state).get(&sid).unwrap().model,
-            "m2",
-            "the session must end on the healthy candidate"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-// ======================================================================
-// Stated-reference seams: a configured/typed candidate id names the family
-// DEFAULT, while `effective_candidates` substitutes before filtering, so the
-// pool holds target ids only. Every seam that compares a stated reference
-// against the pool has to resolve it first.
-// ======================================================================
-
-#[tokio::test]
-async fn static_route_configured_with_a_pinned_key_routes_to_the_target() {
-    let state = temp_state_file("pin-static");
-    let scores = legacy_scores("pin-static");
-    // `routers.static.candidate` names the stable default id, which is exactly
-    // what a config author writes; the pin points it at `a/legacy`.
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         router: static\nrouters:\n  static: {{ candidate: a/m1 }}\n\
-         model_version_pins:\n  \"a/m1\": \"a/legacy\"\nagents:\n{}{}",
-        state.display(),
-        scores.display(),
-        agent_yaml_models(
-            "a",
-            &["m1", "legacy"],
-            &[],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
-        ),
-        agent_yaml("b", &[("m2", 2)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "implement the feature").await?;
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("static → a/legacy"),
-            "the configured static route must resolve its pin, not report \
-             not-routeable or fall through: {text}"
-        );
-        assert!(
-            !text.contains("→ b/m2"),
-            "must not fall through to an unrelated candidate: {text}"
-        );
-        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn fully_qualified_shorthand_naming_a_pinned_key_pins_the_target() {
-    let state = temp_state_file("pin-shorthand");
-    let scores = legacy_scores("pin-shorthand");
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         model_version_pins:\n  \"a/m1\": \"a/legacy\"\n\
-         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
-        state.display(),
-        scores.display(),
-        agent_yaml_models(
-            "a",
-            &["m1", "legacy"],
-            &[],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
-        ),
-        // `b` outscores nothing here; it exists so an unrecognized shorthand
-        // would visibly route elsewhere instead of coincidentally landing right.
-        agent_yaml("b", &[("m2", 2)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // A fully-qualified `agent/model:` shorthand naming the stable default.
-        // Unresolved, `candidate_view` misses and this reads as plain prose.
-        prompt_text(&cx, &sid, "a/m1: implement the feature").await?;
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("static → a/legacy"),
-            "a fully-qualified pinned-key shorthand must still be recognized \
-             and must pin the target: {text}"
-        );
-        assert_eq!(open_state(&state).get(&sid).unwrap().model, "legacy");
-        // The prefix is consumed, not left in the prompt.
-        assert!(!text.contains("a/m1:"), "shorthand prefix stripped: {text}");
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn delegation_hint_naming_a_pinned_key_opens_the_target() {
-    let state = temp_state_file("pin-hint");
-    let log = temp_log("pin-hint");
-    let scores = std::env::temp_dir().join(format!(
-        "router-acp-pin-hint-scores-{}.yaml",
-        uuid::Uuid::new_v4().simple()
-    ));
-    // `other` outscores the pinned target at the same cost, so a DROPPED hint
-    // visibly lands somewhere else. Without it the delegate would reach
-    // `haiku-legacy` on ranking alone and the test would pass vacuously.
-    std::fs::write(
-        &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'cheap/other', default_quality: 2.0 }\n\
-         \x20 - { pattern: 'cheap/*', default_quality: 1.0 }\n\
-         \x20 - { pattern: 'fancy/*', default_quality: 3.0 }\n",
-    )
-    .unwrap();
-    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
-    let cheap = agent_yaml_models(
-        "cheap",
-        &["haiku", "haiku-legacy", "other"],
-        &[
-            ("MOCK_LOG", &log.display().to_string()),
-            ("MOCK_SESSION_MODES", "default,bypassPermissions"),
-        ],
-        "      - { id: haiku, cost_rank: 1 }\n\
-         \x20     - { id: haiku-legacy, cost_rank: 1, auto_eligible: false }\n\
-         \x20     - { id: other, cost_rank: 1 }\n",
-    )
-    .replace(
-        "    models:\n",
-        "    mode_map: { auto: bypassPermissions }\n    models:\n",
-    );
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\n\
-         delegation: {{ enabled: true, max_concurrent: 3 }}\n\
-         model_version_pins:\n  \"cheap/haiku\": \"cheap/haiku-legacy\"\n\
-         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
-        state.display(),
-        scores.display(),
-        cheap,
-        agent_yaml("fancy", &[("opus", 3)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // The parent names the candidate by the stable id it knows. Compared
-        // unsubstituted, the hint matches nothing in the pool and is dropped.
-        prompt_text(
-            &cx,
-            &sid,
-            "big work\nDELEGATE_HINT:cheap/haiku\nDELEGATE:tweak the css",
-        )
-        .await?;
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("router-acp · delegate_task → cheap/haiku-legacy"),
-            "a hint naming the pinned key must open the target: {text}"
-        );
-        assert!(
-            !text.contains("delegate_task → cheap/other"),
-            "an unresolved hint is dropped and ranks `other` instead: {text}"
-        );
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "m1");
         Ok(())
     })
     .await;

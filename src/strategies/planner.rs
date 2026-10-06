@@ -32,13 +32,10 @@ impl PlannerStrategy {
     }
 }
 
-/// Check whether a candidate matches any pattern in `patterns`, considering
-/// both the served id and the version-pin alias.
+/// Check whether a candidate matches any pattern in `patterns`.
 fn matches_any(view: &CandidateView, patterns: &[String]) -> bool {
-    view.ids().any(|id| {
-        let key = id.to_string();
-        patterns.iter().any(|p| glob_match(p, &key))
-    })
+    let key = view.id.to_string();
+    patterns.iter().any(|p| glob_match(p, &key))
 }
 
 impl RouterStrategy for PlannerStrategy {
@@ -98,10 +95,7 @@ impl RouterStrategy for PlannerStrategy {
         // 2. Apply per-model phase boosts.
         for view in &mut pool {
             for boost in &cfg.model_boosts {
-                if view
-                    .ids()
-                    .any(|id| glob_match(&boost.pattern, &id.to_string()))
-                {
+                if glob_match(&boost.pattern, &view.id.to_string()) {
                     let additive = match phase {
                         PlannerPhase::Planning => boost.planning,
                         PlannerPhase::Implementation => boost.implementation,
@@ -271,7 +265,7 @@ pub fn planner_plan_protocol() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::candidate::{CandidateId, CodingTier, TaskClass};
+    use crate::candidate::{CodingTier, TaskClass};
     use crate::classifier::TaskProfile;
     use crate::config::PlannerModelBoost;
     use crate::strategies::test_util::view;
@@ -623,32 +617,6 @@ mod tests {
         assert!(
             !protocol.contains("with the current plan"),
             "must not revive the premature current-plan question: {protocol}"
-        );
-    }
-
-    #[test]
-    fn boost_on_pinned_from_alias() {
-        let cfg = PlannerRouterConfig {
-            model_boosts: vec![PlannerModelBoost {
-                pattern: "*opus[1m]*".into(),
-                implementation: 1.5,
-                planning: 0.0,
-            }],
-            ..planner_cfg()
-        };
-        let s = PlannerStrategy::new(cfg, auto_cfg(), 0.1);
-        let mut p = pool();
-        p[2].pinned_from = Some(CandidateId::new("claude", "opus[1m]"));
-        let ctx = ctx_with_phase(PlannerPhase::Implementation, 0.5);
-        let ranked = s.rank(&ctx, &p).unwrap();
-        let opus = ranked
-            .iter()
-            .find(|r| r.candidate.agent == "claude")
-            .unwrap();
-        assert!(
-            opus.reason.contains("boost"),
-            "should match via pinned_from: {}",
-            opus.reason
         );
     }
 }

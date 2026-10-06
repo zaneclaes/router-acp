@@ -43,22 +43,6 @@ pub struct CandidateView {
     pub on_overage: bool,
     /// Configured per-agent tie-break preference (`agents[].preference`).
     pub preference: f64,
-    /// The `model_version_pins` key this pool member stands in for, when `id`
-    /// is a substituted target. `id` is always the model that will serve; this
-    /// is only the alias it replaced — kept so config and user input that name
-    /// the moving alias keep matching, and so the routing disclosure can say
-    /// which spelling was asked for.
-    pub pinned_from: Option<CandidateId>,
-}
-
-impl CandidateView {
-    /// Every spelling this pool member answers to: the serving id first, then
-    /// the version-pin key it replaced. A glob or exclusion authored against
-    /// the moving alias (a skill route, a planner glob, `[router: exclude=…]`)
-    /// must keep designating the slot after a pin substitutes underneath it.
-    pub fn ids(&self) -> impl Iterator<Item = &CandidateId> {
-        std::iter::once(&self.id).chain(self.pinned_from.iter())
-    }
 }
 
 /// Free-plan residual small enough to treat as exhausted (matches
@@ -207,17 +191,7 @@ pub trait RouterStrategy: Send + Sync {
 /// Instantiate the named strategy from config.
 pub fn make_strategy(kind: StrategyKind, cfg: &Config) -> Box<dyn RouterStrategy> {
     match kind {
-        StrategyKind::Static => {
-            // `routers.static.candidate` is a CONFIG-STATED reference, so it
-            // needs the version-pin map applied like any other: the pool holds
-            // served ids, and a raw pin key would report the configured route
-            // as not-routeable (or fall through to an unrelated candidate).
-            let mut scfg = cfg.routers.static_.clone();
-            if let Some(stated) = scfg.candidate.as_deref().and_then(CandidateId::parse) {
-                scfg.candidate = Some(cfg.resolve_stated_candidate(&stated).to_string());
-            }
-            Box::new(StaticStrategy::new(scfg))
-        }
+        StrategyKind::Static => Box::new(StaticStrategy::new(cfg.routers.static_.clone())),
         StrategyKind::Auto => Box::new(AutoStrategy::with_cost_aversion(
             cfg.routers.auto.clone(),
             cfg.availability_preference.cost_aversion,
@@ -307,7 +281,6 @@ pub(crate) mod test_util {
             plan_headroom: None,
             on_overage: false,
             preference: 0.0,
-            pinned_from: None,
         }
     }
 

@@ -161,8 +161,8 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     "  (explicit selection only)"
                 };
-                let pinned = match cfg.version_pin_target(&id) {
-                    Some(target) => format!("  → pinned to {target}"),
+                let pinned = match cfg.pinned_version(&id) {
+                    Some(version) => format!("  → pinned version {}", version.api_model),
                     None => String::new(),
                 };
                 println!("  candidate: {id}{manual}{pinned}");

@@ -245,25 +245,18 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
                 Some(option) => {
                     let values = select_values(&option);
                     let mut routeable = Vec::new();
-                    // The selector answers for `downstream_id` (which is `id`
-                    // unless the entry pins a legacy version behind a
-                    // known-good alias), while the candidate stays keyed on
-                    // `id` everywhere else. Claude has dropped `[1m]` from
-                    // natively-1M families (`opus[1m]` → `opus`); accept either
-                    // spelling so a server-side picker rename cannot empty
-                    // the pool.
+                    // Claude has dropped `[1m]` from natively-1M families
+                    // (`opus[1m]` → `opus`); accept either spelling so a
+                    // server-side picker rename cannot empty the pool.
                     for model in &spec.models {
-                        let wanted = model.downstream_id();
-                        if offered_selector_value(&values, wanted).is_some()
-                            || offered_selector_value(&values, &model.id).is_some()
-                        {
+                        let wanted = model.id.as_str();
+                        if offered_selector_value(&values, wanted).is_some() {
                             routeable.push(model.id.clone());
                         } else {
                             if model.auto_eligible {
                                 tracing::error!(
                                     agent = spec.agent_name,
                                     model = model.id,
-                                    downstream_id = wanted,
                                     available = ?values,
                                     "auto-eligible model not offered by downstream model selector; \
                                      removing candidate from the pool"
@@ -272,7 +265,6 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
                                 tracing::warn!(
                                     agent = spec.agent_name,
                                     model = model.id,
-                                    downstream_id = wanted,
                                     available = ?values,
                                     "declared model not offered by downstream model selector; \
                                      removing candidate from the pool"
@@ -312,7 +304,7 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
     ProbeOutcome::Routeable
 }
 
-/// Selector spellings a catalog `id` / `downstream_id` may be offered as.
+/// Selector spellings a catalog `id` may be offered as.
 /// Claude dropped the `[1m]` suffix from natively-1M families (`opus[1m]` → `opus`).
 pub fn selector_aliases(id: &str) -> [String; 2] {
     let alt = match id.strip_suffix("[1m]") {
@@ -334,16 +326,9 @@ pub fn offered_selector_value<'a>(values: &'a [String], wanted: &str) -> Option<
 
 /// Value to send to a config-option model selector for this catalog entry.
 /// Prefers a spelling the selector actually listed; falls back to `wanted`
-/// so a miss still fails verification instead of inventing a third id.
-pub fn selector_value_to_send(values: &[String], wanted: &str, id: &str) -> String {
+/// so a miss still fails verification instead of inventing another id.
+pub fn selector_value_to_send(values: &[String], wanted: &str) -> String {
     offered_selector_value(values, wanted)
-        .or_else(|| {
-            if id != wanted {
-                offered_selector_value(values, id)
-            } else {
-                None
-            }
-        })
         .unwrap_or(wanted)
         .to_string()
 }
@@ -564,15 +549,9 @@ agents:
     #[test]
     fn selector_value_to_send_uses_the_offered_spelling() {
         let bare = vec!["opus".into(), "sonnet".into()];
-        assert_eq!(
-            selector_value_to_send(&bare, "opus[1m]", "opus[1m]"),
-            "opus"
-        );
-        assert_eq!(selector_value_to_send(&bare, "opus[1m]", "opus"), "opus");
+        assert_eq!(selector_value_to_send(&bare, "opus[1m]"), "opus");
+        assert_eq!(selector_value_to_send(&bare, "opus"), "opus");
         let missing = vec!["sonnet".into()];
-        assert_eq!(
-            selector_value_to_send(&missing, "opus[1m]", "opus[1m]"),
-            "opus[1m]"
-        );
+        assert_eq!(selector_value_to_send(&missing, "opus[1m]"), "opus[1m]");
     }
 }

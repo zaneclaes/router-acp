@@ -78,7 +78,6 @@ fn route(prompt: &str) -> Outcome {
                 plan_headroom: Some(1.0),
                 on_overage: false,
                 preference: *preference,
-                pinned_from: None,
             }
         })
         .collect();

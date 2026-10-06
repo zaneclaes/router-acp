@@ -349,6 +349,9 @@ impl Default for ResolvedScores {
 #[derive(Debug, Clone)]
 pub struct ScoreTable {
     entries: Vec<(String, ResolvedScores)>,
+    /// Candidate → `agent/<pinned api_model>`: a version-pinned candidate is
+    /// scored as the version it runs (capabilities, quality, context window).
+    pinned: HashMap<CandidateId, CandidateId>,
 }
 
 pub const BUILTIN_SCORE_TABLE: &str = include_str!("../data/scores.yaml");
@@ -430,7 +433,24 @@ impl ScoreTable {
                 },
             ));
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            pinned: HashMap::new(),
+        })
+    }
+
+    /// Score each `pinned_versions` candidate as its pinned version.
+    pub fn with_pinned_versions(mut self, cfg: &crate::config::Config) -> Self {
+        self.pinned = cfg
+            .declared_candidates()
+            .into_iter()
+            .filter_map(|id| {
+                let version = cfg.pinned_version(&id)?;
+                let key = CandidateId::new(&id.agent, &version.api_model);
+                Some((id, key))
+            })
+            .collect();
+        self
     }
 
     pub fn from_file(path: &Path) -> Result<Self, String> {
@@ -442,6 +462,11 @@ impl ScoreTable {
     /// Look up scores for a candidate; the first matching pattern wins,
     /// falling back to neutral defaults.
     pub fn lookup(&self, id: &CandidateId) -> ResolvedScores {
+        self.lookup_exact(self.pinned.get(id).unwrap_or(id))
+    }
+
+    /// `lookup` without the `pinned_versions` mapping: `id` is matched as is.
+    pub fn lookup_exact(&self, id: &CandidateId) -> ResolvedScores {
         let key = id.to_string();
         for (pattern, entry) in &self.entries {
             if glob_match(pattern, &key) {
@@ -714,7 +739,11 @@ mod score_resolution_tests {
             assert_eq!(resolved.context_window, Some(1_050_000), "{id} window");
             assert_eq!(resolved.max_output_tokens, Some(128_000), "{id} max out");
             let xhigh = resolved.resolve_effort(EffortLevel::Xhigh);
-            assert_eq!(xhigh.resolved, Some(EffortLevel::Xhigh), "{id} native xhigh");
+            assert_eq!(
+                xhigh.resolved,
+                Some(EffortLevel::Xhigh),
+                "{id} native xhigh"
+            );
             assert_eq!(xhigh.provider_value.as_deref(), Some("xhigh"));
         }
         assert_eq!(q("codex/gpt-6-luna"), q("codex/gpt-5.6-luna"));
