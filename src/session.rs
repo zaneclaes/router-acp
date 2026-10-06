@@ -103,6 +103,8 @@ pub struct TargetRuntime {
     /// Held only across a cold start + probe, so two sessions opening the
     /// same missing process start it once.
     pub start_gate: Arc<tokio::sync::Mutex<()>>,
+    pub stop: tokio_util::sync::CancellationToken,
+    pub stopped: Arc<tokio::sync::Notify>,
 }
 
 /// Where messages from a downstream session should be routed.
@@ -524,6 +526,12 @@ pub fn meta_marks_coordinator(meta: Option<&agent_client_protocol::schema::v1::M
 /// across await points.
 pub struct Shared {
     pub cfg: Config,
+    pub account_config: Mutex<Config>,
+    pub account_menus: Mutex<HashMap<String, crate::accounts::Menu>>,
+    pub account_login: Mutex<HashSet<String>>,
+    pub account_flows: Mutex<HashMap<String, crate::accounts::LoginFlow>>,
+    pub account_cancellations: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    pub account_write: tokio::sync::Mutex<()>,
     pub scores: ScoreTable,
     pub rules: ClassifierRules,
     pub state: Mutex<StateFile>,
@@ -621,12 +629,20 @@ impl Shared {
                     dead: None,
                     last_respawn: None,
                     start_gate: Arc::default(),
+                    stop: Default::default(),
+                    stopped: Arc::default(),
                 },
             );
         }
 
         let max_concurrent = cfg.delegation.max_concurrent;
         Ok(Arc::new(Self {
+            account_config: Mutex::new(cfg.clone()),
+            account_menus: Mutex::default(),
+            account_login: Mutex::default(),
+            account_flows: Mutex::default(),
+            account_cancellations: Mutex::default(),
+            account_write: Default::default(),
             cfg,
             scores,
             rules,
@@ -658,6 +674,14 @@ impl Shared {
 
     pub fn upstream(&self) -> Option<ConnectionTo<ClientPeer>> {
         self.upstream.get().cloned()
+    }
+
+    pub fn agent_configs(&self) -> Vec<crate::config::AgentConfig> {
+        self.account_config.lock().unwrap().agents.clone()
+    }
+
+    pub fn runtime_config(&self) -> Config {
+        self.account_config.lock().unwrap().clone()
     }
 
     pub fn upstream_client_capabilities(&self) -> ClientCapabilities {
@@ -928,7 +952,7 @@ impl Shared {
         let requested = self
             .with_session(router_sid, |s| s.version_request.clone())
             .flatten();
-        self.cfg
+        self.runtime_config()
             .resolve_version(candidate, requested.as_deref())
             .cloned()
     }
@@ -955,7 +979,11 @@ impl Shared {
     ) -> Option<crate::config::PricingConfig> {
         match self.version_for(router_sid, candidate) {
             Some(v) => v.pricing,
-            None => self.cfg.model_config(candidate)?.pricing.clone(),
+            None => self
+                .runtime_config()
+                .model_config(candidate)?
+                .pricing
+                .clone(),
         }
     }
 
@@ -979,7 +1007,7 @@ impl Shared {
     /// excluding them once — rather than at each of a dozen call sites — is
     /// what makes "never picked by accident" hold for mechanisms added later.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, None, false)
+        self.eligible_views_inner(required, class, None, false, &[])
     }
 
     /// `eligible_views` for resolving an EXPLICIT user pick: also keeps
@@ -993,7 +1021,7 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, None, true)
+        self.eligible_views_inner(required, class, None, true, &[])
     }
 
     /// `candidate_view` with the same dead-process allowance as
@@ -1004,7 +1032,7 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        self.eligible_views_inner(required, class, Some(id), true)
+        self.eligible_views_inner(required, class, Some(id), true, &[])
             .into_iter()
             .find(|v| &v.id == id)
     }
@@ -1019,7 +1047,7 @@ impl Shared {
         class: TaskClass,
         admit: Option<&CandidateId>,
     ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, admit, false)
+        self.eligible_views_inner(required, class, admit, false, &[])
     }
 
     /// The strategy view for ONE candidate, ignoring auto-eligibility — the
@@ -1031,9 +1059,19 @@ impl Shared {
         required: &RequiredCaps,
         class: TaskClass,
     ) -> Option<CandidateView> {
-        self.eligible_views_inner(required, class, Some(id), false)
+        self.eligible_views_inner(required, class, Some(id), false, &[])
             .into_iter()
             .find(|v| &v.id == id)
+    }
+
+    pub(crate) fn eligible_views_excluding(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+        admit: Option<&CandidateId>,
+        excluded: &[String],
+    ) -> Vec<CandidateView> {
+        self.eligible_views_inner(required, class, admit, false, excluded)
     }
 
     fn eligible_views_inner(
@@ -1042,12 +1080,24 @@ impl Shared {
         class: TaskClass,
         admit: Option<&CandidateId>,
         explicit_pick: bool,
+        excluded: &[String],
     ) -> Vec<CandidateView> {
         let candidates = self.routeable_candidates_inner(explicit_pick);
+        let cfg = self.runtime_config();
+        let logging_in = self.account_login.lock().unwrap().clone();
         let mut headroom = self.headroom.lock().unwrap();
         let targets = self.targets.lock().unwrap();
         let mut views = Vec::new();
         for c in candidates {
+            if is_excluded(&c.id, excluded)
+                || logging_in.contains(&c.id.agent)
+                || cfg
+                    .agents
+                    .iter()
+                    .any(|a| a.name == c.id.agent && a.account_disabled)
+            {
+                continue;
+            }
             // An explicit-only candidate stays out of the pool unless it IS
             // the explicitly named candidate.
             if !c.auto_eligible && admit != Some(&c.id) {
@@ -1094,9 +1144,14 @@ impl Shared {
             if headroom.seat_exhausted(&c.id) {
                 continue;
             }
-            let scores = self.scores.lookup(&c.id);
-            let static_preference = self
-                .cfg
+            let scores = cfg
+                .resolve_version(&c.id, None)
+                .map(|version| {
+                    self.scores
+                        .lookup_exact(&CandidateId::new(&c.id.agent, &version.api_model))
+                })
+                .unwrap_or_else(|| self.scores.lookup(&c.id));
+            let static_preference = cfg
                 .agents
                 .iter()
                 .find(|a| a.name == c.id.agent)
@@ -1124,13 +1179,10 @@ impl Shared {
                 }
                 _ => static_preference,
             };
-            let on_overage = availability
-                .as_ref()
-                .is_some_and(|a| self.cfg.availability_preference.enabled && a.on_overage);
+            let on_overage = availability.as_ref().is_some_and(|a| a.on_overage);
             let local_headroom = headroom.headroom(&c.id.agent);
             let plan_headroom = availability
                 .as_ref()
-                .filter(|_| self.cfg.availability_preference.enabled)
                 .map(|a| a.plan_headroom.clamp(0.0, 1.0));
             let effective_headroom = seat_budget
                 .filter(|_| self.cfg.availability_preference.enabled)
@@ -1147,6 +1199,13 @@ impl Shared {
                 on_overage,
                 id: c.id,
             });
+        }
+        crate::accounts::prioritize(&mut views, &cfg.agents, admit);
+        if !self.cfg.availability_preference.enabled {
+            for view in &mut views {
+                view.plan_headroom = None;
+                view.on_overage = false;
+            }
         }
         // Unmetered seats (no plan signal) must not look "more free" than a
         // metered seat that still has included plan — see cap_unmetered_headroom.
@@ -1208,7 +1267,7 @@ impl Shared {
             .active_usage_cordons()
             .into_iter()
             .collect();
-        for agent in &self.cfg.agents {
+        for agent in self.agent_configs().iter().filter(|a| !a.account_disabled) {
             let options: Vec<SessionConfigSelectOption> = self
                 .candidates
                 .lock()
@@ -1227,7 +1286,7 @@ impl Shared {
                 .map(|c| {
                     let opt =
                         SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
-                    let scores = self.scores.lookup(&c.id);
+                    let scores = self.scores_for(router_sid, &c.id);
                     let supported: Vec<_> = scores
                         .effort_levels
                         .iter()
@@ -1246,10 +1305,11 @@ impl Shared {
                         router_meta["auto_eligible"] = json!(false);
                     }
                     // Versions a `[router: version=…]` directive can select.
-                    if let Some(model) = self.cfg.model_config(&c.id)
+                    if let Some(model) = self.runtime_config().model_config(&c.id)
                         && !model.versions.is_empty()
                     {
-                        router_meta["api_model"] = json!(self.cfg.wire_api_model_unpinned(&c.id));
+                        router_meta["api_model"] =
+                            json!(self.runtime_config().wire_api_model_unpinned(&c.id));
                         router_meta["versions"] = json!(
                             model
                                 .versions
@@ -2048,6 +2108,7 @@ pub fn handle_downstream_dispatch(
     match route {
         DownstreamRoute::Primary { router_sid } => match message {
             Dispatch::Notification(msg) => {
+                let msg = crate::accounts::merge_commands(msg)?;
                 // Claude's narration of its user-facing prose arrives as
                 // thinking; relay it as the message it is (see
                 // `relay::narration_as_message`), before anything below reads
@@ -2440,8 +2501,7 @@ pub(crate) fn resolve_mode_id(
     available: &[String],
 ) -> Option<String> {
     let mapped = shared
-        .cfg
-        .agents
+        .agent_configs()
         .iter()
         .find(|a| a.name == agent_name)
         .and_then(|a| a.mode_map.get(requested))
@@ -3225,15 +3285,16 @@ pub(crate) async fn ensure_target_ready(
 /// failing the turn — a fresh session on an equal window usually fits anyway,
 /// since it no longer carries the transcript that overflowed.
 fn prefer_larger_context(
-    scores: &ScoreTable,
+    shared: &Shared,
+    router_sid: &str,
     pool: Vec<CandidateView>,
     min: u64,
 ) -> Vec<CandidateView> {
     let roomier: Vec<CandidateView> = pool
         .iter()
         .filter(|v| {
-            scores
-                .lookup(&v.id)
+            shared
+                .scores_for(router_sid, &v.id)
                 .context_window
                 .is_some_and(|window| window > min)
         })
@@ -3363,7 +3424,7 @@ async fn pin_session(
     let planner_difficulty = shared
         .with_session(router_sid, |s| s.planner_difficulty)
         .flatten();
-    let ctx = RouteContext {
+    let mut ctx = RouteContext {
         profile: profile.clone(),
         required_caps: required,
         explicit_candidate: override_.clone(),
@@ -3380,20 +3441,21 @@ async fn pin_session(
     let excluded_patterns = shared
         .with_session(router_sid, |s| s.excluded.clone())
         .unwrap_or_default();
-    let mut pool = shared.eligible_views_admitting(&required, profile.class, override_.as_ref());
-    if let Some(exclude) = exclude {
-        pool.retain(|v| &v.id != exclude);
-    }
-    if !excluded_patterns.is_empty() {
-        pool.retain(|v| !view_excluded(v, &excluded_patterns));
-    }
+    let mut selection_exclusions = excluded_patterns.clone();
+    selection_exclusions.extend(exclude.map(ToString::to_string));
+    let mut pool = shared.eligible_views_excluding(
+        &required,
+        profile.class,
+        picked.as_ref(),
+        &selection_exclusions,
+    );
     pool.retain(|v| coordinator_admits(v));
     if let Some(min) = larger_context_than {
-        pool = prefer_larger_context(&shared.scores, pool, min);
+        pool = prefer_larger_context(shared, router_sid, pool, min);
     }
     if let Some(effort) = auto_effort {
         pool.retain(|view| {
-            let scores = shared.scores.lookup(&view.id);
+            let scores = shared.scores_for(router_sid, &view.id);
             scores.effort_levels.contains(&effort) && scores.effort_mapping.contains_key(&effort)
         });
     }
@@ -3472,6 +3534,41 @@ async fn pin_session(
             }
         });
     }
+
+    // A skill/planner's automatic override obeys the account order too.
+    let override_ = override_.map(|candidate| {
+        if user_pick || pool.iter().any(|v| v.id == candidate) {
+            return candidate;
+        }
+        let agents = shared.agent_configs();
+        let group = agents
+            .iter()
+            .find(|a| a.name == candidate.agent)
+            .and_then(crate::accounts::provider);
+        let ordered = pool.iter().find(|v| {
+            v.id.model == candidate.model
+                && group.is_some()
+                && agents
+                    .iter()
+                    .find(|a| a.name == v.id.agent)
+                    .and_then(crate::accounts::provider)
+                    == group
+        });
+        if let Some(ordered) = ordered {
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · account priority: {candidate} → {}",
+                    ordered.id
+                ),
+            );
+            ordered.id.clone()
+        } else {
+            candidate
+        }
+    });
+    ctx.explicit_candidate = override_.clone();
 
     // 3. Run the strategy for a full ranked fallback chain. An explicit
     //    `router.candidate` makes routing static for this session.
@@ -4567,7 +4664,7 @@ async fn send_prompt_with_failover(
                     .with_session(&router_sid, |s| s.saw_adapter_cost)
                     .unwrap_or(false);
                 if !saw_cost
-                    && let Some(delta) = synth_turn_cost(&shared.cfg, &candidate, &tu)
+                    && let Some(delta) = synth_turn_cost(&shared.runtime_config(), &candidate, &tu)
                     && delta > 0.0
                 {
                     shared
@@ -4789,10 +4886,9 @@ pub(crate) fn first_eligible_candidate(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let views = shared.eligible_views(&RequiredCaps::default(), class);
+    let views = shared.eligible_views_excluding(&RequiredCaps::default(), class, None, excluded);
     views
         .iter()
-        .filter(|v| !view_excluded(v, excluded))
         .filter_map(|v| {
             patterns
                 .iter()
@@ -4824,11 +4920,10 @@ fn first_matching_pattern_candidate(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let views = shared.eligible_views(&RequiredCaps::default(), class);
+    let views = shared.eligible_views_excluding(&RequiredCaps::default(), class, None, excluded);
     patterns.iter().find_map(|pat| {
         views
             .iter()
-            .filter(|v| !view_excluded(v, excluded))
             .filter(|v| view_matches(pat, v))
             .max_by(|a, b| {
                 (a.quality + a.preference)
@@ -5108,13 +5203,14 @@ fn resolve_reviewers(
     class: TaskClass,
     excluded: &[String],
 ) -> Vec<CandidateId> {
-    let planner_lineage = agent_lineage(&shared.cfg, &planner.agent);
+    let runtime = shared.runtime_config();
+    let planner_lineage = agent_lineage(&runtime, &planner.agent);
     let views = shared.eligible_views(&RequiredCaps::default(), class);
     let mut out: Vec<CandidateId> = Vec::new();
     // 1. Configured reviewer globs, restricted to a different lineage.
     for pat in &cfg.reviewer {
         for v in &views {
-            if agent_lineage(&shared.cfg, &v.id.agent) != planner_lineage
+            if agent_lineage(&runtime, &v.id.agent) != planner_lineage
                 && view_matches(pat, v)
                 && !view_excluded(v, excluded)
                 && !out.contains(&v.id)
@@ -5126,7 +5222,7 @@ fn resolve_reviewers(
     // 2. Fallback: any eligible candidate of a different lineage.
     if out.is_empty() {
         for v in &views {
-            if agent_lineage(&shared.cfg, &v.id.agent) != planner_lineage
+            if agent_lineage(&runtime, &v.id.agent) != planner_lineage
                 && !view_excluded(v, excluded)
                 && !out.contains(&v.id)
             {
@@ -5598,12 +5694,17 @@ fn maybe_trigger_orchestration(
             format!(
                 "router-acp · note: no candidate of a different lineage (company) than the \
                  planner ({}) is available for review; orchestrating anyway",
-                agent_lineage(&shared.cfg, &planner.agent)
+                agent_lineage(&shared.runtime_config(), &planner.agent)
             ),
         );
     }
-    let instructions =
-        build_orchestration_instructions(&shared.cfg, parts, forced, &planner, &reviewers);
+    let instructions = build_orchestration_instructions(
+        &shared.runtime_config(),
+        parts,
+        forced,
+        &planner,
+        &reviewers,
+    );
 
     shared.with_session(router_sid, |s| {
         s.orchestrating = true;
@@ -6288,7 +6389,7 @@ async fn switch_pin(
     else {
         return Err(AcpError::internal_error().data("cannot switch: session is not pinned"));
     };
-    if target == &old_candidate {
+    if target == &old_candidate && shared.route_for(&old_process_key, &old_down_sid).is_some() {
         return Ok(vec![]); // already there
     }
     // Validate the target BEFORE summarizing, so an unknown/dead candidate
@@ -6434,11 +6535,9 @@ async fn switch_pin(
     // 3. Re-pin, seed the summary as context for the next prompt, reset the
     //    confidence baseline to the new (more capable) model.
     let pin_quality = shared
-        .with_session(router_sid, |s| {
-            s.task_class
-                .map(|c| shared.scores.lookup(target).quality(c))
-                .unwrap_or(0.5)
-        })
+        .with_session(router_sid, |s| s.task_class)
+        .flatten()
+        .map(|class| shared.scores_for(router_sid, target).quality(class))
         .unwrap_or(0.5);
     shared.with_session(router_sid, |s| {
         s.pin = Some(PinInfo {
@@ -6513,11 +6612,12 @@ async fn switch_pin(
             ..Default::default()
         },
     );
-    if let Some(old_key) = shared
-        .candidate_runtime(&old_candidate)
-        .map(|r| r.process_key)
-    {
-        close_downstream_session(shared, &old_key, &old_down_sid);
+    // A restarted adapter may reuse its session ids from the beginning. In
+    // that case the replacement route has the same process key and session id
+    // as the stale pin. Closing the stale tuple would unregister the fresh
+    // route we just installed.
+    if old_process_key != opened.process_key || old_down_sid != opened.downstream_sid {
+        close_downstream_session(shared, &old_process_key, &old_down_sid);
     }
     {
         let mut headroom = shared.headroom.lock().unwrap();
@@ -6776,7 +6876,8 @@ pub async fn serve_shared(
     // usage API on an interval and cordon exhausted candidates.
     let usage_task = crate::usage::spawn_usage_poller(&shared);
 
-    let result = build_agent(shared).connect_to(transport).await;
+    let result = build_agent(shared.clone()).connect_to(transport).await;
+    crate::accounts::cancel_all(&shared);
 
     if let Some(task) = listener_task {
         task.abort();
@@ -7016,6 +7117,14 @@ fn on_initialize(
         let keys = task_shared.target_keys();
         // Spawn every downstream process, then probe them concurrently.
         for key in &keys {
+            if task_shared.target_spec(key).is_some_and(|s| {
+                task_shared
+                    .agent_configs()
+                    .iter()
+                    .any(|a| a.name == s.agent_name && a.account_disabled)
+            }) {
+                continue;
+            }
             if task_shared
                 .target_spec(key)
                 .and_then(|spec| {
@@ -7042,7 +7151,13 @@ fn on_initialize(
 
         let routeable = task_shared.routeable_candidates();
         let auth_pending = task_shared.has_auth_pending();
-        if routeable.is_empty() && !auth_pending {
+        if routeable.is_empty()
+            && !auth_pending
+            && !task_shared
+                .agent_configs()
+                .iter()
+                .any(|a| crate::accounts::provider(a).is_some())
+        {
             let _ = responder.respond_with_error(AcpError::invalid_params().data(
                 "router-acp has zero routeable candidates after config/auth/catalog validation; \
                  check agent commands and declared model ids",
@@ -7137,28 +7252,8 @@ fn on_session_new(
     }
     cx.spawn(async move {
         crate::auth::refresh_before_selection(&shared).await;
-        let routeable = shared.routeable_candidates();
-        if routeable.is_empty() {
-            let err = if shared.has_auth_pending()
-                || shared.cfg.agents.iter().any(|a| {
-                    shared
-                        .auth
-                        .lock()
-                        .unwrap()
-                        .unauthenticated(&a.name)
-                        .is_some()
-                })
-            {
-                AcpError::auth_required().data(
-                    "all candidates are waiting for authentication; sign in to a configured provider",
-                )
-            } else {
-                AcpError::invalid_params()
-                    .data("invalid configuration: no routeable or auth-pending candidates remain")
-            };
-            let _ = responder.respond_with_error(err);
-            return Ok(());
-        }
+        // Management commands must remain accessible when every login is
+        // expired. Normal prompts still enforce eligibility at pin time.
         let router_sid = format!("rtr-{}", uuid::Uuid::new_v4());
         shared
             .sessions
@@ -7166,7 +7261,9 @@ fn on_session_new(
             .unwrap()
             .insert(router_sid.clone(), RouterSession::new(&shared.cfg, &req));
         let options = shared.router_config_options(&router_sid);
-        let _ = responder.respond(NewSessionResponse::new(router_sid).config_options(options));
+        let _ =
+            responder.respond(NewSessionResponse::new(router_sid.clone()).config_options(options));
+        crate::accounts::advertise(&shared, &router_sid);
         Ok(())
     })
 }
@@ -7203,12 +7300,20 @@ fn on_set_config_option(
                         match EffortLevel::parse(&value) {
                             Some(EffortLevel::Auto) => {
                                 session.effort_request = None;
-                                refresh_pinned_effort(&shared.cfg, &shared.scores, session);
+                                refresh_pinned_effort(
+                                    &shared.runtime_config(),
+                                    &shared.scores,
+                                    session,
+                                );
                                 Action::RouterUpdated
                             }
                             Some(level) => {
                                 session.effort_request = Some(level);
-                                refresh_pinned_effort(&shared.cfg, &shared.scores, session);
+                                refresh_pinned_effort(
+                                    &shared.runtime_config(),
+                                    &shared.scores,
+                                    session,
+                                );
                                 Action::RouterUpdated
                             }
                             None => Action::BadValue(format!(
@@ -7332,6 +7437,11 @@ fn on_prompt(
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
     let router_sid = sid_str(&req.session_id);
+    if crate::accounts::intercepts(&shared, &router_sid, &req.prompt) {
+        return cx.spawn(async move {
+            crate::accounts::handle_prompt(shared, router_sid, req, responder).await
+        });
+    }
 
     // goose auto-generates a session title by sending a "Generate a short
     // title…" meta-prompt — with NO routing directive — often as the very
@@ -7630,7 +7740,7 @@ fn on_prompt(
                             s.effort_request = (effort != EffortLevel::Auto).then_some(effort);
                         }
                         if directives.effort.is_some() || directives.version.is_some() {
-                            refresh_pinned_effort(&shared.cfg, &shared.scores, s);
+                            refresh_pinned_effort(&shared.runtime_config(), &shared.scores, s);
                             true
                         } else {
                             false
@@ -7680,9 +7790,12 @@ fn on_prompt(
                 let running = shared
                     .version_for(&router_sid, &candidate)
                     .map(|v| v.api_model)
-                    .unwrap_or_else(|| shared.cfg.wire_api_model_unpinned(&candidate));
+                    .unwrap_or_else(|| shared.runtime_config().wire_api_model_unpinned(&candidate));
                 let declared = requested == crate::config::DEFAULT_VERSION
-                    || shared.cfg.declared_version(&candidate, requested).is_some();
+                    || shared
+                        .runtime_config()
+                        .declared_version(&candidate, requested)
+                        .is_some();
                 let note = if declared {
                     format!("router-acp · version: {candidate} runs {running}")
                 } else {
@@ -8167,6 +8280,7 @@ async fn dispatch_prompt(
 
 fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpError> {
     let router_sid = sid_str(&notif.session_id);
+    crate::accounts::cancel_login(&shared, &router_sid);
     let (pin, delegates) = shared
         .with_session(&router_sid, |s| {
             s.cancelled = true;

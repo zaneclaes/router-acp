@@ -116,7 +116,28 @@ Set the default with the top-level `router:` key, override per-session with the 
 
 ### Multiple accounts
 
-Declare `agents[].accounts` to authenticate several instances of one provider independently. Each account gets its own adapter environment, auth evidence, quota cache and reserves, and appears as `agent@account/model` to every ACP client. See [Managing multiple accounts](docs/ACCOUNTS.md) for the exact two-Claude-login workflow that preserves your existing login and [the standalone example](examples/router-accounts.yaml).
+Type `/login` in any router session to manage your provider accounts. The router handles this command itself.
+
+```text
+Manage logins
+1. claude (1 account)
+2. codex (2 accounts)
+3. grok (0 accounts)
+```
+
+Choose a provider, then an existing account or **Add Account**. An account shows its cached usage, **Re-login**, and **Delete account**. Browser sign-in uses the provider's own CLI. New accounts get private directories without replacing your other logins. An expired login remains registered so **Re-login** can repair it.
+
+Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
+
+The provider's ACP adapter must be configured and its login CLI installed. The router validates and atomically saves membership in the configuration passed to `serve --config`. It makes a new login available in the current router too. Deleting removes membership, stops that account's local adapters, and deletes its saved provider credentials. This also signs out a provider CLI that uses the same directory. Credentials stay on disk if another configured account shares that directory. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
+
+When a host generates this configuration, it must preserve the router's membership changes. Kory Code currently generates membership from its own Connected Tools store. Native-added accounts do not appear there and can be overwritten when Kory regenerates the file. Use Connected Tools to manage Kory accounts until those stores are unified. Standalone clients use the router's file directly.
+
+Type `/usage` for a deterministic account report with ASCII bars, percentages, reset times, reserve ceilings, credits, cache timestamps and errors. It reads router snapshots and never sends your command to a model or starts an upstream usage request. Grok reports its access gate because it has no numeric plan meter.
+
+Accounts use lower `priority` numbers first. For example, `priority: 0`, `priority: 1`, and `priority: 2` drain in that order. A configured `agents[].accounts` list defaults to its list order. The expanded standalone form uses `agents[].account_priority`. This is an eligibility gate before model ranking. A later account becomes eligible when earlier accounts are cordoned, exhausted or unavailable. Remaining included plans take precedence over paid overage. Explicit account picks can override order, but cannot bypass reserves or cordons.
+
+`reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves. See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.
 
 ### Token limits, outages, and failover
 
@@ -402,10 +423,13 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `availability_preference.headroom_scale_dollars` | `200` | Remaining overage/credit budget, in dollars, at/above which that pool reads fully free. Free included-plan ranking always uses the plan *fraction*, never a dollar estimate (see [Headroom, quarantine, and availability-aware preference](#headroom-quarantine-and-availability-aware-preference)). |
 | `availability_preference.overage_budget_weight` | `0.2` | Weight on the overage-dollar term while free plan still remains (`seat_budget = plan_headroom + overage_budget_weight × overage_signal`); used at full scale once plan is empty. |
-| `agents[].accounts` | `[]` | Named account instances with `name`, `env` and optional `reserve_capacity`. Expand into `agent@account` agents; inherit command/models/probe/usage source and share provider lineage. Account environment overrides base environment. |
+| `agents[].accounts` | `[]` | Named instances with `name`, `env`, optional `priority` and `reserve_capacity`. Lower priority drains first, defaulting to list order. Expand into `agent@account` agents with isolated authentication and usage. |
+| `agents[].account_priority` | unset | Native priority for an expanded account. Lower numbers drain first within the adapter group, before strategy ranking. Explicit picks still respect cordons. |
+| `agents[].account_disabled` / `accounts[].disabled` | `false` | Membership tombstone saved by `/login` deletion. Keeps the adapter template available to add another login while excluding deleted accounts from routing and usage. |
 | `agents[].reserve_capacity.weekly` / `.session` | `0` | Percentage of each included-plan window kept unused, in [0,100]. Positive reserves cordon at `100 - reserve` even when paid overage is available, and require enabled cordoning plus a usage source. Account entries may override this block. |
 | `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` polls Codex live over one `codex app-server` JSON-RPC round-trip (`account/rateLimits/read`, shared box-wide via a snapshot cache), falling back to Codex's own on-disk rollout-file snapshots only if that RPC fails; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
 | `agents[].auth_probe` | – | Optional non-interactive login check for this agent's provider seat. Run concurrently with every other probe before selection. Output matching `unauthenticated_patterns` (case-insensitive substring) means signed out; otherwise exit zero means signed in; a non-zero exit that matches nothing, a spawn failure, or a timeout is **unknown** and fails open. Omit it for providers with no reliable non-interactive status command — they stay fail-open and reactive. |
+| `agents[].login_command` | provider CLI | Optional executable, args and env for interactive `/login` sign-in. Uses the isolated account directory. It never reuses `auth_probe.command`. |
 | `agents[].auth_probe.timeout_ms` | `2000` | Probe timeout. Exceeding it is unknown, not a failure. |
 | `agents[].auth_probe.unauthenticated_patterns` | `not logged in`, `not signed in`, `authentication required`, `sign in`, `log in`, `login required` | Substrings that make the probe's output definite negative evidence. Set explicitly when a provider's logged-*in* output also mentions signing in. |
 

@@ -936,6 +936,13 @@ pub struct AgentConfig {
     /// Included-plan percentages kept unused, independently for this account.
     #[serde(default)]
     pub reserve_capacity: ReserveCapacityConfig,
+    /// Lower numbers drain first within one adapter's account group.
+    /// Unset standalone agents keep ordinary strategy ranking.
+    #[serde(default)]
+    pub account_priority: Option<u32>,
+    /// Deleted membership keeps an adapter template for adding a new login.
+    #[serde(default)]
+    pub account_disabled: bool,
     /// Independently authenticated instances of this adapter. Expanded into
     /// `name@account` agents before validation; empty keeps the original agent.
     #[serde(default)]
@@ -946,6 +953,10 @@ pub struct AgentConfig {
     /// and timeout is unknown (fail open).
     #[serde(default)]
     pub auth_probe: Option<AuthProbeConfig>,
+    /// Optional login CLI override. Omitted uses the provider's login command.
+    /// It inherits this account's isolated environment, never the probe argv.
+    #[serde(default)]
+    pub login_command: Option<CommandConfig>,
     /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
     /// agent name. Orchestration's cross-lineage review compares THIS — the
     /// point is a reviewer whose models come from a **different company** (and
@@ -974,6 +985,10 @@ pub struct ReserveCapacityConfig {
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     pub name: String,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub disabled: bool,
     #[serde(default)]
     pub env: Vec<EnvVarConfig>,
     #[serde(default)]
@@ -1346,6 +1361,9 @@ pub struct RoutersConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Original file for router-owned account management. Never a YAML key.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
     #[serde(default = "default_router")]
     pub router: StrategyKind,
     #[serde(default = "default_state_file")]
@@ -1654,7 +1672,7 @@ impl Config {
                 agents.push(agent);
                 continue;
             }
-            for account in accounts {
+            for (index, account) in accounts.into_iter().enumerate() {
                 if account.name.is_empty() || account.name.contains(['/', '@']) {
                     return Err(ConfigError(
                         "account name must be nonempty and contain neither `/` nor `@`".into(),
@@ -1662,6 +1680,8 @@ impl Config {
                 }
                 let mut seat = agent.clone();
                 seat.name = format!("{}@{}", agent.name, account.name);
+                seat.account_priority = Some(account.priority.unwrap_or(index as u32));
+                seat.account_disabled = account.disabled || agent.account_disabled;
                 seat.lineage = Some(agent.lineage.clone().unwrap_or_else(|| agent.name.clone()));
                 seat.command.env.extend(account.env);
                 if let Some(reserve) = account.reserve_capacity {
@@ -1690,6 +1710,12 @@ impl Config {
                     *arg = expand_tilde_str(arg);
                 }
             }
+            if let Some(login) = &mut agent.login_command {
+                login.command = expand_tilde_str(&login.command);
+                for arg in &mut login.args {
+                    *arg = expand_tilde_str(arg);
+                }
+            }
             if let ModelSelectionConfig::SpawnConfig { process_template } =
                 &mut agent.model_selection
             {
@@ -1705,7 +1731,9 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let yaml = std::fs::read_to_string(path)
             .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
-        Self::from_yaml(&yaml)
+        let mut cfg = Self::from_yaml(&yaml)?;
+        cfg.source_path = Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {

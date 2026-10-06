@@ -439,9 +439,9 @@ avoid repeating completed actions. Client cancellation never fails over.
 If no eligible account/model remains, the router reports its inability. Tune with `failover.{enabled,max_attempts,
 respawn_cooldown_secs}` and `headroom.cordon_default_secs` in `router.yaml`.
 
-For two Claude logins, follow [Managing multiple accounts](docs/ACCOUNTS.md):
-keep the default login, authenticate the second with its own
-`CLAUDE_CONFIG_DIR`, and configure `agents[].accounts`. Each account can set
+For two Claude logins, type `/login`, choose Claude, then **Add Account**.
+The router preserves the first login and isolates the second. Type `/usage`
+to see every account's cached usage. Each account can set
 `reserve_capacity: {weekly: 10, session: 20}` to cordon at 90% weekly or 80%
 session usage, even with paid overage. This works in Goose without Kory Code.
 

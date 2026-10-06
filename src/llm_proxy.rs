@@ -89,8 +89,8 @@ struct RequestPolicyState {
 pub struct LlmProxyRuntime {
     enabled: bool,
     listen_addr: OnceLock<std::net::SocketAddr>,
-    targets_by_token: HashMap<String, ProxyTarget>,
-    token_by_key: HashMap<ProcessKey, String>,
+    targets_by_token: Mutex<HashMap<String, ProxyTarget>>,
+    token_by_key: Mutex<HashMap<ProcessKey, String>>,
     active: Mutex<HashMap<ProcessKey, Vec<ActiveTurn>>>,
     policy: Mutex<HashMap<String, RequestPolicyState>>,
     next_registration: AtomicU64,
@@ -102,7 +102,7 @@ impl std::fmt::Debug for LlmProxyRuntime {
         f.debug_struct("LlmProxyRuntime")
             .field("enabled", &self.enabled)
             .field("listen_addr", &self.listen_addr.get())
-            .field("targets", &self.targets_by_token.len())
+            .field("targets", &self.targets_by_token.lock().unwrap().len())
             .finish()
     }
 }
@@ -139,8 +139,8 @@ impl LlmProxyRuntime {
         Ok(Arc::new(Self {
             enabled: cfg.llm_proxy.enabled && !targets_by_token.is_empty(),
             listen_addr: OnceLock::new(),
-            targets_by_token,
-            token_by_key,
+            targets_by_token: Mutex::new(targets_by_token),
+            token_by_key: Mutex::new(token_by_key),
             active: Mutex::new(HashMap::new()),
             policy: Mutex::new(HashMap::new()),
             next_registration: AtomicU64::new(1),
@@ -150,6 +150,52 @@ impl LlmProxyRuntime {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(crate) fn register_agent(
+        &self,
+        agent: &crate::config::AgentConfig,
+        specs: &[ProcessTargetSpec],
+    ) {
+        let Some(config) = &agent.llm_proxy else {
+            return;
+        };
+        for spec in specs {
+            let token = target_token(&spec.key);
+            self.targets_by_token.lock().unwrap().insert(
+                token.clone(),
+                ProxyTarget {
+                    key: spec.key.clone(),
+                    agent: agent.name.clone(),
+                    config: config.clone(),
+                },
+            );
+            self.token_by_key
+                .lock()
+                .unwrap()
+                .insert(spec.key.clone(), token);
+        }
+    }
+
+    pub(crate) fn remove_agent(&self, agent: &str) {
+        let keys: Vec<_> = {
+            let mut targets = self.targets_by_token.lock().unwrap();
+            let keys = targets
+                .values()
+                .filter(|t| t.agent == agent)
+                .map(|t| t.key.clone())
+                .collect();
+            targets.retain(|_, target| target.agent != agent);
+            keys
+        };
+        self.token_by_key
+            .lock()
+            .unwrap()
+            .retain(|key, _| !keys.contains(key));
+        self.active
+            .lock()
+            .unwrap()
+            .retain(|key, _| !keys.contains(key));
     }
 
     /// Bind the loopback listener. A bind failure is returned to the caller,
@@ -183,7 +229,7 @@ impl LlmProxyRuntime {
             .route("/proxy/{token}", any(proxy_root))
             .route("/proxy/{token}/{*rest}", any(proxy_with_path))
             .with_state(state);
-        tracing::info!(%addr, targets = self.targets_by_token.len(), "LLM request proxy listening");
+        tracing::info!(%addr, targets = self.targets_by_token.lock().unwrap().len(), "LLM request proxy listening");
         Ok(tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
                 tracing::warn!(%err, "LLM request proxy stopped");
@@ -198,10 +244,10 @@ impl LlmProxyRuntime {
         let Some(addr) = self.listen_addr.get() else {
             return env;
         };
-        let Some(token) = self.token_by_key.get(&spec.key) else {
+        let Some(token) = self.token_by_key.lock().unwrap().get(&spec.key).cloned() else {
             return env;
         };
-        let Some(target) = self.targets_by_token.get(token) else {
+        let Some(target) = self.targets_by_token.lock().unwrap().get(&token).cloned() else {
             return env;
         };
         let Ok(upstream) = reqwest::Url::parse(&target.config.upstream_base_url) else {
@@ -238,7 +284,7 @@ impl LlmProxyRuntime {
         class: TaskClass,
         meta: Option<&agent_client_protocol::schema::v1::Meta>,
     ) -> LlmTurnGuard {
-        if !self.enabled || !self.token_by_key.contains_key(&process_key) {
+        if !self.enabled || !self.token_by_key.lock().unwrap().contains_key(&process_key) {
             return LlmTurnGuard {
                 runtime: None,
                 process_key,
@@ -470,7 +516,14 @@ async fn proxy_request(
     rest: String,
     request: Request<Body>,
 ) -> Response<Body> {
-    let Some(target) = state.runtime.targets_by_token.get(&token).cloned() else {
+    let target = state
+        .runtime
+        .targets_by_token
+        .lock()
+        .unwrap()
+        .get(&token)
+        .cloned();
+    let Some(target) = target else {
         return error_response(StatusCode::NOT_FOUND, "unknown proxy target");
     };
     let (parts, incoming_body) = request.into_parts();
@@ -1838,24 +1891,24 @@ fn declared_api_model(
     version: Option<&str>,
     candidate: &CandidateId,
 ) -> Option<String> {
-    if let Some(version) = shared.cfg.resolve_version(candidate, version) {
+    let cfg = shared.runtime_config();
+    if let Some(version) = cfg.resolve_version(candidate, version) {
         return Some(version.api_model.clone());
     }
-    shared
-        .cfg
-        .model_config(candidate)
+    cfg.model_config(candidate)
         .and_then(|model| model.api_model.clone())
 }
 
 fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
-    shared.cfg.wire_api_model(candidate)
+    shared.runtime_config().wire_api_model(candidate)
 }
 
 /// The wire model `candidate` runs under this turn's `[router: version=…]`.
 fn turn_api_model(shared: &Shared, version: Option<&str>, candidate: &CandidateId) -> String {
-    match shared.cfg.resolve_version(candidate, version) {
+    let cfg = shared.runtime_config();
+    match cfg.resolve_version(candidate, version) {
         Some(v) => v.api_model.clone(),
-        None => shared.cfg.wire_api_model_unpinned(candidate),
+        None => cfg.wire_api_model_unpinned(candidate),
     }
 }
 
@@ -1865,7 +1918,7 @@ fn turn_scores(
     version: Option<&str>,
     candidate: &CandidateId,
 ) -> crate::candidate::ResolvedScores {
-    match shared.cfg.resolve_version(candidate, version) {
+    match shared.runtime_config().resolve_version(candidate, version) {
         Some(v) => shared
             .scores
             .lookup_exact(&CandidateId::new(&candidate.agent, &v.api_model)),
@@ -1874,14 +1927,15 @@ fn turn_scores(
 }
 
 /// Pricing of the version `candidate` runs under this turn's request.
-fn turn_pricing<'a>(
-    shared: &'a Shared,
+fn turn_pricing(
+    shared: &Shared,
     version: Option<&str>,
     candidate: &CandidateId,
-) -> Option<&'a crate::config::PricingConfig> {
-    match shared.cfg.resolve_version(candidate, version) {
-        Some(v) => v.pricing.as_ref(),
-        None => shared.cfg.model_config(candidate)?.pricing.as_ref(),
+) -> Option<crate::config::PricingConfig> {
+    let cfg = shared.runtime_config();
+    match cfg.resolve_version(candidate, version) {
+        Some(v) => v.pricing.clone(),
+        None => cfg.model_config(candidate)?.pricing.clone(),
     }
 }
 

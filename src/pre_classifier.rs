@@ -1371,8 +1371,7 @@ async fn open_evaluator_session(
         );
     } else {
         let mode_id = shared
-            .cfg
-            .agents
+            .agent_configs()
             .iter()
             .find(|agent| agent.name == candidate.agent)
             .and_then(|agent| agent.mode_map.get("preclass"))

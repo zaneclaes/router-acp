@@ -249,6 +249,7 @@ pub fn on_session_delete(
         match conn.send_request(fwd).block_task().await {
             Ok(resp) => {
                 crate::session::close_live_delegates_for(&shared, &router_sid);
+                crate::accounts::cancel_login(&shared, &router_sid);
                 shared.unregister_route(&key, &persisted.downstream_session_id);
                 shared.sessions.lock().unwrap().remove(&router_sid);
                 shared.state.lock().unwrap().remove(&router_sid);
@@ -276,6 +277,7 @@ pub fn on_session_close(
         .and_then(|s| s.pin.clone());
     match pin {
         Some(pin) => {
+            crate::accounts::cancel_login(&shared, &router_sid);
             // Close the live downstream session when supported; state-file
             // entries survive so resume/load keep working if the downstream
             // persists sessions.
@@ -293,6 +295,7 @@ pub fn on_session_close(
                 .remove(&router_sid)
                 .is_some();
             if existed {
+                crate::accounts::cancel_login(&shared, &router_sid);
                 responder.respond(CloseSessionResponse::new())
             } else {
                 responder.respond_with_error(AcpError::invalid_params().data("unknown session id"))

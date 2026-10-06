@@ -52,7 +52,7 @@ pub struct ProcessTargetSpec {
 }
 
 /// Expand one agent config into its process targets.
-fn agent_targets(agent: &AgentConfig) -> Vec<ProcessTargetSpec> {
+pub(crate) fn agent_targets(agent: &AgentConfig) -> Vec<ProcessTargetSpec> {
     match &agent.model_selection {
         ModelSelectionConfig::ConfigOption => vec![ProcessTargetSpec {
             key: ProcessKey(agent.name.clone()),
@@ -150,18 +150,41 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     let (conn_tx, conn_rx) = futures::channel::oneshot::channel();
     let task_shared = shared.clone();
     let task_key = key.clone();
+    let (stop, stopped) = {
+        let mut targets = shared.targets.lock().unwrap();
+        let target = targets.get_mut(key).unwrap();
+        if shared
+            .account_login
+            .lock()
+            .unwrap()
+            .contains(&spec.agent_name)
+            || shared
+                .agent_configs()
+                .iter()
+                .any(|a| a.name == spec.agent_name && a.account_disabled)
+        {
+            return Err(AcpError::invalid_params().data("This account is signing in"));
+        }
+        target.stop = Default::default();
+        target.stopped = Arc::default();
+        (target.stop.clone(), target.stopped.clone())
+    };
     upstream.spawn(async move {
-        let result = builder
+        let connect = builder
             .connect_with(acp_agent, async |cx| {
                 let _ = conn_tx.send(cx.clone());
                 std::future::pending::<Result<(), AcpError>>().await
-            })
-            .await;
+            });
+        let result = tokio::select! {
+            result = connect => result,
+            () = stop.cancelled() => Err(AcpError::internal_error().data("Account authentication changed")),
+        };
         let reason = match result {
             Ok(()) => "downstream connection closed".to_string(),
             Err(err) => format!("downstream connection failed: {err}"),
         };
         task_shared.mark_target_dead(&task_key, &reason);
+        stopped.notify_one();
         // Contained: a downstream death must not tear down the router.
         Ok(())
     })?;

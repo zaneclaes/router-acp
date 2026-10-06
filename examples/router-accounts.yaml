@@ -24,11 +24,13 @@ agents:
     lineage: anthropic
     accounts:
       - name: existing
+        priority: 0
         env: []
         reserve_capacity:
           weekly: 10
           session: 20
       - name: personal
+        priority: 1
         env:
           - name: CLAUDE_CONFIG_DIR
             value: ${HOME}/.config/router-acp/accounts/claude/personal

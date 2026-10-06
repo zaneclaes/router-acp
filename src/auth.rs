@@ -177,9 +177,11 @@ pub async fn refresh_before_selection(shared: &Arc<Shared>) {
     }
     let cycle_start = Instant::now();
     let probes: Vec<_> = shared
-        .cfg
-        .agents
+        .agent_configs()
         .iter()
+        .filter(|agent| {
+            !agent.account_disabled && !shared.account_login.lock().unwrap().contains(&agent.name)
+        })
         .filter_map(|agent| {
             agent
                 .auth_probe
@@ -187,11 +189,12 @@ pub async fn refresh_before_selection(shared: &Arc<Shared>) {
                 .map(|probe| (agent.name.clone(), probe, agent.command.env.clone()))
         })
         .collect();
-    let probe_results = futures::future::join_all(
-        probes
-            .into_iter()
-            .map(|(agent, probe, env)| async move { (agent, run_probe(&probe, &env).await) }),
-    );
+    let probe_results =
+        futures::future::join_all(probes.into_iter().map(|(agent, probe, env)| async move {
+            let isolated = agent.contains('@');
+            let result = run_probe_isolated(&probe, &env, isolated).await;
+            (agent, result)
+        }));
     let (results, ()) = tokio::join!(probe_results, crate::usage::refresh_and_install(shared));
     let mut tracker = shared.auth.lock().unwrap();
     for (agent, result) in results {
@@ -207,11 +210,29 @@ pub async fn refresh_before_selection(shared: &Arc<Shared>) {
     tracker.mark_refreshed();
 }
 
+#[cfg(test)]
 async fn run_probe(
     probe: &AuthProbeConfig,
     env: &[crate::config::EnvVarConfig],
 ) -> AuthAvailability {
+    run_probe_isolated(probe, env, false).await
+}
+
+async fn run_probe_isolated(
+    probe: &AuthProbeConfig,
+    env: &[crate::config::EnvVarConfig],
+    isolated: bool,
+) -> AuthAvailability {
     let mut cmd = tokio::process::Command::new(&probe.command);
+    if isolated
+        || env
+            .iter()
+            .any(|v| v.name == "CLAUDE_CONFIG_DIR" || v.name == "CODEX_HOME")
+    {
+        for key in crate::accounts::AUTH_ENV {
+            cmd.env_remove(key);
+        }
+    }
     cmd.args(&probe.args)
         .envs(env.iter().map(|v| (&v.name, &v.value)))
         .kill_on_drop(true);
@@ -371,7 +392,7 @@ pub fn note_unauthenticated_from_usage_with_generation(
 }
 
 fn uses_claude_credentials(shared: &Arc<Shared>, agent: &str) -> bool {
-    shared.cfg.agents.iter().any(|configured| {
+    shared.agent_configs().iter().any(|configured| {
         configured.name == agent
             && matches!(
                 configured.usage_source,
@@ -384,8 +405,7 @@ fn uses_claude_credentials(shared: &Arc<Shared>, agent: &str) -> bool {
 /// passive local read; it never invokes a provider login/status command.
 pub fn request_access_generation(shared: &Arc<Shared>, agent: &str) -> Option<String> {
     shared
-        .cfg
-        .agents
+        .agent_configs()
         .iter()
         .find(|a| a.name == agent && uses_claude_credentials(shared, agent))
         .and_then(crate::usage::anthropic_access_generation)

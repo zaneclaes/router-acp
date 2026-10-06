@@ -11,10 +11,75 @@ use std::pin::Pin;
 use std::process::Stdio as ProcessStdio;
 use std::sync::{Mutex, OnceLock};
 
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use agent_client_protocol::{ConnectTo, Lines, Role};
+
+/// Drain stdout through the protocol actor before reporting EOF. A transport
+/// error otherwise drops the actor with final notifications still queued.
+async fn process_lines<R: Role>(
+    mut writer: impl AsyncWrite + Unpin + Send + 'static,
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    client: impl ConnectTo<R::Counterpart>,
+) -> Result<(), agent_client_protocol::Error> {
+    use agent_client_protocol::RawJsonRpcMessage;
+    use agent_client_protocol::schema::v1::Response;
+
+    let (channel, protocol) = client.into_channel_and_future();
+    let marker = format!("{DISCONNECT_MARKER}: {}", uuid::Uuid::new_v4());
+    let incoming_marker = marker.clone();
+    let incoming = async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+        {
+            let message = serde_json::from_str::<RawJsonRpcMessage>(&line).map_err(|_| {
+                agent_client_protocol::Error::parse_error().data(serde_json::json!({"line": line}))
+            });
+            channel
+                .tx
+                .unbounded_send(message)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+        }
+        // The SDK acknowledges a queued error through its outgoing channel.
+        // Consume this private acknowledgement here, never on the child's wire.
+        channel
+            .tx
+            .unbounded_send(Err(
+                agent_client_protocol::Error::internal_error().data(incoming_marker)
+            ))
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+    };
+    let outgoing = async move {
+        let mut messages = channel.rx;
+        while let Some(message) = messages.next().await {
+            let message = message?;
+            if let RawJsonRpcMessage::Response(Response::Error { error, .. }) = &message
+                && error.data.as_ref().and_then(serde_json::Value::as_str) == Some(marker.as_str())
+            {
+                return Err(agent_client_protocol::Error::internal_error().data(DISCONNECT_MARKER));
+            }
+            let mut line = serde_json::to_vec(&message)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            line.push(b'\n');
+            writer
+                .write_all(&line)
+                .await
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            writer
+                .flush()
+                .await
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+        }
+        Ok(())
+    };
+    futures::try_join!(incoming, outgoing, protocol)?;
+    Ok(())
+}
 
 type BoxSink = Pin<Box<dyn Sink<String, Error = std::io::Error> + Send>>;
 type BoxStream = Pin<Box<dyn Stream<Item = std::io::Result<String>> + Send>>;
@@ -113,11 +178,28 @@ pub fn kill_all_downstreams() {
 /// Unregisters a downstream PID when its connection future is dropped (any
 /// exit path), so the registry never holds stale PIDs that could later be
 /// reused by an unrelated process.
-struct DownstreamPidGuard(Option<u32>);
+pub(crate) struct DownstreamPidGuard(Option<u32>);
+
+impl DownstreamPidGuard {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        if let Some(pid) = pid {
+            downstream_pids().lock().unwrap().insert(pid);
+        }
+        Self(pid)
+    }
+}
 
 impl Drop for DownstreamPidGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
+            // Account re-login cancels this connection. Retire its children
+            // before a new credential writer can start in the same directory.
+            #[cfg(unix)]
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
             downstream_pids().lock().unwrap().remove(&pid);
         }
     }
@@ -150,6 +232,11 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
         // doesn't half-terminate it outside our control.
         #[cfg(unix)]
         cmd.process_group(0);
+        if self.name.contains('@') || crate::accounts::isolated_environment(&self.env) {
+            for key in crate::accounts::AUTH_ENV {
+                cmd.env_remove(key);
+            }
+        }
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -159,10 +246,7 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
         })?;
         // Track the PID and unregister when this connection future is dropped.
         let pid = child.id();
-        if let Some(pid) = pid {
-            downstream_pids().lock().unwrap().insert(pid);
-        }
-        let _pid_guard = DownstreamPidGuard(pid);
+        let _pid_guard = DownstreamPidGuard::new(pid);
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -180,8 +264,8 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
             std::future::pending::<()>().await
         };
 
-        let transport = lines_transport(stdin, stdout);
-        let protocol = ConnectTo::<R>::connect_to(transport, client);
+        let protocol = process_lines::<R>(stdin, stdout, client);
+        tokio::pin!(protocol);
 
         let exit = async move {
             match child.wait().await {
@@ -194,8 +278,14 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
         };
 
         tokio::select! {
-            result = protocol => result,
-            result = exit => result,
+            result = &mut protocol => result,
+            result = exit => {
+                // Let buffered final output reach the handlers. Bound teardown
+                // when a grandchild keeps stdout open after its parent exits.
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut protocol)
+                    .await
+                    .unwrap_or(result)
+            },
             () = stderr_task => Ok(()),
         }
     }
@@ -322,6 +412,45 @@ mod tests {
         );
         let _ = std::fs::remove_file(&pidfile);
         drop(child);
+    }
+
+    #[tokio::test]
+    async fn process_transport_drains_final_frames_before_exit() {
+        use agent_client_protocol::{Dispatch, Handled};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let received = count.clone();
+        let transport = ProcessTransport {
+            name: "final-frames".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(),
+                "i=0; while [ $i -lt 20 ]; do printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"final\",\"params\":{}}'; i=$((i+1)); done; exit 1".into()],
+            env: vec![],
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3),
+            UntypedRole.builder().on_receive_dispatch(move |message: Dispatch, _cx| {
+                let received = received.clone();
+                async move {
+                    if matches!(&message, Dispatch::Notification(msg) if msg.method() == "final") {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        received.fetch_add(1, Ordering::SeqCst);
+                        Ok(Handled::Yes)
+                    } else {
+                        Ok(Handled::No { message, retry: false })
+                    }
+                }
+            }, agent_client_protocol::on_receive_dispatch!()).connect_with(transport, async |_cx| {
+                std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+            })
+        ).await.expect("transport must terminate");
+        assert!(result.is_err());
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            20,
+            "all buffered frames reached their handlers"
+        );
     }
 
     #[tokio::test]

@@ -207,6 +207,10 @@ impl HeadroomTracker {
         self.usage_cordons = cordons;
     }
 
+    pub fn register_agent(&mut self, agent: &str, budget: u32) {
+        self.budgets.insert(agent.to_string(), budget);
+    }
+
     /// Apply a partial provider-usage refresh. Accounts with a usable reading
     /// replace their prior cordons; an unknown reading retains the last
     /// confirmed cordon until its reset instead of failing open after a race.

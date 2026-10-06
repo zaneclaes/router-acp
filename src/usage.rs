@@ -39,7 +39,11 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
     if !shared.cfg.cordon.enabled {
         return None;
     }
-    if !shared.cfg.agents.iter().any(|a| a.usage_source.is_some()) {
+    if !shared
+        .agent_configs()
+        .iter()
+        .any(|a| a.usage_source.is_some())
+    {
         return None;
     }
     let interval = Duration::from_secs(shared.cfg.cordon.poll_secs.max(30));
@@ -84,8 +88,7 @@ pub fn refresh_after_turn(shared: &Arc<Shared>, agent: &str) {
         return;
     }
     let has_source = shared
-        .cfg
-        .agents
+        .agent_configs()
         .iter()
         .any(|a| a.name == agent && a.usage_source.is_some());
     if !has_source {
@@ -110,7 +113,10 @@ async fn poll_all(
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
     let mut avail: HashMap<CandidateId, SeatAvailability> = HashMap::new();
     let mut observed_agents = HashSet::new();
-    for agent in &shared.cfg.agents {
+    for agent in &shared.agent_configs() {
+        if agent.account_disabled || shared.account_login.lock().unwrap().contains(&agent.name) {
+            continue;
+        }
         let Some(source) = &agent.usage_source else {
             continue;
         };
@@ -1154,8 +1160,8 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 // ----------------------------------------------------------------------
 
 /// Ingest a client `router-acp/availability_hint` extension notification.
-/// Clients that watch seat usage themselves (e.g. Kory Code polls both
-/// providers every minute) push their view here; a fresh hint outranks the
+/// Clients that already have account-attributed usage may push their view
+/// here; a fresh hint outranks the
 /// router's own poll for that agent until it expires. Expected params:
 ///
 /// ```json
@@ -1175,6 +1181,8 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 /// entry's `windows` express plan-window fullness (`scope` names a
 /// model-scoped cap, `active` marks a limit the provider reports as biting);
 /// `overage` describes the paid pool that absorbs usage past the cap.
+/// `agent` is an exact account id, such as `claude@work`. A provider-wide
+/// hint must never be copied into sibling accounts' independent usage.
 pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
     if !shared.cfg.availability_preference.enabled {
         return;
@@ -1321,6 +1329,9 @@ async fn codex_rate_limits_rpc(
 ) -> Result<Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let mut command = tokio::process::Command::new("codex");
+    for key in crate::accounts::AUTH_ENV {
+        command.env_remove(key);
+    }
     if let Some(agent) = agent {
         command.envs(agent.command.env.iter().map(|v| (&v.name, &v.value)));
     }

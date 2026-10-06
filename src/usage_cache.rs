@@ -304,6 +304,47 @@ pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
     serde_json::from_str(&text).ok()
 }
 
+/// Passive published view. A sibling's credentials or old access generation
+/// must never turn into this account's usage report.
+pub fn read_agent_snapshot(agent: &crate::config::AgentConfig) -> Option<Snapshot> {
+    use crate::config::UsageSourceConfig;
+    let (file, account, generation) = match agent.usage_source.as_ref()? {
+        UsageSourceConfig::AnthropicOauth => {
+            let creds = crate::usage::anthropic_oauth_credentials(Some(agent))?;
+            (
+                account_cache_name(
+                    "anthropic-oauth.json",
+                    Some(agent),
+                    "CLAUDE_CONFIG_DIR",
+                    ".claude",
+                ),
+                fingerprint(
+                    creds
+                        .refresh_token
+                        .as_deref()
+                        .unwrap_or(&creds.access_token),
+                ),
+                Some(fingerprint(&creds.access_token)),
+            )
+        }
+        UsageSourceConfig::CodexRollout => (
+            account_cache_name("codex.json", Some(agent), "CODEX_HOME", ".codex"),
+            crate::usage::codex_account_fingerprint(Some(agent))?,
+            None,
+        ),
+    };
+    let snapshot = read_snapshot(&snapshot_path(&file)?)?;
+    if snapshot.account != account
+        || snapshot.fetched_at > unix_now()
+        || (generation.is_some()
+            && snapshot.access_generation.is_some()
+            && generation != snapshot.access_generation)
+    {
+        return None;
+    }
+    Some(snapshot)
+}
+
 /// Atomic write: temp file in the same directory, then rename over the
 /// target — readers never observe a partial snapshot.
 pub fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()> {

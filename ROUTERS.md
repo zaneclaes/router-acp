@@ -32,8 +32,9 @@ model was chosen.
 
 With `agents[].accounts`, candidates also identify the login, for example
 `claude@personal/sonnet`. Each account has independent authentication, usage
-and optional reserves. See [Managing multiple accounts](docs/ACCOUNTS.md) for
-the two-Claude-login setup and a standalone Goose configuration.
+and optional reserves. Type `/login` to add or repair logins, and `/usage`
+to see every account. Lower account priorities drain first before the
+strategy ranks models. See [Multiple accounts](README.md#multiple-accounts).
 
 With the optional **per-request LLM proxy**, the candidate remains the
 session's default and failover owner, but it is no longer necessarily the model
