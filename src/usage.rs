@@ -11,11 +11,11 @@
 //!
 //! Networking is a shelled-out `curl` (token passed via a stdin config so it
 //! never lands in argv) — no TLS crate, matching the project's `git`/`/bin/sh`
-//! precedent. It fails open: any error means "do not cordon" so a usage-endpoint
-//! hiccup can never make a model unroutable (the reactive per-agent cordon is
-//! the safety net if an exhausted model is then actually hit).
+//! precedent. Unknown usage cannot establish a new cordon. A confirmed cordon
+//! survives missing readings until a usable reading replaces it or it resets;
+//! overlapping refreshes must not temporarily reopen reserved capacity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -58,14 +58,14 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
 /// availability sets and install them on `shared.headroom`. Shared by the
 /// periodic poller tick and the turn-end refresh ([`refresh_after_turn`]).
 pub async fn refresh_and_install(shared: &Arc<Shared>) {
-    let (cordons, availability) = poll_all(shared).await;
-    let n = cordons.len();
+    let (cordons, availability, observed_agents) = poll_all(shared).await;
     let a = availability.len();
-    {
+    let n = {
         let mut headroom = shared.headroom.lock().unwrap();
-        headroom.set_usage_cordons(cordons);
+        headroom.reconcile_usage_cordons(cordons, &observed_agents);
         headroom.set_polled_availability(availability);
-    }
+        headroom.active_usage_cordons().len()
+    };
     tracing::debug!(
         cordoned_candidates = n,
         availability_candidates = a,
@@ -105,9 +105,11 @@ async fn poll_all(
 ) -> (
     HashMap<CandidateId, UsageCordon>,
     HashMap<CandidateId, SeatAvailability>,
+    HashSet<String>,
 ) {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
     let mut avail: HashMap<CandidateId, SeatAvailability> = HashMap::new();
+    let mut observed_agents = HashSet::new();
     for agent in &shared.cfg.agents {
         let Some(source) = &agent.usage_source else {
             continue;
@@ -293,10 +295,11 @@ async fn poll_all(
                 "usage-cordoned candidates (limit or reserve reached)"
             );
         }
+        observed_agents.insert(agent.name.clone());
         out.extend(cordons);
         avail.extend(availability);
     }
-    (out, avail)
+    (out, avail, observed_agents)
 }
 
 /// `(candidate id, display name)` for every candidate of `agent`.
@@ -1855,18 +1858,57 @@ mod tests {
         )).unwrap();
         let shared = Shared::new(cfg).unwrap();
         refresh_and_install(&shared).await;
-        let headroom = shared.headroom.lock().unwrap();
+        {
+            let headroom = shared.headroom.lock().unwrap();
+            assert!(
+                headroom
+                    .usage_cordon(&CandidateId::new("codex@work", "gpt-5.5"))
+                    .is_some()
+            );
+            assert!(
+                headroom
+                    .usage_cordon(&CandidateId::new("codex@personal", "gpt-5.5"))
+                    .is_none()
+            );
+            assert_eq!(headroom.active_usage_cordons().len(), 1);
+        }
+
+        // Overlapping startup refreshes can return no snapshot for one account
+        // while another fetch holds its cache lock. That incomplete cycle must
+        // not erase a reserve breach already confirmed by a different cycle.
+        let work_rollout = root.path().join("work/sessions/rollout-limits.jsonl");
+        std::fs::remove_file(&work_rollout).unwrap();
+        refresh_and_install(&shared).await;
         assert!(
-            headroom
+            shared
+                .headroom
+                .lock()
+                .unwrap()
                 .usage_cordon(&CandidateId::new("codex@work", "gpt-5.5"))
-                .is_some()
+                .is_some(),
+            "an unknown account reading cannot clear a confirmed reserve cordon"
         );
+
+        // A subsequent usable reading below the threshold does lift the cordon.
+        std::fs::write(
+            work_rollout,
+            json!({"payload": {"rate_limits": {
+                "limit_id": "codex",
+                "primary": {"used_percent": 10, "window_minutes": 10080, "resets_at": reset}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        refresh_and_install(&shared).await;
         assert!(
-            headroom
-                .usage_cordon(&CandidateId::new("codex@personal", "gpt-5.5"))
-                .is_none()
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&CandidateId::new("codex@work", "gpt-5.5"))
+                .is_none(),
+            "a confirmed healthy reading lifts the reserve cordon"
         );
-        assert_eq!(headroom.active_usage_cordons().len(), 1);
     }
 
     #[test]

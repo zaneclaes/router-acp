@@ -101,7 +101,8 @@ values in that block default to zero.
 Enforcement uses the most recent provider reading; polling and the shared
 cache control when a new reading becomes available. A confirmed reserve
 breach with no reported reset gets a temporary 15-minute cordon, replaced by
-the next reading. Failed or unknown usage reads cannot measure a reserve.
+the next usable reading. Failed or unknown usage reads cannot establish a
+reserve cordon and do not clear a previously confirmed one before its reset.
 
 When a candidate is cordoned, automatic routing and failover skip it. There is
 no all-cordoned fallback: if both Claude accounts are cordoned, wait for a

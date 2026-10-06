@@ -4,7 +4,7 @@
 //! seat meters: we count prompts forwarded, sessions opened, and rate-limit
 //! failures over a sliding window, normalized against per-agent budgets.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::candidate::CandidateId;
@@ -165,9 +165,9 @@ pub struct HeadroomTracker {
     /// Hard per-agent cordons (token/usage limits): the agent is excluded
     /// from routing until the stored instant, with a human-readable reason.
     cordons: HashMap<String, (Instant, String)>,
-    /// Proactive per-candidate cordons from provider usage APIs. Recomputed
-    /// wholesale by the usage poller each cycle (`set_usage_cordons`); each
-    /// entry self-lifts at its absolute `resets_at`.
+    /// Proactive per-candidate cordons from provider usage APIs. Usable account
+    /// readings replace their entries; unknown readings preserve confirmed
+    /// entries until their absolute `resets_at`.
     usage_cordons: HashMap<CandidateId, UsageCordon>,
     /// Reactive per-candidate cordons from failures the candidate itself hit
     /// (a spend cap denies the model with no plan budget left, while the
@@ -201,11 +201,24 @@ impl HeadroomTracker {
         }
     }
 
-    /// Replace the proactive per-candidate usage cordons wholesale (the poller
-    /// computes an authoritative snapshot each cycle). A candidate no longer
-    /// exhausted simply drops out of the map here and becomes routeable again.
+    /// Replace proactive per-candidate usage cordons wholesale. Tests and
+    /// callers with a complete authoritative snapshot use this directly.
     pub fn set_usage_cordons(&mut self, cordons: HashMap<CandidateId, UsageCordon>) {
         self.usage_cordons = cordons;
+    }
+
+    /// Apply a partial provider-usage refresh. Accounts with a usable reading
+    /// replace their prior cordons; an unknown reading retains the last
+    /// confirmed cordon until its reset instead of failing open after a race.
+    pub fn reconcile_usage_cordons(
+        &mut self,
+        cordons: HashMap<CandidateId, UsageCordon>,
+        observed_agents: &HashSet<String>,
+    ) {
+        let now = SystemTime::now();
+        self.usage_cordons
+            .retain(|id, cordon| cordon.resets_at > now && !observed_agents.contains(&id.agent));
+        self.usage_cordons.extend(cordons);
     }
 
     /// Reactively cordon ONE candidate until `resets_at`, for a failure that
