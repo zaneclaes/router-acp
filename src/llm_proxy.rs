@@ -661,6 +661,11 @@ async fn proxy_request(
                             effort: request_effort(
                                 &state.shared,
                                 &active.parent_router_sid,
+                                state
+                                    .shared
+                                    .with_session(&active.state_sid, |s| s.version_request.clone())
+                                    .flatten()
+                                    .as_deref(),
                                 &active.candidate,
                             ),
                         });
@@ -1398,6 +1403,7 @@ enum EffortShape {
 fn request_effort(
     shared: &Shared,
     parent_router_sid: &str,
+    version: Option<&str>,
     candidate: &CandidateId,
 ) -> EffortShape {
     let requested = shared
@@ -1410,9 +1416,7 @@ fn request_effort(
         .flatten();
     match requested {
         None => EffortShape::Preserve,
-        Some(level) => shared
-            .scores
-            .lookup(candidate)
+        Some(level) => turn_scores(shared, version, candidate)
             .resolve_effort(level)
             .provider_value
             .map(EffortShape::Set)
@@ -1465,9 +1469,12 @@ fn select_request_model(
     let signals = inspect_request(body);
     // A coordinator's requests only move within `planning_candidates`; its
     // own pin is re-added below regardless (a human may have picked it).
-    let coordinator = shared
-        .with_session(&active.state_sid, |s| s.coordinator)
-        .unwrap_or(false);
+    let (coordinator, version) = shared
+        .with_session(&active.state_sid, |s| {
+            (s.coordinator, s.version_request.clone())
+        })
+        .unwrap_or((false, None));
+    let version = version.as_deref();
     let candidates = shared.routeable_candidates();
     let mut headroom = shared.headroom.lock().unwrap();
     let mut models: Vec<ModelOption> = candidates
@@ -1485,8 +1492,8 @@ fn select_request_model(
                 && !headroom.seat_exhausted(&candidate.id)
         })
         .map(|candidate| {
-            let scores = shared.scores.lookup(&candidate.id);
-            let api_model = configured_api_model(shared, &candidate.id);
+            let scores = turn_scores(shared, version, &candidate.id);
+            let api_model = turn_api_model(shared, version, &candidate.id);
             ModelOption {
                 id: candidate.id,
                 api_model,
@@ -1515,10 +1522,10 @@ fn select_request_model(
             .candidate_runtime(&active.candidate)
             .map(|candidate| candidate.cost_rank)
             .unwrap_or(u32::MAX);
-        let scores = shared.scores.lookup(&active.candidate);
+        let scores = turn_scores(shared, version, &active.candidate);
         models.push(ModelOption {
             id: active.candidate.clone(),
-            api_model: configured_api_model(shared, &active.candidate),
+            api_model: turn_api_model(shared, version, &active.candidate),
             cost_rank,
             quality: scores.quality(active.class),
             context_window: scores.context_window,
@@ -1677,8 +1684,8 @@ fn select_request_model(
             // — otherwise a short routine blip that escalates right back is a net
             // loss (and thrash pays the write twice). No-op when cache pricing is
             // absent (OpenAI/Responses wire).
-            let break_even =
-                cache_reprime_break_even(shared, &active.candidate, &cheap).unwrap_or(0) as u32;
+            let break_even = cache_reprime_break_even(shared, version, &active.candidate, &cheap)
+                .unwrap_or(0) as u32;
             let required = shared.cfg.llm_proxy.routine_streak.max(break_even);
             if cheap == active.candidate {
                 (
@@ -1787,7 +1794,7 @@ fn select_request_model(
         // authoritative and always written; the incoming string is only
         // trusted when neither is declared, where it is the sole valid wire
         // id we have (rewriting to a bare CLI alias would 404).
-        declared_api_model(shared, &selected).unwrap_or_else(|| {
+        declared_api_model(shared, version, &selected).unwrap_or_else(|| {
             signals
                 .original_model
                 .clone()
@@ -1798,7 +1805,7 @@ fn select_request_model(
             .iter()
             .find(|model| model.id == selected)
             .map(|model| model.api_model.clone())
-            .unwrap_or_else(|| configured_api_model(shared, &selected))
+            .unwrap_or_else(|| turn_api_model(shared, version, &selected))
     };
     let rewrite = signals
         .original_model
@@ -1814,8 +1821,8 @@ fn select_request_model(
         reason,
         event,
         estimated_input: signals.estimated_input,
-        effort: request_effort(shared, &active.parent_router_sid, &selected),
-        fold_system_turns: !shared.scores.lookup(&selected).system_turns,
+        effort: request_effort(shared, &active.parent_router_sid, version, &selected),
+        fold_system_turns: !turn_scores(shared, version, &selected).system_turns,
     }
 }
 
@@ -1826,8 +1833,12 @@ fn select_request_model(
 /// api_model" means the router has no authoritative wire id for this candidate
 /// and must not invent one from the ACP selector id, which is often an alias
 /// the provider API rejects.
-fn declared_api_model(shared: &Shared, candidate: &CandidateId) -> Option<String> {
-    if let Some(version) = shared.cfg.pinned_version(candidate) {
+fn declared_api_model(
+    shared: &Shared,
+    version: Option<&str>,
+    candidate: &CandidateId,
+) -> Option<String> {
+    if let Some(version) = shared.cfg.resolve_version(candidate, version) {
         return Some(version.api_model.clone());
     }
     shared
@@ -1838,6 +1849,40 @@ fn declared_api_model(shared: &Shared, candidate: &CandidateId) -> Option<String
 
 fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
     shared.cfg.wire_api_model(candidate)
+}
+
+/// The wire model `candidate` runs under this turn's `[router: version=…]`.
+fn turn_api_model(shared: &Shared, version: Option<&str>, candidate: &CandidateId) -> String {
+    match shared.cfg.resolve_version(candidate, version) {
+        Some(v) => v.api_model.clone(),
+        None => shared.cfg.wire_api_model_unpinned(candidate),
+    }
+}
+
+/// Scores of the version `candidate` runs under this turn's request.
+fn turn_scores(
+    shared: &Shared,
+    version: Option<&str>,
+    candidate: &CandidateId,
+) -> crate::candidate::ResolvedScores {
+    match shared.cfg.resolve_version(candidate, version) {
+        Some(v) => shared
+            .scores
+            .lookup_exact(&CandidateId::new(&candidate.agent, &v.api_model)),
+        None => shared.scores.lookup_exact(candidate),
+    }
+}
+
+/// Pricing of the version `candidate` runs under this turn's request.
+fn turn_pricing<'a>(
+    shared: &'a Shared,
+    version: Option<&str>,
+    candidate: &CandidateId,
+) -> Option<&'a crate::config::PricingConfig> {
+    match shared.cfg.resolve_version(candidate, version) {
+        Some(v) => v.pricing.as_ref(),
+        None => shared.cfg.model_config(candidate)?.pricing.as_ref(),
+    }
 }
 
 fn strongest_model(models: &[ModelOption]) -> Option<CandidateId> {
@@ -2286,7 +2331,13 @@ fn complete_request(
     error: Option<String>,
 ) {
     let usage = parse_response_usage(captured, context.protocol);
-    let cost = request_cost(shared, &context.model, context.protocol, &usage);
+    let cost = request_cost(
+        shared,
+        &context.state_sid,
+        &context.model,
+        context.protocol,
+        &usage,
+    );
     let response_difficulty = response_difficulty(captured, status);
     let duration_ms = context.started.elapsed().as_millis() as u64;
     {
@@ -2438,14 +2489,15 @@ fn response_difficulty(body: &[u8], _status: u16) -> Option<String> {
 /// so Codex/Grok/Kimi behavior is unchanged.
 fn cache_reprime_break_even(
     shared: &Shared,
+    version: Option<&str>,
     pinned: &CandidateId,
     target: &CandidateId,
 ) -> Option<u64> {
     if pinned == target {
         return Some(0);
     }
-    let pinned = shared.cfg.model_pricing(pinned)?;
-    let target = shared.cfg.model_pricing(target)?;
+    let pinned = turn_pricing(shared, version, pinned)?;
+    let target = turn_pricing(shared, version, target)?;
     let pinned_read = pinned.cache_read_per_mtok?;
     let target_read = target.cache_read_per_mtok?;
     let target_write = target.cache_write_per_mtok?;
@@ -2459,11 +2511,12 @@ fn cache_reprime_break_even(
 
 fn request_cost(
     shared: &Arc<Shared>,
+    state_sid: &str,
     candidate: &CandidateId,
     protocol: LlmWireProtocol,
     usage: &LlmRequestUsage,
 ) -> f64 {
-    let Some(pricing) = shared.cfg.model_pricing(candidate) else {
+    let Some(pricing) = shared.pricing_for(state_sid, candidate) else {
         return 0.0;
     };
     let cache_read_rate = pricing
@@ -3583,6 +3636,32 @@ agents:
     }
 
     #[test]
+    fn a_session_version_takes_effect_on_the_next_request() {
+        let (_dir, shared) = kory_code_shared();
+        let cfg = shared.cfg.clone();
+        let session = RouterSession::rehydrated(&cfg, &PersistedSession::default(), Vec::new());
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".to_string(), session);
+        let opus = claude_active("opus[1m]");
+        let before = select_request_model(&shared, &opus, &aliased_request("claude-opus-5"));
+        assert_eq!(before.model, "claude-opus-5");
+        shared.with_session("r1", |s| s.version_request = Some("claude-opus-4-6".into()));
+        let after = select_request_model(&shared, &opus, &aliased_request("claude-opus-5"));
+        assert_eq!(after.model, "claude-opus-4-6");
+        assert!(after.rewrite && after.honors_pin);
+        assert_eq!(
+            shared
+                .pricing_for("r1", &opus.candidate)
+                .unwrap()
+                .input_per_mtok,
+            6.0
+        );
+    }
+
+    #[test]
     fn a_pinned_version_is_priced_as_itself() {
         let (_dir, shared) = kory_code_shared_with(OPUS_PINNED);
         let opus = CandidateId::new("claude", "opus[1m]");
@@ -3671,6 +3750,7 @@ agents:
         assert_eq!(
             cache_reprime_break_even(
                 &shared,
+                None,
                 &CandidateId::new("mock", "opus"),
                 &CandidateId::new("mock", "haiku"),
             ),
@@ -3681,6 +3761,7 @@ agents:
         assert_eq!(
             cache_reprime_break_even(
                 &plain,
+                None,
                 &CandidateId::new("mock", "opus"),
                 &CandidateId::new("mock", "haiku"),
             ),

@@ -2062,18 +2062,45 @@ impl Config {
     /// The `pinned_versions` entry in force for a candidate; `None` when it
     /// runs its current `api_model`.
     pub fn pinned_version(&self, id: &CandidateId) -> Option<&ModelVersion> {
-        let version = self.pinned_versions.get(&id.to_string())?;
+        self.declared_version(id, self.pinned_versions.get(&id.to_string())?)
+    }
+
+    /// One of a candidate's declared `versions`, by `api_model`.
+    pub fn declared_version(&self, id: &CandidateId, api_model: &str) -> Option<&ModelVersion> {
         self.model_config(id)?
             .versions
             .iter()
-            .find(|v| &v.api_model == version)
+            .find(|v| v.api_model == api_model)
+    }
+
+    /// The version a candidate runs given a session's `[router: version=…]`
+    /// request: `default` forces the current `api_model`, a version the
+    /// candidate declares wins, and anything else (no request, or a version
+    /// of another model) falls back to `pinned_versions`.
+    pub fn resolve_version(
+        &self,
+        id: &CandidateId,
+        requested: Option<&str>,
+    ) -> Option<&ModelVersion> {
+        match requested {
+            Some(DEFAULT_VERSION) => None,
+            Some(v) => self
+                .declared_version(id, v)
+                .or_else(|| self.pinned_version(id)),
+            None => self.pinned_version(id),
+        }
     }
 
     /// The model id the proxy puts on the wire for a candidate.
     pub fn wire_api_model(&self, id: &CandidateId) -> String {
-        if let Some(version) = self.pinned_version(id) {
-            return version.api_model.clone();
+        match self.pinned_version(id) {
+            Some(version) => version.api_model.clone(),
+            None => self.wire_api_model_unpinned(id),
         }
+    }
+
+    /// The candidate's current wire model, ignoring any pinned version.
+    pub fn wire_api_model_unpinned(&self, id: &CandidateId) -> String {
         self.model_config(id)
             .and_then(|m| m.api_model.clone())
             .unwrap_or_else(|| id.model.clone())
@@ -2223,6 +2250,36 @@ agents:
         assert_eq!(cfg.declared_candidates(), vec![opus.clone()]);
         assert_eq!(cfg.wire_api_model(&opus), "claude-opus-4-6");
         assert_eq!(cfg.model_pricing(&opus).unwrap().input_per_mtok, 5.0);
+    }
+
+    #[test]
+    fn a_session_version_request_overrides_the_configured_pin() {
+        let yaml = format!(
+            "pinned_versions:\n  claude/opus: claude-opus-4-6\n{}",
+            versioned_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        let opus = CandidateId::new("claude", "opus");
+        let api = |requested| {
+            cfg.resolve_version(&opus, requested)
+                .map(|v| v.api_model.as_str())
+        };
+        assert_eq!(
+            api(None),
+            Some("claude-opus-4-6"),
+            "no request: the configured pin"
+        );
+        assert_eq!(
+            api(Some("default")),
+            None,
+            "default forces the current api_model"
+        );
+        assert_eq!(api(Some("claude-opus-4-6")), Some("claude-opus-4-6"));
+        assert_eq!(
+            api(Some("gpt-5.5")),
+            Some("claude-opus-4-6"),
+            "not opus's: the pin"
+        );
     }
 
     #[test]

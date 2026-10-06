@@ -7767,7 +7767,15 @@ async fn pinned_version_keeps_the_candidate_and_discloses_the_version() {
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let session = new_session(&cx).await?;
+        let options = serde_json::to_value(&session.config_options)
+            .unwrap()
+            .to_string();
+        assert!(
+            options.contains(r#""api_model":"m1""#) && options.contains(r#""versions":["m1-old"]"#),
+            "the picker is told which versions it can select — {options}"
+        );
+        let sid = session.session_id.0.to_string();
         prompt_text(&cx, &sid, "implement the feature").await?;
         let routed = agent_text(&observed, &sid);
         assert!(
@@ -7777,6 +7785,21 @@ async fn pinned_version_keeps_the_candidate_and_discloses_the_version() {
         assert!(
             routed.contains("pinned version m1-old"),
             "the disclosure names the version that serves — {routed}"
+        );
+        assert_eq!(open_state(&state).get(&sid).unwrap().model, "m1");
+
+        // A live pin changes version on the next message, without a switch.
+        prompt_text(&cx, &sid, "[router: version=default]\nkeep going").await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(
+            routed.contains("version: a/m1 runs m1"),
+            "the version change is disclosed — {routed}"
+        );
+        prompt_text(&cx, &sid, "[router: version=m9]\nkeep going").await?;
+        let routed = agent_text(&observed, &sid);
+        assert!(
+            routed.contains("m9 is not a version of a/m1; it runs m1-old"),
+            "an undeclared version is named, not hidden — {routed}"
         );
         assert_eq!(open_state(&state).get(&sid).unwrap().model, "m1");
         Ok(())

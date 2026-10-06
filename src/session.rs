@@ -186,6 +186,9 @@ pub struct RouterSession {
     pub effort_request: Option<EffortLevel>,
     /// Candidate-specific result, recomputed whenever the pin changes.
     pub resolved_effort: Option<EffortResolution>,
+    /// `[router: version=…]`: the provider version this session runs (see
+    /// `Config::resolve_version`). Takes effect on the next request.
+    pub version_request: Option<String>,
     /// Soft preference from `[router: prefer=...]`: tried first at pin time,
     /// but falls through to the normal strategy ranking if unavailable.
     pub preferred_candidate: Option<CandidateId>,
@@ -389,6 +392,7 @@ impl RouterSession {
             candidate_override_source: None,
             effort_request: None,
             resolved_effort: None,
+            version_request: None,
             preferred_candidate: None,
             pin: None,
             pinning: false,
@@ -456,6 +460,7 @@ impl RouterSession {
             candidate_override_source: None,
             effort_request: None,
             resolved_effort: None,
+            version_request: None,
             preferred_candidate: None,
             pin: None,
             pinning: false,
@@ -906,6 +911,46 @@ impl Shared {
         self.sessions.lock().unwrap().get_mut(router_sid).map(f)
     }
 
+    /// The version `candidate` runs in this session; `None` = its `api_model`.
+    pub fn version_for(
+        &self,
+        router_sid: &str,
+        candidate: &CandidateId,
+    ) -> Option<crate::config::ModelVersion> {
+        let requested = self
+            .with_session(router_sid, |s| s.version_request.clone())
+            .flatten();
+        self.cfg
+            .resolve_version(candidate, requested.as_deref())
+            .cloned()
+    }
+
+    /// Scores of the version `candidate` runs in this session.
+    pub fn scores_for(
+        &self,
+        router_sid: &str,
+        candidate: &CandidateId,
+    ) -> crate::candidate::ResolvedScores {
+        match self.version_for(router_sid, candidate) {
+            Some(v) => self
+                .scores
+                .lookup_exact(&CandidateId::new(&candidate.agent, &v.api_model)),
+            None => self.scores.lookup_exact(candidate),
+        }
+    }
+
+    /// Pricing of the version `candidate` runs in this session.
+    pub fn pricing_for(
+        &self,
+        router_sid: &str,
+        candidate: &CandidateId,
+    ) -> Option<crate::config::PricingConfig> {
+        match self.version_for(router_sid, candidate) {
+            Some(v) => v.pricing,
+            None => self.cfg.model_config(candidate)?.pricing.clone(),
+        }
+    }
+
     pub fn take_meta_disclosure(&self, router_sid: &str) -> Option<serde_json::Value> {
         self.sessions
             .lock()
@@ -1205,6 +1250,19 @@ impl Shared {
                     if !c.auto_eligible {
                         router_meta["auto_eligible"] = json!(false);
                     }
+                    // Versions a `[router: version=…]` directive can select.
+                    if let Some(model) = self.cfg.model_config(&c.id)
+                        && !model.versions.is_empty()
+                    {
+                        router_meta["api_model"] = json!(self.cfg.wire_api_model_unpinned(&c.id));
+                        router_meta["versions"] = json!(
+                            model
+                                .versions
+                                .iter()
+                                .map(|v| v.api_model.as_str())
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     if let Some(cordon) = usage_cordons.get(&c.id) {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(cordon.reason);
@@ -1265,16 +1323,24 @@ pub fn sid_str(sid: &agent_client_protocol::schema::v1::SessionId) -> String {
 
 /// Re-resolve effort for an already pinned session after a user changes the
 /// router-owned effort option. The next provider request reads this state.
-fn refresh_pinned_effort(scores: &ScoreTable, session: &mut RouterSession) {
+fn refresh_pinned_effort(
+    cfg: &crate::config::Config,
+    scores: &ScoreTable,
+    session: &mut RouterSession,
+) {
     let requested = session.effort_request.or_else(|| {
         session
             .task_class
             .map(|class| automatic_effort(class, session.task_complexity))
     });
-    session.resolved_effort = session
-        .pin
-        .as_ref()
-        .and_then(|pin| requested.map(|level| scores.lookup(&pin.candidate).resolve_effort(level)));
+    let version = session.version_request.as_deref();
+    session.resolved_effort = session.pin.as_ref().and_then(|pin| {
+        let key = match cfg.resolve_version(&pin.candidate, version) {
+            Some(v) => CandidateId::new(&pin.candidate.agent, &v.api_model),
+            None => pin.candidate.clone(),
+        };
+        requested.map(|level| scores.lookup_exact(&key).resolve_effort(level))
+    });
 }
 
 // ----------------------------------------------------------------------
@@ -2624,6 +2690,8 @@ pub struct PromptDirectives {
     pub exclude: Vec<String>,
     pub label: Option<String>,
     pub effort: Option<EffortLevel>,
+    /// `[router: version=<api_model>|default]` — the provider version to run.
+    pub version: Option<String>,
     /// `[router: phase=planning|implementation]` — planner phase override.
     pub phase: Option<crate::config::PlannerPhase>,
 }
@@ -2738,6 +2806,12 @@ pub fn parse_prompt_directives(
                     )
                 })?);
             }
+            "version" => {
+                if value.is_empty() {
+                    return Err("directive version must name an api_model or `default`".into());
+                }
+                directives.version = Some(value.to_string());
+            }
             "phase" => {
                 directives.phase = Some(match value {
                     "planning" => crate::config::PlannerPhase::Planning,
@@ -2752,7 +2826,8 @@ pub fn parse_prompt_directives(
             other => {
                 return Err(format!(
                     "unknown routing directive key `{other}` \
-                     (keys: candidate, prefer, switch, strategy, exclude, label, effort, phase)"
+                     (keys: candidate, prefer, switch, strategy, exclude, label, effort, version, \
+                     phase)"
                 ));
             }
         }
@@ -3165,9 +3240,9 @@ fn prefer_larger_context(
 
 /// Name the pinned version on each ranked candidate that runs one, so the
 /// disclosure says which model actually serves.
-fn note_pinned_versions(cfg: &crate::config::Config, ranked: &mut [RankedCandidate]) {
+fn note_pinned_versions(shared: &Shared, router_sid: &str, ranked: &mut [RankedCandidate]) {
     for rc in ranked.iter_mut() {
-        let Some(version) = cfg.pinned_version(&rc.candidate) else {
+        let Some(version) = shared.version_for(router_sid, &rc.candidate) else {
             continue;
         };
         let note = format!("pinned version {}", version.api_model);
@@ -3482,7 +3557,7 @@ async fn pin_session(
         ranked.insert(0, rc);
     }
 
-    note_pinned_versions(&shared.cfg, &mut ranked);
+    note_pinned_versions(shared, router_sid, &mut ranked);
 
     // 4. Walk the ranked list until a candidate opens and verifies,
     //    remembering why each earlier candidate was skipped.
@@ -3524,13 +3599,18 @@ async fn pin_session(
                             .collect()
                     })
                     .unwrap_or_default();
-                let pin_quality = shared.scores.lookup(&candidate).quality(profile.class);
+                let pin_quality = shared
+                    .scores_for(router_sid, &candidate)
+                    .quality(profile.class);
                 let requested_effort = shared
                     .with_session(router_sid, |s| s.effort_request)
                     .flatten()
                     .or(profile.effort.filter(|level| *level != EffortLevel::Auto));
-                let resolved_effort = requested_effort
-                    .map(|level| shared.scores.lookup(&candidate).resolve_effort(level));
+                let resolved_effort = requested_effort.map(|level| {
+                    shared
+                        .scores_for(router_sid, &candidate)
+                        .resolve_effort(level)
+                });
                 let mode_to_apply = shared
                     .with_session(router_sid, |s| {
                         s.pin = Some(PinInfo {
@@ -4518,7 +4598,7 @@ async fn send_prompt_with_failover(
                 // Re-pinning to an equally small window can hit the same wall
                 // when the prompt itself is the oversized part.
                 let larger_context_than = overflowed
-                    .then(|| shared.scores.lookup(&candidate).context_window)
+                    .then(|| shared.scores_for(&router_sid, &candidate).context_window)
                     .flatten();
 
                 // Tear down the failed downstream session and re-pin.
@@ -6984,12 +7064,12 @@ fn on_set_config_option(
                         match EffortLevel::parse(&value) {
                             Some(EffortLevel::Auto) => {
                                 session.effort_request = None;
-                                refresh_pinned_effort(&shared.scores, session);
+                                refresh_pinned_effort(&shared.cfg, &shared.scores, session);
                                 Action::RouterUpdated
                             }
                             Some(level) => {
                                 session.effort_request = Some(level);
-                                refresh_pinned_effort(&shared.scores, session);
+                                refresh_pinned_effort(&shared.cfg, &shared.scores, session);
                                 Action::RouterUpdated
                             }
                             None => Action::BadValue(format!(
@@ -7394,8 +7474,8 @@ fn on_prompt(
                     }
                 }
             }
-            // Effort may change on a live pin; the remaining routing directives
-            // only shape the still-unmade routing decision.
+            // Effort and version may change on a live pin; the remaining
+            // routing directives only shape the still-unmade routing decision.
             let has_pre_pin_directives = directives.strategy.is_some()
                 || directives.candidate.is_some()
                 || directives.prefer.is_some()
@@ -7403,10 +7483,15 @@ fn on_prompt(
                 || directives.label.is_some();
             let applied = shared
                 .with_session(&router_sid, |s| {
+                    if directives.version.is_some() {
+                        s.version_request = directives.version.clone();
+                    }
                     if s.pin.is_some() || s.pinning {
                         if let Some(effort) = directives.effort {
                             s.effort_request = (effort != EffortLevel::Auto).then_some(effort);
-                            refresh_pinned_effort(&shared.scores, s);
+                        }
+                        if directives.effort.is_some() || directives.version.is_some() {
+                            refresh_pinned_effort(&shared.cfg, &shared.scores, s);
                             true
                         } else {
                             false
@@ -7446,6 +7531,28 @@ fn on_prompt(
                     "router-acp · note: routing directive ignored (session already pinned; \
                      use switch= to change models mid-session)",
                 );
+            }
+            // On a live pin, say which version the next request runs. A
+            // version the pinned model does not declare is named, not hidden.
+            let pinned = shared
+                .with_session(&router_sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+                .flatten();
+            if let (Some(requested), Some(candidate)) = (directives.version.as_deref(), pinned) {
+                let running = shared
+                    .version_for(&router_sid, &candidate)
+                    .map(|v| v.api_model)
+                    .unwrap_or_else(|| shared.cfg.wire_api_model_unpinned(&candidate));
+                let declared = requested == crate::config::DEFAULT_VERSION
+                    || shared.cfg.declared_version(&candidate, requested).is_some();
+                let note = if declared {
+                    format!("router-acp · version: {candidate} runs {running}")
+                } else {
+                    format!(
+                        "router-acp · version: {requested} is not a version of {candidate}; \
+                         it runs {running}"
+                    )
+                };
+                notify_user(&shared, &router_sid, &note);
             }
         }
         Err(msg) => {
@@ -8473,6 +8580,17 @@ mod directive_tests {
         assert_eq!(dir.prefer.unwrap().to_string(), "codex/gpt-5.5");
         assert_eq!(dir.switch.unwrap().to_string(), "claude/opus[1m]");
         assert_eq!(text(&stripped), "go");
+    }
+
+    #[test]
+    fn parses_a_version_directive() {
+        let prompt = vec![ContentBlock::from(
+            "[router: switch=claude/opus, version=claude-opus-4-6]\ngo".to_string(),
+        )];
+        let (dir, _) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.version.as_deref(), Some("claude-opus-4-6"));
+        let empty = vec![ContentBlock::from("[router: version=]\ngo".to_string())];
+        assert!(parse_prompt_directives(&empty).is_err());
     }
 
     #[test]

@@ -462,7 +462,12 @@ impl ScoreTable {
     /// Look up scores for a candidate; the first matching pattern wins,
     /// falling back to neutral defaults.
     pub fn lookup(&self, id: &CandidateId) -> ResolvedScores {
-        let key = self.pinned.get(id).unwrap_or(id).to_string();
+        self.lookup_exact(self.pinned.get(id).unwrap_or(id))
+    }
+
+    /// `lookup` without the `pinned_versions` mapping: `id` is matched as is.
+    pub fn lookup_exact(&self, id: &CandidateId) -> ResolvedScores {
+        let key = id.to_string();
         for (pattern, entry) in &self.entries {
             if glob_match(pattern, &key) {
                 return entry.clone();

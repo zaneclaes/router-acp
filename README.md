@@ -251,11 +251,13 @@ Recipes and scripts (or any client that can't set ACP session config options, li
 [router: exclude=claude|codex/gpt-5.4-mini]         # ban lineages/candidates
 [router: switch=claude/opus[1m]]                    # change models mid-session
 [router: switch=claude/opus[1m]] now what?          # …and prompt it in one line
+[router: version=claude-opus-4-6]                   # run a declared older version
+[router: version=default]                           # back to the current api_model
 ```
 
 The router strips the tag (downstream models never see it), fails loudly on invalid directives, and records applied directives in the disclosure and state file. `candidate`, `prefer`, `strategy`, and `exclude` apply **pre-pin only** (post-pin: stripped + visible "ignored" note); `exclude` persists for the session, including failover re-pins. `prefer` is a *soft* pin — the named candidate goes to the front of the ranked chain if it is eligible, otherwise routing falls back to the strategy's normal winner rather than erroring.
 
-`switch` is the exception that works **mid-session**: it hands the live conversation to a different model (see below). These directives let any CLI client steer routing even though it can't set ACP session config options.
+`switch` is the exception that works **mid-session**: it hands the live conversation to a different model (see below). `version` also works at any time and takes effect on the next provider request without a switch: the candidate, its downstream session and its transcript stay put; only the wire model (and its pricing, scores and effort mapping) changes. It names one of the model's `versions[].api_model` or `default`, overrides `pinned_versions` for this session, and a version the pinned model does not declare is named in the disclosure and falls back to `pinned_versions`. Each candidate option advertises `api_model` and `versions` in `_meta.router_acp` when it has versions. These directives let any CLI client steer routing even though it can't set ACP session config options.
 
 ## Switching models mid-session
 
