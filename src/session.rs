@@ -1064,16 +1064,6 @@ impl Shared {
             .find(|v| &v.id == id)
     }
 
-    pub(crate) fn eligible_views_excluding(
-        &self,
-        required: &RequiredCaps,
-        class: TaskClass,
-        admit: Option<&CandidateId>,
-        excluded: &[String],
-    ) -> Vec<CandidateView> {
-        self.eligible_views_inner(required, class, admit, false, excluded)
-    }
-
     fn eligible_views_inner(
         &self,
         required: &RequiredCaps,
@@ -1081,6 +1071,18 @@ impl Shared {
         admit: Option<&CandidateId>,
         explicit_pick: bool,
         excluded: &[String],
+    ) -> Vec<CandidateView> {
+        self.eligible_views_filtered(required, class, admit, explicit_pick, excluded, |_| true)
+    }
+
+    fn eligible_views_filtered(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+        admit: Option<&CandidateId>,
+        explicit_pick: bool,
+        excluded: &[String],
+        matches: impl Fn(&CandidateView) -> bool,
     ) -> Vec<CandidateView> {
         let candidates = self.routeable_candidates_inner(explicit_pick);
         let cfg = self.runtime_config();
@@ -1200,6 +1202,7 @@ impl Shared {
                 id: c.id,
             });
         }
+        views.retain(matches);
         crate::accounts::prioritize(&mut views, &cfg.agents, admit);
         if !self.cfg.availability_preference.enabled {
             for view in &mut views {
@@ -3443,21 +3446,43 @@ async fn pin_session(
         .unwrap_or_default();
     let mut selection_exclusions = excluded_patterns.clone();
     selection_exclusions.extend(exclude.map(ToString::to_string));
-    let mut pool = shared.eligible_views_excluding(
+    let agents = shared.agent_configs();
+    let automatic_group = override_
+        .as_ref()
+        .filter(|_| !user_pick)
+        .and_then(|candidate| {
+            agents
+                .iter()
+                .find(|agent| agent.name == candidate.agent)
+                .and_then(crate::accounts::provider)
+        });
+    let mut pool = shared.eligible_views_filtered(
         &required,
         profile.class,
         picked.as_ref(),
+        false,
         &selection_exclusions,
+        |view| {
+            coordinator_admits(view)
+                && auto_effort.is_none_or(|effort| {
+                    let scores = shared.scores_for(router_sid, &view.id);
+                    scores.effort_levels.contains(&effort)
+                        && scores.effort_mapping.contains_key(&effort)
+                })
+                && automatic_group.is_none_or(|group| {
+                    let view_group = agents
+                        .iter()
+                        .find(|agent| agent.name == view.id.agent)
+                        .and_then(crate::accounts::provider);
+                    view_group != Some(group)
+                        || override_
+                            .as_ref()
+                            .is_some_and(|candidate| candidate.model == view.id.model)
+                })
+        },
     );
-    pool.retain(|v| coordinator_admits(v));
     if let Some(min) = larger_context_than {
         pool = prefer_larger_context(shared, router_sid, pool, min);
-    }
-    if let Some(effort) = auto_effort {
-        pool.retain(|view| {
-            let scores = shared.scores_for(router_sid, &view.id);
-            scores.effort_levels.contains(&effort) && scores.effort_mapping.contains_key(&effort)
-        });
     }
     if pool.is_empty() {
         return Err(if coordinator {
@@ -4886,7 +4911,14 @@ pub(crate) fn first_eligible_candidate(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let views = shared.eligible_views_excluding(&RequiredCaps::default(), class, None, excluded);
+    let views = shared.eligible_views_filtered(
+        &RequiredCaps::default(),
+        class,
+        None,
+        false,
+        excluded,
+        |view| patterns.iter().any(|pattern| view_matches(pattern, view)),
+    );
     views
         .iter()
         .filter_map(|v| {
@@ -4920,7 +4952,14 @@ fn first_matching_pattern_candidate(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let views = shared.eligible_views_excluding(&RequiredCaps::default(), class, None, excluded);
+    let views = shared.eligible_views_filtered(
+        &RequiredCaps::default(),
+        class,
+        None,
+        false,
+        excluded,
+        |view| patterns.iter().any(|pattern| view_matches(pattern, view)),
+    );
     patterns.iter().find_map(|pat| {
         views
             .iter()

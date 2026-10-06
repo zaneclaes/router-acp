@@ -6464,6 +6464,98 @@ async fn account_priority_spends_later_included_plan_before_earlier_overage() {
 }
 
 #[tokio::test]
+async fn account_priority_filters_skill_models_before_plan_and_account_order() {
+    for selection in ["best-quality", "first-match"] {
+        for earlier_opus_overage in [false, true] {
+            let first_model = if earlier_opus_overage {
+                "opus"
+            } else {
+                "sonnet"
+            };
+            let second_model = if earlier_opus_overage {
+                "sonnet"
+            } else {
+                "opus"
+            };
+            let expected = if earlier_opus_overage {
+                "claude@first"
+            } else {
+                "claude@second"
+            };
+            let other = if earlier_opus_overage {
+                "claude@second"
+            } else {
+                "claude@first"
+            };
+            let mut first = agent_yaml("claude@first", &[(first_model, 3)], &[]);
+            first.push_str("    account_priority: 0\n");
+            let mut second = agent_yaml("claude@second", &[(second_model, 3)], &[]);
+            second.push_str("    account_priority: 1\n");
+            let yaml = format!(
+                "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\n\
+                 auto_upgrade: {{enabled: false}}\nskill_routing:\n  - pattern: review-branch\n\
+                 \x20   selection: {selection}\n    candidates: [\"*opus*\"]\nagents:\n{first}{second}",
+                temp_state_file("priority-skill-models").display()
+            );
+            run_test_shared(yaml, async |cx, _observed, shared| {
+                init(&cx).await?;
+                shared.headroom.lock().unwrap().set_polled_availability(
+                    [
+                        (
+                            CandidateId::new("claude@first", first_model),
+                            plan_availability(
+                                if earlier_opus_overage { 0.0 } else { 1.0 },
+                                earlier_opus_overage,
+                            ),
+                        ),
+                        (
+                            CandidateId::new("claude@second", second_model),
+                            plan_availability(0.25, false),
+                        ),
+                    ]
+                    .into(),
+                );
+                let sid = new_session(&cx).await?.session_id.0.to_string();
+                prompt_text(&cx, &sid, "Run /review-branch").await?;
+                assert_eq!(
+                    shared
+                        .with_session(&sid, |session| session
+                            .pin
+                            .as_ref()
+                            .unwrap()
+                            .candidate
+                            .clone())
+                        .unwrap(),
+                    CandidateId::new(expected, "opus")
+                );
+
+                let sid = new_session(&cx).await?.session_id.0.to_string();
+                prompt_text(
+                    &cx,
+                    &sid,
+                    &format!("[router: candidate={other}/sonnet]\nwarm up"),
+                )
+                .await?;
+                prompt_text(&cx, &sid, "Run /review-branch").await?;
+                assert_eq!(
+                    shared
+                        .with_session(&sid, |session| session
+                            .pin
+                            .as_ref()
+                            .unwrap()
+                            .candidate
+                            .clone())
+                        .unwrap(),
+                    CandidateId::new(expected, "opus")
+                );
+                Ok(())
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_accounts_fail_over_without_cordoning_the_other_login() {
     let state = temp_state_file("accounts");
     let yaml = format!(
