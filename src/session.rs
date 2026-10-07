@@ -3385,16 +3385,28 @@ async fn pin_session(
         (Some(o), Some(x)) if o == x => None,
         _ => override_,
     };
-    // An explicit pin to a usage-cordoned candidate is not honored: drop the
-    // override so routing picks the best non-cordoned candidate, and record the
-    // redirect for the disclosure.
-    let mut cordon_redirect: Option<(CandidateId, String, String)> = None;
+    // A saved or explicit pin cannot keep an exhausted account selected.
+    // Drop the override and disclose the redirect, even when paid-usage
+    // permission exhausts the seat without installing a usage cordon.
+    let mut cordon_redirect: Option<(CandidateId, String, Option<String>)> = None;
     let override_ = match override_ {
         Some(cand) => {
-            let cordon = shared.headroom.lock().unwrap().usage_cordon(&cand).cloned();
-            match cordon {
-                Some(c) => {
-                    cordon_redirect = Some((cand, c.reason, c.resets_at_rfc3339));
+            let unavailable = {
+                let headroom = shared.headroom.lock().unwrap();
+                if let Some(cordon) = headroom.usage_cordon(&cand) {
+                    Some((
+                        cordon.reason.clone(),
+                        Some(cordon.resets_at_rfc3339.clone()),
+                    ))
+                } else if headroom.seat_exhausted(&cand) {
+                    Some(("account plan exhausted with no usable overage".into(), None))
+                } else {
+                    None
+                }
+            };
+            match unavailable {
+                Some((reason, resets)) => {
+                    cordon_redirect = Some((cand, reason, resets));
                     None
                 }
                 None => Some(cand),
@@ -3930,11 +3942,16 @@ async fn pin_session(
                 // existing clients parse it unchanged); otherwise the normal
                 // routing line.
                 let mut lines = vec![match &cordon_redirect {
-                    Some((_from, reason, resets)) => format!(
+                    Some((_from, reason, Some(resets))) => format!(
                         "router-acp · failover: cordon → {} · task {} ({reason}, resets {})",
                         candidate,
                         profile.class.as_str(),
                         resets.split('T').next().unwrap_or(resets),
+                    ),
+                    Some((_from, reason, None)) => format!(
+                        "router-acp · failover: cordon → {} · task {} ({reason})",
+                        candidate,
+                        profile.class.as_str(),
                     ),
                     None => format!(
                         "router-acp · {}{} → {} · task {} (complexity {:.2})",

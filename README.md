@@ -146,6 +146,8 @@ Accounts use lower `priority` numbers first. For example, `priority: 0`, `priori
 
 `reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves. See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.
 
+A saved account pin also yields when its included plan is exhausted and paid usage is unavailable or denied. The router announces the replacement and applies the session's normal strategy. An unavailable prompt pin cannot block an eligible sibling, even when static fallback is disabled. A configured static strategy retains its own fallback policy.
+
 ### Token limits, outages, and failover
 
 The router degrades gracefully when seats run dry or adapters fall over, and it always tells the user what happened.

@@ -7152,6 +7152,86 @@ async fn account_overage_grant_outlives_short_quota_hint_ttl() {
 }
 
 #[tokio::test]
+async fn explicit_pin_to_spent_account_fails_over_to_available_sibling() {
+    let state = temp_state_file("spent-account-pin");
+    let yaml = format!(
+        "state_file: {}\nrouter: auto\nrouters:\n  static: {{ candidate: 'claude@home/sonnet', allow_fallback: false }}\n\
+         delegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("claude@home", &[("sonnet", 2)], &[]),
+        agent_yaml("claude@backup", &[("sonnet", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let home = CandidateId::new("claude@home", "sonnet");
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_polled_availability(std::collections::HashMap::from([(
+                home.clone(),
+                router_acp::headroom::SeatAvailability {
+                    plan_headroom: 0.0,
+                    plan_remaining_dollars: None,
+                    on_overage: true,
+                    overage_headroom: Some(0.9),
+                    overage_remaining_dollars: Some(90.0),
+                    source: "poll",
+                },
+            )]));
+        cx.send_notification(agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({"agents": [{"agent": "claude@home", "overage_allowed": false}]}),
+        )?)?;
+        for _ in 0..50 {
+            if shared.headroom.lock().unwrap().seat_exhausted(&home) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(shared.headroom.lock().unwrap().seat_exhausted(&home));
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&home)
+                .is_none()
+        );
+
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@home/sonnet] continue the work",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("claude@backup/sonnet"),
+            "fallback must be disclosed: {text}"
+        );
+        assert!(
+            text.contains("account plan exhausted with no usable overage"),
+            "the exhausted pin must be explained: {text}"
+        );
+        assert!(
+            text.contains("echo:sonnet:"),
+            "the sibling must answer: {text}"
+        );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|s| s.routing)
+            .expect("routing recorded");
+        assert_eq!(routing["candidate"], "claude@backup/sonnet");
+        assert_eq!(routing["cordon_redirect"]["from"], "claude@home/sonnet");
+        assert!(routing["cordon_redirect"]["resets_at"].is_null());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn availability_hint_penalizes_overage_seat() {
     let state = temp_state_file("avail-hint");
     let log = temp_log("avail-hint");

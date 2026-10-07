@@ -401,6 +401,13 @@ SDK traps below, which were all discovered the hard way.
   via `switch_pin` (summarize on the current model → open fresh downstream →
   seed the summary into the next prompt → close old). They exist because CLI
   clients can't set ACP config options.
+- **Exhausted prompt pins** — `pin_session` drops an explicit/saved candidate
+  override when either `usage_cordon` or `seat_exhausted` excludes it. Paid-usage
+  denial can exhaust a seat without installing a usage cordon. Keep both gates,
+  release the headroom lock before disclosure/selection, and record the redirect
+  without inventing a reset timestamp. The normal session strategy resumes;
+  a configured static strategy still obeys its own `allow_fallback` policy.
+  Protocol regression: `explicit_pin_to_spent_account_fails_over_to_available_sibling`.
 - **`model:` shorthand** — a prompt beginning (after any `<turn-context>`
   preamble) with `<ref>:` is sugar for `switch=`/`candidate=`.
   `split_model_shorthand` extracts the leading token; `resolve_candidate_ref`
