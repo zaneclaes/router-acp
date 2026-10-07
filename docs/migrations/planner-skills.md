@@ -124,6 +124,8 @@ The parent checkout is never used for child writes.
 
 `/plan` selects `create-plan`.
 `/implement` selects `select-plan`.
+A direct human request beginning with `implement`, such as `implement ROADMAP.md`, selects the same implementation workflow.
+Quoted examples and internal role or agent-origin messages do not authorize execution.
 An implementation command records the authentic execution request before child admission.
 
 Only the original leading human prompt is eligible for mode parsing.
@@ -281,13 +283,14 @@ routers:
 
 1. The user sends `/plan add a bounded parser improvement`.
 2. The parent runs `create-plan` and records a plan path and required checks.
-3. The parent runs `select-plan` and admits one `WorkSpec`.
-4. The parent calls `delegate_task` with the admitted `work_id`.
-5. The child reports `artifact` with the current Git revision and test evidence.
-6. The parent sends `review` with acceptance or corrections.
-7. The child sends `finished` after the accepted revision and handoff checks.
-8. The parent sends `integrate` after repository integration checks.
-9. The parent sends `complete` only after all receipts and wakes are reconciled.
+3. The user sends `/implement` for the authorized plan.
+4. The parent runs `select-plan` and admits one `WorkSpec`.
+5. The parent calls `delegate_task` with the admitted `work_id`.
+6. The child reports `artifact` with the current Git revision and test evidence.
+7. The parent sends `review` with acceptance or corrections.
+8. The child sends `finished` after the accepted revision and handoff checks.
+9. The parent sends `integrate` after repository integration checks.
+10. The parent sends `complete` only after all receipts and wakes are reconciled.
 
 The generic profile must require repository-declared checks.
 It must leave deployment evidence pending when the repository declares deployment as required.
