@@ -4461,7 +4461,9 @@ fn build_background_instructions() -> String {
      The router's `background_start` tool is available. Use it for every \
      long-running watcher, monitor, server, or background shell instead of a \
      provider-native `run_in_background` mode. It returns immediately while the \
-     ACP client keeps the process visible, inspectable, and cancellable."
+     ACP client keeps the process visible, inspectable, and cancellable. A \
+     watcher should exit when its condition fires; Kory Code wakes you with its \
+     exit status and output."
         .to_string()
 }
 
@@ -8427,6 +8429,8 @@ mod prompt_framing_tests {
         let text = build_background_instructions();
         assert!(text.contains("background_start"), "{text}");
         assert!(text.contains("run_in_background"), "{text}");
+        assert!(text.contains("exit when its condition fires"), "{text}");
+        assert!(text.contains("Kory Code wakes you"), "{text}");
         assert!(
             text.contains("visible, inspectable, and cancellable"),
             "{text}"
