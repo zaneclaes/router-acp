@@ -135,6 +135,13 @@ When a host generates this configuration, it must preserve the router's membersh
 
 Type `/usage` for a deterministic account report with ASCII bars, percentages, reset times, reserve ceilings, credits, cache timestamps and errors. It reads router snapshots and never sends your command to a model or starts an upstream usage request. Grok reports its access gate because it has no numeric plan meter.
 
+Hosts that also offer direct Claude or Codex sessions should supervise
+`router-acp usage-monitor --config ~/.config/router-acp/router.yaml`. The
+monitor reloads that config before each cycle and keeps every account's shared
+snapshot current when no router conversation is active. Provider requests,
+credential isolation, cache locking and refresh cadence remain inside
+router-acp. The host only reads the published snapshots.
+
 Accounts use lower `priority` numbers first. For example, `priority: 0`, `priority: 1`, and `priority: 2` drain in that order. A configured `agents[].accounts` list defaults to its list order. The expanded standalone form uses `agents[].account_priority`. This is an eligibility gate before model ranking. A later account becomes eligible when earlier accounts are cordoned, exhausted or unavailable. Remaining included plans take precedence over paid overage. Explicit account picks can override order, but cannot bypass reserves or cordons.
 
 `reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves. See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.

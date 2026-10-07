@@ -16,6 +16,7 @@
 //! overlapping refreshes must not temporarily reopen reserved capacity.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -27,6 +28,35 @@ use crate::headroom::{SeatAvailability, UsageCordon};
 use crate::session::Shared;
 
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+/// Run the router-owned usage poller without serving ACP. Hosts that expose
+/// direct provider sessions can supervise this process so the same isolated
+/// account caches stay current even when no router conversation is active.
+/// Reloading the atomically-published config before each cycle picks up login,
+/// reserve and priority changes without making the host own polling behavior.
+pub async fn monitor(config_path: PathBuf) -> anyhow::Result<()> {
+    loop {
+        let interval = monitor_once(&config_path).await?;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn monitor_once(config_path: &std::path::Path) -> anyhow::Result<Duration> {
+    let cfg = crate::config::Config::from_file(config_path)?;
+    let interval = Duration::from_secs(cfg.cordon.poll_secs.max(30));
+    let shared = crate::session::Shared::new(cfg)
+        .map_err(|err| anyhow::anyhow!("invalid router runtime: {err:?}"))?;
+    // The supervisor only marks this process healthy after config validation,
+    // never merely because an executable could be spawned.
+    println!(
+        "{}",
+        serde_json::json!({"event": "usage_monitor", "status": "ready"})
+    );
+    if shared.cfg.cordon.enabled {
+        refresh_and_install(&shared).await;
+    }
+    Ok(interval)
+}
 
 /// Extension notification a client may send to share its own (often fresher)
 /// view of seat availability — see [`apply_availability_hint`] for the shape.
@@ -1692,6 +1722,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn usage_monitor_reloads_config_each_cycle_and_uses_the_poll_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("router.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+state_file: {}
+cordon: {{poll_secs: 1}}
+agents:
+  - name: claude
+    command: {{type: stdio, command: /bin/true}}
+    model_selection: {{type: config-option}}
+    models: [{{id: sonnet, cost_rank: 1}}]
+"#,
+                dir.path().join("state.db").display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            monitor_once(&config).await.unwrap(),
+            Duration::from_secs(30)
+        );
+        std::fs::write(&config, "not valid router yaml").unwrap();
+        assert!(
+            monitor_once(&config).await.is_err(),
+            "the next cycle re-reads the file"
+        );
+    }
     #[test]
     fn claude_keychain_service_matches_cli_account_isolation() {
         let cfg = crate::config::Config::from_yaml(

@@ -186,8 +186,13 @@ SDK traps below, which were all discovered the hard way.
   2026-07-21). Its credits gate requires *usable* credits (`unlimited` or a
   positive `balance`) — a bare `has_credits: true` with `balance: null` is
   reported on team plans whose seat is hard-blocked, and failing open on it
-  routed four consecutive conversations to a dead seat. Tests:
-  `usage::tests` (pure, both providers) +
+  routed four consecutive conversations to a dead seat.
+  Hosts that also run provider adapters directly supervise
+  `router-acp usage-monitor --config …`. That router-owned process reloads the
+  config before each poll and keeps the same account-isolated shared caches
+  current without an active ACP router conversation. The host remains a cache
+  reader and process supervisor; it never performs provider usage requests.
+  Tests: `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
 - **Grok `ask_user_question`** (`src/xai_questions.rs`): Grok emits vendor
