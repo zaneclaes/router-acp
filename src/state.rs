@@ -1215,6 +1215,17 @@ impl StateFile {
 
     fn init_schema(&self, kind: FileKind) -> rusqlite::Result<()> {
         let sql = r#"
+        CREATE TABLE IF NOT EXISTS planner_runs (
+            session_id TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL,
+            document TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS planner_workspaces (
+            path TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            work_id TEXT NOT NULL,
+            lease TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS sessions (
             router_session_id     TEXT PRIMARY KEY,
             agent                 TEXT NOT NULL,
@@ -1402,6 +1413,97 @@ impl StateFile {
                 return Err(err);
             }
         }
+        Ok(())
+    }
+
+    pub fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.conn
+            .query_row(
+                "SELECT revision, document FROM planner_runs WHERE session_id = ?1",
+                [sid],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|(rev, doc)| {
+                serde_json::from_str(&doc)
+                    .map(|v| (rev, v))
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
+    /// Optimistic transactional claiming. Independent router processes cannot
+    /// overwrite a newer assignment, receipt, or input acknowledgement.
+    pub fn save_planner_run(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        let doc = serde_json::to_string(document).map_err(|e| e.to_string())?;
+        let changed = if expected == 0 {
+            self.conn.execute("INSERT OR IGNORE INTO planner_runs (session_id, revision, document) VALUES (?1, 1, ?2)", params![sid, doc])
+        } else {
+            self.conn.execute("UPDATE planner_runs SET revision = revision + 1, document = ?1 WHERE session_id = ?2 AND revision = ?3", params![doc, sid, expected as i64])
+        }.map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("planner state changed concurrently; reload before retrying".into());
+        }
+        Ok(expected + 1)
+    }
+
+    /// Commit planner state and new wake deliveries as one durable transition.
+    pub fn save_planner_run_with_wakes(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+        events: &[String],
+    ) -> Result<u64, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let revision = self.save_planner_run(sid, expected, document)?;
+        for payload in events {
+            tx.execute(
+                "INSERT INTO hook_outbox (payload, created_at) VALUES (?1, ?2)",
+                params![payload, now_epoch() as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(revision)
+    }
+
+    pub fn claim_planner_workspace(
+        &self,
+        path: &Path,
+        sid: &str,
+        work_id: &str,
+        lease: &str,
+    ) -> Result<(), String> {
+        let canonical = path.display().to_string();
+        self.conn.execute("INSERT OR IGNORE INTO planner_workspaces (path, session_id, work_id, lease) VALUES (?1, ?2, ?3, ?4)", params![canonical, sid, work_id, lease]).map_err(|e| e.to_string())?;
+        let owned: bool = self.conn.query_row("SELECT session_id = ?2 AND work_id = ?3 AND lease = ?4 FROM planner_workspaces WHERE path = ?1", params![canonical, sid, work_id, lease], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !owned {
+            return Err(format!(
+                "workspace {canonical} is held by another durable assignment"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Merge independent routing context fields atomically, without resetting
+    /// metering, pin lineage, or diagnostics captured by another writer.
+    pub fn patch_session_routing(
+        &self,
+        sid: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.conn.execute("UPDATE sessions SET routing = json_patch(COALESCE(routing, '{}'), ?1) WHERE router_session_id = ?2",
+            params![patch.to_string(), sid]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
