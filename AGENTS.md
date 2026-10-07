@@ -303,6 +303,12 @@ SDK traps below, which were all discovered the hard way.
     `auto::tests::cost_aversion_raises_the_paid_frontier_difficulty_bar`,
     `overage_seat_with_more_dollars_left_beats_higher_fraction_smaller_cap`
     (protocol E2E — a HIGHER fraction with FEWER dollars must still lose).
+  - Client `overage_allowed` permissions are separate from quota hints and
+    apply to exact account agents, including windowless entries and disabled
+    availability scaling. Denial persists until replaced. Grants expire at the
+    hint TTL or `overage_expires_at`, then deny. Null clears the client policy.
+    Native polls retain independent quota numbers and reserve cordons. Test
+    policy through ACP with native readings, sibling accounts and grant expiry.
 - **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by
   default): bind the loopback listener before spawning adapters, then inject
   their process-level base URL. Forward auth, paths, query strings, and SSE;

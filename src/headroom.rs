@@ -181,6 +181,9 @@ pub struct HeadroomTracker {
     /// expiry — a fresh hint wins over the poll for that agent's candidates;
     /// an expired one is ignored (the poll remains the floor).
     availability_hints: HashMap<String, (HashMap<CandidateId, SeatAvailability>, SystemTime)>,
+    /// Client paid-usage consent, independent of provider quota readings.
+    /// None denies overage; a deadline grants it until that instant.
+    overage_permissions: HashMap<String, Option<SystemTime>>,
 }
 
 impl HeadroomTracker {
@@ -198,6 +201,7 @@ impl HeadroomTracker {
             candidate_cordons: HashMap::new(),
             availability_poll: HashMap::new(),
             availability_hints: HashMap::new(),
+            overage_permissions: HashMap::new(),
         }
     }
 
@@ -319,6 +323,15 @@ impl HeadroomTracker {
             .insert(agent.to_string(), (availability, expires_at));
     }
 
+    pub fn set_overage_permission(&mut self, agent: &str, expires_at: Option<SystemTime>) {
+        self.overage_permissions
+            .insert(agent.to_string(), expires_at);
+    }
+
+    pub fn clear_overage_permission(&mut self, agent: &str) {
+        self.overage_permissions.remove(agent);
+    }
+
     /// Seat availability for a candidate: the client hint while fresh (the
     /// client's view is typically newer than the poll), else the poller's.
     /// `None` means no source has data — the candidate's static preference
@@ -328,13 +341,25 @@ impl HeadroomTracker {
     }
 
     pub fn availability_at(&self, id: &CandidateId, now: SystemTime) -> Option<SeatAvailability> {
-        if let Some((map, expires_at)) = self.availability_hints.get(&id.agent)
+        let hinted = if let Some((map, expires_at)) = self.availability_hints.get(&id.agent)
             && *expires_at > now
             && let Some(a) = map.get(id)
         {
-            return Some(a.clone());
+            Some(a)
+        } else {
+            None
+        };
+        let mut availability = hinted.or_else(|| self.availability_poll.get(id)).cloned()?;
+        if self
+            .overage_permissions
+            .get(&id.agent)
+            .is_some_and(|deadline| deadline.is_none_or(|expires_at| expires_at <= now))
+        {
+            availability.on_overage = false;
+            availability.overage_headroom = None;
+            availability.overage_remaining_dollars = None;
         }
-        self.availability_poll.get(id).cloned()
+        Some(availability)
     }
 
     /// True when the freshest availability report says this candidate's seat is
@@ -360,7 +385,13 @@ impl HeadroomTracker {
                 out.extend(map.iter().map(|(id, a)| (id.clone(), a.clone())));
             }
         }
-        let mut list: Vec<_> = out.into_iter().collect();
+        let mut list: Vec<_> = out
+            .into_keys()
+            .filter_map(|id| {
+                self.availability_at(&id, now)
+                    .map(|availability| (id, availability))
+            })
+            .collect();
         list.sort_by_key(|(id, _)| id.to_string());
         list
     }
@@ -697,6 +728,58 @@ mod tests {
         // A hint for one agent never affects another's candidates.
         let other = CandidateId::new("codex", "gpt-5.5");
         assert!(t.availability_at(&other, now).is_none());
+    }
+
+    #[test]
+    fn overage_permission_preserves_quota_and_expires_to_denial() {
+        let mut t = tracker(10);
+        let id = CandidateId::new("claude@personal", "sonnet");
+        let sibling = CandidateId::new("claude", "sonnet");
+        let now = SystemTime::now();
+        let paying = SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.8),
+            overage_remaining_dollars: Some(40.0),
+            source: "poll",
+        };
+        t.set_polled_availability(HashMap::from([
+            (id.clone(), paying.clone()),
+            (sibling.clone(), paying.clone()),
+        ]));
+        t.set_overage_permission(&id.agent, None);
+        assert!(t.seat_exhausted_at(&id, now));
+        assert_eq!(t.availability_at(&sibling, now), Some(paying.clone()));
+        assert!(
+            !t.availabilities()
+                .iter()
+                .find(|(i, _)| i == &id)
+                .unwrap()
+                .1
+                .on_overage
+        );
+
+        t.set_overage_permission(&id.agent, Some(now + Duration::from_secs(30)));
+        assert_eq!(t.availability_at(&id, now), Some(paying.clone()));
+        assert!(t.seat_exhausted_at(&id, now + Duration::from_secs(31)));
+        t.clear_overage_permission(&id.agent);
+        assert_eq!(t.availability_at(&id, now), Some(paying));
+
+        t.set_overage_permission(&id.agent, None);
+        t.set_polled_availability(HashMap::from([(
+            id.clone(),
+            SeatAvailability {
+                plan_headroom: 0.3,
+                on_overage: false,
+                overage_headroom: Some(0.8),
+                overage_remaining_dollars: Some(40.0),
+                plan_remaining_dollars: None,
+                source: "poll",
+            },
+        )]));
+        assert_eq!(t.availability_at(&id, now).unwrap().plan_headroom, 0.3);
+        assert!(!t.seat_exhausted_at(&id, now));
     }
 
     #[test]

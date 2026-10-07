@@ -6953,6 +6953,105 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
 // ======================================================================
 
 #[tokio::test]
+async fn account_overage_permission_gates_native_readings_without_quota_hints() {
+    for scaling in [true, false] {
+        let state = temp_state_file("account-consent");
+        let log = temp_log("account-consent");
+        let yaml = format!(
+            "state_file: {}\nrouter: static\nrouters:\n  static: {{ candidate: 'claude@personal/sonnet', allow_fallback: true }}\n\
+             delegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+             availability_preference: {{ enabled: {scaling} }}\nagents:\n{}{}{}",
+            state.display(),
+            agent_yaml("claude", &[("sonnet", 2)], &[]),
+            agent_yaml(
+                "claude@personal",
+                &[("sonnet", 2)],
+                &[("MOCK_LOG", &log.display().to_string())]
+            ),
+            agent_yaml("codex", &[("gpt-5.6", 2)], &[]),
+        );
+        run_test_shared(yaml, async |cx, observed, shared| {
+            init(&cx).await?;
+            let id = router_acp::candidate::CandidateId::new("claude@personal", "sonnet");
+            let home = router_acp::candidate::CandidateId::new("claude", "sonnet");
+            let paying = router_acp::headroom::SeatAvailability {
+                plan_headroom: 0.0,
+                plan_remaining_dollars: None,
+                on_overage: true,
+                overage_headroom: Some(0.9),
+                overage_remaining_dollars: Some(90.0),
+                source: "poll",
+            };
+            shared.headroom.lock().unwrap().set_polled_availability(
+                std::collections::HashMap::from([
+                    (id.clone(), paying.clone()),
+                    (home.clone(), paying.clone()),
+                ]),
+            );
+            cx.send_notification(agent_client_protocol::UntypedMessage::new(
+                "router-acp/availability_hint",
+                serde_json::json!({"ttl_secs": 1, "agents": [
+                    {"agent": "claude", "overage_allowed": false},
+                    {"agent": "claude@personal", "overage_allowed": false},
+                ]}),
+            )?)?;
+            for _ in 0..50 {
+                if shared.headroom.lock().unwrap().seat_exhausted(&id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(shared.headroom.lock().unwrap().seat_exhausted(&id));
+            // A native refresh must not erase consent or borrow sibling quota.
+            shared.headroom.lock().unwrap().set_polled_availability(
+                std::collections::HashMap::from([
+                    (id.clone(), paying.clone()),
+                    (home.clone(), paying),
+                ]),
+            );
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "hello").await?;
+            assert!(agent_text(&observed, &sid).contains("echo:gpt-5.6:"));
+
+            for (permission, expires, exhausted) in [
+                (serde_json::json!(true), "2099-01-01T00:00:00Z", false),
+                (serde_json::json!(true), "2000-01-01T00:00:00Z", true),
+                (serde_json::Value::Null, "", false),
+            ] {
+                cx.send_notification(agent_client_protocol::UntypedMessage::new(
+                    "router-acp/availability_hint",
+                    serde_json::json!({"agents": [{
+                        "agent": "claude@personal", "overage_allowed": permission,
+                        "overage_expires_at": expires,
+                    }]}),
+                )?)?;
+                for _ in 0..50 {
+                    if shared.headroom.lock().unwrap().seat_exhausted(&id) == exhausted {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(
+                    shared.headroom.lock().unwrap().seat_exhausted(&id),
+                    exhausted
+                );
+                let sid = new_session(&cx).await?.session_id.0.to_string();
+                prompt_text(&cx, &sid, "hello").await?;
+                let expected = if exhausted {
+                    "echo:gpt-5.6:"
+                } else {
+                    "echo:sonnet:"
+                };
+                assert!(agent_text(&observed, &sid).contains(expected));
+            }
+            assert!(shared.headroom.lock().unwrap().seat_exhausted(&home));
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn availability_hint_penalizes_overage_seat() {
     let state = temp_state_file("avail-hint");
     let log = temp_log("avail-hint");

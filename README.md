@@ -188,6 +188,8 @@ Availability comes from the same usage polls that drive proactive cordons, plus 
 
 A fresh hint outranks the router's own poll for that agent until it expires (`ttl_secs`, default `availability_preference.hint_ttl_secs`); hints are session-less (send once per connection, not per session), unknown agents and windowless entries are ignored, and `remaining_dollars` is optional — percent-only hints still work on the fraction fallback. Effective preferences show up right in the disclosure line (`+ pref 0.07` / `- pref 0.25 (seat on paid overage)`), and the full known set rides the pin metadata as `_meta.router_acp.availability`.
 
+Clients that manage paid-usage consent can send a windowless entry for each exact account: `{"agent":"claude@personal","overage_allowed":false}`. The router applies this permission to its own account readings, even when availability preference scaling is disabled. Denial stays until replaced. `true` grants paid usage until the hint TTL or optional `overage_expires_at` timestamp, whichever comes first. An expired grant denies paid usage. `null` removes the client policy. These entries never copy quota between accounts or bypass reserve cordons.
+
 ### Task classification
 
 Every strategy except `static` needs to know what kind of task it's routing and how hard it looks. Two layers do that, and either can run alone:

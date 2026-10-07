@@ -1206,7 +1206,13 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 /// }
 /// ```
 ///
-/// Tolerant by design: unknown agents and windowless entries are skipped, and
+/// `overage_allowed` independently controls paid usage for this exact account.
+/// False denies until replaced; true grants until the hint TTL or optional
+/// `overage_expires_at`, whichever comes first. Null removes the client policy.
+/// Policy applies to native readings even without windows or preference scaling.
+/// It never supplies or replaces account usage or removes reserve cordons.
+///
+/// Tolerant by design: unknown agents and windowless quota entries are skipped, and
 /// `ttl_secs` falls back to `availability_preference.hint_ttl_secs`. An
 /// entry's `windows` express plan-window fullness (`scope` names a
 /// model-scoped cap, `active` marks a limit the provider reports as biting);
@@ -1214,9 +1220,6 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 /// `agent` is an exact account id, such as `claude@work`. A provider-wide
 /// hint must never be copied into sibling accounts' independent usage.
 pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
-    if !shared.cfg.availability_preference.enabled {
-        return;
-    }
     let Some(agents) = params.get("agents").and_then(Value::as_array) else {
         return;
     };
@@ -1232,6 +1235,28 @@ pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
         };
         let candidates = agent_candidates(shared, agent);
         if candidates.is_empty() {
+            continue;
+        }
+        if let Some(permission) = entry.get("overage_allowed") {
+            let mut headroom = shared.headroom.lock().unwrap();
+            match permission {
+                Value::Null => headroom.clear_overage_permission(agent),
+                Value::Bool(false) => headroom.set_overage_permission(agent, None),
+                Value::Bool(true) => {
+                    let deadline = now + Duration::from_secs(ttl);
+                    let deadline = match entry.get("overage_expires_at") {
+                        None => Some(deadline),
+                        Some(Value::String(expires)) => {
+                            crate::limits::parse_reset_timestamp(expires).map(|at| at.min(deadline))
+                        }
+                        _ => None,
+                    };
+                    headroom.set_overage_permission(agent, deadline);
+                }
+                _ => {}
+            }
+        }
+        if !shared.cfg.availability_preference.enabled || entry.get("windows").is_none() {
             continue;
         }
         let availability = hint_agent_availability(entry, &candidates);
