@@ -214,11 +214,12 @@ pub(crate) fn notify(
             .and_then(|s| s.routing)
             .filter(|r| r.pointer("/effort/confirmed").and_then(Value::as_bool) == Some(true))
             .and_then(|r| r.pointer("/effort/resolved").cloned());
+        let effort_confirmed = effort.is_some();
         let msg = agent_client_protocol::UntypedMessage::new(
             "router-acp/planner-child-update",
             json!({
                 "sessionId":route.parent_sid,"child_id":route.child_id,"work_id":route.work_id,"attempt_id":route.attempt_id,
-                "state_session_id":route.state_sid,"candidate":route.candidate,"effort":effort,"state":state,"update":update
+                "state_session_id":route.state_sid,"candidate":route.candidate,"effort":effort,"effort_confirmed":effort_confirmed,"state":state,"update":update
             }),
         )?;
         upstream.send_notification(msg)?;
