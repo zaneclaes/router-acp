@@ -152,7 +152,7 @@ The router degrades gracefully when seats run dry or adapters fall over, and it 
 
 ### Headroom, quarantine, and availability-aware preference
 
-Without provider usage data, headroom falls back to a per-agent sliding-window counter (default 5 h) of prompts and sessions, normalized against `budget_prompts_5h`. A rate-limit/auth/quota error before the first prompt zeroes an agent's headroom; a candidate that keeps failing to open sessions is quarantined for a cool-off (`headroom.quarantine_*`). Errors after a session is pinned are surfaced, never rerouted.
+Without provider usage data, headroom falls back to a per-agent sliding-window counter (default 5 h) of prompts and sessions, normalized against `budget_prompts_5h`. A rate-limit/auth/quota error before the first prompt zeroes an agent's headroom; a candidate that keeps failing to open sessions is quarantined for a cool-off (`headroom.quarantine_*`). Limit, authentication and outage failures on a pinned session trigger hot failover when enabled. Other task errors are surfaced to the client.
 
 `agents[].preference` is a static tie-break ("this seat has the bigger plan"). With `availability_preference` (on by default) it tracks reality instead of staying frozen:
 
@@ -160,7 +160,7 @@ Without provider usage data, headroom falls back to a per-agent sliding-window c
 - **Everything is compared in real dollars, not each seat's own percentage.** A $9k pool at 3% free ($270) and a $3k pool at 3% free ($90) are the same percentage but very different seats, so headroom is a *dollar* figure wherever one is obtainable: overage/credit pools report it directly from the provider API, while included-plan windows don't (on either provider), so the router estimates them from its own metered spend against the reported percentage — saturating at `availability_preference.headroom_scale_dollars` (default $200). Two real shipped bugs came from skipping this: grading two saturated seats by percentage alone tied them at zero even though one had ~$6,600 of paid headroom left and the other ~$100; and using an estimated plan-dollar figure for *free*-plan ranking made a 6%-remaining weekly seat look 100% free next to a seat that actually was 100% free on a smaller cap.
 - **Paid overage raises the quality bar instead of being free.** Once a seat is past its included cap but still routable via overage or credits, its utility takes a `cost_aversion × (1 - task complexity)` penalty (default `cost_aversion: 0.1`) — cheap enough to still allow a materially stronger paid model on hard work, but enough to prefer an included-plan fallback for ordinary tasks. A seat with *no* overage headroom left is a cordon, not a surcharge.
 
-Availability comes from the same usage polls that drive proactive cordons, plus **client availability hints** — the `router-acp/availability_hint` extension notification. A client that already watches its own seat usage (Kory Code polls both providers every minute, including a live Codex rate-limit read) can push that view directly:
+Availability comes from the same usage polls that drive proactive cordons, plus **client availability hints** — the `router-acp/availability_hint` extension notification. A client with independent usage evidence can push that view directly. Kory Code's account integration reads router caches and leaves provider usage polling to the router:
 
 ```json
 {
