@@ -409,6 +409,7 @@ pub fn command(req: &PromptRequest) -> Option<PlannerPhase> {
     match first.text.split_whitespace().next()? {
         "/plan" => Some(PlannerPhase::Planning),
         "/implement" => Some(PlannerPhase::Implementation),
+        verb if verb.eq_ignore_ascii_case("implement") => Some(PlannerPhase::Implementation),
         _ => None,
     }
 }

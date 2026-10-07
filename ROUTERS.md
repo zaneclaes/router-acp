@@ -428,6 +428,9 @@ prevents command recursion.
                                      finish-work -> integrate-plan -> refill/complete
 ```
 
+A direct human request beginning with `implement`, such as `implement ROADMAP.md`,
+enters the same selection workflow. Quoted and agent-origin text cannot grant it.
+
 The parent uses `planner_workflow` for durable assignments and revision-bound
 receipts. `delegate_task {work_id, task, keep_open:true}` opens an isolated child.
 Plain `delegate_task` remains a cheaper, ephemeral helper. Each durable work
