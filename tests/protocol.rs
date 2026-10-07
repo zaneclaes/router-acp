@@ -940,6 +940,42 @@ async fn router_login_text_menu_and_usage_never_prompt_a_model() {
 }
 
 #[tokio::test]
+async fn account_commands_survive_goose_turn_context_block() {
+    // goose sends the typed command, then its `<turn-context>` preamble as a
+    // second text block.
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{}\n    accounts: [{{name: work}}]\n",
+        temp_state_file("native-menu-goose").display(),
+        agent_yaml("claude", &[("sonnet", 2)], &[]).trim_end()
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        for command in ["/login", "1", "/usage"] {
+            cx.send_request(PromptRequest::new(
+                sid.clone(),
+                vec![
+                    ContentBlock::from(command.to_string()),
+                    ContentBlock::from(
+                        "<turn-context>\n<current-time>2026-10-07</current-time>\n</turn-context>"
+                            .to_string(),
+                    ),
+                ],
+            ))
+            .block_task()
+            .await?;
+        }
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("claude (1 account)"), "{text}");
+        assert!(text.contains("Add Account"), "{text}");
+        assert!(!text.contains("echo:"), "a model was prompted: {text}");
+        assert!(shared.with_session(&sid, |s| s.pin.is_none()).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn declared_model_missing_downstream_is_removed() {
     let state = temp_state_file("missing-model");
     // Config declares m1 and bogus; mock only offers m1.

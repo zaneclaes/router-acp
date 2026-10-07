@@ -321,14 +321,35 @@ impl LoginFlow {
     }
 }
 
+/// The user's typed text when the prompt is text only. goose adds its
+/// `<turn-context>…</turn-context>` preamble as a second text block (or inside
+/// the first), so that span is dropped before a command is recognized.
 fn text(prompt: &[ContentBlock]) -> Option<String> {
-    if prompt.len() != 1 {
-        return None;
+    let mut typed = String::new();
+    for block in prompt {
+        let ContentBlock::Text(t) = block else {
+            return None;
+        };
+        typed.push_str(&without_turn_context(&t.text));
+        typed.push('\n');
     }
-    match &prompt[0] {
-        ContentBlock::Text(t) => Some(t.text.trim().to_string()),
-        _ => None,
+    Some(typed.trim().to_string())
+}
+
+fn without_turn_context(text: &str) -> String {
+    const OPEN: &str = "<turn-context>";
+    const CLOSE: &str = "</turn-context>";
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => return out,
+        }
     }
+    out.push_str(rest);
+    out
 }
 
 pub fn intercepts(shared: &Arc<Shared>, sid: &str, prompt: &[ContentBlock]) -> bool {
@@ -1416,6 +1437,29 @@ fn remove_json_field(path: &Path, field: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_ignore_goose_turn_context_in_any_block() {
+        let ctx = "<turn-context>\n<t>2026</t>\n</turn-context>";
+        let blocks = |parts: &[&str]| -> Vec<ContentBlock> {
+            parts
+                .iter()
+                .map(|p| ContentBlock::from(p.to_string()))
+                .collect()
+        };
+        assert_eq!(text(&blocks(&["/usage"])).as_deref(), Some("/usage"));
+        assert_eq!(text(&blocks(&["/usage", ctx])).as_deref(), Some("/usage"));
+        assert_eq!(text(&blocks(&[ctx, "/login"])).as_deref(), Some("/login"));
+        assert_eq!(
+            text(&blocks(&[&format!("{ctx}\n\n/login code abc")])).as_deref(),
+            Some("/login code abc")
+        );
+        assert_eq!(text(&blocks(&[&format!("2\n{ctx}")])).as_deref(), Some("2"));
+        assert_eq!(
+            text(&blocks(&["/usage", "and explain it"])).as_deref(),
+            Some("/usage\nand explain it")
+        );
+    }
 
     #[test]
     fn browser_output_waits_for_complete_urls_and_device_codes() {
