@@ -928,6 +928,9 @@ async fn router_login_text_menu_and_usage_never_prompt_a_model() {
         assert!(text.contains("claude (1 account)"));
         assert!(text.contains("Add Account"));
         assert!(text.contains("Re-login"));
+        assert!(text.contains("Set priority"));
+        // No usage source on this agent, so no reserve to set.
+        assert!(!text.contains("Set reserve capacity"));
         assert!(text.contains("Delete account"));
         assert!(text.contains("logged out"));
         assert!(!text.contains("echo:"));

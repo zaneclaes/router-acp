@@ -124,7 +124,7 @@ Manage logins
 3. grok (0 accounts)
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its cached usage, **Re-login**, and **Delete account**. Browser sign-in uses the provider's own CLI. New accounts get private directories without replacing your other logins. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its cached usage, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Browser sign-in uses the provider's own CLI. New accounts get private directories without replacing your other logins. An expired login remains registered so **Re-login** can repair it.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
