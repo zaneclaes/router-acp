@@ -40,7 +40,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, reconciled per account with a usable reading via `reconcile_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
-| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl**, token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (live `codex app-server` `account/rateLimits/read`; fallback: on-disk rollout snapshots, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. Also computes graded **seat availability** for dynamic preference scaling (`anthropic_availability`/`codex_availability`/`availability_from_windows`) and ingests client hints (`apply_availability_hint`, ext notification `router-acp/availability_hint`, consumed session-less in `on_catch_all`). `spawn_usage_poller` (interval loop, fails open, installs cordons + availability) |
+| `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` uses router-managed credentials to call `GET /api/oauth/usage`; `codex-rollout` uses one `codex app-server` `account/rateLimits/read` round-trip and falls back to its snapshot cache. Both fail open, never hardcode a model list, and feed cordons and seat availability. `spawn_usage_poller` installs those results. |
 | `src/llm_proxy.rs` | optional loopback provider proxy: process base-URL injection, Anthropic Messages + OpenAI Responses/Chat forwarding, auth/SSE pass-through, per-active-prompt attribution, same-agent request policy (routine demotion, difficulty/stagnation escalation, verdict expiry, dwell, context guards), request disclosure, usage/cache/cost capture |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (delegation-bypass count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
 | `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated; load/resume reattach the router's own MCP tools via `session::mcp_servers_for_pin`) |
@@ -114,6 +114,17 @@ SDK traps below, which were all discovered the hard way.
 ## Architectural invariants (from PLAN.md; do not break casually)
 
 - Never call provider model APIs; everything goes through ACP adapters.
+- **Credential authority:** `src/credentials.rs` is the only canonical writer
+  for Claude, Codex, Grok, and Kimi credentials. Native adapters receive
+  private access-only runtime stores. Kory and other hosts consume native
+  `account-status` JSON and delegate native ACP `/login`; they never parse
+  error strings or probes as logout evidence, or read, write, refresh, swap,
+  or remove LLM tokens. A per-credential OS lock is allowed only for
+  login, automatic repair, or removal. Never hold it during a
+  session or turn. Waiters re-read and reuse a completed repair. Generation
+  and router-epoch guards discard stale completions. Only a definitive refresh
+  rejection for the current generation durably marks unauthenticated. A 401,
+  probe, network error, or unknown result keeps the account eligible.
 - Model selection: `session/set_config_option` on the `category: model`
   select option; the **response** is authoritative (silent no-ops must fail
   the pin). No `session/set_model`. No assumed CLI model flags —
@@ -581,7 +592,8 @@ fails.
   `~/.cargo/bin/router-acp serve --config ~/.config/router-acp/router.yaml`.
   goose's ACP slots spawn fixed binary names; `pi-acp` takes no args (why it
   was chosen), `codex-acp` takes `-c` flags (why it can't be shimmed).
-  `claude-acp`/`codex-acp` remain direct. After code changes run
+  Kory starts new and resumed work through the router, with legacy transcript
+  handoff for resumed work. After code changes run
   `cargo install --path . --force` or goose keeps the old binary.
 - Real adapters live at `~/nvm/versions/node/v24.16.0/bin/{claude-agent-acp,codex-acp,grok}`
   (nvm-versioned paths — they move on node upgrades) and `~/.local/bin/kimi`
@@ -591,13 +603,14 @@ fails.
   is a native ACP agent (verified — valid `initialize`, `authMethods:[grok.com]`);
   model fixed per process via `grok agent --model <id> stdio` (spawn-config, args
   `["agent"]` + template `["--model","${model_id}","stdio"]`); `grok login`, only
-  `grok-4.6` confirmed. grok has no usage_source (no pollable/on-disk snapshot) —
+  native router ACP `/login`; only `grok-4.6` is confirmed. grok has no
+  usage_source (no pollable/on-disk snapshot) —
   its subscription **access gate** drives a cordon instead (see the grok-gate
   invariant above). **kimi** (Moonshot `kimi-cli` v1.49.0, `uv tool install
   kimi-cli` → `~/.local/bin/kimi`): `kimi acp` is a native ACP agent (verified —
   valid `initialize` `{name:"Kimi Code CLI"}`, `sessionCapabilities:{list,resume}`,
-  `authMethods:[login]`; `session/new` → "Authentication required" until `kimi
-  login` (browser OAuth, auto-configures account model ids). `--model` is a
+  `authMethods:[login]`; `session/new` requests native router ACP `/login`
+  until browser OAuth configures account model ids. `--model` is a
   **global** flag so it precedes the subcommand: `kimi --model <id> acp`
   (spawn-config, NO base args + template `["--model","${model_id}","acp"]`).
   `lineage: moonshot`; only `kimi-k2` configured (best-guess), score-table

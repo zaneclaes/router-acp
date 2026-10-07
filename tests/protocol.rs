@@ -37,6 +37,184 @@ fn router_exe() -> &'static str {
     env!("CARGO_BIN_EXE_router-acp")
 }
 
+fn claude_credential_fixture(outcome: Option<&str>) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    let value = serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic-access",
+        "refreshToken":"synthetic-refresh","expiresAt":4070908800000u64}});
+    std::fs::write(
+        directory.path().join(".credentials.json"),
+        value.to_string(),
+    )
+    .unwrap();
+    if let Some(outcome) = outcome {
+        use sha2::{Digest, Sha256};
+        let generation = format!(
+            "{:x}",
+            Sha256::digest(value["claudeAiOauth"].to_string().as_bytes())
+        );
+        std::fs::write(
+            directory.path().join(".router-acp-auth.json"),
+            serde_json::json!({"generation":generation,"epoch":"fixture","outcome":outcome,
+                "attempted_at":chrono::Utc::now().to_rfc3339()})
+            .to_string(),
+        )
+        .unwrap();
+    }
+    directory
+}
+
+#[tokio::test]
+async fn native_auth_error_reply_does_not_cordon_an_unconfirmed_logout() {
+    let state = temp_state_file("auth-reply");
+    let credential = claude_credential_fixture(None);
+    let file = credential.path().join(".credentials.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    value["claudeAiOauth"]
+        .as_object_mut()
+        .unwrap()
+        .remove("refreshToken");
+    std::fs::write(&file, value.to_string()).unwrap();
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nfailover: {{enabled: false}}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "claude",
+            &[("m1", 1)],
+            &[
+                (
+                    "CLAUDE_CONFIG_DIR",
+                    &credential.path().display().to_string()
+                ),
+                (
+                    "MOCK_REPLY_TEXT",
+                    "Failed to authenticate: OAuth session expired and could not be refreshed"
+                ),
+            ]
+        ),
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        assert!(
+            prompt_text(&cx, &sid, "[router: candidate=claude/m1]\nstart")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            router_acp::credentials::availability(&config.agents[0]),
+            router_acp::auth::AuthAvailability::Unknown
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("authentication unavailable"), "{text}");
+        assert!(!text.contains("definitively rejected"), "{text}");
+        let session = new_session(&cx).await?;
+        let options = session.config_options.unwrap();
+        let candidate = options
+            .iter()
+            .find(|o| o.id.0.as_ref() == "router.candidate")
+            .unwrap();
+        let SessionConfigKind::Select(select) = &candidate.kind else {
+            panic!("router.candidate must be a select");
+        };
+        let choices: Vec<_> = match &select.options {
+            SessionConfigSelectOptions::Grouped(groups) => {
+                groups.iter().flat_map(|g| &g.options).collect()
+            }
+            SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
+            _ => vec![],
+        };
+        let account = choices
+            .iter()
+            .find(|o| o.value.0.as_ref() == "claude/m1")
+            .unwrap();
+        let value = serde_json::to_value(account).unwrap();
+        assert_ne!(
+            value.pointer("/_meta/router_acp/available"),
+            Some(&serde_json::json!(false))
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn personal_and_team_accounts_prompt_concurrently() {
+    let state = temp_state_file("account-concurrency");
+    let personal = claude_credential_fixture(None);
+    let team = claude_credential_fixture(None);
+    let personal_log = temp_log("personal-concurrent");
+    let team_log = temp_log("team-concurrent");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "claude@personal",
+            &[("m1", 1)],
+            &[
+                ("CLAUDE_CONFIG_DIR", &personal.path().display().to_string()),
+                ("MOCK_LOG", &personal_log.display().to_string()),
+            ]
+        ),
+        agent_yaml(
+            "claude@team",
+            &[("m1", 1)],
+            &[
+                ("CLAUDE_CONFIG_DIR", &team.path().display().to_string()),
+                ("MOCK_LOG", &team_log.display().to_string()),
+            ]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let first = new_session(&cx).await?.session_id.0.to_string();
+        let second = new_session(&cx).await?.session_id.0.to_string();
+        let (personal_result, team_result) = tokio::join!(
+            prompt_text(
+                &cx,
+                &first,
+                "[router: candidate=claude@personal/m1]\nSLEEP:10000"
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !read_log(&personal_log)
+                        .iter()
+                        .any(|e| e["event"] == "prompt")
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    prompt_text(
+                        &cx,
+                        &second,
+                        "[router: candidate=claude@team/m1]\nteam work",
+                    )
+                    .await
+                })
+                .await
+                .expect("team account waited for the personal account's turn to end")
+                .inspect(|_| {
+                    let _ = cx.send_notification(CancelNotification::new(first.clone()));
+                })
+            }
+        );
+        assert_eq!(personal_result?.stop_reason, StopReason::Cancelled);
+        assert_eq!(team_result?.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &second);
+        assert!(text.contains("claude@team/m1"), "{text}");
+        assert_eq!(
+            open_state(&state).get(&first).unwrap().agent,
+            "claude@personal"
+        );
+        assert_eq!(
+            open_state(&state).get(&second).unwrap().agent,
+            "claude@team"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// Events observed by the test client.
 #[derive(Default)]
 struct Observed {
@@ -75,7 +253,17 @@ where
         )
         .with_writer(std::io::stderr)
         .try_init();
-    let cfg = Config::from_yaml(&cfg_yaml).expect("test config parses");
+    let mut cfg = Config::from_yaml(&cfg_yaml).expect("test config parses");
+    // Mock adapters must never observe or publish state for a real login.
+    let credential_home = tempfile::tempdir().unwrap();
+    for agent in &mut cfg.agents {
+        if !agent.command.env.iter().any(|entry| entry.name == "HOME") {
+            agent.command.env.push(router_acp::config::EnvVarConfig {
+                name: "HOME".into(),
+                value: credential_home.path().to_string_lossy().into(),
+            });
+        }
+    }
     let shared = Shared::new(cfg).expect("shared state builds");
     let shared_for_test = shared.clone();
     let (channel_a, channel_b) = Channel::duplex();
@@ -932,7 +1120,8 @@ async fn router_login_text_menu_and_usage_never_prompt_a_model() {
         // No usage source on this agent, so no reserve to set.
         assert!(!text.contains("Set reserve capacity"));
         assert!(text.contains("Delete account"));
-        assert!(text.contains("logged out"));
+        assert!(text.contains("auth: unknown"));
+        assert!(!text.contains("auth: rejected"));
         assert!(!text.contains("echo:"));
         assert!(shared.with_session(&sid, |s| s.pin.is_none()).unwrap());
         prompt_text(&cx, &sid, "/cancel").await?;
@@ -3495,15 +3684,17 @@ async fn routing_scales_with_task_complexity_and_prefers_claude() {
 }
 
 #[tokio::test]
-async fn unauthenticated_agent_is_not_spawned_and_auto_routes_live_peer() {
+async fn manager_rejection_is_not_spawned_and_auto_routes_live_peer() {
     let state = temp_state_file("auth-preflight");
     let claude_log = temp_log("auth-preflight-claude");
     let grok_log = temp_log("auth-preflight-grok");
+    let credential = claude_credential_fixture(Some("Rejected"));
     let preclass = r#"{"routing":{"task_class":"Ops","complexity":0.08,"confidence":0.95,"reason":"trivial ops"}}"#;
     let claude = agent_yaml(
         "claude",
         &[("haiku", 1), ("sonnet", 2), ("opus", 4)],
-        &[("MOCK_LOG", &claude_log.display().to_string())],
+        &[("MOCK_LOG", &claude_log.display().to_string()),
+          ("CLAUDE_CONFIG_DIR", &credential.path().display().to_string())],
     )
     .replace(
         "    model_selection:",
@@ -3539,10 +3730,7 @@ async fn unauthenticated_agent_is_not_spawned_and_auto_routes_live_peer() {
                 .unwrap_or_else(|| panic!("missing {model}: {text}"));
             let tail = &text[pos..text.len().min(pos + 500)];
             assert!(tail.contains("\"available\":false"), "{model}: {tail}");
-            assert!(
-                tail.contains("provider is not signed in"),
-                "{model}: {tail}"
-            );
+            assert!(tail.contains("definitively rejected"), "{model}: {tail}");
             assert!(
                 !tail.contains("resets_at"),
                 "auth has no reset timestamp: {tail}"
@@ -3572,10 +3760,12 @@ async fn static_pin_to_unauthenticated_agent_reports_auth_required_with_live_pee
     let state = temp_state_file("auth-static-pin");
     let claude_log = temp_log("auth-static-pin-claude");
     let codex_log = temp_log("auth-static-pin-codex");
+    let credential = claude_credential_fixture(Some("Rejected"));
     let claude = agent_yaml(
         "claude",
         &[("fable", 5)],
-        &[("MOCK_LOG", &claude_log.display().to_string())],
+        &[("MOCK_LOG", &claude_log.display().to_string()),
+          ("CLAUDE_CONFIG_DIR", &credential.path().display().to_string())],
     )
     .replace(
         "    model_selection:",
@@ -3670,7 +3860,7 @@ async fn authenticated_agent_remains_eligible_for_preclass_and_ops_pin() {
 }
 
 #[tokio::test]
-async fn runtime_auth_rejection_removes_agent_from_next_auto_decision() {
+async fn session_auth_error_without_failed_repair_does_not_cordon() {
     let state = temp_state_file("auth-reactive");
     let claude_log = temp_log("auth-reactive-claude");
     let grok_log = temp_log("auth-reactive-grok");
@@ -3692,13 +3882,13 @@ async fn runtime_auth_rejection_removes_agent_from_next_auto_decision() {
             &[("MOCK_LOG", &grok_log.display().to_string())],
         ),
     );
-    run_test(yaml, async |cx, observed| {
+    run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
         let first = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &first, "First Ops prompt").await?;
         assert!(
-            agent_text(&observed, &first).contains("echo:grok-4.5:"),
-            "first Claude auth rejection fails over to Grok"
+            agent_text(&observed, &first).contains("echo:sonnet:"),
+            "an unconfirmed session error may try another model on the same account"
         );
         let claude_prompts = read_log(&claude_log)
             .iter()
@@ -3708,23 +3898,30 @@ async fn runtime_auth_rejection_removes_agent_from_next_auto_decision() {
         let second_session = new_session(&cx).await?;
         let opts = serde_json::to_string(&second_session.config_options).unwrap();
         assert!(
-            opts.contains("claude/haiku")
-                && opts.contains("\"available\":false")
-                && opts.contains("claude is not signed in"),
-            "reactive auth state reaches picker: {opts}"
+            opts.contains("claude/haiku") && !opts.contains("definitively rejected"),
+            "an unknown repair must not create a logout indication: {opts}"
+        );
+        assert!(shared.auth_rejection("claude").is_none());
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .cordon_active("claude")
+                .is_none()
         );
         let second = second_session.session_id.0.to_string();
         prompt_text(&cx, &second, "Second Ops prompt").await?;
         assert!(
-            agent_text(&observed, &second).contains("auto → grok/grok-4.5"),
-            "next Auto decision skips all Claude models"
+            agent_text(&observed, &second).contains("auto → claude/haiku"),
+            "the next session can still use the account"
         );
         assert_eq!(
             read_log(&claude_log)
                 .iter()
                 .filter(|e| e["event"] == "prompt")
                 .count(),
-            claude_prompts,
+            claude_prompts + 1,
             "next decision never probes another Claude model"
         );
         Ok(())
@@ -4111,17 +4308,22 @@ async fn switch_directive_hands_off_to_new_model_mid_session() {
     .await;
 }
 
-/// Agent `b` whose boot auth probe says logged out, so init never spawns it.
+/// A managed account whose shared credential manager rejected refresh.
 fn logged_out_at_boot_yaml(
     state: &std::path::Path,
     a_log: &std::path::Path,
     b_log: &std::path::Path,
+    credential_dir: &std::path::Path,
     b_env: &[(&str, &str)],
 ) -> String {
     let b_log = b_log.display().to_string();
-    let mut env = vec![("MOCK_LOG", b_log.as_str())];
+    let credential_dir = credential_dir.display().to_string();
+    let mut env = vec![
+        ("MOCK_LOG", b_log.as_str()),
+        ("CLAUDE_CONFIG_DIR", credential_dir.as_str()),
+    ];
     env.extend_from_slice(b_env);
-    let b = agent_yaml("b", &[("m2", 2)], &env).replace(
+    let b = agent_yaml("claude@cold", &[("m2", 2)], &env).replace(
         "    model_selection:",
         "    auth_probe:\n      command: /bin/sh\n      args: [\"-c\", \"echo not signed in >&2; exit 1\"]\n    model_selection:",
     );
@@ -4146,17 +4348,27 @@ async fn switch_starts_a_target_skipped_at_boot_and_hands_off() {
     let state = temp_state_file("switch-boot-skipped");
     let a_log = temp_log("switch-boot-skipped-a");
     let b_log = temp_log("switch-boot-skipped-b");
-    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, &[]);
+    let credential = claude_credential_fixture(Some("Rejected"));
+    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, credential.path(), &[]);
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         assert!(read_log(&b_log).is_empty(), "b not spawned at boot");
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart the work").await?;
-
-        let resp = prompt_text(&cx, &sid, "[router: switch=b/m2] continue the work").await?;
+        // Native login has replaced the manager's rejected generation.
+        std::fs::remove_file(credential.path().join(".router-acp-auth.json")).unwrap();
+        let resp = prompt_text(
+            &cx,
+            &sid,
+            "[router: switch=claude@cold/m2] continue the work",
+        )
+        .await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(text.contains("switched a/m1 → b/m2"), "switched: {text}");
+        assert!(
+            text.contains("switched a/m1 → claude@cold/m2"),
+            "switched: {text}"
+        );
         assert!(text.contains("echo:m2:"), "new model answered: {text}");
         assert!(!text.contains("no live downstream"), "{text}");
         Ok(())
@@ -4169,20 +4381,35 @@ async fn switch_to_a_still_signed_out_target_fails_before_the_summary() {
     let state = temp_state_file("switch-boot-signed-out");
     let a_log = temp_log("switch-boot-signed-out-a");
     let b_log = temp_log("switch-boot-signed-out-b");
-    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, &[("MOCK_AUTH_REQUIRED", "1")]);
+    let credential = claude_credential_fixture(Some("Rejected"));
+    let yaml = logged_out_at_boot_yaml(
+        &state,
+        &a_log,
+        &b_log,
+        credential.path(),
+        &[("MOCK_AUTH_REQUIRED", "1")],
+    );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart the work").await?;
 
-        let failed = prompt_text(&cx, &sid, "[router: switch=b/m2] continue the work").await;
+        let failed = prompt_text(
+            &cx,
+            &sid,
+            "[router: switch=claude@cold/m2] continue the work",
+        )
+        .await;
         assert!(failed.is_err(), "turn fails: {failed:?}");
         let text = agent_text(&observed, &sid);
         assert!(
-            text.contains("switch to b/m2 failed"),
+            text.contains("switch to claude@cold/m2 failed"),
             "failure named: {text}"
         );
-        assert!(text.contains("not signed in"), "sign-in named: {text}");
+        assert!(
+            text.contains("authentication") || text.contains("refresh"),
+            "sign-in named: {text}"
+        );
         assert!(!text.contains("no live downstream"), "{text}");
         assert!(
             !read_log(&a_log).iter().any(|e| e["event"] == "prompt"

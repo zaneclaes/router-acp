@@ -21,7 +21,7 @@ use crate::config::{AgentConfig, Config, EnvVarConfig, UsageSourceConfig};
 use crate::session::{CandidateRuntime, CandidateStatus, Shared, TargetRuntime};
 use crate::strategies::CandidateView;
 
-const PROVIDERS: [&str; 3] = ["claude", "codex", "grok"];
+const PROVIDERS: [&str; 4] = ["claude", "codex", "grok", "kimi"];
 /// Reserve percentages offered by `/login` → account → Set reserve capacity.
 const RESERVE_STEPS: [u32; 10] = [0, 5, 10, 15, 20, 25, 30, 40, 50, 75];
 
@@ -75,19 +75,21 @@ pub fn provider(agent: &AgentConfig) -> Option<&'static str> {
         Some(UsageSourceConfig::CodexRollout) => Some("codex"),
         _ => PROVIDERS
             .into_iter()
-            .find(|p| agent.name.split('@').next() == Some(p)),
+            .find(|p| agent.name.split('@').next() == Some(p))
+            .or_else(
+                || match Path::new(&agent.command.command).file_name()?.to_str()? {
+                    "claude-agent-acp" | "claude-acp" => Some("claude"),
+                    "codex-acp" => Some("codex"),
+                    "grok" => Some("grok"),
+                    "kimi" => Some("kimi"),
+                    _ => None,
+                },
+            ),
     }
 }
 
 fn directory(agent: &AgentConfig) -> Option<PathBuf> {
-    match provider(agent)? {
-        "claude" => agent.config_dir("CLAUDE_CONFIG_DIR", ".claude"),
-        "codex" => agent.config_dir("CODEX_HOME", ".codex"),
-        "grok" => agent
-            .env_var("HOME")
-            .map(|h| PathBuf::from(h).join(".grok")),
-        _ => None,
-    }
+    crate::credentials::directory(agent)
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -193,7 +195,7 @@ fn plan_label(provider: &str, plan: &str) -> String {
     .to_string()
 }
 
-fn jwt_claims(token: &str) -> Option<Value> {
+pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
     // JWT payloads use base64url. No validation is implied by this label read.
     let encoded = token.split('.').nth(1)?;
     let mut bits = 0u32;
@@ -885,30 +887,47 @@ fn new_account(shared: &Arc<Shared>, p: &str) -> Result<(AgentConfig, String), A
     let variable = match p {
         "claude" => "CLAUDE_CONFIG_DIR",
         "codex" => "CODEX_HOME",
+        "kimi" => "KIMI_SHARE_DIR",
         _ => "HOME",
     };
-    agent
-        .command
-        .env
-        .retain(|e| e.name != variable && !AUTH_ENV.contains(&e.name.as_str()));
+    agent.command.env.retain(|e| {
+        e.name != variable
+            && !(p == "kimi" && e.name == "KIMI_CODE_HOME")
+            && !AUTH_ENV.contains(&e.name.as_str())
+    });
     agent.command.env.push(EnvVarConfig {
         name: variable.into(),
         value: dir.to_string_lossy().into_owned(),
     });
+    if p == "kimi" {
+        agent.command.env.push(EnvVarConfig {
+            name: "KIMI_CODE_HOME".into(),
+            value: dir.to_string_lossy().into_owned(),
+        });
+    }
     Ok((agent, source))
 }
 
-pub(crate) const AUTH_ENV: [&str; 5] = [
+pub(crate) const AUTH_ENV: [&str; 6] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
     "XAI_API_KEY",
+    "KIMI_API_KEY",
 ];
 
 pub(crate) fn isolated_environment(env: &[(String, String)]) -> bool {
-    env.iter()
-        .any(|(name, _)| name == "CLAUDE_CONFIG_DIR" || name == "CODEX_HOME")
+    env.iter().any(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "CLAUDE_CONFIG_DIR"
+                | "CODEX_HOME"
+                | "GROK_AUTH_PROVIDER_COMMAND"
+                | "KIMI_SHARE_DIR"
+                | "KIMI_CODE_HOME"
+        )
+    })
 }
 
 fn start_login(
@@ -971,7 +990,36 @@ fn start_login(
             }
             other => other,
         };
+        // Hold only adapter-start gates during restoration. Publish handoffs
+        // before making this account available, so no prompt sees a stale pin
+        // between the replacement adapter's probe and its handoff notification.
+        let gates: Vec<_> = shared
+            .targets
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|t| t.spec.agent_name == agent.name)
+            .map(|t| t.start_gate.clone())
+            .collect();
+        let permits = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut permits = Vec::new();
+            for gate in gates {
+                permits.push(gate.lock_owned().await);
+            }
+            permits
+        })
+        .await;
+        if !adding {
+            queue_relogin_handoffs(&shared, &agent.name);
+        }
         shared.account_login.lock().unwrap().remove(&agent.name);
+        let Ok(_permits) = permits else {
+            runner.set(LoginStatus::Error(format!(
+                "Timed out restoring {}: its adapter startup is still in progress. Retry the session.",
+                agent.name
+            )));
+            return;
+        };
         match result {
             Ok(()) => {
                 crate::auth::note_authenticated(&shared.auth, &agent.name);
@@ -982,9 +1030,6 @@ fn start_login(
                     {
                         crate::downstream::probe_target(&shared, &key).await;
                     }
-                }
-                if !adding {
-                    queue_relogin_handoffs(&shared, &agent.name);
                 }
                 runner.set(LoginStatus::Success(format!(
                     "Signed in as {}. Account registration survives logout.",
@@ -1006,7 +1051,6 @@ fn start_login(
                             crate::downstream::probe_target(&shared, &key).await;
                         }
                     }
-                    queue_relogin_handoffs(&shared, &agent.name);
                 }
                 runner.set(LoginStatus::Error(error));
             }
@@ -1037,14 +1081,15 @@ async fn run_login(
     flow: &LoginFlow,
     mut input: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<(), String> {
+    let _credential_lock = crate::credentials::lock(agent).await?;
     if flow.cancel.is_cancelled() {
         return Err("Login cancelled. Existing accounts remain registered.".into());
     }
     let p = provider(agent).unwrap();
-    let default_args: &[&str] = if p == "claude" {
-        &["auth", "login", "--claudeai"]
-    } else {
-        &["login", "--device-auth"]
+    let default_args: &[&str] = match p {
+        "claude" => &["auth", "login", "--claudeai"],
+        "codex" => &["login", "--device-auth"],
+        _ => &["login"],
     };
     let command = agent
         .login_command
@@ -1077,6 +1122,9 @@ async fn run_login(
             }
             "codex" => {
                 cmd.env("CODEX_HOME", dir);
+            }
+            "kimi" => {
+                cmd.env("KIMI_SHARE_DIR", &dir).env("KIMI_CODE_HOME", dir);
             }
             _ => {
                 cmd.env("HOME", dir.parent().unwrap());
@@ -1122,7 +1170,7 @@ async fn run_login(
     loop {
         tokio::select! {
             status = child.wait() => return match status {
-                Ok(s) if s.success() => Ok(()),
+                Ok(s) if s.success() => crate::credentials::login_succeeded(agent),
                 Ok(s) => Err(format!("{p} login failed ({s}). Re-login keeps the account registered.")),
                 Err(e) => Err(format!("{p} login failed: {e}")),
             },
@@ -1162,7 +1210,7 @@ fn browser_message(output: &str, p: &str) -> Option<String> {
             })
             .map(|m| m.as_str().to_string())
     };
-    if p != "claude" && code.is_none() {
+    if !matches!(p, "claude" | "kimi") && code.is_none() {
         return None;
     }
     Some(
@@ -1343,6 +1391,7 @@ async fn publish_added(
         let variable = match provider(agent) {
             Some("claude") => "CLAUDE_CONFIG_DIR",
             Some("codex") => "CODEX_HOME",
+            Some("kimi") => "KIMI_SHARE_DIR",
             _ => "HOME",
         };
         let env = added["command"]
@@ -1354,11 +1403,18 @@ async fn publish_added(
             .ok_or("Invalid command environment")?;
         env.extend(account_env);
         env.retain(|v| {
-            v.get("name")
-                .and_then(Value::as_str)
-                .is_none_or(|n| n != variable && !AUTH_ENV.contains(&n))
+            v.get("name").and_then(Value::as_str).is_none_or(|n| {
+                n != variable
+                    && !(provider(agent) == Some("kimi") && n == "KIMI_CODE_HOME")
+                    && !AUTH_ENV.contains(&n)
+            })
         });
         env.push(serde_json::json!({"name": variable, "value": agent.env_var(variable)}));
+        if provider(agent) == Some("kimi") {
+            env.push(
+                serde_json::json!({"name": "KIMI_CODE_HOME", "value": agent.env_var(variable)}),
+            );
+        }
         // Keep the original account ahead of the newly added one by default.
         for a in agents.iter_mut().filter(|a| {
             a.get("name")
@@ -1427,6 +1483,7 @@ fn register(shared: &Arc<Shared>, agent: &AgentConfig) {
         targets.insert(
             spec.key.clone(),
             TargetRuntime {
+                credential_generation: None,
                 spec,
                 conn: None,
                 init: None,
@@ -1566,6 +1623,10 @@ async fn delete_account(shared: &Arc<Shared>, name: &str) -> Result<String, AcpE
         .find(|a| a.name == name)
         .ok_or_else(|| AcpError::invalid_params().data("Account no longer exists"))?
         .clone();
+    // Removal uses the same authority lock as login and refresh.
+    let _credential_lock = crate::credentials::lock(&agent)
+        .await
+        .map_err(|message| AcpError::internal_error().data(message))?;
     let shared_store = directory(&agent).is_some_and(|dir| {
         agents
             .iter()
@@ -1665,7 +1726,12 @@ fn remove_credentials(agent: &AgentConfig) -> Result<(), String> {
             )?;
         }
     } else {
-        match std::fs::remove_file(dir.join("auth.json")) {
+        let path = dir.join(if provider(agent) == Some("kimi") {
+            "credentials/kimi-code.json"
+        } else {
+            "auth.json"
+        });
+        match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),

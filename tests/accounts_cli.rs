@@ -197,9 +197,15 @@ async fn wait_for_ambient_paths(path: &Path, account_dir: &Path) -> String {
         loop {
             if let Ok(value) = tokio::fs::read_to_string(&path).await
                 && ["login", "probe", "downstream"].iter().all(|label| {
-                    value
-                        .lines()
-                        .any(|line| line.starts_with(&format!("{label}|{account_dir}|")))
+                    value.lines().any(|line| {
+                        let fields: Vec<_> = line.split('|').collect();
+                        fields.first() == Some(label)
+                            && fields.get(1).is_some_and(|observed| {
+                                observed == &account_dir
+                                    || observed
+                                        .starts_with(&format!("{account_dir}/.router-acp-runtime/"))
+                            })
+                    })
                 })
             {
                 return value;
@@ -223,13 +229,21 @@ async fn wait_for_ambient_observations(
     minimum: usize,
 ) {
     let path = path.to_path_buf();
-    let prefix = format!("{label}|{}|", account_dir.to_string_lossy());
+    let account_dir = account_dir.to_string_lossy().to_string();
     tokio::time::timeout(Duration::from_secs(3), async move {
         loop {
             if std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .lines()
-                .filter(|line| line.starts_with(&prefix))
+                .filter(|line| {
+                    let fields: Vec<_> = line.split('|').collect();
+                    fields.first() == Some(&label)
+                        && fields.get(1).is_some_and(|observed| {
+                            *observed == account_dir.as_str()
+                                || observed
+                                    .starts_with(&format!("{account_dir}/.router-acp-runtime/"))
+                        })
+                })
                 .count()
                 >= minimum
             {
@@ -324,10 +338,10 @@ if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     IFS= read -r code || true
     mkdir -p "$dir"
     printf '{"oauthAccount":{"emailAddress":"fixture-new@example.test"}}\n' > "$dir/.claude.json"
-    printf '{"claudeAiOauth":{"rateLimitTier":"pro"}}\n' > "$dir/.credentials.json"
+    printf '{"claudeAiOauth":{"accessToken":"fixture-access","expiresAt":4070908800000,"rateLimitTier":"pro"}}\n' > "$dir/.credentials.json"
 else
     mkdir -p "$dir"
-    printf '{"email":"fixture-new@example.test","plan_type":"pro"}\n' > "$dir/auth.json"
+    printf '{"OPENAI_API_KEY":"fixture-access","email":"fixture-new@example.test","plan_type":"pro"}\n' > "$dir/auth.json"
 fi
 printf 'success\n' >> "$state/events"
 exit 0
@@ -379,7 +393,7 @@ exec "$@"
         if provider == "claude" {
             std::fs::write(
                 path.join(".credentials.json"),
-                r#"{"claudeAiOauth":{"rateLimitTier":"existing"}}"#,
+                r#"{"claudeAiOauth":{"accessToken":"fixture-access","expiresAt":4070908800000,"rateLimitTier":"existing"}}"#,
             )
             .unwrap();
             std::fs::write(
@@ -390,7 +404,7 @@ exec "$@"
         } else {
             std::fs::write(
                 path.join("auth.json"),
-                r#"{"email":"existing@example.test","plan_type":"existing"}"#,
+                r#"{"OPENAI_API_KEY":"fixture-access","email":"existing@example.test","plan_type":"existing"}"#,
             )
             .unwrap();
         }
@@ -407,7 +421,7 @@ exec "$@"
         if provider == "claude" {
             std::fs::write(
                 base.join(".credentials.json"),
-                r#"{"claudeAiOauth":{"rateLimitTier":"home"}}"#,
+                r#"{"claudeAiOauth":{"accessToken":"fixture-access","expiresAt":4070908800000,"rateLimitTier":"home"}}"#,
             )
             .unwrap();
             std::fs::write(
@@ -418,7 +432,7 @@ exec "$@"
         } else {
             std::fs::write(
                 base.join("auth.json"),
-                r#"{"email":"home@example.test","plan_type":"home"}"#,
+                r#"{"OPENAI_API_KEY":"fixture-access","email":"home@example.test","plan_type":"home"}"#,
             )
             .unwrap();
         }
@@ -761,7 +775,7 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
         std::fs::read_to_string(&fixture.probe_log)
             .unwrap()
             .lines()
-            .any(|line| line == added_dir)
+            .any(|line| line.starts_with(&format!("{added_dir}/.router-acp-runtime/")))
     );
     restarted.close().await;
 }
@@ -872,7 +886,11 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     assert!(
         added_lines.iter().all(|line| {
             let fields: Vec<_> = line.split('|').collect();
-            fields.len() == 7 && fields[2..].iter().all(|value| value.is_empty())
+            fields.len() == 7
+                && fields[2..].iter().enumerate().all(|(index, value)| {
+                    value.is_empty()
+                        || (index == 2 && matches!(*value, "added-access" | "fixture-access"))
+                })
         }),
         "{added_lines:?}"
     );
@@ -914,7 +932,11 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     assert!(
         added_lines.iter().all(|line| {
             let fields: Vec<_> = line.split('|').collect();
-            fields.len() == 7 && fields[2..].iter().all(|value| value.is_empty())
+            fields.len() == 7
+                && fields[2..].iter().enumerate().all(|(index, value)| {
+                    value.is_empty()
+                        || (index == 2 && matches!(*value, "added-access" | "fixture-access"))
+                })
         }),
         "{added_lines:?}"
     );
@@ -1034,7 +1056,8 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         std::fs::read_to_string(&fixture.probe_log)
             .unwrap()
             .lines()
-            .any(|line| line == existing_dir.to_string_lossy())
+            .any(|line| line
+                .starts_with(&format!("{}/.router-acp-runtime/", existing_dir.display())))
     );
     restarted.close().await;
 }

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod candidate;
 pub mod classifier;
 pub mod config;
+pub mod credentials;
 pub mod delegate_hook;
 pub mod delegate_mcp;
 pub mod downstream;

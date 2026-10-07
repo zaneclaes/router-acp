@@ -32,6 +32,30 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Read sanitized router account status without spawning provider adapters.
+    AccountStatus {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Internal: access-only credential hook for a router-owned Grok adapter.
+    CredentialToken {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        runtime_directory: PathBuf,
+    },
+    /// Internal: finish a credential rotation even if its caller disconnects.
+    #[command(hide = true)]
+    CredentialRepair {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        observed: String,
+    },
     /// Send one message to a router session with no ACP client attached and
     /// stream the reply to stdout — e.g. a supervisor waking a parent session
     /// whose client is gone. The session keeps its provider session and the
@@ -167,6 +191,42 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => Err(anyhow::anyhow!("router exited with error: {e}")),
             }
+        }
+        Command::AccountStatus { config } => {
+            let config = Config::from_file(&config)?;
+            println!("{}", router_acp::account_usage::status(&config));
+            Ok(())
+        }
+        Command::CredentialToken {
+            provider,
+            directory,
+            runtime_directory,
+        } => {
+            let token = router_acp::credentials::token_for_helper(
+                &provider,
+                &directory,
+                std::env::var("GROK_AUTH_EXPIRED").as_deref() == Ok("1"),
+                &runtime_directory,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            println!("{token}");
+            Ok(())
+        }
+        Command::CredentialRepair {
+            provider,
+            directory,
+            observed,
+        } => {
+            let result =
+                router_acp::credentials::repair_for_helper(&provider, &directory, &observed)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                result == router_acp::credentials::RepairOutcome::Repaired,
+                "Credential repair unavailable"
+            );
+            Ok(())
         }
         Command::UsageMonitor { config } => {
             tracing_subscriber::fmt()

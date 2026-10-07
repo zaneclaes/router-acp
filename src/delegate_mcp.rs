@@ -1390,7 +1390,7 @@ pub async fn run_delegate_task(
                 ),
             },
         };
-        let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
+        let request_generation = crate::auth::request_access_generation(shared, &candidate);
         // Host-directed workers get the router's worker tools (identity and
         // structured handoffs), bound to this worker id.
         let mut session_mcp = sub_mcp.clone();
@@ -1679,6 +1679,7 @@ pub async fn run_delegate_task(
                     profile.class,
                     None,
                 );
+                let prompt_generation = crate::auth::request_access_generation(shared, &candidate);
                 let result = opened.conn.send_request(prompt).block_task().await;
                 // The host may send the worker back to finish before the turn
                 // returns to the parent (`delegate_turn_end`).
@@ -1702,6 +1703,28 @@ pub async fn run_delegate_task(
                     }
                     Err(err) => Err(err),
                 };
+                let result = result.and_then(|resp| {
+                    if resp.stop_reason != StopReason::Cancelled
+                        && crate::auth::response_is_auth_error(&capture.lock().unwrap())
+                    {
+                        Err(AcpError::auth_required()
+                            .data("Provider reported an authentication error"))
+                    } else {
+                        Ok(resp)
+                    }
+                });
+                if result
+                    .as_ref()
+                    .is_err_and(crate::downstream::is_auth_required)
+                {
+                    crate::auth::note_auth_failure_for_request(
+                        shared,
+                        &candidate.agent,
+                        "Authentication unavailable",
+                        prompt_generation.as_deref(),
+                    )
+                    .await;
+                }
                 shared
                     .state
                     .lock()
@@ -1819,7 +1842,8 @@ pub async fn run_delegate_task(
                         &candidate.agent,
                         format!("{} is not signed in", candidate.agent),
                         request_generation.as_deref(),
-                    );
+                    )
+                    .await;
                 }
                 let class = crate::limits::classify_failure(&err);
                 let human = crate::session::apply_failure(shared, &candidate, &err, &class);
@@ -2159,6 +2183,7 @@ pub async fn run_delegate_followup(
         TaskClass::CodingGeneral,
         None,
     );
+    let request_generation = crate::auth::request_access_generation(shared, &candidate);
     let result = conn.send_request(prompt).block_task().await;
     let mut turns = turns + 1;
     let result = match result {
@@ -2180,6 +2205,27 @@ pub async fn run_delegate_followup(
         }
         Err(err) => Err(err),
     };
+    let result = result.and_then(|resp| {
+        if resp.stop_reason != StopReason::Cancelled
+            && crate::auth::response_is_auth_error(&capture.lock().unwrap())
+        {
+            Err(AcpError::auth_required().data("Provider reported an authentication error"))
+        } else {
+            Ok(resp)
+        }
+    });
+    if result
+        .as_ref()
+        .is_err_and(crate::downstream::is_auth_required)
+    {
+        crate::auth::note_auth_failure_for_request(
+            shared,
+            &candidate.agent,
+            "Authentication unavailable",
+            request_generation.as_deref(),
+        )
+        .await;
+    }
     if let Some(live) = shared
         .live_delegates
         .lock()

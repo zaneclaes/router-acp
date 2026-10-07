@@ -214,6 +214,7 @@ pub struct ProcessTransport {
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub scrub_auth_env: bool,
 }
 
 /// Environment every downstream adapter process inherits from this router
@@ -246,7 +247,10 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
         // doesn't half-terminate it outside our control.
         #[cfg(unix)]
         cmd.process_group(0);
-        if self.name.contains('@') || crate::accounts::isolated_environment(&self.env) {
+        if self.scrub_auth_env
+            || self.name.contains('@')
+            || crate::accounts::isolated_environment(&self.env)
+        {
             for key in crate::accounts::AUTH_ENV {
                 cmd.env_remove(key);
             }
@@ -445,6 +449,7 @@ mod tests {
             args: vec!["-c".into(),
                 "i=0; while [ $i -lt 20 ]; do printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"final\",\"params\":{}}'; i=$((i+1)); done; exit 1".into()],
             env: vec![],
+            scrub_auth_env: false,
         };
         let result = tokio::time::timeout(std::time::Duration::from_secs(3),
             UntypedRole.builder().on_receive_dispatch(move |message: Dispatch, _cx| {
@@ -479,6 +484,7 @@ mod tests {
             command: "false".into(),
             args: vec![],
             env: vec![],
+            scrub_auth_env: false,
         };
         let result = UntypedRole
             .builder()
