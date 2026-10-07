@@ -46,48 +46,55 @@ pub fn summarize(shared: &Arc<Shared>) -> String {
         },
     );
 
-    let mut out = String::from("Usage\n");
-    let mut current_provider: Option<String> = None;
-    for (_, agent, provider) in accounts {
-        if current_provider.as_deref() != Some(provider.as_str()) {
-            if current_provider.is_some() {
-                out.push('\n');
+    // One top-level section per account, so each login reads on its own.
+    let sections: Vec<String> = accounts
+        .iter()
+        .map(|(_, agent, _)| {
+            let mut section = format!("{}:", account_title(agent));
+            for line in account_lines(shared, agent) {
+                section.push_str("\n  ");
+                section.push_str(&line);
             }
-            out.push_str(&format!("{provider}:\n"));
-            current_provider = Some(provider);
-        }
-        let detail = summarize_account(shared, &agent);
-        for line in detail.lines() {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out.trim_end_matches('\n').to_string()
+            section
+        })
+        .collect();
+    format!("Usage\n\n{}", sections.join("\n\n"))
 }
 
-/// Format one account for `/login` detail and for the grouped `/usage` view.
+/// Format one account for the `/login` account detail.
 pub fn summarize_account(shared: &Arc<Shared>, agent: &AgentConfig) -> String {
+    let mut lines = vec![account_title(agent)];
+    lines.extend(account_lines(shared, agent));
+    lines.join("\n")
+}
+
+/// `claude (zane@example.com)`: the provider and the signed-in identity, or
+/// the configured name when no identity is known.
+fn account_title(agent: &AgentConfig) -> String {
     let provider = crate::accounts::provider(agent).unwrap_or("unknown");
-    let (identity, plan) = crate::accounts::identity(agent);
-    let identity = if identity.trim().is_empty() {
+    let (identity, _) = crate::accounts::identity(agent);
+    let identity = identity.trim();
+    if identity.is_empty() || identity == agent.name {
         safe_text(&agent.name)
     } else {
-        safe_text(&identity)
-    };
+        format!("{provider} ({})", safe_text(identity))
+    }
+}
 
-    let mut lines = vec![format!("{} ({})", safe_text(&agent.name), identity)];
+fn account_lines(shared: &Arc<Shared>, agent: &AgentConfig) -> Vec<String> {
+    let provider = crate::accounts::provider(agent).unwrap_or("unknown");
+    let (_, plan) = crate::accounts::identity(agent);
+    let mut lines = Vec::new();
     if let Some(plan) = plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
         lines.push(format!("plan: {}", safe_text(plan)));
     }
     if agent.account_priority.is_some() {
-        lines.push(format!(
-            "account priority: {}",
-            agent
-                .account_priority
-                .map(|priority| priority.to_string())
-                .unwrap_or_else(|| "unset".to_string())
-        ));
+        // Shown as the 1-based position in the provider's drain order, so an
+        // older config that stored 0 still reads as 1.
+        let group = crate::accounts::account_group(shared, &agent.name);
+        if let Some(rank) = group.iter().position(|name| name == &agent.name) {
+            lines.push(format!("account priority: {}", rank + 1));
+        }
     }
 
     let auth = shared.auth.lock().unwrap().availability(&agent.name);
@@ -123,7 +130,7 @@ pub fn summarize_account(shared: &Arc<Shared>, agent: &AgentConfig) -> String {
             "model {} cordon: {} (resets {})",
             safe_text(&model),
             safe_text(&cordon.reason),
-            safe_text(&cordon.resets_at_rfc3339)
+            reset_label(&cordon.resets_at_rfc3339)
         ));
     }
 
@@ -136,17 +143,18 @@ pub fn summarize_account(shared: &Arc<Shared>, agent: &AgentConfig) -> String {
         if reactive_cordon.is_none() {
             lines.push("gate: available or not yet observed".to_string());
         }
-        return lines.join("\n");
+        return lines;
     }
 
     let snapshot = crate::usage_cache::read_agent_snapshot(agent);
-    lines.push(format_snapshot(
+    let usage = format_snapshot(
         provider,
         snapshot.as_ref(),
         unix_now(),
         shared.cfg.cordon.poll_secs.max(DEFAULT_CACHE_MAX_AGE_SECS),
-    ));
-    lines.join("\n")
+    );
+    lines.extend(usage.lines().map(str::to_string));
+    lines
 }
 
 /// Format a provider payload without exposing arbitrary JSON fields.
@@ -357,7 +365,7 @@ fn claude_credits(payload: &Value) -> Option<String> {
     if let Some(percent) = percent {
         detail.push_str(&format!(" {}", meter_suffix(percent, reset)));
     } else if let Some(reset) = reset {
-        detail.push_str(&format!("; resets {}", safe_text(&reset)));
+        detail.push_str(&format!("; resets {}", reset_label(&reset)));
     }
     Some(format!("extra usage: {detail}"))
 }
@@ -420,9 +428,58 @@ fn window_line(label: &str, percent: f64, reset: Option<String>) -> String {
 fn meter_suffix(percent: f64, reset: Option<String>) -> String {
     let mut out = format!("{}% {}", rounded_percent(percent), usage_bar(percent));
     if let Some(reset) = reset {
-        out.push_str(&format!("; resets {}", safe_text(&reset)));
+        out.push_str(&format!("; resets {}", reset_label(&reset)));
     }
     out
+}
+
+/// A reset time as the reader's local weekday and hour plus how far away it
+/// is: `Tue 12am (in 4 days 3 hours)`. Unparseable values print as given.
+fn reset_label(raw: &str) -> String {
+    friendly_reset(raw, chrono::Utc::now(), &chrono::Local)
+}
+
+fn friendly_reset<Tz: chrono::TimeZone>(
+    raw: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    tz: &Tz,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use chrono::Timelike;
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(raw.trim()) else {
+        return safe_text(raw);
+    };
+    let local = at.with_timezone(tz);
+    let (pm, hour) = local.hour12();
+    let suffix = if pm { "pm" } else { "am" };
+    let clock = match local.minute() {
+        0 => format!("{hour}{suffix}"),
+        minute => format!("{hour}:{minute:02}{suffix}"),
+    };
+    let minutes = (at.with_timezone(&chrono::Utc) - now)
+        .num_seconds()
+        .saturating_add(30)
+        / 60;
+    let relative = if minutes <= 0 {
+        "now".to_string()
+    } else {
+        let units = [
+            (minutes / 1440, "day"),
+            (minutes % 1440 / 60, "hour"),
+            (minutes % 60, "minute"),
+        ];
+        let parts: Vec<String> = units
+            .iter()
+            .skip_while(|(n, _)| *n == 0)
+            .take(2)
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, unit)| format!("{n} {unit}{}", if *n == 1 { "" } else { "s" }))
+            .collect();
+        format!("in {}", parts.join(" "))
+    };
+    format!("{} {clock} ({relative})", local.format("%a"))
 }
 
 fn claude_label(kind: &str, scope: Option<&str>) -> String {
@@ -678,6 +735,37 @@ fn safe_text(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resets_read_as_local_weekday_hour_and_distance() {
+        // Wed 2026-10-07 14:41 UTC.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-07T14:41:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mountain = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
+        let utc = chrono::Utc;
+        assert_eq!(
+            friendly_reset("2026-10-14T06:00:00.397593+00:00", now, &mountain),
+            "Wed 12am (in 6 days 15 hours)"
+        );
+        assert_eq!(
+            friendly_reset("2026-10-07T16:20:00.397566+00:00", now, &utc),
+            "Wed 4:20pm (in 1 hour 39 minutes)"
+        );
+        assert_eq!(
+            friendly_reset("2026-10-07T14:46:00Z", now, &utc),
+            "Wed 2:46pm (in 5 minutes)"
+        );
+        assert_eq!(
+            friendly_reset("2026-10-11T14:41:00Z", now, &utc),
+            "Sun 2:41pm (in 4 days)"
+        );
+        assert_eq!(
+            friendly_reset("2026-10-07T14:00:00Z", now, &utc),
+            "Wed 2pm (now)"
+        );
+        assert_eq!(friendly_reset("soon", now, &utc), "soon");
+    }
 
     #[test]
     fn formats_claude_limits_scopes_and_spend_in_snake_case() {

@@ -865,7 +865,8 @@ fn new_account(shared: &Arc<Shared>, p: &str) -> Result<(AgentConfig, String), A
             .filter(|a| provider(a) == Some(p))
             .filter_map(|a| a.account_priority)
             .max()
-            .unwrap_or(0)
+            // Priorities are 1-based; an unset original is given 1 on save.
+            .unwrap_or(1)
             .saturating_add(1),
     );
     let home = agent
@@ -1365,7 +1366,7 @@ async fn publish_added(
                 .is_some_and(|n| n.split('@').next() == agent.name.split('@').next())
         }) {
             if a.get("account_priority").is_none() {
-                a["account_priority"] = serde_json::json!(0);
+                a["account_priority"] = serde_json::json!(1);
             }
         }
         agents.push(added);
@@ -1442,7 +1443,7 @@ fn register(shared: &Arc<Shared>, agent: &AgentConfig) {
 }
 
 /// The registered accounts sharing `name`'s provider, in priority order.
-fn account_group(shared: &Arc<Shared>, name: &str) -> Vec<String> {
+pub(crate) fn account_group(shared: &Arc<Shared>, name: &str) -> Vec<String> {
     shared
         .agent_configs()
         .iter()
@@ -1500,14 +1501,14 @@ fn set_account_fields(
 }
 
 /// Move `name` to `position` (0 = drained first) and renumber its whole
-/// provider group, so every account gets an explicit, distinct priority.
+/// provider group 1..=N, so every account gets an explicit, distinct priority.
 async fn set_priority(shared: &Arc<Shared>, name: &str, position: usize) -> Result<(), String> {
     let mut order = account_group(shared, name);
     order.retain(|n| n != name);
     order.insert(position.min(order.len()), name.to_string());
     let cfg = write_config(shared, |doc| {
-        for (priority, account) in order.iter().enumerate() {
-            let p = serde_json::json!(priority);
+        for (index, account) in order.iter().enumerate() {
+            let p = serde_json::json!(index + 1);
             set_account_fields(
                 doc,
                 account,
@@ -1805,8 +1806,8 @@ mod tests {
                 .unwrap()
                 .account_priority
         };
-        assert_eq!(priority("claude@added"), Some(0));
-        assert_eq!(priority("claude"), Some(1));
+        assert_eq!(priority("claude@added"), Some(1));
+        assert_eq!(priority("claude"), Some(2));
     }
 
     #[test]

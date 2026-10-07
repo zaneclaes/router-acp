@@ -712,7 +712,8 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
             .count(),
         1
     );
-    assert_eq!(added.account_priority, Some(1));
+    // 1-based: the original account is saved as 1, the added one as 2.
+    assert_eq!(added.account_priority, Some(2));
     let added_dir = added.env_var("CODEX_HOME").unwrap();
     assert!(added_dir.starts_with(fixture.account_root.to_string_lossy().as_ref()));
     assert_eq!(
@@ -1068,7 +1069,7 @@ async fn standalone_menu_sets_listed_account_priority_and_reserve() {
     assert!(text.contains("session reserve set to 0%."), "{text}");
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
     let account = cfg.agents.iter().find(|a| a.name == "codex@old").unwrap();
-    assert_eq!(account.account_priority, Some(0));
+    assert_eq!(account.account_priority, Some(1));
     assert_eq!(account.reserve_capacity.weekly, 10.0);
     assert_eq!(account.reserve_capacity.session, 0.0);
     assert_eq!(prompt_count(&fixture.original_log), 0);

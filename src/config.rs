@@ -1667,7 +1667,8 @@ impl Config {
                 }
                 let mut seat = agent.clone();
                 seat.name = format!("{}@{}", agent.name, account.name);
-                seat.account_priority = Some(account.priority.unwrap_or(index as u32));
+                // Priorities are 1-based: list order defaults to 1, 2, 3…
+                seat.account_priority = Some(account.priority.unwrap_or(index as u32 + 1));
                 seat.account_disabled = account.disabled || agent.account_disabled;
                 seat.lineage = Some(agent.lineage.clone().unwrap_or_else(|| agent.name.clone()));
                 seat.command.env.extend(account.env);
