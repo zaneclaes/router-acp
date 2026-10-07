@@ -142,7 +142,7 @@ pub struct DelegateHandle {
     pub downstream_sid: String,
 }
 
-/// A delegate sub-session kept open across multiple turns so the orchestrator
+/// A delegate sub-session kept open across multiple turns so the parent
 /// can send follow-up instructions to the same sub-agent (preserving its
 /// context) rather than re-briefing a fresh session each time.
 pub struct LiveDelegate {
@@ -154,10 +154,33 @@ pub struct LiveDelegate {
     pub capture: Arc<Mutex<String>>,
     /// State-DB row id for this delegate, for follow-up logging.
     pub sub_sid: String,
+    /// The start event sent to `delegation.lifecycle_hook`, if one is
+    /// configured; its stop event is sent when the delegate is closed.
+    pub lifecycle: Option<crate::delegate_hook::DelegateEvent>,
+    /// Router worker id (`b-…`/`w-…`), also the `worker_handoffs` key.
+    pub worker_id: String,
+    /// Turns completed so far, for `delegate_turn_end` events.
+    pub turns: u32,
+}
+
+impl LiveDelegate {
+    /// Release per-delegate state and report the stop to the lifecycle hook.
+    pub fn finish(&self, shared: &Arc<Shared>, outcome: &str) {
+        shared.delegate_effort.lock().unwrap().remove(&self.sub_sid);
+        shared
+            .worker_handoffs
+            .lock()
+            .unwrap()
+            .remove(&self.worker_id);
+        crate::delegate_mcp::drop_worker_tokens(shared, &self.worker_id);
+        if let Some(event) = &self.lifecycle {
+            crate::delegate_hook::deliver(shared, &event.stopped(outcome, None));
+        }
+    }
 }
 
 /// A `delegate_task background: true` job. The subtask runs on its own tokio
-/// task; the orchestrator collects the outcome later via `delegate_await`.
+/// task; the parent collects the outcome later via `delegate_await`.
 /// `result` stays `None` while running and is consumed (entry removed) when an
 /// await returns it.
 pub struct BackgroundDelegate {
@@ -180,8 +203,8 @@ pub struct RouterSession {
     pub required_mcp_capabilities: Vec<String>,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
-    /// Who set `candidate_override` (user, a skill route, the orchestration
-    /// planner). Not persisted: the pin happens on the turn that sets it.
+    /// Who set `candidate_override` (user or a skill route). Not persisted:
+    /// the pin happens on the turn that sets it.
     pub candidate_override_source: Option<OverrideSource>,
     /// Explicit user effort (`auto` clears it); it takes precedence over a
     /// classifier recommendation and is retained across failover.
@@ -214,8 +237,8 @@ pub struct RouterSession {
     /// Candidate/agent exclusion patterns from a `[router: exclude=...]`
     /// prompt directive. Session-scoped; also honored by failover re-pins.
     pub excluded: Vec<String>,
-    /// Optional grouping label from `[router: label=...]` — shared by the
-    /// planner/subtask/review sessions of one orchestration run.
+    /// Optional grouping label from `[router: label=...]` — shared with the
+    /// session's delegates.
     pub run_label: Option<String>,
     /// Whether any downstream output was relayed to the client during the
     /// current prompt turn. Hot failover preserves it with tool statuses
@@ -270,17 +293,8 @@ pub struct RouterSession {
     /// When set, agent text on the pinned session is captured here instead
     /// of relayed (used to collect a summary during a switch).
     pub capturing_summary: Option<Arc<Mutex<String>>>,
-    // ---- auto-orchestration ----
-    /// Set once a prompt is detected as a multi-part task list and the session
-    /// is put into orchestration mode: relaxes delegation to allow same-/higher-
-    /// tier peers (for cross-lineage review), and marks the session as an
-    /// orchestrator in disclosures/state.
-    pub orchestrating: bool,
-    /// One-shot orchestration protocol instructions to prepend to the next
-    /// prompt (taken once, like `pending_context`).
-    pub pending_orchestration: Option<String>,
     /// One-shot host injects from the pre-classifier (e.g. ui_planning guidance),
-    /// prepended after the orchestration protocol when both fire.
+    /// prepended to the next prompt.
     pub pending_injects: Vec<String>,
     /// Candidate whose freshly opened downstream session should receive the
     /// ordinary delegation directive on its first prompt. Set only when the
@@ -295,9 +309,10 @@ pub struct RouterSession {
     /// Successful LLM pre-classification supersedes the static classifier for
     /// the initial model-selection profile.
     pub preclass_profile: Option<crate::classifier::TaskProfile>,
-    /// Whether the native-subagent-usage warning has fired this turn (an
-    /// orchestrating session using the adapter's built-in `Task` tool instead of
-    /// `delegate_task`). Reset each turn so it warns at most once per turn.
+    /// Whether the native-subagent-usage warning has fired this turn (a session
+    /// that received the delegation directive using the adapter's built-in
+    /// `Task` tool instead of `delegate_task`). Reset each turn so it warns at
+    /// most once per turn.
     pub turn_native_subagent_warned: bool,
     /// Ticket ids already injected into this session's context (a re-mention
     /// doesn't re-inject the same ticket).
@@ -424,8 +439,6 @@ impl RouterSession {
             escalation_requested: None,
             pending_context: None,
             capturing_summary: None,
-            orchestrating: false,
-            pending_orchestration: None,
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
             delegation_directive_active: false,
@@ -492,8 +505,6 @@ impl RouterSession {
             escalation_requested: None,
             pending_context: None,
             capturing_summary: None,
-            orchestrating: false,
-            pending_orchestration: None,
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
             delegation_directive_active: false,
@@ -543,15 +554,25 @@ pub struct Shared {
     pub candidates: Mutex<Vec<CandidateRuntime>>,
     sid_map: Mutex<HashMap<(ProcessKey, String), DownstreamRoute>>,
     pub delegate_tokens: Mutex<HashMap<String, crate::delegate_mcp::DelegateBinding>>,
-    /// Delegate sub-sessions kept alive for follow-up turns (orchestration),
-    /// keyed by the short `delegate_id` returned to the orchestrator.
+    /// Delegate sub-sessions kept alive for follow-up turns (`keep_open`),
+    /// keyed by the short `delegate_id` returned to the parent.
     pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
     /// Background delegate jobs keyed by the short `b-…` id returned to the
-    /// orchestrator; results are collected (and consumed) via `delegate_await`.
+    /// parent; results are collected (and consumed) via `delegate_await`.
     pub background_delegates: Mutex<HashMap<String, BackgroundDelegate>>,
     /// Signaled whenever any background delegate finishes, waking waiters in
     /// `delegate_await`.
     pub background_notify: tokio::sync::Notify,
+    /// Per-delegate effort from `delegate_task` `hints.effort`, keyed by the
+    /// delegate's state-session id. The LLM proxy reads it in place of the
+    /// parent session's effort while that delegate runs.
+    pub delegate_effort: Mutex<HashMap<String, crate::candidate::EffortLevel>>,
+    /// Per-agent delegate slots for agents with `max_delegates`, beside the
+    /// global `delegate_semaphore`.
+    pub agent_delegate_slots: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// Each worker's latest `worker_handoff`, keyed by worker id; reported
+    /// with its next `delegate_turn_end` and cleared when the next turn starts.
+    pub worker_handoffs: Mutex<HashMap<String, crate::delegate_hook::Handoff>>,
     /// Short-TTL cache of fetched ticket content (ticket id → (fetched-at,
     /// body)), so concurrent sessions share one fetch.
     pub ticket_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
@@ -636,6 +657,14 @@ impl Shared {
         }
 
         let max_concurrent = cfg.delegation.max_concurrent;
+        let agent_delegate_slots = cfg
+            .agents
+            .iter()
+            .filter_map(|a| {
+                a.max_delegates
+                    .map(|n| (a.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
+            })
+            .collect();
         Ok(Arc::new(Self {
             account_config: Mutex::new(cfg.clone()),
             account_menus: Mutex::default(),
@@ -658,6 +687,9 @@ impl Shared {
             live_delegates: Mutex::new(HashMap::new()),
             background_delegates: Mutex::new(HashMap::new()),
             background_notify: tokio::sync::Notify::new(),
+            delegate_effort: Mutex::new(HashMap::new()),
+            agent_delegate_slots,
+            worker_handoffs: Mutex::new(HashMap::new()),
             ticket_cache: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             delegate_socket: OnceLock::new(),
@@ -1379,6 +1411,25 @@ pub fn sid_str(sid: &agent_client_protocol::schema::v1::SessionId) -> String {
     sid.0.to_string()
 }
 
+/// The effort a primary session runs at: an explicit request (the
+/// `router.effort` option or `[router: effort=…]`) as given; otherwise
+/// `effort.default` or the automatic recommendation, capped at
+/// `effort.max_automatic`.
+pub(crate) fn session_effort(
+    cfg: &crate::config::Config,
+    explicit: Option<EffortLevel>,
+    automatic: Option<EffortLevel>,
+) -> Option<EffortLevel> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let chosen = cfg.effort.default.or(automatic)?;
+    Some(match cfg.effort.max_automatic {
+        Some(cap) if chosen > cap => cap,
+        _ => chosen,
+    })
+}
+
 /// Re-resolve effort for an already pinned session after a user changes the
 /// router-owned effort option. The next provider request reads this state.
 fn refresh_pinned_effort(
@@ -1386,11 +1437,13 @@ fn refresh_pinned_effort(
     scores: &ScoreTable,
     session: &mut RouterSession,
 ) {
-    let requested = session.effort_request.or_else(|| {
+    let requested = session_effort(
+        cfg,
+        session.effort_request,
         session
             .task_class
-            .map(|class| automatic_effort(class, session.task_complexity))
-    });
+            .map(|class| automatic_effort(class, session.task_complexity)),
+    );
     let version = session.version_request.as_deref();
     session.resolved_effort = session.pin.as_ref().and_then(|pin| {
         let key = match cfg.resolve_version(&pin.candidate, version) {
@@ -2160,16 +2213,17 @@ pub fn handle_downstream_dispatch(
                             // per distinct tool (on its initial announcement).
                             if su == "tool_call" {
                                 note_tool_activity(shared, key, &down_sid, &router_sid);
-                                // Delegation degradation: a model that received
-                                // either router delegation protocol used the
-                                // adapter's built-in sub-agent tool instead.
-                                let delegation_mode = shared.with_session(&router_sid, |s| {
-                                    (s.orchestrating, s.delegation_directive_active)
-                                });
+                                // Delegation bypass: a model told to use only the
+                                // router's delegation tools used the adapter's
+                                // built-in sub-agent tool instead. A host that
+                                // allows native subagents is not bypassing.
+                                let prompted = shared
+                                    .with_session(&router_sid, |s| s.delegation_directive_active)
+                                    .unwrap_or(false);
                                 if is_native_subagent_tool(update)
-                                    && delegation_mode.is_some_and(|(orchestrating, prompted)| {
-                                        orchestrating || prompted
-                                    })
+                                    && prompted
+                                    && shared.cfg.delegation.native_subagents
+                                        == crate::config::NativeSubagentPolicy::Forbid
                                 {
                                     shared
                                         .state
@@ -2187,24 +2241,13 @@ pub fn handle_downstream_dispatch(
                                         })
                                         .unwrap_or(false);
                                     if warn {
-                                        let orchestrating = delegation_mode
-                                            .is_some_and(|(orchestrating, _)| orchestrating);
                                         notify_user(
                                             shared,
                                             &router_sid,
-                                            if orchestrating {
-                                                "router-acp · orchestration degraded: the planner \
-                                                 used its built-in sub-agent tool instead of \
-                                                 `delegate_task` — sub-tasks stay in the planner's \
-                                                 lineage and are invisible to the router (no \
-                                                 cross-lineage review, no per-subtask model routing, \
-                                                 no delegate rows recorded)"
-                                            } else {
-                                                "router-acp · delegation bypassed: the model used \
-                                                 its built-in sub-agent tool instead of the router's \
-                                                 `delegate_task`; that work is invisible to router \
-                                                 routing and cost telemetry"
-                                            },
+                                            "router-acp · delegation bypassed: the model used \
+                                             its built-in sub-agent tool instead of the router's \
+                                             `delegate_task`; that work is invisible to router \
+                                             routing and cost telemetry",
                                         );
                                     }
                                 }
@@ -2710,6 +2753,7 @@ pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
     };
     for d in orphans {
         close_downstream_session(shared, &d.process_key, &d.downstream_sid);
+        d.finish(shared, "closed");
     }
     // Drop the session's background jobs too: finished results nobody will
     // collect, and completion markers for still-running jobs (which notice the
@@ -2754,15 +2798,40 @@ pub struct PromptDirectives {
     pub phase: Option<crate::config::PlannerPhase>,
 }
 
-/// Parse (and strip) a routing directive from the prompt.
-/// Returns `Ok(None)` when no directive is present; `Err` describes an
-/// invalid directive (the prompt fails loudly so recipes get fixed).
+/// Parse (and strip) every routing directive in the prompt. Several tags
+/// (`[router: candidate=…] [router: effort=…]`) merge as if they were one
+/// comma-separated tag: a later key overrides an earlier one, and `exclude`
+/// lists combine. Returns `Ok(None)` when no directive is present; `Err`
+/// describes an invalid directive (the prompt fails loudly so recipes get
+/// fixed).
+pub fn parse_prompt_directives(
+    prompt: &[ContentBlock],
+) -> Result<Option<(PromptDirectives, Vec<ContentBlock>)>, String> {
+    let mut merged: Option<PromptDirectives> = None;
+    let mut remaining = prompt.to_vec();
+    while let Some((next, stripped)) = parse_one_prompt_directive(&remaining)? {
+        remaining = stripped;
+        let into = merged.get_or_insert_with(PromptDirectives::default);
+        into.candidate = next.candidate.or(into.candidate.take());
+        into.prefer = next.prefer.or(into.prefer.take());
+        into.switch = next.switch.or(into.switch.take());
+        into.strategy = next.strategy.or(into.strategy.take());
+        into.exclude.extend(next.exclude);
+        into.label = next.label.or(into.label.take());
+        into.effort = next.effort.or(into.effort.take());
+        into.version = next.version.or(into.version.take());
+        into.phase = next.phase.or(into.phase.take());
+    }
+    Ok(merged.map(|directives| (directives, remaining)))
+}
+
+/// Parse (and strip) the first routing directive in the prompt.
 ///
 /// The directive is matched on any line of ANY text block — goose both wraps
 /// prompts in a `<turn-context>` preamble AND may split it into a separate
 /// content block, so neither "line 1" nor "first block" is safe. Only the
 /// directive line is removed; the surrounding text (preamble + task) is kept.
-pub fn parse_prompt_directives(
+fn parse_one_prompt_directive(
     prompt: &[ContentBlock],
 ) -> Result<Option<(PromptDirectives, Vec<ContentBlock>)>, String> {
     // Locate the `[router:` directive within any text block, then
@@ -3417,8 +3486,8 @@ async fn pin_session(
     // With Model=Auto, an explicit effort is a routing requirement rather
     // than a post-selection preference. A concrete candidate remains allowed
     // to normalize to its nearest provider-supported level.
-    // A coordinator keeps a non-human override (skill route, orchestration
-    // planner) only when it names a planning candidate.
+    // A coordinator keeps a non-human override (a skill route) only when it
+    // names a planning candidate.
     let coordinator = shared
         .with_session(router_sid, |s| s.coordinator)
         .unwrap_or(false);
@@ -3717,10 +3786,13 @@ async fn pin_session(
                 let pin_quality = shared
                     .scores_for(router_sid, &candidate)
                     .quality(profile.class);
-                let requested_effort = shared
-                    .with_session(router_sid, |s| s.effort_request)
-                    .flatten()
-                    .or(profile.effort.filter(|level| *level != EffortLevel::Auto));
+                let requested_effort = session_effort(
+                    &shared.cfg,
+                    shared
+                        .with_session(router_sid, |s| s.effort_request)
+                        .flatten(),
+                    profile.effort.filter(|level| *level != EffortLevel::Auto),
+                );
                 let resolved_effort = requested_effort.map(|level| {
                     shared
                         .scores_for(router_sid, &candidate)
@@ -3728,7 +3800,7 @@ async fn pin_session(
                 });
                 let mode_to_apply = shared
                     .with_session(router_sid, |s| {
-                        s.pin = Some(PinInfo {
+                        let previous = s.pin.replace(PinInfo {
                             candidate: candidate.clone(),
                             process_key: opened.process_key.clone(),
                             downstream_sid: opened.downstream_sid.clone(),
@@ -3740,10 +3812,7 @@ async fn pin_session(
                         // received the router tools.
                         s.pending_delegation_directive = None;
                         s.delegation_directive_active = false;
-                        if delegate_attached
-                            && shared.cfg.delegation.inject_prompt
-                            && !s.orchestrating
-                        {
+                        if delegate_attached && shared.cfg.delegation.inject_prompt {
                             s.pending_delegation_directive = Some(candidate.clone());
                         }
                         // Confidence baseline for this pin; reset struggle.
@@ -3754,9 +3823,26 @@ async fn pin_session(
                         s.struggle = 0.0;
                         // Deferred pre-pin mode wins; on failover re-apply
                         // whatever the client had set for this session.
-                        s.pending_mode.take().or_else(|| s.applied_mode.clone())
+                        (
+                            s.pending_mode.take().or_else(|| s.applied_mode.clone()),
+                            previous,
+                        )
                     })
-                    .flatten();
+                    .unwrap_or((None, None));
+                let (mode_to_apply, previous_pin) = mode_to_apply;
+                // A failover re-pin moved the parent to a new provider session.
+                if let Some(previous) = previous_pin {
+                    report_repin(
+                        shared,
+                        router_sid,
+                        &previous.candidate,
+                        &previous.downstream_sid,
+                        &candidate,
+                        &opened.downstream_sid,
+                        "failover",
+                    )
+                    .await;
+                }
 
                 // Apply the session mode (deferred pre-pin, or carried across
                 // a failover). Best effort: an unsupported mode leaves the
@@ -4085,7 +4171,7 @@ async fn pin_session(
 
 /// The MCP servers to hand a new pinned session: the client's own servers
 /// plus the router delegate endpoint when delegation is enabled and useful.
-fn mcp_servers_for_pin(
+pub(crate) fn mcp_servers_for_pin(
     shared: &Arc<Shared>,
     router_sid: &str,
     candidate: &CandidateId,
@@ -4107,8 +4193,7 @@ fn mcp_servers_for_pin(
             merge_catalog_entries(&mut servers, entries);
         }
     }
-    let delegate_attached =
-        crate::delegate_mcp::delegation_available(shared, router_sid, candidate);
+    let delegate_attached = crate::delegate_mcp::delegation_available(shared, candidate);
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
     }
@@ -4289,18 +4374,86 @@ mod mcp_catalog_tests {
     }
 }
 
-fn build_delegation_instructions() -> String {
-    "[router-acp delegation]\n\
-     The router's `delegate_task`, `delegate_await`, `delegate_followup`, and \
-     `delegate_close` tools are available for cheaper sub-sessions. Proactively \
-     delegate only bounded, independent work when the briefing and verification \
-     overhead is lower than doing it yourself. Do not delegate work that depends \
-     on hidden conversation context, tightly coupled integration, or overlapping \
-     file edits. Give each delegate a complete brief, verify its result, and \
-     integrate it yourself. Use only the router-owned delegation tools; never use \
-     provider-native Task/spawn/subagent tools. If no suitable subtask exists, \
-     continue directly."
-        .to_string()
+fn build_delegation_instructions(policy: crate::config::NativeSubagentPolicy) -> String {
+    let native = match policy {
+        crate::config::NativeSubagentPolicy::Forbid => {
+            "Use only the router-owned delegation tools; never use provider-native \
+             Task/spawn/subagent tools."
+        }
+        // The host's own workflow decides when a native subagent is right.
+        crate::config::NativeSubagentPolicy::Allow => {
+            "Provider-native subagent tools remain available when your instructions call \
+             for them; use the router-owned tools when a different model should do the work."
+        }
+    };
+    format!(
+        "[router-acp delegation]\n\
+         The router's `delegate_task`, `delegate_await`, `delegate_followup`, and \
+         `delegate_close` tools are available for cheaper sub-sessions. Proactively \
+         delegate only bounded, independent work when the briefing and verification \
+         overhead is lower than doing it yourself. Do not delegate work that depends \
+         on hidden conversation context, tightly coupled integration, or overlapping \
+         file edits. Give each delegate a complete brief, verify its result, and \
+         integrate it yourself. {native} If no suitable subtask exists, continue directly."
+    )
+}
+
+#[cfg(test)]
+mod effort_policy_tests {
+    use super::session_effort;
+    use crate::candidate::EffortLevel;
+
+    fn cfg(effort: &str) -> crate::config::Config {
+        crate::config::Config::from_yaml(&format!(
+            "{effort}agents:\n  - name: a\n    command: {{ type: stdio, command: mock-agent }}\n    \
+             model_selection: {{ type: config-option }}\n    models: [{{ id: m1, cost_rank: 1 }}]\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_wins_then_default_then_automatic_capped() {
+        let none = cfg("");
+        assert_eq!(
+            session_effort(&none, None, Some(EffortLevel::Max)),
+            Some(EffortLevel::Max)
+        );
+        let policy = cfg("effort: { default: medium, max_automatic: high }\n");
+        // The default replaces the automatic recommendation...
+        assert_eq!(
+            session_effort(&policy, None, Some(EffortLevel::Max)),
+            Some(EffortLevel::Medium)
+        );
+        // ...and an explicit request is never capped.
+        assert_eq!(
+            session_effort(&policy, Some(EffortLevel::Max), Some(EffortLevel::Low)),
+            Some(EffortLevel::Max)
+        );
+        let capped = cfg("effort: { max_automatic: high }\n");
+        assert_eq!(
+            session_effort(&capped, None, Some(EffortLevel::Xhigh)),
+            Some(EffortLevel::High)
+        );
+        assert_eq!(
+            session_effort(&capped, None, Some(EffortLevel::Low)),
+            Some(EffortLevel::Low)
+        );
+    }
+}
+
+#[cfg(test)]
+mod delegation_directive_tests {
+    use super::build_delegation_instructions;
+    use crate::config::NativeSubagentPolicy;
+
+    #[test]
+    fn native_subagent_policy_controls_the_directive() {
+        let forbid = build_delegation_instructions(NativeSubagentPolicy::Forbid);
+        assert!(forbid.contains("never use provider-native Task/spawn/subagent tools"));
+        let allow = build_delegation_instructions(NativeSubagentPolicy::Allow);
+        assert!(!allow.contains("never use provider-native"), "{allow}");
+        assert!(allow.contains("Provider-native subagent tools remain available"));
+    }
 }
 
 fn build_background_instructions() -> String {
@@ -4521,32 +4674,30 @@ async fn send_prompt_with_failover(
         // attempt — pre-loop pending_switch, or a mid-turn escalation on the
         // previous iteration) is prepended, consumed once. It is already fully
         // framed by `switch_pin` (summary or log-transcript fallback).
-        let (orchestration, delegation, injects, handoff) = shared
+        let (delegation, injects, handoff) = shared
             .with_session(&router_sid, |s| {
                 (
-                    s.pending_orchestration.take(),
                     s.pending_delegation_directive.take(),
                     std::mem::take(&mut s.pending_injects),
                     s.pending_context.take(),
                 )
             })
-            .unwrap_or((None, None, Vec::new(), None));
+            .unwrap_or((None, Vec::new(), None));
         let effective_prompt = {
             let mut blocks = Vec::new();
-            // Router framing first (background contract, then the full
-            // orchestration protocol or scoped ordinary-delegation directive),
-            // followed by host pre-class injects (e.g. ui_planning), switch
-            // handoff context, and the task. The short question policy closes
-            // the prompt so it is both recent and does not disturb the task's
-            // established first-content-block transport semantics.
+            // Router framing first (background contract, then the scoped
+            // delegation directive), followed by host pre-class injects (e.g.
+            // ui_planning), switch handoff context, and the task. The short
+            // question policy closes the prompt so it is both recent and does
+            // not disturb the task's established first-content-block transport
+            // semantics.
             if shared.upstream_client_capabilities().terminal {
                 blocks.push(ContentBlock::from(build_background_instructions()));
             }
-            if let Some(instr) = orchestration {
-                blocks.push(ContentBlock::from(instr));
-            }
             if let Some(directive_candidate) = delegation {
-                blocks.push(ContentBlock::from(build_delegation_instructions()));
+                blocks.push(ContentBlock::from(build_delegation_instructions(
+                    shared.cfg.delegation.native_subagents,
+                )));
                 shared.with_session(&router_sid, |s| {
                     s.delegation_directive_active = true;
                 });
@@ -4960,7 +5111,7 @@ pub(crate) fn first_eligible_candidate(
 /// The counterpart of `first_eligible_candidate`, which maxes quality across
 /// the whole list and so treats list order as a mere tie-break. Here order is
 /// the decision: a route can name a seat the score table would never pick
-/// (a flat-rate seat, or a cross-lineage one for review value) and still get
+/// (a flat-rate seat, or another company's) and still get
 /// automatic fallthrough to the next glob when that seat is cordoned,
 /// excluded, or simply not declared.
 fn first_matching_pattern_candidate(
@@ -5237,9 +5388,9 @@ fn detect_skill_route<'a>(cfg: &'a Config, prompt: &[ContentBlock]) -> Option<&'
 }
 
 /// The company lineage of an agent: the configured `agents[].lineage` tag, or
-/// the agent name when none is declared. Cross-lineage review compares THIS —
-/// the goal is a reviewer from a **different company** (different failure
-/// modes), so two agents backed by the same vendor share a lineage.
+/// the agent name when none is declared. Account seats of one agent share it,
+/// and lifecycle-hook events report it so a host can tell which company a
+/// worker runs on.
 pub fn agent_lineage(cfg: &Config, agent: &str) -> String {
     cfg.agents
         .iter()
@@ -5248,191 +5399,37 @@ pub fn agent_lineage(cfg: &Config, agent: &str) -> String {
         .unwrap_or_else(|| agent.to_string())
 }
 
-/// Resolve concrete reviewer candidates of a DIFFERENT lineage (company) than
-/// the planner (preferring the configured `reviewer` globs, then any
-/// other-lineage candidate). Empty only when the planner's lineage is the sole
-/// one available.
-fn resolve_reviewers(
+/// Tell `delegation.lifecycle_hook` that a session's pin moved to a new
+/// provider session (failover, switch, escalation, demotion, ...), so a host
+/// that bound work to the old provider session id can follow it. Awaited so
+/// the host has rebound before the new session's first turn; a failed
+/// delivery stays in the outbox.
+async fn report_repin(
     shared: &Arc<Shared>,
-    cfg: &crate::config::OrchestrationConfig,
-    planner: &CandidateId,
-    class: TaskClass,
-    excluded: &[String],
-) -> Vec<CandidateId> {
-    let runtime = shared.runtime_config();
-    let planner_lineage = agent_lineage(&runtime, &planner.agent);
-    let views = shared.eligible_views(&RequiredCaps::default(), class);
-    let mut out: Vec<CandidateId> = Vec::new();
-    // 1. Configured reviewer globs, restricted to a different lineage.
-    for pat in &cfg.reviewer {
-        for v in &views {
-            if agent_lineage(&runtime, &v.id.agent) != planner_lineage
-                && view_matches(pat, v)
-                && !view_excluded(v, excluded)
-                && !out.contains(&v.id)
-            {
-                out.push(v.id.clone());
-            }
-        }
+    router_sid: &str,
+    previous: &CandidateId,
+    previous_downstream_sid: &str,
+    candidate: &CandidateId,
+    downstream_sid: &str,
+    reason: &str,
+) {
+    if shared.cfg.delegation.lifecycle_hook.is_none() || previous_downstream_sid == downstream_sid {
+        return;
     }
-    // 2. Fallback: any eligible candidate of a different lineage.
-    if out.is_empty() {
-        for v in &views {
-            if agent_lineage(&runtime, &v.id.agent) != planner_lineage
-                && !view_excluded(v, excluded)
-                && !out.contains(&v.id)
-            {
-                out.push(v.id.clone());
-            }
-        }
-    }
-    out.truncate(3);
-    out
-}
-
-/// The orchestration protocol prepended to the planner model's prompt when a
-/// multi-part task list is auto-detected. This recreates the goose orchestrate
-/// recipe entirely in-process: the planner decomposes the task, drives
-/// `delegate_task` sub-sessions (each routed per-complexity), has a
-/// different-lineage peer review the net result, and adjudicates fixes. It is
-/// guidance to the model, not a hard state
-/// machine — the delegation pool relaxation (peer/same-tier) is what makes the
-/// cross-lineage review routeable, and the explicit reviewer ids + the ban on
-/// the model's built-in sub-agent tool are what keep the review off the
-/// planner's own lineage.
-fn build_orchestration_instructions(
-    cfg: &Config,
-    parts: usize,
-    forced: bool,
-    planner: &CandidateId,
-    reviewers: &[CandidateId],
-) -> String {
-    let o = &cfg.orchestration;
-    let lineage = agent_lineage(cfg, &planner.agent);
-    let intro = if forced && parts < 2 {
-        "The user explicitly requested orchestration for the task below.".to_string()
-    } else {
-        format!("The user's message below is a multi-part task ({parts} parts detected).")
+    let (router_pid, router_started_at_ms) = crate::delegate_hook::process_identity();
+    let event = crate::delegate_hook::RepinEvent {
+        event: "parent_repinned",
+        parent_router_session_id: router_sid.to_string(),
+        previous_downstream_session_id: previous_downstream_sid.to_string(),
+        previous_candidate: previous.to_string(),
+        downstream_session_id: downstream_sid.to_string(),
+        candidate: candidate.to_string(),
+        lineage: agent_lineage(&shared.runtime_config(), &candidate.agent),
+        reason: reason.to_string(),
+        router_pid,
+        router_started_at_ms,
     };
-    let confidence_line = format!(
-        "EXCEPTION — confidence skip: if your stated confidence from step 1 (re-assessed \
-         after integration) is strictly greater than {:.2}, SKIP the review pass and say so \
-         in your final report (\"review skipped: confidence X > {:.2}\"); otherwise run it.",
-        o.review_confidence, o.review_confidence
-    );
-    let review_line = if reviewers.is_empty() {
-        format!(
-            "No candidate of a different lineage than your own (`{lineage}`) is currently \
-             available: SKIP the review pass entirely and note in your final report that it \
-             was skipped for lack of a cross-lineage reviewer."
-        )
-    } else {
-        let ids = reviewers
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "You are lineage `{lineage}`. The review MUST run on a DIFFERENT lineage — call \
-             `delegate_task` with `hints.candidate` set to one of: {ids}. Do NOT review on your \
-             own `{lineage}` lineage. {confidence_line}"
-        )
-    };
-    let host_instructions = if o.instructions.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "HOST-SUPPLIED ORCHESTRATION INSTRUCTIONS:\n{}\n",
-            o.instructions.trim()
-        )
-    };
-    let rounds = o.max_fix_rounds;
-    format!(
-        "[router-acp orchestration — you are the ORCHESTRATOR]\n\
-         {intro} Do NOT implement \
-         it all yourself in one pass.\n\
-         CRITICAL — HOW TO DELEGATE: use the router's `delegate_task` tool for EVERY subtask and \
-         for the review. Do NOT use any built-in sub-agent tool (e.g. `Task`, `dispatch_agent`, \
-         `spawn`) for these: those run inside your own model lineage and are invisible to the \
-         router, which defeats both per-subtask model routing and the cross-lineage review. If \
-         `delegate_task` is not loaded yet, load it first, then use it.\n\
-         {host_instructions}\
-         CRITICAL — RUN INDEPENDENT SUBTASKS IN PARALLEL: your client executes tool calls one at \
-         a time, so N plain `delegate_task` calls run the subtasks serially. Instead, dispatch \
-         every independent subtask with `background: true` — each call returns a `b-…` id \
-         immediately and the subtask runs concurrently — then collect them with `delegate_await` \
-         (it returns finished results and lists still-running jobs; call it again until none \
-         remain). Never fabricate a pending job's result; results only come from `delegate_await`. \
-         Use a plain (foreground) `delegate_task` only for a single subtask whose result you need \
-         before you can even phrase the next step. A subtask that depends on another's output \
-         must not start until that prerequisite has been collected. For a subtask you want to \
-         iterate on across review→fix rounds, add `keep_open: true` — the collected result \
-         carries a `delegate_id` for `delegate_followup` (and `delegate_close` when done).\n\
-         Run this pipeline, disclosing your progress as you go:\n\
-         1. PLAN. Investigate just enough (read-only) to restate the task as concrete, verifiable \
-         success criteria and to split it into self-contained subtasks. Subtasks MUST NOT overlap \
-         in the files they edit — merge any that would (parallel sub-sessions editing the same \
-         file race). State your confidence (0.0–1.0) that your plan, once implemented by the \
-         subtasks, will fully satisfy the criteria — step 3 uses it.\n\
-         2. DELEGATE. Dispatch the independent subtasks in parallel (`background: true`, then \
-         `delegate_await` — see above). Give each a fully self-contained `task` (file paths, \
-         current vs. desired behavior, constraints, and acceptance checks) — the router routes \
-         each subtask by reading its prompt, so describe difficulty honestly. Pass relevant paths \
-         in `context_files`. Do a piece yourself only if it genuinely needs your full context.\n\
-         3. REVIEW (independent, different lineage) — only AFTER every implementation subtask has \
-         been collected and integrated. {review_line} When the review runs, hand the reviewer the \
-         ORIGINAL task verbatim and have it re-derive the criteria itself, inspect the diff, and \
-         run the tests — returning a verdict plus any blocking issues.\n\
-         4. ADJUDICATE (only if a review ran). For each blocking issue, delegate a targeted fix \
-         and re-review. At most {rounds} fix rounds; if still not approved, stop and report what \
-         remains.\n\
-         Finally, report: the success criteria and how each is met; per-subtask outcomes (and \
-         which model the router chose for each); the review verdict history — or the exact reason \
-         the review was skipped (no cross-lineage reviewer, or your confidence vs. the bar).\n\
-         [end orchestration protocol — the user's task follows]"
-    )
-}
-
-/// True when the previous agent turn appears to have asked the user
-/// question(s)/decisions — so a list in the user's reply is *answers*, not a new
-/// multi-part task, and must not trigger orchestration. Deliberately
-/// conservative (it only fires on clear solicitations) so genuine follow-up task
-/// lists still orchestrate.
-fn previous_turn_solicited_answers(prev_agent_text: &str) -> bool {
-    let text = prev_agent_text.trim();
-    if text.is_empty() {
-        return false;
-    }
-    let lower = text.to_lowercase();
-    // Phrases that clearly solicit a decision/answer, low false-positive.
-    const SOLICIT_PHRASES: &[&str] = &[
-        "open question",
-        "open decision",
-        "open item",
-        "please confirm",
-        "please decide",
-        "to decide",
-        "need to decide",
-        "decisions:",
-        "questions:",
-        "options:",
-        "your call",
-        "up to you",
-        "which of",
-        "do you want",
-        "do you prefer",
-        "would you like",
-        "would you prefer",
-        "how would you like",
-        "let me know which",
-        "let me know how",
-        "which would you",
-    ];
-    let has_phrase = SOLICIT_PHRASES.iter().any(|p| lower.contains(p));
-    let questions = text.matches('?').count();
-    // Did the agent itself enumerate the options/questions?
-    let enumerated = crate::tasklist::detect_task_list(text).is_some();
-    has_phrase || questions >= 2 || (questions >= 1 && enumerated)
+    crate::delegate_hook::deliver_now(shared, &event).await;
 }
 
 /// Enter Planning. On first entry, inject the built-in plan-first protocol
@@ -5460,7 +5457,7 @@ fn enter_planning_phase(shared: &Arc<Shared>, router_sid: &str) {
 
 /// Determine the planner phase for this turn and apply a monotonic upgrade
 /// to the session when warranted. Called from `dispatch_prompt` right
-/// alongside orchestration/skill-routing.
+/// alongside skill routing.
 ///
 /// Sources (checked in order):
 ///
@@ -5623,205 +5620,6 @@ fn select_planner_target(
         .into_iter()
         .next()
         .map(|r| r.candidate)
-}
-
-/// If auto-orchestration is enabled and the prompt warrants multi-track work,
-/// put the session into orchestration mode: steer/switch it to a planner model
-/// and queue the orchestration protocol for the next prompt. Returns `true`
-/// when it fired.
-///
-/// Authority for the auto path:
-/// - session strategy must be `Auto` (planner/static/escalation/pareto-code skip)
-/// - `pre_classifier.enabled` → LLM pre-class `orchestrate` decision (fail-open
-///   means no auto-orchestrate). Legacy `tasklist::detect_task_list` is not used.
-/// - pre-classifier off → `tasklist::detect_task_list` + `min_items` (legacy).
-///
-/// An explicit `orchestrate:` prefix overrides every auto gate (including
-/// `enabled` and the strategy check). Runs BEFORE `skill_routing`.
-fn maybe_trigger_orchestration(
-    shared: &Arc<Shared>,
-    router_sid: &str,
-    prompt: &[ContentBlock],
-    forced: bool,
-    preclass: Option<&crate::pre_classifier::PreClassResult>,
-) -> bool {
-    let cfg = &shared.cfg.orchestration;
-    // An explicit `orchestrate:` prefix overrides every auto-detection gate,
-    // including `enabled` — the user asked for it by name.
-    if !forced && !cfg.enabled {
-        return false;
-    }
-    // Automatic orchestration is an `auto`-router concern. Planner already
-    // owns plan-vs-implement routing; other strategies must not be overwritten
-    // by `orchestration.planner`. Forced `orchestrate:` still applies.
-    if !forced {
-        let strategy = shared
-            .with_session(router_sid, |s| s.strategy)
-            .unwrap_or(shared.cfg.router);
-        if strategy != StrategyKind::Auto {
-            tracing::debug!(
-                session = router_sid,
-                ?strategy,
-                "auto-orchestration skipped: session strategy is not auto"
-            );
-            return false;
-        }
-    }
-    let text = prompt_display_text(prompt);
-    let (parts, why_auto) = if forced {
-        let parts = crate::tasklist::detect_task_list(&text).unwrap_or(1);
-        (parts, "orchestrate: requested")
-    } else if shared.cfg.pre_classifier.enabled {
-        // Pre-class is authority when enabled. No result / fail-open / below
-        // threshold → do not auto-orchestrate.
-        let Some(pre) = preclass else {
-            return false;
-        };
-        let Some(dec) = pre.orchestrate.as_ref() else {
-            return false;
-        };
-        let thr = shared.cfg.pre_classifier.orchestrate_min_confidence;
-        if !dec.warranted || dec.confidence < thr {
-            tracing::debug!(
-                session = router_sid,
-                warranted = dec.warranted,
-                confidence = dec.confidence,
-                thr,
-                "auto-orchestration skipped: pre-class did not warrant it"
-            );
-            return false;
-        }
-        (dec.estimated_parts.max(2), "pre-class")
-    } else {
-        let parts = crate::tasklist::detect_task_list(&text).unwrap_or(1);
-        if parts < cfg.min_items.max(2) {
-            return false;
-        }
-        // Exception: don't orchestrate a list that answers the model's
-        // questions. `turn_output` still holds the previous agent turn here (it
-        // is cleared later, inside `send_prompt_with_failover`); empty pre-pin,
-        // so a first prompt is never mistaken for an answer.
-        let prev_agent_turn = shared
-            .with_session(router_sid, |s| s.turn_output.clone())
-            .unwrap_or_default();
-        if previous_turn_solicited_answers(&prev_agent_turn) {
-            tracing::debug!(
-                session = router_sid,
-                "auto-orchestration skipped: prompt looks like answers to the model's questions"
-            );
-            return false;
-        }
-        (parts, "auto-detected list")
-    };
-
-    let (class, excluded, current) = shared
-        .with_session(router_sid, |s| {
-            (
-                s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                s.excluded.clone(),
-                s.pin.as_ref().map(|p| p.candidate.clone()),
-            )
-        })
-        .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None));
-
-    // A capable planner is required; if none is eligible, route normally.
-    let Some(planner) = first_eligible_candidate(shared, &cfg.planner, class, &excluded) else {
-        notify_user(
-            shared,
-            router_sid,
-            format!(
-                "router-acp · detected a {parts}-part task but no orchestration planner ({:?}) is \
-                 available; routing normally",
-                cfg.planner
-            ),
-        );
-        return false;
-    };
-
-    let current_is_planner = current
-        .as_ref()
-        .map(|c| cfg.planner.iter().any(|g| candidate_matches(g, c)))
-        .unwrap_or(false);
-    let reviewers = resolve_reviewers(shared, cfg, &planner, class, &excluded);
-    if reviewers.is_empty() {
-        notify_user(
-            shared,
-            router_sid,
-            format!(
-                "router-acp · note: no candidate of a different lineage (company) than the \
-                 planner ({}) is available for review; orchestrating anyway",
-                agent_lineage(&shared.runtime_config(), &planner.agent)
-            ),
-        );
-    }
-    let instructions = build_orchestration_instructions(
-        &shared.runtime_config(),
-        parts,
-        forced,
-        &planner,
-        &reviewers,
-    );
-
-    shared.with_session(router_sid, |s| {
-        s.orchestrating = true;
-        s.pending_orchestration = Some(instructions);
-        // Group this run (planner + its delegated subtasks/review) under a
-        // shared label unless the caller already set one.
-        if s.run_label.is_none() {
-            s.run_label = Some("orchestrate".to_string());
-        }
-    });
-
-    let (what, why) = if forced && parts < 2 {
-        ("the task".to_string(), "orchestrate: requested")
-    } else if forced {
-        (format!("a {parts}-part task"), "orchestrate: requested")
-    } else {
-        (format!("a {parts}-part task"), why_auto)
-    };
-    match &current {
-        // Pre-pin: steer the imminent pin onto the planner.
-        None => {
-            let planner2 = planner.clone();
-            shared.with_session(router_sid, |s| {
-                if s.candidate_override.is_none() {
-                    s.candidate_override = Some(planner2);
-                    s.candidate_override_source = Some(OverrideSource::Planner);
-                }
-            });
-            notify_user(
-                shared,
-                router_sid,
-                format!("router-acp · orchestrating {what} on {planner} ({why})"),
-            );
-        }
-        // Already on a planner-class model: orchestrate in place.
-        Some(cur) if current_is_planner => {
-            notify_user(
-                shared,
-                router_sid,
-                format!("router-acp · orchestrating {what} on {cur} ({why})"),
-            );
-        }
-        // Post-pin on a weaker model: switch to the planner (summarize + hand off).
-        Some(_) => {
-            let planner2 = planner.clone();
-            shared.with_session(router_sid, |s| {
-                s.pending_switch = Some(SwitchRequest {
-                    target: planner2,
-                    reason: format!("orchestration of {what} ({why})"),
-                    handoff: HandoffStyle::Full,
-                    user_pick: false,
-                });
-            });
-            notify_user(
-                shared,
-                router_sid,
-                format!("router-acp · orchestrating {what}; switching to {planner} ({why})"),
-            );
-        }
-    }
-    true
 }
 
 /// Estimate a session's confidence in [0, 1]: how fully the pinned model's
@@ -6402,7 +6200,7 @@ fn static_unrouteable_message(
 }
 
 /// A coordinator only leaves `planning_candidates` on a human pick. Anything
-/// else (planner upgrade, skill route, orchestration, escalation, demotion) is
+/// else (planner upgrade, skill route, escalation, demotion) is
 /// refused and disclosed; the session stays on its current model.
 fn refuse_coordinator_switch(shared: &Arc<Shared>, router_sid: &str, sw: &SwitchRequest) -> bool {
     if sw.user_pick || !shared.coordinator_blocks(router_sid, &sw.target) {
@@ -6617,10 +6415,20 @@ async fn switch_pin(
         s.pending_context = handoff.clone();
         s.pending_delegation_directive = None;
         s.delegation_directive_active = false;
-        if delegate_attached && shared.cfg.delegation.inject_prompt && !s.orchestrating {
+        if delegate_attached && shared.cfg.delegation.inject_prompt {
             s.pending_delegation_directive = Some(target.clone());
         }
     });
+    report_repin(
+        shared,
+        router_sid,
+        &old_candidate,
+        &old_down_sid,
+        target,
+        &opened.downstream_sid,
+        reason,
+    )
+    .await;
 
     // 4. Re-apply the session mode on the new downstream (best effort).
     if let Some(requested) = applied_mode {
@@ -6932,6 +6740,13 @@ pub async fn serve_shared(
     // usage API on an interval and cordon exhausted candidates.
     let usage_task = crate::usage::spawn_usage_poller(&shared);
 
+    // Lifecycle-hook events carry this process's identity; fix it now so the
+    // reported start time is the router's own. Then redeliver anything a
+    // previous router left in the outbox.
+    crate::delegate_hook::process_identity();
+    let outbox_task =
+        crate::delegate_hook::spawn_outbox_flusher(&shared, std::time::Duration::from_secs(30));
+
     let result = build_agent(shared.clone()).connect_to(transport).await;
     crate::accounts::cancel_all(&shared);
 
@@ -6939,6 +6754,9 @@ pub async fn serve_shared(
         task.abort();
     }
     if let Some(task) = usage_task {
+        task.abort();
+    }
+    if let Some(task) = outbox_task {
         task.abort();
     }
     if let Some(task) = llm_proxy_task {
@@ -7518,12 +7336,9 @@ fn on_prompt(
     }
 
     // Tracks whether the user steered routing explicitly (a `[router: …]`
-    // directive, a `model:` shorthand, or a skill invocation). Any of these
-    // suppresses auto-orchestration for this prompt.
+    // directive or a `model:` shorthand). Either suppresses the pre-classifier
+    // and planner-phase heuristics for this prompt.
     let mut explicit_routing = false;
-    // Set by an `orchestrate:` / `orchestrator:` prefix — forces orchestration
-    // regardless of list detection.
-    let mut force_orchestrate = false;
     // Per-prompt `hard:` / `easy:` — reset so a prior prefix cannot stick.
     shared.with_session(&router_sid, |s| s.planner_difficulty = None);
     // Coordinator role is sticky: a tagged prompt sets it, an untagged one
@@ -7587,17 +7402,12 @@ fn on_prompt(
             // `codex/gpt-5.5:`, `sonnet: fix this`) is a switch (post-pin) or a
             // pin steer (pre-pin) to the referenced candidate. Resolution gates
             // it — a token that doesn't name an eligible candidate is left as
-            // ordinary prose. Reserved tokens: `orchestrate:`/`orchestrator:`
-            // force auto-orchestration; `hard:`/`easy:` subset the planner
-            // pool (astra/fable vs opus/sol) without pinning a named model.
+            // ordinary prose. Reserved tokens: `hard:`/`easy:` subset the
+            // planner pool (astra/fable vs opus/sol) without pinning a named
+            // model.
             if let Some((ref_str, stripped)) = split_model_shorthand(&req.prompt) {
                 let lower_ref = ref_str.to_lowercase();
-                if lower_ref == "orchestrate" || lower_ref == "orchestrator" {
-                    force_orchestrate = true;
-                    req =
-                        PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
-                    tracing::info!(session = router_sid, "orchestration forced via prefix");
-                } else if let Some(diff) = match lower_ref.as_str() {
+                if let Some(diff) = match lower_ref.as_str() {
                     "hard" => Some(crate::config::PlannerDifficulty::Hard),
                     "easy" => Some(crate::config::PlannerDifficulty::Easy),
                     _ => None,
@@ -7896,8 +7706,8 @@ fn on_prompt(
     }
 
     // The rest of prompt handling runs in a spawned task: ticket-context
-    // enrichment shells out (async), and orchestration/classification must see
-    // the ENRICHED prompt — "Fix HAI-1234" routes on the ticket's real content.
+    // enrichment shells out (async), and classification must see the ENRICHED
+    // prompt — "Fix HAI-1234" routes on the ticket's real content.
     cx.spawn(async move {
         let req = crate::tickets::enrich_prompt(&shared, &router_sid, req).await;
         dispatch_prompt(
@@ -7906,23 +7716,21 @@ fn on_prompt(
             req,
             responder,
             explicit_routing,
-            force_orchestrate,
             planner_needs_switch,
         )
         .await
     })
 }
 
-/// Post-directive prompt handling: pre-classifier, auto-orchestration, skill
-/// routing, and the relay/pin dispatch. Runs inside a spawned task (never on the
-/// dispatch loop); the prompt has already been ticket-enriched.
+/// Post-directive prompt handling: pre-classifier, skill routing, and the
+/// relay/pin dispatch. Runs inside a spawned task (never on the dispatch loop);
+/// the prompt has already been ticket-enriched.
 async fn dispatch_prompt(
     shared: Arc<Shared>,
     router_sid: String,
     req: PromptRequest,
     responder: Responder<PromptResponse>,
     explicit_routing: bool,
-    force_orchestrate: bool,
     mut planner_needs_switch: bool,
 ) -> Result<(), AcpError> {
     crate::auth::refresh_before_selection(&shared).await;
@@ -7930,11 +7738,10 @@ async fn dispatch_prompt(
     // from live targets only; give dead ones their cooldown-gated respawn
     // first, as the initial pin does.
     revive_dead_targets(&shared).await;
-    // Pre-classifier (when enabled): one cheap ACP evaluation covering
-    // orchestrate + host dimensions. v1 = first eligible turn per session.
-    // Fail-open. Explicit `[router:…]` / `model:` suppress the auto path;
-    // `orchestrate:` force still allows dimensions to inject on first run.
-    let eligible_preclass = force_orchestrate || !explicit_routing;
+    // Pre-classifier (when enabled): one cheap ACP evaluation covering task
+    // class, complexity and host dimensions. v1 = first eligible turn per
+    // session. Fail-open. Explicit `[router:…]` / `model:` suppress it.
+    let eligible_preclass = !explicit_routing;
     let already = shared
         .with_session(&router_sid, |s| s.preclass_done)
         .unwrap_or(true);
@@ -7982,9 +7789,7 @@ async fn dispatch_prompt(
         }
 
         // Authoritative decision note MUST reach the model — UI disclosures are
-        // peeled into a classify tool card and never enter the agent prompt, so
-        // without this inject the agent re-runs tasklist heuristics and wrongly
-        // tells the user "orchestration will fire; override with orchestrate:".
+        // peeled into a classify tool card and never enter the agent prompt.
         let decision_note = crate::pre_classifier::agent_decision_note(&shared.cfg, &result);
         let preclass_profile = result.routing.as_ref().map(|routing| {
             let cwd = shared
@@ -8020,9 +7825,8 @@ async fn dispatch_prompt(
         None
     };
 
-    // Hoist skill detection so both the planner phase logic and
-    // orchestration/skill-routing can reuse the result without a second
-    // pattern-matching pass.
+    // Hoist skill detection so both the planner phase logic and skill routing
+    // can reuse the result without a second pattern-matching pass.
     let detected_skill = detect_skill_route(&shared.cfg, &req.prompt);
 
     // Planner phase (when router == planner): update the monotonic phase,
@@ -8068,27 +7872,9 @@ async fn dispatch_prompt(
         }
     }
 
-    // Auto-orchestration runs next, but only for `router: auto`: a multi-part /
-    // pre-class-warranted task orchestrates even if it names a skill.
-    // Suppressed by an explicit `[router: …]` directive, `model:` shorthand,
-    // or any non-auto strategy (planner owns its own phase router).
-    // FORCED unconditionally by the `orchestrate:` prefix.
-    let orchestrating_now = if force_orchestrate || !explicit_routing {
-        maybe_trigger_orchestration(
-            &shared,
-            &router_sid,
-            &req.prompt,
-            force_orchestrate,
-            preclass.as_ref(),
-        )
-    } else {
-        false
-    };
-
     // Skill routing: certain skills (e.g. ship-pr) demand a capable model class.
-    // Only when the prompt is NOT an orchestrated multi-part task: if it invokes
-    // a skill, steer routing to its preferred candidates — pre-pin via
-    // candidate_override, mid-session via a switch.
+    // If the prompt invokes a skill, steer routing to its preferred candidates —
+    // pre-pin via candidate_override, mid-session via a switch.
     //
     // "Already ok" requires the pin to still be *routeable*, not just glob-
     // matching. A pin that matches `*opus*` but is usage-cordoned (plan at
@@ -8100,7 +7886,7 @@ async fn dispatch_prompt(
     // target `candidates`. Collapsing the two (the pre-`also_acceptable`
     // behaviour) force-switches an already-better pin onto a lesser model for
     // no reason other than its absence from the target pool.
-    if !orchestrating_now && let Some(route) = detected_skill {
+    if let Some(route) = detected_skill {
         let (class, excluded, current) = shared
             .with_session(&router_sid, |s| {
                 (
@@ -8616,71 +8402,13 @@ mod escalation_signal_tests {
 }
 
 #[cfg(test)]
-mod orchestration_unit_tests {
+mod prompt_framing_tests {
     use super::build_background_instructions;
-    use super::build_orchestration_instructions;
     use super::build_question_instructions;
     use super::frame_terse;
     use super::is_native_subagent_tool;
-    use super::previous_turn_solicited_answers as solicited;
     use crate::candidate::CandidateId;
-    use crate::config::Config;
     use serde_json::json;
-
-    fn cfg_with(orchestration: &str) -> Config {
-        let yaml = format!(
-            "orchestration:\n{orchestration}\n\
-             agents:\n\
-             \x20 - name: claude\n\
-             \x20   command: {{ type: stdio, command: mock-agent }}\n\
-             \x20   model_selection: {{ type: config-option }}\n\
-             \x20   models:\n\
-             \x20     - id: sonnet\n\
-             \x20       cost_rank: 2\n"
-        );
-        Config::from_yaml(&yaml).unwrap()
-    }
-
-    #[test]
-    fn protocol_mandates_parallel_background_delegation() {
-        let cfg = cfg_with("  enabled: true");
-        let planner = CandidateId::new("claude", "sonnet");
-        let reviewer = CandidateId::new("codex", "gpt-5.5");
-        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
-        assert!(text.contains("background: true"), "{text}");
-        assert!(text.contains("delegate_await"), "{text}");
-        assert!(
-            text.contains("only AFTER every implementation subtask"),
-            "review must be ordered after implementation: {text}"
-        );
-    }
-
-    #[test]
-    fn protocol_keeps_lifecycle_policy_host_owned() {
-        let cfg = cfg_with("  enabled: true\n  instructions: custom-host-rule");
-        let planner = CandidateId::new("claude", "sonnet");
-        let reviewer = CandidateId::new("codex", "gpt-5.5");
-        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
-
-        assert!(
-            text.contains("HOST-SUPPLIED ORCHESTRATION INSTRUCTIONS"),
-            "{text}"
-        );
-        assert!(text.contains("custom-host-rule"), "{text}");
-        for forbidden in [
-            "gh pr",
-            "pull request",
-            "commit and push",
-            "fresh branch",
-            "SUBMIT.",
-            "repository's required",
-        ] {
-            assert!(
-                !text.contains(forbidden),
-                "{forbidden:?} leaked into: {text}"
-            );
-        }
-    }
 
     #[test]
     fn terse_handoff_does_not_assume_repository_tools() {
@@ -8715,30 +8443,6 @@ mod orchestration_unit_tests {
     }
 
     #[test]
-    fn review_skippable_by_confidence_with_configured_bar() {
-        let cfg = cfg_with("  enabled: true\n  review_confidence: 0.9");
-        let planner = CandidateId::new("claude", "sonnet");
-        let reviewer = CandidateId::new("codex", "gpt-5.5");
-        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[reviewer]);
-        assert!(text.contains("strictly greater than 0.90"), "{text}");
-        assert!(text.contains("SKIP the review pass"), "{text}");
-        // The cross-lineage mandate still stands when the review does run.
-        assert!(text.contains("codex/gpt-5.5"), "{text}");
-    }
-
-    #[test]
-    fn review_skipped_entirely_without_cross_lineage_reviewer() {
-        let cfg = cfg_with("  enabled: true");
-        let planner = CandidateId::new("claude", "sonnet");
-        let text = build_orchestration_instructions(&cfg, 3, false, &planner, &[]);
-        assert!(
-            text.contains("SKIP the review pass entirely"),
-            "no-lineage case must skip, not same-lineage review: {text}"
-        );
-        assert!(text.contains("lack of a cross-lineage reviewer"), "{text}");
-    }
-
-    #[test]
     fn native_subagent_tool_detected_by_name_not_delegate() {
         // Claude's built-in Task tool (via _meta.claudeCode.toolName).
         assert!(is_native_subagent_tool(
@@ -8757,44 +8461,6 @@ mod orchestration_unit_tests {
         // Ordinary tools don't match.
         assert!(!is_native_subagent_tool(&json!({"title": "Read File"})));
         assert!(!is_native_subagent_tool(&json!({"kind": "execute"})));
-    }
-
-    #[test]
-    fn detects_enumerated_decisions_from_the_agent() {
-        assert!(solicited(
-            "Open decisions: (1) which database? (2) which auth provider?"
-        ));
-        assert!(solicited(
-            "A few questions:\n1. DB choice\n2. deploy target?"
-        ));
-    }
-
-    #[test]
-    fn detects_multiple_questions() {
-        assert!(solicited(
-            "What database should we use? What about the auth provider?"
-        ));
-    }
-
-    #[test]
-    fn detects_solicit_phrases_without_question_marks() {
-        assert!(solicited(
-            "These are up to you: postgres or mysql, oauth or basic."
-        ));
-        assert!(solicited("Please confirm the plan before I proceed."));
-    }
-
-    #[test]
-    fn does_not_fire_on_a_plain_completion() {
-        assert!(!solicited(
-            "Done — I fixed the bug in auth.rs and the tests pass."
-        ));
-        // A single casual question is not a multi-answer solicitation.
-        assert!(!solicited(
-            "I refactored the handler. Does that look right?"
-        ));
-        // No prior turn (fresh session).
-        assert!(!solicited(""));
     }
 }
 
@@ -8824,14 +8490,38 @@ mod directive_tests {
     }
 
     #[test]
+    fn several_directive_tags_merge() {
+        // Two tags on one line, the second without a space after `router:` —
+        // both apply, and neither reaches the model.
+        let prompt = vec![ContentBlock::from(
+            "[router: candidate=codex/gpt-6.1-sol] [router:effort=medium] implement-all"
+                .to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.candidate.unwrap().to_string(), "codex/gpt-6.1-sol");
+        assert_eq!(dir.effort, Some(EffortLevel::Medium));
+        assert_eq!(text(&stripped), "implement-all");
+
+        // A later tag overrides an earlier key; exclusions combine.
+        let prompt = vec![ContentBlock::from(
+            "[router: effort=high, exclude=grok]\ntask\n[router: effort=low, exclude=kimi]"
+                .to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.effort, Some(EffortLevel::Low));
+        assert_eq!(dir.exclude, vec!["grok".to_string(), "kimi".to_string()]);
+        assert_eq!(text(&stripped), "task");
+    }
+
+    #[test]
     fn directive_survives_goose_turn_context_preamble() {
         // goose prepends a <turn-context> block, pushing the directive off
         // line 1. The parser must still find and strip exactly that line —
         // and a bracketed model id like `claude-fable-5[1m]` must parse.
         let prompt = vec![ContentBlock::from(
             "<turn-context>\n<current-time>2026-07-10</current-time>\n</turn-context>\n\
-             [router: candidate=claude/claude-fable-5[1m], label=orchestrate]\n\n\
-             Orchestrate this task."
+             [router: candidate=claude/claude-fable-5[1m], label=nightly]\n\n\
+             Run the nightly task."
                 .to_string(),
         )];
         let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
@@ -8839,12 +8529,12 @@ mod directive_tests {
             dir.candidate.unwrap().to_string(),
             "claude/claude-fable-5[1m]"
         );
-        assert_eq!(dir.label.as_deref(), Some("orchestrate"));
+        assert_eq!(dir.label.as_deref(), Some("nightly"));
         let out = text(&stripped);
         assert!(!out.contains("[router:"), "directive stripped: {out}");
         assert!(out.contains("<turn-context>"), "preamble preserved: {out}");
         assert!(
-            out.contains("Orchestrate this task."),
+            out.contains("Run the nightly task."),
             "task preserved: {out}"
         );
     }

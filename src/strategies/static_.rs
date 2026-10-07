@@ -49,9 +49,6 @@ impl RouterStrategy for StaticStrategy {
                         Some(OverrideSource::Skill(name)) => {
                             format!("steered by skill `{name}` routing")
                         }
-                        Some(OverrideSource::Planner) => {
-                            "orchestration planner (auto-orchestrate)".to_string()
-                        }
                         Some(OverrideSource::UserPick) | None => {
                             "explicitly selected via router.candidate".to_string()
                         }
@@ -152,14 +149,6 @@ mod tests {
         assert_eq!(
             explicit_reason(Some(OverrideSource::Skill("ship-pr".into()))),
             "steered by skill `ship-pr` routing"
-        );
-    }
-
-    #[test]
-    fn planner_steered_reason_names_orchestration() {
-        assert_eq!(
-            explicit_reason(Some(OverrideSource::Planner)),
-            "orchestration planner (auto-orchestrate)"
         );
     }
 

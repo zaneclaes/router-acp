@@ -12,7 +12,10 @@ clients that show config selectors) — or, from any client, with a
 **prompt directive** on any line of the first prompt:
 `[router: strategy=pareto-code]`, `[router: candidate=claude/sonnet]`,
 `[router: prefer=codex/gpt-5.5]`, `[router: exclude=claude]` (stripped before
-the model sees it). Either way, changes land **before the first prompt**.
+the model sees it). Several tags in one prompt merge as if they were one
+comma-separated tag: a later key overrides an earlier one, `exclude` lists
+combine, and every tag is stripped. Either way, changes land **before the
+first prompt**.
 
 After the first prompt the session is pinned to its candidate. Three things
 can still change the model:
@@ -437,7 +440,7 @@ clear it. A coordinator:
   are all ignored (the directive is rejected with a notice). A coordinator
   already in Implementation is pulled back.
 - only pins, fails over, crosses over, escalates, demotes, or follows a skill
-  route or orchestration steer onto a `planning_candidates` match. Per-request
+  route onto a `planning_candidates` match. Per-request
   proxy alternates are filtered the same way. Refusals are disclosed
   (`router-acp · coordinator: refused switch to …`).
 - fails the turn (`no planning candidate is routeable`) when nothing in the
@@ -476,9 +479,6 @@ routers:
     apex_complexity: 0.85
     floor_complexity: 0.15
 ```
-
-Automatic orchestration does not apply: an implementation-ready prompt
-stays in the implementation pool. Use `orchestrate:` to opt in.
 
 ## `static` — no routing at all
 
@@ -664,77 +664,7 @@ fails with that reason instead of running on the model the human left. Each swit
 
 ---
 
-## Auto-orchestration of task lists
-
-Automatic orchestration applies only to `router: auto`. `router: planner`
-already has its own planning/implementation phase router and is never
-auto-steered onto `orchestration.planner`. Other strategies (`pareto-code`,
-`escalation`, `static`) likewise skip the automatic path. An explicit
-`orchestrate:` prefix remains a deliberate override on any strategy.
-
-When `router: auto` is active and `orchestration.enabled` is set
-and a prompt reads as a **multi-part task list**, the router turns that session
-into an orchestrator instead of answering the list in one turn.
-
-Two things can decide that a prompt *is* a multi-part task list. With the LLM
-**pre-classifier** enabled (`pre_classifier.enabled` — one cheap evaluator call
-whose `orchestrate` verdict is gated on
-`pre_classifier.orchestrate_min_confidence`; see
-[ORCHESTRATION.md](ORCHESTRATION.md)), that verdict is authoritative. The
-built-in detector below is what runs when the pre-classifier is off.
-
-What counts as a list for the built-in detector (it is permissive):
-
-- markdown numbers — `1. … 2. … 3. …`
-- markdown bullets — `- … / * … / + …`
-- inline numbering — `… (1) do this (2) do that …`
-- ordered prose — `First, … Then, … Finally, …`
-
-On a match of at least `min_items` parts — and only when the list is a *new*
-task, not you answering the model's own questions (if the previous agent turn
-posed questions/decisions, e.g. "Open decisions: (1)… (2)…", the router treats
-your enumerated reply as answers and relays normally), and with **no** explicit
-`[router: …]` directive or `model:` shorthand on the prompt (those suppress it):
-
-1. The session is steered (pre-pin) or **switched** (mid-session, via the same
-   summarize-and-re-pin machinery above) onto the best eligible **`planner`**
-   candidate.
-2. An orchestration protocol is prepended to the prompt telling the planner to
-   **plan → delegate the independent parts in parallel (`delegate_task
-   background: true` + `delegate_await`, each routed per-complexity) →
-   review on a different lineage (`reviewer`) after all parts are collected —
-   skipped with a note when no other lineage is available or the planner's
-   stated confidence clears `review_confidence` → adjudicate fixes
-   (`max_fix_rounds`) → submit (`submit`)**.
-3. For that session, delegation is allowed to **same-/higher-tier peers**, not
-   just strictly-cheaper ones — this is what makes the cross-lineage reviewer
-   routeable. (Ordinary delegation stays cheaper-only.)
-
-Orchestration **takes precedence over `skill_routing`**: a multi-part task list
-orchestrates even if it names a skill. Skill routing only fires for a skill
-invocation that is *not* a multi-part task. Host-owned workflow policy is not
-interpreted by router-acp.
-
-```yaml
-orchestration:
-  enabled: true
-  min_items: 2
-  planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"]   # best first
-  reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]             # a different lineage than the planner
-  instructions: ""             # optional opaque host-owned workflow policy
-  max_fix_rounds: 2
-  review_confidence: 0.8        # planner confidence above this skips the review
-```
-
-The planner iterates on a subtask by keeping its sub-agent open
-(`delegate_task keep_open: true` → `delegate_followup` → `delegate_close`)
-rather than re-briefing a fresh session each round. Every trigger is disclosed
-(`router-acp · orchestrating a N-part task on …`). The full pipeline, mechanism,
-and config are in [`ORCHESTRATION.md`](ORCHESTRATION.md); because it is built on
-the router's own `delegate_task` tool it needs no recipe or `summon` extension,
-so it works from any ACP client and plain chat.
-
-### Host capability MCPs
+## Host capability MCPs
 
 The host registers concrete bundles per router session, while
 `delegation.mcp_catalogs` maps each catalog to opaque capabilities. A
@@ -774,8 +704,18 @@ credentials, and incomplete coverage fails closed.
   delegates with `auto` semantics, since "the configured candidate" is never
   in the cheaper pool). With `delegation.inject_prompt: true`, an ordinary
   downstream session gets one scoped instruction only when that cheaper-worker
-  tool was actually attached; model switches re-establish it, while
-  orchestration keeps its stronger protocol.
+  tool was actually attached; model switches re-establish it. With
+  `delegation.candidate_hints: exact` a parent may instead name any eligible
+  candidate (any tier, agent or account), and the call fails rather than
+  substituting another model.
+- **Reasoning effort.** An explicit request (the `router.effort` option or
+  `[router: effort=…]`) is used as given and never capped. Otherwise the
+  router recommends a level from the task class and complexity; top-level
+  `effort.default` replaces that recommendation, and `effort.max_automatic`
+  caps any level the router picks by itself (`default` above `max_automatic`
+  is a config error). Without a cap, a long, detailed prompt such as a whole
+  skill's instructions classifies at maximum complexity and runs at
+  `max`/`xhigh` effort.
 - **Determinism.** Identical inputs and state produce identical decisions —
   ranking has no randomness, and all tie-breaks are stable.
 - **Every decision is disclosed** on the console

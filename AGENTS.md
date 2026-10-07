@@ -11,9 +11,8 @@ agent stdio` / `kimi acp`, both wired as `spawn-config` agents with
 best `(agent, model)` candidate, pins it, relays everything, and offers a
 `delegate_task` MCP tool for cheaper sub-sessions. Built against
 `agent-client-protocol` **1.2.0** (Rust SDK). The original build spec
-(HAI-6345) was completed and deleted; `PLAN.md` now holds the follow-on
-orchestration plan. User-facing docs: `README.md`, `ROUTERS.md`,
-`GOOSE.md`, `ORCHESTRATION.md`.
+(HAI-6345) was completed and deleted. User-facing docs: `README.md`,
+`ROUTERS.md`, `GOOSE.md`.
 
 ## Build / test / install
 
@@ -37,17 +36,18 @@ SDK traps below, which were all discovered the hard way.
 | `src/transport.rs` | flushing stdio + child-process transports (replaces broken SDK ones); **downstream teardown**: each agent process is spawned in its own process group (`process_group(0)`) and its PID tracked in a global registry; `kill_all_downstreams()` SIGKILLs every group (agent + grandchildren like a Bash mid-`git commit`). `serve` calls it on disconnect AND from a SIGINT/SIGTERM handler — because `kill_on_drop` does NOT run on signal-death or runtime teardown, which once let a Ctrl+C'd agent keep running and commit broken code to `main` |
 | `src/strategies/` | `RouterStrategy` trait; `static_`, `auto`, `pareto_code`, `escalation`; each `RankedCandidate` carries `reason` (human) + `weights` (json) for disclosure/state. `escalation::rank` only picks the cheap start + fallback chain; its escalation is runtime (`session::escalation_target`/`note_investigation`/`escalation_post_turn`) |
 | `src/classifier.rs` | heuristic task class + complexity (data-driven), cwd language fingerprint, optional Ollama backend (own mini HTTP client; never uses seat agents) |
-| `src/pre_classifier.rs` | composable **LLM pre-classifier** (`pre_classifier.*`): one cheap tool-less ACP evaluation returns structured `routing` (task class/complexity, supersedes the static classifier) + `orchestrate` + host dimensions. No wall-clock timeout on the LLM call; a failed evaluator is cordoned (`classify_failure`+`apply_failure`) and failed over. Mode-less tool use is not cordoned. If none classify, fall back to the static keyword classifier (confidence 0); `dispatch_prompt` still refuses to pin if routing is missing (client cancel). Never loops. Interrupt is client cancellation, not a timer |
+| `src/pre_classifier.rs` | composable **LLM pre-classifier** (`pre_classifier.*`): one cheap tool-less ACP evaluation returns structured `routing` (task class/complexity, supersedes the static classifier, plus recommended `effort`) + the `planner` router's phase + host dimensions. No wall-clock timeout on the LLM call; a failed evaluator is cordoned (`classify_failure`+`apply_failure`) and failed over. Mode-less tool use is not cordoned. If none classify, fall back to the static keyword classifier (confidence 0); `dispatch_prompt` still refuses to pin if routing is missing (client cancel). Never loops. Interrupt is client cancellation, not a timer |
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, reconciled per account with a usable reading via `reconcile_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
 | `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl**, token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (live `codex app-server` `account/rateLimits/read`; fallback: on-disk rollout snapshots, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. Also computes graded **seat availability** for dynamic preference scaling (`anthropic_availability`/`codex_availability`/`availability_from_windows`) and ingests client hints (`apply_availability_hint`, ext notification `router-acp/availability_hint`, consumed session-less in `on_catch_all`). `spawn_usage_poller` (interval loop, fails open, installs cordons + availability) |
 | `src/llm_proxy.rs` | optional loopback provider proxy: process base-URL injection, Anthropic Messages + OpenAI Responses/Chat forwarding, auth/SSE pass-through, per-active-prompt attribution, same-agent request policy (routine demotion, difficulty/stagnation escalation, verdict expiry, dwell, context guards), request disclosure, usage/cache/cost capture |
-| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
-| `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated) |
-| `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→session binding, minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool — except orchestrating sessions, which may delegate to same-/higher-tier peers), multi-turn `delegate_task keep_open` → `run_delegate_followup`/`run_delegate_close` over a `Shared.live_delegates` registry, `mcp-delegate` helper bridge |
-| `src/tasklist.rs` | `detect_task_list(text) -> Option<usize>` — recognizes multi-part task lists (markdown numbers/bullets, inline `(1)(2)`, semantic "first…then…finally" ordering) for auto-orchestration; pure + unit-tested |
-| `src/tickets.rs` | ticket-context loading: `find_ticket_refs` (configured `prefix` at word start + digits), `fetch_ticket` (rule's argv with `$TICKET` substituted, no shell, 20s timeout, output capped), `enrich_prompt` (prepends framed ticket content BEFORE orchestration detection/classification; per-session dedup via `injected_tickets`, 5-min global `ticket_cache`, fail-open, disclosed). Pluggable across ticketing systems (linear/jira/gh CLIs) |
+| `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (delegation-bypass count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
+| `src/lifecycle.rs` | session/list,load,resume,delete,close (route to owning downstream, ids remapped, pin rehydrated; load/resume reattach the router's own MCP tools via `session::mcp_servers_for_pin`) |
+| `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→binding map (`DelegateBinding.worker` marks a `router-worker` connection: `worker_whoami`/`worker_handoff` only), minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool, same agent first — except with `delegation.candidate_hints: exact`, where `hints.candidate` names any eligible model or fails without substituting; `agents[].max_delegates` slots in `Shared.agent_delegate_slots` beside the global semaphore; `hints.effort` → `Shared.delegate_effort`, read by `llm_proxy::request_effort` by state-session id; `gate_turns` runs `delegate_turn_end` and re-prompts on exit 2), multi-turn `delegate_task keep_open` → `run_delegate_followup` (optionally a background job)/`run_delegate_close` over a `Shared.live_delegates` registry, `delegate_result` (re-reads the state DB by `worker_id`/`background_id` in the delegate row's routing JSON), `mcp-delegate` helper bridge |
+| `src/delegate_hook.rs` | `delegation.lifecycle_hook`: `delegate_start` (awaited after the delegate session opens, before its prompt; a failure refuses the delegate and queues an `aborted` stop), `delegate_turn_end` (`TurnVerdict`: only exit 2 + stderr continues), and durable `delegate_stop`/`parent_repinned` (`deliver`/`deliver_now` through the state DB `hook_outbox`, flushed every 30 s by `spawn_outbox_flusher`); `process_identity` (pid + start ms on every event); the delegate identity line. `parent_repinned` is emitted by `session::report_repin` from both pin sites (`pin_session` and `switch_pin`) |
+| `src/headless.rs` | `router-acp prompt`: in-process client that resumes/loads a session (by router id or pinned provider id) or opens one, applies a mode, sends one message and streams text to stdout; first-allow permissions, no fs/terminal capability. `serve`/`prompt` export `ROUTER_ACP_CONFIG`/`ROUTER_ACP_BIN` to every adapter (`transport::set_router_env`) |
+| `src/tickets.rs` | ticket-context loading: `find_ticket_refs` (configured `prefix` at word start + digits), `fetch_ticket` (rule's argv with `$TICKET` substituted, no shell, 20s timeout, output capped), `enrich_prompt` (prepends framed ticket content BEFORE classification; per-session dedup via `injected_tickets`, 5-min global `ticket_cache`, fail-open, disclosed). Pluggable across ticketing systems (linear/jira/gh CLIs) |
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment |
 | `src/xai_questions.rs` | Grok `_x.ai/ask_user_question` ↔ ACP `elicitation/create` translation (pure; `session.rs` intercepts) |
 | `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
@@ -101,7 +101,7 @@ SDK traps below, which were all discovered the hard way.
    `tools/list`/`ping`/`notifications/initialized` with `params: null`; when
    `tools/list` errored, the adapter saw **zero** delegate tools and
    `delegate_task` silently never appeared — so **delegation never worked live at
-   all** (0 rows in the state DB, undetected until orchestration relied on it).
+   all** (0 rows in the state DB, undetected until a live workflow relied on it).
    The mock's delegate path didn't exercise `tools/list`, so unit/protocol tests
    were green while production was broken. Fix: `lenient_params!` macro impls a
    `Deserialize` via `IgnoredAny` → `Default` for those types (handlers ignore
@@ -400,7 +400,10 @@ SDK traps below, which were all discovered the hard way.
   one **mid-session** directive: it re-pins a live session onto another model
   via `switch_pin` (summarize on the current model → open fresh downstream →
   seed the summary into the next prompt → close old). They exist because CLI
-  clients can't set ACP config options.
+  clients can't set ACP config options. Several tags in one prompt
+  (`[router: candidate=…] [router: effort=…]`) merge as if they were one
+  comma-separated tag — a later key overrides an earlier one, `exclude` lists
+  combine, every tag is stripped (`several_directive_tags_merge`).
 - **Exhausted prompt pins** — `pin_session` drops an explicit/saved candidate
   override when either `usage_cordon` or `seat_exhausted` excludes it. Paid-usage
   denial can exhaust a seat without installing a usage cordon. Keep both gates,
@@ -441,10 +444,9 @@ SDK traps below, which were all discovered the hard way.
   code spans (`strip_code_spans`) before matching so a skill *named* in
   backticks/examples doesn't count as invoking it — **LESSON (hickory-ai6):** a
   feature-list prompt describing an autocomplete for `` `/ship-pr` `` matched the
-  raw substring, pinned opus via skill_routing, set `explicit_routing`, and thus
-  silently suppressed auto-orchestration (the disclosure only said "explicitly
-  selected via router.candidate", hiding that skill_routing did it — now a skill
-  steer emits its own `notify_user` line). Struggle accrues from
+  raw substring and silently pinned opus via skill_routing (the disclosure only
+  said "explicitly selected via router.candidate", hiding that skill_routing did
+  it — now a skill steer emits its own `notify_user` line). Struggle accrues from
   MaxTokens/Refusal stop reasons and ≥3 in-turn tool failures (counted in the
   Primary relay). The summary turn is captured (`capturing_summary`) and not
   relayed; the fully-framed handoff block is prepended once via
@@ -457,83 +459,52 @@ SDK traps below, which were all discovered the hard way.
   `frame_transcript`. The disclosure states which path was used. Regression-tested
   in `switch_directive_hands_off_…`, `switch_falls_back_to_log_transcript_when_summary_fails`,
   `low_confidence_pin_auto_upgrades_…`, `auto_upgrade_disabled_…`, `skill_routing_switches_…`.
-- **Auto-orchestration** (`orchestration.*`, off by default): the prompt tail
-  now runs in an async `dispatch_prompt` task (spawned from `on_prompt`) so
-  `tickets::enrich_prompt` executes FIRST — orchestration detection and
-  classification see the ticket-ENRICHED prompt ("Fix HAI-1234" routes on the
-  ticket's real content). `dispatch_prompt` calls `maybe_trigger_orchestration`
-  (returns `bool`) when `!explicit_routing` (a `[router:]` directive or `model:`
-  shorthand sets `explicit_routing` and suppresses it); an
-  `orchestrate:`/`orchestrator:` prompt prefix (reserved tokens in the shorthand
-  tokenizer) FORCES it, bypassing every gate including `enabled` and list
-  detection. **Precedence:** it runs BEFORE `skill_routing`, and
-  `skill_routing` is gated on `!orchestrating_now` — so a multi-part task list
-  *always* orchestrates even if it names a skill; the planner decides when to
-  invoke that skill. Skill routing only fires for a skill invocation that is
-  NOT a multi-part task. It is ALSO suppressed when the list answers the model's
-  own questions: `previous_turn_solicited_answers` inspects the prior agent turn
-  (`s.turn_output`, still the previous turn at `on_prompt` time — cleared later in
-  `send_prompt_with_failover`) for question marks / decision phrases / an
-  enumerated agent list. `tasklist::detect_task_list` recognizes a multi-part list;
-  above `min_items` it sets `s.orchestrating = true`, steers pre-pin
-  (`candidate_override`) or switches post-pin (`pending_switch`) to the best
-  eligible `planner` glob, and queues `build_orchestration_instructions` into
-  `s.pending_orchestration`. That one-shot block is prepended (before any switch
-  `pending_context` handoff) in `send_prompt_with_failover`'s `effective_prompt`.
-  Ordinary delegation first restricts the cheaper pool to the primary
-  candidate's agent (for example Sol → Terra/Luna), falling back cross-lineage
-  only when no cheaper sibling exists. `orchestrating` relaxes the delegate pool (`run_delegate_task` /
-  `delegate_server_entry`) from cheaper-only to any-eligible so the cross-lineage
-  reviewer is routeable — this is the ONLY router-level change; the pipeline
-  itself is the planner following the injected protocol with `delegate_task` +
-  the multi-turn `keep_open`/`delegate_followup`/`delegate_close` tools. It
-  implements the plan → delegate → cross-lineage review pipeline
-  in-process (the former goose `orchestrate.yaml` recipe was removed — the router
-  owns this now), working from any ACP client. Lifecycle and integration policy
-  is host-owned opaque text in `orchestration.instructions`; router-acp does not
-  define or interpret it.
-  `close_live_delegates_for` reaps kept-open sub-sessions on
-  session/close|delete. `maybe_trigger_orchestration` also sets
-  `run_label = "orchestrate"` (so the planner + its delegate rows group) and
-  resolves explicit **different-lineage** reviewer candidate ids via
-  `resolve_reviewers`. **Lineage = company, not agent name**: compared via
-  `agent_lineage` (the `agents[].lineage` config tag, defaulting to the agent
-  name) — so the same `reviewer` glob list yields the opposite company of
-  whoever planned, and two agents backed by one vendor (tagged with the same
-  `lineage`) are never each other's reviewer. Configured `reviewer` globs are
-  restricted to different-lineage candidates, else any other-lineage candidate;
-  injected into the protocol. Regression: `reviewer_prefers_opposite_lineage_…`
-  (symmetry) + `same_company_agents_share_a_lineage_for_review`.
-  Tests: `orchestration_*` in `tests/protocol.rs` + `tasklist::tests`. Do NOT
-  `include_str!`-style couple this to goose — router-acp still has no notion of
-  recipes; it only detects lists and drives delegation.
-  **LESSON (shipped bug):** the first live run pinned the fable planner but it
-  used claude-agent-acp's **built-in `Task` sub-agent tool** (haiku subtasks,
-  opus review) instead of the router's `delegate_task` — so there were NO
-  `parent_session_id` rows, the review stayed on the planner's own lineage, and
-  nothing was `run_label`led. The native sub-agent tool spawns in-lineage and is
-  invisible to the router; router-acp cannot remove it (it's the adapter's, not an
-  MCP server). The only lever is the injected protocol, which now **explicitly
-  forbids** `Task`/`dispatch_agent`/`spawn` and **mandates** `delegate_task` with
-  the concrete cross-lineage reviewer id. This is inherent to the prose-instruction
-  approach: a model that ignores the ban silently degrades to same-lineage,
-  unobservable orchestration. (Confirmed unfixable at the transport layer:
-  ACP `NewSessionRequest` has no tool-suppression field, and `Task` is a native
-  adapter tool, not a router-injected MCP server — so the router *cannot* remove
-  it.) **Degradation is now detected + surfaced**: `is_native_subagent_tool`
-  (matches `_meta.claudeCode.toolName`/title against `Task`/`dispatch_agent`/…,
-  never `delegate_*`) fires in `handle_downstream_dispatch`; in an orchestrating
-  session it warns once/turn (`turn_native_subagent_warned`) and increments the
-  persisted `native_subagent_calls`. **Observability** (added because the first
-  evaluation couldn't answer "is this helping"): real `cost_usd` is captured from
-  `usage_update.cost` (primary in `log_downstream_event`; delegate in the
+- **Auto-orchestration was removed** (superseded by `router: planner`). Config
+  load rejects any `orchestration:` block with "`orchestration` was removed:
+  auto-orchestration is superseded by the `planner` router (`router: planner`,
+  ROUTERS.md). Delete the `orchestration:` block." Do not reintroduce list
+  detection, an `orchestrate:` prefix, peer delegation or router-run review.
+- **Ticket enrichment runs first**: the prompt tail runs in an async
+  `dispatch_prompt` task (spawned from `on_prompt`) so `tickets::enrich_prompt`
+  executes BEFORE classification ("Fix HAI-1234" routes on the ticket's real
+  content).
+- **Delegation pool**: `run_delegate_task` / `delegate_server_entry` are
+  strictly cheaper-than-parent, first restricted to the primary candidate's
+  agent (for example Sol → Terra/Luna), falling back to other agents only when
+  no cheaper sibling exists. `delegation.candidate_hints: exact` is the only
+  widening: `hints.candidate` names any eligible model (any tier, agent or
+  account) and fails rather than substituting. `close_live_delegates_for` reaps
+  kept-open sub-sessions on session/close|delete. **Lineage = company, not
+  agent name**: `agent_lineage` reads `agents[].lineage` (default: the agent
+  name); account seats share their base agent's lineage, and lifecycle-hook
+  events report it. Nothing routes on it.
+- **Delegation bypass detection**: the router cannot remove an adapter's
+  built-in sub-agent tool (Claude's `Task` is native, not a router-injected MCP
+  server, and ACP `NewSessionRequest` has no tool-suppression field), so the
+  injected delegation directive (`delegation.inject_prompt`) is the only lever.
+  `is_native_subagent_tool` (matches `_meta.claudeCode.toolName`/title against
+  `Task`/`dispatch_agent`/…, never `delegate_*`) fires in
+  `handle_downstream_dispatch` only while `s.delegation_directive_active` and
+  `delegation.native_subagents` is `forbid` (the default); it warns once per
+  turn (`turn_native_subagent_warned`, `router-acp · delegation bypassed: …`)
+  and increments the persisted `native_subagent_calls`. With `allow` it does
+  not fire. Regression: `ordinary_native_subagent_bypass_is_reported`,
+  `native_subagent_tool_detected_by_name_not_delegate`.
+- **Observability**: real `cost_usd` is captured from `usage_update.cost`
+  (primary in `log_downstream_event`; delegate in the
   `DownstreamRoute::Delegate` arm, attributed to the `{parent}::delegate-{sid}`
-  row); `compute_ms` times each model turn; `git_head` tags the run at pin. The
-  `router-acp report` CLI summarizes runs (planner vs delegate cost, delegate
-  count, cross-lineage-review present, degraded%). Token *counters*
-  (`tokens_*`) remain text-estimates and under-count badly — prefer `cost_usd`
-  and `context_used` for cost, `compute_ms` for time (never `updated_at −
-  created_at`, which is dominated by user idle).
+  row); `compute_ms` times each model turn; `git_head` tags the session at pin.
+  `router-acp delegation-report` summarizes delegation adoption. Token
+  *counters* (`tokens_*`) remain text-estimates and under-count badly — prefer
+  `cost_usd` and `context_used` for cost, `compute_ms` for time (never
+  `updated_at − created_at`, which is dominated by user idle).
+- **Reasoning effort** (`session::session_effort`): an explicit request (the
+  `router.effort` option or `[router: effort=…]`) is used as given and never
+  capped; otherwise top-level `effort.default` or the automatic class/complexity
+  recommendation, capped at `effort.max_automatic`. `default` above
+  `max_automatic` fails config load. The cap exists because a long detailed
+  prompt (a whole skill's instructions) classifies at max complexity and would
+  otherwise run at max/xhigh effort.
 - **`escalation` router** (start cheap, escalate on *observed* difficulty — not
   a prompt guess): `EscalationStrategy::rank` pins the cheapest capable candidate
   (or, if `initial_router` is set, delegates the starting pick to that strategy —
@@ -649,8 +620,6 @@ fails.
 - `GOOSE.md` — the user's actual install/runbook (mode handling, failover
   visibility, tuning table)
 - `examples/router-full.yaml`, `examples/router-preferred.yaml` — annotated configs
-- `ORCHESTRATION.md` — the router-native auto-orchestration pipeline
-  (plan → delegate → cross-lineage review; there is no longer a goose recipe)
 - `PLAN.md` — the active follow-on plan (the original build spec was
   completed and removed); post-spec deviations (failover, complexity-scaled
   tradeoff, preference, directives) are documented in README/AGENTS.

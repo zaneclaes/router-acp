@@ -712,7 +712,8 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
             .count(),
         1
     );
-    assert_eq!(added.account_priority, Some(1));
+    // 1-based: the original account is saved as 1, the added one as 2.
+    assert_eq!(added.account_priority, Some(2));
     let added_dir = added.env_var("CODEX_HOME").unwrap();
     assert!(added_dir.starts_with(fixture.account_root.to_string_lossy().as_ref()));
     assert_eq!(
@@ -1036,6 +1037,43 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
             .any(|line| line == existing_dir.to_string_lossy())
     );
     restarted.close().await;
+}
+
+#[tokio::test]
+async fn standalone_menu_sets_listed_account_priority_and_reserve() {
+    let fixture = login_fixture("codex", Some("old"));
+    let mut client = spawn(&fixture.config);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    // codex → codex@old → Set priority → position 1; then Set reserve
+    // capacity → Weekly → 10%, and Session → 0%.
+    for command in [
+        "/login", "2", "1", "3", "1", "4", "1", "3", "2", "1", "/cancel",
+    ] {
+        assert!(
+            client.prompt(&sid, command).await.get("result").is_some(),
+            "{command}"
+        );
+    }
+    let text = client.text();
+    assert!(text.contains("Account moved to position 1."), "{text}");
+    assert!(text.contains("weekly reserve set to 10%."), "{text}");
+    assert!(text.contains("session reserve set to 0%."), "{text}");
+    let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
+    let account = cfg.agents.iter().find(|a| a.name == "codex@old").unwrap();
+    assert_eq!(account.account_priority, Some(1));
+    assert_eq!(account.reserve_capacity.weekly, 10.0);
+    assert_eq!(account.reserve_capacity.session, 0.0);
+    assert_eq!(prompt_count(&fixture.original_log), 0);
+    client.close().await;
 }
 
 #[tokio::test]

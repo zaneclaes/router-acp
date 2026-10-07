@@ -153,6 +153,83 @@ pub struct DelegationConfig {
     /// 1.0 disables the cap.
     #[serde(default = "default_delegate_complexity_cap")]
     pub complexity_cap: f64,
+    /// How a `delegate_task` `hints.candidate` is treated. `prefer` (default)
+    /// honors the hint only inside the cost-scoped pool and otherwise ranks
+    /// that pool as usual. `exact` lets the hint address any eligible
+    /// candidate, whatever its tier or agent, and fails the call instead of
+    /// substituting another model — for hosts whose workflow requires a
+    /// specific worker model (e.g. a Sol parent with a Grok worker).
+    #[serde(default)]
+    pub candidate_hints: CandidateHintMode,
+    /// Whether the injected delegation directive forbids provider-native
+    /// Task/spawn/subagent tools (`forbid`, default) or leaves them to the
+    /// host's own workflow (`allow`).
+    #[serde(default)]
+    pub native_subagents: NativeSubagentPolicy,
+    /// Optional external command run when a delegate starts and stops, so a
+    /// host can account for router-owned workers it cannot otherwise see.
+    #[serde(default)]
+    pub lifecycle_hook: Option<DelegateLifecycleHook>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CandidateHintMode {
+    #[default]
+    Prefer,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeSubagentPolicy {
+    #[default]
+    Forbid,
+    Allow,
+}
+
+/// Reasoning effort for primary sessions when no one asked for a level
+/// explicitly (the `router.effort` option or `[router: effort=…]`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffortConfig {
+    /// Used instead of the automatic class/complexity recommendation. A long,
+    /// detailed prompt (a whole skill's instructions) classifies as maximum
+    /// complexity, so the automatic level can be far higher than the work
+    /// needs; a coordinating parent is better served by a fixed level.
+    #[serde(default)]
+    pub default: Option<crate::candidate::EffortLevel>,
+    /// Ceiling on any level the router picks by itself (automatic or
+    /// `default`). Explicit requests are never capped.
+    #[serde(default)]
+    pub max_automatic: Option<crate::candidate::EffortLevel>,
+}
+
+/// A command the router runs (no shell) with one JSON event on stdin (see
+/// `delegate_hook`). `delegate_start` runs after the delegate session opens
+/// and before its prompt; a non-zero exit or timeout refuses the delegate.
+/// `delegate_turn_end` runs when each delegate turn ends; exit 2 sends the
+/// hook's stderr back to that delegate as its next prompt, at most
+/// `max_continuations` times per turn. `delegate_stop` and `parent_repinned`
+/// are delivered durably through the state DB's outbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateLifecycleHook {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_continuations")]
+    pub max_continuations: u32,
+}
+
+fn default_lifecycle_hook_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_max_continuations() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +260,9 @@ impl Default for DelegationConfig {
             max_concurrent: default_max_concurrent(),
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
+            candidate_hints: CandidateHintMode::default(),
+            native_subagents: NativeSubagentPolicy::default(),
+            lifecycle_hook: None,
         }
     }
 }
@@ -435,9 +515,8 @@ impl Default for AutoUpgradeConfig {
 /// Load ticket details into the prompt when a ticket id is referenced. When a
 /// prompt mentions `<prefix><digits>` (e.g. `HAI-1234`), the router runs
 /// `command` (with `$TICKET` substituted) and prepends its stdout to the prompt
-/// before classification and orchestration detection — so "Fix HAI-1234"
-/// becomes a rich prompt that routes (and possibly orchestrates) on the
-/// ticket's actual content. Fails open: a failed/slow fetch leaves the prompt
+/// before classification — so "Fix HAI-1234" becomes a rich prompt that routes
+/// on the ticket's actual content. Fails open: a failed/slow fetch leaves the prompt
 /// unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -464,7 +543,7 @@ pub enum RouteSelection {
     /// The FIRST glob with an eligible candidate wins; quality only breaks
     /// ties *within* that one glob. Use when list order encodes a deliberate
     /// preference the score table does not — e.g. routing a ship flow to a
-    /// flat-rate or cross-lineage seat that a quality-max pick would never
+    /// flat-rate or second-company seat that a quality-max pick would never
     /// select, while still falling through to the next glob when that seat is
     /// cordoned or excluded.
     FirstMatch,
@@ -519,100 +598,6 @@ pub struct SkillRoute {
     pub marks_implementation_phase: bool,
 }
 
-/// Automatic orchestration. When a prompt reads as a multi-part task list
-/// (markdown list, inline `(1)(2)`, or "first … then … finally" ordering), the
-/// router runs a plan → delegate → review pipeline entirely in-process:
-/// it steers/switches the session to a `planner` model and injects an
-/// orchestration protocol instructing that model to decompose the task, delegate
-/// each part via `delegate_task` (routed per-complexity in isolated
-/// sub-sessions), and have a different-lineage `reviewer` verify the net result.
-/// Delegation in an orchestrating session is allowed to
-/// same-/higher-tier peers (so cross-lineage review works), unlike ordinary
-/// cost-shedding delegation. An explicit `[router: …]` directive or `model:`
-/// shorthand on the prompt suppresses auto-orchestration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrchestrationConfig {
-    /// Master switch. Off by default so it never surprises a plain session;
-    /// turn it on in your router.yaml to get automatic decomposition.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Minimum number of detected parts before a prompt is treated as an
-    /// orchestratable list.
-    #[serde(default = "default_min_items")]
-    pub min_items: usize,
-    /// Candidate globs for the planner/orchestrator, best first. The first one
-    /// with an eligible candidate wins (like `skill_routing`).
-    #[serde(default = "default_planner")]
-    pub planner: Vec<String>,
-    /// Preferred cross-lineage reviewer candidate globs, best first. Passed to
-    /// the orchestrator as guidance; it should pick one of a *different* lineage
-    /// than the planner for the review pass.
-    #[serde(default = "default_reviewer")]
-    pub reviewer: Vec<String>,
-    /// Opaque host-owned instructions appended to the orchestration protocol.
-    /// The router does not interpret this text; workflow policy belongs to the
-    /// host rather than router-acp.
-    #[serde(default)]
-    pub instructions: String,
-    /// Maximum review → fix → re-review rounds.
-    #[serde(default = "default_max_fix_rounds")]
-    pub max_fix_rounds: u32,
-    /// Planner self-confidence bar for skipping the review pass. After
-    /// integrating, the planner states its confidence (0.0–1.0) that the
-    /// implementation is correct; strictly above this bar the review is
-    /// skipped with a note.
-    #[serde(default = "default_review_confidence")]
-    pub review_confidence: f64,
-}
-
-fn default_min_items() -> usize {
-    2
-}
-
-fn default_planner() -> Vec<String> {
-    // Opus 5 outranks Grok 4.5; prefer it over gpt-5.5 when both are free.
-    vec![
-        "*sol*".to_string(),
-        "*fable*".to_string(),
-        "*opus*".to_string(),
-        "*grok*".to_string(),
-        "*gpt-5.5*".to_string(),
-    ]
-}
-
-fn default_reviewer() -> Vec<String> {
-    vec![
-        "*gpt-5.5*".to_string(),
-        "*sol*".to_string(),
-        "*opus*".to_string(),
-        "*fable*".to_string(),
-        "*grok*".to_string(),
-    ]
-}
-
-fn default_max_fix_rounds() -> u32 {
-    2
-}
-
-fn default_review_confidence() -> f64 {
-    0.8
-}
-
-impl Default for OrchestrationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            min_items: default_min_items(),
-            planner: default_planner(),
-            reviewer: default_reviewer(),
-            instructions: String::new(),
-            max_fix_rounds: default_max_fix_rounds(),
-            review_confidence: default_review_confidence(),
-        }
-    }
-}
-
 /// When a host-registered pre-classifier dimension should inject its prompt.
 ///
 /// YAML shapes:
@@ -654,8 +639,8 @@ fn default_dim_min_confidence() -> f64 {
     0.70
 }
 
-/// Composable LLM pre-classifier: one cheap ACP evaluation returns structured
-/// decisions for auto-orchestration and host-registered dimensions.
+/// Composable LLM pre-classifier: one cheap ACP evaluation returns the task
+/// class/complexity, the planner router's phase, and host-registered dimensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreClassifierConfig {
@@ -692,9 +677,6 @@ pub struct PreClassifierConfig {
     /// Emit `router-acp · pre-class …` disclosure lines.
     #[serde(default = "default_true")]
     pub disclose: bool,
-    /// Minimum confidence to act on the built-in `orchestrate` dimension.
-    #[serde(default = "default_orchestrate_min_confidence")]
-    pub orchestrate_min_confidence: f64,
     /// Host extensions (e.g. `ui_planning`). One evaluator call covers all.
     #[serde(default)]
     pub dimensions: Vec<PreClassDimension>,
@@ -743,10 +725,6 @@ fn default_preclass_stall_timeout_ms() -> u64 {
     90_000
 }
 
-fn default_orchestrate_min_confidence() -> f64 {
-    0.65
-}
-
 impl Default for PreClassifierConfig {
     fn default() -> Self {
         Self {
@@ -755,7 +733,6 @@ impl Default for PreClassifierConfig {
             timeout_ms: default_preclass_timeout_ms(),
             stall_timeout_ms: default_preclass_stall_timeout_ms(),
             disclose: true,
-            orchestrate_min_confidence: default_orchestrate_min_confidence(),
             dimensions: Vec::new(),
             evaluator_cwd: None,
         }
@@ -865,7 +842,7 @@ pub struct ModelConfig {
     /// Whether any AUTOMATIC mechanism may choose this candidate. `false`
     /// removes it from every automatic pool — the `auto`/`pareto-code`
     /// strategies, escalation/demotion targets, pre-classifier evaluators,
-    /// orchestration planner/reviewer globs, skill routes, failover, delegate
+    /// skill routes, failover, delegate
     /// scoping and per-request proxy routing — while leaving it explicitly
     /// selectable (`router.candidate`, `[router: candidate=…]`,
     /// `[router: switch=…]`): reachable on purpose, never by accident.
@@ -943,6 +920,12 @@ pub struct AgentConfig {
     /// Deleted membership keeps an adapter template for adding a new login.
     #[serde(default)]
     pub account_disabled: bool,
+    /// Most delegated sub-sessions this agent runs at once, beside the global
+    /// `delegation.max_concurrent`. Each account seat gets its own limit, so
+    /// adding accounts or agents adds delegate capacity. Unset: only the
+    /// global limit applies.
+    #[serde(default)]
+    pub max_delegates: Option<usize>,
     /// Independently authenticated instances of this adapter. Expanded into
     /// `name@account` agents before validation; empty keeps the original agent.
     #[serde(default)]
@@ -958,10 +941,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub login_command: Option<CommandConfig>,
     /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
-    /// agent name. Orchestration's cross-lineage review compares THIS — the
-    /// point is a reviewer whose models come from a **different company** (and
-    /// thus behave differently), so two agents backed by the same vendor (e.g.
-    /// two Claude seats) should declare the same `lineage`.
+    /// agent name. Reported with lifecycle-hook events so a host can tell which
+    /// company a worker runs on; two agents backed by the same vendor (e.g. two
+    /// Claude seats) should declare the same `lineage` (account seats share it
+    /// automatically).
     #[serde(default)]
     pub lineage: Option<String>,
     /// Optional per-request LLM proxy interposition for this adapter. The
@@ -1321,8 +1304,7 @@ pub struct PlannerRouterConfig {
     /// Opaque host-owned instructions injected into the agent's context when
     /// the session enters the planning phase. The router does not interpret
     /// this text; workflow policy (ticket decomposition, session-spawning
-    /// protocol, coordination rules) belongs to the host. Analogous to
-    /// `orchestration.instructions`.
+    /// protocol, coordination rules) belongs to the host.
     #[serde(default)]
     pub planning_instructions: String,
 }
@@ -1408,10 +1390,15 @@ pub struct Config {
     /// Ticket-reference → context-loading rules (prefix + fetch command).
     #[serde(default)]
     pub ticket_context: Vec<TicketRule>,
-    /// Automatic orchestration of multi-part task lists.
+    /// Removed: auto-orchestration was superseded by the `planner` router.
+    /// Accepted only so a stale `orchestration:` block fails validation with a
+    /// pointer to its replacement instead of a bare unknown-field error.
+    #[serde(default, skip_serializing)]
+    pub orchestration: Option<serde_yaml::Value>,
+    /// Reasoning-effort policy for primary sessions.
     #[serde(default)]
-    pub orchestration: OrchestrationConfig,
-    /// Composable LLM pre-classifier (orchestration + host dimensions).
+    pub effort: EffortConfig,
+    /// Composable LLM pre-classifier (task class, complexity, host dimensions).
     #[serde(default)]
     pub pre_classifier: PreClassifierConfig,
     /// Expiry of elevated pins (escalations, auto-upgrades, skill pins):
@@ -1680,7 +1667,8 @@ impl Config {
                 }
                 let mut seat = agent.clone();
                 seat.name = format!("{}@{}", agent.name, account.name);
-                seat.account_priority = Some(account.priority.unwrap_or(index as u32));
+                // Priorities are 1-based: list order defaults to 1, 2, 3…
+                seat.account_priority = Some(account.priority.unwrap_or(index as u32 + 1));
                 seat.account_disabled = account.disabled || agent.account_disabled;
                 seat.lineage = Some(agent.lineage.clone().unwrap_or_else(|| agent.name.clone()));
                 seat.command.env.extend(account.env);
@@ -1691,6 +1679,12 @@ impl Config {
             }
         }
         cfg.agents = agents;
+        if let Some(hook) = &mut cfg.delegation.lifecycle_hook {
+            hook.command = expand_tilde_str(&hook.command);
+            for arg in &mut hook.args {
+                *arg = expand_tilde_str(arg);
+            }
+        }
         // Downstream adapters are spawned via `Command::new` (no shell), so a
         // leading `~` in a command path or arg would never be expanded and the
         // spawn would fail — expand it here the same way we do for state paths.
@@ -1879,6 +1873,24 @@ impl Config {
                 "delegation.complexity_cap must be between 0 and 1".into(),
             ));
         }
+        if let Some(hook) = &self.delegation.lifecycle_hook {
+            if hook.command.trim().is_empty() {
+                return Err(ConfigError(
+                    "delegation.lifecycle_hook.command must not be empty".into(),
+                ));
+            }
+            if hook.timeout_ms == 0 {
+                return Err(ConfigError(
+                    "delegation.lifecycle_hook.timeout_ms must be positive".into(),
+                ));
+            }
+        }
+        if let Some(agent) = self.agents.iter().find(|a| a.max_delegates == Some(0)) {
+            return Err(ConfigError(format!(
+                "agent `{}`: max_delegates must be positive (omit it for no per-agent limit)",
+                agent.name
+            )));
+        }
         if self.llm_proxy.enabled {
             let listen: std::net::SocketAddr = self.llm_proxy.listen.parse().map_err(|_| {
                 ConfigError(format!(
@@ -2059,23 +2071,21 @@ impl Config {
                 )));
             }
         }
-        if self.orchestration.enabled {
-            if self.orchestration.planner.is_empty() {
-                return Err(ConfigError(
-                    "orchestration.enabled is true but orchestration.planner is empty".into(),
-                ));
-            }
-            if self.orchestration.min_items < 2 {
-                return Err(ConfigError(
-                    "orchestration.min_items must be at least 2".into(),
-                ));
-            }
-            if !(0.0..=1.0).contains(&self.orchestration.review_confidence) {
-                return Err(ConfigError(format!(
-                    "orchestration.review_confidence must be within 0.0..=1.0, got `{}`",
-                    self.orchestration.review_confidence
-                )));
-            }
+        if self.orchestration.is_some() {
+            return Err(ConfigError(
+                "`orchestration` was removed: auto-orchestration is superseded by the `planner` \
+                 router (`router: planner`, ROUTERS.md). Delete the `orchestration:` block."
+                    .into(),
+            ));
+        }
+        if let (Some(default), Some(cap)) = (self.effort.default, self.effort.max_automatic)
+            && default > cap
+        {
+            return Err(ConfigError(format!(
+                "effort.default `{}` is above effort.max_automatic `{}`",
+                default.as_str(),
+                cap.as_str()
+            )));
         }
         if self.pre_classifier.enabled {
             if self.pre_classifier.evaluator.is_empty() {
@@ -2085,23 +2095,11 @@ impl Config {
             }
             // pre_classifier.timeout_ms is deprecated/ignored (the classifier no
             // longer times out); any value — including 0 — is accepted.
-            if !(0.0..=1.0).contains(&self.pre_classifier.orchestrate_min_confidence) {
-                return Err(ConfigError(format!(
-                    "pre_classifier.orchestrate_min_confidence must be within 0.0..=1.0, got `{}`",
-                    self.pre_classifier.orchestrate_min_confidence
-                )));
-            }
             let mut seen = HashSet::new();
             for dim in &self.pre_classifier.dimensions {
                 if dim.id.trim().is_empty() {
                     return Err(ConfigError(
                         "pre_classifier.dimensions: id must not be empty".into(),
-                    ));
-                }
-                if dim.id == "orchestrate" {
-                    return Err(ConfigError(
-                        "pre_classifier.dimensions: id `orchestrate` is reserved for the built-in dimension"
-                            .into(),
                     ));
                 }
                 if !seen.insert(dim.id.clone()) {
@@ -2282,8 +2280,7 @@ agents:
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
-        assert_eq!(cfg.orchestration.review_confidence, 0.8);
-        assert!(cfg.orchestration.instructions.is_empty());
+        assert!(cfg.effort.default.is_none() && cfg.effort.max_automatic.is_none());
         assert!(!cfg.llm_proxy.enabled);
         assert_eq!(cfg.llm_proxy.minimum_dwell_requests, 12);
     }
@@ -2293,6 +2290,50 @@ agents:
         let yaml = format!("delegation:\n  inject_prompt: true\n{}", minimal_yaml());
         let cfg = Config::from_yaml(&yaml).unwrap();
         assert!(cfg.delegation.inject_prompt);
+    }
+
+    #[test]
+    fn parses_delegate_worker_controls() {
+        let cfg = Config::from_yaml(minimal_yaml()).unwrap();
+        assert_eq!(cfg.delegation.candidate_hints, CandidateHintMode::Prefer);
+        assert_eq!(
+            cfg.delegation.native_subagents,
+            NativeSubagentPolicy::Forbid
+        );
+        assert!(cfg.delegation.lifecycle_hook.is_none());
+
+        let yaml = format!(
+            "delegation:\n  candidate_hints: exact\n  native_subagents: allow\n  \
+             lifecycle_hook: {{ command: ~/bin/hook, args: [\"~/x\"] }}\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.delegation.candidate_hints, CandidateHintMode::Exact);
+        assert_eq!(cfg.delegation.native_subagents, NativeSubagentPolicy::Allow);
+        let hook = cfg.delegation.lifecycle_hook.as_ref().unwrap();
+        assert!(!hook.command.starts_with('~'), "command is tilde-expanded");
+        assert!(!hook.args[0].starts_with('~'), "args are tilde-expanded");
+        assert_eq!(hook.timeout_ms, 30_000);
+        assert_eq!(hook.max_continuations, 3);
+
+        let empty = format!(
+            "delegation:\n  lifecycle_hook: {{ command: \"\" }}\n{}",
+            minimal_yaml()
+        );
+        assert!(Config::from_yaml(&empty).is_err());
+    }
+
+    #[test]
+    fn max_delegates_is_per_account_seat_and_positive() {
+        let yaml = format!(
+            "{}\n    max_delegates: 4\n    accounts:\n      - name: work\n      - name: personal\n",
+            minimal_yaml().trim_end()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert!(cfg.agents.iter().all(|a| a.max_delegates == Some(4)));
+        assert_eq!(cfg.agents.len(), 2, "each seat carries its own limit");
+        let zero = format!("{}\n    max_delegates: 0\n", minimal_yaml().trim_end());
+        assert!(Config::from_yaml(&zero).is_err());
     }
 
     #[test]
@@ -2306,33 +2347,33 @@ agents:
     }
 
     #[test]
-    fn parses_review_confidence_override() {
-        let yaml = format!(
-            "orchestration:\n  enabled: true\n  review_confidence: 0.95\n{}",
-            minimal_yaml()
-        );
-        let cfg = Config::from_yaml(&yaml).unwrap();
-        assert_eq!(cfg.orchestration.review_confidence, 0.95);
+    fn a_stale_orchestration_block_points_to_the_planner_router() {
+        for block in ["orchestration:\n  enabled: false\n", "orchestration: {}\n"] {
+            let err = Config::from_yaml(&format!("{block}{}", minimal_yaml())).unwrap_err();
+            assert!(err.0.contains("`planner` router"), "{}", err.0);
+        }
     }
 
     #[test]
-    fn parses_host_owned_orchestration_instructions() {
+    fn parses_effort_policy() {
         let yaml = format!(
-            "orchestration:\n  enabled: true\n  instructions: follow-host-policy\n{}",
+            "effort: {{ default: medium, max_automatic: high }}\n{}",
             minimal_yaml()
         );
         let cfg = Config::from_yaml(&yaml).unwrap();
-        assert_eq!(cfg.orchestration.instructions, "follow-host-policy");
-    }
-
-    #[test]
-    fn rejects_review_confidence_out_of_range() {
-        let yaml = format!(
-            "orchestration:\n  enabled: true\n  review_confidence: 1.5\n{}",
+        assert_eq!(
+            cfg.effort.default,
+            Some(crate::candidate::EffortLevel::Medium)
+        );
+        assert_eq!(
+            cfg.effort.max_automatic,
+            Some(crate::candidate::EffortLevel::High)
+        );
+        let inverted = format!(
+            "effort: {{ default: max, max_automatic: medium }}\n{}",
             minimal_yaml()
         );
-        let err = Config::from_yaml(&yaml).unwrap_err();
-        assert!(err.0.contains("review_confidence"), "{}", err.0);
+        assert!(Config::from_yaml(&inverted).is_err());
     }
 
     fn versioned_yaml() -> &'static str {

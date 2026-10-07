@@ -64,7 +64,7 @@ pub struct PersistedSession {
     /// `primary` (a normal pinned session) or `delegate` (a sub-agent
     /// spawned via `delegate_task`).
     pub kind: String,
-    /// Optional grouping label (e.g. an orchestration run id) shared by
+    /// Optional grouping label (`[router: label=…]`) shared by
     /// related sessions.
     pub run_label: Option<String>,
     pub created_at: Option<u64>,
@@ -92,9 +92,9 @@ pub struct PersistedSession {
     /// Separate from adapter turn cost to avoid mixing granularities.
     pub llm_request_cost_usd: f64,
     pub llm_requests_total: u64,
-    /// Count of native (adapter built-in) sub-agent tool calls seen in an
-    /// orchestrating session — each one bypasses the router's `delegate_task`,
-    /// so a non-zero value means orchestration silently degraded.
+    /// Count of native (adapter built-in) sub-agent tool calls seen in a
+    /// session told to use only the router's `delegate_task` — each one
+    /// bypassed router delegation.
     pub native_subagent_calls: u64,
     /// Number of ordinary delegation directives injected into downstream model
     /// sessions. Detailed candidate/scope data remains in `session_log`.
@@ -309,6 +309,15 @@ impl StateFile {
                    started_at, updated_at, detail
             FROM tool_calls
             WHERE completed_at IS NULL;
+        -- Lifecycle-hook events (`delegate_stop`, `parent_repinned`) not yet
+        -- accepted by the host. Every router process sharing this DB flushes
+        -- it, so an event survives a hook failure or a router restart.
+        CREATE TABLE IF NOT EXISTS hook_outbox (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload    TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 0
+        );
         "#;
         if let Err(err) = self.conn.execute_batch(sql) {
             tracing::error!(%err, "failed to initialize state schema");
@@ -832,7 +841,7 @@ impl StateFile {
         );
     }
 
-    /// Increment the native-subagent-call counter (orchestration degradation).
+    /// Increment the native-subagent-call counter (router delegation bypassed).
     pub fn note_native_subagent(&self, router_session_id: &str) {
         let _ = self.conn.execute(
             "UPDATE sessions SET native_subagent_calls=native_subagent_calls+1 \
@@ -907,8 +916,53 @@ impl StateFile {
         self.prune_at(now_epoch())
     }
 
+    /// Queue a lifecycle-hook event; returns its outbox id.
+    pub fn outbox_push(&self, payload: &str) -> Option<i64> {
+        match self.conn.execute(
+            "INSERT INTO hook_outbox (payload, created_at) VALUES (?1, ?2)",
+            params![payload, now_epoch() as i64],
+        ) {
+            Ok(_) => Some(self.conn.last_insert_rowid()),
+            Err(err) => {
+                tracing::error!(%err, "cannot queue lifecycle-hook event");
+                None
+            }
+        }
+    }
+
+    /// Undelivered events, oldest first.
+    pub fn outbox_pending(&self, limit: usize) -> Vec<(i64, String)> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT id, payload FROM hook_outbox ORDER BY id LIMIT ?1")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map(params![limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn outbox_done(&self, id: i64) {
+        let _ = self
+            .conn
+            .execute("DELETE FROM hook_outbox WHERE id = ?1", params![id]);
+    }
+
+    pub fn outbox_attempted(&self, id: i64) {
+        let _ = self.conn.execute(
+            "UPDATE hook_outbox SET attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        );
+    }
+
     pub fn prune_at(&self, now: u64) -> usize {
         let cutoff = now.saturating_sub(self.retention.max_age.as_secs()) as i64;
+        // An event the host never accepted within the history window is moot.
+        let _ = self.conn.execute(
+            "DELETE FROM hook_outbox WHERE created_at < ?1",
+            params![cutoff],
+        );
         match self.conn.execute(
             "DELETE FROM sessions WHERE updated_at IS NOT NULL AND updated_at < ?1",
             params![cutoff],

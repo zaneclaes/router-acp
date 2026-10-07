@@ -22,6 +22,8 @@ use crate::session::{CandidateRuntime, CandidateStatus, Shared, TargetRuntime};
 use crate::strategies::CandidateView;
 
 const PROVIDERS: [&str; 3] = ["claude", "codex", "grok"];
+/// Reserve percentages offered by `/login` → account → Set reserve capacity.
+const RESERVE_STEPS: [u32; 10] = [0, 5, 10, 15, 20, 25, 30, 40, 50, 75];
 
 pub fn advertise(shared: &Arc<Shared>, sid: &str) {
     if let Some(cx) = shared.upstream() {
@@ -287,7 +289,51 @@ pub enum Menu {
     Providers,
     Provider(String, Vec<String>),
     Account(String),
+    Priority(String),
+    Reserve(String),
+    ReserveWindow(String, ReserveWindow),
     Delete(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveWindow {
+    Weekly,
+    Session,
+}
+
+impl ReserveWindow {
+    fn label(self) -> &'static str {
+        match self {
+            ReserveWindow::Weekly => "weekly",
+            ReserveWindow::Session => "session",
+        }
+    }
+}
+
+const RELOGIN: &str = "Re-login";
+const SET_PRIORITY: &str = "Set priority";
+const SET_RESERVE: &str = "Set reserve capacity";
+const DELETE: &str = "Delete account";
+const BACK: &str = "Back";
+
+fn account_options(agent: &AgentConfig) -> Vec<String> {
+    // Re-login and Delete keep their original numbers (1 and 2).
+    let mut options = vec![
+        RELOGIN.to_string(),
+        DELETE.to_string(),
+        SET_PRIORITY.to_string(),
+    ];
+    // Reserves cordon from usage readings, so they need a usage source.
+    if agent.usage_source.is_some() {
+        options.push(SET_RESERVE.to_string());
+    }
+    options.push(BACK.to_string());
+    options
+}
+
+fn account_label(agent: &AgentConfig) -> String {
+    let (label, plan) = identity(agent);
+    plan.map(|p| format!("{label} ({p})")).unwrap_or(label)
 }
 
 fn provider_menu(shared: &Arc<Shared>, p: &str) -> Menu {
@@ -321,14 +367,35 @@ impl LoginFlow {
     }
 }
 
+/// The user's typed text when the prompt is text only. goose adds its
+/// `<turn-context>…</turn-context>` preamble as a second text block (or inside
+/// the first), so that span is dropped before a command is recognized.
 fn text(prompt: &[ContentBlock]) -> Option<String> {
-    if prompt.len() != 1 {
-        return None;
+    let mut typed = String::new();
+    for block in prompt {
+        let ContentBlock::Text(t) = block else {
+            return None;
+        };
+        typed.push_str(&without_turn_context(&t.text));
+        typed.push('\n');
     }
-    match &prompt[0] {
-        ContentBlock::Text(t) => Some(t.text.trim().to_string()),
-        _ => None,
+    Some(typed.trim().to_string())
+}
+
+fn without_turn_context(text: &str) -> String {
+    const OPEN: &str = "<turn-context>";
+    const CLOSE: &str = "</turn-context>";
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => return out,
+        }
     }
+    out.push_str(rest);
+    out
 }
 
 pub fn intercepts(shared: &Arc<Shared>, sid: &str, prompt: &[ContentBlock]) -> bool {
@@ -405,26 +472,97 @@ fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
             let mut labels: Vec<_> = names
                 .iter()
                 .map(|name| {
-                    let Some(a) = agents.iter().find(|a| &a.name == name) else {
-                        return "Account removed".into();
-                    };
-                    let (label, plan) = identity(a);
-                    plan.map(|p| format!("{label} ({p})")).unwrap_or(label)
+                    agents
+                        .iter()
+                        .find(|a| &a.name == name)
+                        .map(account_label)
+                        .unwrap_or_else(|| "Account removed".into())
                 })
                 .collect();
             labels.extend(["Add Account".into(), "Back".into()]);
             (format!("{p}: accounts in priority order"), labels)
         }
-        Menu::Account(name) => {
-            let body = shared
-                .agent_configs()
+        Menu::Account(name) => match shared.agent_configs().iter().find(|a| &a.name == name) {
+            Some(a) => (
+                crate::account_usage::summarize_account(shared, a),
+                account_options(a),
+            ),
+            None => ("Account was removed".into(), vec![BACK.into()]),
+        },
+        Menu::Priority(name) => {
+            let group = account_group(shared, name);
+            let agents = shared.agent_configs();
+            let label = |n: &String| {
+                agents
+                    .iter()
+                    .find(|a| &a.name == n)
+                    .map(account_label)
+                    .unwrap_or_else(|| n.clone())
+            };
+            let mut options: Vec<String> = group
                 .iter()
-                .find(|a| &a.name == name)
-                .map(|a| crate::account_usage::summarize_account(shared, a))
-                .unwrap_or_else(|| "Account was removed".into());
+                .enumerate()
+                .map(|(i, n)| {
+                    if n == name {
+                        format!("Position {} (current)", i + 1)
+                    } else {
+                        format!("Position {} (now {})", i + 1, label(n))
+                    }
+                })
+                .collect();
+            options.push(BACK.into());
             (
-                body,
-                vec!["Re-login".into(), "Delete account".into(), "Back".into()],
+                format!(
+                    "Move {} to which position? Position 1 is used first.",
+                    label(name)
+                ),
+                options,
+            )
+        }
+        Menu::Reserve(name) => {
+            let agent = shared.agent_configs().into_iter().find(|a| &a.name == name);
+            let label = agent.as_ref().map(account_label).unwrap_or(name.clone());
+            let reserve = agent.map(|a| a.reserve_capacity).unwrap_or_default();
+            (
+                format!(
+                    "Reserve capacity for {label}: the share of each included-plan window kept \
+                     unused. The router moves to another account at {}% weekly or {}% session usage.",
+                    100.0 - reserve.weekly,
+                    100.0 - reserve.session
+                ),
+                vec![
+                    format!("Weekly reserve ({}%)", reserve.weekly),
+                    format!("Session reserve ({}%)", reserve.session),
+                    BACK.into(),
+                ],
+            )
+        }
+        Menu::ReserveWindow(name, window) => {
+            let agent = shared.agent_configs().into_iter().find(|a| &a.name == name);
+            let label = agent.as_ref().map(account_label).unwrap_or(name.clone());
+            let current = agent
+                .map(|a| match window {
+                    ReserveWindow::Weekly => a.reserve_capacity.weekly,
+                    ReserveWindow::Session => a.reserve_capacity.session,
+                })
+                .unwrap_or_default();
+            let mut options: Vec<String> = RESERVE_STEPS
+                .iter()
+                .map(|&p| {
+                    if f64::from(p) == current {
+                        format!("{p}% (current)")
+                    } else {
+                        format!("{p}%")
+                    }
+                })
+                .collect();
+            options.push(BACK.into());
+            (
+                format!(
+                    "Keep how much of {label}'s {} window unused?",
+                    window.label()
+                ),
+                options,
             )
         }
         Menu::Delete(name) => (
@@ -629,15 +767,58 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
                     .into_iter()
                     .find(|a| a.name == name)
                     .ok_or_else(|| AcpError::invalid_params().data("Account no longer exists"))?;
-                match choice {
-                    1 => {
+                let options = account_options(&agent);
+                match choice.checked_sub(1).and_then(|i| options.get(i)) {
+                    Some(o) if o == RELOGIN => {
                         let flow = start_login(shared, sid, agent, None)?;
                         shared.account_menus.lock().unwrap().remove(sid);
                         return finish_login(shared, sid, flow, structured).await;
                     }
-                    2 => state = Menu::Delete(name),
-                    3 => state = provider_menu(shared, provider(&agent).unwrap()),
-                    _ => emit(shared, sid, "Choose a listed number."),
+                    Some(o) if o == SET_PRIORITY => state = Menu::Priority(name),
+                    Some(o) if o == SET_RESERVE => state = Menu::Reserve(name),
+                    Some(o) if o == DELETE => state = Menu::Delete(name),
+                    Some(_) => state = provider_menu(shared, provider(&agent).unwrap()),
+                    None => emit(shared, sid, "Choose a listed number."),
+                }
+            }
+            Menu::Priority(name) => {
+                let group = account_group(shared, &name);
+                if choice > 0 && choice <= group.len() {
+                    match set_priority(shared, &name, choice - 1).await {
+                        Ok(()) => {
+                            emit(shared, sid, &format!("Account moved to position {choice}."))
+                        }
+                        Err(e) => emit(shared, sid, &format!("router-acp: {e}")),
+                    }
+                    state = Menu::Account(name);
+                } else if choice == group.len() + 1 {
+                    state = Menu::Account(name);
+                } else {
+                    emit(shared, sid, "Choose a listed number.");
+                }
+            }
+            Menu::Reserve(name) => match choice {
+                1 => state = Menu::ReserveWindow(name, ReserveWindow::Weekly),
+                2 => state = Menu::ReserveWindow(name, ReserveWindow::Session),
+                3 => state = Menu::Account(name),
+                _ => emit(shared, sid, "Choose a listed number."),
+            },
+            Menu::ReserveWindow(name, window) => {
+                if choice > 0 && choice <= RESERVE_STEPS.len() {
+                    let percent = RESERVE_STEPS[choice - 1];
+                    match set_reserve(shared, &name, window, percent).await {
+                        Ok(()) => emit(
+                            shared,
+                            sid,
+                            &format!("{} reserve set to {percent}%.", window.label()),
+                        ),
+                        Err(e) => emit(shared, sid, &format!("router-acp: {e}")),
+                    }
+                    state = Menu::Reserve(name);
+                } else if choice == RESERVE_STEPS.len() + 1 {
+                    state = Menu::Reserve(name);
+                } else {
+                    emit(shared, sid, "Choose a listed number.");
                 }
             }
             Menu::Delete(name) if choice == 2 => {
@@ -684,7 +865,8 @@ fn new_account(shared: &Arc<Shared>, p: &str) -> Result<(AgentConfig, String), A
             .filter(|a| provider(a) == Some(p))
             .filter_map(|a| a.account_priority)
             .max()
-            .unwrap_or(0)
+            // Priorities are 1-based; an unset original is given 1 on save.
+            .unwrap_or(1)
             .saturating_add(1),
     );
     let home = agent
@@ -1184,7 +1366,7 @@ async fn publish_added(
                 .is_some_and(|n| n.split('@').next() == agent.name.split('@').next())
         }) {
             if a.get("account_priority").is_none() {
-                a["account_priority"] = serde_json::json!(0);
+                a["account_priority"] = serde_json::json!(1);
             }
         }
         agents.push(added);
@@ -1258,6 +1440,120 @@ fn register(shared: &Arc<Shared>, agent: &AgentConfig) {
             },
         );
     }
+}
+
+/// The registered accounts sharing `name`'s provider, in priority order.
+pub(crate) fn account_group(shared: &Arc<Shared>, name: &str) -> Vec<String> {
+    shared
+        .agent_configs()
+        .iter()
+        .find(|a| a.name == name)
+        .and_then(provider)
+        .map(|p| accounts(shared, p).into_iter().map(|a| a.name).collect())
+        .unwrap_or_default()
+}
+
+/// Set fields on an account wherever the document declares it: a standalone
+/// `agents[]` entry (what `/login` → Add Account writes) and/or an entry in
+/// its base agent's `accounts:` list.
+fn set_account_fields(
+    doc: &mut Value,
+    name: &str,
+    standalone: &[(&str, Value)],
+    listed: &[(&str, Value)],
+) -> Result<(), String> {
+    let agents = doc
+        .get_mut("agents")
+        .and_then(Value::as_array_mut)
+        .ok_or("Missing agents configuration")?;
+    let mut found = false;
+    for a in agents
+        .iter_mut()
+        .filter(|a| a.get("name").and_then(Value::as_str) == Some(name))
+    {
+        for (key, value) in standalone {
+            a[*key] = value.clone();
+        }
+        found = true;
+    }
+    if let Some((base, account)) = name.split_once('@') {
+        for list in agents
+            .iter_mut()
+            .filter(|a| a.get("name").and_then(Value::as_str) == Some(base))
+            .filter_map(|a| a.get_mut("accounts").and_then(Value::as_array_mut))
+        {
+            for a in list
+                .iter_mut()
+                .filter(|a| a.get("name").and_then(Value::as_str) == Some(account))
+            {
+                for (key, value) in listed {
+                    a[*key] = value.clone();
+                }
+                found = true;
+            }
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(format!("{name} is not in the router configuration"))
+    }
+}
+
+/// Move `name` to `position` (0 = drained first) and renumber its whole
+/// provider group 1..=N, so every account gets an explicit, distinct priority.
+async fn set_priority(shared: &Arc<Shared>, name: &str, position: usize) -> Result<(), String> {
+    let mut order = account_group(shared, name);
+    order.retain(|n| n != name);
+    order.insert(position.min(order.len()), name.to_string());
+    let cfg = write_config(shared, |doc| {
+        for (index, account) in order.iter().enumerate() {
+            let p = serde_json::json!(index + 1);
+            set_account_fields(
+                doc,
+                account,
+                &[("account_priority", p.clone())],
+                &[("priority", p)],
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
+    *shared.account_config.lock().unwrap() = cfg;
+    Ok(())
+}
+
+/// Set one reserve window, keeping the account's other window as it is.
+async fn set_reserve(
+    shared: &Arc<Shared>,
+    name: &str,
+    window: ReserveWindow,
+    percent: u32,
+) -> Result<(), String> {
+    let mut reserve = shared
+        .agent_configs()
+        .into_iter()
+        .find(|a| a.name == name)
+        .ok_or("Account no longer exists")?
+        .reserve_capacity;
+    match window {
+        ReserveWindow::Weekly => reserve.weekly = f64::from(percent),
+        ReserveWindow::Session => reserve.session = f64::from(percent),
+    }
+    let value = serde_json::json!(reserve);
+    let cfg = write_config(shared, |doc| {
+        set_account_fields(
+            doc,
+            name,
+            &[("reserve_capacity", value.clone())],
+            &[("reserve_capacity", value)],
+        )
+    })
+    .await?;
+    *shared.account_config.lock().unwrap() = cfg;
+    // Re-read usage now, so the new cordon threshold applies before the next poll.
+    crate::usage::refresh_after_turn(shared, name);
+    Ok(())
 }
 
 async fn delete_account(shared: &Arc<Shared>, name: &str) -> Result<String, AcpError> {
@@ -1418,6 +1714,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn commands_ignore_goose_turn_context_in_any_block() {
+        let ctx = "<turn-context>\n<t>2026</t>\n</turn-context>";
+        let blocks = |parts: &[&str]| -> Vec<ContentBlock> {
+            parts
+                .iter()
+                .map(|p| ContentBlock::from(p.to_string()))
+                .collect()
+        };
+        assert_eq!(text(&blocks(&["/usage"])).as_deref(), Some("/usage"));
+        assert_eq!(text(&blocks(&["/usage", ctx])).as_deref(), Some("/usage"));
+        assert_eq!(text(&blocks(&[ctx, "/login"])).as_deref(), Some("/login"));
+        assert_eq!(
+            text(&blocks(&[&format!("{ctx}\n\n/login code abc")])).as_deref(),
+            Some("/login code abc")
+        );
+        assert_eq!(text(&blocks(&[&format!("2\n{ctx}")])).as_deref(), Some("2"));
+        assert_eq!(
+            text(&blocks(&["/usage", "and explain it"])).as_deref(),
+            Some("/usage\nand explain it")
+        );
+    }
+
+    #[test]
     fn browser_output_waits_for_complete_urls_and_device_codes() {
         assert!(browser_message("https://example.test/de", "claude").is_none());
         assert_eq!(
@@ -1453,6 +1772,70 @@ mod tests {
             ["help", "login", "usage"]
         );
         assert_eq!(commands[1]["description"], "Manage provider accounts");
+    }
+
+    #[tokio::test]
+    async fn set_priority_moves_an_added_account_first_and_saves_it() {
+        // The shape `/login` → Add Account leaves: the original standalone
+        // agent plus a standalone `claude@<id>` copy.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.yaml");
+        let agent = |name: &str, priority: u32| {
+            format!(
+                "  - name: {name}\n    account_priority: {priority}\n    command: {{type: stdio, command: mock, env: [{{name: CLAUDE_CONFIG_DIR, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: opus, cost_rank: 3}}]\n",
+                dir.path().join(name).display()
+            )
+        };
+        let yaml = format!(
+            "state_file: {}\nagents:\n{}{}",
+            dir.path().join("state.db").display(),
+            agent("claude", 0),
+            agent("claude@added", 1),
+        );
+        std::fs::write(&path, &yaml).unwrap();
+        let shared = Shared::new(Config::from_file(&path).unwrap()).unwrap();
+        assert_eq!(account_group(&shared, "claude"), ["claude", "claude@added"]);
+        set_priority(&shared, "claude@added", 0).await.unwrap();
+        assert_eq!(account_group(&shared, "claude"), ["claude@added", "claude"]);
+        let saved = Config::from_file(&path).unwrap();
+        let priority = |name: &str| {
+            saved
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap()
+                .account_priority
+        };
+        assert_eq!(priority("claude@added"), Some(1));
+        assert_eq!(priority("claude"), Some(2));
+    }
+
+    #[test]
+    fn reserve_edit_targets_standalone_and_listed_accounts() {
+        let mut doc: Value = serde_yaml::from_str(
+            "agents:\n  - name: claude\n  - name: claude@added\n  - name: codex\n    accounts: [{name: work}, {name: home}]\n",
+        )
+        .unwrap();
+        let reserve = serde_json::json!({"weekly": 10.0, "session": 20.0});
+        set_account_fields(
+            &mut doc,
+            "claude@added",
+            &[("reserve_capacity", reserve.clone())],
+            &[("reserve_capacity", reserve.clone())],
+        )
+        .unwrap();
+        set_account_fields(
+            &mut doc,
+            "codex@home",
+            &[("account_priority", serde_json::json!(0))],
+            &[("priority", serde_json::json!(0))],
+        )
+        .unwrap();
+        assert_eq!(doc["agents"][1]["reserve_capacity"], reserve);
+        assert!(doc["agents"][0].get("reserve_capacity").is_none());
+        assert_eq!(doc["agents"][2]["accounts"][1]["priority"], 0);
+        assert!(doc["agents"][2].get("account_priority").is_none());
+        assert!(set_account_fields(&mut doc, "codex@gone", &[], &[]).is_err());
     }
 
     #[tokio::test]

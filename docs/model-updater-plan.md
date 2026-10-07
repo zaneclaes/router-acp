@@ -23,7 +23,7 @@ Repo checkout on this workstation: `/opt/dev/router-acp` (`origin` = `https://gi
 | Path | Role |
 |------|------|
 | `data/scores.yaml` | Built-in quality table. Embedded at compile time via `include_str!` in `src/candidate.rs`. First-match glob on `"agent/model"`. Overrideable wholesale with config key `score_table:`. |
-| `examples/router-preferred.yaml` | Canonical full multi-agent deployment example (claude / codex / grok / kimi). Live-ish model lists, `cost_rank`, `pricing`, orchestration planner/reviewer globs, skill_routing. |
+| `examples/router-preferred.yaml` | Canonical full multi-agent deployment example (claude / codex / grok / kimi). Live-ish model lists, `cost_rank`, `pricing`, planner globs, skill_routing. |
 | `examples/router-full.yaml` | Alternate smaller ladder — not the source of truth for production ranks. |
 | `src/config.rs` | `ModelConfig { id, display_name?, api_model?, cost_rank, pricing? }`, `AgentConfig.models`, `deny_unknown_fields` everywhere. |
 | `src/candidate.rs` | Score table parse/lookup; `TaskClass::ALL`; golden data-layer tests. |
@@ -57,7 +57,7 @@ Encoded by scores + ranks + `auto` defaults in preferred config (`cost_quality_t
 | Moderate Research / Architecture | `claude/opus[1m]` |
 | Hard Architecture (gated pool) | `claude/opus[1m]` over fable (cost wins despite slightly lower quality) |
 | Hard/long work | never `*mini*` / `*luna*` |
-| Cross-lineage / planner pins | globs prefer `*fable*`, `*sol*`, `*grok-4.5*` outside pure `auto` |
+| Planner pins | globs prefer `*fable*`, `*sol*`, `*grok-4.5*` outside pure `auto` |
 
 **Design note (must document in ticket implementation):** the narrow fable−opus quality gap (~0.02) + `min_cost_weight` means **fable currently does not win pure `auto` goldens**; fable wins via pin / planner / strongest-model paths. Updater must preserve that unless policy is deliberately changed (comment rewrite required).
 
@@ -210,7 +210,7 @@ Rules:
 2. Compute blended price prior: `input + k·output` with `k` from local output/input ratio (~3) or default 3.
 3. Dense-rank into **global ladder 1..5** (do not extend to 6 — rescales `auto` pool norms).
 4. Apply **documented scarcity overrides** (YAML sidecar or table in script):
-   - Example: `grok-4.5` may remain rank 5 despite cheap API (seat scarcity / cross-lineage reviewer value).
+   - Example: `grok-4.5` may remain rank 5 despite cheap API (seat scarcity).
 5. Keep ranks **per-family ladder** only if global dense-rank would break preferred ordering goldens; report either way.
 
 #### B3. Goose session for judgment
@@ -240,7 +240,7 @@ Recipe constraints:
 Update (with `--apply`):
 
 1. `data/scores.yaml` — patterns, qualities, context windows, comments/provenance.
-2. `examples/router-preferred.yaml` — model ids, display_name, api_model, cost_rank, pricing; orchestration/skill_routing globs only if ids renamed.
+2. `examples/router-preferred.yaml` — model ids, display_name, api_model, cost_rank, pricing; planner/skill_routing globs only if ids renamed.
 3. `examples/router-full.yaml` — keep in sync for shared agents or document intentional lag.
 4. Docs snippets in `GOOSE.md` model tables if they list concrete ids.
 5. **Do not** rewrite `src/**` unless schema change is required (new score field, etc.) — schema changes are a separate PR.

@@ -162,7 +162,7 @@ cheaper model must not carry a higher rank than a pricier one (blended price =
 `input + 3·output`). Every real exception is documented in
 `cost.rank_exceptions` with its reason, and an undocumented inversion is an
 error. Today there are three exceptions — Terra held above 5.5, Grok pinned at 5
-for cross-lineage review, Kimi floored at 2 — and each one names why.
+as a scarce seat, Kimi floored at 2 — and each one names why.
 
 ## Phase 3 — validation
 

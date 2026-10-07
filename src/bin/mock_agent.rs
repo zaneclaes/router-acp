@@ -48,6 +48,11 @@
 //!   killed)
 //! - `DELEGATE_HINT:<agent/model>` — attach `hints.candidate` to every
 //!   `DELEGATE:` call in the same prompt (exercises the hint resolution path).
+//! - `DELEGATE_EFFORT:<level>` — attach `hints.effort` to every `DELEGATE:`
+//!   call in the same prompt.
+//! - `MCP_CALL:<server> <tool> <json args>` — call any tool on the named MCP
+//!   server from `session/new` (in order, before other directives) and echo
+//!   `mcp:<tool>:<text>`; works for `router-delegate` and `router-worker`.
 //! - `DELEGATE:<task>` — call the `delegate_task` tool on the MCP server
 //!   named `router-delegate` passed in session/new (may repeat; all
 //!   delegations run concurrently)
@@ -436,9 +441,9 @@ async fn run_prompt(
             let _ = cx.send_notification(chunk(&session_id, body));
             return responder.respond(PromptResponse::new(StopReason::EndTurn));
         }
-        // Default fail-open-friendly reply when tests forget the env: no
-        // orchestration, no dimensions.
-        let default = r#"{"orchestrate":{"warranted":false,"confidence":0.95,"estimated_parts":1,"reason":"mock default"}}"#;
+        // Default reply when tests forget the env: a minimal routing-only
+        // classification, no dimensions.
+        let default = r#"{"routing":{"task_class":"CodingGeneral","complexity":0.2,"confidence":0.9,"reason":"mock default"}}"#;
         let _ = cx.send_notification(chunk(&session_id, default.to_string()));
         return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }
@@ -662,6 +667,52 @@ async fn run_prompt(
         }
     }
 
+    // MCP_CALL:<server> <tool> <json args> — one call each, in order.
+    for spec in text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("MCP_CALL:"))
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    {
+        let mut parts = spec.splitn(3, ' ');
+        let (Some(server_name), Some(tool)) = (parts.next(), parts.next()) else {
+            reply.push(format!("mcp-error:bad MCP_CALL `{spec}`"));
+            continue;
+        };
+        let arguments: Value = parts
+            .next()
+            .and_then(|a| serde_json::from_str(a).ok())
+            .unwrap_or_else(|| json!({}));
+        let Some(server) = mcp_servers
+            .iter()
+            .find(|s| matches!(s, McpServer::Stdio(stdio) if stdio.name == server_name))
+        else {
+            reply.push(format!("mcp-error:no {server_name} MCP server"));
+            continue;
+        };
+        let result = match McpClient::spawn(server).await {
+            Ok(mut client) => {
+                let result = client
+                    .request("tools/call", json!({"name": tool, "arguments": arguments}))
+                    .await;
+                client.shutdown().await;
+                result
+            }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(value) => {
+                let text = value["content"][0]["text"].as_str().unwrap_or("");
+                let is_error = value["isError"].as_bool().unwrap_or(false);
+                reply.push(format!(
+                    "mcp{}:{tool}:{text}",
+                    if is_error { "-error" } else { "" }
+                ));
+            }
+            Err(err) => reply.push(format!("mcp-error:{tool}:{err}")),
+        }
+    }
+
     // Run all DELEGATE directives concurrently, one MCP client each; the
     // router caps concurrency on its side.
     let delegate_tasks: Vec<&str> = text
@@ -671,6 +722,10 @@ async fn run_prompt(
     let delegate_hint: Option<String> = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("DELEGATE_HINT:"))
+        .map(|c| c.trim().to_string());
+    let delegate_effort: Option<String> = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("DELEGATE_EFFORT:"))
         .map(|c| c.trim().to_string());
     if !delegate_tasks.is_empty() {
         let delegate_server = mcp_servers
@@ -684,11 +739,15 @@ async fn run_prompt(
                         let server = server.clone();
                         let task = task.to_string();
                         let hint = delegate_hint.clone();
+                        let effort = delegate_effort.clone();
                         async move {
                             let mut client = McpClient::spawn(&server).await?;
                             let mut arguments = json!({"task": task});
                             if let Some(candidate) = hint {
                                 arguments["hints"] = json!({"candidate": candidate});
+                            }
+                            if let Some(effort) = effort {
+                                arguments["hints"]["effort"] = json!(effort);
                             }
                             let result = client
                                 .request(

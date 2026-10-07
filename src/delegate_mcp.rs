@@ -23,9 +23,11 @@ use agent_client_protocol::{
     ByteStreams, Responder, UntypedRole, on_receive_notification, on_receive_request,
 };
 
+use crate::candidate::EffortLevel;
 use crate::candidate::{CandidateId, RequiredCaps, TaskClass};
 use crate::classifier::{ClassifyInput, classify_heuristic};
-use crate::config::StrategyKind;
+use crate::config::{CandidateHintMode, StrategyKind};
+use crate::delegate_hook::DelegateEvent;
 use crate::session::{
     DelegateHandle, DownstreamRoute, Shared, close_downstream_session, open_downstream_session,
     resolve_mode_id,
@@ -38,6 +40,11 @@ pub const DELEGATE_FOLLOWUP_TOOL_NAME: &str = "delegate_followup";
 pub const DELEGATE_CLOSE_TOOL_NAME: &str = "delegate_close";
 pub const DELEGATE_AWAIT_TOOL_NAME: &str = "delegate_await";
 pub const BACKGROUND_START_TOOL_NAME: &str = "background_start";
+pub const DELEGATE_RESULT_TOOL_NAME: &str = "delegate_result";
+/// MCP server given to host-directed delegates (a lifecycle hook is set).
+pub const WORKER_SERVER_NAME: &str = "router-worker";
+pub const WORKER_WHOAMI_TOOL_NAME: &str = "worker_whoami";
+pub const WORKER_HANDOFF_TOOL_NAME: &str = "worker_handoff";
 
 /// Per-session binding for the stdio helper handshake.
 ///
@@ -53,6 +60,8 @@ pub const BACKGROUND_START_TOOL_NAME: &str = "background_start";
 pub struct DelegateBinding {
     pub router_sid: String,
     pub delegation_enabled: bool,
+    /// Set for a `router-worker` connection: the delegate it serves.
+    pub worker: Option<WorkerBinding>,
 }
 
 const TOOL_DESCRIPTION: &str = "Delegate a small, self-contained subtask to a lower-cost agent \
@@ -178,7 +187,7 @@ pub struct DelegateTaskArgs {
     /// endpoints, credentials, or catalog identities.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
-    /// Keep the sub-session open after this turn so the orchestrator can send
+    /// Keep the sub-session open after this turn so the parent can send
     /// follow-up instructions to the same sub-agent (context preserved) via
     /// `delegate_followup`. Returns a `delegate_id` to reference it.
     #[serde(default)]
@@ -191,6 +200,10 @@ pub struct DelegateTaskArgs {
     /// `delegate_id`).
     #[serde(default)]
     pub background: bool,
+    /// Router-assigned worker id: the `b-…` job id of a background delegate.
+    /// Not part of the tool input; foreground delegates get a fresh `w-…` id.
+    #[serde(skip)]
+    pub worker_id: Option<String>,
 }
 
 /// `delegate_await` tool input.
@@ -210,6 +223,24 @@ pub struct DelegateAwaitArgs {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DelegateFollowupArgs {
     pub delegate_id: String,
+    pub message: String,
+    /// Return a `b-…` id immediately and run the follow-up turn concurrently;
+    /// collect it with `delegate_await`.
+    #[serde(default)]
+    pub background: bool,
+}
+
+/// `delegate_result` tool input.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DelegateResultArgs {
+    pub delegate_id: String,
+}
+
+/// `worker_handoff` tool input.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkerHandoffArgs {
+    pub kind: String,
+    #[serde(default)]
     pub message: String,
 }
 
@@ -240,6 +271,10 @@ pub struct DelegateHints {
     pub min_quality: Option<f64>,
     #[serde(default)]
     pub candidate: Option<String>,
+    /// Reasoning effort for this delegate (`low` … `max`), applied by the LLM
+    /// proxy in place of the parent session's effort.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn tool_definition() -> Value {
@@ -266,6 +301,12 @@ fn tool_definition() -> Value {
                         "candidate": {
                             "type": "string",
                             "description": "Preferred agent/model candidate id."
+                        },
+                        "effort": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "xhigh", "max"],
+                            "description": "Reasoning effort for this sub-agent (applied by the \
+                                 router's LLM proxy; otherwise it inherits this session's effort)."
                         }
                     }
                 },
@@ -328,11 +369,73 @@ fn followup_tool_definition() -> Value {
                 "message": {
                     "type": "string",
                     "description": "The follow-up instruction for the sub-agent."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Return a b-… id immediately and run the follow-up turn \
+                         concurrently; collect it with delegate_await. Use it to answer one \
+                         long-running sub-agent while supervising others."
                 }
             },
             "required": ["delegate_id", "message"]
         }
     })
+}
+
+fn result_tool_definition() -> Value {
+    json!({
+        "name": DELEGATE_RESULT_TOOL_NAME,
+        "description": "Re-read a sub-agent's latest output and status by its b-… job id, \
+             w-… worker id or d-… delegate id — including results delegate_await already \
+             returned, e.g. after this conversation was compacted or resumed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delegate_id": {
+                    "type": "string",
+                    "description": "A b-…, w-… or d-… id from an earlier delegate_task."
+                }
+            },
+            "required": ["delegate_id"]
+        }
+    })
+}
+
+/// Tools of the `router-worker` server a host-directed delegate receives.
+fn worker_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": WORKER_WHOAMI_TOOL_NAME,
+            "description": "Your worker id, model and parent session, as your host registered \
+                 them. Use the worker id wherever your instructions ask for your own id.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": WORKER_HANDOFF_TOOL_NAME,
+            "description": "Record how you are handing this turn back to your parent, then end \
+                 the turn. Your host checks the handoff when the turn ends and may send you \
+                 back with what is still missing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": crate::delegate_hook::HANDOFF_KINDS,
+                        "description": "commit_paths_ready, waiting, lease_requested, \
+                             ownership_requested, staging_gate_request, round_verified, \
+                             round_failed or reassignment_required."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The evidence, request or wait your parent needs: paths \
+                             and SHAs, the lease or gate you need, or what you are waiting on \
+                             and when you will check it next."
+                    }
+                },
+                "required": ["kind", "message"]
+            }
+        }),
+    ]
 }
 
 fn close_tool_definition() -> Value {
@@ -361,6 +464,7 @@ fn listed_tools(delegation_enabled: bool, terminal_enabled: bool) -> Vec<Value> 
             await_tool_definition(),
             followup_tool_definition(),
             close_tool_definition(),
+            result_tool_definition(),
         ]);
     }
     if terminal_enabled {
@@ -404,12 +508,8 @@ fn background_start_tool_definition() -> Value {
 // Injection decision
 // ----------------------------------------------------------------------
 
-/// Whether the candidate can use router delegation for this session.
-pub fn delegation_available(
-    shared: &Arc<Shared>,
-    router_sid: &str,
-    candidate: &CandidateId,
-) -> bool {
+/// Whether a session pinned to `candidate` can use router delegation.
+pub fn delegation_available(shared: &Arc<Shared>, candidate: &CandidateId) -> bool {
     if !shared.cfg.delegation.enabled {
         return false;
     }
@@ -424,10 +524,9 @@ pub fn delegation_available(
     else {
         return false;
     };
-    // Ordinary sessions only get the tool when a strictly-cheaper candidate
-    // exists (delegation sheds cost). Orchestrating sessions get it whenever
-    // there is any other candidate, so the planner can delegate to same-/higher-
-    // tier peers (e.g. a cross-lineage reviewer).
+    // Sessions get the tool when a strictly-cheaper candidate exists
+    // (delegation sheds cost), or with `candidate_hints: exact`, where the
+    // parent can name any other model.
     //
     // Only auto-eligible candidates count as delegation targets — the
     // delegate pool is built from `eligible_views`, so an explicit-only
@@ -439,10 +538,8 @@ pub fn delegation_available(
     if delegatable.is_empty() {
         return false;
     }
-    let orchestrating = shared
-        .with_session(router_sid, |s| s.orchestrating)
-        .unwrap_or(false);
-    orchestrating || delegatable.iter().any(|c| c.cost_rank < parent_cost)
+    let exact_hints = shared.cfg.delegation.candidate_hints == CandidateHintMode::Exact;
+    exact_hints || delegatable.iter().any(|c| c.cost_rank < parent_cost)
 }
 
 /// Build the router-owned MCP server entry for a pinned session. The server is
@@ -453,9 +550,7 @@ pub fn delegate_server_entry(
     router_sid: &str,
     candidate: &CandidateId,
 ) -> Option<McpServer> {
-    if !delegation_available(shared, router_sid, candidate)
-        && !shared.upstream_client_capabilities().terminal
-    {
+    if !delegation_available(shared, candidate) && !shared.upstream_client_capabilities().terminal {
         return None;
     }
     let socket = shared.delegate_socket.get()?.clone();
@@ -464,12 +559,13 @@ pub fn delegate_server_entry(
     // Freeze the decision against the candidate being pinned, not against
     // `session.pin` — that pin is committed only *after* `session/new`
     // returns, and tools/list runs inside that call.
-    let delegation_enabled = delegation_available(shared, router_sid, candidate);
+    let delegation_enabled = delegation_available(shared, candidate);
     shared.delegate_tokens.lock().unwrap().insert(
         token.clone(),
         DelegateBinding {
             router_sid: router_sid.to_string(),
             delegation_enabled,
+            worker: None,
         },
     );
     shared.with_session(router_sid, |s| s.delegate_token = Some(token.clone()));
@@ -575,12 +671,16 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
         .ok_or("unknown delegate token")?;
     let router_sid = binding.router_sid;
     let delegation_enabled = binding.delegation_enabled;
+    // A `router-worker` connection serves only the worker's own tools.
+    let worker = binding.worker;
+    let worker_connection = worker.is_some();
     tracing::debug!(session = router_sid, "delegate MCP helper connected");
 
     let transport = ByteStreams::new(write_half.compat_write(), reader.compat());
 
     let call_shared = shared.clone();
     let call_sid = router_sid.clone();
+    let call_worker = worker.clone();
     let terminal_enabled = shared.upstream_client_capabilities().terminal;
     UntypedRole
         .builder()
@@ -613,7 +713,11 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                   responder: Responder<McpToolsListResult>,
                   _cx| async move {
                 responder.respond(McpToolsListResult {
-                    tools: listed_tools(delegation_enabled, terminal_enabled),
+                    tools: if worker_connection {
+                        worker_tools()
+                    } else {
+                        listed_tools(delegation_enabled, terminal_enabled)
+                    },
                 })
             },
             on_receive_request!(),
@@ -624,10 +728,39 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                   cx: agent_client_protocol::ConnectionTo<UntypedRole>| {
                 let shared = call_shared.clone();
                 let router_sid = call_sid.clone();
+                let worker = call_worker.clone();
                 async move {
+                    // A worker's connection serves only its own tools.
+                    if let Some(worker) = &worker {
+                        return responder.respond(match req.name.as_str() {
+                            WORKER_WHOAMI_TOOL_NAME => text_result(worker_whoami(worker), false),
+                            WORKER_HANDOFF_TOOL_NAME => {
+                                match serde_json::from_value::<WorkerHandoffArgs>(req.arguments) {
+                                    Ok(args) => match run_worker_handoff(&shared, worker, args) {
+                                        Ok(text) => text_result(text, false),
+                                        Err(msg) => text_result(msg, true),
+                                    },
+                                    Err(err) => text_result(
+                                        format!("invalid worker_handoff arguments: {err}"),
+                                        true,
+                                    ),
+                                }
+                            }
+                            other => text_result(format!("unknown tool `{other}`"), true),
+                        });
+                    }
                     // Tool calls can take minutes; run them off the MCP
                     // dispatch loop so pings keep working.
                     match req.name.as_str() {
+                        DELEGATE_RESULT_TOOL_NAME => {
+                            let result = serde_json::from_value::<DelegateResultArgs>(req.arguments)
+                                .map_err(|err| format!("invalid delegate_result arguments: {err}"))
+                                .and_then(|args| run_delegate_result(&shared, &router_sid, args));
+                            responder.respond(match result {
+                                Ok(text) => text_result(text, false),
+                                Err(msg) => text_result(msg, true),
+                            })
+                        }
                         DELEGATE_TOOL_NAME => {
                             let args: DelegateTaskArgs = match serde_json::from_value(req.arguments) {
                                 Ok(args) => args,
@@ -689,6 +822,13 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                                         ));
                                     }
                                 };
+                            if args.background {
+                                let result = start_background_followup(&shared, &router_sid, args);
+                                return responder.respond(match result {
+                                    Ok(text) => text_result(text, false),
+                                    Err(msg) => text_result(msg, true),
+                                });
+                            }
                             cx.spawn(async move {
                                 let result =
                                     run_delegate_followup(&shared, &router_sid, args).await;
@@ -793,7 +933,7 @@ async fn run_background_start(
 }
 
 // ----------------------------------------------------------------------
-// Delegate orchestration
+// Delegate execution
 // ----------------------------------------------------------------------
 
 /// Start a `background: true` delegate job: register it, spawn
@@ -803,13 +943,48 @@ async fn run_background_start(
 fn start_background_delegate(
     shared: &Arc<Shared>,
     router_sid: &str,
-    args: DelegateTaskArgs,
+    mut args: DelegateTaskArgs,
+) -> Result<String, String> {
+    let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    args.worker_id = Some(job_id.clone());
+    let summary = args.task.clone();
+    let task_shared = shared.clone();
+    let task_sid = router_sid.to_string();
+    start_background_job(shared, router_sid, job_id, &summary, async move {
+        run_delegate_task(&task_shared, &task_sid, args).await
+    })
+}
+
+/// `delegate_followup` with `background: true`: the follow-up turn runs as a
+/// background job collected by `delegate_await`.
+fn start_background_followup(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: DelegateFollowupArgs,
+) -> Result<String, String> {
+    let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let summary = format!("follow-up to {}: {}", args.delegate_id, args.message);
+    let task_shared = shared.clone();
+    let task_sid = router_sid.to_string();
+    start_background_job(shared, router_sid, job_id, &summary, async move {
+        run_delegate_followup(&task_shared, &task_sid, args).await
+    })
+}
+
+/// Register a background job, run `job` on its own tokio task, and return
+/// its `b-…` id immediately. The semaphores inside the job still bound how
+/// many jobs execute at once.
+fn start_background_job(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    job_id: String,
+    summary: &str,
+    job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
 ) -> Result<String, String> {
     if shared.with_session(router_sid, |_| ()).is_none() {
         return Err("parent session no longer exists".to_string());
     }
-    let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let mut summary = args.task.replace('\n', " ");
+    let mut summary = summary.replace('\n', " ");
     if summary.len() > 60 {
         summary.truncate(57);
         summary.push_str("...");
@@ -824,10 +999,9 @@ fn start_background_delegate(
         },
     );
     let task_shared = shared.clone();
-    let task_sid = router_sid.to_string();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
-        let result = run_delegate_task(&task_shared, &task_sid, args).await;
+        let result = job.await;
         // The parent may have closed while we ran (its jobs are dropped from
         // the registry) — only record a result somebody can still collect.
         let mut jobs = task_shared.background_delegates.lock().unwrap();
@@ -948,40 +1122,60 @@ fn render_await(
     out.trim_end().to_string()
 }
 
-/// Scope a delegate candidate pool by cost. Ordinary delegation is strictly
-/// cheaper-than-parent (cost shedding; an empty result is the caller's
-/// "do the subtask yourself" error). An orchestrating session's HINT-LESS
-/// (worker) delegations are also cheaper-only — the planner already runs on
-/// a frontier model, and same-tier fan-out buys parallelism at zero cost
-/// savings — falling back to the full pool only when the parent is already
-/// the cheapest tier (never break the pipeline). An explicit
-/// `hints.candidate` keeps the full pool: that is how the planner addresses
-/// its same-/higher-tier cross-lineage reviewer.
+/// `delegation.candidate_hints: exact`: the pool is exactly the named
+/// candidate, or the call fails with the reason it cannot run there.
+fn exact_hint_pool(
+    eligible: Vec<CandidateView>,
+    raw: &str,
+    hinted: Option<&CandidateId>,
+) -> Result<Vec<CandidateView>, String> {
+    let Some(hinted) = hinted else {
+        return Err(format!(
+            "hints.candidate `{raw}` is not an agent/model candidate id"
+        ));
+    };
+    let pool: Vec<CandidateView> = eligible.into_iter().filter(|v| &v.id == hinted).collect();
+    if pool.is_empty() {
+        return Err(format!(
+            "hinted delegate candidate `{hinted}` is not available (unknown, not offered by its \
+             adapter, signed out, cordoned or quarantined); not substituting another model"
+        ));
+    }
+    Ok(pool)
+}
+
+/// Parse `hints.effort`; `auto` (or no hint) inherits the parent's effort.
+fn parse_effort_hint(raw: Option<&str>) -> Result<Option<EffortLevel>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(text) => match EffortLevel::parse(text) {
+            Some(EffortLevel::Auto) => Ok(None),
+            Some(level) => Ok(Some(level)),
+            None => Err(format!(
+                "hints.effort `{text}` is not one of low, medium, high, xhigh, max"
+            )),
+        },
+    }
+}
+
+/// Scope a delegate candidate pool by cost: strictly cheaper than the parent
+/// (cost shedding; an empty result is the caller's "do the subtask yourself"
+/// error), same agent first. Reaching a same- or higher-tier model, or
+/// another agent, takes `delegation.candidate_hints: exact`.
 fn scope_delegate_pool(
     pool: Vec<CandidateView>,
     parent_cost: u32,
     parent_agent: &str,
-    orchestrating: bool,
-    hinted: bool,
 ) -> Vec<CandidateView> {
-    if orchestrating && hinted {
-        return pool;
-    }
     let cheaper: Vec<CandidateView> = pool
         .iter()
         .filter(|v| v.cost_rank < parent_cost)
         .cloned()
         .collect();
-    let cheaper = if orchestrating && cheaper.is_empty() {
-        pool
-    } else {
-        cheaper
-    };
     // A main-session model switch changes the natural worker family too:
     // Sol delegates to cheaper Codex siblings (Terra/Luna/etc.), not a stale
-    // Claude candidate. Cross-lineage review remains available through an
-    // explicit orchestration hint. Fall back globally only for agents such as
-    // Grok that have no cheaper sibling at all.
+    // Claude candidate. Fall back globally only for agents such as Grok that
+    // have no cheaper sibling at all.
     let same_agent: Vec<CandidateView> = cheaper
         .iter()
         .filter(|view| view.id.agent == parent_agent)
@@ -1083,29 +1277,41 @@ pub async fn run_delegate_task(
         .min(shared.cfg.delegation.complexity_cap.clamp(0.0, 1.0));
 
     // Scope the pool by cost (see `scope_delegate_pool`).
-    let orchestrating = shared
-        .with_session(router_sid, |s| s.orchestrating)
-        .unwrap_or(false);
     // The hint is a STATED reference (a parent model names a candidate by the
     // id it knows), so resolve it through the version-pin map — otherwise a
     // hint naming the stable default id matches nothing in the pool and is
     // silently dropped.
     let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
-    let mut pool = scope_delegate_pool(
-        shared.eligible_views(&RequiredCaps::default(), profile.class),
-        parent_cost,
-        &pin.candidate.agent,
-        orchestrating,
-        hinted.is_some(),
-    );
+    let effort = parse_effort_hint(args.hints.effort.as_deref())?;
+    let exact = shared.cfg.delegation.candidate_hints == CandidateHintMode::Exact;
+    let mut pool = match (&args.hints.candidate, &hinted) {
+        // `exact`: the named model or an error — never a substitute, whatever
+        // its tier or agent relative to the parent.
+        (Some(raw), _) if exact => exact_hint_pool(
+            shared.eligible_views(&RequiredCaps::default(), profile.class),
+            raw,
+            hinted.as_ref(),
+        )?,
+        _ => scope_delegate_pool(
+            shared.eligible_views(&RequiredCaps::default(), profile.class),
+            parent_cost,
+            &pin.candidate.agent,
+        ),
+    };
     if let Some(min_quality) = args.hints.min_quality {
         pool.retain(|v| v.quality >= min_quality);
     }
-    if let Some(hinted) = hinted {
+    if let Some(hinted) = &hinted {
         // Honor the hint only when it survives the cost scoping.
-        if pool.iter().any(|v| v.id == hinted) {
-            pool.retain(|v| v.id == hinted);
+        if pool.iter().any(|v| &v.id == hinted) {
+            pool.retain(|v| &v.id == hinted);
         }
+    }
+    if pool.is_empty() && exact && hinted.is_some() {
+        return Err(format!(
+            "hinted delegate candidate `{}` is below hints.min_quality",
+            args.hints.candidate.as_deref().unwrap_or_default()
+        ));
     }
     if pool.is_empty() {
         return Err(
@@ -1151,17 +1357,62 @@ pub async fn run_delegate_task(
         sub_mcp.extend(servers.iter().cloned());
     }
     let capture = Arc::new(Mutex::new(String::new()));
+    // One worker id per delegation, whichever candidate ends up running it:
+    // the background job id when there is one, so the parent and the host
+    // name the worker the same way.
+    let worker_id = args
+        .worker_id
+        .clone()
+        .unwrap_or_else(|| format!("w-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    let lifecycle_hook = shared.cfg.delegation.lifecycle_hook.clone();
 
     let mut last_err = None;
-    for rc in ranked {
+    let ranked_len = ranked.len();
+    for (index, rc) in ranked.into_iter().enumerate() {
         let candidate = rc.candidate.clone();
+        // `agents[].max_delegates`: skip a full agent while another ranked
+        // candidate remains, otherwise wait for its next free slot. The permit
+        // is held for as long as this turn runs.
+        let _agent_slot = match shared.agent_delegate_slots.get(&candidate.agent) {
+            None => None,
+            Some(slots) => match slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) if index + 1 < ranked_len => {
+                    last_err = Some(format!("{candidate}: every delegate slot is busy"));
+                    continue;
+                }
+                Err(_) => Some(
+                    slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| "router shutting down".to_string())?,
+                ),
+            },
+        };
         let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
+        // Host-directed workers get the router's worker tools (identity and
+        // structured handoffs), bound to this worker id.
+        let mut session_mcp = sub_mcp.clone();
+        if lifecycle_hook.is_some()
+            && let Some(entry) = worker_server_entry(
+                shared,
+                router_sid,
+                WorkerBinding {
+                    worker_id: worker_id.clone(),
+                    candidate: candidate.to_string(),
+                    parent_downstream_sid: pin.downstream_sid.clone(),
+                },
+            )
+        {
+            session_mcp.push(entry);
+        }
         match open_downstream_session(
             shared,
             &candidate,
             cwd.clone(),
             dirs.clone(),
-            sub_mcp.clone(),
+            session_mcp,
             DownstreamRoute::Delegate {
                 parent_router_sid: router_sid.to_string(),
                 capture: capture.clone(),
@@ -1248,6 +1499,72 @@ pub async fn run_delegate_task(
                         }
                     }
                 }
+                let sub_sid = format!("{router_sid}::delegate-{}", opened.downstream_sid);
+                let mut task_summary = args.task.replace('\n', " ");
+                if task_summary.len() > 60 {
+                    task_summary.truncate(57);
+                    task_summary.push_str("...");
+                }
+                // A host that accounts for its workers registers this one
+                // before it runs; a refusal fails the delegation outright
+                // rather than trying another model.
+                let (router_pid, router_started_at_ms) = crate::delegate_hook::process_identity();
+                let lifecycle = lifecycle_hook.as_ref().map(|_| DelegateEvent {
+                    event: "delegate_start",
+                    worker_id: worker_id.clone(),
+                    parent_router_session_id: router_sid.to_string(),
+                    parent_downstream_session_id: pin.downstream_sid.clone(),
+                    parent_candidate: pin.candidate.to_string(),
+                    candidate: candidate.to_string(),
+                    lineage: crate::session::agent_lineage(
+                        &shared.runtime_config(),
+                        &candidate.agent,
+                    ),
+                    downstream_session_id: opened.downstream_sid.clone(),
+                    state_session_id: sub_sid.clone(),
+                    cwd: cwd.display().to_string(),
+                    effort: effort.map(|level| level.as_str().to_string()),
+                    background: args.background,
+                    keep_open: args.keep_open,
+                    task_summary: task_summary.clone(),
+                    router_pid,
+                    router_started_at_ms,
+                    turn: None,
+                    last_message: None,
+                    handoff: None,
+                    outcome: None,
+                    detail: None,
+                });
+                if let (Some(hook), Some(event)) = (&lifecycle_hook, &lifecycle)
+                    && let Err(err) = crate::delegate_hook::run(hook, event).await
+                {
+                    tracing::warn!(
+                        parent = router_sid,
+                        candidate = %candidate,
+                        worker = %event.worker_id,
+                        %err,
+                        "delegate start hook refused the delegate"
+                    );
+                    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                    drop_worker_tokens(shared, &worker_id);
+                    // A start that timed out may still have registered the
+                    // worker on the host's side; tell it the worker never ran.
+                    crate::delegate_hook::deliver(
+                        shared,
+                        &event.stopped("aborted", Some(err.clone())),
+                    );
+                    return Err(format!(
+                        "delegation.lifecycle_hook refused delegate {} on {candidate}: {err}",
+                        event.worker_id
+                    ));
+                }
+                if let Some(level) = effort {
+                    shared
+                        .delegate_effort
+                        .lock()
+                        .unwrap()
+                        .insert(sub_sid.clone(), level);
+                }
                 tracing::info!(
                     parent = router_sid,
                     candidate = %candidate,
@@ -1255,11 +1572,6 @@ pub async fn run_delegate_task(
                     "delegated subtask routed"
                 );
                 // Tell the user which model got the subtask and why.
-                let mut task_summary = args.task.replace('\n', " ");
-                if task_summary.len() > 60 {
-                    task_summary.truncate(57);
-                    task_summary.push_str("...");
-                }
                 crate::session::notify_user(
                     shared,
                     router_sid,
@@ -1279,7 +1591,6 @@ pub async fn run_delegate_task(
                 // Record the sub-agent as its own state-DB row, linked to the
                 // parent, so the delegation tree is observable. It shares the
                 // parent's run_label for grouping.
-                let sub_sid = format!("{router_sid}::delegate-{}", opened.downstream_sid);
                 let parent_label = shared
                     .with_session(router_sid, |s| s.run_label.clone())
                     .flatten();
@@ -1298,6 +1609,8 @@ pub async fn run_delegate_task(
                             "class": profile.class.as_str(),
                             "reason": rc.reason,
                             "parent": router_sid,
+                            "worker_id": worker_id,
+                            "background_id": args.worker_id,
                         })),
                         parent_session_id: Some(router_sid.to_string()),
                         kind: "delegate".to_string(),
@@ -1333,7 +1646,14 @@ pub async fn run_delegate_task(
                         .send_notification(CancelNotification::new(opened.downstream_sid.clone()));
                 }
 
-                let mut content: Vec<ContentBlock> = vec![ContentBlock::from(args.task.clone())];
+                let mut content: Vec<ContentBlock> = Vec::new();
+                if let Some(event) = &lifecycle {
+                    // The worker names itself with the id its host registered.
+                    content.push(ContentBlock::from(crate::delegate_hook::identity_line(
+                        event,
+                    )));
+                }
+                content.push(ContentBlock::from(args.task.clone()));
                 for file in &args.context_files {
                     let uri = if file.contains("://") {
                         file.clone()
@@ -1360,15 +1680,42 @@ pub async fn run_delegate_task(
                     None,
                 );
                 let result = opened.conn.send_request(prompt).block_task().await;
+                // The host may send the worker back to finish before the turn
+                // returns to the parent (`delegate_turn_end`).
+                let mut turns = 1;
+                let result = match result {
+                    Ok(resp) => {
+                        gate_turns(
+                            shared,
+                            &TurnGate {
+                                lifecycle: lifecycle.as_ref(),
+                                conn: &opened.conn,
+                                downstream_sid: &opened.downstream_sid,
+                                sub_sid: &sub_sid,
+                                worker_id: &worker_id,
+                                capture: &capture,
+                            },
+                            resp,
+                            &mut turns,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                };
                 shared
                     .state
                     .lock()
                     .unwrap()
                     .add_compute_ms(&sub_sid, turn_start.elapsed().as_millis() as u64);
+                let worker = lifecycle
+                    .as_ref()
+                    .map(|event| format!(", worker {}", event.worker_id))
+                    .unwrap_or_default();
 
-                // Tear down (remove the handle, close the session) — used on
-                // every path except a successful `keep_open` delegation.
-                let teardown = || {
+                // Tear down (remove the handle, close the session, report the
+                // stop) — used on every path except a successful `keep_open`
+                // delegation, whose stop is reported when it is closed.
+                let teardown = |outcome: &str, detail: Option<String>| {
                     shared.with_session(router_sid, |s| {
                         s.delegates.retain(|d| {
                             d.downstream_sid != handle.downstream_sid
@@ -1376,6 +1723,12 @@ pub async fn run_delegate_task(
                         });
                     });
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                    shared.delegate_effort.lock().unwrap().remove(&sub_sid);
+                    shared.worker_handoffs.lock().unwrap().remove(&worker_id);
+                    drop_worker_tokens(shared, &worker_id);
+                    if let Some(event) = &lifecycle {
+                        crate::delegate_hook::deliver(shared, &event.stopped(outcome, detail));
+                    }
                 };
 
                 return match result {
@@ -1423,25 +1776,28 @@ pub async fn run_delegate_task(
                                             candidate: candidate.clone(),
                                             capture: capture.clone(),
                                             sub_sid: sub_sid.clone(),
+                                            lifecycle: lifecycle.clone(),
+                                            worker_id: worker_id.clone(),
+                                            turns,
                                         },
                                     );
                                     Ok(format!(
-                                        "[delegated to {candidate}] [delegate_id: {delegate_id} — \
-                                         send more instructions to this same sub-agent with \
-                                         `delegate_followup`, then `delegate_close` when done]\n\
-                                         {text}"
+                                        "[delegated to {candidate}{worker}] [delegate_id: \
+                                         {delegate_id} — send more instructions to this same \
+                                         sub-agent with `delegate_followup`, then \
+                                         `delegate_close` when done]\n{text}"
                                     ))
                                 } else {
-                                    teardown();
-                                    Ok(format!("[delegated to {candidate}]\n{text}"))
+                                    teardown("completed", None);
+                                    Ok(format!("[delegated to {candidate}{worker}]\n{text}"))
                                 }
                             }
                             StopReason::Cancelled => {
-                                teardown();
+                                teardown("cancelled", None);
                                 Err(format!("delegated subtask on {candidate} was cancelled"))
                             }
                             other => {
-                                teardown();
+                                teardown("failed", Some(format!("stopped early ({other:?})")));
                                 Err(format!(
                                     "delegated subtask on {candidate} stopped early ({other:?}); \
                                      partial output:\n{text}"
@@ -1450,7 +1806,7 @@ pub async fn run_delegate_task(
                         }
                     }
                     Err(err) => {
-                        teardown();
+                        teardown("failed", Some(err.to_string()));
                         Err(format!("delegated prompt on {candidate} failed: {err}"))
                     }
                 };
@@ -1482,6 +1838,230 @@ pub async fn run_delegate_task(
     Err(last_err.unwrap_or_else(|| "no delegate candidate could open a session".to_string()))
 }
 
+/// What `gate_turns` needs to continue one delegate session.
+struct TurnGate<'a> {
+    lifecycle: Option<&'a DelegateEvent>,
+    conn: &'a agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    downstream_sid: &'a str,
+    sub_sid: &'a str,
+    worker_id: &'a str,
+    capture: &'a Arc<Mutex<String>>,
+}
+
+/// Ask the host whether a delegate turn may end (`delegate_turn_end`). While
+/// it answers `Continue`, send its message back to the same sub-session —
+/// at most `max_continuations` times — the way a provider's subagent-stop
+/// hook keeps a worker going. Without a lifecycle hook, or once the turn did
+/// not end normally, the response is returned unchanged.
+async fn gate_turns(
+    shared: &Arc<Shared>,
+    gate: &TurnGate<'_>,
+    mut resp: agent_client_protocol::schema::v1::PromptResponse,
+    turns: &mut u32,
+) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
+    let (Some(hook), Some(event)) = (&shared.cfg.delegation.lifecycle_hook, gate.lifecycle) else {
+        return Ok(resp);
+    };
+    let mut continued = 0;
+    loop {
+        if !matches!(
+            resp.stop_reason,
+            StopReason::EndTurn | StopReason::MaxTurnRequests
+        ) {
+            return Ok(resp);
+        }
+        let text = gate.capture.lock().unwrap().clone();
+        let handoff = shared
+            .worker_handoffs
+            .lock()
+            .unwrap()
+            .get(gate.worker_id)
+            .cloned();
+        let message =
+            match crate::delegate_hook::turn_end(hook, &event.turn_ended(*turns, &text, handoff))
+                .await
+            {
+                crate::delegate_hook::TurnVerdict::Release => return Ok(resp),
+                crate::delegate_hook::TurnVerdict::Continue(message) => message,
+            };
+        if continued >= hook.max_continuations {
+            gate.capture.lock().unwrap().push_str(&format!(
+                "\n\n[router-acp · the host still returned this turn after {continued} \
+                 continuations: {message}]"
+            ));
+            return Ok(resp);
+        }
+        continued += 1;
+        *turns += 1;
+        shared
+            .worker_handoffs
+            .lock()
+            .unwrap()
+            .remove(gate.worker_id);
+        gate.capture.lock().unwrap().push_str(&format!(
+            "\n\n[router-acp · the host returned the turn: {message}]\n\n"
+        ));
+        shared.state.lock().unwrap().log(
+            gate.sub_sid,
+            &crate::state::LogEntry {
+                kind: "delegate_continue".to_string(),
+                role: "user".to_string(),
+                summary: message.chars().take(200).collect(),
+                detail: Some(serde_json::json!({"message": message})),
+                tokens_input: crate::state::estimate_tokens(&message),
+                tokens_estimated: true,
+                ..Default::default()
+            },
+        );
+        let prompt = PromptRequest::new(
+            gate.downstream_sid.to_string(),
+            vec![ContentBlock::from(message)],
+        );
+        resp = gate.conn.send_request(prompt).block_task().await?;
+    }
+}
+
+/// The worker a router-worker MCP connection belongs to.
+#[derive(Debug, Clone)]
+pub struct WorkerBinding {
+    pub worker_id: String,
+    pub candidate: String,
+    pub parent_downstream_sid: String,
+}
+
+/// The `router-worker` MCP server for one host-directed delegate: its
+/// identity and structured-handoff tools, over the same socket as the parent's
+/// delegate tools but bound to the worker by its own token.
+fn worker_server_entry(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    worker: WorkerBinding,
+) -> Option<McpServer> {
+    let socket = shared.delegate_socket.get()?.clone();
+    let exe = std::env::var("ROUTER_ACP_HELPER_EXE")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::current_exe())
+        .ok()?;
+    let token = uuid::Uuid::new_v4().to_string();
+    shared.delegate_tokens.lock().unwrap().insert(
+        token.clone(),
+        DelegateBinding {
+            router_sid: router_sid.to_string(),
+            delegation_enabled: false,
+            worker: Some(worker),
+        },
+    );
+    let stdio = McpServerStdio::new(WORKER_SERVER_NAME, exe).args(vec![
+        "mcp-delegate".to_string(),
+        "--socket".to_string(),
+        socket.display().to_string(),
+        "--token".to_string(),
+        token,
+    ]);
+    Some(McpServer::Stdio(stdio))
+}
+
+/// Forget a finished worker's MCP tokens.
+pub fn drop_worker_tokens(shared: &Shared, worker_id: &str) {
+    shared
+        .delegate_tokens
+        .lock()
+        .unwrap()
+        .retain(|_, b| b.worker.as_ref().is_none_or(|w| w.worker_id != worker_id));
+}
+
+fn run_worker_handoff(
+    shared: &Shared,
+    worker: &WorkerBinding,
+    args: WorkerHandoffArgs,
+) -> Result<String, String> {
+    if !crate::delegate_hook::HANDOFF_KINDS.contains(&args.kind.as_str()) {
+        return Err(format!(
+            "unknown handoff kind `{}`; use one of {}",
+            args.kind,
+            crate::delegate_hook::HANDOFF_KINDS.join(", ")
+        ));
+    }
+    shared.worker_handoffs.lock().unwrap().insert(
+        worker.worker_id.clone(),
+        crate::delegate_hook::Handoff {
+            kind: args.kind.clone(),
+            message: args.message,
+        },
+    );
+    Ok(format!(
+        "Recorded `{}` handoff for worker {}. End your turn now; your host checks it when the \
+         turn ends and may send you back with what is still missing.",
+        args.kind, worker.worker_id
+    ))
+}
+
+fn worker_whoami(worker: &WorkerBinding) -> String {
+    format!(
+        "worker id: {}\nmodel: {}\nparent session: {}",
+        worker.worker_id, worker.candidate, worker.parent_downstream_sid
+    )
+}
+
+/// `delegate_result`: re-read a delegate's latest output from the state DB,
+/// by background job id (`b-…`), worker id (`w-…`) or live delegate id
+/// (`d-…`), even after `delegate_await` consumed it.
+fn run_delegate_result(
+    shared: &Shared,
+    router_sid: &str,
+    args: DelegateResultArgs,
+) -> Result<String, String> {
+    let id = args.delegate_id.trim();
+    let live_sub = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .get(id)
+        .filter(|d| d.parent_sid == router_sid)
+        .map(|d| d.sub_sid.clone());
+    let running = shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .get(id)
+        .is_some_and(|j| j.parent_sid == router_sid && j.result.is_none());
+    let state = shared.state.lock().unwrap();
+    let row = state.all().into_iter().find(|(row_id, row)| {
+        row.parent_session_id.as_deref() == Some(router_sid)
+            && (live_sub.as_deref() == Some(row_id.as_str())
+                || row.routing.as_ref().is_some_and(|r| {
+                    r["worker_id"].as_str() == Some(id) || r["background_id"].as_str() == Some(id)
+                }))
+    });
+    let Some((sub_sid, row)) = row else {
+        return Err(format!(
+            "no delegate `{id}` in this session (ids are b-…, w-… or d-…)"
+        ));
+    };
+    let latest = state
+        .log_for(&sub_sid, 200)
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == "agent_response")
+        .and_then(|e| {
+            e.detail
+                .and_then(|d| d["text"].as_str().map(str::to_string))
+        });
+    let status = if running {
+        "still running"
+    } else if live_sub.is_some() {
+        "open (keep_open)"
+    } else {
+        "finished"
+    };
+    Ok(format!(
+        "delegate {id} on {}/{} — {status}\n{}",
+        row.agent,
+        row.model,
+        latest.unwrap_or_else(|| "(no output recorded yet)".to_string())
+    ))
+}
+
 /// Send a follow-up instruction to a delegate sub-session kept alive by an
 /// earlier `delegate_task(keep_open=true)`, preserving that sub-agent's context.
 pub async fn run_delegate_followup(
@@ -1496,7 +2076,7 @@ pub async fn run_delegate_followup(
         .map_err(|_| "router shutting down".to_string())?;
 
     // Look up the live delegate and verify it belongs to this parent session.
-    let (process_key, downstream_sid, candidate, capture, sub_sid) = {
+    let (process_key, downstream_sid, candidate, capture, sub_sid, lifecycle, worker_id, turns) = {
         let live = shared.live_delegates.lock().unwrap();
         let d = live.get(&args.delegate_id).ok_or_else(|| {
             format!(
@@ -1513,8 +2093,23 @@ pub async fn run_delegate_followup(
             d.candidate.clone(),
             d.capture.clone(),
             d.sub_sid.clone(),
+            d.lifecycle.clone(),
+            d.worker_id.clone(),
+            d.turns,
         )
     };
+    let _agent_slot = match shared.agent_delegate_slots.get(&candidate.agent) {
+        Some(slots) => Some(
+            slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "router shutting down".to_string())?,
+        ),
+        None => None,
+    };
+    // A new turn starts: its handoff is whatever the worker records now.
+    shared.worker_handoffs.lock().unwrap().remove(&worker_id);
 
     if shared
         .with_session(router_sid, |s| s.cancelled)
@@ -1565,6 +2160,34 @@ pub async fn run_delegate_followup(
         None,
     );
     let result = conn.send_request(prompt).block_task().await;
+    let mut turns = turns + 1;
+    let result = match result {
+        Ok(resp) => {
+            gate_turns(
+                shared,
+                &TurnGate {
+                    lifecycle: lifecycle.as_ref(),
+                    conn: &conn,
+                    downstream_sid: &downstream_sid,
+                    sub_sid: &sub_sid,
+                    worker_id: &worker_id,
+                    capture: &capture,
+                },
+                resp,
+                &mut turns,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
+    if let Some(live) = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .get_mut(&args.delegate_id)
+    {
+        live.turns = turns;
+    }
     shared
         .state
         .lock()
@@ -1635,6 +2258,7 @@ pub fn run_delegate_close(
             .retain(|h| h.downstream_sid != d.downstream_sid || h.process_key != d.process_key);
     });
     close_downstream_session(shared, &d.process_key, &d.downstream_sid);
+    d.finish(shared, "closed");
     Ok(format!(
         "closed delegate {} ({})",
         args.delegate_id, d.candidate
@@ -1749,7 +2373,8 @@ mod tests {
                 DELEGATE_TOOL_NAME,
                 DELEGATE_AWAIT_TOOL_NAME,
                 DELEGATE_FOLLOWUP_TOOL_NAME,
-                DELEGATE_CLOSE_TOOL_NAME
+                DELEGATE_CLOSE_TOOL_NAME,
+                DELEGATE_RESULT_TOOL_NAME
             ]
         );
         assert_eq!(
@@ -1860,39 +2485,35 @@ mod tests {
     }
 
     #[test]
+    fn exact_hints_address_any_tier_or_fail() {
+        let fable = CandidateId::new("claude", "fable");
+        let pool = exact_hint_pool(pool3(), "claude/fable", Some(&fable)).unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].id, fable);
+        let missing = CandidateId::new("grok", "grok-4.7");
+        let err = exact_hint_pool(pool3(), "grok/grok-4.7", Some(&missing)).unwrap_err();
+        assert!(err.contains("not substituting"), "{err}");
+        assert!(exact_hint_pool(pool3(), "nonsense", None).is_err());
+    }
+
+    #[test]
+    fn effort_hints_parse_strictly() {
+        assert_eq!(parse_effort_hint(None).unwrap(), None);
+        assert_eq!(parse_effort_hint(Some("auto")).unwrap(), None);
+        assert_eq!(
+            parse_effort_hint(Some(" LOW ")).unwrap(),
+            Some(EffortLevel::Low)
+        );
+        assert!(parse_effort_hint(Some("turbo")).is_err());
+    }
+
+    #[test]
     fn ordinary_delegation_is_strictly_cheaper() {
-        let scoped = scope_delegate_pool(pool3(), 5, "claude", false, false);
+        let scoped = scope_delegate_pool(pool3(), 5, "claude");
         assert!(scoped.iter().all(|v| v.cost_rank < 5));
         assert_eq!(scoped.len(), 2);
         // Parent already cheapest → empty pool → the caller's error path.
-        assert!(scope_delegate_pool(pool3(), 1, "claude", false, false).is_empty());
-    }
-
-    #[test]
-    fn orchestration_workers_are_cheaper_only_without_a_hint() {
-        // A hint-less (worker) delegation from an orchestrating frontier
-        // planner must not land back on the frontier tier.
-        let scoped = scope_delegate_pool(pool3(), 5, "claude", true, false);
-        assert!(
-            scoped.iter().all(|v| v.cost_rank < 5),
-            "same-tier candidate survived a hint-less orchestration delegation"
-        );
-        assert_eq!(scoped.len(), 2);
-    }
-
-    #[test]
-    fn orchestration_hinted_delegation_keeps_the_full_pool() {
-        // The planner addresses its cross-lineage reviewer by explicit
-        // `hints.candidate` — same-/higher-tier must stay routeable.
-        let scoped = scope_delegate_pool(pool3(), 5, "claude", true, true);
-        assert_eq!(scoped.len(), 3);
-    }
-
-    #[test]
-    fn orchestration_from_the_cheapest_tier_falls_back_to_full_pool() {
-        // Never break the pipeline when the planner is already cheapest.
-        let scoped = scope_delegate_pool(pool3(), 1, "claude", true, false);
-        assert_eq!(scoped.len(), 3);
+        assert!(scope_delegate_pool(pool3(), 1, "claude").is_empty());
     }
 
     #[test]
@@ -1907,7 +2528,7 @@ mod tests {
         codex[2].cost_rank = 5;
         pool.extend(codex);
 
-        let scoped = scope_delegate_pool(pool, 5, "codex", false, false);
+        let scoped = scope_delegate_pool(pool, 5, "codex");
         let ids: Vec<String> = scoped.into_iter().map(|view| view.id.to_string()).collect();
         assert_eq!(ids, vec!["codex/luna", "codex/terra"]);
     }

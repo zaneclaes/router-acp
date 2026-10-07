@@ -1,8 +1,8 @@
 //! Composable LLM pre-classifier: one cheap ACP evaluation of the user prompt
 //! returns structured decisions for built-in and host-registered dimensions.
 //!
-//! When enabled, this is the authority for auto-orchestration (replacing
-//! `tasklist::detect_task_list`) and for host injects such as Kory's
+//! When enabled, this is the authority for the task class/complexity routing
+//! profile, the `planner` router's phase, and host injects such as Kory's
 //! `ui_planning` dimension. Prefer the configured `evaluator` globs (cheap
 //! seats first); if none are eligible, fall back to any available model. A
 //! failed evaluator is cordoned and the next eligible one is tried. If none
@@ -75,7 +75,6 @@ pub struct PreClassResult {
     /// Missing/invalid output fails open to the static classifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingDecision>,
-    pub orchestrate: Option<OrchestrateDecision>,
     /// Planner phase decision (planning vs implementation) when the router
     /// is `planner`. `None` for non-planner configs or missing evaluator output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,7 +82,7 @@ pub struct PreClassResult {
     /// Extension dimension id → raw JSON object the evaluator returned.
     #[serde(default)]
     pub dimensions: BTreeMap<String, Value>,
-    /// Modes that will act (inject / orchestrate) this turn.
+    /// Host dimensions that will act (inject) this turn.
     #[serde(default)]
     pub acted_modes: Vec<String>,
     /// Host inject prompts to prepend this turn (ordered).
@@ -116,20 +115,6 @@ pub struct RoutingDecision {
     pub effort: Option<EffortLevel>,
     #[serde(default)]
     pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrchestrateDecision {
-    pub warranted: bool,
-    pub confidence: f64,
-    #[serde(default = "default_parts")]
-    pub estimated_parts: usize,
-    #[serde(default)]
-    pub reason: String,
-}
-
-fn default_parts() -> usize {
-    1
 }
 
 /// Pre-classifier decision on the planner phase (planning vs implementation).
@@ -173,20 +158,10 @@ pub(crate) fn evaluator_workspace(
 
 /// Whether auto pre-class should run for this prompt.
 ///
-/// v1: first classify event per session (not every mid-session turn). Forced
-/// `orchestrate:` still bypasses the auto path without needing pre-class for
-/// the force decision; we still run pre-class on the first eligible turn so
-/// extension dimensions (e.g. ui_planning) can inject.
+/// v1: first classify event per session (not every mid-session turn), so
+/// extension dimensions (e.g. ui_planning) can inject on the first turn.
 pub fn should_run(cfg: &PreClassifierConfig, already_ran: bool, eligible_turn: bool) -> bool {
     cfg.enabled && eligible_turn && !already_ran
-}
-
-/// Automatic `orchestrate` is an `auto`-router dimension. `router: planner`
-/// already owns plan-vs-implement routing and must not be asked for, or act
-/// on, an auto-orchestration verdict. Explicit `orchestrate:` is a separate
-/// user override in `session.rs`.
-fn auto_orchestrate_dimension_active(cfg: &Config) -> bool {
-    cfg.router == crate::config::StrategyKind::Auto && cfg.orchestration.enabled
 }
 
 /// Build the single evaluator user-message text (system rules + dimensions +
@@ -250,29 +225,6 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          \"confidence\": 0.0-1.0, \"effort\": \"low|medium|high|xhigh|max\", \"reason\": string }\n\n",
     );
     schema_keys.push("routing".into());
-
-    if auto_orchestrate_dimension_active(cfg) {
-        out.push_str(
-            "## Dimension: orchestrate\n\
-             Decide whether the router should auto-orchestrate this prompt as a multi-track \
-             implementation job (plan → parallel subtasks → review).\n\
-             YES only when the work decomposes into genuinely INDEPENDENT tracks that different \
-             workers could implement in parallel.\n\
-             Sequential workflow STAGES of one deliverable (investigate → implement → test → \
-             verify → ship; rebase → CI → merge) are ONE track — never count them as parts.\n\
-             NO for: enumerated prose, Q&A lists, design discussions, plans/RFCs the user wants \
-             discussed (not built yet), single-track tasks, answers to the model's questions, \
-             pure research/explanation.\n\
-             Shipping or merging an existing PR, a single bug fix (even one needing \
-             investigation), and any single-artifact change are all single-track: \
-             warranted=false.\n\
-             estimated_parts counts parallelizable tracks, not steps.\n\
-             Return:\n\
-             \"orchestrate\": { \"warranted\": bool, \"confidence\": 0.0-1.0, \
-             \"estimated_parts\": int >= 1, \"reason\": string }\n\n",
-        );
-        schema_keys.push("orchestrate".into());
-    }
 
     if cfg.router == crate::config::StrategyKind::Planner {
         out.push_str(
@@ -400,35 +352,6 @@ pub fn parse_evaluator_json(raw: &str) -> Result<Value, String> {
         }
     }
     serde_json::from_str(trimmed).map_err(|e| format!("JSON parse failed: {e}"))
-}
-
-fn parse_orchestrate(v: &Value) -> Option<OrchestrateDecision> {
-    let obj = v.as_object()?;
-    let warranted = obj
-        .get("warranted")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    let confidence = obj
-        .get("confidence")
-        .and_then(|x| x.as_f64())
-        .unwrap_or(0.0);
-    let estimated_parts = obj
-        .get("estimated_parts")
-        .and_then(|x| x.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(1)
-        .max(1);
-    let reason = obj
-        .get("reason")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some(OrchestrateDecision {
-        warranted,
-        confidence,
-        estimated_parts,
-        reason,
-    })
 }
 
 fn parse_planner_phase(v: &Value) -> Option<PlannerPhaseDecision> {
@@ -578,36 +501,6 @@ pub fn apply_thresholds(
         log.push_str("routing: missing/invalid — static classifier fallback\n");
     }
 
-    // Automatic orchestration is an `auto`-router concern. Ignore a stray
-    // evaluator `orchestrate` field under planner/static/escalation/pareto-code.
-    let orchestrate = if auto_orchestrate_dimension_active(cfg) {
-        parsed.get("orchestrate").and_then(parse_orchestrate)
-    } else {
-        None
-    };
-    if let Some(ref o) = orchestrate {
-        let thr = cfg.pre_classifier.orchestrate_min_confidence;
-        let acts = o.warranted && o.confidence >= thr;
-        summary_dims.insert(
-            "orchestrate".into(),
-            json!({
-                "warranted": o.warranted,
-                "confidence": o.confidence,
-                "estimated_parts": o.estimated_parts,
-                "reason": o.reason,
-                "acts": acts,
-                "threshold": thr,
-            }),
-        );
-        log.push_str(&format!(
-            "orchestrate: warranted={} conf={:.2} parts={} acts={} — {}\n",
-            o.warranted, o.confidence, o.estimated_parts, acts, o.reason
-        ));
-        if acts {
-            acted_modes.push("orchestrate".into());
-        }
-    }
-
     let planner_phase = if cfg.router == crate::config::StrategyKind::Planner {
         parsed.get("planner_phase").and_then(parse_planner_phase)
     } else {
@@ -736,7 +629,6 @@ pub fn apply_thresholds(
         evaluator: evaluator.map(|s| s.to_string()),
         latency_ms,
         routing,
-        orchestrate,
         planner_phase,
         dimensions,
         acted_modes,
@@ -799,7 +691,6 @@ fn fail_open(
         evaluator: evaluator.clone(),
         latency_ms,
         routing: None,
-        orchestrate: None,
         planner_phase: None,
         dimensions: BTreeMap::new(),
         acted_modes: Vec::new(),
@@ -1049,7 +940,6 @@ async fn static_fallback(
         evaluator: Some("static-classifier".into()),
         latency_ms,
         routing: Some(routing),
-        orchestrate: None,
         planner_phase: None,
         dimensions: BTreeMap::new(),
         acted_modes: Vec::new(),
@@ -1420,69 +1310,25 @@ pub fn disclose(shared: &Arc<Shared>, router_sid: &str, result: &PreClassResult)
 }
 
 /// Compact, authoritative note prepended to the agent's turn so it cannot
-/// re-litigate routing (e.g. re-running `tasklist::detect_task_list` and telling
-/// the user "orchestration will fire — override with orchestrate:"). UI-only
-/// disclosures are peeled into a tool card and never reach the model.
+/// re-litigate the router's classification. UI-only disclosures are peeled
+/// into a tool card and never reach the model.
 pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
-    let thr = cfg.pre_classifier.orchestrate_min_confidence;
     let planner = cfg.router == crate::config::StrategyKind::Planner;
     let mut lines =
         vec!["[router-acp pre-class decision — AUTHORITATIVE for this turn]".to_string()];
     if planner {
         lines.push("Planner phase is authoritative for this session.".to_string());
-        lines.push(
-            "Do NOT re-run tasklist heuristics, and do NOT claim auto-orchestration will run."
-                .to_string(),
-        );
     } else {
         lines.push(
-            "The router already evaluated auto-orchestration and host dimensions.".to_string(),
-        );
-        lines.push(
-            "Do NOT re-run tasklist heuristics, do NOT claim orchestration will fire,".to_string(),
-        );
-        lines.push(
-            "and do NOT tell the user to `orchestrate:` unless they explicitly want it."
-                .to_string(),
+            "The router already classified this prompt and evaluated host dimensions.".to_string(),
         );
     }
 
     if !result.ok {
-        if auto_orchestrate_dimension_active(cfg) {
-            lines.push(format!(
-                "Pre-class FAIL-OPEN: {} — auto-orchestration was NOT started.",
-                result.skip_reason.as_deref().unwrap_or("unknown error")
-            ));
-        } else {
-            lines.push(format!(
-                "Pre-class FAIL-OPEN: {}.",
-                result.skip_reason.as_deref().unwrap_or("unknown error")
-            ));
-        }
-    } else if auto_orchestrate_dimension_active(cfg) {
-        if let Some(o) = result.orchestrate.as_ref() {
-            let acts = o.warranted && o.confidence >= thr;
-            if acts {
-                lines.push(format!(
-                    "Auto-orchestration: WILL RUN (warranted=true, confidence={:.2} ≥ thr={thr:.2}, ~{} parts). Reason: {}",
-                    o.confidence, o.estimated_parts, o.reason
-                ));
-            } else {
-                lines.push(format!(
-                    "Auto-orchestration: SUPPRESSED (warranted={}, confidence={:.2}, thr={thr:.2}). Reason: {}",
-                    o.warranted, o.confidence, o.reason
-                ));
-                lines.push(
-                    "A multi-bullet ticket body alone does NOT orchestrate while pre_classifier is on."
-                        .to_string(),
-                );
-            }
-        } else {
-            lines.push(
-                "Auto-orchestration: SUPPRESSED (no orchestrate decision in evaluator reply)."
-                    .to_string(),
-            );
-        }
+        lines.push(format!(
+            "Pre-class FAIL-OPEN: {}.",
+            result.skip_reason.as_deref().unwrap_or("unknown error")
+        ));
     }
 
     if let Some(routing) = result.routing.as_ref() {
@@ -1544,11 +1390,6 @@ pub fn agent_decision_note(cfg: &Config, result: &PreClassResult) -> String {
     lines.join("\n")
 }
 
-/// Default description for the built-in orchestrate dimension (docs / tests).
-pub fn orchestrate_dimension_description() -> &'static str {
-    "Complex multi-track implementation with distinct sub-tracks — not enumerated prose/Q&A/plans."
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,14 +1406,12 @@ agents:
     models: [{ id: m1, display_name: M1, cost_rank: 1 }]
 "#;
         let mut cfg = Config::from_yaml(yaml).unwrap();
-        cfg.orchestration.enabled = true;
         cfg.pre_classifier = PreClassifierConfig {
             enabled: true,
             evaluator: vec!["*m1*".into()],
             timeout_ms: 15_000,
             stall_timeout_ms: 90_000,
             disclose: true,
-            orchestrate_min_confidence: 0.65,
             dimensions: dims,
             evaluator_cwd: None,
         };
@@ -1673,7 +1512,7 @@ pre_classifier:
     }
 
     #[test]
-    fn build_prompt_includes_marker_and_orchestrate() {
+    fn build_prompt_includes_marker_and_routing_anchors() {
         let cfg = cfg_with_dims(vec![]);
         let p = build_evaluator_prompt(&cfg, "1. do a\n2. do b");
         assert!(p.contains(PRECLASS_MARKER));
@@ -1685,17 +1524,16 @@ pre_classifier:
         assert!(p.contains("0.90-1.00"));
         assert!(p.contains("low, medium, high, xhigh, max"));
         assert!(p.contains("xhigh for ambiguous cross-system reasoning"));
-        assert!(p.contains("Dimension: orchestrate"));
+        assert!(
+            !p.contains("orchestrate"),
+            "no orchestration dimension: {p}"
+        );
         assert!(p.contains("1. do a"));
         // Context-vs-ask + bounded-action + symptom-report + docs-deliverable anchors.
         assert!(p.contains("Context is background, NOT the ask"));
         assert!(p.contains("already-reviewed PR is mechanical Ops"));
         assert!(p.contains("typically 0.36-0.60, not higher"));
         assert!(p.contains("score the decisions, not the prose"));
-        // Orchestrate: independent tracks, not workflow stages.
-        assert!(p.contains("genuinely INDEPENDENT tracks"));
-        assert!(p.contains("never count them as parts"));
-        assert!(p.contains("estimated_parts counts parallelizable tracks, not steps"));
     }
 
     #[test]
@@ -1772,14 +1610,14 @@ pre_classifier:
     #[test]
     fn parse_json_strips_fences() {
         let v = parse_evaluator_json(
-            "Here you go:\n```json\n{\"orchestrate\":{\"warranted\":false,\"confidence\":0.9,\"estimated_parts\":1,\"reason\":\"qa\"}}\n```\n",
+            "Here you go:\n```json\n{\"routing\":{\"task_class\":\"Ops\",\"complexity\":0.1,\"confidence\":0.9}}\n```\n",
         )
         .unwrap();
-        assert_eq!(v["orchestrate"]["warranted"], false);
+        assert_eq!(v["routing"]["task_class"], "Ops");
     }
 
     #[test]
-    fn thresholds_orchestrate_and_ui_inject() {
+    fn thresholds_routing_and_ui_inject() {
         let cfg = cfg_with_dims(vec![PreClassDimension {
             id: "ui_planning".into(),
             description: "ui".into(),
@@ -1799,12 +1637,6 @@ pre_classifier:
                 "confidence": 0.91,
                 "reason": "new interactive surface"
             },
-            "orchestrate": {
-                "warranted": true,
-                "confidence": 0.9,
-                "estimated_parts": 3,
-                "reason": "multi-track impl"
-            },
             "ui_planning": {
                 "mode": "planning",
                 "confidence": 0.85,
@@ -1815,10 +1647,8 @@ pre_classifier:
         assert!(r.ok);
         assert_eq!(r.routing.as_ref().unwrap().task_class, TaskClass::UiTweak);
         assert_eq!(r.routing.as_ref().unwrap().complexity, 0.42);
-        assert!(r.acted_modes.contains(&"orchestrate".to_string()));
-        assert!(r.acted_modes.contains(&"UI".to_string()));
+        assert_eq!(r.acted_modes, vec!["UI".to_string()]);
         assert_eq!(r.injects, vec!["INJECT-UI".to_string()]);
-        assert!(r.orchestrate.as_ref().unwrap().warranted);
     }
 
     #[test]
@@ -1914,27 +1744,22 @@ pre_classifier:
     }
 
     #[test]
-    fn thresholds_fail_low_confidence() {
+    fn a_stray_orchestrate_field_is_ignored() {
         let cfg = cfg_with_dims(vec![]);
         let parsed = json!({
             "routing": {
                 "task_class": "Writing",
-                "task_classes": ["Writing"],
-                "categories": ["docs"],
                 "complexity": 0.12,
                 "confidence": 0.9,
                 "reason": "bounded prose"
             },
-            "orchestrate": {
-                "warranted": true,
-                "confidence": 0.4,
-                "estimated_parts": 3,
-                "reason": "maybe"
-            }
+            "orchestrate": { "warranted": true, "confidence": 0.99, "estimated_parts": 3 }
         });
         let r = apply_thresholds(&cfg, &parsed, Some("a/m1"), 5, "");
+        assert!(r.ok);
         assert!(r.acted_modes.is_empty());
-        assert!(r.orchestrate.as_ref().unwrap().warranted);
+        assert!(r.summary["dimensions"].get("orchestrate").is_none());
+        assert!(!agent_decision_note(&cfg, &r).contains("orchestrat"));
     }
 
     #[test]
@@ -1951,7 +1776,7 @@ pre_classifier:
     }
 
     #[test]
-    fn agent_decision_note_suppresses_orchestration_clearly() {
+    fn agent_decision_note_is_authoritative_and_states_the_routing() {
         let cfg = cfg_with_dims(vec![]);
         let parsed = json!({
             "routing": {
@@ -1961,61 +1786,26 @@ pre_classifier:
                 "complexity": 0.7,
                 "confidence": 0.9,
                 "reason": "cross-system design"
-            },
-            "orchestrate": {
-                "warranted": false,
-                "confidence": 0.85,
-                "estimated_parts": 1,
-                "reason": "single-track sequential pipeline"
             }
         });
         let r = apply_thresholds(&cfg, &parsed, Some("claude/haiku"), 100, "");
         let note = agent_decision_note(&cfg, &r);
         assert!(note.contains("AUTHORITATIVE"));
-        assert!(note.contains("SUPPRESSED"));
-        assert!(note.contains("single-track sequential pipeline"));
-        assert!(note.contains("Do NOT"));
-        assert!(!note.contains("WILL RUN"));
+        assert!(note.contains("class=Architecture complexity=0.70"));
+        assert!(note.contains("cross-system design"));
     }
 
     #[test]
-    fn agent_decision_note_when_orchestrate_acts() {
-        let cfg = cfg_with_dims(vec![]);
-        let parsed = json!({
-            "routing": {
-                "task_class": "Feature",
-                "task_classes": ["Feature"],
-                "categories": ["backend"],
-                "complexity": 0.65,
-                "confidence": 0.9,
-                "reason": "multi-track implementation"
-            },
-            "orchestrate": {
-                "warranted": true,
-                "confidence": 0.9,
-                "estimated_parts": 3,
-                "reason": "multi-track impl"
-            }
-        });
-        let r = apply_thresholds(&cfg, &parsed, Some("a/m1"), 50, "");
-        let note = agent_decision_note(&cfg, &r);
-        assert!(note.contains("WILL RUN"));
-        assert!(note.contains("multi-track impl"));
-    }
-
-    #[test]
-    fn planner_prompt_includes_phase_and_omits_orchestrate() {
+    fn planner_prompt_includes_phase() {
         let mut cfg = cfg_with_dims(vec![]);
         cfg.router = StrategyKind::Planner;
         let p = build_evaluator_prompt(&cfg, "implement the attached ticket");
         assert!(p.contains("Dimension: planner_phase"));
-        assert!(!p.contains("Dimension: orchestrate"));
         assert!(p.contains("\"planner_phase\": { ... }"));
-        assert!(!p.contains("\"orchestrate\": { ... }"));
     }
 
     #[test]
-    fn planner_ignores_stray_orchestrate_verdict() {
+    fn planner_phase_decision_is_parsed_and_noted() {
         let mut cfg = cfg_with_dims(vec![]);
         cfg.router = StrategyKind::Planner;
         let parsed = json!({
@@ -2027,12 +1817,6 @@ pre_classifier:
                 "confidence": 0.9,
                 "reason": "implementation-ready ticket"
             },
-            "orchestrate": {
-                "warranted": true,
-                "confidence": 0.95,
-                "estimated_parts": 3,
-                "reason": "stale auto-orchestrate"
-            },
             "planner_phase": {
                 "phase": "implementation",
                 "confidence": 0.95,
@@ -2041,8 +1825,6 @@ pre_classifier:
             }
         });
         let r = apply_thresholds(&cfg, &parsed, Some("a/m1"), 12, "raw\n");
-        assert!(r.orchestrate.is_none());
-        assert!(!r.acted_modes.iter().any(|m| m == "orchestrate"));
         let phase = r.planner_phase.as_ref().expect("planner_phase present");
         assert_eq!(phase.phase, PlannerPhase::Implementation);
         assert!(phase.plan_ready);
@@ -2050,34 +1832,5 @@ pre_classifier:
         let note = agent_decision_note(&cfg, &r);
         assert!(note.contains("Planner phase is authoritative"));
         assert!(note.contains("Planner phase: implementation"));
-        assert!(!note.contains("WILL RUN"));
-        assert!(!note.contains("Auto-orchestration"));
-        assert!(!note.contains("orchestrate:"));
-    }
-
-    #[test]
-    fn static_router_also_ignores_stray_orchestrate() {
-        let mut cfg = cfg_with_dims(vec![]);
-        cfg.router = StrategyKind::Static;
-        let parsed = json!({
-            "routing": {
-                "task_class": "Feature",
-                "complexity": 0.5,
-                "confidence": 0.9,
-                "reason": "work"
-            },
-            "orchestrate": {
-                "warranted": true,
-                "confidence": 0.99,
-                "estimated_parts": 4,
-                "reason": "stale"
-            }
-        });
-        let r = apply_thresholds(&cfg, &parsed, Some("a/m1"), 8, "");
-        assert!(r.orchestrate.is_none());
-        assert!(!r.acted_modes.iter().any(|m| m == "orchestrate"));
-        let note = agent_decision_note(&cfg, &r);
-        assert!(!note.contains("WILL RUN"));
-        assert!(!note.contains("Auto-orchestration"));
     }
 }

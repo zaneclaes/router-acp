@@ -57,7 +57,7 @@ benchmark_scoring:
       # Same shape one tier down on codex: Terra lists at half Sol's price
       # ($2.50/$15 vs $5/$30) and trails Sol by 0.9-3.1 raw points on all four
       # same-source rows — consistent in direction but each inside typical
-      # error bars. Order = Sol (the xhigh-capable flagship the orchestration
+      # error bars. Order = Sol (the xhigh-capable flagship the planner
       # globs prefer); cost_rank (4 vs 5) routes everyday hard codex work to
       # Terra.
       - { ahead: "*sol*", behind: "*terra*" }
@@ -233,8 +233,8 @@ cost:
         would pull trivial traffic onto it.
     - candidate: "grok/grok-4.6"
       why: >-
-        Cheapest frontier on list price ($2/$6) but pinned at rank 5: the value
-        is cross-lineage review (the planner/reviewer globs), the seat is
+        Cheapest frontier on list price ($2/$6) but pinned at rank 5: it is a
+        second company's frontier that hosts name explicitly, the seat is
         scarce, and a rank matching its price would make it win ordinary `auto`
         traffic that the Claude and Codex seats already cover.
     - candidate: "kimi/kimi-k2"

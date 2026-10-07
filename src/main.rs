@@ -32,6 +32,27 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Send one message to a router session with no ACP client attached and
+    /// stream the reply to stdout — e.g. a supervisor waking a parent session
+    /// whose client is gone. The session keeps its provider session and the
+    /// router's delegate tools.
+    Prompt {
+        #[arg(long)]
+        config: PathBuf,
+        /// Router session id (`rtr-…`) or the provider session id one is
+        /// pinned to. Omit to open a new session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Working directory for a new or reloaded session (default: cwd).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Session mode to apply first, as a client would (e.g. `auto`).
+        #[arg(long)]
+        mode: Option<String>,
+        /// The message to send.
+        #[arg(long)]
+        message: String,
+    },
     /// Internal: stdio<->socket bridge for the delegate MCP server.
     /// Spawned by downstream agents as a stdio MCP server.
     McpDelegate {
@@ -73,19 +94,6 @@ enum Command {
         session: String,
         /// Max log entries to include (default: effectively unbounded).
         #[arg(long, default_value_t = 100_000)]
-        limit: usize,
-    },
-    /// Summarize orchestrated runs: planner vs delegate cost/compute, whether
-    /// sub-tasks were actually delegated, and whether orchestration degraded to
-    /// the adapter's built-in sub-agent tool.
-    Report {
-        #[arg(long)]
-        config: PathBuf,
-        /// Only runs with this run_label (default "orchestrate").
-        #[arg(long, default_value = "orchestrate")]
-        run_label: String,
-        /// Max runs to show (default 20).
-        #[arg(long, default_value_t = 20)]
         limit: usize,
     },
     /// Report adoption of the ordinary scoped delegation directive: how often
@@ -134,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr)
                 .init();
             let cfg = Config::from_file(&config)?;
+            export_router_env(&config);
             // Downstream agents run with workspace write access; they must die
             // when the router does. On a signal (goose's Ctrl+C) neither
             // destructors nor `kill_on_drop` run, so an in-flight agent can keep
@@ -178,6 +187,45 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(unix))]
             router_acp::usage::monitor(config).await
+        }
+        Command::Prompt {
+            config,
+            session,
+            cwd,
+            mode,
+            message,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "router_acp=warn".into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            let cfg = Config::from_file(&config)?;
+            export_router_env(&config);
+            let cwd = match cwd {
+                Some(cwd) => cwd,
+                None => std::env::current_dir()?,
+            };
+            let result = router_acp::headless::run(
+                cfg,
+                router_acp::headless::PromptOptions {
+                    session,
+                    cwd,
+                    message,
+                    mode,
+                },
+            )
+            .await;
+            router_acp::transport::kill_all_downstreams();
+            match result {
+                Ok(stop) => {
+                    eprintln!("router-acp: turn ended ({stop:?})");
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!("prompt failed: {e}")),
+            }
         }
         Command::McpDelegate { socket, token } => {
             router_acp::delegate_mcp::run_helper(&socket, &token)
@@ -339,152 +387,6 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Report {
-            config,
-            run_label,
-            limit,
-        } => {
-            let cfg = Config::from_file(&config)?;
-            let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
-            let all = state.all(); // newest first
-            // Index children by parent.
-            let mut children: std::collections::HashMap<String, Vec<_>> =
-                std::collections::HashMap::new();
-            for (id, s) in &all {
-                if let Some(p) = &s.parent_session_id {
-                    children
-                        .entry(p.clone())
-                        .or_default()
-                        .push((id.clone(), s.clone()));
-                }
-            }
-            let runs: Vec<_> = all
-                .iter()
-                .filter(|(_, s)| s.kind == "primary" && s.run_label.as_deref() == Some(&run_label))
-                .take(limit.max(1))
-                .collect();
-
-            println!(
-                "orchestration report — run_label='{run_label}' ({} runs)\n",
-                runs.len()
-            );
-            let (mut delegated_runs, mut degraded_runs) = (0usize, 0usize);
-            let (mut sum_planner_cost, mut sum_delegate_cost) = (0f64, 0f64);
-            for (id, s) in &runs {
-                let kids = children.get(id).cloned().unwrap_or_default();
-                let effective_cost = |session: &router_acp::state::PersistedSession| {
-                    if session.llm_requests_total > 0 && session.llm_request_cost_usd > 0.0 {
-                        session.llm_request_cost_usd
-                    } else {
-                        session.cost_usd
-                    }
-                };
-                let planner_cost = effective_cost(s);
-                let delegate_cost: f64 =
-                    kids.iter().map(|(_, c)| effective_cost(c)).sum::<f64>() + 0.0;
-                let delegate_cost = if delegate_cost == 0.0 {
-                    0.0
-                } else {
-                    delegate_cost
-                };
-                // Lineage = company (agents[].lineage, default agent name):
-                // a delegate on a same-vendor sibling agent is NOT cross-lineage.
-                let cross_lineage = kids.iter().any(|(_, c)| {
-                    router_acp::session::agent_lineage(&cfg, &c.agent)
-                        != router_acp::session::agent_lineage(&cfg, &s.agent)
-                });
-                if !kids.is_empty() {
-                    delegated_runs += 1;
-                }
-                if s.native_subagent_calls > 0 {
-                    degraded_runs += 1;
-                }
-                sum_planner_cost += planner_cost;
-                sum_delegate_cost += delegate_cost;
-
-                println!(
-                    "{}  planner {}/{}",
-                    &id[..id.len().min(20)],
-                    s.agent,
-                    s.model
-                );
-                println!(
-                    "    cost: planner ${:.4} + delegates ${:.4} = ${:.4}  | compute {}s | context {}",
-                    planner_cost,
-                    delegate_cost,
-                    planner_cost + delegate_cost,
-                    s.compute_ms / 1000,
-                    s.context_used
-                );
-                println!(
-                    "    delegates: {} | cross-lineage review: {} | native-subagent (degraded): {}{}",
-                    kids.len(),
-                    if cross_lineage { "yes" } else { "NO" },
-                    s.native_subagent_calls,
-                    if s.native_subagent_calls > 0 {
-                        "  ⚠ planner bypassed delegate_task"
-                    } else {
-                        ""
-                    }
-                );
-                for (_, c) in &kids {
-                    println!(
-                        "      └─ {}/{}  ${:.4}  {}s  {}",
-                        c.agent,
-                        c.model,
-                        effective_cost(c),
-                        c.compute_ms / 1000,
-                        c.title
-                            .as_deref()
-                            .unwrap_or("")
-                            .replace('\n', " ")
-                            .chars()
-                            .take(60)
-                            .collect::<String>()
-                    );
-                }
-                if let Some(sha) = &s.git_sha {
-                    println!(
-                        "    git: {}@{}",
-                        s.git_branch.as_deref().unwrap_or("?"),
-                        &sha[..sha.len().min(10)]
-                    );
-                }
-                println!();
-            }
-            println!("── summary ──");
-            println!("  runs analyzed          : {}", runs.len());
-            println!(
-                "  runs that delegated    : {} ({}%)",
-                delegated_runs,
-                if runs.is_empty() {
-                    0
-                } else {
-                    delegated_runs * 100 / runs.len()
-                }
-            );
-            println!(
-                "  runs degraded (native) : {} ({}%)",
-                degraded_runs,
-                if runs.is_empty() {
-                    0
-                } else {
-                    degraded_runs * 100 / runs.len()
-                }
-            );
-            println!(
-                "  cost: planner ${:.2} + delegates ${:.2} = ${:.2}",
-                sum_planner_cost,
-                sum_delegate_cost,
-                sum_planner_cost + sum_delegate_cost
-            );
-            println!(
-                "\nnote: cost is the adapter's own usage_update.cost (USD). \"degraded\" runs used\n\
-                 the built-in Task tool instead of delegate_task — their sub-work is not captured\n\
-                 here. Join git_sha/branch to CI/merge outcomes for accuracy signal."
-            );
-            Ok(())
-        }
         Command::DelegationReport { config, limit } => {
             let cfg = Config::from_file(&config)?;
             let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
@@ -575,4 +477,18 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Tell every adapter this router spawns where it came from, so tools running
+/// inside an adapter (a host's hooks) can recognize a router-hosted session and
+/// wake it again through `router-acp prompt --config <this config>`.
+fn export_router_env(config: &std::path::Path) {
+    let mut env = Vec::new();
+    if let Ok(path) = std::fs::canonicalize(config) {
+        env.push(("ROUTER_ACP_CONFIG".to_string(), path.display().to_string()));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        env.push(("ROUTER_ACP_BIN".to_string(), exe.display().to_string()));
+    }
+    router_acp::transport::set_router_env(env);
 }

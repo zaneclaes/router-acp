@@ -20,6 +20,26 @@ use crate::session::{
 };
 use crate::state::PersistedSession;
 
+/// The MCP servers a reloaded or resumed session gets: the client's servers
+/// plus the router's own delegate/terminal endpoint, exactly as when it was
+/// first pinned — otherwise a parent reattached after a restart would have
+/// lost `delegate_task` and the rest of its router tools.
+fn reattached_mcp_servers(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    persisted: &PersistedSession,
+    client_mcp: &[agent_client_protocol::schema::v1::McpServer],
+) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+    let candidate = CandidateId::new(&persisted.agent, &persisted.model);
+    match crate::session::mcp_servers_for_pin(shared, router_sid, &candidate, client_mcp) {
+        Ok((servers, _)) => servers,
+        Err(err) => {
+            tracing::warn!(session = router_sid, %err, "reattaching without router tools");
+            client_mcp.to_vec()
+        }
+    }
+}
+
 /// Resolve the owning downstream for a persisted session: the target, its
 /// connection, and whether it advertises the given capability.
 fn owning_target(
@@ -125,7 +145,12 @@ pub fn on_session_load(
     );
 
     let fwd = LoadSessionRequest::new(persisted.downstream_session_id.clone(), req.cwd.clone())
-        .mcp_servers(req.mcp_servers.clone())
+        .mcp_servers(reattached_mcp_servers(
+            &shared,
+            &router_sid,
+            &persisted,
+            &req.mcp_servers,
+        ))
         .meta(req.meta.clone());
 
     cx.spawn(async move {
@@ -192,7 +217,12 @@ pub fn on_session_resume(
     );
 
     let fwd = ResumeSessionRequest::new(persisted.downstream_session_id.clone(), req.cwd.clone())
-        .mcp_servers(req.mcp_servers.clone())
+        .mcp_servers(reattached_mcp_servers(
+            &shared,
+            &router_sid,
+            &persisted,
+            &req.mcp_servers,
+        ))
         .meta(req.meta.clone());
 
     cx.spawn(async move {

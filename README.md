@@ -29,7 +29,6 @@ This repo:
 - [Prompt routing directives](#prompt-routing-directives)
 - [Switching models mid-session](#switching-models-mid-session)
 - [In-session delegation](#in-session-delegation)
-- [Auto-orchestration](#auto-orchestration)
 - [Configuration reference](#configuration-reference)
 - [Session modes](#session-modes)
 - [First-run authentication](#first-run-authentication)
@@ -79,7 +78,7 @@ router-acp serve --config router.yaml
      }
      ```
 3. Send a prompt. The first reply opens with a routing disclosure line, e.g. `[router-acp] auto → claude/sonnet · task BugFix (complexity 0.35) · …` — that line is your proof the router is serving the session.
-4. From there: let it auto-decide what model to use for any given task, hot switch via a prompt (`gpt: continue this work`), and enable [auto-orchestration](#auto-orchestration) so multi-part task lists are decomposed, routed, and reviewed automatically.
+4. From there: let it auto-decide what model to use for any given task, hot switch via a prompt (`gpt: continue this work`), or set `router: planner` ([ROUTERS.md](ROUTERS.md#planner--two-phase-routing-plan--implement)) to plan on a frontier model and implement on a cheaper one.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
@@ -125,7 +124,7 @@ Manage logins
 3. grok (0 accounts)
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its cached usage, **Re-login**, and **Delete account**. Browser sign-in uses the provider's own CLI. New accounts get private directories without replacing your other logins. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its cached usage, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Browser sign-in uses the provider's own CLI. New accounts get private directories without replacing your other logins. An expired login remains registered so **Re-login** can repair it.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
@@ -197,7 +196,11 @@ Clients that manage paid-usage consent can send a windowless entry for each exac
 Every strategy except `static` needs to know what kind of task it's routing and how hard it looks. Two layers do that, and either can run alone:
 
 - **The heuristic classifier** (`classifier.backend: heuristic`, the default) reads the first prompt with deterministic, data-driven rule tables — keyword hits, multi-step structure ("do X and Y, then Z"), mentioned files, and a scan of the project's languages — and produces a task class (`BugFix`, `Research`, `Architecture`, `UiTweak`, …) plus a complexity score from 0 (trivial) to 1 (very hard). Rules live in [`data/classifier.yaml`](data/classifier.yaml) (override with `classifier.rules_file`); updating them is a data edit, not a code change. An optional **local-model backend** (`classifier.backend: local-model`, e.g. `ollama:qwen3:4b`) can replace the heuristic with a small locally-run model (temperature 0, JSON output) — it never touches a paid seat, and falls back to the heuristic on timeout, a parse failure, or an unavailable runtime.
-- **The pre-classifier** (`pre_classifier.enabled`, off by default) replaces the heuristic's guess with one cheap, tool-less ACP evaluation on a real model — a preferred cheap seat first (`pre_classifier.evaluator`, default `*haiku*`/`*mini*`/`*flash*` globs), widening to any available model if none of those are eligible. It returns the same task class and complexity, now model-derived instead of keyword-derived, plus the `orchestrate` verdict that decides [auto-orchestration](#auto-orchestration) (`warranted`, `confidence`, `estimated_parts`) and any host-registered `dimensions` (`pre_classifier.dimensions`) — all in the same call, so a host like Kory Code can add its own opaque decision (e.g. "does this need UI mockup-first planning?") without a second round-trip. A failing evaluator is cordoned and the router fails over to the next eligible one. A mode-less evaluator (Grok) that fires a tool call is cancelled but not cordoned. If no evaluator can classify, routing falls back to the static keyword classifier (confidence 0) so the session can still start, rather than hard-failing the turn. `stall_timeout_ms` (default 90s) bounds a *silent* evaluator, not total run time, so a slow-but-streaming model is still allowed to finish. Every pre-class decision is disclosed as `router-acp · pre-class …` (or suppressed with `disclose: false`).
+- **The pre-classifier** (`pre_classifier.enabled`, off by default) replaces the heuristic's guess with one cheap, tool-less ACP evaluation on a real model — a preferred cheap seat first (`pre_classifier.evaluator`, default `*haiku*`/`*mini*`/`*flash*` globs), widening to any available model if none of those are eligible. It returns the same task class and complexity, now model-derived instead of keyword-derived, plus the reasoning effort it recommends, the `router: planner` phase, and any host-registered `dimensions` (`pre_classifier.dimensions`) — all in the same call, so a host like Kory Code can add its own opaque decision (e.g. "does this need UI mockup-first planning?") without a second round-trip. A failing evaluator is cordoned and the router fails over to the next eligible one. A mode-less evaluator (Grok) that fires a tool call is cancelled but not cordoned. If no evaluator can classify, routing falls back to the static keyword classifier (confidence 0) so the session can still start, rather than hard-failing the turn. `stall_timeout_ms` (default 90s) bounds a *silent* evaluator, not total run time, so a slow-but-streaming model is still allowed to finish. Every pre-class decision is disclosed as `router-acp · pre-class …` (or suppressed with `disclose: false`).
+
+**Ticket context** (`ticket_context`, pluggable) — when a prompt references a ticket id (e.g. "Fix ABC-1234"), the router runs the configured command (`linear issue view $TICKET`, `jira …`, `gh issue view …` — any CLI that prints the ticket) and prepends the ticket's content to the prompt **before** classification, so a bare ticket mention routes on the ticket's real scope. Fail-open (a bad fetch never blocks the turn), once per ticket per session, fetches cached ~5 min. The chars actually injected on a turn that enriches ride that turn's routing metadata as `_meta.router_acp.ticket_enrichment_chars` (absent when nothing was injected), so a host measuring fixed per-turn overhead can separate "the ticket was big" from an actual settings regression.
+
+**Reasoning effort.** A primary session's effort follows an explicit request first — the `router.effort` session option or `[router: effort=…]` — and is never capped. Without one, the router recommends a level from the task class and complexity. Top-level `effort.default` replaces that recommendation with a fixed level, and `effort.max_automatic` caps any level the router picks by itself. The cap exists because a long, detailed prompt (a whole skill's instructions, say) classifies at maximum complexity and would otherwise run at `max`/`xhigh` effort. See the [configuration reference](#routing--classification).
 
 ### Quality data
 
@@ -289,7 +292,11 @@ Recipes and scripts (or any client that can't set ACP session config options, li
 [router: switch=claude/opus[1m]] now what?          # …and prompt it in one line
 [router: version=claude-opus-4-6]                   # run a declared older version
 [router: version=default]                           # back to the current api_model
+[router: effort=medium]                             # explicit reasoning effort (never capped)
+[router: candidate=codex/gpt-6.1-sol] [router: effort=medium] task   # several tags merge
 ```
+
+Several `[router: …]` tags in one prompt merge as if they were one comma-separated tag: a later key overrides an earlier one, `exclude` lists combine, and every tag is stripped.
 
 The router strips the tag (downstream models never see it), fails loudly on invalid directives, and records applied directives in the disclosure and state file. `candidate`, `prefer`, `strategy`, and `exclude` apply **pre-pin only** (post-pin: stripped + visible "ignored" note); `exclude` persists for the session, including failover re-pins. `prefer` is a *soft* pin — the named candidate goes to the front of the ranked chain if it is eligible, otherwise routing falls back to the strategy's normal winner rather than erroring.
 
@@ -327,7 +334,7 @@ This takes the state DB path directly rather than a `--config`, so it runs stand
 
 ## In-session delegation
 
-The pinned primary agent gets a router-provided MCP tool, `delegate_task`, for small self-contained subtasks — mechanical edits, isolated bug fixes, focused research. Each delegated subtask runs in an **ephemeral downstream session on a strictly lower-`cost_rank` candidate** (preferring a same-agent sibling before falling back cross-lineage — so a Sol primary delegates ordinary work to Terra/Luna when they're eligible), returns the sub-agent's output as the tool result, and forwards the sub-session's permission/fs/terminal callbacks to the original client under the parent session id — permission UX stays intact without interleaving sub-agent transcript streaming into the parent's. Delegates have no upstream client of their own, so the router applies each candidate's `auto` `mode_map` entry itself at session creation (for example Claude `bypassPermissions` or Codex `agent-full-access`), and each delegate's full task, final response, streamed progress, and tool activity land in its `session_log` row for UIs.
+The pinned primary agent gets a router-provided MCP tool, `delegate_task`, for small self-contained subtasks — mechanical edits, isolated bug fixes, focused research. Each delegated subtask runs in an **ephemeral downstream session on a strictly lower-`cost_rank` candidate** (preferring a same-agent sibling before falling back to other agents — so a Sol primary delegates ordinary work to Terra/Luna when they're eligible), returns the sub-agent's output as the tool result, and forwards the sub-session's permission/fs/terminal callbacks to the original client under the parent session id — permission UX stays intact without interleaving sub-agent transcript streaming into the parent's. Delegates have no upstream client of their own, so the router applies each candidate's `auto` `mode_map` entry itself at session creation (for example Claude `bypassPermissions` or Codex `agent-full-access`), and each delegate's full task, final response, streamed progress, and tool activity land in its `session_log` row for UIs.
 
 One routing subtlety: a delegated subtask is usually a long, fully-specified brief, which the classifier would read as *maximum* complexity — routing every subtask to the priciest candidate. `delegation.complexity_cap` (default `0.6`) caps a delegate's classified complexity so cost-aware routing still applies to spec'd work (`1.0` disables it).
 
@@ -339,13 +346,46 @@ An ACP host registers concrete named MCP bundles with `router-acp/delegate_mcp_c
 
 Some clients never hold a live post-`session/new` connection into the session they created — a client that spawns the router as a subprocess only to relay its stdout can never send that notification. For those, set `ROUTER_ACP_MCP_CATALOGS` to the same `catalogs` JSON shape (`{"<catalog>": [<McpServer>, ...]}`) before the router process starts; it seeds `delegate_mcp_catalogs` once at session creation. It's an additive fallback only: absent or malformed content fails open to no catalogs, and a later live notification still overwrites the seed as usual.
 
-`delegation.inject_prompt: true` also prepends a one-shot directive to each ordinary downstream session that actually received these tools, asking the parent to delegate only bounded, independent work whose briefing/verification overhead is worthwhile and to verify and integrate the result itself. A model switch creates a fresh downstream session, so the router re-injects there when a cheaper worker remains available; orchestration does not receive this ordinary directive because its stronger protocol already governs delegation. The opt-in defaults to `false`.
+`delegation.inject_prompt: true` also prepends a one-shot directive to each ordinary downstream session that actually received these tools, asking the parent to delegate only bounded, independent work whose briefing/verification overhead is worthwhile and to verify and integrate the result itself. A model switch creates a fresh downstream session, so the router re-injects there when a cheaper worker remains available. The opt-in defaults to `false`. When a session that received this directive uses its adapter's built-in sub-agent tool (Claude's `Task`) instead while `delegation.native_subagents` is `forbid` (the default), the router warns inline (`router-acp · delegation bypassed: …`) and counts it in `native_subagent_calls`; that work is invisible to router routing and cost telemetry. With `native_subagents: allow` it does not fire.
 
 Concurrency is bounded by `delegation.max_concurrent`; `session/cancel` on the parent cancels the primary prompt and every active sub-session.
 
-For **review → fix → re-review** loops, a delegated sub-session can be kept alive: `delegate_task` with `keep_open: true` returns a `delegate_id`; send it more instructions with `delegate_followup` (context preserved), and release it with `delegate_close`. These are what let the orchestrator (below) iterate on a subtask without re-briefing a fresh session each round.
+For **review → fix → re-review** loops, a delegated sub-session can be kept alive: `delegate_task` with `keep_open: true` returns a `delegate_id`; send it more instructions with `delegate_followup` (context preserved), and release it with `delegate_close`. This lets a parent iterate on a subtask without re-briefing a fresh session each round.
 
 For **parallel** subtasks there is a background mode: MCP clients execute tool calls one at a time, so N plain `delegate_task` calls run the subtasks serially no matter what the router allows. `delegate_task` with `background: true` instead returns a `b-…` job id immediately and runs the subtask on its own task; `delegate_await` collects results — it waits up to `timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default: all pending), returns every finished job's output exactly once, and lists the ones still running so the caller polls with short, idle-timeout-safe calls. `background` composes with `keep_open` (the collected result carries the `delegate_id`), and `delegation.max_concurrent` still bounds how many jobs execute at once.
+
+### Host-directed workers
+
+Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:
+
+- **`candidate_hints: exact`** — `hints.candidate` addresses *any* eligible candidate by name, whatever its cost tier, agent or account (so a Sol parent can hand a task to `grok/grok-4.7` or `claude@personal/opus[1m]`). If that candidate is unknown, not offered by its adapter, signed out, cordoned or quarantined, the call fails and says why; it never substitutes another model. With the default `prefer`, a hint is honored only inside the cost-scoped pool (strictly cheaper, same agent first) and otherwise falls back silently, as before. In `exact` mode the tools are offered whenever any other candidate exists.
+- **Capacity.** `delegation.max_concurrent` bounds all delegates at once, and `agents[].max_delegates` bounds one agent (each account seat separately), so adding agents and accounts adds capacity up to the global limit. A full agent is skipped while another ranked candidate remains, otherwise the delegate waits for its slot.
+- **`hints.effort`** (`low` … `max`) on `delegate_task` sets that delegate's reasoning effort, which the [per-request proxy](#per-request-llm-routing) applies instead of the parent's. It needs `llm_proxy` enabled for the delegate's agent; without the proxy, delegates keep the adapter's own effort.
+- **`native_subagents: allow`** drops the "never use provider-native Task/spawn/subagent tools" sentence from the injected delegation directive, for hosts whose own instructions decide when a native subagent is right. The default `forbid` keeps it.
+- **Long-running workers.** Start a worker with `background: true, keep_open: true`; answer it with `delegate_followup`, which also takes `background: true` so the parent keeps supervising others while one worker runs its next turn; collect with `delegate_await`. `delegate_result` re-reads any delegate's latest output from the state DB by its `b-…`, `w-…` or `d-…` id, including results `delegate_await` already returned (after a compaction, or from a resumed parent).
+- **`lifecycle_hook`** runs a command (no shell) with one JSON event on stdin:
+  - `delegate_start` — after the delegate's session opens, before its prompt. A non-zero exit or timeout (`timeout_ms`, default 30 s) refuses the delegate with the hook's stderr, so a host can refuse a worker it could not register. A refused start is followed by a `delegate_stop` with outcome `aborted`, in case the host recorded it before timing out.
+  - `delegate_turn_end` — whenever a delegate turn ends, with `turn`, `last_message` and the worker's latest structured `handoff`. Exit 2 with a message on stderr sends that message back to the same delegate as its next prompt, at most `max_continuations` (default 3) times per turn — the router equivalent of a provider's subagent-stop hook keeping a worker going. Any other result releases the turn.
+  - `delegate_stop` — `completed`, `cancelled` or `failed`, or `closed` when a `keep_open` delegate is closed.
+  - `parent_repinned` — a session's pin moved to a new provider session (failover, including hot failover between accounts; an explicit switch; escalation; demotion), with `previous_downstream_session_id`/`previous_candidate`, the new `downstream_session_id`/`candidate`, and `reason`. It is delivered before the new session's first turn, so a host that bound work to the old provider session can follow the parent onto the new model.
+  
+  `delegate_stop` and `parent_repinned` go through a `hook_outbox` table in the state DB: an event the hook did not accept stays queued, and every router process sharing that DB retries it every 30 s and at startup. Delegate events carry `worker_id` (the `b-…` job id for a background delegate, else a `w-…` id), `parent_router_session_id`, `parent_downstream_session_id` (the id the provider's own hooks report for the parent), `parent_candidate`, `candidate`, `lineage`, `downstream_session_id`, `state_session_id`, `cwd`, `effort`, `background`, `keep_open` and `task_summary`; every event carries `router_pid` and `router_started_at_ms`, so a host can treat a dead router's workers as stopped even if no stop event arrives.
+- **Worker tools.** While a hook is configured, each delegate gets a `router-worker` MCP server: `worker_whoami` returns its worker id, model and parent session, and `worker_handoff {kind, message}` records a structured handoff (`commit_paths_ready`, `waiting`, `lease_requested`, `ownership_requested`, `staging_gate_request`, `round_verified`, `round_failed`, `reassignment_required`) that the turn-end event carries. The delegate's prompt also opens with `[router-acp delegate] worker id: … · model: … · parent session: …`, and the tool result names the worker (`[delegated to grok/grok-4.7, worker b-…]`).
+- **Resuming a parent without its client.** `router-acp prompt --config <file> --session <id> --mode auto --message <text>` reopens a router session (`session/resume`, else `session/load`) and sends one message with no ACP client attached, streaming the reply to stdout. `--session` takes a router id or the provider session id the router pinned it to — what the provider's own hooks recorded — so a supervisor can wake a parent whose goose is gone. A reloaded or resumed session gets its router tools back. Every adapter the router spawns inherits `ROUTER_ACP_CONFIG` and `ROUTER_ACP_BIN`, so a host's hooks can tell they run under the router and build that command.
+
+Delegates still end when their router exits: the router kills every adapter when its client disconnects or is interrupted, so a worker cannot outlive the goose session that started it. Committed work survives; a host recovers the rest through its stop events, the router-pid liveness check, `delegate_result` and `router-acp prompt`.
+
+```yaml
+delegation:
+  candidate_hints: exact
+  native_subagents: allow
+  max_concurrent: 20
+  lifecycle_hook:
+    command: /path/to/host/worker-ledger   # reads one JSON event on stdin
+    args: ["router-delegate"]
+    timeout_ms: 120000
+    max_continuations: 3
+```
 
 ### Managed background terminals
 
@@ -357,44 +397,11 @@ The router also instructs downstream models to use it instead of an adapter's
 private `run_in_background` mode, so the host client can persist the process,
 show its output and status, and cancel it independently of foreground turns.
 
-## Auto-orchestration
-
-When a prompt reads as a **multi-part task list**, the router can run an entire plan → parallel-delegate → cross-lineage-review pipeline itself, in-process, instead of answering the list in one turn. Turn it on with `orchestration.enabled` (off by default); it steers (pre-pin) or switches (mid-session) the session onto a **planner** frontier model and injects an orchestration protocol instructing that model to:
-
-1. **Plan** — restate the task as success criteria, split it into file-disjoint, self-contained subtasks, and state a confidence (0.0–1.0) that the plan will satisfy the criteria.
-2. **Delegate — in parallel** — dispatch independent subtasks via `delegate_task background: true` + `delegate_await`, each routed per-complexity in its own sub-session.
-3. **Review** — after every implementation subtask is collected, delegate an independent review to a candidate of a **different lineage** than the planner (`reviewer` globs), handing it the original task verbatim. Skipped, with a note, when no cross-lineage reviewer is available or the planner's stated confidence exceeds `review_confidence`.
-4. **Adjudicate** — fix blocking issues and re-review, bounded by `max_fix_rounds`.
-
-The one thing this needs beyond ordinary delegation is **peer delegation**: an orchestrating session may delegate to *same-* or *higher*-tier candidates, not just strictly-cheaper ones, so the cross-lineage reviewer is actually reachable. Everything else — decomposition and review — is the planner model following the injected protocol with its own tools plus `delegate_task`/`delegate_followup`. Lifecycle and integration policy belongs to the host; `orchestration.instructions` appends opaque host-owned text that router-acp does not interpret.
-
-**What decides a prompt is a task list** is one of two paths:
-
-- **The pre-classifier** (recommended — see [Task classification](#task-classification)), when `pre_classifier.enabled`: its `orchestrate` verdict (`warranted`, `confidence`, `estimated_parts`) decides, gated on `confidence >= pre_classifier.orchestrate_min_confidence` (default `0.65`). One evaluation covers this and any host dimensions in the same call.
-- **The legacy detector**, when the pre-classifier is off: `src/tasklist.rs` recognizes markdown numbers (`1. …`), markdown bullets (`- …`), inline enumeration (`… (1) … (2) …`), and ordered prose ("first … then … finally …"), triggering once a prompt reaches `orchestration.min_items` parts.
-
-Automatic orchestration applies only to `router: auto`. `router: planner` already owns plan-vs-implement routing and is not auto-steered onto `orchestration.planner`; other strategies skip the automatic path too. An explicit `orchestrate:` prefix remains the opt-in override on any strategy.
-
-Either way, orchestration fires on **any** prompt (fresh or mid-session), **takes precedence over `skill_routing`**, and is **suppressed** by an explicit `[router: …]` directive or `model:` shorthand, and when the "list" is actually you answering the model's own enumerated questions (it asked "Open decisions: (1)… (2)…" and you replied with a matching list). Each trigger is disclosed (`router-acp · orchestrating a N-part task on …`).
-
-Two related prompt features:
-
-- **Force it** — start a message with `orchestrate:` (or `orchestrator:`) to run the pipeline on any task, list or not, overriding every auto-detection gate including `orchestration.enabled` itself.
-- **Ticket context** (`ticket_context`, pluggable) — when a prompt references a ticket id (e.g. "Fix ABC-1234"), the router runs the configured command (`linear issue view $TICKET`, `jira …`, `gh issue view …` — any CLI that prints the ticket) and prepends the ticket's content to the prompt **before** classification and orchestration detection, so a bare ticket mention routes on the ticket's real scope, and a ticket whose body is a work list orchestrates — with the planner delegating its parts. Fail-open (a bad fetch never blocks the turn), once per ticket per session, fetches cached ~5 min. The chars actually injected on a turn that enriches ride that turn's routing metadata as `_meta.router_acp.ticket_enrichment_chars` (absent when nothing was injected), so a host measuring fixed per-turn overhead can separate "the ticket was big" from an actual settings regression.
-
-> **Caveat — the planner must actually use `delegate_task`.** Sub-session routing, the cross-lineage review, and the `parent_session_id`/`run_label` rows all depend on it. Some adapters ship a *built-in* sub-agent tool (Claude's `Task`) that spawns same-lineage sub-agents *inside* the adapter — invisible to the router. The injected protocol explicitly forbids that tool and mandates `delegate_task` with a concrete different-lineage reviewer id, but the router cannot remove the adapter's own tool; a model that ignores the instruction degrades to same-lineage, unobservable orchestration. If you see no delegate rows in the state DB after an orchestrated run, the planner used its native tool — the router detects this, warns inline (`orchestration degraded: …`), and records it (`native_subagent_calls`).
-
-Evaluate orchestrated runs — real per-run cost (from the adapter's own `usage_update.cost`), delegate split, cross-lineage-review presence, and degraded% — with:
-
-```sh
-router-acp report --config router.yaml
-```
-
-See [`ORCHESTRATION.md`](ORCHESTRATION.md) for the full pipeline, the router-mechanism-vs-instruction table, and caveats.
-
 ## Configuration reference
 
 See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete annotated example, or [`examples/router-preferred.yaml`](examples/router-preferred.yaml) for a real four-agent (Claude/Codex/Grok/Kimi) starting config.
+
+> **Migration note.** The `orchestration:` block was removed. A config that still has one fails to load with: "`orchestration` was removed: auto-orchestration is superseded by the `planner` router (`router: planner`, ROUTERS.md). Delete the `orchestration:` block." Delete the block; for plan-then-implement routing use [`router: planner`](ROUTERS.md#planner--two-phase-routing-plan--implement).
 
 ### Routing & classification
 
@@ -406,15 +413,16 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
 | `probe_timeout_ms` | `120000` | Timeout for downstream initialize/probe/session-open calls. |
+| `effort.default` | unset | Reasoning effort (`low` … `max`) used for primary sessions instead of the automatic class/complexity recommendation when nobody asked explicitly (the `router.effort` option or `[router: effort=…]`). See [Reasoning effort](#task-classification). |
+| `effort.max_automatic` | unset | Ceiling on any effort the router picks by itself (automatic or `effort.default`). Explicit requests are never capped. `effort.default` above `effort.max_automatic` is a config error. |
 | `classifier.backend` | `heuristic` | `heuristic` or `local-model`. |
 | `classifier.local_model` | – | e.g. `ollama:qwen3:4b` (or `ollama@host:port:model`); temperature 0, JSON output. Falls back to the heuristic on timeout/parse failure/unavailable runtime. Never uses the seat-backed ACP agents. |
 | `classifier.timeout_ms` | `1500` | Local-model call timeout. |
 | `classifier.rules_file` | built-in | Path to a classifier rules YAML. |
-| `pre_classifier.enabled` | `false` | Replace the heuristic with one authoritative LLM evaluation per session (task class/complexity, `orchestrate`, host `dimensions`). A total miss across every eligible evaluator falls back to the static keyword classifier (confidence 0) so session start is not hard-blocked. |
+| `pre_classifier.enabled` | `false` | Replace the heuristic with one authoritative LLM evaluation per session (task class/complexity, planner phase, host `dimensions`). A total miss across every eligible evaluator falls back to the static keyword classifier (confidence 0) so session start is not hard-blocked. |
 | `pre_classifier.evaluator` | `*haiku*`, `*mini*`, `*flash*` | Preferred cheap-seat globs for the evaluator, in order; widens to any available model if none are eligible. |
 | `pre_classifier.stall_timeout_ms` | `90000` | Max time the evaluator may go with **no streamed progress** before it's treated as a failure and the router tries the next evaluator. Bounds silence, not total run time, so a slow-but-streaming model is still allowed to finish. (`timeout_ms` is a deprecated, ignored field kept only so old configs still load.) |
 | `pre_classifier.disclose` | `true` | Emit `router-acp · pre-class …` disclosure lines. |
-| `pre_classifier.orchestrate_min_confidence` | `0.65` | Minimum `orchestrate.confidence` to act on auto-orchestration (see [Auto-orchestration](#auto-orchestration)). |
 | `pre_classifier.dimensions[]` | `[]` | Host-registered extra decisions returned by the same evaluation: `id`, `description` (evaluator instruction), `min_confidence` (default `0.70`), `act_when` (`{warranted: true}` or `{field, equals}`), `inject_prompt` (text injected into the turn when the dimension acts). |
 | `pre_classifier.evaluator_cwd` | unset | Working directory for the evaluator's throwaway session, replacing the classified session's own cwd (and dropping `additional_directories`) — avoids paying a full project-context load to classify a prompt the project has no bearing on. Unset keeps classifying from the session's own cwd. |
 
@@ -434,7 +442,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `availability_preference.hint_ttl_secs` | `600` | How long a client `router-acp/availability_hint` outranks the router's own poll (per agent). |
 | `availability_preference.headroom_scale_dollars` | `200` | Remaining overage/credit budget, in dollars, at/above which that pool reads fully free. Free included-plan ranking always uses the plan *fraction*, never a dollar estimate (see [Headroom, quarantine, and availability-aware preference](#headroom-quarantine-and-availability-aware-preference)). |
 | `availability_preference.overage_budget_weight` | `0.2` | Weight on the overage-dollar term while free plan still remains (`seat_budget = plan_headroom + overage_budget_weight × overage_signal`); used at full scale once plan is empty. |
-| `agents[].accounts` | `[]` | Named instances with `name`, `env`, optional `priority` and `reserve_capacity`. Lower priority drains first, defaulting to list order. Expand into `agent@account` agents with isolated authentication and usage. |
+| `agents[].accounts` | `[]` | Named instances with `name`, `env`, optional `priority` and `reserve_capacity`. Lower priority drains first; priorities are 1-based and default to list order (1, 2, …). Expand into `agent@account` agents with isolated authentication and usage. |
 | `agents[].account_priority` | unset | Native priority for an expanded account. Lower numbers drain first within the adapter group, before strategy ranking. Explicit picks still respect cordons. |
 | `agents[].account_disabled` / `accounts[].disabled` | `false` | Membership tombstone saved by `/login` deletion. Keeps the adapter template available to add another login while excluding deleted accounts from routing and usage. |
 | `agents[].reserve_capacity.weekly` / `.session` | `0` | Percentage of each included-plan window kept unused, in [0,100]. Positive reserves cordon at `100 - reserve` even when paid overage is available, and require enabled cordoning plus a usage source. Account entries may override this block. |
@@ -459,24 +467,21 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `pinned_versions` | `{}` | Version pinning: `agent/model-id` → `default` or one of that model's `versions[].api_model`. Routing never sees it — the candidate keeps its id in every pool, directive, glob and state row — and the per-request proxy sends the pinned version on the wire, priced (`versions[].pricing`) and scored (`data/scores.yaml` matched against `agent/<pinned api_model>`) as that version. The routing disclosure adds a `pinned version <api_model>` note. A key that is not a declared model, or a version the model does not declare, fails the load. |
 | — pin rejected by the provider | – | When the provider rejects the pinned model's `api_model` (HTTP 400/404 — a version gated behind a newer client, a retired id), the router does **not** fall back to whatever the downstream alias would have served: the session is attributed and priced as the pinned version, so serving a different one silently would be a lie. Instead the provider's error is returned to the adapter verbatim (its message is usually actionable), the session gets a notice, and the candidate is cordoned for `headroom.cordon_default_secs` with the provider's reason — so the picker shows it unavailable, automatic routing drops it, and the next turn routes elsewhere instead of paying the same failing round trip again. Rejections of a router-chosen **alternate** keep the original retry-unchanged recovery: there the pinned model is what the adapter asked for anyway. For a version the score table marks `system_turns: false` (Opus 4.6/4.7, Sonnet 4.6), the proxy folds Claude Code's mid-conversation `role: "system"` turns into user turns and drops the `mid-conversation-system` / `per-turn-control` beta tokens before sending, so the pinned version is never asked for a feature it lacks. A 400 that still rejects a **feature of the request** rather than the model (`… is not supported on this model`, a structured tool-addition turn the proxy cannot fold, `cache_control`) is relayed but does **not** cordon: the adapter re-sends without the feature and the pinned version serves that retry. |
 
-### Delegation & orchestration
+### Delegation
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `delegation.enabled` | `true` | Offer `delegate_task` to pinned sessions. |
-| `delegation.inject_prompt` | `false` | When the tools are actually attached to an ordinary primary session, inject one scoped instruction to use them for suitable bounded work. Re-injected after a model switch; suppressed for orchestration. |
+| `delegation.inject_prompt` | `false` | When the tools are actually attached to an ordinary primary session, inject one scoped instruction to use them for suitable bounded work. Re-injected after a model switch. |
 | `delegation.mcp_catalogs` | `[]` | Host-defined catalog-to-capability policy for first-prompt and bounded-delegate MCP attachment. |
 | `delegation.max_concurrent` | `3` | Concurrent delegated sub-sessions. |
 | `delegation.socket_path` | temp dir | Unix socket the delegate helper connects back on. |
 | `delegation.complexity_cap` | `0.6` | Ceiling on a delegated subtask's classified complexity, so a long, fully-specified brief doesn't misread as maximum difficulty and route every subtask to the priciest candidate. `1.0` disables it. |
+| `delegation.candidate_hints` | `prefer` | `exact`: `hints.candidate` addresses any eligible candidate regardless of tier or agent and fails rather than substituting. See [Host-directed workers](#host-directed-workers). |
+| `delegation.native_subagents` | `forbid` | `allow` removes the ban on provider-native subagent tools from the injected delegation directive. |
+| `delegation.lifecycle_hook` | unset | `{ command, args, timeout_ms, max_continuations }` run with a JSON `delegate_start` / `delegate_turn_end` / `delegate_stop` / `parent_repinned` event on stdin; a failed start refuses the delegate, exit 2 at a turn end sends the worker back. See [Host-directed workers](#host-directed-workers). |
+| `agents[].max_delegates` | unset | Concurrent delegates for this agent (each account seat separately), beside `delegation.max_concurrent`. |
 | `ROUTER_ACP_MCP_CATALOGS` (env) | unset | JSON seed for `delegate_mcp_catalogs` when no client connection can ever send the `router-acp/delegate_mcp_catalogs` notification. Fails open on absent/malformed content. |
-| `orchestration.enabled` | `false` | Auto-orchestrate multi-part task lists: steer/switch to a planner model and inject the decompose→delegate→review protocol. |
-| `orchestration.min_items` | `2` | Smallest detected list size treated as a multi-part task (legacy detector only; the pre-classifier decides via `orchestrate_min_confidence` instead). |
-| `orchestration.planner[]` | frontier globs | Planner/orchestrator candidate globs — they define the pool; the pick is by preference-adjusted quality (`quality + agents[].preference`), glob order breaking ties. |
-| `orchestration.reviewer[]` | frontier globs | Preferred cross-lineage reviewer globs handed to the orchestrator (it should pick a different lineage than the planner). |
-| `orchestration.instructions` | `""` | Opaque host-owned workflow instructions appended to the planner prompt; router-acp does not interpret them. |
-| `orchestration.max_fix_rounds` | `2` | Max review → fix → re-review rounds. |
-| `orchestration.review_confidence` | `0.8` | Planner self-confidence bar (0.0–1.0) for skipping the review pass: strictly above it, the review is skipped with a note. |
 
 ### Per-request LLM proxy
 
@@ -525,11 +530,11 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
 | `agents[].models[]` | – | `id` (must match the downstream selector's value for `config-option`; a `[1m]` suffix difference is accepted), optional `display_name`, `api_model` (provider model id for proxy rewrites; defaults to `id`), `versions`, `cost_rank` (1 = cheapest/least scarce), `auto_eligible`, and optional `pricing`. |
-| `agents[].models[].auto_eligible` | `true` | `false` removes the candidate from every **automatic** selection pool — the `auto`/`pareto-code` strategies, escalation and demotion targets, pre-classifier evaluators, orchestration planner/reviewer globs, skill routes, failover, delegate scoping, and per-request proxy routing — while it stays advertised in `router.candidate` (flagged `auto_eligible: false` in the option's `_meta.router_acp`) and selectable by name via `[router: candidate=…]`/`switch=`. |
+| `agents[].models[].auto_eligible` | `true` | `false` removes the candidate from every **automatic** selection pool — the `auto`/`pareto-code` strategies, escalation and demotion targets, pre-classifier evaluators, skill routes, failover, delegate scoping, and per-request proxy routing — while it stays advertised in `router.candidate` (flagged `auto_eligible: false` in the option's `_meta.router_acp`) and selectable by name via `[router: candidate=…]`/`switch=`. |
 | `agents[].models[].versions` | `[]` | Older provider versions `pinned_versions` may select: each `{ api_model, pricing? }`. `api_model` must be unique and differ from the model's current one. |
 | `agents[].models[].pricing` | – | API-equivalent USD per Mtok: `input_per_mtok`, `output_per_mtok`, and optional `cache_read_per_mtok`/`cache_write_per_mtok` (default to `0.1×`/`1.25×` the input rate when unset). Prices every attributed request and drives the LLM-proxy cache-reprime gate. |
 | `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). When `pre_classifier.enabled`, an evaluator that advertises session modes requires an explicit tool-safe `preclass` entry whose target it advertises; it is applied before the classifier prompt. Mode-less adapters run the evaluator without `session/set_mode`; a tool call from those adapters is cancelled but not cordoned, and routing falls back to the static classifier. |
-| `agents[].lineage` | agent name | Model-company tag (e.g. `anthropic`, `openai`). Orchestration's cross-lineage review requires the reviewer's lineage to differ from the planner's — the intent is a different **company** with different failure modes — so two agents backed by the same vendor should declare the same `lineage`. |
+| `agents[].lineage` | agent name | Model-company tag (e.g. `anthropic`, `openai`). Account seats (`agents[].accounts`) share their base agent's lineage, and `lifecycle_hook` delegate events report it as `lineage`. Two agents backed by the same vendor should declare the same `lineage`. |
 | `agents[].preference` | `0` | Additive utility tie-break for this agent (`auto`) and within-tier tie-break (`pareto-code`). Keep small, e.g. `0.05`. Scaled dynamically by seat availability unless `availability_preference.enabled: false`. |
 
 ## Session modes
@@ -554,7 +559,7 @@ Tip: adapters usually persist auth in your home directory, so it is often easies
 `session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are implemented end-to-end and advertised **only when at least one downstream supports them**:
 
 - `list` merges downstream lists, rewriting downstream ids to router ids via the state file (sessions the router can't route back are omitted).
-- `load`/`resume` require a known router session id in the state file, route to the owning downstream only, rehydrate the pin before any prompt, and relay replayed transcript updates under the router id.
+- `load`/`resume` require a known router session id in the state file, route to the owning downstream only, rehydrate the pin before any prompt, reattach the router's own tools (delegation, managed terminals), and relay replayed transcript updates under the router id. `router-acp prompt --session` does the same without a client (see [Host-directed workers](#host-directed-workers)).
 - `delete` routes to the owning downstream, then removes router state.
 - `close` closes the live downstream session (state-file entries survive so `load`/`resume` keep working when the downstream persists sessions).
 
