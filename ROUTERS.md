@@ -319,8 +319,9 @@ routers:
 
 ## `planner` — two-phase routing (plan → implement)
 
-**In one sentence:** frontier models plan, workhorse models build; the
-session upgrades monotonically from planning to implementation.
+The planner separates workflow phase from model role. `/plan` selects planning
+and `/implement` selects implementation. Either command works after the other.
+Coordinators retain planner models while their children implement assignments.
 
 The `planner` strategy splits a session into two phases, each with its own
 candidate pool:
@@ -372,7 +373,11 @@ model_boosts:
 
 ### Phase transitions
 
-Transitions are **monotonic** — once `Implementation`, never reverted.
+An authentic leading `/plan` or `/implement` takes precedence over classifier
+guesses and skill phase flags. Quoted examples, embedded commands, tool output,
+and internal role invocations cannot change the phase. Arguments and attachments
+are retained as original input receipts. Commands do not grant arbitrary scope,
+merge, deployment, or publication authority.
 
 1. **Skill signal** — `marks_implementation_phase: true` on a
    `skill_routing` entry definitively upgrades (e.g. `/ship-pr`).
@@ -383,51 +388,71 @@ Transitions are **monotonic** — once `Implementation`, never reverted.
    like a build, but no reviewable plan exists yet.
 3. **Heuristic** — high-precision keyword phrases ("implement it", "build
    this", "ship it") in the prompt text.
-4. **Directive** — `[router: phase=implementation]` always applies;
-   `[router: phase=planning]` is rejected if already implementing.
+4. **Directive** — `[router: phase=implementation]` and
+   `[router: phase=planning]` select their requested routing phase. Repository
+   execution still requires an authentic implementation request and admission.
 
-**Entering Planning always injects two things**, on every path that first
-sets the phase (pre-classifier `planning`, `implementation` +
-`plan_ready=false`, heuristic miss, `[router: phase=planning]`, or the
-default first turn):
+Planning uses a repository policy snapshot and six role skills. No ticket
+service is required by the default Markdown policy. A repository can select a
+relative policy file with `routers.planner.profile` and an optional roadmap
+with `routers.planner.roadmap`.
 
-1. The built-in **plan-first protocol** (`[router-acp planner protocol]`):
-   investigate, present a concrete reviewable plan, capture it on a Linear
-   ticket (the planner writes that ticket — never the implementation
-   agent), then ask one structured question. The handoff question is
-   forbidden until the session is ticket-bound. Offer exactly one pair —
-   never both Proceed and Create EPIC in the same question:
-   - Default — the work fits in one PR to the session's repository, even
-     when it also needs PRs in other repositories: `Proceed with
-     implementation` and `Refine the plan`.
-   - Only when the plan needs two or more PRs to that repository:
-     `Create EPIC` and `Refine the plan`. The planning session becomes the
-     epic parent; children run in separate ticket-bound sessions, each
-     child exactly one PR. The option preview lists the children, one
-     numbered line each ending `— 1 PR`. Coordinating stays in Planning;
-     there is no phase switch.
-   One PR is one ticket, never an epic. The choice defaults to Proceed; the router's
-   complexity and confidence numbers are advisory, never a gate. The
-   former coordinate label `Spawn sessions and coordinate` is no longer
-   offered; hosts keep accepting it as a legacy synonym.
-   Implementation edits are forbidden in that turn. The approval question
-   is forbidden until the plan has been presented — there is no "proceed
-   with the current plan?" prompt when no plan exists.
-2. Host `planning_instructions`, if configured.
+| Role | Owner and result |
+| --- | --- |
+| `create-plan` | Parent produces a grounded, reviewable plan. |
+| `select-plan` | Parent admits bounded scope with stable plan/work identities. |
+| `implement-work` | Child produces an exact revision, checks, and evidence. |
+| `review-work` | Parent accepts that revision or returns bounded corrections. |
+| `finish-work` | Same child records the accepted revision's handoff receipts. |
+| `integrate-plan` | Parent verifies required integration and disposition evidence. |
 
-A structured "Proceed" answer is resolved inside the planning model's
-current ACP turn, so it cannot itself switch the pin. The host (Kory Code)
-queues a follow-up user prompt `[router: phase=implementation]` after that
-turn ends. On a pinned planning session that directive upgrades the phase
-**and** queues a `pending_switch` to the best implementation-phase
-candidate (same summarize-and-re-pin as any other switch). Declining or
-choosing `Refine the plan` does not change phase. Choosing
-`Create EPIC` (or the legacy `Spawn sessions and coordinate`) also stays in
-Planning: the host queues an epic coordination brief **without** a
-`[router: phase=…]` directive.
+Each role resolves an explicit `routers.planner.<role>.skill` mapping, then an
+exact repository role name, then bundled Markdown. An invalid explicit mapping
+fails visibly. Discovery supports `.agents/skills`, `.claude/skills`, and
+`.codex/skills`. Canonical aliases deduplicate. Conflicting files fail resolution.
+The source paths, hashes, contents, and effective mapping persist with the run.
+Configuration changes cannot reinterpret an active run.
 
-When any other source upgrades the phase post-pin, the router likewise
-queues a `pending_switch` to the best implementation-phase candidate.
+An explicit repository `/plan` or `/implement` skill remains an entrypoint.
+Its guidance executes once under its owning role. Implementation entrypoint
+guidance reaches the admitted child after selection. Internal role metadata
+prevents command recursion.
+
+```text
+/plan -> create-plan -> reviewable plan
+                          |
+/implement -> select-plan -> isolated child -> parent review
+                                  ^                |
+                                  +-- corrections -+
+                                                   |
+                                     finish-work -> integrate-plan -> refill/complete
+```
+
+The parent uses `planner_workflow` for durable assignments and revision-bound
+receipts. `delegate_task {work_id, task, keep_open:true}` opens an isolated child.
+Plain `delegate_task` remains a cheaper, ephemeral helper. Each durable work
+keeps its child and workspace across replacement attempts. Stale attempts and
+child-authored parent operations are refused. The default allocator creates
+separate clones next to the state database and preserves the repository origin.
+An optional `workspace` command receives a JSON assignment on stdin and returns
+`path`, `lease`, optional `environment`, and optional ACP `mcp_servers`. Host
+rebindings cannot replace the router's lifecycle tools.
+
+Pending input, original attachments, accepted revisions, finishing/integration
+receipts, and wake acknowledgements persist in SQLite. An idle-parent wake has
+bounded retries and cannot infer approval. Disconnecting or cancelling stops
+automatic execution. Resume requires the exact parent identity. `/plan` pauses
+new dispatch while preserving running assignments. `/implement` explicitly
+resumes admitted execution. An empty runnable queue is not completion.
+
+Clients can negotiate `_meta.router_acp.planner_children: true` in their
+initialize capabilities. They receive `router-acp/planner-child-update` and
+child-scoped callbacks. Controls use `router-acp/planner-child` with the exact
+parent `sessionId`, durable `child_id`, and `action` of `prompt`, `cancel`, or
+`close`. A child presentation must never launch another coordinator.
+
+See [consumer migration assets](docs/migrations/planner-skills.md) for Hickory
+and exact Chordzy role templates, rollout, parity tests, drain, and rollback.
 
 ### Coordinator sessions
 
@@ -437,10 +462,9 @@ and supervises implementation sessions) with
 `session/prompt`. The role is sticky: a later prompt without it does not
 clear it. A coordinator:
 
-- stays in **Planning**. Skill `marks_implementation_phase`, the
-  pre-classifier, the phrase heuristic, and `[router: phase=implementation]`
-  are all ignored (the directive is rejected with a notice). A coordinator
-  already in Implementation is pulled back.
+- keeps workflow phase separate from its coordinator role. `/implement` can
+  select child execution and `/plan` can select refinement. Neither changes
+  the parent's planner model role. Classifier/skill guesses cannot remove it.
 - only pins, fails over, crosses over, escalates, demotes, or follows a skill
   route onto a `planning_candidates` match. Per-request
   proxy alternates are filtered the same way. Refusals are disclosed
@@ -469,6 +493,9 @@ cordoned, excluded, or not declared), the strategy falls back to ranking the
 router: planner
 routers:
   planner:
+    profile: markdown
+    # roadmap: ROADMAP.md
+    # finish-work: { skill: ship-pr }  # only if this repository has that skill
     planning_candidates: ["*opus*", "*sol*", "*astra*", "*fable*"]
     implementation_candidates: ["*terra*", "*opus*", "*grok*"]
     easy_planning_candidates: ["*opus*", "*sol*"]
@@ -712,12 +739,16 @@ credentials, and incomplete coverage fails closed.
   substituting another model.
 - **Reasoning effort.** An explicit request (the `router.effort` option or
   `[router: effort=…]`) is used as given and never capped. Otherwise the
-  router recommends a level from the task class and complexity; top-level
+  router uses Medium for routine work. Bounded trivial UI/writing may use Low.
+  High needs concrete difficulty evidence. Labels and prompt length alone do
+  not raise effort. Delegates classify their assigned scope instead of inheriting
+  a parent's inflated effort. Top-level
   `effort.default` replaces that recommendation, and `effort.max_automatic`
   caps any level the router picks by itself (`default` above `max_automatic`
-  is a config error). Without a cap, a long, detailed prompt such as a whole
-  skill's instructions classifies at maximum complexity and runs at
-  `max`/`xhigh` effort.
+  is a config error). Automatic capability resolution never rounds effort up.
+  Native adapters must confirm their setting. The proxy reports the accepted
+  request's wire value through `router-acp/effort-update`, including provider
+  clamps and unchanged fallback bodies. Missing metadata establishes no effort.
 - **Determinism.** Identical inputs and state produce identical decisions —
   ranking has no randomness, and all tie-breaks are stable.
 - **Every decision is disclosed** on the console

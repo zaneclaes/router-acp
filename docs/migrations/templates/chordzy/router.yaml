@@ -1,0 +1,20 @@
+routers:
+  planner:
+    profile: docs/router-planner-policy.md
+    roadmap: Docs/ROADMAP.md
+    create-plan:
+      skill: plan
+    select-plan:
+      skill: select-plan
+    implement-work:
+      skill: implement
+    review-work:
+      skill: review-work
+    finish-work:
+      skill: finish-work
+    integrate-plan:
+      skill: integrate-plan
+    workspace:
+      command: chordzy-planner-workspace
+      args: []
+      timeout_ms: 120000

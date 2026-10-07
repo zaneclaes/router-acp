@@ -146,6 +146,7 @@ pub struct LiveDelegate {
     pub lifecycle: Option<crate::delegate_hook::DelegateEvent>,
     /// Router worker id (`b-…`/`w-…`), also the `worker_handoffs` key.
     pub worker_id: String,
+    pub planner: Option<crate::planner_workflow::WorkerIdentity>,
     /// Turns completed so far, for `delegate_turn_end` events.
     pub turns: u32,
 }
@@ -198,6 +199,7 @@ pub struct RouterSession {
     pub effort_request: Option<EffortLevel>,
     /// Candidate-specific result, recomputed whenever the pin changes.
     pub resolved_effort: Option<EffortResolution>,
+    pub native_effort_options: Vec<SessionConfigOption>,
     /// `[router: version=…]`: the provider version this session runs (see
     /// `Config::resolve_version`). Takes effect on the next request.
     pub version_request: Option<String>,
@@ -206,6 +208,9 @@ pub struct RouterSession {
     pub preferred_candidate: Option<CandidateId>,
     pub pin: Option<PinInfo>,
     pub pinning: bool,
+    /// Per-session activity fence. Idle planner wakes never race a client turn.
+    pub prompt_activity: usize,
+    pub planner_wake_active: bool,
     pub cancelled: bool,
     pub delegate_token: Option<String>,
     /// Route details to attach under `_meta.router_acp` on the first
@@ -338,7 +343,7 @@ pub struct RouterSession {
     // ---- planner two-phase routing ----
     /// Current planner phase when `router: planner` is active. `None` for
     /// non-planner sessions. Only meaningful when `strategy == Planner`.
-    /// Monotonic: once `Implementation`, never reverted.
+    /// Automatic transitions are monotonic; explicit commands can reverse it.
     pub planner_phase: Option<crate::config::PlannerPhase>,
     /// Per-prompt `hard:` / `easy:` planner-pool override. Reset at the
     /// start of every prompt; set only when that prompt carries the prefix.
@@ -392,6 +397,25 @@ impl RouterSession {
         persisted: &crate::state::PersistedSession,
         mcp_servers: Vec<McpServer>,
     ) -> Self {
+        let routing = persisted.routing.as_ref();
+        let saved_effort = routing.and_then(|r| r.get("effort"));
+        let explicit_effort = saved_effort
+            .and_then(|e| e.get("explicit"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        let requested_effort = saved_effort
+            .and_then(|e| e.get("requested"))
+            .and_then(|v| v.as_str())
+            .and_then(EffortLevel::parse)
+            .filter(|e| *e != EffortLevel::Auto);
+        let saved_class = routing
+            .and_then(|r| r.get("class"))
+            .and_then(|v| v.as_str())
+            .and_then(TaskClass::parse);
+        let saved_complexity = routing
+            .and_then(|r| r.get("complexity"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         Self {
             cwd: persisted.cwd.clone(),
             additional_directories: persisted.additional_directories.clone(),
@@ -401,12 +425,19 @@ impl RouterSession {
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
-            effort_request: None,
+            effort_request: if explicit_effort {
+                requested_effort
+            } else {
+                None
+            },
             resolved_effort: None,
+            native_effort_options: Vec::new(),
             version_request: None,
             preferred_candidate: None,
             pin: None,
             pinning: false,
+            prompt_activity: 0,
+            planner_wake_active: false,
             cancelled: false,
             delegate_token: None,
             pending_meta_disclosure: None,
@@ -420,8 +451,8 @@ impl RouterSession {
             turn_last_text_start: 0,
             delegates: Vec::new(),
             pinned_quality: 0.0,
-            task_class: None,
-            task_complexity: 0.0,
+            task_class: saved_class,
+            task_complexity: saved_complexity,
             struggle: 0.0,
             turn_tool_failures: 0,
             turn_counted_tools: HashSet::new(),
@@ -439,8 +470,17 @@ impl RouterSession {
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
             delegation_directive_active: false,
-            preclass_done: false,
-            preclass_profile: None,
+            preclass_done: saved_class.is_some(),
+            preclass_profile: saved_class.map(|class| crate::classifier::TaskProfile {
+                class,
+                complexity: saved_complexity,
+                languages: Vec::new(),
+                effort: if explicit_effort {
+                    Some(automatic_effort(class, saved_complexity))
+                } else {
+                    requested_effort
+                },
+            }),
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             pending_ticket_enrichment_chars: None,
@@ -448,9 +488,14 @@ impl RouterSession {
             elevation_skill: None,
             quiet_turns: 0,
             saw_adapter_cost: false,
-            planner_phase: None,
+            planner_phase: routing
+                .and_then(|r| r.get("planner_phase"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             planner_difficulty: None,
-            coordinator: false,
+            coordinator: routing
+                .and_then(|r| r.get("coordinator"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             pin_user_pick: persisted
                 .routing
                 .as_ref()
@@ -472,10 +517,13 @@ impl RouterSession {
             candidate_override_source: None,
             effort_request: None,
             resolved_effort: None,
+            native_effort_options: Vec::new(),
             version_request: None,
             preferred_candidate: None,
             pin: None,
             pinning: false,
+            prompt_activity: 0,
+            planner_wake_active: false,
             cancelled: false,
             delegate_token: None,
             pending_meta_disclosure: None,
@@ -575,6 +623,10 @@ pub struct Shared {
     /// delegate's state-session id. The LLM proxy reads it in place of the
     /// parent session's effort while that delegate runs.
     pub delegate_effort: Mutex<HashMap<String, crate::candidate::EffortLevel>>,
+    pub planner_deliveries: Mutex<HashMap<String, crate::planner_workflow::PendingDelivery>>,
+    pub planner_child_routes:
+        Mutex<HashMap<(ProcessKey, String), crate::planner_client::ChildRoute>>,
+    pub planner_child_targets: Mutex<HashSet<ProcessKey>>,
     /// Per-agent delegate slots for agents with `max_delegates`, beside the
     /// global `delegate_semaphore`.
     pub agent_delegate_slots: HashMap<String, Arc<tokio::sync::Semaphore>>,
@@ -704,6 +756,9 @@ impl Shared {
             managed_backgrounds: Mutex::new(HashMap::new()),
             background_interrupts: Mutex::new(HashMap::new()),
             delegate_effort: Mutex::new(HashMap::new()),
+            planner_deliveries: Mutex::default(),
+            planner_child_routes: Mutex::default(),
+            planner_child_targets: Mutex::default(),
             agent_delegate_slots,
             worker_handoffs: Mutex::new(HashMap::new()),
             ticket_cache: Mutex::new(HashMap::new()),
@@ -1514,7 +1569,12 @@ pub(crate) fn session_effort(
     if explicit.is_some() {
         return explicit;
     }
-    let chosen = cfg.effort.default.or(automatic)?;
+    let chosen = cfg
+        .effort
+        .default
+        .or(automatic)
+        .unwrap_or(EffortLevel::Medium)
+        .min(EffortLevel::High);
     Some(match cfg.effort.max_automatic {
         Some(cap) if chosen > cap => cap,
         _ => chosen,
@@ -1523,7 +1583,7 @@ pub(crate) fn session_effort(
 
 /// Re-resolve effort for an already pinned session after a user changes the
 /// router-owned effort option. The next provider request reads this state.
-fn refresh_pinned_effort(
+pub(crate) fn refresh_pinned_effort(
     cfg: &crate::config::Config,
     scores: &ScoreTable,
     session: &mut RouterSession,
@@ -1532,8 +1592,14 @@ fn refresh_pinned_effort(
         cfg,
         session.effort_request,
         session
-            .task_class
-            .map(|class| automatic_effort(class, session.task_complexity)),
+            .preclass_profile
+            .as_ref()
+            .and_then(|p| p.effort)
+            .or_else(|| {
+                session
+                    .task_class
+                    .map(|class| automatic_effort(class, session.task_complexity))
+            }),
     );
     let version = session.version_request.as_deref();
     session.resolved_effort = session.pin.as_ref().and_then(|pin| {
@@ -1541,8 +1607,119 @@ fn refresh_pinned_effort(
             Some(v) => CandidateId::new(&pin.candidate.agent, &v.api_model),
             None => pin.candidate.clone(),
         };
-        requested.map(|level| scores.lookup_exact(&key).resolve_effort(level))
+        requested.map(|level| {
+            if session.effort_request.is_some() {
+                scores.lookup_exact(&key).resolve_effort(level)
+            } else {
+                scores.lookup_exact(&key).resolve_automatic_effort(level)
+            }
+        })
     });
+}
+
+fn persist_runtime_context(shared: &Shared, sid: &str) -> Result<(), AcpError> {
+    let patch = shared.with_session(sid, |s| json!({
+        "candidate": s.pin.as_ref().map(|p| p.candidate.to_string()),
+        "planner_phase": s.planner_phase,
+        "coordinator": s.coordinator,
+        "effort": {
+            "requested": s.resolved_effort.as_ref().map(|r| r.requested.as_str()),
+            "resolved": s.resolved_effort.as_ref().and_then(|r| r.resolved.map(EffortLevel::as_str)),
+            "provider_value": s.resolved_effort.as_ref().and_then(|r| r.provider_value.clone()),
+            "confirmed": s.resolved_effort.as_ref().is_some_and(|r| r.confirmed),
+            "explicit": s.effort_request.is_some(),
+            "source": if s.effort_request.is_some() { "human" } else { "automatic" }
+        }
+    })).ok_or_else(|| AcpError::internal_error().data("session disappeared"))?;
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .patch_session_routing(sid, &patch)
+        .map_err(|e| AcpError::internal_error().data(e))?;
+    shared.with_session(sid, |s| {
+        let pending = s.pending_meta_disclosure.get_or_insert_with(|| json!({}));
+        if let (Some(pending), Some(patch)) = (pending.as_object_mut(), patch.as_object()) {
+            pending.extend(patch.clone());
+        }
+    });
+    Ok(())
+}
+
+/// Without the HTTP proxy, advertise only effort the adapter confirms.
+/// A score-table mapping alone is not proof that a provider request used it.
+pub(crate) async fn apply_native_effort(
+    shared: &Shared,
+    candidate: &CandidateId,
+    conn: &ConnectionTo<AgentPeer>,
+    downstream_sid: &str,
+    options: &[SessionConfigOption],
+    resolution: &mut EffortResolution,
+    explicit: bool,
+) -> Result<(), AcpError> {
+    if shared.llm_proxy.enabled()
+        && shared
+            .runtime_config()
+            .agents
+            .iter()
+            .any(|a| a.name == candidate.agent && a.llm_proxy.is_some())
+    {
+        return Ok(());
+    }
+    let option = options.iter().find(|o| {
+        matches!(
+            o.id.0.as_ref(),
+            "reasoning_effort" | "reasoningEffort" | "effort"
+        )
+    });
+    let value = option.and_then(|o| {
+        let values = select_values(o);
+        resolution
+            .provider_value
+            .clone()
+            .filter(|v| values.contains(v))
+            .or_else(|| {
+                resolution
+                    .resolved
+                    .or(Some(resolution.requested))
+                    .map(EffortLevel::as_str)
+                    .filter(|v| values.iter().any(|s| s == v))
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                values
+                    .iter()
+                    .filter_map(|value| EffortLevel::parse(value).map(|level| (level, value)))
+                    .filter(|(level, _)| {
+                        *level != EffortLevel::Auto && (explicit || *level <= resolution.requested)
+                    })
+                    .min_by_key(|(level, _)| {
+                        (resolution.requested as i16 - *level as i16).unsigned_abs()
+                    })
+                    .map(|(_, value)| value.clone())
+            })
+    });
+    if let (Some(option), Some(value)) = (option, value) {
+        let response = conn
+            .send_request(SetSessionConfigOptionRequest::new(
+                downstream_sid.to_string(),
+                option.id.clone(),
+                SessionConfigOptionValue::value_id(value.clone()),
+            ))
+            .block_task()
+            .await?;
+        verify_model_selected(&response.config_options, &option.id, &value).map_err(|e| {
+            AcpError::internal_error().data(format!("effort verification failed: {e}"))
+        })?;
+        resolution.resolved = EffortLevel::parse(&value).or(resolution.resolved);
+        resolution.provider_value = Some(value);
+        resolution.confirmed = true;
+    } else {
+        resolution.resolved = None;
+        resolution.provider_value = None;
+        resolution.confirmed = false;
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -1646,6 +1823,13 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         .get("sessionUpdate")
         .and_then(|k| k.as_str())
         .unwrap_or("");
+    if matches!(
+        kind,
+        "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"
+    ) && let Err(error) = crate::planner_workflow::confirm_delivery(shared, router_sid)
+    {
+        tracing::warn!(session = router_sid, %error, "could not persist original input delivery");
+    }
     let entry = match kind {
         "tool_call" | "tool_call_update" => {
             let tool_call_id = update
@@ -2171,6 +2355,43 @@ fn client_has_form_elicitation(shared: &Shared) -> bool {
         .is_some_and(|caps| caps.form.is_some())
 }
 
+fn track_approval(
+    shared: &Arc<Shared>,
+    sid: &str,
+    down_sid: &str,
+    method: &str,
+    responder: Responder<Value>,
+) -> Result<Responder<Value>, AcpError> {
+    if !matches!(
+        method,
+        "session/request_permission" | "elicitation/create" | "_x.ai/ask_user_question"
+    ) {
+        return Ok(responder);
+    }
+    let id = format!("{down_sid}:{}", responder.id());
+    crate::planner_wake::approval_started(shared, sid, &id)
+        .map_err(|e| AcpError::internal_error().data(e))?;
+    let shared = shared.clone();
+    let sid = sid.to_string();
+    Ok(responder.wrap_params(move |_, result| {
+        if result.is_ok() {
+            crate::planner_wake::approval_answered(&shared, &sid, &id)
+                .map_err(|e| AcpError::internal_error().data(e))?;
+        } else if crate::planner_workflow::load(&shared, &sid)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            crate::planner_workflow::mutate(&shared, &sid, |run| {
+                run.status = crate::planner_workflow::RunStatus::Paused;
+                Ok(())
+            })
+            .map_err(|e| AcpError::internal_error().data(e))?;
+        }
+        result
+    }))
+}
+
 /// Translate Grok's `_x.ai/ask_user_question` into `elicitation/create` and
 /// map the client's form result back into Grok's `{outcome, answers}` shape.
 fn forward_xai_ask(
@@ -2477,6 +2698,7 @@ pub fn handle_downstream_dispatch(
             Dispatch::Request(msg, responder) => {
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
+                let responder = track_approval(shared, &router_sid, &down_sid, &method, responder)?;
                 // Escalation router: a file read is investigation; a write or
                 // a terminal command is a side effect that locks out mid-turn
                 // escalation.
@@ -2522,6 +2744,20 @@ pub fn handle_downstream_dispatch(
                 // Sub-agent transcript streaming is not interleaved into the
                 // parent transcript; capture agent text for the tool result.
                 if msg.method() == "session/update" {
+                    let child = shared
+                        .planner_child_routes
+                        .lock()
+                        .unwrap()
+                        .get(&(key.clone(), down_sid.clone()))
+                        .cloned();
+                    if let Some(child) = child {
+                        crate::planner_client::notify(
+                            shared,
+                            &child,
+                            "progress",
+                            Some(msg.params().clone()),
+                        )?;
+                    }
                     if let Some(text) = agent_chunk_text(msg.params()) {
                         capture.lock().unwrap().push_str(&text);
                         let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
@@ -2563,6 +2799,19 @@ pub fn handle_downstream_dispatch(
                 // Permission/fs/terminal callbacks go live to the client
                 // under the parent router session id.
                 let method = msg.method().to_string();
+                let responder =
+                    track_approval(shared, &parent_router_sid, &down_sid, &method, responder)?;
+                let client_sid = if crate::planner_client::supported(shared) {
+                    shared
+                        .planner_child_routes
+                        .lock()
+                        .unwrap()
+                        .get(&(key.clone(), down_sid.clone()))
+                        .map(|r| r.child_id.clone())
+                        .unwrap_or_else(|| parent_router_sid.clone())
+                } else {
+                    parent_router_sid.clone()
+                };
                 // Permission callbacks are forwarded to the parent relay for
                 // silent compatibility handling, but never persisted as
                 // visible delegate activity. Dangerous mode should make them
@@ -2585,13 +2834,11 @@ pub fn handle_downstream_dispatch(
                     && client_has_form_elicitation(shared)
                     && let Some(parsed) = crate::xai_questions::parse_request(msg.params())
                 {
-                    forward_xai_ask(shared, &upstream, parsed, responder, &parent_router_sid)?;
+                    forward_xai_ask(shared, &upstream, parsed, responder, &client_sid)?;
                     return Ok(Handled::Yes);
                 }
-                let fwd = relay::normalize_terminal_create(&relay::with_session_id(
-                    &msg,
-                    &parent_router_sid,
-                )?)?;
+                let fwd =
+                    relay::normalize_terminal_create(&relay::with_session_id(&msg, &client_sid)?)?;
                 upstream.send_request(fwd).forward_response_to(responder)?;
                 Ok(Handled::Yes)
             }
@@ -2708,6 +2955,7 @@ pub struct OpenedSession {
     pub downstream_sid: String,
     /// Session modes advertised by the downstream at creation.
     pub modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
+    pub config_options: Vec<SessionConfigOption>,
 }
 
 /// Create a downstream session for `candidate`, verify model selection, and
@@ -2773,6 +3021,27 @@ async fn open_downstream_session_once(
         .candidate_runtime(candidate)
         .ok_or_else(|| AcpError::invalid_params().data(format!("unknown candidate {candidate}")))?;
     let key = runtime.process_key.clone();
+    open_downstream_session_at(
+        shared,
+        candidate,
+        key,
+        cwd,
+        additional_directories,
+        mcp_servers,
+        route,
+    )
+    .await
+}
+
+pub(crate) async fn open_downstream_session_at(
+    shared: &Arc<Shared>,
+    candidate: &CandidateId,
+    key: ProcessKey,
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+    route: DownstreamRoute,
+) -> Result<OpenedSession, AcpError> {
     ensure_target_ready(shared, candidate, &key).await?;
     let conn = shared.target_conn(&key).ok_or_else(|| {
         AcpError::internal_error().data(format!("no live downstream process for {candidate}"))
@@ -2795,26 +3064,57 @@ async fn open_downstream_session_once(
     let (tx, rx) = futures::channel::oneshot::channel();
     let reg_shared = shared.clone();
     let reg_key = key.clone();
+    let reg_conn = conn.clone();
+    // Fence a late response against the timeout. Both registration and
+    // expiry use this lock so a timed-out open cannot leave an orphan route.
+    let completion = Arc::new(Mutex::new((false, None::<String>)));
+    let reg_completion = completion.clone();
     conn.send_request(new_req)
         .on_receiving_result(move |result| {
             let result: Result<NewSessionResponse, AcpError> = result;
             async move {
                 if let Ok(resp) = &result {
-                    reg_shared.register_route(&reg_key, &sid_str(&resp.session_id), route);
+                    let downstream_sid = sid_str(&resp.session_id);
+                    let mut completion = reg_completion.lock().unwrap();
+                    if completion.0 {
+                        drop(completion);
+                        cleanup_failed_session(&reg_shared, &reg_key, &reg_conn, &downstream_sid);
+                    } else {
+                        reg_shared.register_route(&reg_key, &downstream_sid, route);
+                        completion.1 = Some(downstream_sid);
+                    }
                 }
                 let _ = tx.send(result);
                 Ok(())
             }
         })?;
     let timeout = std::time::Duration::from_millis(shared.cfg.probe_timeout_ms);
-    let resp = tokio::time::timeout(timeout, rx)
+    let result = tokio::time::timeout(timeout, rx)
         .await
         .map_err(|_| {
             AcpError::internal_error().data(format!("session/new on {candidate} timed out"))
-        })?
-        .map_err(|_| AcpError::internal_error().data("downstream connection closed"))??;
+        })
+        .and_then(|r| {
+            r.map_err(|_| AcpError::internal_error().data("downstream connection closed"))
+        })
+        .and_then(|r| r);
+    let resp = match result {
+        Ok(resp) => resp,
+        Err(error) => {
+            let downstream_sid = {
+                let mut completion = completion.lock().unwrap();
+                completion.0 = true;
+                completion.1.take()
+            };
+            if let Some(downstream_sid) = downstream_sid {
+                cleanup_failed_session(shared, &key, &conn, &downstream_sid);
+            }
+            return Err(error);
+        }
+    };
     let downstream_sid = sid_str(&resp.session_id);
     let modes = resp.modes.clone();
+    let mut config_options = resp.config_options.clone().unwrap_or_default();
 
     // Apply and verify model selection for config-option targets. The
     // set_config_option response is authoritative; no notification needed.
@@ -2845,6 +3145,7 @@ async fn open_downstream_session_once(
                     return Err(AcpError::internal_error()
                         .data(format!("model verification failed for {candidate}: {msg}")));
                 }
+                config_options = set_resp.config_options;
             }
             Err(err) => {
                 cleanup_failed_session(shared, &key, &conn, &downstream_sid);
@@ -2858,6 +3159,7 @@ async fn open_downstream_session_once(
         process_key: key,
         downstream_sid,
         modes,
+        config_options,
     })
 }
 
@@ -2881,6 +3183,14 @@ fn cleanup_failed_session(
 /// Best-effort close of a downstream session.
 pub fn close_downstream_session(shared: &Arc<Shared>, key: &ProcessKey, downstream_sid: &str) {
     shared.unregister_route(key, downstream_sid);
+    let child = shared
+        .planner_child_routes
+        .lock()
+        .unwrap()
+        .remove(&(key.clone(), downstream_sid.into()));
+    if let Some(child) = child {
+        let _ = crate::planner_client::notify(shared, &child, "idle", None);
+    }
     if let Some(conn) = shared.target_conn(key) {
         let supports_close = shared
             .target_init(key)
@@ -2890,6 +3200,11 @@ pub fn close_downstream_session(shared: &Arc<Shared>, key: &ProcessKey, downstre
             conn.send_request(CloseSessionRequest::new(downstream_sid.to_string()))
                 .detach();
         }
+    }
+    if shared.planner_child_targets.lock().unwrap().remove(key)
+        && let Some(target) = shared.targets.lock().unwrap().remove(key)
+    {
+        target.stop.cancel();
     }
 }
 
@@ -2918,6 +3233,29 @@ fn git_head(cwd: &std::path::Path) -> (Option<String>, Option<String>) {
 /// Close any delegate sub-sessions kept open (`keep_open`) under a parent
 /// session, when that parent is closed or deleted, so they don't leak.
 pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
+    crate::delegate_mcp::drop_parent_tokens(shared, router_sid);
+    let handles = shared
+        .with_session(router_sid, |s| {
+            s.cancelled = true;
+            std::mem::take(&mut s.delegates)
+        })
+        .unwrap_or_default();
+    if crate::planner_workflow::load(shared, router_sid)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = crate::planner_workflow::mutate(shared, router_sid, |run| {
+            run.status = crate::planner_workflow::RunStatus::Paused;
+            Ok(())
+        });
+    }
+    for handle in handles {
+        if let Some(conn) = shared.target_conn(&handle.process_key) {
+            let _ = conn.send_notification(CancelNotification::new(handle.downstream_sid.clone()));
+        }
+        close_downstream_session(shared, &handle.process_key, &handle.downstream_sid);
+    }
     let orphans: Vec<LiveDelegate> = {
         let mut live = shared.live_delegates.lock().unwrap();
         let ids: Vec<String> = live
@@ -3725,7 +4063,7 @@ async fn pin_session(
     shared: &Arc<Shared>,
     router_sid: &str,
     prompt: &[ContentBlock],
-    cancellation: &RequestCancellation,
+    cancellation: Option<&RequestCancellation>,
     exclude: Option<&CandidateId>,
     is_failover: bool,
     larger_context_than: Option<u64>,
@@ -3837,7 +4175,11 @@ async fn pin_session(
         required_caps: required,
         explicit_candidate: override_.clone(),
         explicit_source: override_source,
-        planner_phase,
+        planner_phase: if coordinator {
+            Some(crate::config::PlannerPhase::Planning)
+        } else {
+            planner_phase
+        },
         planner_difficulty,
     };
 
@@ -4068,7 +4410,7 @@ async fn pin_session(
     let mut skipped: Vec<(CandidateId, String)> = Vec::new();
     let mut last_err: Option<AcpError> = None;
     for rc in ranked {
-        if cancellation.is_cancelled()
+        if cancellation.is_some_and(RequestCancellation::is_cancelled)
             || shared
                 .with_session(router_sid, |s| s.cancelled)
                 .unwrap_or(false)
@@ -4112,11 +4454,38 @@ async fn pin_session(
                         .flatten(),
                     profile.effort.filter(|level| *level != EffortLevel::Auto),
                 );
-                let resolved_effort = requested_effort.map(|level| {
-                    shared
-                        .scores_for(router_sid, &candidate)
-                        .resolve_effort(level)
+                let explicit_effort = shared
+                    .with_session(router_sid, |s| s.effort_request.is_some())
+                    .unwrap_or(false);
+                let mut resolved_effort = requested_effort.map(|level| {
+                    let scores = shared.scores_for(router_sid, &candidate);
+                    if explicit_effort {
+                        scores.resolve_effort(level)
+                    } else {
+                        scores.resolve_automatic_effort(level)
+                    }
                 });
+                if let Some(resolution) = &mut resolved_effort
+                    && let Err(err) = apply_native_effort(
+                        shared,
+                        &candidate,
+                        &opened.conn,
+                        &opened.downstream_sid,
+                        &opened.config_options,
+                        resolution,
+                        explicit_effort,
+                    )
+                    .await
+                {
+                    cleanup_failed_session(
+                        shared,
+                        &opened.process_key,
+                        &opened.conn,
+                        &opened.downstream_sid,
+                    );
+                    crate::delegate_mcp::drop_parent_tokens(shared, router_sid);
+                    return Err(err);
+                }
                 let mode_to_apply = shared
                     .with_session(router_sid, |s| {
                         let previous = s.pin.replace(PinInfo {
@@ -4139,6 +4508,7 @@ async fn pin_session(
                         s.task_class = Some(profile.class);
                         s.task_complexity = profile.complexity;
                         s.resolved_effort = resolved_effort.clone();
+                        s.native_effort_options = opened.config_options.clone();
                         s.struggle = 0.0;
                         // Deferred pre-pin mode wins; on failover re-apply
                         // whatever the client had set for this session.
@@ -4285,8 +4655,13 @@ async fn pin_session(
                         "requested": requested_effort.map(EffortLevel::as_str),
                         "resolved": resolved_effort.as_ref().and_then(|effort| effort.resolved.map(EffortLevel::as_str)),
                         "provider_value": resolved_effort.as_ref().and_then(|effort| effort.provider_value.clone()),
+                        "confirmed": resolved_effort.as_ref().is_some_and(|effort| effort.confirmed),
                         "explicit": shared.with_session(router_sid, |s| s.effort_request.is_some()).unwrap_or(false),
+                        "source": if explicit_effort { "human" } else if shared.cfg.effort.default.is_some() { "configured-default" } else { "automatic" },
+                        "reason": if explicit_effort { "explicit human request" } else if requested_effort == Some(EffortLevel::High) { "difficulty evidence or configured default, bounded by automatic ceiling" } else { "routine baseline or bounded trivial task" },
                     },
+                    "planner_phase": shared.with_session(router_sid, |s| s.planner_phase),
+                    "coordinator": shared.with_session(router_sid, |s| s.coordinator).unwrap_or(false),
                     "languages": profile.languages,
                     "reason": rc.reason,
                     "weights": rc.weights,
@@ -4430,7 +4805,7 @@ async fn pin_session(
                     s.pending_meta_disclosure = Some(details);
                 });
 
-                if cancellation.is_cancelled()
+                if cancellation.is_some_and(RequestCancellation::is_cancelled)
                     || shared
                         .with_session(router_sid, |s| s.cancelled)
                         .unwrap_or(false)
@@ -4441,6 +4816,7 @@ async fn pin_session(
                 return Ok(PinOutcome::Pinned);
             }
             Err(err) => {
+                crate::delegate_mcp::drop_parent_tokens(shared, router_sid);
                 tracing::warn!(
                     candidate = %candidate,
                     error = %err,
@@ -4724,7 +5100,7 @@ mod effort_policy_tests {
         let none = cfg("");
         assert_eq!(
             session_effort(&none, None, Some(EffortLevel::Max)),
-            Some(EffortLevel::Max)
+            Some(EffortLevel::High)
         );
         let policy = cfg("effort: { default: medium, max_automatic: high }\n");
         // The default replaces the automatic recommendation...
@@ -4829,7 +5205,7 @@ async fn send_primary_prompt(
     candidate: &CandidateId,
     conn: Option<ConnectionTo<AgentPeer>>,
     fwd: PromptRequest,
-    cancellation: RequestCancellation,
+    cancellation: Option<RequestCancellation>,
 ) -> (Result<PromptResponse, AcpError>, Option<String>) {
     let unavailable = |reason: String| {
         (
@@ -4844,9 +5220,10 @@ async fn send_primary_prompt(
         return unavailable("downstream session is no longer live after an adapter outage".into());
     };
     let down_sid = fwd.session_id.clone();
-    let sent = conn
-        .send_request(fwd)
-        .forward_cancellation_from(cancellation.clone());
+    let mut sent = conn.send_request(fwd);
+    if let Some(cancellation) = &cancellation {
+        sent = sent.forward_cancellation_from(cancellation.clone());
+    }
     let reply = sent.block_task();
     tokio::pin!(reply);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -4854,7 +5231,7 @@ async fn send_primary_prompt(
         tokio::select! {
             result = &mut reply => return (result, None),
             _ = tick.tick() => {
-                if cancellation.is_cancelled() || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true) {
+                if cancellation.as_ref().is_some_and(RequestCancellation::is_cancelled) || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
                     return (Ok(PromptResponse::new(StopReason::Cancelled)), None);
                 }
@@ -5026,7 +5403,31 @@ async fn send_prompt_with_failover(
     req: PromptRequest,
     responder: Responder<PromptResponse>,
 ) -> Result<(), AcpError> {
+    let result = run_primary_turn(shared, router_sid, req, Some(responder.cancellation())).await;
+    responder.respond_with_result(result)
+}
+
+pub(crate) async fn run_primary_turn(
+    shared: Arc<Shared>,
+    router_sid: String,
+    mut req: PromptRequest,
+    cancellation: Option<RequestCancellation>,
+) -> Result<PromptResponse, AcpError> {
     use crate::limits::{FailureClass, classify_failure};
+
+    // Router-owned turns enter without dispatch_prompt. They still honor the
+    // same live account and repository skill policy as ordinary client turns.
+    if shared
+        .with_session(&router_sid, |s| s.planner_wake_active)
+        .unwrap_or(false)
+    {
+        crate::auth::refresh_before_selection(&shared).await;
+        revive_dead_targets(&shared).await;
+        req = crate::tickets::enrich_prompt(&shared, &router_sid, req).await;
+        if let Some(route) = detect_prompt_skill_route(&shared, &router_sid, &req) {
+            apply_skill_route(&shared, &router_sid, route);
+        }
+    }
 
     // A requested/auto-detected model switch fires here, before this turn is
     // forwarded, so the prompt lands on the new model. The current model first
@@ -5062,7 +5463,7 @@ async fn send_prompt_with_failover(
                     ),
                 );
                 flush_pending_disclosure(&shared, &router_sid);
-                return responder.respond_with_error(e);
+                return Err(e);
             }
             Err(e) => notify_user(
                 &shared,
@@ -5099,10 +5500,8 @@ async fn send_prompt_with_failover(
             })
             .flatten()
         else {
-            return responder.respond_with_error(
-                AcpError::internal_error()
-                    .data("session has no live downstream (its process may have died)"),
-            );
+            return Err(AcpError::internal_error()
+                .data("session has no live downstream (its process may have died)"));
         };
         let conn = shared
             .route_for(&process_key, &down_sid)
@@ -5214,6 +5613,43 @@ async fn send_prompt_with_failover(
             .with_session(&router_sid, |session| session.task_class)
             .flatten()
             .unwrap_or(TaskClass::CodingGeneral);
+        let native = shared.with_session(&router_sid, |s| {
+            (
+                s.resolved_effort.clone(),
+                s.native_effort_options.clone(),
+                s.effort_request.is_some(),
+            )
+        });
+        if let (Some((Some(mut resolution), options, explicit)), Some(native_conn)) =
+            (native, conn.as_ref())
+        {
+            apply_native_effort(
+                &shared,
+                &candidate,
+                native_conn,
+                &down_sid,
+                &options,
+                &mut resolution,
+                explicit,
+            )
+            .await?;
+            shared.with_session(&router_sid, |s| s.resolved_effort = Some(resolution));
+        }
+        persist_runtime_context(&shared, &router_sid)?;
+        // Disclose the confirmed effort before the model starts. Tool-only
+        // opening turns must not leave clients waiting for a prose chunk.
+        if let (Some(upstream), Some(details)) =
+            (shared.upstream(), shared.take_meta_disclosure(&router_sid))
+        {
+            let notice = agent_client_protocol::UntypedMessage::new(
+                "session/update",
+                json!({
+                    "sessionId":router_sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":""}},
+                    "_meta":{"router_acp":details}
+                }),
+            )?;
+            upstream.send_notification(notice)?;
+        }
         let _llm_turn = shared.llm_proxy.begin_turn(
             process_key.clone(),
             router_sid.clone(),
@@ -5229,13 +5665,22 @@ async fn send_prompt_with_failover(
         let turn_start = std::time::Instant::now();
         // A save failure belongs to the turn that hit it, never to later ones.
         shared.with_session(&router_sid, |s| s.persistence_error = None);
+        if let Some(input_id) = crate::planner_workflow::prompt_input_id(&req) {
+            crate::planner_workflow::queue_delivery(
+                &shared,
+                &router_sid,
+                &router_sid,
+                &router_sid,
+                vec![input_id.into()],
+            );
+        }
         let (result, unavailability) = send_primary_prompt(
             &shared,
             &router_sid,
             &candidate,
             conn,
             fwd,
-            responder.cancellation(),
+            cancellation.clone(),
         )
         .await;
         // A failed/cancelled send cannot discard the restored conversation.
@@ -5247,6 +5692,33 @@ async fn send_prompt_with_failover(
                 .unwrap_or(true)
         {
             shared.with_session(&router_sid, |s| s.pending_history = history);
+        }
+        if result.is_ok() {
+            crate::planner_workflow::confirm_delivery(&shared, &router_sid)
+                .map_err(|e| AcpError::internal_error().data(e))?;
+        }
+        shared
+            .planner_deliveries
+            .lock()
+            .unwrap()
+            .remove(&router_sid);
+        if (result.is_ok()
+            || shared
+                .with_session(&router_sid, |s| s.turn_saw_output)
+                .unwrap_or(false))
+            && let Some(input_id) = crate::planner_workflow::prompt_input_id(&req)
+            && crate::planner_workflow::load(&shared, &router_sid)
+                .ok()
+                .flatten()
+                .is_some()
+            && let Err(e) = crate::planner_workflow::mark_input_delivered(
+                &shared,
+                &router_sid,
+                input_id,
+                &router_sid,
+            )
+        {
+            return Err(AcpError::internal_error().data(e));
         }
         {
             let state = shared.state.lock().unwrap();
@@ -5262,12 +5734,14 @@ async fn send_prompt_with_failover(
 
         // A human cancellation is never provider-health evidence and never
         // triggers a replacement, even if the adapter reports a transport error.
-        if responder.cancellation().is_cancelled()
+        if cancellation
+            .as_ref()
+            .is_some_and(RequestCancellation::is_cancelled)
             || shared
                 .with_session(&router_sid, |s| s.cancelled)
                 .unwrap_or(true)
         {
-            return responder.respond(PromptResponse::new(StopReason::Cancelled));
+            return Ok(PromptResponse::new(StopReason::Cancelled));
         }
 
         // Mid-turn escalation: the relay flagged it (and interrupted this turn)
@@ -5443,13 +5917,15 @@ async fn send_prompt_with_failover(
                 // snapshot (self-throttled and fire-and-forget; never delays
                 // the turn).
                 crate::usage::refresh_after_turn(&shared, &candidate.agent);
-                return responder.respond(resp);
+                return Ok(resp);
             }
             Err(err) => {
                 let partial_work = shared
                     .with_session(&router_sid, |s| s.turn_saw_output || s.turn_side_effect)
                     .unwrap_or(false);
-                let cancelled = responder.cancellation().is_cancelled()
+                let cancelled = cancellation
+                    .as_ref()
+                    .is_some_and(RequestCancellation::is_cancelled)
                     || shared
                         .with_session(&router_sid, |s| s.cancelled)
                         .unwrap_or(false);
@@ -5545,7 +6021,7 @@ async fn send_prompt_with_failover(
                     // The turn ends in error, so no model chunk will carry the
                     // queued notice — flush it as its own chunk now.
                     flush_pending_disclosure(&shared, &router_sid);
-                    return responder.respond_with_error(err);
+                    return Err(err);
                 }
 
                 tracing::warn!(
@@ -5660,7 +6136,7 @@ async fn send_prompt_with_failover(
                     &shared,
                     &router_sid,
                     &req.prompt,
-                    &responder.cancellation(),
+                    cancellation.as_ref(),
                     Some(&candidate),
                     true,
                     larger_context_than,
@@ -5669,7 +6145,7 @@ async fn send_prompt_with_failover(
                 {
                     Ok(PinOutcome::Pinned) => continue,
                     Ok(PinOutcome::Cancelled) => {
-                        return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                        return Ok(PromptResponse::new(StopReason::Cancelled));
                     }
                     Err(pin_err) => {
                         notify_user(
@@ -5678,15 +6154,13 @@ async fn send_prompt_with_failover(
                             format!("router-acp · no fallback candidate available — {pin_err}"),
                         );
                         flush_pending_disclosure(&shared, &router_sid);
-                        return responder.respond_with_error(pin_err);
+                        return Err(pin_err);
                     }
                 }
             }
         }
     }
-    responder.respond_with_error(
-        AcpError::internal_error().data("all failover attempts exhausted for this prompt"),
-    )
+    Err(AcpError::internal_error().data("all failover attempts exhausted for this prompt"))
 }
 
 /// True when a human chose `candidate` for this session.
@@ -5761,7 +6235,7 @@ fn adopt_capacity_substitute(shared: &Arc<Shared>, router_sid: &str, failed: &Ca
 
 /// True when `pattern` (an exact `agent/model` id, a glob like `*opus*`, or a
 /// bare agent name) designates `candidate`.
-fn candidate_matches(pattern: &str, candidate: &CandidateId) -> bool {
+pub(crate) fn candidate_matches(pattern: &str, candidate: &CandidateId) -> bool {
     pattern.eq_ignore_ascii_case(&candidate.agent)
         || crate::candidate::glob_match(pattern, &candidate.to_string())
 }
@@ -6085,7 +6559,10 @@ fn prompt_mentions_skill(text_lower: &str, pattern: &str) -> bool {
 /// The first configured skill route whose pattern the prompt invokes. Code spans
 /// are stripped first so a skill *mentioned* in code/examples (e.g. a UI prompt
 /// describing `` `/ship-pr` `` autocomplete) does not hijack routing.
-fn detect_skill_route<'a>(cfg: &'a Config, prompt: &[ContentBlock]) -> Option<&'a SkillRoute> {
+pub(crate) fn detect_skill_route<'a>(
+    cfg: &'a Config,
+    prompt: &[ContentBlock],
+) -> Option<&'a SkillRoute> {
     if cfg.skill_routing.is_empty() {
         return None;
     }
@@ -6153,17 +6630,23 @@ fn enter_planning_phase(shared: &Arc<Shared>, router_sid: &str) {
         return;
     }
     let protocol = crate::strategies::planner::planner_plan_protocol();
-    let host = shared.cfg.routers.planner.planning_instructions.clone();
+    let role = crate::planner_workflow::ensure(shared, router_sid).map(|run| {
+        run.policy
+            .instructions(crate::planner_skills::PlannerRole::CreatePlan)
+    });
     shared.with_session(router_sid, |s| {
         s.planner_phase = Some(PlannerPhase::Planning);
+        s.pending_injects
+            .retain(|p| !p.starts_with("[router-acp planner"));
         s.pending_injects.push(protocol);
-        if !host.is_empty() {
-            s.pending_injects.push(host);
+        if let Ok(role) = role {
+            s.pending_injects.push(role);
         }
     });
 }
 
-/// Determine the planner phase for this turn and apply a monotonic upgrade
+/// Determine the automatic planner phase for this turn. Explicit commands
+/// are handled before expansion and can select either phase at any time.
 /// to the session when warranted. Called from `dispatch_prompt` right
 /// alongside skill routing.
 ///
@@ -6180,8 +6663,7 @@ fn enter_planning_phase(shared: &Arc<Shared>, router_sid: &str) {
 /// [`enter_planning_phase`] so the built-in protocol and host
 /// `planning_instructions` always land together.
 ///
-/// The session's `planner_phase` is monotonic: once `Implementation`, it
-/// stays there. Returns `true` when a mid-session switch to a new
+/// Automatic transitions remain monotonic. Returns `true` when a switch to a new
 /// implementation-phase model should be queued.
 fn maybe_update_planner_phase(
     shared: &Arc<Shared>,
@@ -6200,13 +6682,15 @@ fn maybe_update_planner_phase(
     if strategy != StrategyKind::Planner {
         return false;
     }
-    // A coordinator never leaves Planning: skill, pre-class, and heuristic
-    // upgrades are all ignored.
+    // A coordinator retains its planner models. Explicit workflow phase is
+    // independent of that role, and heuristics cannot overwrite it.
     if shared
         .with_session(router_sid, |s| s.coordinator)
         .unwrap_or(false)
     {
-        enter_planning_phase(shared, router_sid);
+        if current.is_none() {
+            enter_planning_phase(shared, router_sid);
+        }
         return false;
     }
     // Already implementation — monotonic, nothing to do.
@@ -6983,7 +7467,7 @@ async fn switch_pin(
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     let (mcp_servers, delegate_attached) =
         mcp_servers_for_pin(shared, router_sid, target, &client_mcp)?;
-    let opened = open_downstream_session(
+    let opening = open_downstream_session(
         shared,
         target,
         cwd,
@@ -6993,7 +7477,14 @@ async fn switch_pin(
             router_sid: router_sid.to_string(),
         },
     )
-    .await?;
+    .await;
+    let opened = match opening {
+        Ok(opened) => opened,
+        Err(error) => {
+            crate::delegate_mcp::drop_parent_tokens(shared, router_sid);
+            return Err(error);
+        }
+    };
 
     // 3. Re-pin, seed the summary as context for the next prompt, reset the
     //    confidence baseline to the new (more capable) model.
@@ -7024,6 +7515,8 @@ async fn switch_pin(
         s.pending_context = handoff.clone();
         s.pending_delegation_directive = None;
         s.delegation_directive_active = false;
+        s.native_effort_options = opened.config_options.clone();
+        refresh_pinned_effort(&shared.runtime_config(), &shared.scores, s);
         if delegate_attached && shared.cfg.delegation.inject_prompt {
             s.pending_delegation_directive = Some(target.clone());
         }
@@ -7067,7 +7560,25 @@ async fn switch_pin(
         }
     });
 
-    // 5. Persist + close the old session.
+    // 5. Persist + close the old session. Keep classification and explicit
+    // effort provenance through the switch so resume resolves the same policy.
+    let mut routing = shared
+        .state
+        .lock()
+        .unwrap()
+        .get(router_sid)
+        .and_then(|s| s.routing)
+        .and_then(|r| r.as_object().cloned())
+        .unwrap_or_default();
+    routing.extend(
+        json!({
+            "strategy": "switch", "candidate": target.to_string(),
+            "from": old_candidate.to_string(), "reason": reason, "user_pick": user_pick,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
     shared.state.lock().unwrap().upsert(
         router_sid.to_string(),
         PersistedSession {
@@ -7083,13 +7594,7 @@ async fn switch_pin(
             // Record the switch lineage: the downstream session this router
             // session was pinned to before this switch.
             prior_session_id: Some(old_down_sid.clone()),
-            routing: Some(serde_json::json!({
-                "strategy": "switch",
-                "candidate": target.to_string(),
-                "from": old_candidate.to_string(),
-                "reason": reason,
-                "user_pick": user_pick,
-            })),
+            routing: Some(serde_json::Value::Object(routing)),
             ..Default::default()
         },
     );
@@ -7202,7 +7707,7 @@ async fn route_and_pin(
         &shared,
         &router_sid,
         &req.prompt,
-        &responder.cancellation(),
+        Some(&responder.cancellation()),
         None,
         false,
         None,
@@ -7352,6 +7857,7 @@ pub async fn serve_shared(
         shared.cfg.retention(),
         crate::maintenance::TICK_EVERY,
     );
+    let planner_wake_task = crate::planner_wake::spawn(&shared);
 
     let result = build_agent(shared.clone()).connect_to(transport).await;
     crate::accounts::cancel_all(&shared);
@@ -7365,6 +7871,7 @@ pub async fn serve_shared(
     if let Some(task) = outbox_task {
         task.abort();
     }
+    planner_wake_task.abort();
     if let Some(task) = llm_proxy_task {
         task.abort();
     }
@@ -8064,6 +8571,34 @@ fn on_prompt(
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
     let router_sid = sid_str(&req.session_id);
+    let activity = crate::planner_wake::PromptActivity::client(&shared, &router_sid);
+    let responder = responder.wrap_params(move |_, result| {
+        drop(activity);
+        result
+    });
+    if shared
+        .with_session(&router_sid, |s| {
+            s.strategy == StrategyKind::Planner && s.prompt_activity > 1
+        })
+        .unwrap_or(false)
+    {
+        let meta = req.meta.get_or_insert_with(Default::default);
+        let router = meta.entry("router_acp").or_insert_with(|| json!({}));
+        if router.get("input_id").is_none() {
+            router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
+        }
+        if let Err(error) =
+            crate::planner_workflow::enqueue_parent_input(&shared, &router_sid, &req)
+        {
+            return responder.respond_with_error(AcpError::invalid_params().data(error));
+        }
+        notify_user(
+            &shared,
+            &router_sid,
+            "router-acp · original input and controls retained for the next parent turn",
+        );
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
     if crate::accounts::intercepts(&shared, &router_sid, &req.prompt) {
         return cx.spawn(async move {
             crate::accounts::handle_prompt(shared, router_sid, req, responder).await
@@ -8088,11 +8623,119 @@ fn on_prompt(
         ));
     }
 
+    let (req, explicit_routing, planner_needs_switch) =
+        match prepare_parent_prompt(shared.clone(), router_sid.clone(), req) {
+            Ok(prepared) => prepared,
+            Err(error) => return responder.respond_with_error(error),
+        };
+
+    // The rest of prompt handling runs in a spawned task: ticket-context
+    // enrichment shells out (async), and classification must see the ENRICHED
+    // prompt — "Fix HAI-1234" routes on the ticket's real content.
+    cx.spawn(async move {
+        let original_blocks = req.prompt.len();
+        let req = crate::tickets::enrich_prompt(&shared, &router_sid, req).await;
+        if req.prompt.len() > original_blocks {
+            shared.state.lock().unwrap().log(
+                &router_sid,
+                &crate::state::LogEntry {
+                    kind: "context_injection".into(),
+                    role: "router".into(),
+                    detail: Some(json!({"prompt": req.prompt[..req.prompt.len() - original_blocks]})),
+                    ..Default::default()
+                },
+            );
+        }
+        dispatch_prompt(
+            shared,
+            router_sid,
+            req,
+            responder,
+            explicit_routing,
+            planner_needs_switch,
+        )
+        .await
+    })
+}
+
+fn queue_planner_phase_switch(shared: &Arc<Shared>, router_sid: &str) {
+    let (class, excluded) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new()));
+    if let Some(target) = select_planner_target(
+        shared,
+        shared
+            .with_session(router_sid, |s| s.planner_phase)
+            .flatten()
+            .unwrap_or(crate::config::PlannerPhase::Planning),
+        class,
+        &excluded,
+        None,
+    ) {
+        shared.with_session(router_sid, |s| {
+            if s.pending_switch.is_none() {
+                s.pending_switch = Some(SwitchRequest {
+                    target,
+                    reason: "explicit or detected planner phase change".to_string(),
+                    handoff: HandoffStyle::Full,
+                    user_pick: false,
+                });
+            }
+        });
+    }
+}
+
+pub(crate) fn prepare_parent_prompt(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+) -> Result<(PromptRequest, bool, bool), AcpError> {
+    prepare_parent_prompt_inner(shared, router_sid, req, false)
+}
+
+pub(crate) fn prepare_queued_parent_prompt(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+) -> Result<PromptRequest, AcpError> {
+    let (req, _, needs_switch) =
+        prepare_parent_prompt_inner(shared.clone(), router_sid.clone(), req, true)?;
+    if needs_switch {
+        queue_planner_phase_switch(&shared, &router_sid);
+    }
+    Ok(req)
+}
+
+fn prepare_parent_prompt_inner(
+    shared: Arc<Shared>,
+    router_sid: String,
+    mut req: PromptRequest,
+    queued: bool,
+) -> Result<(PromptRequest, bool, bool), AcpError> {
+    let already_pinned = shared
+        .with_session(&router_sid, |s| s.pin.is_some())
+        .unwrap_or(false);
+    if shared
+        .with_session(&router_sid, |s| s.strategy == StrategyKind::Planner)
+        .unwrap_or(false)
+    {
+        let meta = req.meta.get_or_insert_with(Default::default);
+        let router = meta.entry("router_acp").or_insert_with(|| json!({}));
+        if router.get("input_id").is_none() && router.get("planner_input_id").is_none() {
+            router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
+        }
+    }
+    let original_req = req.clone();
     if shared.with_session(&router_sid, |_| ()).is_none() {
-        return responder.respond_with_error(AcpError::invalid_params().data("unknown session id"));
+        return Err(AcpError::invalid_params().data("unknown session id"));
     }
     let prompt_text = prompt_display_text(&req.prompt);
-    if let Err(err) = shared.state.lock().unwrap().log_checked(
+    shared.state.lock().unwrap().log_checked(
         &router_sid,
         &crate::state::LogEntry {
             kind: "user_prompt".into(),
@@ -8103,12 +8746,7 @@ fn on_prompt(
             tokens_estimated: true,
             ..Default::default()
         },
-    ) {
-        return responder.respond_with_error(
-            AcpError::internal_error().data(format!("cannot save router conversation: {err}")),
-        );
-    }
-
+    ).map_err(|err| AcpError::internal_error().data(format!("cannot save router conversation: {err}")))?;
     // Tracks whether the user steered routing explicitly (a `[router: …]`
     // directive or a `model:` shorthand). Either suppresses the pre-classifier
     // and planner-phase heuristics for this prompt.
@@ -8124,7 +8762,12 @@ fn on_prompt(
             (s.coordinator, s.strategy == StrategyKind::Planner)
         })
         .unwrap_or((false, false));
-    if coordinator && planner_session {
+    if coordinator
+        && planner_session
+        && shared
+            .with_session(&router_sid, |s| s.planner_phase.is_none())
+            .unwrap_or(false)
+    {
         enter_planning_phase(&shared, &router_sid);
     }
     // An off-pool pin that no human chose (an automatic upgrade before the
@@ -8308,8 +8951,8 @@ fn on_prompt(
                 }
             }
             // `phase=` sets the planner phase (valid pre- and post-pin).
-            // Implementation always applies; planning is rejected when the
-            // session is already in implementation (monotonic upgrade).
+            // Explicit commands are reversible. Automatic detection below
+            // remains monotonic and cannot undo a user's phase selection.
             // Entering Planning injects the plan-first protocol. Upgrading a
             // pinned session to Implementation queues a summarize-and-re-pin
             // so the configured implementation candidate actually takes over
@@ -8323,35 +8966,16 @@ fn on_prompt(
                     .with_session(&router_sid, |s| s.pin.is_some() || s.pinning)
                     .unwrap_or(false);
                 match (current, phase) {
-                    (Some(PlannerPhase::Implementation), PlannerPhase::Planning) => {
-                        notify_user(
-                            &shared,
-                            &router_sid,
-                            "router-acp · rejected: cannot downgrade from implementation to \
-                             planning — phase transitions are one-way. Start a new session \
-                             to plan again.",
-                        );
-                    }
                     (_, PlannerPhase::Planning) => {
                         enter_planning_phase(&shared, &router_sid);
-                    }
-                    (_, PlannerPhase::Implementation)
-                        if shared
-                            .with_session(&router_sid, |s| s.coordinator)
-                            .unwrap_or(false) =>
-                    {
-                        notify_user(
-                            &shared,
-                            &router_sid,
-                            "router-acp · coordinator: rejected [router: phase=implementation] \
-                             — coordinator sessions stay in planning",
-                        );
+                        planner_needs_switch |=
+                            pinned && current != Some(PlannerPhase::Planning) && !coordinator;
                     }
                     (_, PlannerPhase::Implementation) => {
                         shared.with_session(&router_sid, |s| {
                             s.planner_phase = Some(PlannerPhase::Implementation);
                         });
-                        if pinned && current != Some(PlannerPhase::Implementation) {
+                        if pinned && current != Some(PlannerPhase::Implementation) && !coordinator {
                             planner_needs_switch = true;
                             notify_user(
                                 &shared,
@@ -8448,10 +9072,62 @@ fn on_prompt(
             }
         }
         Err(msg) => {
-            return responder.respond_with_error(
-                AcpError::invalid_params().data(format!("invalid routing directive: {msg}")),
+            return Err(
+                AcpError::invalid_params().data(format!("invalid routing directive: {msg}"))
             );
         }
+    }
+
+    // Parse control directives from the authentic request before expanding
+    // repository guidance. Bracketed examples in skills are never controls.
+    if shared
+        .with_session(&router_sid, |s| s.strategy == StrategyKind::Planner)
+        .unwrap_or(false)
+    {
+        if let Err(err) = crate::planner_workflow::ensure(&shared, &router_sid) {
+            return Err(AcpError::invalid_params().data(err));
+        }
+        let current = shared
+            .with_session(&router_sid, |s| s.planner_phase)
+            .flatten();
+        match crate::planner_workflow::user_command_from_original(
+            &shared,
+            &router_sid,
+            &original_req,
+            &mut req,
+            queued,
+        ) {
+            Ok(Some(phase)) => {
+                explicit_routing = true;
+                planner_needs_switch |= already_pinned && current != Some(phase) && !coordinator;
+                shared.with_session(&router_sid, |s| {
+                    s.planner_phase = Some(phase);
+                    s.pending_injects
+                        .retain(|p| !p.starts_with("[router-acp planner"));
+                });
+                notify_user(
+                    &shared,
+                    &router_sid,
+                    format!("router-acp · explicit workflow phase: {phase:?}"),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => return Err(AcpError::invalid_params().data(err)),
+        }
+    }
+    if crate::planner_workflow::load(&shared, &router_sid)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let meta = req.meta.get_or_insert_with(Default::default);
+        let router = meta.entry("router_acp").or_insert_with(|| json!({}));
+        if router.get("input_id").is_none() && router.get("planner_input_id").is_none() {
+            router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
+        }
+    }
+    if let Err(err) = crate::planner_workflow::observe_input(&shared, &router_sid, &original_req) {
+        return Err(AcpError::internal_error().data(err));
     }
 
     // A prompt that carried only a directive (empty after stripping) is valid
@@ -8472,45 +9148,13 @@ fn on_prompt(
             )
             .meta(req.meta.clone());
         } else {
-            return responder.respond_with_error(
-                AcpError::invalid_params()
-                    .data("prompt contains only a routing directive and no actual task"),
-            );
+            return Err(AcpError::invalid_params()
+                .data("prompt contains only a routing directive and no actual task"));
         }
     }
 
-    // The rest of prompt handling runs in a spawned task: ticket-context
-    // enrichment shells out (async), and classification must see the ENRICHED
-    // prompt — "Fix HAI-1234" routes on the ticket's real content.
-    if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
-        return responder.respond_with_error(err);
-    }
-    cx.spawn(async move {
-        let original_blocks = req.prompt.len();
-        let req = crate::tickets::enrich_prompt(&shared, &router_sid, req).await;
-        if req.prompt.len() > original_blocks {
-            shared.state.lock().unwrap().log(
-                &router_sid,
-                &crate::state::LogEntry {
-                    kind: "context_injection".into(),
-                    role: "router".into(),
-                    detail: Some(
-                        json!({"prompt": req.prompt[..req.prompt.len() - original_blocks]}),
-                    ),
-                    ..Default::default()
-                },
-            );
-        }
-        dispatch_prompt(
-            shared,
-            router_sid,
-            req,
-            responder,
-            explicit_routing,
-            planner_needs_switch,
-        )
-        .await
-    })
+    crate::restoration::checkpoint(&shared, &router_sid)?;
+    Ok((req, explicit_routing, planner_needs_switch))
 }
 
 /// Post-directive prompt handling: pre-classifier, skill routing, and the
@@ -8524,11 +9168,28 @@ async fn dispatch_prompt(
     explicit_routing: bool,
     mut planner_needs_switch: bool,
 ) -> Result<(), AcpError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while shared
+        .with_session(&router_sid, |s| s.planner_wake_active)
+        .unwrap_or(false)
+    {
+        if tokio::time::Instant::now() >= deadline {
+            return responder.respond_with_error(AcpError::internal_error().data("previous automatic planner turn did not stop; original input is retained, retry with the same input identity"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     crate::auth::refresh_before_selection(&shared).await;
     // Mid-session routing (cordon escapes, skill and planner switches) picks
     // from live targets only; give dead ones their cooldown-gated respawn
     // first, as the initial pin does.
     revive_dead_targets(&shared).await;
+    if shared
+        .with_session(&router_sid, |s| s.strategy == StrategyKind::Planner)
+        .unwrap_or(false)
+        && let Err(err) = crate::planner_workflow::ensure(&shared, &router_sid)
+    {
+        return responder.respond_with_error(AcpError::invalid_params().data(err));
+    }
     // Pre-classifier (when enabled): one cheap ACP evaluation covering task
     // class, complexity and host dimensions. v1 = first eligible turn per
     // session. Fail-open. Explicit `[router:…]` / `model:` suppress it.
@@ -8616,11 +9277,9 @@ async fn dispatch_prompt(
         None
     };
 
-    // Hoist skill detection so both the planner phase logic and skill routing
-    // can reuse the result without a second pattern-matching pass.
-    let detected_skill = detect_skill_route(&shared.cfg, &req.prompt);
+    let detected_skill = detect_prompt_skill_route(&shared, &router_sid, &req);
 
-    // Planner phase (when router == planner): update the monotonic phase,
+    // Planner phase (when router == planner): update the automatic phase,
     // potentially queuing a mid-session switch to an implementation model.
     // A `[router: phase=…]` directive already ran above (`explicit_routing`);
     // skip the classifier/heuristic pass so it cannot fight the directive,
@@ -8635,180 +9294,11 @@ async fn dispatch_prompt(
         );
     }
     if planner_needs_switch {
-        let (class, excluded) = shared
-            .with_session(&router_sid, |s| {
-                (
-                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                    s.excluded.clone(),
-                )
-            })
-            .unwrap_or((TaskClass::CodingGeneral, Vec::new()));
-        if let Some(target) = select_planner_target(
-            &shared,
-            crate::config::PlannerPhase::Implementation,
-            class,
-            &excluded,
-            None,
-        ) {
-            shared.with_session(&router_sid, |s| {
-                if s.pending_switch.is_none() {
-                    s.pending_switch = Some(SwitchRequest {
-                        target,
-                        reason: "planner phase upgrade → implementation".to_string(),
-                        handoff: HandoffStyle::Full,
-                        user_pick: false,
-                    });
-                }
-            });
-        }
+        queue_planner_phase_switch(&shared, &router_sid);
     }
 
-    // Skill routing: certain skills (e.g. ship-pr) demand a capable model class.
-    // If the prompt invokes a skill, steer routing to its preferred candidates —
-    // pre-pin via candidate_override, mid-session via a switch.
-    //
-    // "Already ok" requires the pin to still be *routeable*, not just glob-
-    // matching. A pin that matches `*opus*` but is usage-cordoned (plan at
-    // 100%, no overage) must fall through to the next eligible skill
-    // candidate (e.g. grok) instead of staying on the dead seat.
-    //
-    // Acceptability and switch targets are DIFFERENT sets: the pin is fine if
-    // it matches `candidates` OR `also_acceptable`, but a switch may only
-    // target `candidates`. Collapsing the two (the pre-`also_acceptable`
-    // behaviour) force-switches an already-better pin onto a lesser model for
-    // no reason other than its absence from the target pool.
     if let Some(route) = detected_skill {
-        let (class, excluded, current) = shared
-            .with_session(&router_sid, |s| {
-                (
-                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                    s.excluded.clone(),
-                    s.pin.as_ref().map(|p| p.candidate.clone()),
-                )
-            })
-            .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None));
-        let already_ok = current.as_ref().is_some_and(|c| {
-            route
-                .candidates
-                .iter()
-                .chain(route.also_acceptable.iter())
-                .any(|rc| candidate_matches(rc, c))
-                && !is_excluded(c, &excluded)
-                // "Is the CURRENT pin still serviceable?", not "would auto
-                // pick it?" — an explicitly pinned legacy version satisfies
-                // an approved skill pool and must not be switched away from.
-                && shared
-                    .candidate_view(c, &RequiredCaps::default(), class)
-                    .is_some()
-        });
-        if already_ok {
-            // Re-invoking the skill on an already-compliant pin is an
-            // explicit restatement of the verdict, not a no-op: without this,
-            // the demotion clock kept counting from the FIRST invocation, so
-            // a second `/ship-pr` mid-flow did nothing to stop an elevated
-            // pin expiring under it.
-            //
-            // Also drop a queued switch (auto-upgrade / demotion / cordon
-            // escape) that would leave this pin. Observed: grok was the
-            // session pin, `/finalize-pr` matched `already_ok` (grok is in
-            // `candidates`), then `send_prompt_with_failover` consumed a
-            // leftover auto-upgrade to Sol — `also_acceptable`, never a
-            // switch target — and the skill's pin was discarded.
-            let pattern = route.pattern.clone();
-            shared.with_session(&router_sid, |s| {
-                s.elevation = Some(format!("skill `{pattern}`"));
-                s.elevation_skill = Some(pattern.clone());
-                s.quiet_turns = 0;
-                s.pending_switch = None;
-            });
-        } else {
-            match select_route_target(&shared, route, class, &excluded) {
-                Some(target) => {
-                    let pattern = route.pattern.clone();
-                    let handoff = if route.terse_handoff {
-                        HandoffStyle::Terse
-                    } else {
-                        HandoffStyle::Full
-                    };
-                    // No-op if somehow already on the picked target (e.g. pin
-                    // was outside the skill set but equal by coincidence).
-                    if current.as_ref() == Some(&target) {
-                        shared.with_session(&router_sid, |s| {
-                            s.elevation = Some(format!("skill `{pattern}`"));
-                            s.elevation_skill = Some(pattern.clone());
-                            s.quiet_turns = 0;
-                        });
-                    } else if current.is_some() {
-                        shared.with_session(&router_sid, |s| {
-                            s.pending_switch = Some(SwitchRequest {
-                                target: target.clone(),
-                                reason: format!(
-                                    "skill `{pattern}` requires a {target}-class model"
-                                ),
-                                handoff,
-                                user_pick: false,
-                            });
-                            s.elevation = Some(format!("skill `{pattern}`"));
-                            s.elevation_skill = Some(pattern.clone());
-                            s.quiet_turns = 0;
-                        });
-                        tracing::info!(session = router_sid, skill = %pattern, %target, "skill switch queued");
-                    } else {
-                        // Pre-pin: an explicit UserPick (`[router: candidate=…]`,
-                        // `model:` shorthand, `router.candidate` config) already
-                        // chose the seat. Skill routing used to overwrite that
-                        // override because `already_ok` is false when `current`
-                        // pin is None, so spawn `model: claude/sonnet` plus a
-                        // brief that names ship-pr/finalize-pr silently pinned
-                        // grok. A later `/ship-pr` on a pinned session still
-                        // switches via the `current.is_some()` arm above; a
-                        // plain unpinned `/ship-pr` with no UserPick still
-                        // steers (this skip is UserPick-only).
-                        let keep_user_pick = shared
-                            .with_session(&router_sid, |s| {
-                                matches!(
-                                    s.candidate_override_source,
-                                    Some(OverrideSource::UserPick)
-                                )
-                            })
-                            .unwrap_or(false);
-                        if keep_user_pick {
-                            tracing::info!(
-                                session = router_sid,
-                                skill = %pattern,
-                                "skill steer skipped: user pick already set"
-                            );
-                        } else {
-                            shared.with_session(&router_sid, |s| {
-                                s.candidate_override = Some(target.clone());
-                                s.candidate_override_source =
-                                    Some(OverrideSource::Skill(pattern.clone()));
-                                s.elevation = Some(format!("skill `{pattern}`"));
-                                s.elevation_skill = Some(pattern.clone());
-                                s.quiet_turns = 0;
-                            });
-                            notify_user(
-                                &shared,
-                                &router_sid,
-                                format!(
-                                    "router-acp · skill `{pattern}` steering this session to {target}"
-                                ),
-                            );
-                            tracing::info!(session = router_sid, skill = %pattern, %target, "skill pin steered");
-                        }
-                    }
-                }
-                None => notify_user(
-                    &shared,
-                    &router_sid,
-                    format!(
-                        "router-acp · skill `{}` prefers {:?} but none are available; \
-                         keeping current routing",
-                        route.pattern, route.candidates
-                    ),
-                ),
-            }
-        }
+        apply_skill_route(&shared, &router_sid, route);
     }
 
     // Proactive re-route: if the pin became usage-cordoned mid-session (cap
@@ -8914,9 +9404,199 @@ async fn dispatch_prompt(
     }
 }
 
+fn detect_prompt_skill_route<'a>(
+    shared: &'a Arc<Shared>,
+    router_sid: &str,
+    req: &PromptRequest,
+) -> Option<&'a SkillRoute> {
+    let internal_role = req
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("router_acp"))
+        .and_then(|m| m.get("planner_role"))
+        .is_some();
+    if internal_role {
+        let role = req
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("router_acp"))
+            .and_then(|m| m.get("planner_role"))
+            .and_then(|v| {
+                serde_json::from_value::<crate::planner_skills::PlannerRole>(v.clone()).ok()
+            });
+        let skill = role.and_then(|role| {
+            crate::planner_workflow::load(shared, router_sid)
+                .ok()
+                .flatten()
+                .and_then(|run| run.policy.roles.get(&role).map(|s| s.name.clone()))
+        });
+        skill.and_then(|skill| {
+            shared
+                .cfg
+                .skill_routing
+                .iter()
+                .find(|r| prompt_mentions_skill(&format!("/{skill}"), &r.pattern))
+        })
+    } else {
+        detect_skill_route(&shared.cfg, &req.prompt)
+    }
+}
+
+fn apply_skill_route(shared: &Arc<Shared>, router_sid: &str, route: &SkillRoute) {
+    // Skill routing: certain skills (e.g. ship-pr) demand a capable model class.
+    // If the prompt invokes a skill, steer routing to its preferred candidates —
+    // pre-pin via candidate_override, mid-session via a switch.
+    //
+    // "Already ok" requires the pin to still be *routeable*, not just glob-
+    // matching. A pin that matches `*opus*` but is usage-cordoned (plan at
+    // 100%, no overage) must fall through to the next eligible skill
+    // candidate (e.g. grok) instead of staying on the dead seat.
+    //
+    // Acceptability and switch targets are DIFFERENT sets: the pin is fine if
+    // it matches `candidates` OR `also_acceptable`, but a switch may only
+    // target `candidates`. Collapsing the two (the pre-`also_acceptable`
+    // behaviour) force-switches an already-better pin onto a lesser model for
+    // no reason other than its absence from the target pool.
+    let (class, excluded, current) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None));
+    let already_ok = current.as_ref().is_some_and(|c| {
+        route
+            .candidates
+            .iter()
+            .chain(route.also_acceptable.iter())
+            .any(|rc| candidate_matches(rc, c))
+            && !is_excluded(c, &excluded)
+            // "Is the CURRENT pin still serviceable?", not "would auto
+            // pick it?" — an explicitly pinned legacy version satisfies
+            // an approved skill pool and must not be switched away from.
+            && shared
+                .candidate_view(c, &RequiredCaps::default(), class)
+                .is_some()
+    });
+    if already_ok {
+        // Re-invoking the skill on an already-compliant pin is an
+        // explicit restatement of the verdict, not a no-op: without this,
+        // the demotion clock kept counting from the FIRST invocation, so
+        // a second `/ship-pr` mid-flow did nothing to stop an elevated
+        // pin expiring under it.
+        //
+        // Also drop a queued switch (auto-upgrade / demotion / cordon
+        // escape) that would leave this pin. Observed: grok was the
+        // session pin, `/finalize-pr` matched `already_ok` (grok is in
+        // `candidates`), then `send_prompt_with_failover` consumed a
+        // leftover auto-upgrade to Sol — `also_acceptable`, never a
+        // switch target — and the skill's pin was discarded.
+        let pattern = route.pattern.clone();
+        shared.with_session(router_sid, |s| {
+            s.elevation = Some(format!("skill `{pattern}`"));
+            s.elevation_skill = Some(pattern.clone());
+            s.quiet_turns = 0;
+            s.pending_switch = None;
+        });
+    } else {
+        match select_route_target(shared, route, class, &excluded) {
+            Some(target) => {
+                let pattern = route.pattern.clone();
+                let handoff = if route.terse_handoff {
+                    HandoffStyle::Terse
+                } else {
+                    HandoffStyle::Full
+                };
+                // No-op if somehow already on the picked target (e.g. pin
+                // was outside the skill set but equal by coincidence).
+                if current.as_ref() == Some(&target) {
+                    shared.with_session(router_sid, |s| {
+                        s.elevation = Some(format!("skill `{pattern}`"));
+                        s.elevation_skill = Some(pattern.clone());
+                        s.quiet_turns = 0;
+                    });
+                } else if current.is_some() {
+                    shared.with_session(router_sid, |s| {
+                        s.pending_switch = Some(SwitchRequest {
+                            target: target.clone(),
+                            reason: format!("skill `{pattern}` requires a {target}-class model"),
+                            handoff,
+                            user_pick: false,
+                        });
+                        s.elevation = Some(format!("skill `{pattern}`"));
+                        s.elevation_skill = Some(pattern.clone());
+                        s.quiet_turns = 0;
+                    });
+                    tracing::info!(session = router_sid, skill = %pattern, %target, "skill switch queued");
+                } else {
+                    // Pre-pin: an explicit UserPick (`[router: candidate=…]`,
+                    // `model:` shorthand, `router.candidate` config) already
+                    // chose the seat. Skill routing used to overwrite that
+                    // override because `already_ok` is false when `current`
+                    // pin is None, so spawn `model: claude/sonnet` plus a
+                    // brief that names ship-pr/finalize-pr silently pinned
+                    // grok. A later `/ship-pr` on a pinned session still
+                    // switches via the `current.is_some()` arm above; a
+                    // plain unpinned `/ship-pr` with no UserPick still
+                    // steers (this skip is UserPick-only).
+                    let keep_user_pick = shared
+                        .with_session(router_sid, |s| {
+                            matches!(s.candidate_override_source, Some(OverrideSource::UserPick))
+                        })
+                        .unwrap_or(false);
+                    if keep_user_pick {
+                        tracing::info!(
+                            session = router_sid,
+                            skill = %pattern,
+                            "skill steer skipped: user pick already set"
+                        );
+                    } else {
+                        shared.with_session(router_sid, |s| {
+                            s.candidate_override = Some(target.clone());
+                            s.candidate_override_source =
+                                Some(OverrideSource::Skill(pattern.clone()));
+                            s.elevation = Some(format!("skill `{pattern}`"));
+                            s.elevation_skill = Some(pattern.clone());
+                            s.quiet_turns = 0;
+                        });
+                        notify_user(
+                            shared,
+                            router_sid,
+                            format!(
+                                "router-acp · skill `{pattern}` steering this session to {target}"
+                            ),
+                        );
+                        tracing::info!(session = router_sid, skill = %pattern, %target, "skill pin steered");
+                    }
+                }
+            }
+            None => notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · skill `{}` prefers {:?} but none are available; \
+                     keeping current routing",
+                    route.pattern, route.candidates
+                ),
+            ),
+        }
+    }
+}
+
 fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpError> {
     let router_sid = sid_str(&notif.session_id);
     crate::accounts::cancel_login(&shared, &router_sid);
+    let planner = crate::planner_workflow::load(&shared, &router_sid)
+        .map_err(|e| AcpError::internal_error().data(e))?;
+    if planner.is_some() {
+        crate::planner_workflow::mutate(&shared, &router_sid, |run| {
+            run.status = crate::planner_workflow::RunStatus::Paused;
+            Ok(())
+        })
+        .map_err(|e| AcpError::internal_error().data(e))?;
+    }
     let (pin, delegates) = shared
         .with_session(&router_sid, |s| {
             s.cancelled = true;
@@ -8943,6 +9623,11 @@ fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpEr
     for d in delegates {
         if let Some(conn) = shared.target_conn(&d.process_key) {
             let _ = conn.send_notification(CancelNotification::new(d.downstream_sid.clone()));
+        }
+    }
+    if let Some(run) = planner {
+        for work in run.works.values() {
+            crate::planner_client::stop_child(&shared, &router_sid, &work.child_id);
         }
     }
     Ok(())
@@ -9000,6 +9685,30 @@ fn log_user_steer(
 }
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
+    if let Dispatch::Request(msg, responder) = message {
+        if msg.method() == "router-acp/planner-child" {
+            let params = msg.params().clone();
+            if let Some(upstream) = shared.upstream() {
+                upstream.spawn(async move {
+                    let result = crate::planner_client::control(&shared, params)
+                        .await
+                        .map_err(|e| AcpError::invalid_params().data(e));
+                    let _ = responder.respond_with_result(result);
+                    Ok(())
+                })?;
+                return Ok(Handled::Yes);
+            }
+            return Ok(Handled::No {
+                message: Dispatch::Request(msg, responder),
+                retry: false,
+            });
+        }
+        return relay_catch_all(shared, Dispatch::Request(msg, responder));
+    }
+    relay_catch_all(shared, message)
+}
+
+fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
     if matches!(message, Dispatch::Response(..)) {
         return Ok(Handled::No {
             message,
