@@ -450,7 +450,9 @@ resumes admitted execution. An empty runnable queue is not completion.
 
 Clients can negotiate `_meta.router_acp.planner_children: true` in their
 initialize capabilities. They receive `router-acp/planner-child-update` and
-child-scoped callbacks. Controls use `router-acp/planner-child` with the exact
+child-scoped callbacks. A child update's `effort` is usable only when
+`effort_confirmed` is true. Missing confirmation means unavailable effort.
+Controls use `router-acp/planner-child` with the exact
 parent `sessionId`, durable `child_id`, and `action` of `prompt`, `cancel`, or
 `close`. A child presentation must never launch another coordinator.
 
