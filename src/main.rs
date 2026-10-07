@@ -25,6 +25,13 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Keep router-owned account usage snapshots current for hosts that also
+    /// run provider adapters directly, without an active router conversation.
+    UsageMonitor {
+        /// Path to the router configuration file. Reloaded before each poll.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Internal: stdio<->socket bridge for the delegate MCP server.
     /// Spawned by downstream agents as a stdio MCP server.
     McpDelegate {
@@ -93,6 +100,26 @@ enum Command {
     },
 }
 
+#[cfg(unix)]
+async fn termination_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut intr = signal(SignalKind::interrupt()).ok();
+    let wait_term = async {
+        match term.as_mut() {
+            Some(s) => s.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    let wait_intr = async {
+        match intr.as_mut() {
+            Some(s) => s.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! { _ = wait_term => {}, _ = wait_intr => {} }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -114,22 +141,7 @@ async fn main() -> anyhow::Result<()> {
             // downstream process group on SIGINT/SIGTERM before exiting.
             #[cfg(unix)]
             tokio::spawn(async {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut term = signal(SignalKind::terminate()).ok();
-                let mut intr = signal(SignalKind::interrupt()).ok();
-                let wait_term = async {
-                    match term.as_mut() {
-                        Some(s) => s.recv().await,
-                        None => std::future::pending().await,
-                    }
-                };
-                let wait_intr = async {
-                    match intr.as_mut() {
-                        Some(s) => s.recv().await,
-                        None => std::future::pending().await,
-                    }
-                };
-                tokio::select! { _ = wait_term => {}, _ = wait_intr => {} }
+                termination_signal().await;
                 router_acp::transport::kill_all_downstreams();
                 std::process::exit(130);
             });
@@ -146,6 +158,26 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => Err(anyhow::anyhow!("router exited with error: {e}")),
             }
+        }
+        Command::UsageMonitor { config } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "router_acp=info".into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            #[cfg(unix)]
+            {
+                // Dropping the poll future runs kill_on_drop for an in-flight
+                // Codex reader. A default SIGTERM would orphan that child.
+                tokio::select! {
+                    result = router_acp::usage::monitor(config) => result,
+                    _ = termination_signal() => Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            router_acp::usage::monitor(config).await
         }
         Command::McpDelegate { socket, token } => {
             router_acp::delegate_mcp::run_helper(&socket, &token)

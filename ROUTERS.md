@@ -18,7 +18,7 @@ After the first prompt the session is pinned to its candidate. Three things
 can still change the model:
 
 - **failover** — automatic, when the pinned model goes down or hits its token
-  limit before a turn produces output;
+  limit, or the account/model becomes cordoned, including after partial output;
 - **`[router: switch=agent/model]`** — an explicit request, at any point, to
   hand the conversation to a different model (see *Switching models
   mid-session* below);
@@ -29,6 +29,12 @@ can still change the model:
 Whichever router runs, the decision is printed to your console and recorded
 in the state file, including the math, so you never have to guess why a
 model was chosen.
+
+With `agents[].accounts`, candidates also identify the login, for example
+`claude@personal/sonnet`. Each account has independent authentication, usage
+and optional reserves. Type `/login` to add or repair logins, and `/usage`
+to see every account. Lower account priorities drain first before the
+strategy ranks models. See [Multiple accounts](README.md#multiple-accounts).
 
 With the optional **per-request LLM proxy**, the candidate remains the
 session's default and failover owner, but it is no longer necessarily the model
@@ -65,8 +71,8 @@ candidate is in the pool only if it is:
   validation against the adapter's own model list;
 - **capable** — if your prompt contains an image, only image-capable agents
   survive (same for audio and embedded resources);
-- **not cordoned** — an agent that hit its token/usage limit sits out until
-  the reset time it reported;
+- **not cordoned** — an account/model that hit its token/usage limit or
+  configured reserve ceiling sits out until its reset;
 - **not quarantined** — a candidate that repeatedly failed to open sessions
   cools off for a while (`headroom.quarantine_*`).
 
@@ -752,13 +758,17 @@ credentials, and incomplete coverage fails closed.
   can't hand a live transcript to a different agent, so the summary is the
   bridge.
 - **Failover is the exception.** If the pinned model hits a token limit or
-  goes down before a turn produces output, the router announces it, cordons
+  goes down, or becomes cordoned, the router announces it, cordons
   or quarantines the culprit, re-runs *the session's router* over the
-  remaining pool, and continues on the winner — with a visible note that
-  conversation context does not transfer. See `failover.*` config.
+  remaining pool, and continues on the winner. A truncated transcript carries
+  prior and partial responses plus tool statuses; the replacement is instructed
+  to inspect uncertain effects and avoid repeating completed actions. Client
+  cancellation never triggers failover. See `failover.*` config.
 - **Cordons beat everything.** A token/usage-limited agent is out of every
   pool until the reset time parsed from its own error message (or
-  `headroom.cordon_default_secs`). Even `static` won't route to it.
+  `headroom.cordon_default_secs`). Positive reserves also hard-cordon at
+  `100 - reserve_capacity` percent usage, regardless of overage. Even `static`
+  won't route to a cordoned candidate; an empty pool returns an unavailable error.
 - **Delegation reuses the session's router** over a pool restricted to
   candidates strictly cheaper than the pinned one (a static session
   delegates with `auto` semantics, since "the configured candidate" is never

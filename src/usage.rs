@@ -11,11 +11,12 @@
 //!
 //! Networking is a shelled-out `curl` (token passed via a stdin config so it
 //! never lands in argv) — no TLS crate, matching the project's `git`/`/bin/sh`
-//! precedent. It fails open: any error means "do not cordon" so a usage-endpoint
-//! hiccup can never make a model unroutable (the reactive per-agent cordon is
-//! the safety net if an exhausted model is then actually hit).
+//! precedent. Unknown usage cannot establish a new cordon. A confirmed cordon
+//! survives missing readings until a usable reading replaces it or it resets;
+//! overlapping refreshes must not temporarily reopen reserved capacity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -28,6 +29,35 @@ use crate::session::Shared;
 
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
+/// Run the router-owned usage poller without serving ACP. Hosts that expose
+/// direct provider sessions can supervise this process so the same isolated
+/// account caches stay current even when no router conversation is active.
+/// Reloading the atomically-published config before each cycle picks up login,
+/// reserve and priority changes without making the host own polling behavior.
+pub async fn monitor(config_path: PathBuf) -> anyhow::Result<()> {
+    loop {
+        let interval = monitor_once(&config_path).await?;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn monitor_once(config_path: &std::path::Path) -> anyhow::Result<Duration> {
+    let cfg = crate::config::Config::from_file(config_path)?;
+    let interval = Duration::from_secs(cfg.cordon.poll_secs.max(30));
+    let shared = crate::session::Shared::new(cfg)
+        .map_err(|err| anyhow::anyhow!("invalid router runtime: {err:?}"))?;
+    // The supervisor only marks this process healthy after config validation,
+    // never merely because an executable could be spawned.
+    println!(
+        "{}",
+        serde_json::json!({"event": "usage_monitor", "status": "ready"})
+    );
+    if shared.cfg.cordon.enabled {
+        refresh_and_install(&shared).await;
+    }
+    Ok(interval)
+}
+
 /// Extension notification a client may send to share its own (often fresher)
 /// view of seat availability — see [`apply_availability_hint`] for the shape.
 pub const AVAILABILITY_HINT_METHOD: &str = "router-acp/availability_hint";
@@ -39,7 +69,11 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
     if !shared.cfg.cordon.enabled {
         return None;
     }
-    if !shared.cfg.agents.iter().any(|a| a.usage_source.is_some()) {
+    if !shared
+        .agent_configs()
+        .iter()
+        .any(|a| a.usage_source.is_some())
+    {
         return None;
     }
     let interval = Duration::from_secs(shared.cfg.cordon.poll_secs.max(30));
@@ -58,14 +92,14 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
 /// availability sets and install them on `shared.headroom`. Shared by the
 /// periodic poller tick and the turn-end refresh ([`refresh_after_turn`]).
 pub async fn refresh_and_install(shared: &Arc<Shared>) {
-    let (cordons, availability) = poll_all(shared).await;
-    let n = cordons.len();
+    let (cordons, availability, observed_agents) = poll_all(shared).await;
     let a = availability.len();
-    {
+    let n = {
         let mut headroom = shared.headroom.lock().unwrap();
-        headroom.set_usage_cordons(cordons);
+        headroom.reconcile_usage_cordons(cordons, &observed_agents);
         headroom.set_polled_availability(availability);
-    }
+        headroom.active_usage_cordons().len()
+    };
     tracing::debug!(
         cordoned_candidates = n,
         availability_candidates = a,
@@ -84,8 +118,7 @@ pub fn refresh_after_turn(shared: &Arc<Shared>, agent: &str) {
         return;
     }
     let has_source = shared
-        .cfg
-        .agents
+        .agent_configs()
         .iter()
         .any(|a| a.name == agent && a.usage_source.is_some());
     if !has_source {
@@ -105,10 +138,15 @@ async fn poll_all(
 ) -> (
     HashMap<CandidateId, UsageCordon>,
     HashMap<CandidateId, SeatAvailability>,
+    HashSet<String>,
 ) {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
     let mut avail: HashMap<CandidateId, SeatAvailability> = HashMap::new();
-    for agent in &shared.cfg.agents {
+    let mut observed_agents = HashSet::new();
+    for agent in &shared.agent_configs() {
+        if agent.account_disabled || shared.account_login.lock().unwrap().contains(&agent.name) {
+            continue;
+        }
         let Some(source) = &agent.usage_source else {
             continue;
         };
@@ -132,14 +170,21 @@ async fn poll_all(
         };
         let (cordons, availability) = match source {
             UsageSourceConfig::AnthropicOauth => {
-                let cached =
-                    crate::usage_cache::cached_anthropic_usage(shared.cfg.cordon.min_refresh_secs)
-                        .await;
+                let cached = crate::usage_cache::cached_anthropic_usage_for_agent(
+                    shared.cfg.cordon.min_refresh_secs,
+                    Some(agent),
+                )
+                .await;
                 match cached {
                     crate::usage_cache::CachedUsage::Success(payload) => {
                         crate::auth::note_authenticated_from_usage(&shared.auth, &agent.name);
                         (
-                            anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                            anthropic_cordons_with_reserve(
+                                &payload,
+                                &candidates,
+                                &agent.reserve_capacity,
+                                SystemTime::now(),
+                            ),
                             anthropic_availability_with_spend(
                                 &payload,
                                 &candidates,
@@ -158,7 +203,12 @@ async fn poll_all(
                             &access_generation,
                         );
                         (
-                            anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                            anthropic_cordons_with_reserve(
+                                &payload,
+                                &candidates,
+                                &agent.reserve_capacity,
+                                SystemTime::now(),
+                            ),
                             anthropic_availability_with_spend(
                                 &payload,
                                 &candidates,
@@ -194,7 +244,12 @@ async fn poll_all(
                             continue;
                         };
                         (
-                            anthropic_cordons(&payload, &candidates, SystemTime::now()),
+                            anthropic_cordons_with_reserve(
+                                &payload,
+                                &candidates,
+                                &agent.reserve_capacity,
+                                SystemTime::now(),
+                            ),
                             anthropic_availability_with_spend(
                                 &payload,
                                 &candidates,
@@ -206,9 +261,11 @@ async fn poll_all(
                 }
             }
             UsageSourceConfig::CodexRollout => {
-                let cached =
-                    crate::usage_cache::cached_codex_usage(shared.cfg.cordon.min_refresh_secs)
-                        .await;
+                let cached = crate::usage_cache::cached_codex_usage_for_agent(
+                    shared.cfg.cordon.min_refresh_secs,
+                    Some(agent),
+                )
+                .await;
                 let mut snapshots = match cached {
                     crate::usage_cache::CachedUsage::Success(payload) => {
                         crate::auth::note_authenticated_from_usage(&shared.auth, &agent.name);
@@ -245,14 +302,19 @@ async fn poll_all(
                 // The passive rollout fallback carries quota data but is not
                 // fresh authentication evidence.
                 if snapshots.is_empty() {
-                    snapshots = latest_codex_rate_limits();
+                    snapshots = latest_codex_rate_limits(agent);
                 }
                 if snapshots.is_empty() {
                     tracing::debug!(agent = %agent.name, "no usage snapshot; failing open");
                     continue;
                 }
                 (
-                    codex_cordons(&snapshots, &candidates, SystemTime::now()),
+                    codex_cordons_with_reserve(
+                        &snapshots,
+                        &candidates,
+                        &agent.reserve_capacity,
+                        SystemTime::now(),
+                    ),
                     codex_availability_with_spend(
                         &snapshots,
                         &candidates,
@@ -266,13 +328,14 @@ async fn poll_all(
             tracing::info!(
                 agent = %agent.name,
                 count = cordons.len(),
-                "usage-cordoned candidates (cap exhausted, no overage headroom)"
+                "usage-cordoned candidates (limit or reserve reached)"
             );
         }
+        observed_agents.insert(agent.name.clone());
         out.extend(cordons);
         avail.extend(availability);
     }
-    (out, avail)
+    (out, avail, observed_agents)
 }
 
 /// `(candidate id, display name)` for every candidate of `agent`.
@@ -353,9 +416,28 @@ pub(crate) struct OauthCredentials {
 
 /// Read the Claude CLI OAuth credentials: first `~/.claude/.credentials.json`
 /// (Linux), else the macOS Keychain (`Claude Code-credentials`).
-pub(crate) fn anthropic_oauth_credentials() -> Option<OauthCredentials> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = std::path::Path::new(&home).join(".claude/.credentials.json");
+pub(crate) fn provider_config_dir(
+    agent: Option<&crate::config::AgentConfig>,
+    variable: &str,
+    default: &str,
+) -> Option<std::path::PathBuf> {
+    if let Some(agent) = agent {
+        return agent.config_dir(variable, default);
+    }
+    std::env::var(variable)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| std::path::PathBuf::from(crate::config::expand_tilde_str(&v)))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(default))
+        })
+}
+
+pub(crate) fn anthropic_oauth_credentials(
+    agent: Option<&crate::config::AgentConfig>,
+) -> Option<OauthCredentials> {
+    if let Some(dir) = provider_config_dir(agent, "CLAUDE_CONFIG_DIR", ".claude") {
+        let path = dir.join(".credentials.json");
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Some(creds) = credentials_from_json(&text)
         {
@@ -364,13 +446,9 @@ pub(crate) fn anthropic_oauth_credentials() -> Option<OauthCredentials> {
     }
     #[cfg(target_os = "macos")]
     {
+        let service = anthropic_keychain_service(agent);
         if let Ok(out) = std::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                "Claude Code-credentials",
-                "-w",
-            ])
+            .args(["find-generic-password", "-s", &service, "-w"])
             .output()
             && out.status.success()
             && let Some(creds) = credentials_from_json(&String::from_utf8_lossy(&out.stdout))
@@ -381,8 +459,27 @@ pub(crate) fn anthropic_oauth_credentials() -> Option<OauthCredentials> {
     None
 }
 
-pub(crate) fn anthropic_access_generation() -> Option<String> {
-    anthropic_oauth_credentials().map(|creds| crate::usage_cache::fingerprint(&creds.access_token))
+/// Claude CLI scopes its macOS Keychain service to the first eight hex digits
+/// of SHA-256(CLAUDE_CONFIG_DIR). Match the literal environment value, not a
+/// canonicalized path. Verified against @anthropic-ai/claude-code 2.0.76.
+#[cfg(any(target_os = "macos", test))]
+fn anthropic_keychain_service(agent: Option<&crate::config::AgentConfig>) -> String {
+    let dir = agent.map_or_else(
+        || std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        |a| a.env_var("CLAUDE_CONFIG_DIR"),
+    );
+    match dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => format!(
+            "Claude Code-credentials-{}",
+            &crate::usage_cache::fingerprint(&dir)[..8]
+        ),
+        None => "Claude Code-credentials".into(),
+    }
+}
+
+pub(crate) fn anthropic_access_generation(agent: &crate::config::AgentConfig) -> Option<String> {
+    anthropic_oauth_credentials(Some(agent))
+        .map(|creds| crate::usage_cache::fingerprint(&creds.access_token))
 }
 
 fn credentials_from_json(text: &str) -> Option<OauthCredentials> {
@@ -420,16 +517,34 @@ pub fn anthropic_cordons(
     candidates: &[(CandidateId, String)],
     now: SystemTime,
 ) -> HashMap<CandidateId, UsageCordon> {
+    anthropic_cordons_with_reserve(
+        payload,
+        candidates,
+        &crate::config::ReserveCapacityConfig::default(),
+        now,
+    )
+}
+
+pub fn anthropic_cordons_with_reserve(
+    payload: &Value,
+    candidates: &[(CandidateId, String)],
+    reserve: &crate::config::ReserveCapacityConfig,
+    now: SystemTime,
+) -> HashMap<CandidateId, UsageCordon> {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
-    // Overage/credits still available → nothing is unroutable.
-    if overage_has_headroom(payload) {
-        return out;
-    }
+    let overage = overage_has_headroom(payload);
     let Some(limits) = payload.get("limits").and_then(|l| l.as_array()) else {
         return out;
     };
     for lim in limits {
-        let percent = lim.get("percent").and_then(Value::as_f64).unwrap_or(0.0);
+        let Some(percent) = lim.get("percent").and_then(Value::as_f64) else {
+            continue;
+        };
+        let reserved = match lim.get("kind").and_then(Value::as_str).unwrap_or("") {
+            "session" => reserve.session,
+            kind if kind.starts_with("weekly") => reserve.weekly,
+            _ => 0.0,
+        };
         // Saturation is TRUE exhaustion only (`percent >= 100`). The API's
         // `is_active` merely marks the window currently metering — the running
         // 5-hour window is `is_active` at *any* utilization — and `severity` is
@@ -438,17 +553,26 @@ pub fn anthropic_cordons(
         // weekly headroom (and overage exhausted, so the early return above
         // didn't fire) read as maxed and locked every candidate out — including
         // Fable, whose binding weekly cap was nowhere near full.
-        if percent < 100.0 {
+        if !percent.is_finite() || percent < 100.0 - reserved || (reserved == 0.0 && overage) {
             continue;
         }
-        let Some(resets_str) = lim.get("resets_at").and_then(Value::as_str) else {
+        let reported = lim.get("resets_at").and_then(Value::as_str);
+        let timestamp = reported.and_then(crate::limits::parse_reset_timestamp);
+        let Some(resets_at) = reserve_reset(timestamp, reserved, now) else {
             continue;
         };
-        let Some(delay) = crate::limits::parse_reset_delay_at(&resets_str.to_lowercase(), now)
-        else {
-            continue;
-        };
-        let resets_at = now + delay;
+        let reset = timestamp
+            .and(reported)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                epoch_to_rfc3339(
+                    resets_at
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+            });
+        let resets_str = reset.as_str();
 
         let scope_model = lim.get("scope").and_then(|s| s.get("model")).and_then(|m| {
             m.get("display_name")
@@ -460,7 +584,13 @@ pub fn anthropic_cordons(
         match scope_model {
             // Model-scoped weekly cap: cordon matching candidate(s) only.
             Some(model) if !model.is_empty() => {
-                let reason = format!("Weekly {model} limit reached");
+                let mut reason = format!("Weekly {model} limit reached");
+                if reserved > 0.0 {
+                    reason.push_str(&format!(" ({reserved}% capacity reserved)"));
+                }
+                if timestamp.is_none() {
+                    reason.push_str("; provider reset unknown, temporary cordon");
+                }
                 for (id, display) in candidates {
                     if model_matches(model, id, display) {
                         upsert_latest(&mut out, id, &reason, resets_at, resets_str);
@@ -469,10 +599,16 @@ pub fn anthropic_cordons(
             }
             // All-models weekly or 5-hour session cap: cordon every candidate.
             _ => {
-                let reason = match lim.get("kind").and_then(Value::as_str).unwrap_or("") {
+                let mut reason = match lim.get("kind").and_then(Value::as_str).unwrap_or("") {
                     "session" => "5-hour usage limit reached".to_string(),
                     _ => "Weekly usage limit reached".to_string(),
                 };
+                if reserved > 0.0 {
+                    reason.push_str(&format!(" ({reserved}% capacity reserved)"));
+                }
+                if timestamp.is_none() {
+                    reason.push_str("; provider reset unknown, temporary cordon");
+                }
                 for (id, _) in candidates {
                     upsert_latest(&mut out, id, &reason, resets_at, resets_str);
                 }
@@ -480,6 +616,20 @@ pub fn anthropic_cordons(
         }
     }
     out
+}
+
+/// A known reserve breach still cordons when the provider omits its reset.
+/// Polling replaces this temporary cordon once a newer reading is available.
+fn reserve_reset(
+    reported: Option<SystemTime>,
+    reserved: f64,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    match reported {
+        Some(at) => (at > now).then_some(at),
+        None if reserved > 0.0 => Some(now + Duration::from_secs(900)),
+        None => None,
+    }
 }
 
 /// True when the overage/credit pool can still absorb usage past plan limits.
@@ -748,6 +898,14 @@ pub fn anthropic_availability_with_spend(
     let windows: Vec<AvailWindow> = limits
         .iter()
         .filter_map(|lim| {
+            if lim
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(crate::limits::parse_reset_timestamp)
+                .is_some_and(|reset| reset <= now)
+            {
+                return None;
+            }
             let percent = lim.get("percent").and_then(Value::as_f64)?;
             let scope = lim
                 .get("scope")
@@ -1032,8 +1190,8 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 // ----------------------------------------------------------------------
 
 /// Ingest a client `router-acp/availability_hint` extension notification.
-/// Clients that watch seat usage themselves (e.g. Kory Code polls both
-/// providers every minute) push their view here; a fresh hint outranks the
+/// Clients that already have account-attributed usage may push their view
+/// here; a fresh hint outranks the
 /// router's own poll for that agent until it expires. Expected params:
 ///
 /// ```json
@@ -1048,15 +1206,20 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 /// }
 /// ```
 ///
-/// Tolerant by design: unknown agents and windowless entries are skipped, and
+/// `overage_allowed` independently controls paid usage for this exact account.
+/// False denies until replaced; true grants until `overage_expires_at` when
+/// supplied, otherwise until the hint TTL. Null removes the client policy.
+/// Policy applies to native readings even without windows or preference scaling.
+/// It never supplies or replaces account usage or removes reserve cordons.
+///
+/// Tolerant by design: unknown agents and windowless quota entries are skipped, and
 /// `ttl_secs` falls back to `availability_preference.hint_ttl_secs`. An
 /// entry's `windows` express plan-window fullness (`scope` names a
 /// model-scoped cap, `active` marks a limit the provider reports as biting);
 /// `overage` describes the paid pool that absorbs usage past the cap.
+/// `agent` is an exact account id, such as `claude@work`. A provider-wide
+/// hint must never be copied into sibling accounts' independent usage.
 pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
-    if !shared.cfg.availability_preference.enabled {
-        return;
-    }
     let Some(agents) = params.get("agents").and_then(Value::as_array) else {
         return;
     };
@@ -1074,6 +1237,21 @@ pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
         if candidates.is_empty() {
             continue;
         }
+        if let Some(permission) = entry.get("overage_allowed") {
+            let mut headroom = shared.headroom.lock().unwrap();
+            match permission {
+                Value::Null => headroom.clear_overage_permission(agent),
+                Value::Bool(false) => headroom.set_overage_permission(agent, None),
+                Value::Bool(true) => {
+                    let deadline = overage_permission_expiry(entry, now, Duration::from_secs(ttl));
+                    headroom.set_overage_permission(agent, deadline);
+                }
+                _ => {}
+            }
+        }
+        if !shared.cfg.availability_preference.enabled || entry.get("windows").is_none() {
+            continue;
+        }
         let availability = hint_agent_availability(entry, &candidates);
         tracing::debug!(
             agent,
@@ -1086,6 +1264,20 @@ pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
             availability,
             now + Duration::from_secs(ttl),
         );
+    }
+}
+
+/// Resolve a true paid-usage grant. An explicit timestamp is authoritative;
+/// malformed explicit values fail closed as a persistent denial.
+fn overage_permission_expiry(
+    entry: &Value,
+    now: SystemTime,
+    hint_ttl: Duration,
+) -> Option<SystemTime> {
+    match entry.get("overage_expires_at") {
+        None => Some(now + hint_ttl),
+        Some(Value::String(expires)) => crate::limits::parse_reset_timestamp(expires),
+        Some(_) => None,
     }
 }
 
@@ -1161,9 +1353,11 @@ pub fn hint_agent_availability(
 /// relay's recipe: sha256 of `tokens.account_id` (stable across token
 /// refreshes), else `tokens.refresh_token`, else `OPENAI_API_KEY`, else the
 /// raw `auth.json` text. `None` when signed out (no readable auth.json).
-pub(crate) fn codex_account_fingerprint() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let raw = std::fs::read_to_string(std::path::Path::new(&home).join(".codex/auth.json")).ok()?;
+pub(crate) fn codex_account_fingerprint(
+    agent: Option<&crate::config::AgentConfig>,
+) -> Option<String> {
+    let dir = provider_config_dir(agent, "CODEX_HOME", ".codex")?;
+    let raw = std::fs::read_to_string(dir.join("auth.json")).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let pick = |v: &Value, path: &[&str]| -> Option<String> {
         let mut cur = v.clone();
@@ -1184,15 +1378,26 @@ pub(crate) fn codex_account_fingerprint() -> Option<String> {
 /// notifications are skipped. Returns the raw camelCase result
 /// (`{rateLimits, rateLimitsByLimitId, rateLimitResetCredits}`). The child is
 /// killed when the answer (or the 20s deadline) lands.
-pub(crate) async fn fetch_codex_usage() -> Result<Value, String> {
-    tokio::time::timeout(Duration::from_secs(20), codex_rate_limits_rpc())
+pub(crate) async fn fetch_codex_usage(
+    agent: Option<&crate::config::AgentConfig>,
+) -> Result<Value, String> {
+    tokio::time::timeout(Duration::from_secs(20), codex_rate_limits_rpc(agent))
         .await
         .map_err(|_| "codex app-server timed out".to_string())?
 }
 
-async fn codex_rate_limits_rpc() -> Result<Value, String> {
+async fn codex_rate_limits_rpc(
+    agent: Option<&crate::config::AgentConfig>,
+) -> Result<Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let mut child = tokio::process::Command::new("codex")
+    let mut command = tokio::process::Command::new("codex");
+    for key in crate::accounts::AUTH_ENV {
+        command.env_remove(key);
+    }
+    if let Some(agent) = agent {
+        command.envs(agent.command.env.iter().map(|v| (&v.name, &v.value)));
+    }
+    let mut child = command
         .arg("app-server")
         // The caller can be aborted mid-RPC (timeout, turn-end refresh task,
         // shutdown); an orphaned app-server would linger forever.
@@ -1281,11 +1486,11 @@ pub fn codex_pools_from_payload(payload: &Value) -> Vec<Value> {
 /// data), which used to mask an exhausted sibling pool and let the router keep
 /// routing to a dead seat (observed live 2026-07-21: "premium" snapshots hid
 /// the "codex" pool sitting at 100% for the week). Empty if nothing is found.
-fn latest_codex_rate_limits() -> Vec<Value> {
-    let Some(home) = std::env::var_os("HOME") else {
+fn latest_codex_rate_limits(agent: &crate::config::AgentConfig) -> Vec<Value> {
+    let Some(dir) = provider_config_dir(Some(agent), "CODEX_HOME", ".codex") else {
         return Vec::new();
     };
-    let root = std::path::Path::new(&home).join(".codex/sessions");
+    let root = dir.join("sessions");
     // Collect rollout files (sessions/YYYY/MM/DD/rollout-*.jsonl), newest first.
     let mut files: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
     collect_rollouts(&root, 0, &mut files);
@@ -1396,6 +1601,20 @@ pub fn codex_cordons(
     candidates: &[(CandidateId, String)],
     now: SystemTime,
 ) -> HashMap<CandidateId, UsageCordon> {
+    codex_cordons_with_reserve(
+        rate_limits,
+        candidates,
+        &crate::config::ReserveCapacityConfig::default(),
+        now,
+    )
+}
+
+pub fn codex_cordons_with_reserve(
+    rate_limits: &[Value],
+    candidates: &[(CandidateId, String)],
+    reserve: &crate::config::ReserveCapacityConfig,
+    now: SystemTime,
+) -> HashMap<CandidateId, UsageCordon> {
     let mut out: HashMap<CandidateId, UsageCordon> = HashMap::new();
     for pool in rate_limits {
         let plan_headroom = codex_plan_has_headroom(pool, now);
@@ -1421,35 +1640,49 @@ pub fn codex_cordons(
                 }
             }
         }
-        if codex_overage_usable(pool) {
-            continue;
-        }
+        let overage = codex_overage_usable(pool);
         for key in ["primary", "secondary"] {
             let Some(win) = pool.get(key).filter(|w| !w.is_null()) else {
                 continue;
             };
-            let used = field(win, "used_percent", "usedPercent")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            if used < 100.0 {
-                continue;
-            }
-            let Some(epoch) = field(win, "resets_at", "resetsAt").and_then(Value::as_u64) else {
+            let Some(used) = field(win, "used_percent", "usedPercent").and_then(Value::as_f64)
+            else {
                 continue;
             };
-            let resets_at = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch);
-            if resets_at <= now {
-                continue; // already reset
-            }
             let window_minutes = field(win, "window_minutes", "windowDurationMins")
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let reason = if window_minutes >= 1440 {
+                .unwrap_or(if key == "secondary" { 10080 } else { 300 });
+            let reserved = if window_minutes >= 1440 {
+                reserve.weekly
+            } else {
+                reserve.session
+            };
+            if !used.is_finite() || used < 100.0 - reserved || (reserved == 0.0 && overage) {
+                continue;
+            }
+            let reported = field(win, "resets_at", "resetsAt")
+                .and_then(Value::as_u64)
+                .map(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch));
+            let Some(resets_at) = reserve_reset(reported, reserved, now) else {
+                continue;
+            };
+            let mut reason = if window_minutes >= 1440 {
                 "Codex weekly usage limit reached".to_string()
             } else {
                 "Codex 5-hour usage limit reached".to_string()
             };
-            let rfc = epoch_to_rfc3339(epoch);
+            if reserved > 0.0 {
+                reason.push_str(&format!(" ({reserved}% capacity reserved)"));
+            }
+            if reported.is_none() {
+                reason.push_str("; provider reset unknown, temporary cordon");
+            }
+            let rfc = epoch_to_rfc3339(
+                resets_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
             for (id, _) in candidates {
                 upsert_latest(&mut out, id, &reason, resets_at, &rfc);
             }
@@ -1520,6 +1753,267 @@ pub(crate) fn epoch_to_rfc3339(secs: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn usage_monitor_reloads_config_each_cycle_and_uses_the_poll_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("router.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+state_file: {}
+cordon: {{poll_secs: 1}}
+agents:
+  - name: claude
+    command: {{type: stdio, command: /bin/true}}
+    model_selection: {{type: config-option}}
+    models: [{{id: sonnet, cost_rank: 1}}]
+"#,
+                dir.path().join("state.db").display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            monitor_once(&config).await.unwrap(),
+            Duration::from_secs(30)
+        );
+        std::fs::write(&config, "not valid router yaml").unwrap();
+        assert!(
+            monitor_once(&config).await.is_err(),
+            "the next cycle re-reads the file"
+        );
+    }
+    #[test]
+    fn claude_keychain_service_matches_cli_account_isolation() {
+        let cfg = crate::config::Config::from_yaml(
+            "agents:\n  - name: claude\n    command: {type: stdio, command: mock-agent}\n    model_selection: {type: config-option}\n    models: [{id: sonnet, cost_rank: 1}]\n    accounts:\n      - name: default\n        env: [{name: CLAUDE_CONFIG_DIR, value: ''}]\n      - name: personal\n        env: [{name: CLAUDE_CONFIG_DIR, value: /tmp/router-acp-claude-personal}]\n",
+        ).unwrap();
+        assert_eq!(
+            anthropic_keychain_service(Some(&cfg.agents[0])),
+            "Claude Code-credentials"
+        );
+        assert_eq!(
+            anthropic_keychain_service(Some(&cfg.agents[1])),
+            "Claude Code-credentials-704cd5a3"
+        );
+    }
+
+    #[test]
+    fn expired_anthropic_windows_do_not_renew_cordons_or_exhaust_the_seat() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let payload = json!({"limits": [{
+            "kind": "weekly_all", "percent": 100, "resets_at": "2000-01-01T00:00:00Z"
+        }]});
+        assert!(anthropic_cordons(&payload, &cands(), now).is_empty());
+        assert!(anthropic_availability_with_spend(&payload, &cands(), None, now).is_empty());
+    }
+
+    #[test]
+    fn anthropic_reserves_apply_at_the_boundary_even_with_overage() {
+        let reserve = crate::config::ReserveCapacityConfig {
+            weekly: 10.0,
+            session: 20.0,
+        };
+        let mut payload = json!({"extra_usage": {"is_enabled": true, "utilization": 1}, "limits": [{
+            "kind": "weekly_scoped", "percent": 89.9, "resets_at": "2099-01-01T00:00:00Z",
+            "scope": {"model": {"display_name": "Fable"}}
+        }]});
+        let now = SystemTime::now();
+        assert!(anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now).is_empty());
+        payload["limits"][0]["percent"] = json!(90);
+        let cordons = anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now);
+        assert!(cordons.contains_key(&fable()));
+        assert_eq!(cordons.len(), 1, "model scope must not cordon its siblings");
+        payload["limits"][0] =
+            json!({"kind": "session", "percent": 79.9, "resets_at": "2099-01-01T00:00:00Z"});
+        assert!(anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now).is_empty());
+        payload["limits"][0]["percent"] = json!(80);
+        assert_eq!(
+            anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now).len(),
+            cands().len()
+        );
+        payload["limits"][0]["resets_at"] = json!("2000-01-01T00:00:00Z");
+        assert!(anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now).is_empty());
+    }
+
+    #[test]
+    fn codex_reserves_apply_to_the_reported_window_with_usable_credits() {
+        let reserve = crate::config::ReserveCapacityConfig {
+            weekly: 10.0,
+            session: 20.0,
+        };
+        for (key, minutes, ceiling) in [("primary", 300, 80.0), ("secondary", 10080, 90.0)] {
+            let mut pool = json!({"credits": {"unlimited": true}});
+            pool[key] = json!({"usedPercent": ceiling - 0.1, "windowDurationMins": minutes, "resetsAt": 4070908800u64});
+            assert!(
+                codex_cordons_with_reserve(
+                    &[pool.clone()],
+                    &codex_cands(),
+                    &reserve,
+                    SystemTime::now()
+                )
+                .is_empty()
+            );
+            pool[key]["usedPercent"] = json!(ceiling);
+            assert_eq!(
+                codex_cordons_with_reserve(
+                    &[pool.clone()],
+                    &codex_cands(),
+                    &reserve,
+                    SystemTime::now()
+                )
+                .len(),
+                codex_cands().len()
+            );
+            pool[key]["resetsAt"] = json!(1);
+            assert!(
+                codex_cordons_with_reserve(&[pool], &codex_cands(), &reserve, SystemTime::now())
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn known_reserve_breaches_cordon_even_without_a_reset_timestamp() {
+        let reserve = crate::config::ReserveCapacityConfig {
+            weekly: 10.0,
+            session: 20.0,
+        };
+        let now = SystemTime::now();
+        let payload = json!({"limits": [{"kind": "session", "percent": 80}]});
+        let cordons = anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now);
+        assert_eq!(cordons.len(), cands().len());
+        assert!(
+            cordons
+                .values()
+                .all(|c| c.resets_at > now && c.reason.contains("reset unknown"))
+        );
+        let pool = json!({"primary": {"usedPercent": 80, "windowDurationMins": 300}, "credits": {"unlimited": true}});
+        assert_eq!(
+            codex_cordons_with_reserve(&[pool], &codex_cands(), &reserve, now).len(),
+            codex_cands().len()
+        );
+    }
+
+    #[test]
+    fn credential_reads_and_codex_rollouts_are_account_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["work", "personal"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            std::fs::write(dir.join(".credentials.json"), json!({"claudeAiOauth": {"accessToken": name, "refreshToken": format!("refresh-{name}"), "expiresAt": 4070908800000u64}}).to_string()).unwrap();
+            std::fs::write(
+                dir.join("auth.json"),
+                json!({"tokens": {"account_id": name}}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("sessions/rollout-test.jsonl"), json!({"payload": {"rate_limits": {"limit_id": name, "primary": {"used_percent": if name == "work" {90} else {10}}}}}).to_string()).unwrap();
+        }
+        let cfg = crate::config::Config::from_yaml(&format!("agents:\n  - name: claude\n    command: {{type: stdio, command: mock-agent}}\n    model_selection: {{type: config-option}}\n    models: [{{id: sonnet, cost_rank: 1}}]\n    accounts:\n      - name: work\n        env: [{{name: CLAUDE_CONFIG_DIR, value: '{}'}}, {{name: CODEX_HOME, value: '{}'}}]\n      - name: personal\n        env: [{{name: CLAUDE_CONFIG_DIR, value: '{}'}}, {{name: CODEX_HOME, value: '{}'}}]\n", root.path().join("work").display(), root.path().join("work").display(), root.path().join("personal").display(), root.path().join("personal").display())).unwrap();
+        assert_eq!(
+            anthropic_oauth_credentials(Some(&cfg.agents[0]))
+                .unwrap()
+                .access_token,
+            "work"
+        );
+        assert_eq!(
+            anthropic_oauth_credentials(Some(&cfg.agents[1]))
+                .unwrap()
+                .access_token,
+            "personal"
+        );
+        assert_ne!(
+            anthropic_access_generation(&cfg.agents[0]),
+            anthropic_access_generation(&cfg.agents[1])
+        );
+        assert_ne!(
+            codex_account_fingerprint(Some(&cfg.agents[0])),
+            codex_account_fingerprint(Some(&cfg.agents[1]))
+        );
+        assert_eq!(
+            latest_codex_rate_limits(&cfg.agents[0])[0]["primary"]["used_percent"],
+            json!(90)
+        );
+        assert_eq!(
+            latest_codex_rate_limits(&cfg.agents[1])[0]["primary"]["used_percent"],
+            json!(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_refresh_installs_reserves_only_on_the_matching_account() {
+        let root = tempfile::tempdir().unwrap();
+        let reset = future_epoch(SystemTime::now());
+        for (name, percent) in [("work", 90), ("personal", 10)] {
+            let dir = root.path().join(name).join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            // No auth.json: exercise the account-scoped rollout fallback without
+            // spawning a real provider or contacting an endpoint.
+            std::fs::write(dir.join("rollout-limits.jsonl"), json!({"payload": {"rate_limits": {
+                "limit_id": "codex", "primary": {"used_percent": percent, "window_minutes": 10080, "resets_at": reset},
+                "credits": {"unlimited": true}
+            }}}).to_string()).unwrap();
+        }
+        let cfg = crate::config::Config::from_yaml(&format!(
+            "state_file: '{}'\nagents:\n  - name: codex\n    command: {{type: stdio, command: unused-mock-agent}}\n    model_selection: {{type: config-option}}\n    models: [{{id: gpt-5.5, cost_rank: 1}}]\n    usage_source: {{type: codex-rollout}}\n    reserve_capacity: {{weekly: 10, session: 20}}\n    accounts:\n      - name: work\n        env: [{{name: CODEX_HOME, value: '{}'}}]\n      - name: personal\n        env: [{{name: CODEX_HOME, value: '{}'}}]\n",
+            root.path().join("state.sqlite").display(), root.path().join("work").display(), root.path().join("personal").display()
+        )).unwrap();
+        let shared = Shared::new(cfg).unwrap();
+        refresh_and_install(&shared).await;
+        {
+            let headroom = shared.headroom.lock().unwrap();
+            assert!(
+                headroom
+                    .usage_cordon(&CandidateId::new("codex@work", "gpt-5.5"))
+                    .is_some()
+            );
+            assert!(
+                headroom
+                    .usage_cordon(&CandidateId::new("codex@personal", "gpt-5.5"))
+                    .is_none()
+            );
+            assert_eq!(headroom.active_usage_cordons().len(), 1);
+        }
+
+        // Overlapping startup refreshes can return no snapshot for one account
+        // while another fetch holds its cache lock. That incomplete cycle must
+        // not erase a reserve breach already confirmed by a different cycle.
+        let work_rollout = root.path().join("work/sessions/rollout-limits.jsonl");
+        std::fs::remove_file(&work_rollout).unwrap();
+        refresh_and_install(&shared).await;
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&CandidateId::new("codex@work", "gpt-5.5"))
+                .is_some(),
+            "an unknown account reading cannot clear a confirmed reserve cordon"
+        );
+
+        // A subsequent usable reading below the threshold does lift the cordon.
+        std::fs::write(
+            work_rollout,
+            json!({"payload": {"rate_limits": {
+                "limit_id": "codex",
+                "primary": {"used_percent": 10, "window_minutes": 10080, "resets_at": reset}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        refresh_and_install(&shared).await;
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&CandidateId::new("codex@work", "gpt-5.5"))
+                .is_none(),
+            "a confirmed healthy reading lifts the reserve cordon"
+        );
+    }
 
     #[test]
     fn empty_refresh_token_fingerprints_like_missing() {
@@ -1599,11 +2093,11 @@ mod tests {
             "spend": { "enabled": true, "percent": 100 },
             "limits": [
                 { "kind": "session", "percent": 72, "severity": "normal",
-                  "resets_at": "2026-07-20T23:09:59+00:00", "scope": null, "is_active": false },
+                  "resets_at": "2099-07-20T23:09:59+00:00", "scope": null, "is_active": false },
                 { "kind": "weekly_all", "percent": 78, "severity": "warning",
-                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": false },
+                  "resets_at": "2099-07-22T16:59:59+00:00", "scope": null, "is_active": false },
                 { "kind": "weekly_scoped", "percent": 100, "severity": "critical",
-                  "resets_at": "2026-07-22T16:59:59+00:00",
+                  "resets_at": "2099-07-22T16:59:59+00:00",
                   "scope": { "model": { "id": null, "display_name": "Fable" } },
                   "is_active": true }
             ]
@@ -1619,7 +2113,7 @@ mod tests {
         let f = &c[&fable()];
         assert!(f.reason.contains("Fable"));
         assert!(f.resets_at > now);
-        assert_eq!(f.resets_at_rfc3339, "2026-07-22T16:59:59+00:00");
+        assert_eq!(f.resets_at_rfc3339, "2099-07-22T16:59:59+00:00");
     }
 
     #[test]
@@ -1640,7 +2134,7 @@ mod tests {
             "spend": { "enabled": true, "percent": 100 },
             "limits": [
                 { "kind": "weekly_all", "percent": 100, "severity": "critical",
-                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": true }
+                  "resets_at": "2099-07-22T16:59:59+00:00", "scope": null, "is_active": true }
             ]
         });
         let c = anthropic_cordons(&p, &cands(), now);
@@ -1655,7 +2149,7 @@ mod tests {
             "spend": { "enabled": true, "percent": 100 },
             "limits": [
                 { "kind": "weekly_all", "percent": 78, "severity": "warning",
-                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": false }
+                  "resets_at": "2099-07-22T16:59:59+00:00", "scope": null, "is_active": false }
             ]
         });
         assert!(anthropic_cordons(&p, &cands(), now).is_empty());
@@ -1674,9 +2168,9 @@ mod tests {
             "spend": { "enabled": true, "percent": 100 },
             "limits": [
                 { "kind": "session", "percent": 97, "severity": "critical",
-                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": true },
+                  "resets_at": "2099-07-22T16:59:59+00:00", "scope": null, "is_active": true },
                 { "kind": "weekly_all", "percent": 63, "severity": "normal",
-                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": false }
+                  "resets_at": "2099-07-22T16:59:59+00:00", "scope": null, "is_active": false }
             ]
         })
     }
@@ -2101,7 +2595,7 @@ mod tests {
         let mut p = exhausted_payload();
         p["limits"][2]["percent"] = json!(80); // the Fable-scoped weekly window
         let now = SystemTime::now();
-        let resets_str = "2026-08-12T17:00:00+00:00";
+        let resets_str = "2099-08-12T17:00:00+00:00";
         p["limits"][2]["resets_at"] = json!(resets_str);
         let spend: &SpendLookup = &|_models, _since| Some(50.0);
         let a = anthropic_availability_with_spend(&p, &cands(), Some(spend), now);
@@ -2198,9 +2692,9 @@ mod tests {
                 { "kind": "session", "group": "session", "percent": 0, "severity": "normal",
                   "resets_at": null, "scope": null, "is_active": false },
                 { "kind": "weekly_all", "group": "weekly", "percent": 81, "severity": "warning",
-                  "resets_at": "2026-07-29T16:59:59+00:00", "scope": null, "is_active": false },
+                  "resets_at": "2099-07-29T16:59:59+00:00", "scope": null, "is_active": false },
                 { "kind": "weekly_scoped", "group": "weekly", "percent": 100, "severity": "critical",
-                  "resets_at": "2026-07-29T16:59:59+00:00",
+                  "resets_at": "2099-07-29T16:59:59+00:00",
                   "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
                   "is_active": true }
             ]
@@ -2246,9 +2740,9 @@ mod tests {
             "spend": { "enabled": true, "percent": 100 },
             "limits": [
                 { "kind": "session", "percent": 100, "severity": "critical",
-                  "resets_at": "2026-07-22T16:59:59+00:00", "scope": null, "is_active": true },
+                  "resets_at": "2099-07-22T16:59:59+00:00", "scope": null, "is_active": true },
                 { "kind": "weekly_all", "percent": 100, "severity": "critical",
-                  "resets_at": "2026-07-29T16:59:59+00:00", "scope": null, "is_active": true }
+                  "resets_at": "2099-07-29T16:59:59+00:00", "scope": null, "is_active": true }
             ]
         });
         let a = anthropic_availability(&p, &cands());
@@ -2350,6 +2844,33 @@ mod tests {
         assert!(
             a.values().all(|v| (v.plan_headroom - 1.0).abs() < 1e-9),
             "inactive full meter ignored: {a:?}"
+        );
+    }
+
+    #[test]
+    fn overage_grant_expiry_honors_explicit_timestamp_over_hint_ttl() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let hint_ttl = Duration::from_secs(60);
+        let explicit = json!({ "overage_expires_at": "2099-01-01T00:00:00Z" });
+        let explicit_expiry = overage_permission_expiry(&explicit, now, hint_ttl);
+        assert_eq!(
+            explicit_expiry,
+            crate::limits::parse_reset_timestamp("2099-01-01T00:00:00Z")
+        );
+        assert!(explicit_expiry.unwrap() > now + hint_ttl);
+
+        assert_eq!(
+            overage_permission_expiry(&json!({}), now, hint_ttl),
+            Some(now + hint_ttl)
+        );
+        assert_eq!(
+            overage_permission_expiry(
+                &json!({ "overage_expires_at": "not-a-timestamp" }),
+                now,
+                hint_ttl,
+            ),
+            None,
+            "malformed explicit expiry must fail closed"
         );
     }
 

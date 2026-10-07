@@ -136,6 +136,16 @@ pub fn is_outage_text(lower: &str) -> bool {
         // fail over rather than dead-end.
         || lower.contains("upgrade required")
         || lower.contains("status 426")
+        || is_provider_terms_gate_text(lower)
+}
+
+/// Claude can accept OAuth credentials while refusing every model until the
+/// account accepts updated legal terms. This gate affects the whole account.
+pub fn is_provider_terms_gate_text(lower: &str) -> bool {
+    (lower.contains("consumer terms")
+        && lower.contains("privacy policy")
+        && lower.contains("accept"))
+        || lower.contains("accept them in claude.ai")
 }
 
 struct ResetPatterns {
@@ -232,6 +242,12 @@ pub fn parse_reset_delay_at(lower: &str, now: SystemTime) -> Option<Duration> {
 
 /// Convert a matched ISO-8601 timestamp to epoch seconds (UTC). Offsets are
 /// honored; a missing zone designator is treated as UTC.
+pub(crate) fn parse_reset_timestamp(text: &str) -> Option<SystemTime> {
+    let lower = text.to_lowercase();
+    let captures = patterns().iso.captures(&lower)?;
+    Some(UNIX_EPOCH + Duration::from_secs(iso_to_epoch(&captures)?))
+}
+
 fn iso_to_epoch(cap: &regex::Captures<'_>) -> Option<u64> {
     let year: i64 = cap[1].parse().ok()?;
     let month: i64 = cap[2].parse().ok()?;
@@ -463,6 +479,14 @@ mod tests {
     fn outdated_adapter_426_is_an_outage() {
         let err = AcpError::internal_error().data(
             r#"{"message":"API error (status 426 Upgrade Required): Your Grok CLI version (0.2.106) is outdated. Please update to version 1.0.13 or later","http_status":426}"#,
+        );
+        assert_eq!(classify_failure(&err), FailureClass::Outage);
+    }
+
+    #[test]
+    fn provider_terms_gate_is_an_outage() {
+        let err = AcpError::internal_error().data(
+            "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai to continue.",
         );
         assert_eq!(classify_failure(&err), FailureClass::Outage);
     }

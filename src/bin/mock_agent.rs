@@ -13,6 +13,8 @@
 //!   model (verification must catch this)
 //! - `MOCK_EXIT_AFTER_INIT=1`: process exits shortly after initialize
 //! - `MOCK_EXIT_ON_PROMPT=1`: process exits on receiving a prompt
+//! - `MOCK_EXIT_AFTER_TOOLS=1`: exits after tool directives, without message text
+//! - `MOCK_EXIT_AFTER_OUTPUT=1`: exits after tools and a partial message
 //! - `MOCK_CAPS_IMAGE=1`: advertise the image prompt capability
 //! - `MOCK_LOG`: append JSONL events (initialize/authenticate/new/
 //!   set_config/prompt/cancel) for test assertions
@@ -40,6 +42,7 @@
 //!   extension request and echo the raw reply
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
+//! - `TEXT:<message>` — stream text before the remaining directives
 //! - `EXIT_NOW:<model>` — crash on this prompt if it reached `<model>` (a
 //!   respawned process is healthy; a failover replay to another model is not
 //!   killed)
@@ -392,7 +395,7 @@ async fn run_prompt(
         }
     }
 
-    // Stream a chunk first, then crash: failover must NOT trigger.
+    // Stream a chunk first, then crash, exercising hot continuation.
     if text.contains("CHUNK_THEN_EXIT") {
         let _ = cx.send_notification(chunk(&session_id, "partial output before crash".into()));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -458,7 +461,9 @@ async fn run_prompt(
         {
             return responder.respond(PromptResponse::new(StopReason::Cancelled));
         }
-        if let Some(spec) = line.strip_prefix("TOOL:") {
+        if let Some(message) = line.strip_prefix("TEXT:") {
+            let _ = cx.send_notification(chunk(&session_id, message.to_string()));
+        } else if let Some(spec) = line.strip_prefix("TOOL:") {
             // Emit a real `session/update` tool_call, the way claude-agent-acp
             // does. Forms: `read` | `exec:<cmd>` | `edit` | `fail` | `mcp:<name>`.
             tool_seq += 1;
@@ -834,6 +839,15 @@ async fn run_prompt(
         }
     }
 
+    if std::env::var("MOCK_EXIT_AFTER_TOOLS").as_deref() == Ok("1") {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(1);
+    }
+    if std::env::var("MOCK_EXIT_AFTER_OUTPUT").as_deref() == Ok("1") {
+        let _ = cx.send_notification(chunk(&session_id, "partial output before crash".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(1);
+    }
     finish_prompt(&text, model, session_id, reply, &cx, responder)
 }
 

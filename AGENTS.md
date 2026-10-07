@@ -40,7 +40,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/pre_classifier.rs` | composable **LLM pre-classifier** (`pre_classifier.*`): one cheap tool-less ACP evaluation returns structured `routing` (task class/complexity, supersedes the static classifier) + `orchestrate` + host dimensions. No wall-clock timeout on the LLM call; a failed evaluator is cordoned (`classify_failure`+`apply_failure`) and failed over. Mode-less tool use is not cordoned. If none classify, fall back to the static keyword classifier (confidence 0); `dispatch_prompt` still refuses to pin if routing is missing (client cancel). Never loops. Interrupt is client cancellation, not a timer |
 | `src/candidate.rs` | `CandidateId`, `TaskClass`, `CodingTier`, `RequiredCaps`, score table (`data/scores.yaml`) |
 | `src/limits.rs` | failure classification (RateLimited/Outage/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
-| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, replaced wholesale by the poller via `set_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
+| `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, reconciled per account with a usable reading via `reconcile_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
 | `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` (CLI OAuth token from `~/.claude/.credentials.json` or macOS Keychain `Claude Code-credentials`, `GET /api/oauth/usage` via shelled-out **curl**, token on stdin, no TLS dep; `anthropic_cordons` — overage-gated, `limits[].scope.model.display_name` match) and `codex-rollout` (live `codex app-server` `account/rateLimits/read`; fallback: on-disk rollout snapshots, newest per limit pool; `codex_cordons` — gated on *usable* credits (`unlimited`/positive `balance`, not bare `has_credits`), account-wide, `epoch_to_rfc3339`). Both pure+tested, never a hardcoded model list. Also computes graded **seat availability** for dynamic preference scaling (`anthropic_availability`/`codex_availability`/`availability_from_windows`) and ingests client hints (`apply_availability_hint`, ext notification `router-acp/availability_hint`, consumed session-less in `on_catch_all`). `spawn_usage_poller` (interval loop, fails open, installs cordons + availability) |
 | `src/llm_proxy.rs` | optional loopback provider proxy: process base-URL injection, Anthropic Messages + OpenAI Responses/Chat forwarding, auth/SSE pass-through, per-active-prompt attribution, same-agent request policy (routine demotion, difficulty/stagnation escalation, verdict expiry, dwell, context guards), request disclosure, usage/cache/cost capture |
 | `src/state.rs` | **SQLite** state DB (rusqlite, bundled): `sessions` table (pin + routing diagnostics + `parent_session_id`/`prior_session_id` (switch lineage)/`kind`/`run_label` + token counters + observability metrics: `cost_usd` (authoritative USD from `usage_update.cost`, max), `native_subagent_calls` (orchestration-degradation count), `compute_ms` (model turn time excl. idle), `git_branch`/`git_sha` (for CI/merge join)) and `session_log` table (every ACP interaction + tokens); `history`-window pruning; additive column migrations via guarded `ALTER TABLE`; one-time `sessions.json` import. Setters `set_cost_usd`/`note_native_subagent`/`add_compute_ms`/`set_git` update in place (not via `upsert`, so re-pin preserves them). `StateFile` methods take `&self` (Connection is !Sync → kept behind `Mutex` in `Shared`). |
@@ -120,8 +120,14 @@ SDK traps below, which were all discovered the hard way.
   `spawn-config` exists for per-model argv/env.
 - Route once per session; pin for life. The deliberate exception (added at
   user request, post-plan): failover when the pinned model is rate-limited
-  or down **and the turn has produced no output** (`turn_saw_output`) and
-  the client hasn't cancelled. Context loss is disclosed.
+  or down, or its account/model becomes cordoned, and the client hasn't
+  cancelled. Partial text and tool statuses are carried to the replacement
+  with continuation instructions; completed actions must not be blindly replayed.
+  The continuation flag survives silent failures between replacements: always
+  rebuild the transcript while continuing, even without an `agent_response` row
+  (a tools-only interrupted turn has none). A process death invalidates its
+  session routes; respawning the adapter does not revive old downstream IDs.
+  Tests: `chained_hot_failover_*`, `downstream_death_between_turns_*`.
 - Relaying is raw-JSON with only `sessionId` rewritten; `_meta` is
   preserved; router metadata lives under `_meta.router_acp` only.
 - Delegation: strictly lower `cost_rank` than the parent, depth capped at 1
@@ -140,8 +146,8 @@ SDK traps below, which were all discovered the hard way.
   checked in `maybe_update_planner_phase`, the `phase=implementation`
   directive, `refuse_coordinator_switch` (every queued `pending_switch` and
   mid-turn escalation), the escalation/upgrade/demotion targets, the
-  `pin_session` pool (initial pin, failover, crossover, all-cordoned
-  fallback; empty → error), and `llm_proxy::select_request_model`. Only
+  `pin_session` pool (initial pin, failover, crossover; empty → error), and
+  `llm_proxy::select_request_model`. Only
   `SwitchRequest.user_pick` / `OverrideSource::UserPick` pass, and
   `pin_user_pick` (persisted as `routing.user_pick`) keeps a human's pick in
   place. A new routing path that can move a pin must go through the same
@@ -153,9 +159,8 @@ SDK traps below, which were all discovered the hard way.
   excludes them (so `auto`/failover never pick them); an explicit pin to a
   cordoned candidate is refused in `pin_session` (`cordon_redirect` clears the
   override → best non-cordoned candidate, disclosed in the failover-line format
-  + `details.cordon_redirect`); if the pool is empty ONLY because everything is
-  usage-cordoned, `eligible_views_relaxed` + soonest-`resets_at` picks the
-  least-bad rather than failing (`all_cordoned_fallback`); `router_config_options`
+  + `details.cordon_redirect`); an empty eligible pool returns an unavailable
+  error, never a bypass of usage cordons or reserves; `router_config_options`
   keeps cordoned candidates in the `router.candidate` picker but tags them
   `_meta.router_acp.{available:false,unavailable_reason,resets_at}`; and every
   turn's routing metadata carries `details.usage_cordons`
@@ -164,9 +169,12 @@ SDK traps below, which were all discovered the hard way.
   availability mid-session — the picker option is only re-advertised at
   session creation, but cordons can appear/lift during a long session. **Invariants:**
   generic (models discovered from the API, never hardcoded — the cordon gate is
-  a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*);
-  **fail-open** (any poll/token/parse error → no cordon; the reactive per-agent
-  cordon is the safety net); self-lifts at absolute `resets_at`. Codex has no
+  a *scoped weekly cap ≥100%* AND *overage/credit pool has no headroom*, or
+  a configured positive `reserve_capacity` ceiling regardless of overage);
+  **fail-open on unknown state** (an error cannot establish a new cordon; it
+  retains a previously confirmed cordon until a usable reading or its reset,
+  so overlapping refreshes cannot erase a reserve); the reactive per-agent
+  cordon is the safety net; self-lifts at absolute `resets_at`. Codex has no
   third-party-pollable endpoint (limits arrive in response headers;
   Cloudflare 403s non-Codex clients), so `codex-rollout` polls via Codex's own
   binary — a `codex app-server` RPC (`account/rateLimits/read`), cached
@@ -178,8 +186,13 @@ SDK traps below, which were all discovered the hard way.
   2026-07-21). Its credits gate requires *usable* credits (`unlimited` or a
   positive `balance`) — a bare `has_credits: true` with `balance: null` is
   reported on team plans whose seat is hard-blocked, and failing open on it
-  routed four consecutive conversations to a dead seat. Tests:
-  `usage::tests` (pure, both providers) +
+  routed four consecutive conversations to a dead seat.
+  Hosts that also run provider adapters directly supervise
+  `router-acp usage-monitor --config …`. That router-owned process reloads the
+  config before each poll and keeps the same account-isolated shared caches
+  current without an active ACP router conversation. The host remains a cache
+  reader and process supervisor; it never performs provider usage requests.
+  Tests: `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
 - **Grok `ask_user_question`** (`src/xai_questions.rs`): Grok emits vendor
@@ -290,6 +303,13 @@ SDK traps below, which were all discovered the hard way.
     `auto::tests::cost_aversion_raises_the_paid_frontier_difficulty_bar`,
     `overage_seat_with_more_dollars_left_beats_higher_fraction_smaller_cap`
     (protocol E2E — a HIGHER fraction with FEWER dollars must still lose).
+  - Client `overage_allowed` permissions are separate from quota hints and
+    apply to exact account agents, including windowless entries and disabled
+    availability scaling. Denial persists until replaced. Grants expire at the
+    explicit `overage_expires_at`, using hint TTL only when none is supplied,
+    then deny. Malformed explicit deadlines deny. Null clears the client policy.
+    Native polls retain independent quota numbers and reserve cordons. Test
+    policy through ACP with native readings, sibling accounts and grant expiry.
 - **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by
   default): bind the loopback listener before spawning adapters, then inject
   their process-level base URL. Forward auth, paths, query strings, and SSE;
@@ -381,6 +401,13 @@ SDK traps below, which were all discovered the hard way.
   via `switch_pin` (summarize on the current model → open fresh downstream →
   seed the summary into the next prompt → close old). They exist because CLI
   clients can't set ACP config options.
+- **Exhausted prompt pins** — `pin_session` drops an explicit/saved candidate
+  override when either `usage_cordon` or `seat_exhausted` excludes it. Paid-usage
+  denial can exhaust a seat without installing a usage cordon. Keep both gates,
+  release the headroom lock before disclosure/selection, and record the redirect
+  without inventing a reset timestamp. The normal session strategy resumes;
+  a configured static strategy still obeys its own `allow_fallback` policy.
+  Protocol regression: `explicit_pin_to_spent_account_fails_over_to_available_sibling`.
 - **`model:` shorthand** — a prompt beginning (after any `<turn-context>`
   preamble) with `<ref>:` is sugar for `switch=`/`candidate=`.
   `split_model_shorthand` extracts the leading token; `resolve_candidate_ref`
@@ -558,7 +585,7 @@ serves fs reads, collects `session/update`s). Mock behavior is env-driven:
 Prompt-text directives the mock obeys: `PERM`, `READFILE:<path>`,
 `SLEEP:<ms>` (cancel-aware), `TITLE:<t>` (emits session_info_update),
 `DELEGATE:<task>` (spawns and drives the delegate MCP server),
-`CHUNK_THEN_EXIT` (output then crash — must NOT fail over). Delegation tests
+`CHUNK_THEN_EXIT` (output then crash — exercises hot failover). Delegation tests
 set `ROUTER_ACP_HELPER_EXE=env!("CARGO_BIN_EXE_router-acp")` because
 `current_exe()` is the test binary.
 

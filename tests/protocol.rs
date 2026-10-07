@@ -735,30 +735,65 @@ async fn xai_ask_user_question_forwards_raw_without_form_capability() {
 #[tokio::test]
 async fn cancel_returns_cancelled_promptly() {
     let state = temp_state_file("cancel");
+    let log = temp_log("cancel-peer");
     let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
         state.display(),
-        agent_yaml("mock", &[("m1", 1)], &[])
+        agent_yaml("mock", &[("m1", 1)], &[]),
+        agent_yaml(
+            "peer",
+            &[("m2", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
     );
-    run_test(yaml, async |cx, _observed| {
+    run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
-        let session = new_session(&cx).await?;
-        let sid = session.session_id.0.to_string();
-
-        let sent = cx.send_request(PromptRequest::new(
-            sid.clone(),
-            vec![ContentBlock::from("SLEEP:30000".to_string())],
-        ));
-        // Give routing time to pin and forward, then cancel.
-        let cx2 = cx.clone();
-        let sid2 = sid.clone();
-        cx.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let _ = cx2.send_notification(CancelNotification::new(sid2));
-            Ok(())
-        })?;
-        let resp = sent.block_task().await?;
-        assert_eq!(resp.stop_reason, StopReason::Cancelled);
+        for activity in ["", "TEXT:partial-before-cancel", "TOOL:edit"] {
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            let sent = cx.send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from(format!(
+                    "[router: candidate=mock/m1]\n{activity}\nSLEEP:30000"
+                ))],
+            ));
+            // Give routing time to pin and produce the requested activity.
+            let cx2 = cx.clone();
+            let sid2 = sid.clone();
+            cx.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let _ = cx2.send_notification(CancelNotification::new(sid2));
+                Ok(())
+            })?;
+            let resp = sent.block_task().await?;
+            assert_eq!(resp.stop_reason, StopReason::Cancelled);
+            let text = agent_text(&observed, &sid);
+            if activity.starts_with("TEXT:") {
+                assert!(
+                    text.contains("partial-before-cancel"),
+                    "cancellation follows streamed text"
+                );
+            } else if activity.starts_with("TOOL:") {
+                assert!(
+                    observed
+                        .lock()
+                        .unwrap()
+                        .updates
+                        .iter()
+                        .any(|n| n.session_id.0.as_ref() == sid
+                            && matches!(&n.update, SessionUpdate::ToolCall(_))),
+                    "cancellation follows a completed tool"
+                );
+            }
+            assert!(!text.contains("failover:"));
+            assert!(
+                !read_log(&log)
+                    .iter()
+                    .any(|entry| entry["event"] == "prompt")
+            );
+            let mut headroom = shared.headroom.lock().unwrap();
+            assert!(headroom.cordon_active("mock").is_none());
+            assert!(!headroom.is_quarantined(&CandidateId::new("mock", "m1")));
+        }
         Ok(())
     })
     .await;
@@ -789,9 +824,12 @@ async fn auth_pending_agent_becomes_routeable_after_authenticate() {
             "namespaced auth methods"
         );
 
-        // session/new before auth: auth_required.
-        let err = new_session(&cx).await.unwrap_err();
-        assert_eq!(err.code, AcpError::auth_required().code, "got: {err}");
+        // Management stays available before login. Model prompts still fail.
+        let manage = new_session(&cx).await?;
+        let manage_sid = manage.session_id.0.to_string();
+        prompt_text(&cx, &manage_sid, "/usage").await?;
+        assert!(agent_text(&observed, &manage_sid).contains("Usage"));
+        assert!(!agent_text(&observed, &manage_sid).contains("echo:"));
 
         // Relay authenticate, then the candidate verifies and routing works.
         cx.send_request(AuthenticateRequest::new("mock/mock-login".to_string()))
@@ -802,6 +840,100 @@ async fn auth_pending_agent_becomes_routeable_after_authenticate() {
         let resp = prompt_text(&cx, &sid, "after auth").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         assert!(agent_text(&observed, &sid).contains("echo:m1:after auth"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn native_account_priorities_drain_in_order_despite_sibling_headroom() {
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nrouter: auto\nagents:\n{}\n    accounts:\n      - {{name: first, priority: 0}}\n      - {{name: second, priority: 1}}\n      - {{name: third, priority: 2}}\n",
+        temp_state_file("account-priority").display(),
+        agent_yaml("claude", &[("sonnet", 2)], &[]).trim_end()
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_polled_availability(std::collections::HashMap::from([
+                (
+                    CandidateId::new("claude@first", "sonnet"),
+                    router_acp::headroom::SeatAvailability {
+                        plan_headroom: 0.05,
+                        on_overage: false,
+                        plan_remaining_dollars: None,
+                        overage_headroom: None,
+                        overage_remaining_dollars: None,
+                        source: "poll",
+                    },
+                ),
+                (
+                    CandidateId::new("claude@second", "sonnet"),
+                    router_acp::headroom::SeatAvailability {
+                        plan_headroom: 0.95,
+                        on_overage: false,
+                        plan_remaining_dollars: None,
+                        overage_headroom: None,
+                        overage_remaining_dollars: None,
+                        source: "poll",
+                    },
+                ),
+            ]));
+        for name in ["first", "second", "third"] {
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "fix a typo").await?;
+            let selected = shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                .unwrap();
+            assert_eq!(selected, format!("claude@{name}"));
+            shared.headroom.lock().unwrap().cordon(
+                &selected,
+                Some(Duration::from_secs(300)),
+                "account reserve ceiling reached",
+            );
+        }
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        assert!(prompt_text(&cx, &sid, "fix a typo").await.is_err());
+        prompt_text(&cx, &sid, "/login").await?;
+        assert!(agent_text(&observed, &sid).contains("claude (3 accounts)"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn router_login_text_menu_and_usage_never_prompt_a_model() {
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{}\n    accounts: [{{name: expired}}]\n",
+        temp_state_file("native-menu").display(),
+        agent_yaml("claude", &[("sonnet", 2)], &[]).trim_end()
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        shared.auth.lock().unwrap().set(
+            "claude@expired",
+            router_acp::auth::AuthAvailability::Unauthenticated {
+                reason: "logged out".into(),
+            },
+        );
+        prompt_text(&cx, &sid, "/login").await?;
+        prompt_text(&cx, &sid, "1").await?;
+        prompt_text(&cx, &sid, "1").await?;
+        prompt_text(&cx, &sid, "/usage").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("claude (1 account)"));
+        assert!(text.contains("Add Account"));
+        assert!(text.contains("Re-login"));
+        assert!(text.contains("Delete account"));
+        assert!(text.contains("logged out"));
+        assert!(!text.contains("echo:"));
+        assert!(shared.with_session(&sid, |s| s.pin.is_none()).unwrap());
+        prompt_text(&cx, &sid, "/cancel").await?;
+        assert!(shared.account_menus.lock().unwrap().is_empty());
         Ok(())
     })
     .await;
@@ -2671,31 +2803,141 @@ async fn context_overflow_fails_over_to_a_larger_window_and_carries_a_transcript
 }
 
 #[tokio::test]
-async fn no_failover_after_output_streamed() {
-    let state = temp_state_file("no-failover");
+async fn hot_failover_after_output_carries_partial_text_and_completed_tools() {
+    let state = temp_state_file("hot-failover");
+    let log = temp_log("hot-failover");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
         state.display(),
-        agent_yaml("cheap", &[("haiku", 1)], &[]),
-        agent_yaml("fancy", &[("opus", 3)], &[])
+        agent_yaml(
+            "cheap",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml("fancy", &[("opus", 3)], &[("MOCK_EXIT_AFTER_OUTPUT", "1")])
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        // fancy streams a chunk and THEN crashes: retrying could duplicate
-        // side effects, so the error must surface instead of failing over.
-        let err = prompt_text(&cx, &sid, "CHUNK_THEN_EXIT").await.unwrap_err();
-        assert!(!format!("{err}").is_empty());
+        let response =
+            prompt_text(&cx, &sid, "Complete the change once\nTOOL:exec:write-file").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
         assert!(text.contains("partial output before crash"), "got: {text}");
         assert!(
-            !text.contains("failover: "),
-            "no failover after visible output: {text}"
+            text.contains("failover: auto → cheap/haiku"),
+            "hot failover disclosed: {text}"
+        );
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "prompt")
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "replacement should receive one continuation"
+        );
+        let handoff = prompts[0]["text"].as_str().unwrap();
+        assert!(
+            handoff.contains("Hot failover:")
+                && handoff.contains("Do not repeat completed actions")
+                && handoff.contains("partial output before crash"),
+            "successor receives partial text and continuation instructions: {handoff}"
         );
         assert!(
-            text.contains("not failing over because this turn already produced output"),
-            "user told why: {text}"
+            handoff.contains("Tool: Bash [completed]") && handoff.contains("write-file"),
+            "tool evidence carried: {handoff}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chained_hot_failover_preserves_completed_tools_across_a_silent_failure() {
+    let state = temp_state_file("chained-hot-failover");
+    let log = temp_log("chained-hot-failover");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nheadroom: {{quarantine_failures: 1}}\nrouters:\n  auto: {{cost_quality_tradeoff: 0}}\nagents:\n{}{}{}",
+        state.display(),
+        agent_yaml("a", &[("opus", 3)], &[("MOCK_EXIT_AFTER_TOOLS", "1")]),
+        agent_yaml("b", &[("sonnet", 2)], &[("MOCK_EXIT_ON_PROMPT", "1")]),
+        agent_yaml(
+            "c",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response =
+            prompt_text(&cx, &sid, "Complete the change once\nTOOL:exec:write-file").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("failover: auto → b/sonnet") && text.contains("failover: auto → c/haiku"),
+            "both failovers occurred: {text}"
+        );
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|entry| entry["event"] == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        let handoff = prompts[0]["text"].as_str().unwrap();
+        assert!(
+            handoff.contains("Hot failover:")
+                && handoff.contains("Tool: Bash [completed]")
+                && handoff.contains("write-file"),
+            "third model retains the original tool evidence: {handoff}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn downstream_death_between_turns_fails_over_with_prior_context() {
+    let state = temp_state_file("idle-death");
+    let log = temp_log("idle-death-peer");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nfailover: {{respawn_cooldown_secs: 3600}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("opus", 3)], &[]),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/opus]\nremember 4271").await?;
+        // Simulate the shared adapter dying while the original session is idle.
+        let key = shared
+            .candidate_runtime(&CandidateId::new("a", "opus"))
+            .unwrap()
+            .process_key;
+        shared.mark_target_dead(&key, "adapter exited while idle");
+
+        let response = prompt_text(&cx, &sid, "second task").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("failover: auto → b/sonnet"),
+            "idle death disclosed: {text}"
+        );
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "prompt")
+            .collect();
+        let handoff = prompts.last().unwrap()["text"].as_str().unwrap();
+        assert!(
+            handoff.contains("Assistant: echo:opus:remember 4271")
+                && handoff.contains("second task"),
+            "replacement receives both turns: {handoff}"
         );
         Ok(())
     })
@@ -6040,6 +6282,546 @@ async fn mock_lifecycle_capabilities_not_advertised_when_unsupported() {
 // Provider usage-cap cordons
 // ======================================================================
 
+fn ordered_accounts_yaml(name: &str, availability: bool) -> String {
+    let state = temp_state_file(name);
+    let agents = ["first", "second", "third"]
+        .iter()
+        .enumerate()
+        .map(|(priority, name)| {
+            let mut agent = agent_yaml(&format!("claude@{name}"), &[("sonnet", 2)], &[]);
+            agent.push_str(&format!("    account_priority: {priority}\n"));
+            agent
+        })
+        .collect::<String>();
+    format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\navailability_preference: {{enabled: {availability}}}\nagents:\n{agents}",
+        state.display()
+    )
+}
+
+fn plan_availability(free: f64, paid: bool) -> router_acp::headroom::SeatAvailability {
+    router_acp::headroom::SeatAvailability {
+        plan_headroom: free,
+        plan_remaining_dollars: None,
+        on_overage: paid,
+        overage_headroom: paid.then_some(1.0),
+        overage_remaining_dollars: paid.then_some(100.0),
+        source: "poll",
+    }
+}
+
+#[tokio::test]
+async fn account_priority_drains_first_then_second_then_third_without_bypassing_cordons() {
+    for availability in [true, false] {
+        let yaml = ordered_accounts_yaml("account-priority", availability);
+        run_test_shared(yaml, async |cx, _observed, shared| {
+            init(&cx).await?;
+            shared.headroom.lock().unwrap().set_polled_availability(
+                [
+                    (
+                        CandidateId::new("claude@first", "sonnet"),
+                        plan_availability(0.01, false),
+                    ),
+                    (
+                        CandidateId::new("claude@second", "sonnet"),
+                        plan_availability(0.80, false),
+                    ),
+                    (
+                        CandidateId::new("claude@third", "sonnet"),
+                        plan_availability(1.0, false),
+                    ),
+                ]
+                .into(),
+            );
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            for (turn, name) in ["first", "first", "second", "third"]
+                .into_iter()
+                .enumerate()
+            {
+                prompt_text(&cx, &sid, "Continue the task").await?;
+                assert_eq!(
+                    shared
+                        .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                        .unwrap(),
+                    format!("claude@{name}")
+                );
+                if turn > 0 {
+                    shared.headroom.lock().unwrap().cordon(
+                        &format!("claude@{name}"),
+                        Some(Duration::from_secs(3600)),
+                        "capacity reserved",
+                    );
+                }
+            }
+            let error = prompt_text(&cx, &sid, "Continue the task")
+                .await
+                .expect_err("all accounts are cordoned");
+            assert!(
+                format!("{error}").contains("cordoned")
+                    || format!("{error}").contains("no available")
+            );
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn account_priority_honors_exclusions_and_only_user_overrides_bypass_order() {
+    let yaml = ordered_accounts_yaml("account-priority-overrides", true);
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        for source in [
+            router_acp::strategies::OverrideSource::Skill("review".into()),
+            router_acp::strategies::OverrideSource::Planner,
+            router_acp::strategies::OverrideSource::UserPick,
+        ] {
+            let user = source == router_acp::strategies::OverrideSource::UserPick;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            shared.with_session(&sid, |s| {
+                s.candidate_override = Some(CandidateId::new("claude@second", "sonnet"));
+                s.candidate_override_source = Some(source);
+            });
+            prompt_text(&cx, &sid, "Complete the task").await?;
+            let expected = if user {
+                "claude@second"
+            } else {
+                "claude@first"
+            };
+            assert_eq!(
+                shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                    .unwrap(),
+                expected
+            );
+        }
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: exclude=claude@first]\nComplete the task",
+        )
+        .await?;
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                .unwrap(),
+            "claude@second"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn account_priority_spends_later_included_plan_before_earlier_overage() {
+    for availability in [true, false] {
+        let yaml = ordered_accounts_yaml("account-priority-overage", availability);
+        run_test_shared(yaml, async |cx, _observed, shared| {
+            init(&cx).await?;
+            shared.headroom.lock().unwrap().set_polled_availability(
+                [
+                    (
+                        CandidateId::new("claude@first", "sonnet"),
+                        plan_availability(0.0, true),
+                    ),
+                    (
+                        CandidateId::new("claude@second", "sonnet"),
+                        plan_availability(0.25, false),
+                    ),
+                    (
+                        CandidateId::new("claude@third", "sonnet"),
+                        plan_availability(1.0, false),
+                    ),
+                ]
+                .into(),
+            );
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "Complete the task").await?;
+            assert_eq!(
+                shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                    .unwrap(),
+                "claude@second"
+            );
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(
+                &cx,
+                &sid,
+                "[router: candidate=claude@first/sonnet]\nComplete the task",
+            )
+            .await?;
+            assert_eq!(
+                shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                    .unwrap(),
+                "claude@first"
+            );
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn account_priority_filters_skill_models_before_plan_and_account_order() {
+    for selection in ["best-quality", "first-match"] {
+        for earlier_opus_overage in [false, true] {
+            let first_model = if earlier_opus_overage {
+                "opus"
+            } else {
+                "sonnet"
+            };
+            let second_model = if earlier_opus_overage {
+                "sonnet"
+            } else {
+                "opus"
+            };
+            let expected = if earlier_opus_overage {
+                "claude@first"
+            } else {
+                "claude@second"
+            };
+            let other = if earlier_opus_overage {
+                "claude@second"
+            } else {
+                "claude@first"
+            };
+            let mut first = agent_yaml("claude@first", &[(first_model, 3)], &[]);
+            first.push_str("    account_priority: 0\n");
+            let mut second = agent_yaml("claude@second", &[(second_model, 3)], &[]);
+            second.push_str("    account_priority: 1\n");
+            let yaml = format!(
+                "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\n\
+                 auto_upgrade: {{enabled: false}}\nskill_routing:\n  - pattern: review-branch\n\
+                 \x20   selection: {selection}\n    candidates: [\"*opus*\"]\nagents:\n{first}{second}",
+                temp_state_file("priority-skill-models").display()
+            );
+            run_test_shared(yaml, async |cx, _observed, shared| {
+                init(&cx).await?;
+                shared.headroom.lock().unwrap().set_polled_availability(
+                    [
+                        (
+                            CandidateId::new("claude@first", first_model),
+                            plan_availability(
+                                if earlier_opus_overage { 0.0 } else { 1.0 },
+                                earlier_opus_overage,
+                            ),
+                        ),
+                        (
+                            CandidateId::new("claude@second", second_model),
+                            plan_availability(0.25, false),
+                        ),
+                    ]
+                    .into(),
+                );
+                let sid = new_session(&cx).await?.session_id.0.to_string();
+                prompt_text(&cx, &sid, "Run /review-branch").await?;
+                assert_eq!(
+                    shared
+                        .with_session(&sid, |session| session
+                            .pin
+                            .as_ref()
+                            .unwrap()
+                            .candidate
+                            .clone())
+                        .unwrap(),
+                    CandidateId::new(expected, "opus")
+                );
+
+                let sid = new_session(&cx).await?.session_id.0.to_string();
+                prompt_text(
+                    &cx,
+                    &sid,
+                    &format!("[router: candidate={other}/sonnet]\nwarm up"),
+                )
+                .await?;
+                prompt_text(&cx, &sid, "Run /review-branch").await?;
+                assert_eq!(
+                    shared
+                        .with_session(&sid, |session| session
+                            .pin
+                            .as_ref()
+                            .unwrap()
+                            .candidate
+                            .clone())
+                        .unwrap(),
+                    CandidateId::new(expected, "opus")
+                );
+                Ok(())
+            })
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_accounts_fail_over_without_cordoning_the_other_login() {
+    let state = temp_state_file("accounts");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{}    accounts:\n      - name: work\n        env: [{{name: MOCK_FAIL_PROMPT_MSG, value: 'HTTP 429 usage limit reached'}}]\n      - name: personal\n        env: []\n",
+        state.display(),
+        agent_yaml("claude", &[("sonnet", 2)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@work/sonnet]\nComplete the task",
+        )
+        .await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(agent_text(&observed, &sid).contains("failover: auto → claude@personal/sonnet"));
+        let mut headroom = shared.headroom.lock().unwrap();
+        assert!(headroom.cordon_active("claude@work").is_some());
+        assert!(headroom.cordon_active("claude@personal").is_none());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn provider_terms_gate_fails_over_to_another_native_account() {
+    let state = temp_state_file("account-terms");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{}    accounts:\n      - name: gated\n        env: [{{name: MOCK_FAIL_PROMPT_MSG, value: \"API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai to continue.\"}}]\n      - name: ready\n        env: []\n",
+        state.display(),
+        agent_yaml("claude", &[("sonnet", 2), ("opus", 3)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@gated/sonnet]\nComplete the task",
+        )
+        .await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("failover: auto → claude@ready/"),
+            "terms-gated account must fail over: {text}"
+        );
+        let mut headroom = shared.headroom.lock().unwrap();
+        assert!(headroom.cordon_active("claude@gated").is_some());
+        assert!(headroom.cordon_active("claude@ready").is_none());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn all_usage_cordoned_returns_unavailable_without_prompting_any_model() {
+    let state = temp_state_file("all-cordoned");
+    let log = temp_log("all-cordoned");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("opus", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let cordons = [("a", "opus"), ("b", "sonnet")]
+            .into_iter()
+            .map(|(agent, model)| {
+                (
+                    CandidateId::new(agent, model),
+                    router_acp::headroom::UsageCordon {
+                        reason: "Weekly usage limit reached (10% capacity reserved)".into(),
+                        resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                        resets_at_rfc3339: "2099-01-01T00:00:00Z".into(),
+                    },
+                )
+            })
+            .collect();
+        shared.headroom.lock().unwrap().set_usage_cordons(cordons);
+        let err = prompt_text(&cx, &sid, "Complete the task")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("no available candidate"),
+            "clear inability: {err}"
+        );
+        assert!(
+            !read_log(&log)
+                .iter()
+                .any(|entry| entry["event"] == "prompt"),
+            "cordoned models must never be prompted"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cordon_during_active_tool_turn_interrupts_and_continues_on_peer() {
+    let state = temp_state_file("active-cordon");
+    let log = temp_log("active-cordon-peer");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\nrouters:\n  auto: {{cost_quality_tradeoff: 0}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("opus", 3)], &[]),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/opus]\nTOOL:edit\nSLEEP:3000",
+        );
+        let cordon = async {
+            for _ in 0..200 {
+                if agent_text(&observed, &sid).contains("tool:")
+                    || observed
+                        .lock()
+                        .unwrap()
+                        .updates
+                        .iter()
+                        .any(|n| matches!(&n.update, SessionUpdate::ToolCall(_)))
+                {
+                    shared.headroom.lock().unwrap().cordon(
+                        "a",
+                        Some(Duration::from_secs(3600)),
+                        "capacity reserved",
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("tool activity was never observed");
+        };
+        let (response, ()) = tokio::join!(prompt, cordon);
+        assert_eq!(response?.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("failover: auto → b/sonnet"),
+            "active cordon must fail over: {text}"
+        );
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|entry| entry["event"] == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "one continuation reaches the peer");
+        let handoff = prompts[0]["text"].as_str().unwrap();
+        assert!(
+            handoff.contains("Tool: Edit [completed]"),
+            "handoff preserves tool status: {handoff}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cordon_after_terminal_callback_without_text_uses_hot_continuation() {
+    let state = temp_state_file("callback-cordon");
+    let log = temp_log("callback-cordon-peer");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("opus", 3)], &[]),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        )
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=a/opus]\nTERMINAL_GROK:run-once\nSLEEP:3000",
+        );
+        let cordon = async {
+            for _ in 0..200 {
+                if !observed.lock().unwrap().terminal_creates.is_empty() {
+                    shared.headroom.lock().unwrap().cordon(
+                        "a",
+                        Some(Duration::from_secs(3600)),
+                        "capacity reserved",
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("terminal callback never arrived");
+        };
+        let (response, ()) = tokio::join!(prompt, cordon);
+        assert_eq!(response?.stop_reason, StopReason::EndTurn);
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "prompt")
+            .collect();
+        let handoff = prompts[0]["text"].as_str().unwrap();
+        assert!(
+            handoff.contains("Hot failover:")
+                && handoff.contains("Tool: terminal/create [requested; completion unknown]"),
+            "callback side effects must reach the handoff: {handoff}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agent_cordon_between_turns_never_sends_another_prompt_to_that_account() {
+    let state = temp_state_file("between-cordon");
+    let log = temp_log("between-cordon");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("opus", 3)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml("b", &[("sonnet", 2)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/opus]\nfirst task").await?;
+        shared.headroom.lock().unwrap().cordon(
+            "a",
+            Some(Duration::from_secs(3600)),
+            "capacity reserved",
+        );
+        prompt_text(&cx, &sid, "second task").await?;
+        assert!(agent_text(&observed, &sid).contains("failover: auto → b/sonnet"));
+        assert_eq!(
+            read_log(&log)
+                .iter()
+                .filter(|entry| entry["event"] == "prompt")
+                .count(),
+            1,
+            "no prompt or summary should hit the cordoned account"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn usage_cordon_excludes_advertises_and_redirects() {
     let state = temp_state_file("cordon");
@@ -6169,6 +6951,285 @@ async fn usage_cordon_excludes_advertises_and_redirects() {
 // ======================================================================
 // Availability hints → dynamic preference
 // ======================================================================
+
+#[tokio::test]
+async fn account_overage_permission_gates_native_readings_without_quota_hints() {
+    for scaling in [true, false] {
+        let state = temp_state_file("account-consent");
+        let log = temp_log("account-consent");
+        let yaml = format!(
+            "state_file: {}\nrouter: static\nrouters:\n  static: {{ candidate: 'claude@personal/sonnet', allow_fallback: true }}\n\
+             delegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+             availability_preference: {{ enabled: {scaling} }}\nagents:\n{}{}{}",
+            state.display(),
+            agent_yaml("claude", &[("sonnet", 2)], &[]),
+            agent_yaml(
+                "claude@personal",
+                &[("sonnet", 2)],
+                &[("MOCK_LOG", &log.display().to_string())]
+            ),
+            agent_yaml("codex", &[("gpt-5.6", 2)], &[]),
+        );
+        run_test_shared(yaml, async |cx, observed, shared| {
+            init(&cx).await?;
+            let id = router_acp::candidate::CandidateId::new("claude@personal", "sonnet");
+            let home = router_acp::candidate::CandidateId::new("claude", "sonnet");
+            let paying = router_acp::headroom::SeatAvailability {
+                plan_headroom: 0.0,
+                plan_remaining_dollars: None,
+                on_overage: true,
+                overage_headroom: Some(0.9),
+                overage_remaining_dollars: Some(90.0),
+                source: "poll",
+            };
+            shared.headroom.lock().unwrap().set_polled_availability(
+                std::collections::HashMap::from([
+                    (id.clone(), paying.clone()),
+                    (home.clone(), paying.clone()),
+                ]),
+            );
+            cx.send_notification(agent_client_protocol::UntypedMessage::new(
+                "router-acp/availability_hint",
+                serde_json::json!({"ttl_secs": 1, "agents": [
+                    {"agent": "claude", "overage_allowed": false},
+                    {"agent": "claude@personal", "overage_allowed": false},
+                ]}),
+            )?)?;
+            for _ in 0..50 {
+                if shared.headroom.lock().unwrap().seat_exhausted(&id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(shared.headroom.lock().unwrap().seat_exhausted(&id));
+            // A native refresh must not erase consent or borrow sibling quota.
+            shared.headroom.lock().unwrap().set_polled_availability(
+                std::collections::HashMap::from([
+                    (id.clone(), paying.clone()),
+                    (home.clone(), paying),
+                ]),
+            );
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "hello").await?;
+            assert!(agent_text(&observed, &sid).contains("echo:gpt-5.6:"));
+
+            for (permission, expires, exhausted) in [
+                (serde_json::json!(true), "2099-01-01T00:00:00Z", false),
+                (serde_json::json!(true), "2000-01-01T00:00:00Z", true),
+                (serde_json::Value::Null, "", false),
+            ] {
+                cx.send_notification(agent_client_protocol::UntypedMessage::new(
+                    "router-acp/availability_hint",
+                    serde_json::json!({"agents": [{
+                        "agent": "claude@personal", "overage_allowed": permission,
+                        "overage_expires_at": expires,
+                    }]}),
+                )?)?;
+                for _ in 0..50 {
+                    if shared.headroom.lock().unwrap().seat_exhausted(&id) == exhausted {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(
+                    shared.headroom.lock().unwrap().seat_exhausted(&id),
+                    exhausted
+                );
+                let sid = new_session(&cx).await?.session_id.0.to_string();
+                prompt_text(&cx, &sid, "hello").await?;
+                let expected = if exhausted {
+                    "echo:gpt-5.6:"
+                } else {
+                    "echo:sonnet:"
+                };
+                assert!(agent_text(&observed, &sid).contains(expected));
+            }
+            assert!(shared.headroom.lock().unwrap().seat_exhausted(&home));
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn account_overage_grant_outlives_short_quota_hint_ttl() {
+    let state = temp_state_file("account-grant-expiry");
+    let log = temp_log("account-grant-expiry");
+    let yaml = format!(
+        "state_file: {}\nrouter: static\nrouters:\n  static: {{ candidate: 'claude@personal/sonnet', allow_fallback: true }}\n\
+         delegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "claude@personal",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml("codex", &[("gpt-5.6", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let id = CandidateId::new("claude@personal", "sonnet");
+        let paying = router_acp::headroom::SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.9),
+            overage_remaining_dollars: Some(90.0),
+            source: "poll",
+        };
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_polled_availability(std::collections::HashMap::from([(id.clone(), paying)]));
+
+        cx.send_notification(agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({
+                "ttl_secs": 1,
+                "agents": [{
+                    "agent": "claude@personal",
+                    "windows": [{ "percent": 100, "scope": serde_json::Value::Null, "active": true }],
+                    "overage": { "enabled": true, "percent": 10 },
+                    "overage_allowed": true,
+                    "overage_expires_at": "2099-01-01T00:00:00Z"
+                }]
+            }),
+        )?)?;
+
+        for _ in 0..50 {
+            if shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&id)
+                .is_some_and(|a| a.source == "hint")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&id)
+                .map(|a| a.source),
+            Some("hint"),
+            "the quota hint should apply before its TTL expires"
+        );
+
+        for _ in 0..100 {
+            if shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&id)
+                .is_some_and(|a| a.source == "poll")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let availability = shared.headroom.lock().unwrap().availability(&id);
+        assert_eq!(
+            availability.as_ref().map(|a| a.source),
+            Some("poll"),
+            "quota hint must expire on its own TTL"
+        );
+        assert!(
+            !shared.headroom.lock().unwrap().seat_exhausted(&id),
+            "the explicit grant must survive the shorter quota hint TTL"
+        );
+
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hello").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:sonnet:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_pin_to_spent_account_fails_over_to_available_sibling() {
+    let state = temp_state_file("spent-account-pin");
+    let yaml = format!(
+        "state_file: {}\nrouter: auto\nrouters:\n  static: {{ candidate: 'claude@home/sonnet', allow_fallback: false }}\n\
+         delegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("claude@home", &[("sonnet", 2)], &[]),
+        agent_yaml("claude@backup", &[("sonnet", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let home = CandidateId::new("claude@home", "sonnet");
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_polled_availability(std::collections::HashMap::from([(
+                home.clone(),
+                router_acp::headroom::SeatAvailability {
+                    plan_headroom: 0.0,
+                    plan_remaining_dollars: None,
+                    on_overage: true,
+                    overage_headroom: Some(0.9),
+                    overage_remaining_dollars: Some(90.0),
+                    source: "poll",
+                },
+            )]));
+        cx.send_notification(agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({"agents": [{"agent": "claude@home", "overage_allowed": false}]}),
+        )?)?;
+        for _ in 0..50 {
+            if shared.headroom.lock().unwrap().seat_exhausted(&home) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(shared.headroom.lock().unwrap().seat_exhausted(&home));
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&home)
+                .is_none()
+        );
+
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@home/sonnet] continue the work",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("claude@backup/sonnet"),
+            "fallback must be disclosed: {text}"
+        );
+        assert!(
+            text.contains("account plan exhausted with no usable overage"),
+            "the exhausted pin must be explained: {text}"
+        );
+        assert!(
+            text.contains("echo:sonnet:"),
+            "the sibling must answer: {text}"
+        );
+        let routing = open_state(&state)
+            .get(&sid)
+            .and_then(|s| s.routing)
+            .expect("routing recorded");
+        assert_eq!(routing["candidate"], "claude@backup/sonnet");
+        assert_eq!(routing["cordon_redirect"]["from"], "claude@home/sonnet");
+        assert!(routing["cordon_redirect"]["resets_at"].is_null());
+        Ok(())
+    })
+    .await;
+}
 
 #[tokio::test]
 async fn availability_hint_penalizes_overage_seat() {

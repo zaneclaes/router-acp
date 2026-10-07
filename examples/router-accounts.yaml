@@ -1,0 +1,39 @@
+# Two independently authenticated Claude accounts for Goose desktop.
+# The empty environment on `existing` preserves the normal Claude login.
+cordon:
+  enabled: true
+
+agents:
+  - name: claude
+    command:
+      type: stdio
+      command: claude-agent-acp
+    model_selection:
+      type: config-option
+    models:
+      - id: opus
+        display_name: Claude Opus
+        cost_rank: 3
+      - id: sonnet
+        display_name: Claude Sonnet
+        cost_rank: 2
+    auth_probe:
+      command: claude
+      args: [auth, status]
+    usage_source: { type: anthropic-oauth }
+    lineage: anthropic
+    accounts:
+      - name: existing
+        priority: 0
+        env: []
+        reserve_capacity:
+          weekly: 10
+          session: 20
+      - name: personal
+        priority: 1
+        env:
+          - name: CLAUDE_CONFIG_DIR
+            value: ${HOME}/.config/router-acp/accounts/claude/personal
+        reserve_capacity:
+          weekly: 10
+          session: 20

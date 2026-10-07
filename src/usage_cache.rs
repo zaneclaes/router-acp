@@ -304,6 +304,47 @@ pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
     serde_json::from_str(&text).ok()
 }
 
+/// Passive published view. A sibling's credentials or old access generation
+/// must never turn into this account's usage report.
+pub fn read_agent_snapshot(agent: &crate::config::AgentConfig) -> Option<Snapshot> {
+    use crate::config::UsageSourceConfig;
+    let (file, account, generation) = match agent.usage_source.as_ref()? {
+        UsageSourceConfig::AnthropicOauth => {
+            let creds = crate::usage::anthropic_oauth_credentials(Some(agent))?;
+            (
+                account_cache_name(
+                    "anthropic-oauth.json",
+                    Some(agent),
+                    "CLAUDE_CONFIG_DIR",
+                    ".claude",
+                ),
+                fingerprint(
+                    creds
+                        .refresh_token
+                        .as_deref()
+                        .unwrap_or(&creds.access_token),
+                ),
+                Some(fingerprint(&creds.access_token)),
+            )
+        }
+        UsageSourceConfig::CodexRollout => (
+            account_cache_name("codex.json", Some(agent), "CODEX_HOME", ".codex"),
+            crate::usage::codex_account_fingerprint(Some(agent))?,
+            None,
+        ),
+    };
+    let snapshot = read_snapshot(&snapshot_path(&file)?)?;
+    if snapshot.account != account
+        || snapshot.fetched_at > unix_now()
+        || (generation.is_some()
+            && snapshot.access_generation.is_some()
+            && generation != snapshot.access_generation)
+    {
+        return None;
+    }
+    Some(snapshot)
+}
+
 /// Atomic write: temp file in the same directory, then rename over the
 /// target — readers never observe a partial snapshot.
 pub fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
@@ -441,16 +482,29 @@ fn classify_error(err: &str) -> String {
 /// freshest payload available (possibly stale on failure or lock contention),
 /// or `None` when there's nothing usable (fail open, as before).
 pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> CachedUsage {
-    let Some(initial) = anthropic_cache_request() else {
+    cached_anthropic_usage_for_agent(min_refresh_secs, None).await
+}
+
+pub(crate) async fn cached_anthropic_usage_for_agent(
+    min_refresh_secs: u64,
+    agent: Option<&crate::config::AgentConfig>,
+) -> CachedUsage {
+    let Some(initial) = anthropic_cache_request(agent) else {
         return CachedUsage::Unknown(None);
     };
+    let file_name = account_cache_name(
+        "anthropic-oauth.json",
+        agent,
+        "CLAUDE_CONFIG_DIR",
+        ".claude",
+    );
     cached_usage(
         ANTHROPIC_SOURCE,
-        "anthropic-oauth.json",
+        &file_name,
         initial,
         min_refresh_secs,
         true,
-        anthropic_cache_request,
+        || anthropic_cache_request(agent),
         |token| async move {
             let Some(token) = token else {
                 return Err("Claude access credential is unavailable".to_string());
@@ -467,12 +521,20 @@ pub async fn cached_anthropic_usage(min_refresh_secs: u64) -> CachedUsage {
 /// the shared cache — every serve process polling it independently is wasted
 /// work, and the snapshot is what the relay reads.
 pub async fn cached_codex_usage(min_refresh_secs: u64) -> CachedUsage {
-    let Some(fp) = crate::usage::codex_account_fingerprint() else {
+    cached_codex_usage_for_agent(min_refresh_secs, None).await
+}
+
+pub(crate) async fn cached_codex_usage_for_agent(
+    min_refresh_secs: u64,
+    agent: Option<&crate::config::AgentConfig>,
+) -> CachedUsage {
+    let Some(fp) = crate::usage::codex_account_fingerprint(agent) else {
         return CachedUsage::Unknown(None);
     };
+    let file_name = account_cache_name("codex.json", agent, "CODEX_HOME", ".codex");
     cached_usage(
         CODEX_SOURCE,
-        "codex.json",
+        &file_name,
         CacheRequest {
             account: fp,
             access_generation: None,
@@ -483,7 +545,7 @@ pub async fn cached_codex_usage(min_refresh_secs: u64) -> CachedUsage {
         min_refresh_secs,
         false,
         || {
-            crate::usage::codex_account_fingerprint().map(|account| CacheRequest {
+            crate::usage::codex_account_fingerprint(agent).map(|account| CacheRequest {
                 account,
                 access_generation: None,
                 access_expires_at: None,
@@ -491,7 +553,7 @@ pub async fn cached_codex_usage(min_refresh_secs: u64) -> CachedUsage {
                 access_token: None,
             })
         },
-        |_token| async { crate::usage::fetch_codex_usage().await },
+        |_token| async { crate::usage::fetch_codex_usage(agent).await },
     )
     .await
 }
@@ -506,8 +568,32 @@ struct CacheRequest {
     access_token: Option<String>,
 }
 
-fn anthropic_cache_request() -> Option<CacheRequest> {
-    let creds = crate::usage::anthropic_oauth_credentials()?;
+fn account_cache_name(
+    file: &str,
+    agent: Option<&crate::config::AgentConfig>,
+    variable: &str,
+    default: &str,
+) -> String {
+    let Some(dir) = crate::usage::provider_config_dir(agent, variable, default) else {
+        return file.to_string();
+    };
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let default_dir = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(default))
+        .map(|dir| dir.canonicalize().unwrap_or(dir));
+    if default_dir.as_ref() == Some(&dir) {
+        file.to_string()
+    } else {
+        format!(
+            "{}-{}.json",
+            file.trim_end_matches(".json"),
+            fingerprint(&dir.to_string_lossy())
+        )
+    }
+}
+
+fn anthropic_cache_request(agent: Option<&crate::config::AgentConfig>) -> Option<CacheRequest> {
+    let creds = crate::usage::anthropic_oauth_credentials(agent)?;
     let account = fingerprint(
         creds
             .refresh_token
@@ -687,6 +773,30 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn account_snapshots_have_independent_paths_and_locks() {
+        let cfg = crate::config::Config::from_yaml("agents:\n  - name: claude\n    command: {type: stdio, command: mock-agent}\n    model_selection: {type: config-option}\n    models: [{id: sonnet, cost_rank: 1}]\n    accounts:\n      - name: work\n        env: [{name: CLAUDE_CONFIG_DIR, value: /tmp/work}]\n      - name: personal\n        env: [{name: CLAUDE_CONFIG_DIR, value: /tmp/personal}]\n").unwrap();
+        let a = account_cache_name(
+            "anthropic-oauth.json",
+            Some(&cfg.agents[0]),
+            "CLAUDE_CONFIG_DIR",
+            ".claude",
+        );
+        let b = account_cache_name(
+            "anthropic-oauth.json",
+            Some(&cfg.agents[1]),
+            "CLAUDE_CONFIG_DIR",
+            ".claude",
+        );
+        assert_ne!(a, b);
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join(a).with_extension("json.lock");
+        let b = root.path().join(b).with_extension("json.lock");
+        let _held = acquire_lock(&a, SystemTime::now(), Duration::from_secs(60)).unwrap();
+        let _independent = acquire_lock(&b, SystemTime::now(), Duration::from_secs(60))
+            .expect("a busy account must not prevent another account's usage read");
+    }
 
     fn snap(account: &str, attempted_at: u64, failures: u32) -> Snapshot {
         Snapshot {

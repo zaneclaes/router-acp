@@ -766,9 +766,8 @@ impl Default for PreClassifierConfig {
 #[serde(deny_unknown_fields)]
 pub struct FailoverConfig {
     /// Fail over a pinned session to the next best candidate when the
-    /// pinned model is rate-limited or down — only when no output has
-    /// streamed for the failing turn (retrying after side effects would
-    /// risk duplicating them). Conversation context does not transfer.
+    /// pinned model is rate-limited, down or cordoned. Partial output and
+    /// tool statuses transfer as a continuation. Never fails over on cancel.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Minimum seconds between respawn attempts of a dead downstream
@@ -934,12 +933,30 @@ pub struct AgentConfig {
     /// usage caps and cordons this agent's candidates that are exhausted.
     #[serde(default)]
     pub usage_source: Option<UsageSourceConfig>,
+    /// Included-plan percentages kept unused, independently for this account.
+    #[serde(default)]
+    pub reserve_capacity: ReserveCapacityConfig,
+    /// Lower numbers drain first within one adapter's account group.
+    /// Unset standalone agents keep ordinary strategy ranking.
+    #[serde(default)]
+    pub account_priority: Option<u32>,
+    /// Deleted membership keeps an adapter template for adding a new login.
+    #[serde(default)]
+    pub account_disabled: bool,
+    /// Independently authenticated instances of this adapter. Expanded into
+    /// `name@account` agents before validation; empty keeps the original agent.
+    #[serde(default)]
+    pub accounts: Vec<AccountConfig>,
     /// Optional non-interactive provider login probe. Exit zero is positive
     /// authentication evidence. A non-zero result is negative evidence only
     /// when its output matches `unauthenticated_patterns`; every other error
     /// and timeout is unknown (fail open).
     #[serde(default)]
     pub auth_probe: Option<AuthProbeConfig>,
+    /// Optional login CLI override. Omitted uses the provider's login command.
+    /// It inherits this account's isolated environment, never the probe argv.
+    #[serde(default)]
+    pub login_command: Option<CommandConfig>,
     /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
     /// agent name. Orchestration's cross-lineage review compares THIS — the
     /// point is a reviewer whose models come from a **different company** (and
@@ -953,6 +970,52 @@ pub struct AgentConfig {
     /// providers' public API endpoints.
     #[serde(default)]
     pub llm_proxy: Option<AgentLlmProxyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReserveCapacityConfig {
+    #[serde(default)]
+    pub weekly: f64,
+    #[serde(default)]
+    pub session: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfig {
+    pub name: String,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub env: Vec<EnvVarConfig>,
+    #[serde(default)]
+    pub reserve_capacity: Option<ReserveCapacityConfig>,
+}
+
+impl AgentConfig {
+    /// Match the adapter's environment without mutating the router process.
+    pub fn env_var(&self, name: &str) -> Option<String> {
+        self.command
+            .env
+            .iter()
+            .rev()
+            .find(|v| v.name == name)
+            .map(|v| v.value.clone())
+            .or_else(|| std::env::var(name).ok())
+    }
+
+    pub fn config_dir(&self, variable: &str, default: &str) -> Option<PathBuf> {
+        self.env_var(variable)
+            .filter(|v| !v.is_empty())
+            .map(|v| PathBuf::from(expand_tilde_str(&v)))
+            .or_else(|| {
+                self.env_var("HOME")
+                    .map(|home| PathBuf::from(home).join(default))
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1298,6 +1361,9 @@ pub struct RoutersConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Original file for router-owned account management. Never a YAML key.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
     #[serde(default = "default_router")]
     pub router: StrategyKind,
     #[serde(default = "default_state_file")]
@@ -1596,6 +1662,35 @@ impl Config {
         if let Some(p) = &cfg.delegation.socket_path {
             cfg.delegation.socket_path = Some(expand_tilde(p));
         }
+        let mut agents = Vec::new();
+        for mut agent in std::mem::take(&mut cfg.agents) {
+            if agent.name.is_empty() {
+                return Err(ConfigError("agent name must not be empty".into()));
+            }
+            let accounts = std::mem::take(&mut agent.accounts);
+            if accounts.is_empty() {
+                agents.push(agent);
+                continue;
+            }
+            for (index, account) in accounts.into_iter().enumerate() {
+                if account.name.is_empty() || account.name.contains(['/', '@']) {
+                    return Err(ConfigError(
+                        "account name must be nonempty and contain neither `/` nor `@`".into(),
+                    ));
+                }
+                let mut seat = agent.clone();
+                seat.name = format!("{}@{}", agent.name, account.name);
+                seat.account_priority = Some(account.priority.unwrap_or(index as u32));
+                seat.account_disabled = account.disabled || agent.account_disabled;
+                seat.lineage = Some(agent.lineage.clone().unwrap_or_else(|| agent.name.clone()));
+                seat.command.env.extend(account.env);
+                if let Some(reserve) = account.reserve_capacity {
+                    seat.reserve_capacity = reserve;
+                }
+                agents.push(seat);
+            }
+        }
+        cfg.agents = agents;
         // Downstream adapters are spawned via `Command::new` (no shell), so a
         // leading `~` in a command path or arg would never be expanded and the
         // spawn would fail — expand it here the same way we do for state paths.
@@ -1604,9 +1699,20 @@ impl Config {
             for arg in &mut agent.command.args {
                 *arg = expand_tilde_str(arg);
             }
+            for env in &mut agent.command.env {
+                if matches!(env.name.as_str(), "CLAUDE_CONFIG_DIR" | "CODEX_HOME") {
+                    env.value = expand_tilde_str(&env.value);
+                }
+            }
             if let Some(probe) = &mut agent.auth_probe {
                 probe.command = expand_tilde_str(&probe.command);
                 for arg in &mut probe.args {
+                    *arg = expand_tilde_str(arg);
+                }
+            }
+            if let Some(login) = &mut agent.login_command {
+                login.command = expand_tilde_str(&login.command);
+                for arg in &mut login.args {
                     *arg = expand_tilde_str(arg);
                 }
             }
@@ -1625,7 +1731,9 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let yaml = std::fs::read_to_string(path)
             .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
-        Self::from_yaml(&yaml)
+        let mut cfg = Self::from_yaml(&yaml)?;
+        cfg.source_path = Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1636,6 +1744,23 @@ impl Config {
         }
         let mut names = HashSet::new();
         for agent in &self.agents {
+            for (window, reserve) in [
+                ("weekly", agent.reserve_capacity.weekly),
+                ("session", agent.reserve_capacity.session),
+            ] {
+                if !(0.0..=100.0).contains(&reserve) {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: reserve_capacity.{window} must be between 0 and 100",
+                        agent.name
+                    )));
+                }
+                if reserve > 0.0 && (!self.cordon.enabled || agent.usage_source.is_none()) {
+                    return Err(ConfigError(format!(
+                        "agent `{}`: reserve_capacity requires cordon.enabled and a usage_source",
+                        agent.name
+                    )));
+                }
+            }
             if agent.name.is_empty() {
                 return Err(ConfigError("agent name must not be empty".into()));
             }
@@ -2469,6 +2594,10 @@ agents:
                 "router-full.yaml",
                 include_str!("../examples/router-full.yaml"),
             ),
+            (
+                "router-accounts.yaml",
+                include_str!("../examples/router-accounts.yaml"),
+            ),
         ] {
             let cfg = Config::from_yaml(yaml)
                 .unwrap_or_else(|e| panic!("examples/{name} must parse: {e}"));
@@ -2479,5 +2608,61 @@ agents:
                 "examples/{name} must define at least one agent"
             );
         }
+    }
+
+    #[test]
+    fn expands_accounts_with_independent_reserves_and_shared_lineage() {
+        let yaml = format!(
+            "{}\n    lineage: anthropic\n    usage_source: {{type: anthropic-oauth}}\n    reserve_capacity: {{weekly: 10, session: 20}}\n    accounts:\n      - name: work\n        env: [{{name: CLAUDE_CONFIG_DIR, value: /tmp/work}}]\n      - name: personal\n        env: [{{name: CLAUDE_CONFIG_DIR, value: /tmp/personal}}]\n        reserve_capacity: {{weekly: 5}}\n",
+            minimal_yaml().trim_end()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.agents.len(), 2);
+        assert_eq!(cfg.agents[0].name, "claude@work");
+        assert_eq!(cfg.agents[1].name, "claude@personal");
+        assert_eq!(cfg.agents[0].lineage, cfg.agents[1].lineage);
+        assert_eq!(cfg.agents[0].reserve_capacity.session, 20.0);
+        assert_eq!(cfg.agents[1].reserve_capacity.weekly, 5.0);
+        assert_eq!(cfg.agents[1].reserve_capacity.session, 0.0);
+        assert_ne!(
+            cfg.agents[0].config_dir("CLAUDE_CONFIG_DIR", ".claude"),
+            cfg.agents[1].config_dir("CLAUDE_CONFIG_DIR", ".claude")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_unenforceable_reserves_and_duplicate_accounts() {
+        for reserve in ["-1", "101", ".nan"] {
+            let yaml = format!(
+                "{}\n    usage_source: {{type: anthropic-oauth}}\n    reserve_capacity: {{weekly: {reserve}}}\n",
+                minimal_yaml().trim_end()
+            );
+            assert!(
+                Config::from_yaml(&yaml)
+                    .unwrap_err()
+                    .0
+                    .contains("reserve_capacity.weekly")
+            );
+        }
+        let yaml = format!(
+            "{}\n    reserve_capacity: {{session: 20}}\n",
+            minimal_yaml().trim_end()
+        );
+        assert!(
+            Config::from_yaml(&yaml)
+                .unwrap_err()
+                .0
+                .contains("usage_source")
+        );
+        let yaml = format!(
+            "{}\n    accounts: [{{name: work}}, {{name: work}}]\n",
+            minimal_yaml().trim_end()
+        );
+        assert!(
+            Config::from_yaml(&yaml)
+                .unwrap_err()
+                .0
+                .contains("duplicate agent")
+        );
     }
 }
