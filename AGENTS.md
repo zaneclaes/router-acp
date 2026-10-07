@@ -306,7 +306,8 @@ SDK traps below, which were all discovered the hard way.
   - Client `overage_allowed` permissions are separate from quota hints and
     apply to exact account agents, including windowless entries and disabled
     availability scaling. Denial persists until replaced. Grants expire at the
-    hint TTL or `overage_expires_at`, then deny. Null clears the client policy.
+    explicit `overage_expires_at`, using hint TTL only when none is supplied,
+    then deny. Malformed explicit deadlines deny. Null clears the client policy.
     Native polls retain independent quota numbers and reserve cordons. Test
     policy through ACP with native readings, sibling accounts and grant expiry.
 - **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by

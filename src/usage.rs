@@ -1207,8 +1207,8 @@ fn codex_overage_dollars(rate_limits: &Value) -> Option<f64> {
 /// ```
 ///
 /// `overage_allowed` independently controls paid usage for this exact account.
-/// False denies until replaced; true grants until the hint TTL or optional
-/// `overage_expires_at`, whichever comes first. Null removes the client policy.
+/// False denies until replaced; true grants until `overage_expires_at` when
+/// supplied, otherwise until the hint TTL. Null removes the client policy.
 /// Policy applies to native readings even without windows or preference scaling.
 /// It never supplies or replaces account usage or removes reserve cordons.
 ///
@@ -1243,14 +1243,7 @@ pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
                 Value::Null => headroom.clear_overage_permission(agent),
                 Value::Bool(false) => headroom.set_overage_permission(agent, None),
                 Value::Bool(true) => {
-                    let deadline = now + Duration::from_secs(ttl);
-                    let deadline = match entry.get("overage_expires_at") {
-                        None => Some(deadline),
-                        Some(Value::String(expires)) => {
-                            crate::limits::parse_reset_timestamp(expires).map(|at| at.min(deadline))
-                        }
-                        _ => None,
-                    };
+                    let deadline = overage_permission_expiry(entry, now, Duration::from_secs(ttl));
                     headroom.set_overage_permission(agent, deadline);
                 }
                 _ => {}
@@ -1271,6 +1264,20 @@ pub fn apply_availability_hint(shared: &Arc<Shared>, params: &Value) {
             availability,
             now + Duration::from_secs(ttl),
         );
+    }
+}
+
+/// Resolve a true paid-usage grant. An explicit timestamp is authoritative;
+/// malformed explicit values fail closed as a persistent denial.
+fn overage_permission_expiry(
+    entry: &Value,
+    now: SystemTime,
+    hint_ttl: Duration,
+) -> Option<SystemTime> {
+    match entry.get("overage_expires_at") {
+        None => Some(now + hint_ttl),
+        Some(Value::String(expires)) => crate::limits::parse_reset_timestamp(expires),
+        Some(_) => None,
     }
 }
 
@@ -2837,6 +2844,33 @@ agents:
         assert!(
             a.values().all(|v| (v.plan_headroom - 1.0).abs() < 1e-9),
             "inactive full meter ignored: {a:?}"
+        );
+    }
+
+    #[test]
+    fn overage_grant_expiry_honors_explicit_timestamp_over_hint_ttl() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let hint_ttl = Duration::from_secs(60);
+        let explicit = json!({ "overage_expires_at": "2099-01-01T00:00:00Z" });
+        let explicit_expiry = overage_permission_expiry(&explicit, now, hint_ttl);
+        assert_eq!(
+            explicit_expiry,
+            crate::limits::parse_reset_timestamp("2099-01-01T00:00:00Z")
+        );
+        assert!(explicit_expiry.unwrap() > now + hint_ttl);
+
+        assert_eq!(
+            overage_permission_expiry(&json!({}), now, hint_ttl),
+            Some(now + hint_ttl)
+        );
+        assert_eq!(
+            overage_permission_expiry(
+                &json!({ "overage_expires_at": "not-a-timestamp" }),
+                now,
+                hint_ttl,
+            ),
+            None,
+            "malformed explicit expiry must fail closed"
         );
     }
 

@@ -7052,6 +7052,106 @@ async fn account_overage_permission_gates_native_readings_without_quota_hints() 
 }
 
 #[tokio::test]
+async fn account_overage_grant_outlives_short_quota_hint_ttl() {
+    let state = temp_state_file("account-grant-expiry");
+    let log = temp_log("account-grant-expiry");
+    let yaml = format!(
+        "state_file: {}\nrouter: static\nrouters:\n  static: {{ candidate: 'claude@personal/sonnet', allow_fallback: true }}\n\
+         delegation: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "claude@personal",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml("codex", &[("gpt-5.6", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let id = CandidateId::new("claude@personal", "sonnet");
+        let paying = router_acp::headroom::SeatAvailability {
+            plan_headroom: 0.0,
+            plan_remaining_dollars: None,
+            on_overage: true,
+            overage_headroom: Some(0.9),
+            overage_remaining_dollars: Some(90.0),
+            source: "poll",
+        };
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_polled_availability(std::collections::HashMap::from([(id.clone(), paying)]));
+
+        cx.send_notification(agent_client_protocol::UntypedMessage::new(
+            "router-acp/availability_hint",
+            serde_json::json!({
+                "ttl_secs": 1,
+                "agents": [{
+                    "agent": "claude@personal",
+                    "windows": [{ "percent": 100, "scope": serde_json::Value::Null, "active": true }],
+                    "overage": { "enabled": true, "percent": 10 },
+                    "overage_allowed": true,
+                    "overage_expires_at": "2099-01-01T00:00:00Z"
+                }]
+            }),
+        )?)?;
+
+        for _ in 0..50 {
+            if shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&id)
+                .is_some_and(|a| a.source == "hint")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&id)
+                .map(|a| a.source),
+            Some("hint"),
+            "the quota hint should apply before its TTL expires"
+        );
+
+        for _ in 0..100 {
+            if shared
+                .headroom
+                .lock()
+                .unwrap()
+                .availability(&id)
+                .is_some_and(|a| a.source == "poll")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let availability = shared.headroom.lock().unwrap().availability(&id);
+        assert_eq!(
+            availability.as_ref().map(|a| a.source),
+            Some("poll"),
+            "quota hint must expire on its own TTL"
+        );
+        assert!(
+            !shared.headroom.lock().unwrap().seat_exhausted(&id),
+            "the explicit grant must survive the shorter quota hint TTL"
+        );
+
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hello").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:sonnet:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn availability_hint_penalizes_overage_seat() {
     let state = temp_state_file("avail-hint");
     let log = temp_log("avail-hint");
