@@ -441,9 +441,9 @@ async fn run_prompt(
             let _ = cx.send_notification(chunk(&session_id, body));
             return responder.respond(PromptResponse::new(StopReason::EndTurn));
         }
-        // Default fail-open-friendly reply when tests forget the env: no
-        // orchestration, no dimensions.
-        let default = r#"{"orchestrate":{"warranted":false,"confidence":0.95,"estimated_parts":1,"reason":"mock default"}}"#;
+        // Default reply when tests forget the env: a minimal routing-only
+        // classification, no dimensions.
+        let default = r#"{"routing":{"task_class":"CodingGeneral","complexity":0.2,"confidence":0.9,"reason":"mock default"}}"#;
         let _ = cx.send_notification(chunk(&session_id, default.to_string()));
         return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }

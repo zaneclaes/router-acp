@@ -3866,7 +3866,7 @@ async fn delegate_subagent_gets_linked_state_row() {
 }
 
 // ======================================================================
-// Prompt routing directives (orchestration support)
+// Prompt routing directives
 // ======================================================================
 
 #[tokio::test]
@@ -5300,141 +5300,15 @@ async fn usage_cordon_escape_skips_equal_quality_peer() {
 }
 
 #[tokio::test]
-async fn orchestration_pins_planner_and_injects_protocol_on_a_list() {
-    let state = temp_state_file("orch-pin");
-    let log = temp_log("orch-pin");
-    // Planner = b/m2. A multi-part list on a fresh session must pin the planner
-    // and prepend the orchestration protocol (visible in the mock's echo).
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: true, inject_prompt: true }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    let state_path = state.clone();
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating a 3-part task"),
-            "orchestration disclosed: {text}"
-        );
-        assert!(text.contains("echo:m2:"), "pinned the planner b/m2: {text}");
-        assert!(
-            text.contains("you are the ORCHESTRATOR"),
-            "orchestration protocol injected into the prompt: {text}"
-        );
-        // Must forbid the model's built-in sub-agent tool (which stays in-lineage
-        // and is invisible to the router).
-        assert!(
-            text.contains("Do NOT use any built-in sub-agent"),
-            "protocol forbids the native Task tool: {text}"
-        );
-        // Must name a concrete cross-lineage reviewer (a/m1, lineage a ≠ planner b).
-        assert!(
-            text.contains("a/m1") && text.contains("DIFFERENT lineage"),
-            "protocol pins the review to a different lineage: {text}"
-        );
-        // The session is grouped under the orchestrate run label.
-        let db = open_state(&state_path);
-        let row = db.get(&sid).expect("session row");
-        assert_eq!(row.run_label.as_deref(), Some("orchestrate"));
-        assert!(
-            row.delegation_directive_injections == 0,
-            "the stronger orchestration protocol suppresses the ordinary directive"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn orchestration_planner_pick_honors_agent_preference() {
-    let state = temp_state_file("orch-pref");
-    // Planner globs list b/m2 FIRST (like the live `["*sol*", "*fable*"]`
-    // config), and b/m2 has the higher raw quality (0.90 vs 0.87) — but agent
-    // `a` carries `preference: 0.15`, so a/m1's preference-adjusted quality
-    // (1.02) must win the planner seat. Pattern order alone used to decide,
-    // which made raising `preference` a no-op for orchestration.
-    let scores = std::env::temp_dir().join(format!(
-        "router-acp-scores-{}.yaml",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(
-        &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.87 }\n",
-    )
-    .unwrap();
-    let yaml = format!(
-        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\", \"*m1*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        scores.display(),
-        agent_yaml("a", &[("m1", 1)], &[]).replace(
-            "    model_selection:",
-            "    preference: 0.15\n    model_selection:"
-        ),
-        agent_yaml("b", &[("m2", 2)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating a 3-part task on a/m1"),
-            "preferred agent won the planner seat: {text}"
-        );
-        assert!(
-            text.contains("echo:m1:"),
-            "ran on the preferred planner: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn orchestration_delegate_children_inherit_run_label_and_parent() {
-    // An orchestrating session that actually delegates gets a linked, labelled
-    // sub-session row — the observability the DB was missing when the planner
-    // used its built-in (router-invisible) sub-agent tool instead.
-    let state = temp_state_file("orch-deleg");
-    let log = temp_log("orch-deleg");
+async fn delegate_children_inherit_run_label_and_parent() {
+    // A labelled session that delegates gets a linked sub-session row that
+    // carries the parent's run label.
+    let state = temp_state_file("label-deleg");
+    let log = temp_log("label-deleg");
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 3 }}\n\
          auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*opus*\"]\n\
          routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
         state.display(),
         agent_yaml(
@@ -5455,17 +5329,17 @@ async fn orchestration_delegate_children_inherit_run_label_and_parent() {
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        // A list (orchestration triggers → pins fancy/opus planner) whose prompt
-        // also drives the mock to actually call delegate_task.
+        // A label directive whose prompt also drives the mock to actually call
+        // delegate_task.
         prompt_text(
             &cx,
             &sid,
-            "Handle these:\n1. first thing\n2. second thing\nDELEGATE:do the subtask",
+            "[router: label=nightly]\nhandle it\nDELEGATE:do the subtask",
         )
         .await?;
         let db = open_state(&state_path);
         let parent = db.get(&sid).expect("parent row");
-        assert_eq!(parent.run_label.as_deref(), Some("orchestrate"));
+        assert_eq!(parent.run_label.as_deref(), Some("nightly"));
         let children: Vec<_> = db
             .all()
             .into_iter()
@@ -5476,303 +5350,8 @@ async fn orchestration_delegate_children_inherit_run_label_and_parent() {
         assert_eq!(child.kind, "delegate");
         assert_eq!(
             child.run_label.as_deref(),
-            Some("orchestrate"),
+            Some("nightly"),
             "delegate child inherits the run label"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn orchestrating_planner_using_native_task_is_flagged() {
-    // When an orchestrating planner uses the adapter's built-in sub-agent tool
-    // (title "Task") instead of delegate_task, the router warns and records it.
-    let state = temp_state_file("orch-degraded");
-    let log = temp_log("orch-degraded");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    let state_path = state.clone();
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // A list (orchestration fires → pins planner b/m2) whose turn also emits
-        // a native "Task" tool call.
-        let resp = prompt_text(&cx, &sid, "Do these:\n1. one\n2. two\nTOOL:mcp:Task").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestration degraded"),
-            "router warns when planner uses native sub-agent tool: {text}"
-        );
-        let db = open_state(&state_path);
-        let row = db.get(&sid).expect("session row");
-        assert!(
-            row.native_subagent_calls >= 1,
-            "native-subagent use recorded: {}",
-            row.native_subagent_calls
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn multi_part_task_orchestrates_over_a_genuine_skill_invocation() {
-    // A real skill token in a multi-part task must NOT hijack routing to the
-    // skill's model — orchestration wins, and the planner decides when/if to run
-    // the skill (end-of-work skills like shipping run last).
-    let state = temp_state_file("orch-vs-skill");
-    let log = temp_log("orch-vs-skill");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m1*\"]\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // A genuine ship-pr invocation, but as part of a multi-part task.
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Do the work then ship-pr:\n1. add the feature\n2. write tests",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating a 2-part task"),
-            "orchestration wins over skill routing for a multi-part task: {text}"
-        );
-        assert!(
-            text.contains("echo:m2:"),
-            "pinned the planner b/m2, not the skill's a/m1: {text}"
-        );
-        assert!(
-            !text.contains("skill `ship-pr` steering"),
-            "skill routing did not fire: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn explicit_directive_suppresses_auto_orchestration() {
-    let state = temp_state_file("orch-suppress");
-    let log = temp_log("orch-suppress");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // A list, but the user forces a candidate — orchestration must NOT fire.
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "[router: candidate=a/m1]\nDo these:\n1. one\n2. two\n3. three",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("echo:m1:"),
-            "honored explicit pin a/m1: {text}"
-        );
-        assert!(
-            !text.contains("you are the ORCHESTRATOR"),
-            "no orchestration protocol injected: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn orchestration_switches_pinned_session_on_a_list() {
-    let state = temp_state_file("orch-switch");
-    let log = temp_log("orch-switch");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // Pin a/m1 with a plain (non-list) prompt.
-        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
-        // A follow-up list must switch the live session onto the planner.
-        let resp = prompt_text(&cx, &sid, "Now: (1) refactor (2) add tests (3) ship").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating a 3-part task"),
-            "orchestration disclosed: {text}"
-        );
-        assert!(
-            text.contains("echo:m2:"),
-            "switched to the planner b/m2: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn orchestration_skipped_when_list_answers_the_models_questions() {
-    let state = temp_state_file("orch-answer");
-    let log = temp_log("orch-answer");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // Pin a/m1 (NOT the planner). The echoed turn carries the model's
-        // questions, so it lands in turn_output as the "previous agent turn".
-        prompt_text(
-            &cx,
-            &sid,
-            "[router: candidate=a/m1]\nWhich database should we use? Which auth provider?",
-        )
-        .await?;
-        // The user answers with a list — this must NOT switch to the planner.
-        let resp = prompt_text(&cx, &sid, "1. postgres\n2. oauth\n3. fly.io").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            !text.contains("orchestrating"),
-            "answering the model's questions must not orchestrate: {text}"
-        );
-        assert!(
-            text.contains("echo:m1:1. postgres"),
-            "stayed on the pinned model to relay the answer: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn backticked_skill_mention_does_not_suppress_orchestration() {
-    // hickory-ai6 regression: a task list that merely *mentions* a skill name
-    // inside backticks (a UI example) must not trigger skill_routing and must
-    // still orchestrate.
-    let state = temp_state_file("orch-skillmention");
-    let log = temp_log("orch-skillmention");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         skill_routing:\n  - pattern: ship-pr\n    candidates: [\"*m1*\"]\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Improve the UI:\n\
-             1. add an autocomplete so typing `/` suggests skills like `/ship-pr`\n\
-             2. fix the loading spinner",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating a 2-part task"),
-            "list orchestrates despite the backticked skill mention: {text}"
-        );
-        assert!(
-            text.contains("echo:m2:"),
-            "pinned the planner b/m2, not the skill's a/m1: {text}"
-        );
-        assert!(
-            !text.contains("skill `ship-pr`"),
-            "skill routing must not fire on a backticked mention: {text}"
         );
         Ok(())
     })
@@ -6892,7 +6471,6 @@ async fn account_priority_honors_exclusions_and_only_user_overrides_bypass_order
         init(&cx).await?;
         for source in [
             router_acp::strategies::OverrideSource::Skill("review".into()),
-            router_acp::strategies::OverrideSource::Planner,
             router_acp::strategies::OverrideSource::UserPick,
         ] {
             let user = source == router_acp::strategies::OverrideSource::UserPick;
@@ -8070,16 +7648,15 @@ async fn partial_plan_headroom_changes_effective_cost() {
 // ======================================================================
 
 #[tokio::test]
-async fn ticket_reference_enriches_prompt_and_triggers_orchestration() {
-    let state = temp_state_file("ticket-orch");
+async fn ticket_reference_enriches_prompt() {
+    let state = temp_state_file("ticket-enrich");
     let state_path = state.clone();
-    let log = temp_log("ticket-orch");
-    // The fetch command emits a multi-part work list — so the bare prompt
-    // "Fix HAI-1234" becomes rich enough to trigger orchestration.
+    let log = temp_log("ticket-enrich");
+    // The fetch command emits the ticket body, which is injected into the
+    // bare prompt "Fix HAI-1234" before it reaches the downstream model.
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
          ticket_context:\n\
          \x20 - prefix: \"HAI-\"\n\
          \x20   command: [\"/bin/sh\", \"-c\", \"printf '# %s: upgrade pipeline\\n1. add extractor\\n2. wire routes\\n3. add tests\\n' $TICKET\"]\n\
@@ -8111,11 +7688,6 @@ async fn ticket_reference_enriches_prompt_and_triggers_orchestration() {
             text.contains("HAI-1234: upgrade pipeline"),
             "ticket content reached the downstream model: {text}"
         );
-        assert!(
-            text.contains("orchestrating a 3-part task"),
-            "ticket's work list triggered orchestration: {text}"
-        );
-        assert!(text.contains("echo:m2:"), "pinned the planner: {text}");
         assert_eq!(
             open_state(&state_path)
                 .get(&sid)
@@ -8216,263 +7788,9 @@ async fn ticket_enrichment_chars_rides_the_pin_and_resets_next_turn() {
     .await;
 }
 
-#[tokio::test]
-async fn orchestrate_prefix_forces_orchestration_without_a_list() {
-    let state = temp_state_file("orch-force");
-    let log = temp_log("orch-force");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        // A single-sentence task — no list — but the prefix forces it.
-        let resp = prompt_text(&cx, &sid, "orchestrate: fix the login bug").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrate: requested"),
-            "forced orchestration disclosed: {text}"
-        );
-        assert!(text.contains("echo:m2:"), "pinned the planner: {text}");
-        assert!(
-            text.contains("you are the ORCHESTRATOR"),
-            "protocol injected: {text}"
-        );
-        assert!(
-            text.contains("explicitly requested orchestration"),
-            "forced intro wording: {text}"
-        );
-        assert!(
-            !text.contains("echo:m2:orchestrate:"),
-            "prefix stripped from the model's prompt: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn reviewer_prefers_opposite_lineage_of_planner_symmetrically() {
-    // With the SAME reviewer glob list, the resolved reviewer must be the
-    // opposite lineage of whichever planner is chosen — enforced in code
-    // (resolve_reviewers filters agent != planner.agent), not by prose.
-    // Both candidates share one quality score (custom table) and no
-    // preference, so glob order is the planner tie-break in each direction.
-    // Direction 1: planner globs prefer *sol* → planner b/gpt-sol → the
-    // injected protocol must pin the review to a/fable-5.
-    let scores = std::env::temp_dir().join(format!(
-        "router-acp-scores-{}.yaml",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(
-        &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"*\", default_quality: 0.90 }\n",
-    )
-    .unwrap();
-    for (planner_globs, expect_planner_echo, expect_reviewer) in [
-        ("[\"*sol*\", \"*fable*\"]", "echo:gpt-sol:", "a/fable-5"),
-        ("[\"*fable*\", \"*sol*\"]", "echo:fable-5:", "b/gpt-sol"),
-    ] {
-        let state = temp_state_file("orch-symmetry");
-        let log = temp_log("orch-symmetry");
-        let yaml = format!(
-            "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-             auto_upgrade: {{ enabled: false }}\n\
-             orchestration:\n  enabled: true\n  min_items: 2\n\
-             \x20 planner: {planner_globs}\n\
-             \x20 reviewer: [\"*sol*\", \"*fable*\"]\n\
-             agents:\n{}{}",
-            state.display(),
-            scores.display(),
-            agent_yaml(
-                "a",
-                &[("fable-5", 5)],
-                &[("MOCK_LOG", &log.display().to_string())]
-            ),
-            agent_yaml(
-                "b",
-                &[("gpt-sol", 5)],
-                &[("MOCK_LOG", &log.display().to_string())]
-            ),
-        );
-        run_test(yaml, async |cx, observed| {
-            init(&cx).await?;
-            let sid = new_session(&cx).await?.session_id.0.to_string();
-            let resp = prompt_text(&cx, &sid, "Do these:\n1. one\n2. two").await?;
-            assert_eq!(resp.stop_reason, StopReason::EndTurn);
-            let text = agent_text(&observed, &sid);
-            assert!(
-                text.contains(expect_planner_echo),
-                "planner {expect_planner_echo} pinned (globs {planner_globs}): {text}"
-            );
-            assert!(
-                text.contains(&format!("set to one of: {expect_reviewer}")),
-                "review pinned to opposite lineage {expect_reviewer}: {text}"
-            );
-            Ok(())
-        })
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn same_company_agents_share_a_lineage_for_review() {
-    // Lineage = company, not agent name. Two agents both tagged
-    // `lineage: anthropic` (e.g. two Claude seats): a planner on one must NOT
-    // review on the other — even though the reviewer glob prefers its model and
-    // the agent NAME differs — and must land on the other company instead.
-    let state = temp_state_file("orch-lineage");
-    let log = temp_log("orch-lineage");
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n\
-         \x20 planner: [\"*fable*\"]\n\
-         \x20 reviewer: [\"*opus*\", \"*sol*\"]\n\
-         agents:\n{}{}{}",
-        state.display(),
-        agent_yaml(
-            "claude-a",
-            &[("fable-5", 5)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        )
-        .replace(
-            "model_selection:",
-            "lineage: anthropic\n    model_selection:"
-        ),
-        agent_yaml(
-            "claude-b",
-            &[("opus-x", 4)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        )
-        .replace(
-            "model_selection:",
-            "lineage: anthropic\n    model_selection:"
-        ),
-        agent_yaml(
-            "d",
-            &[("gpt-sol", 5)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(&cx, &sid, "Do these:\n1. one\n2. two").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("echo:fable-5:"),
-            "planner on claude-a/fable-5: {text}"
-        );
-        assert!(
-            text.contains("set to one of: d/gpt-sol"),
-            "review must skip same-company claude-b/opus-x and land on d/gpt-sol: {text}"
-        );
-        assert!(
-            !text.contains("one of: claude-b/opus-x"),
-            "same-lineage sibling must not be offered as reviewer: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
 // ---------------------------------------------------------------------------
 // Pre-classifier (HAI-7056)
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn preclass_false_positive_list_does_not_orchestrate() {
-    // A multi-bullet plan/Q&A that the legacy detector would treat as a task
-    // list must NOT orchestrate when pre-class says warranted=false.
-    let state = temp_state_file("preclass-fp");
-    let log = temp_log("preclass-fp");
-    let preclass_json = r#"{"routing":{"task_class":"Writing","task_classes":["Writing"],"categories":["docs"],"complexity":0.18,"confidence":0.9,"reason":"bounded plan"},"orchestrate":{"warranted":false,"confidence":0.92,"estimated_parts":1,"reason":"enumerated Q&A / plan, not multi-track impl"}}"#;
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
-         \x20 orchestrate_min_confidence: 0.65\n  disclose: true\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[
-                ("MOCK_LOG", &log.display().to_string()),
-                ("MOCK_PRECLASS_JSON", preclass_json),
-            ]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Open decisions:\n1. postgres or sqlite?\n2. oauth or saml?\n3. fly or k8s?",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("pre-class"),
-            "pre-class disclosure expected: {text}"
-        );
-        assert!(
-            !text.contains("orchestrating"),
-            "pre-class FP must not orchestrate: {text}"
-        );
-        assert!(
-            !text.contains("you are the ORCHESTRATOR"),
-            "no orchestration protocol: {text}"
-        );
-        let routing = open_state(&state)
-            .get(&sid)
-            .and_then(|session| session.routing)
-            .expect("routing persisted");
-        assert_eq!(routing["class"], "Writing", "{routing}");
-        assert_eq!(routing["complexity"], 0.18, "{routing}");
-        let events = read_log(&log);
-        let set_mode = events
-            .iter()
-            .position(|event| event["event"] == "set_mode" && event["modeId"] == "preclass")
-            .expect("pre-class safe mode must be set");
-        let prompt = events
-            .iter()
-            .position(|event| event["event"] == "prompt")
-            .expect("evaluator prompt");
-        assert!(
-            set_mode < prompt,
-            "safe mode must precede evaluator prompt: {events:?}"
-        );
-        Ok(())
-    })
-    .await;
-}
 
 #[tokio::test]
 async fn preclass_mode_less_evaluator_runs_without_set_mode() {
@@ -8834,65 +8152,12 @@ async fn preclass_tool_attempt_is_cancelled_and_fails_over() {
 }
 
 #[tokio::test]
-async fn preclass_true_multi_track_still_orchestrates() {
-    let state = temp_state_file("preclass-tp");
-    let log = temp_log("preclass-tp");
-    let preclass_json = r#"{"routing":{"task_class":"Feature","task_classes":["Feature","Architecture"],"categories":["backend"],"complexity":0.72,"confidence":0.9,"reason":"multi-track implementation"},"orchestrate":{"warranted":true,"confidence":0.9,"estimated_parts":3,"reason":"multi-track implementation"}}"#;
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
-         \x20 orchestrate_min_confidence: 0.65\n  disclose: true\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[
-                ("MOCK_LOG", &log.display().to_string()),
-                ("MOCK_PRECLASS_JSON", preclass_json),
-            ]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(
-            &cx,
-            &sid,
-            "Please handle these:\n1. add a flag\n2. wire it up\n3. document it",
-        )
-        .await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(text.contains("pre-class"), "pre-class disclosure: {text}");
-        assert!(
-            text.contains("orchestrating a 3-part task"),
-            "pre-class TP must orchestrate: {text}"
-        );
-        assert!(
-            text.contains("you are the ORCHESTRATOR"),
-            "protocol injected: {text}"
-        );
-        assert!(text.contains("echo:m2:"), "pinned planner b/m2: {text}");
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn preclass_no_routing_falls_back_to_static_classifier() {
     // Valid JSON with no `routing` block: the LLM walk yields no classification.
     // Session start proceeds on the static keyword classifier rather than
     // hard-failing.
     let state = temp_state_file("preclass-no-routing");
-    let preclass_json = r#"{"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"n/a"}}"#;
+    let preclass_json = r#"{"notes":{"reason":"no routing block"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -9055,11 +8320,10 @@ async fn preclass_widens_after_preferred_pool_exhausted() {
 async fn preclass_dimension_injects_ui_planning() {
     let state = temp_state_file("preclass-ui");
     let log = temp_log("preclass-ui");
-    let preclass_json = r#"{"routing":{"task_class":"UiTweak","task_classes":["UiTweak","Feature"],"categories":["UX","frontend"],"complexity":0.55,"confidence":0.92,"reason":"new UI surface"},"orchestrate":{"warranted":false,"confidence":0.9,"estimated_parts":1,"reason":"single UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
+    let preclass_json = r#"{"routing":{"task_class":"UiTweak","task_classes":["UiTweak","Feature"],"categories":["UX","frontend"],"complexity":0.55,"confidence":0.92,"reason":"new UI surface"},"ui_planning":{"mode":"planning","confidence":0.88,"reason":"redesign request"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
          pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
          \x20 disclose: true\n\
          \x20 dimensions:\n\
@@ -9091,56 +8355,6 @@ async fn preclass_dimension_injects_ui_planning() {
         assert!(
             text.contains("[kory-code] PLANNING INJECT"),
             "ui_planning inject must ride the prompt: {text}"
-        );
-        assert!(
-            !text.contains("orchestrating"),
-            "must not orchestrate: {text}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn preclass_force_orchestrate_still_works() {
-    // orchestrate: force overrides pre-class saying no.
-    let state = temp_state_file("preclass-force");
-    let log = temp_log("preclass-force");
-    let preclass_json = r#"{"routing":{"task_class":"CodingGeneral","task_classes":["CodingGeneral"],"categories":["code"],"complexity":0.4,"confidence":0.9,"reason":"bounded work"},"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*m2*\"]\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*m1*\"]\n  timeout_ms: 5000\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml(
-            "a",
-            &[("m1", 1)],
-            &[
-                ("MOCK_LOG", &log.display().to_string()),
-                ("MOCK_PRECLASS_JSON", preclass_json),
-            ]
-        ),
-        agent_yaml(
-            "b",
-            &[("m2", 2)],
-            &[("MOCK_LOG", &log.display().to_string())]
-        ),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(&cx, &sid, "orchestrate: ship the release notes").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating"),
-            "force must orchestrate despite pre-class no: {text}"
-        );
-        assert!(
-            text.contains("you are the ORCHESTRATOR"),
-            "protocol injected: {text}"
         );
         Ok(())
     })
@@ -9595,14 +8809,13 @@ async fn planner_phase_implementation_directive_switches_pinned_session() {
 }
 
 #[tokio::test]
-async fn planner_stray_orchestrate_does_not_auto_orchestrate_and_picks_implementation() {
+async fn planner_ready_implementation_plan_picks_boosted_implementation_candidate() {
     // Live-shaped: router: planner, implementation pool terra/opus/grok with a
-    // +2 grok boost, orchestration.enabled with planner=*sol*. A stale
-    // evaluator `orchestrate: warranted=true` must NOT steal the pin onto
-    // orchestration.planner; implementation + plan_ready routes to grok.
-    let state = temp_state_file("planner-no-auto-orch");
-    let log = temp_log("planner-no-auto-orch");
-    let preclass = r#"{"routing":{"task_class":"Architecture","task_classes":["Architecture"],"categories":["backend"],"complexity":0.55,"confidence":0.9,"reason":"implementation-ready ticket"},"planner_phase":{"phase":"implementation","confidence":0.95,"plan_ready":true,"reason":"ticket is ready to build"},"orchestrate":{"warranted":true,"confidence":0.95,"estimated_parts":3,"reason":"stale auto-orchestrate"}}"#;
+    // +2 grok boost and planning on sol. An implementation-phase, plan_ready
+    // verdict must enter the implementation phase and route to grok, not sol.
+    let state = temp_state_file("planner-impl-boost");
+    let log = temp_log("planner-impl-boost");
+    let preclass = r#"{"routing":{"task_class":"Architecture","task_classes":["Architecture"],"categories":["backend"],"complexity":0.55,"confidence":0.9,"reason":"implementation-ready ticket"},"planner_phase":{"phase":"implementation","confidence":0.95,"plan_ready":true,"reason":"ticket is ready to build"}}"#;
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\n\
          auto_upgrade: {{ enabled: false }}\n\
@@ -9611,9 +8824,7 @@ async fn planner_stray_orchestrate_does_not_auto_orchestrate_and_picks_implement
          implementation_candidates: [\"*terra*\", \"*opus*\", \"*grok*\"]\n    \
          model_boosts:\n      - {{ pattern: \"*grok*\", implementation: 2.0, planning: 0.0 }}\n    \
          phase_upgrade_confidence: 0.7\n    apex_complexity: 0.85\n    floor_complexity: 0.15\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*sol*\"]\n\
          pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n  disclose: true\n\
-         \x20 orchestrate_min_confidence: 0.65\n\
          agents:\n{}{}{}",
         state.display(),
         agent_yaml(
@@ -9640,81 +8851,23 @@ async fn planner_stray_orchestrate_does_not_auto_orchestrate_and_picks_implement
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "Implement the attached ticket").await?;
 
-        let (phase, orchestrating) = shared
-            .with_session(&sid, |s| (s.planner_phase, s.orchestrating))
+        let phase = shared
+            .with_session(&sid, |s| s.planner_phase)
             .expect("session");
         assert_eq!(
             phase,
             Some(router_acp::config::PlannerPhase::Implementation),
             "ready implementation plan must enter implementation phase"
         );
-        assert!(
-            !orchestrating,
-            "planner must not auto-orchestrate from a stray orchestrate verdict"
-        );
 
         let text = agent_text(&observed, &sid);
-        assert!(
-            !text.contains("orchestrating"),
-            "no auto-orchestration disclosure: {text}"
-        );
-        assert!(
-            !text.contains("you are the ORCHESTRATOR"),
-            "orchestration protocol must not be injected: {text}"
-        );
         assert!(
             text.contains("echo:grok:"),
             "implementation + grok boost must pin grok, not sol: {text}"
         );
         assert!(
             !text.contains("echo:sol:"),
-            "orchestration planner must not steal the pin: {text}"
-        );
-
-        let prompts = planner_user_prompts(&log);
-        let prompt = prompts
-            .iter()
-            .find(|p| !p.contains("[router-acp pre-classifier]"))
-            .expect("downstream user prompt");
-        assert!(
-            !prompt.contains("you are the ORCHESTRATOR"),
-            "downstream prompt must not carry the orchestration protocol: {prompt}"
-        );
-        Ok(())
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn planner_explicit_orchestrate_prefix_still_forces_orchestration() {
-    let state = temp_state_file("planner-force-orch");
-    let preclass = r#"{"routing":{"task_class":"CodingGeneral","complexity":0.4,"confidence":0.9,"reason":"bounded work"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"no plan"},"orchestrate":{"warranted":false,"confidence":0.99,"estimated_parts":1,"reason":"no"}}"#;
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\n\
-         router: planner\n\
-         routers:\n  planner:\n    planning_candidates: [\"*sol*\"]\n    \
-         implementation_candidates: [\"*opus*\"]\n\
-         orchestration:\n  enabled: true\n  min_items: 2\n  planner: [\"*sol*\"]\n\
-         pre_classifier:\n  enabled: true\n  evaluator: [\"*sol*\"]\n  disclose: true\n\
-         agents:\n{}{}",
-        state.display(),
-        agent_yaml("codex", &[("sol", 1)], &[("MOCK_PRECLASS_JSON", preclass)]),
-        agent_yaml("claude", &[("opus", 2)], &[]),
-    );
-    run_test(yaml, async |cx, observed| {
-        init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        let resp = prompt_text(&cx, &sid, "orchestrate: ship the release notes").await?;
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        let text = agent_text(&observed, &sid);
-        assert!(
-            text.contains("orchestrating"),
-            "explicit orchestrate: must still force orchestration under planner: {text}"
-        );
-        assert!(
-            text.contains("you are the ORCHESTRATOR"),
-            "forced orchestration must inject the protocol: {text}"
+            "the planning candidate must not take an implementation turn: {text}"
         );
         Ok(())
     })

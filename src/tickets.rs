@@ -3,9 +3,8 @@
 //! When a prompt mentions a ticket id matching a configured prefix (e.g.
 //! `HAI-1234` for `prefix: "HAI-"`), the router runs the rule's command (e.g.
 //! `linear issue view $TICKET`) and prepends the ticket's content to the prompt
-//! **before** classification and orchestration detection. "Fix HAI-1234" thus
-//! routes on the ticket's actual scope — and a ticket whose body is a work list
-//! can trigger auto-orchestration.
+//! **before** classification. "Fix HAI-1234" thus routes on the ticket's
+//! actual scope.
 //!
 //! Fail-open by design: a missing command, non-zero exit, timeout, or empty
 //! output leaves the prompt untouched. Each ticket is injected at most once per

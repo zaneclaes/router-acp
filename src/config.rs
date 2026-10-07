@@ -188,6 +188,23 @@ pub enum NativeSubagentPolicy {
     Allow,
 }
 
+/// Reasoning effort for primary sessions when no one asked for a level
+/// explicitly (the `router.effort` option or `[router: effort=…]`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffortConfig {
+    /// Used instead of the automatic class/complexity recommendation. A long,
+    /// detailed prompt (a whole skill's instructions) classifies as maximum
+    /// complexity, so the automatic level can be far higher than the work
+    /// needs; a coordinating parent is better served by a fixed level.
+    #[serde(default)]
+    pub default: Option<crate::candidate::EffortLevel>,
+    /// Ceiling on any level the router picks by itself (automatic or
+    /// `default`). Explicit requests are never capped.
+    #[serde(default)]
+    pub max_automatic: Option<crate::candidate::EffortLevel>,
+}
+
 /// A command the router runs (no shell) with one JSON event on stdin (see
 /// `delegate_hook`). `delegate_start` runs after the delegate session opens
 /// and before its prompt; a non-zero exit or timeout refuses the delegate.
@@ -498,9 +515,8 @@ impl Default for AutoUpgradeConfig {
 /// Load ticket details into the prompt when a ticket id is referenced. When a
 /// prompt mentions `<prefix><digits>` (e.g. `HAI-1234`), the router runs
 /// `command` (with `$TICKET` substituted) and prepends its stdout to the prompt
-/// before classification and orchestration detection — so "Fix HAI-1234"
-/// becomes a rich prompt that routes (and possibly orchestrates) on the
-/// ticket's actual content. Fails open: a failed/slow fetch leaves the prompt
+/// before classification — so "Fix HAI-1234" becomes a rich prompt that routes
+/// on the ticket's actual content. Fails open: a failed/slow fetch leaves the prompt
 /// unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -527,7 +543,7 @@ pub enum RouteSelection {
     /// The FIRST glob with an eligible candidate wins; quality only breaks
     /// ties *within* that one glob. Use when list order encodes a deliberate
     /// preference the score table does not — e.g. routing a ship flow to a
-    /// flat-rate or cross-lineage seat that a quality-max pick would never
+    /// flat-rate or second-company seat that a quality-max pick would never
     /// select, while still falling through to the next glob when that seat is
     /// cordoned or excluded.
     FirstMatch,
@@ -582,100 +598,6 @@ pub struct SkillRoute {
     pub marks_implementation_phase: bool,
 }
 
-/// Automatic orchestration. When a prompt reads as a multi-part task list
-/// (markdown list, inline `(1)(2)`, or "first … then … finally" ordering), the
-/// router runs a plan → delegate → review pipeline entirely in-process:
-/// it steers/switches the session to a `planner` model and injects an
-/// orchestration protocol instructing that model to decompose the task, delegate
-/// each part via `delegate_task` (routed per-complexity in isolated
-/// sub-sessions), and have a different-lineage `reviewer` verify the net result.
-/// Delegation in an orchestrating session is allowed to
-/// same-/higher-tier peers (so cross-lineage review works), unlike ordinary
-/// cost-shedding delegation. An explicit `[router: …]` directive or `model:`
-/// shorthand on the prompt suppresses auto-orchestration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrchestrationConfig {
-    /// Master switch. Off by default so it never surprises a plain session;
-    /// turn it on in your router.yaml to get automatic decomposition.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Minimum number of detected parts before a prompt is treated as an
-    /// orchestratable list.
-    #[serde(default = "default_min_items")]
-    pub min_items: usize,
-    /// Candidate globs for the planner/orchestrator, best first. The first one
-    /// with an eligible candidate wins (like `skill_routing`).
-    #[serde(default = "default_planner")]
-    pub planner: Vec<String>,
-    /// Preferred cross-lineage reviewer candidate globs, best first. Passed to
-    /// the orchestrator as guidance; it should pick one of a *different* lineage
-    /// than the planner for the review pass.
-    #[serde(default = "default_reviewer")]
-    pub reviewer: Vec<String>,
-    /// Opaque host-owned instructions appended to the orchestration protocol.
-    /// The router does not interpret this text; workflow policy belongs to the
-    /// host rather than router-acp.
-    #[serde(default)]
-    pub instructions: String,
-    /// Maximum review → fix → re-review rounds.
-    #[serde(default = "default_max_fix_rounds")]
-    pub max_fix_rounds: u32,
-    /// Planner self-confidence bar for skipping the review pass. After
-    /// integrating, the planner states its confidence (0.0–1.0) that the
-    /// implementation is correct; strictly above this bar the review is
-    /// skipped with a note.
-    #[serde(default = "default_review_confidence")]
-    pub review_confidence: f64,
-}
-
-fn default_min_items() -> usize {
-    2
-}
-
-fn default_planner() -> Vec<String> {
-    // Opus 5 outranks Grok 4.5; prefer it over gpt-5.5 when both are free.
-    vec![
-        "*sol*".to_string(),
-        "*fable*".to_string(),
-        "*opus*".to_string(),
-        "*grok*".to_string(),
-        "*gpt-5.5*".to_string(),
-    ]
-}
-
-fn default_reviewer() -> Vec<String> {
-    vec![
-        "*gpt-5.5*".to_string(),
-        "*sol*".to_string(),
-        "*opus*".to_string(),
-        "*fable*".to_string(),
-        "*grok*".to_string(),
-    ]
-}
-
-fn default_max_fix_rounds() -> u32 {
-    2
-}
-
-fn default_review_confidence() -> f64 {
-    0.8
-}
-
-impl Default for OrchestrationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            min_items: default_min_items(),
-            planner: default_planner(),
-            reviewer: default_reviewer(),
-            instructions: String::new(),
-            max_fix_rounds: default_max_fix_rounds(),
-            review_confidence: default_review_confidence(),
-        }
-    }
-}
-
 /// When a host-registered pre-classifier dimension should inject its prompt.
 ///
 /// YAML shapes:
@@ -717,8 +639,8 @@ fn default_dim_min_confidence() -> f64 {
     0.70
 }
 
-/// Composable LLM pre-classifier: one cheap ACP evaluation returns structured
-/// decisions for auto-orchestration and host-registered dimensions.
+/// Composable LLM pre-classifier: one cheap ACP evaluation returns the task
+/// class/complexity, the planner router's phase, and host-registered dimensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreClassifierConfig {
@@ -755,9 +677,6 @@ pub struct PreClassifierConfig {
     /// Emit `router-acp · pre-class …` disclosure lines.
     #[serde(default = "default_true")]
     pub disclose: bool,
-    /// Minimum confidence to act on the built-in `orchestrate` dimension.
-    #[serde(default = "default_orchestrate_min_confidence")]
-    pub orchestrate_min_confidence: f64,
     /// Host extensions (e.g. `ui_planning`). One evaluator call covers all.
     #[serde(default)]
     pub dimensions: Vec<PreClassDimension>,
@@ -806,10 +725,6 @@ fn default_preclass_stall_timeout_ms() -> u64 {
     90_000
 }
 
-fn default_orchestrate_min_confidence() -> f64 {
-    0.65
-}
-
 impl Default for PreClassifierConfig {
     fn default() -> Self {
         Self {
@@ -818,7 +733,6 @@ impl Default for PreClassifierConfig {
             timeout_ms: default_preclass_timeout_ms(),
             stall_timeout_ms: default_preclass_stall_timeout_ms(),
             disclose: true,
-            orchestrate_min_confidence: default_orchestrate_min_confidence(),
             dimensions: Vec::new(),
             evaluator_cwd: None,
         }
@@ -928,7 +842,7 @@ pub struct ModelConfig {
     /// Whether any AUTOMATIC mechanism may choose this candidate. `false`
     /// removes it from every automatic pool — the `auto`/`pareto-code`
     /// strategies, escalation/demotion targets, pre-classifier evaluators,
-    /// orchestration planner/reviewer globs, skill routes, failover, delegate
+    /// skill routes, failover, delegate
     /// scoping and per-request proxy routing — while leaving it explicitly
     /// selectable (`router.candidate`, `[router: candidate=…]`,
     /// `[router: switch=…]`): reachable on purpose, never by accident.
@@ -1027,10 +941,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub login_command: Option<CommandConfig>,
     /// Model-company lineage tag (e.g. `anthropic`, `openai`). Defaults to the
-    /// agent name. Orchestration's cross-lineage review compares THIS — the
-    /// point is a reviewer whose models come from a **different company** (and
-    /// thus behave differently), so two agents backed by the same vendor (e.g.
-    /// two Claude seats) should declare the same `lineage`.
+    /// agent name. Reported with lifecycle-hook events so a host can tell which
+    /// company a worker runs on; two agents backed by the same vendor (e.g. two
+    /// Claude seats) should declare the same `lineage` (account seats share it
+    /// automatically).
     #[serde(default)]
     pub lineage: Option<String>,
     /// Optional per-request LLM proxy interposition for this adapter. The
@@ -1390,8 +1304,7 @@ pub struct PlannerRouterConfig {
     /// Opaque host-owned instructions injected into the agent's context when
     /// the session enters the planning phase. The router does not interpret
     /// this text; workflow policy (ticket decomposition, session-spawning
-    /// protocol, coordination rules) belongs to the host. Analogous to
-    /// `orchestration.instructions`.
+    /// protocol, coordination rules) belongs to the host.
     #[serde(default)]
     pub planning_instructions: String,
 }
@@ -1477,10 +1390,15 @@ pub struct Config {
     /// Ticket-reference → context-loading rules (prefix + fetch command).
     #[serde(default)]
     pub ticket_context: Vec<TicketRule>,
-    /// Automatic orchestration of multi-part task lists.
+    /// Removed: auto-orchestration was superseded by the `planner` router.
+    /// Accepted only so a stale `orchestration:` block fails validation with a
+    /// pointer to its replacement instead of a bare unknown-field error.
+    #[serde(default, skip_serializing)]
+    pub orchestration: Option<serde_yaml::Value>,
+    /// Reasoning-effort policy for primary sessions.
     #[serde(default)]
-    pub orchestration: OrchestrationConfig,
-    /// Composable LLM pre-classifier (orchestration + host dimensions).
+    pub effort: EffortConfig,
+    /// Composable LLM pre-classifier (task class, complexity, host dimensions).
     #[serde(default)]
     pub pre_classifier: PreClassifierConfig,
     /// Expiry of elevated pins (escalations, auto-upgrades, skill pins):
@@ -2152,23 +2070,21 @@ impl Config {
                 )));
             }
         }
-        if self.orchestration.enabled {
-            if self.orchestration.planner.is_empty() {
-                return Err(ConfigError(
-                    "orchestration.enabled is true but orchestration.planner is empty".into(),
-                ));
-            }
-            if self.orchestration.min_items < 2 {
-                return Err(ConfigError(
-                    "orchestration.min_items must be at least 2".into(),
-                ));
-            }
-            if !(0.0..=1.0).contains(&self.orchestration.review_confidence) {
-                return Err(ConfigError(format!(
-                    "orchestration.review_confidence must be within 0.0..=1.0, got `{}`",
-                    self.orchestration.review_confidence
-                )));
-            }
+        if self.orchestration.is_some() {
+            return Err(ConfigError(
+                "`orchestration` was removed: auto-orchestration is superseded by the `planner` \
+                 router (`router: planner`, ROUTERS.md). Delete the `orchestration:` block."
+                    .into(),
+            ));
+        }
+        if let (Some(default), Some(cap)) = (self.effort.default, self.effort.max_automatic)
+            && default > cap
+        {
+            return Err(ConfigError(format!(
+                "effort.default `{}` is above effort.max_automatic `{}`",
+                default.as_str(),
+                cap.as_str()
+            )));
         }
         if self.pre_classifier.enabled {
             if self.pre_classifier.evaluator.is_empty() {
@@ -2178,23 +2094,11 @@ impl Config {
             }
             // pre_classifier.timeout_ms is deprecated/ignored (the classifier no
             // longer times out); any value — including 0 — is accepted.
-            if !(0.0..=1.0).contains(&self.pre_classifier.orchestrate_min_confidence) {
-                return Err(ConfigError(format!(
-                    "pre_classifier.orchestrate_min_confidence must be within 0.0..=1.0, got `{}`",
-                    self.pre_classifier.orchestrate_min_confidence
-                )));
-            }
             let mut seen = HashSet::new();
             for dim in &self.pre_classifier.dimensions {
                 if dim.id.trim().is_empty() {
                     return Err(ConfigError(
                         "pre_classifier.dimensions: id must not be empty".into(),
-                    ));
-                }
-                if dim.id == "orchestrate" {
-                    return Err(ConfigError(
-                        "pre_classifier.dimensions: id `orchestrate` is reserved for the built-in dimension"
-                            .into(),
                     ));
                 }
                 if !seen.insert(dim.id.clone()) {
@@ -2375,8 +2279,7 @@ agents:
         assert_eq!(cfg.headroom.window_secs, 5 * 60 * 60);
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
-        assert_eq!(cfg.orchestration.review_confidence, 0.8);
-        assert!(cfg.orchestration.instructions.is_empty());
+        assert!(cfg.effort.default.is_none() && cfg.effort.max_automatic.is_none());
         assert!(!cfg.llm_proxy.enabled);
         assert_eq!(cfg.llm_proxy.minimum_dwell_requests, 12);
     }
@@ -2443,33 +2346,33 @@ agents:
     }
 
     #[test]
-    fn parses_review_confidence_override() {
-        let yaml = format!(
-            "orchestration:\n  enabled: true\n  review_confidence: 0.95\n{}",
-            minimal_yaml()
-        );
-        let cfg = Config::from_yaml(&yaml).unwrap();
-        assert_eq!(cfg.orchestration.review_confidence, 0.95);
+    fn a_stale_orchestration_block_points_to_the_planner_router() {
+        for block in ["orchestration:\n  enabled: false\n", "orchestration: {}\n"] {
+            let err = Config::from_yaml(&format!("{block}{}", minimal_yaml())).unwrap_err();
+            assert!(err.0.contains("`planner` router"), "{}", err.0);
+        }
     }
 
     #[test]
-    fn parses_host_owned_orchestration_instructions() {
+    fn parses_effort_policy() {
         let yaml = format!(
-            "orchestration:\n  enabled: true\n  instructions: follow-host-policy\n{}",
+            "effort: {{ default: medium, max_automatic: high }}\n{}",
             minimal_yaml()
         );
         let cfg = Config::from_yaml(&yaml).unwrap();
-        assert_eq!(cfg.orchestration.instructions, "follow-host-policy");
-    }
-
-    #[test]
-    fn rejects_review_confidence_out_of_range() {
-        let yaml = format!(
-            "orchestration:\n  enabled: true\n  review_confidence: 1.5\n{}",
+        assert_eq!(
+            cfg.effort.default,
+            Some(crate::candidate::EffortLevel::Medium)
+        );
+        assert_eq!(
+            cfg.effort.max_automatic,
+            Some(crate::candidate::EffortLevel::High)
+        );
+        let inverted = format!(
+            "effort: {{ default: max, max_automatic: medium }}\n{}",
             minimal_yaml()
         );
-        let err = Config::from_yaml(&yaml).unwrap_err();
-        assert!(err.0.contains("review_confidence"), "{}", err.0);
+        assert!(Config::from_yaml(&inverted).is_err());
     }
 
     fn versioned_yaml() -> &'static str {

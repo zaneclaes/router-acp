@@ -187,7 +187,7 @@ pub struct DelegateTaskArgs {
     /// endpoints, credentials, or catalog identities.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
-    /// Keep the sub-session open after this turn so the orchestrator can send
+    /// Keep the sub-session open after this turn so the parent can send
     /// follow-up instructions to the same sub-agent (context preserved) via
     /// `delegate_followup`. Returns a `delegate_id` to reference it.
     #[serde(default)]
@@ -508,12 +508,8 @@ fn background_start_tool_definition() -> Value {
 // Injection decision
 // ----------------------------------------------------------------------
 
-/// Whether the candidate can use router delegation for this session.
-pub fn delegation_available(
-    shared: &Arc<Shared>,
-    router_sid: &str,
-    candidate: &CandidateId,
-) -> bool {
+/// Whether a session pinned to `candidate` can use router delegation.
+pub fn delegation_available(shared: &Arc<Shared>, candidate: &CandidateId) -> bool {
     if !shared.cfg.delegation.enabled {
         return false;
     }
@@ -528,10 +524,9 @@ pub fn delegation_available(
     else {
         return false;
     };
-    // Ordinary sessions only get the tool when a strictly-cheaper candidate
-    // exists (delegation sheds cost). Orchestrating sessions get it whenever
-    // there is any other candidate, so the planner can delegate to same-/higher-
-    // tier peers (e.g. a cross-lineage reviewer).
+    // Sessions get the tool when a strictly-cheaper candidate exists
+    // (delegation sheds cost), or with `candidate_hints: exact`, where the
+    // parent can name any other model.
     //
     // Only auto-eligible candidates count as delegation targets — the
     // delegate pool is built from `eligible_views`, so an explicit-only
@@ -543,13 +538,8 @@ pub fn delegation_available(
     if delegatable.is_empty() {
         return false;
     }
-    let orchestrating = shared
-        .with_session(router_sid, |s| s.orchestrating)
-        .unwrap_or(false);
-    // With exact hints the parent can address any other model by name, so the
-    // tool is useful even when nothing cheaper exists.
     let exact_hints = shared.cfg.delegation.candidate_hints == CandidateHintMode::Exact;
-    orchestrating || exact_hints || delegatable.iter().any(|c| c.cost_rank < parent_cost)
+    exact_hints || delegatable.iter().any(|c| c.cost_rank < parent_cost)
 }
 
 /// Build the router-owned MCP server entry for a pinned session. The server is
@@ -560,9 +550,7 @@ pub fn delegate_server_entry(
     router_sid: &str,
     candidate: &CandidateId,
 ) -> Option<McpServer> {
-    if !delegation_available(shared, router_sid, candidate)
-        && !shared.upstream_client_capabilities().terminal
-    {
+    if !delegation_available(shared, candidate) && !shared.upstream_client_capabilities().terminal {
         return None;
     }
     let socket = shared.delegate_socket.get()?.clone();
@@ -571,7 +559,7 @@ pub fn delegate_server_entry(
     // Freeze the decision against the candidate being pinned, not against
     // `session.pin` — that pin is committed only *after* `session/new`
     // returns, and tools/list runs inside that call.
-    let delegation_enabled = delegation_available(shared, router_sid, candidate);
+    let delegation_enabled = delegation_available(shared, candidate);
     shared.delegate_tokens.lock().unwrap().insert(
         token.clone(),
         DelegateBinding {
@@ -945,7 +933,7 @@ async fn run_background_start(
 }
 
 // ----------------------------------------------------------------------
-// Delegate orchestration
+// Delegate execution
 // ----------------------------------------------------------------------
 
 /// Start a `background: true` delegate job: register it, spawn
@@ -1170,40 +1158,24 @@ fn parse_effort_hint(raw: Option<&str>) -> Result<Option<EffortLevel>, String> {
     }
 }
 
-/// Scope a delegate candidate pool by cost. Ordinary delegation is strictly
-/// cheaper-than-parent (cost shedding; an empty result is the caller's
-/// "do the subtask yourself" error). An orchestrating session's HINT-LESS
-/// (worker) delegations are also cheaper-only — the planner already runs on
-/// a frontier model, and same-tier fan-out buys parallelism at zero cost
-/// savings — falling back to the full pool only when the parent is already
-/// the cheapest tier (never break the pipeline). An explicit
-/// `hints.candidate` keeps the full pool: that is how the planner addresses
-/// its same-/higher-tier cross-lineage reviewer.
+/// Scope a delegate candidate pool by cost: strictly cheaper than the parent
+/// (cost shedding; an empty result is the caller's "do the subtask yourself"
+/// error), same agent first. Reaching a same- or higher-tier model, or
+/// another agent, takes `delegation.candidate_hints: exact`.
 fn scope_delegate_pool(
     pool: Vec<CandidateView>,
     parent_cost: u32,
     parent_agent: &str,
-    orchestrating: bool,
-    hinted: bool,
 ) -> Vec<CandidateView> {
-    if orchestrating && hinted {
-        return pool;
-    }
     let cheaper: Vec<CandidateView> = pool
         .iter()
         .filter(|v| v.cost_rank < parent_cost)
         .cloned()
         .collect();
-    let cheaper = if orchestrating && cheaper.is_empty() {
-        pool
-    } else {
-        cheaper
-    };
     // A main-session model switch changes the natural worker family too:
     // Sol delegates to cheaper Codex siblings (Terra/Luna/etc.), not a stale
-    // Claude candidate. Cross-lineage review remains available through an
-    // explicit orchestration hint. Fall back globally only for agents such as
-    // Grok that have no cheaper sibling at all.
+    // Claude candidate. Fall back globally only for agents such as Grok that
+    // have no cheaper sibling at all.
     let same_agent: Vec<CandidateView> = cheaper
         .iter()
         .filter(|view| view.id.agent == parent_agent)
@@ -1305,9 +1277,6 @@ pub async fn run_delegate_task(
         .min(shared.cfg.delegation.complexity_cap.clamp(0.0, 1.0));
 
     // Scope the pool by cost (see `scope_delegate_pool`).
-    let orchestrating = shared
-        .with_session(router_sid, |s| s.orchestrating)
-        .unwrap_or(false);
     // The hint is a STATED reference (a parent model names a candidate by the
     // id it knows), so resolve it through the version-pin map — otherwise a
     // hint naming the stable default id matches nothing in the pool and is
@@ -1327,8 +1296,6 @@ pub async fn run_delegate_task(
             shared.eligible_views(&RequiredCaps::default(), profile.class),
             parent_cost,
             &pin.candidate.agent,
-            orchestrating,
-            hinted.is_some(),
         ),
     };
     if let Some(min_quality) = args.hints.min_quality {
@@ -1549,7 +1516,10 @@ pub async fn run_delegate_task(
                     parent_downstream_session_id: pin.downstream_sid.clone(),
                     parent_candidate: pin.candidate.to_string(),
                     candidate: candidate.to_string(),
-                    lineage: crate::session::agent_lineage(&shared.cfg, &candidate.agent),
+                    lineage: crate::session::agent_lineage(
+                        &shared.runtime_config(),
+                        &candidate.agent,
+                    ),
                     downstream_session_id: opened.downstream_sid.clone(),
                     state_session_id: sub_sid.clone(),
                     cwd: cwd.display().to_string(),
@@ -2539,38 +2509,11 @@ mod tests {
 
     #[test]
     fn ordinary_delegation_is_strictly_cheaper() {
-        let scoped = scope_delegate_pool(pool3(), 5, "claude", false, false);
+        let scoped = scope_delegate_pool(pool3(), 5, "claude");
         assert!(scoped.iter().all(|v| v.cost_rank < 5));
         assert_eq!(scoped.len(), 2);
         // Parent already cheapest → empty pool → the caller's error path.
-        assert!(scope_delegate_pool(pool3(), 1, "claude", false, false).is_empty());
-    }
-
-    #[test]
-    fn orchestration_workers_are_cheaper_only_without_a_hint() {
-        // A hint-less (worker) delegation from an orchestrating frontier
-        // planner must not land back on the frontier tier.
-        let scoped = scope_delegate_pool(pool3(), 5, "claude", true, false);
-        assert!(
-            scoped.iter().all(|v| v.cost_rank < 5),
-            "same-tier candidate survived a hint-less orchestration delegation"
-        );
-        assert_eq!(scoped.len(), 2);
-    }
-
-    #[test]
-    fn orchestration_hinted_delegation_keeps_the_full_pool() {
-        // The planner addresses its cross-lineage reviewer by explicit
-        // `hints.candidate` — same-/higher-tier must stay routeable.
-        let scoped = scope_delegate_pool(pool3(), 5, "claude", true, true);
-        assert_eq!(scoped.len(), 3);
-    }
-
-    #[test]
-    fn orchestration_from_the_cheapest_tier_falls_back_to_full_pool() {
-        // Never break the pipeline when the planner is already cheapest.
-        let scoped = scope_delegate_pool(pool3(), 1, "claude", true, false);
-        assert_eq!(scoped.len(), 3);
+        assert!(scope_delegate_pool(pool3(), 1, "claude").is_empty());
     }
 
     #[test]
@@ -2585,7 +2528,7 @@ mod tests {
         codex[2].cost_rank = 5;
         pool.extend(codex);
 
-        let scoped = scope_delegate_pool(pool, 5, "codex", false, false);
+        let scoped = scope_delegate_pool(pool, 5, "codex");
         let ids: Vec<String> = scoped.into_iter().map(|view| view.id.to_string()).collect();
         assert_eq!(ids, vec!["codex/luna", "codex/terra"]);
     }

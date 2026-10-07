@@ -148,28 +148,14 @@ skill_routing:
 # pinned_versions:
 #   "claude/claude-fable-5[1m]": claude-fable-5-1
 
-# Auto-orchestration of multi-part task lists. When a prompt reads as a list
-# (markdown bullets/numbers, inline "(1)(2)", or "first… then… finally…") the
-# router runs a plan→delegate→review pipeline entirely in-process:
-# it steers/switches the session onto a `planner` frontier model and injects an
-# orchestration protocol telling that model to decompose the task, delegate the
-# independent parts IN PARALLEL via `delegate_task background: true` +
-# `delegate_await` (each routed per-complexity in its own sub-session), have a
-# DIFFERENT-lineage `reviewer` verify the net result — skipped with a note when
-# no other lineage is routeable or the planner's stated confidence exceeds
-# `review_confidence` — and adjudicate fixes. Orchestrating sessions may delegate to same-/higher-
-# tier peers (so the cross-lineage review is routeable), and the planner can
-# hold a sub-agent open across review→fix rounds (keep_open + delegate_followup).
-# An explicit `[router: …]` directive or `model:` shorthand suppresses it.
-# Disabled by default — turn it on here.
-orchestration:
-  enabled: true
-  min_items: 2                              # smallest list treated as multi-part
-  planner: ["*fable*", "*sol*", "*grok*"] # best first
-  reviewer: ["*sol*", "*fable*", "*grok*"] # a different lineage will be preferred
-  instructions: ""                         # optional opaque host-owned workflow policy
-  max_fix_rounds: 2
-  review_confidence: 0.8                    # planner confidence above this skips the review
+# Reasoning effort for primary sessions when nobody asked for a level (the
+# `router.effort` option or `[router: effort=…]`). `default` replaces the
+# automatic class/complexity recommendation — a long, detailed prompt such as a
+# whole skill's instructions otherwise reads as maximum complexity — and
+# `max_automatic` caps whatever the router picks by itself.
+# effort:
+#   default: medium
+#   max_automatic: high
 
 agents:
   - name: claude

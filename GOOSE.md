@@ -180,8 +180,8 @@ Notes on this file:
 
   (Quote ids containing `[`/`]` in YAML, e.g. `"opus[1m]"`.)
 
-- **xAI Grok** is wired in as a third agent (`lineage: xai`), giving
-  orchestration a third company for cross-lineage review. Its CLI is itself an
+- **xAI Grok** is wired in as a third agent (`lineage: xai`), adding
+  a third model company to the pool. Its CLI is itself an
   ACP agent, so no separate adapter:
 
   ```sh
@@ -195,8 +195,8 @@ Notes on this file:
   is simply skipped by routing (no error). Only `grok-4.6` is pre-configured;
   add others once `grok models` shows them.
 
-- **Moonshot Kimi** is wired in as a fourth agent (`lineage: moonshot`), a fourth
-  company for cross-lineage review. Its CLI is itself an ACP agent too:
+- **Moonshot Kimi** is wired in as a fourth agent (`lineage: moonshot`), adding
+  a fourth model company. Its CLI is itself an ACP agent too:
 
   ```sh
   uv tool install kimi-cli       # provides `kimi`; `kimi acp` speaks ACP
@@ -298,7 +298,7 @@ That line is your proof the router is serving the session. Also sanity-check:
   of every prompt, response, and tool call with per-entry token counts.
   It's a SQLite DB (`~/.local/state/router-acp/sessions.db`) — query it
   directly with `sqlite3` if you like. Delegated sub-agents appear as child
-  rows linked to their parent; orchestration runs share a `run_label`. The
+  rows linked to their parent. The
   DB auto-prunes to the `history` window (default 30d).
 - A plain `goose session` (no `GOOSE_PROVIDER`) must still start the real
   Claude adapter with **no** `[router-acp]` line — proving claude-acp was
@@ -476,53 +476,15 @@ usage cap (auto/failover skip it, an explicit pin falls back). Because Grok
 gives no reset time, that cordon lasts `headroom.cordon_default_secs` and then
 re-tries. Same `cordon: { enabled: false }` switch turns it off.
 
-## Orchestrated workflows (plan → subtasks → cross-lineage review)
+## Plan, then implement
 
-Orchestration is now **built into router-acp** — there is no goose recipe or
-wrapper to install. Turn it on once in `router.yaml`:
+To plan on a frontier model and build on a cheaper one in the same session,
+set `router: planner` in `router.yaml` — see the `planner` section of
+[`ROUTERS.md`](ROUTERS.md#planner--two-phase-routing-plan--implement).
 
-```yaml
-orchestration:
-  enabled: true
-  planner: ["*fable*", "*opus*", "*sol*", "*gpt-5.5*"]
-  reviewer: ["*sol*", "*gpt-5.5*", "*opus*"]
-  instructions: ""     # optional opaque host-owned workflow policy
-```
-
-Then just type a multi-part task in any goose session — a markdown list,
-`(1)…(2)…`, or "first… then… finally…". The router pins a planner frontier
-model, decomposes the task, fans the parts out to routed sub-sessions via its
-`delegate_task` tool, and has a different-lineage model review the result.
-You'll see `router-acp · orchestrating a N-part task on …`
-inline; the planner and every subtask are recorded (sharing `run_label
-= orchestrate`) in `~/.local/state/router-acp/sessions.db`.
-
-It fires on any prompt and is suppressed by an explicit `[router: …]` directive,
-a `model:` shorthand, or when your list is answering the model's own questions.
-Start a message with **`orchestrate:`** to force the pipeline on any task,
-list or not. And with `ticket_context` configured (your config loads `HAI-…`
-tickets via the linear CLI), **"Fix HAI-1234" pulls the ticket into the prompt
-first** — classification and orchestration run on the ticket's real content, so
-a ticket whose body is a work list orchestrates and delegates its parts.
-See [`ORCHESTRATION.md`](ORCHESTRATION.md) for the full pipeline, the
-`orchestration.*` config, and caveats.
-
-**Watch for degradation.** The whole benefit depends on the planner using the
-router's `delegate_task` tool. If it uses its adapter's *built-in* sub-agent tool
-(Claude's `Task`) instead, sub-work stays in one lineage and is invisible to the
-router — you'll see `router-acp · orchestration degraded: the planner used its
-built-in sub-agent tool …` inline, and no delegate rows appear.
-
-**Review your runs** with the report:
-
-```sh
-router-acp report --config ~/.config/router-acp/router.yaml
-```
-
-It shows, per run: planner vs. delegate **cost** (the adapter's real USD, not an
-estimate), delegate count, whether a cross-lineage review ran, and the
-degraded% (native-subagent use). Each run is tagged with its git branch/HEAD so
-you can later join outcomes to CI/merge results.
+With `ticket_context` configured (your config loads `HAI-…` tickets via the
+linear CLI), **"Fix HAI-1234" pulls the ticket into the prompt first**, so
+classification runs on the ticket's real content.
 
 ## Notes and caveats
 

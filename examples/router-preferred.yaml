@@ -207,7 +207,7 @@ agents:
 
   # xAI Grok. The official CLI (`npm i -g @xai-official/grok`) is itself an ACP
   # agent — `grok agent stdio` — so no separate adapter is needed. Its own
-  # company, so it's a valid cross-lineage reviewer for claude AND codex.
+  # company (lineage `xai`), beside claude and codex.
   # Auth is separate: run `grok login` once, then `grok models` to confirm the
   # exact model ids your plan exposes (router-acp drops unknown ids at startup).
   # No `usage_source`: Grok exposes no usage meter, so the router instead watches
@@ -245,7 +245,7 @@ agents:
 
   # Moonshot Kimi. The CLI (`uv tool install kimi-cli`, executable `kimi`) is
   # itself an ACP agent — `kimi acp` — so no separate adapter is needed. Its own
-  # company, so it's a valid cross-lineage reviewer for claude, codex AND grok.
+  # company (lineage `moonshot`), beside claude, codex and grok.
   # Auth is separate: run `kimi login` once (browser OAuth) — it also
   # auto-configures the model ids your account exposes; confirm them (config
   # file / `/model`) and list them below. No `usage_source` (Moonshot exposes no
@@ -354,21 +354,10 @@ availability_preference:
   hint_ttl_secs: 600           # how long a client hint stays authoritative
   headroom_scale_dollars: 200  # remaining budget at/above which a seat reads fully free
 
-orchestration:
-  enabled: true
-  min_items: 2                              # smallest list treated as multi-part
-  # Opus 5 outranks Grok on quality (see data/scores.yaml); keep Fable /
-  # Sol first as absolute frontiers, then Opus, then Grok as cross-lineage.
-  planner: ["*fable*", "*sol*", "*opus*", "*grok*"] # best first
-  reviewer: ["*sol*", "*opus*", "*fable*", "*grok*"] # different lineage preferred
-  instructions: ""                         # optional opaque host-owned workflow policy
-  max_fix_rounds: 2
-  review_confidence: 0.8                    # planner confidence above this skips the review
-
 # Composable LLM pre-classifier: one cheap ACP evaluation authoritatively
-# decides task class, complexity, auto-orchestration, and host dimensions.
-# When disabled or invalid, routing falls back to the static classifier and
-# orchestration falls back to tasklist::detect_task_list.
+# decides task class, complexity, the planner router's phase, and host
+# dimensions. When disabled or invalid, routing falls back to the static
+# classifier.
 # Hosts (e.g. Kory Code) register extra dimensions under `dimensions:`.
 # Hickory boxes load defaults from kory-code/router.yaml, not this example.
 pre_classifier:
@@ -376,7 +365,6 @@ pre_classifier:
   evaluator: ["*haiku*", "*mini*", "*flash*"]
   timeout_ms: 15000                         # prompt-turn budget only (spawn + session/new excluded)
   disclose: true
-  orchestrate_min_confidence: 0.65
   dimensions: []
   # Example host dimension (Kory Code registers ui_planning in monorepo yaml):
   # dimensions:
@@ -411,10 +399,9 @@ auto_upgrade:
 
 # Ticket context (pluggable). When a prompt mentions <prefix><digits> (e.g.
 # "Fix HAI-1234"), the router runs `command` ($TICKET substituted) and prepends
-# its stdout to the prompt BEFORE classification and orchestration detection —
-# so a bare ticket reference routes (and, if the ticket is a work list,
-# orchestrates) on the ticket's real content, and the planner can delegate its
-# parts. Works with any ticketing system whose CLI can print an issue; the
+# its stdout to the prompt BEFORE classification — so a bare ticket reference
+# routes on the ticket's real content. Works with any ticketing system whose
+# CLI can print an issue; the
 # command runs without a shell and fails open (a bad fetch never blocks the
 # turn). Each ticket is injected once per session.
 ticket_context:

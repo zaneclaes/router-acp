@@ -64,7 +64,7 @@ pub struct PersistedSession {
     /// `primary` (a normal pinned session) or `delegate` (a sub-agent
     /// spawned via `delegate_task`).
     pub kind: String,
-    /// Optional grouping label (e.g. an orchestration run id) shared by
+    /// Optional grouping label (`[router: label=…]`) shared by
     /// related sessions.
     pub run_label: Option<String>,
     pub created_at: Option<u64>,
@@ -92,9 +92,9 @@ pub struct PersistedSession {
     /// Separate from adapter turn cost to avoid mixing granularities.
     pub llm_request_cost_usd: f64,
     pub llm_requests_total: u64,
-    /// Count of native (adapter built-in) sub-agent tool calls seen in an
-    /// orchestrating session — each one bypasses the router's `delegate_task`,
-    /// so a non-zero value means orchestration silently degraded.
+    /// Count of native (adapter built-in) sub-agent tool calls seen in a
+    /// session told to use only the router's `delegate_task` — each one
+    /// bypassed router delegation.
     pub native_subagent_calls: u64,
     /// Number of ordinary delegation directives injected into downstream model
     /// sessions. Detailed candidate/scope data remains in `session_log`.
@@ -841,7 +841,7 @@ impl StateFile {
         );
     }
 
-    /// Increment the native-subagent-call counter (orchestration degradation).
+    /// Increment the native-subagent-call counter (router delegation bypassed).
     pub fn note_native_subagent(&self, router_session_id: &str) {
         let _ = self.conn.execute(
             "UPDATE sessions SET native_subagent_calls=native_subagent_calls+1 \

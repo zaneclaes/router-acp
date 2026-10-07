@@ -123,8 +123,7 @@ fn max_free_metered_plan(views: &[CandidateView]) -> Option<f64> {
 }
 
 /// Who put the explicit candidate on the session. The router itself steers the
-/// pin for orchestration and skill routing, so the disclosure must not claim
-/// the user picked those.
+/// pin for skill routing, so the disclosure must not claim the user picked it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverrideSource {
     /// `router.candidate` config option, a `[router: candidate=…]` directive,
@@ -132,8 +131,6 @@ pub enum OverrideSource {
     UserPick,
     /// A `skill_routing` rule, carrying the matched pattern.
     Skill(String),
-    /// Auto-orchestration steering the pin onto the planner.
-    Planner,
 }
 
 /// Context for one routing decision.
