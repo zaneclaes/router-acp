@@ -85,10 +85,6 @@ pub enum CachedUsage {
         payload: Value,
         access_generation: String,
     },
-    AuthRejectedWithGeneration {
-        reason: String,
-        access_generation: String,
-    },
     Unknown(Option<Value>),
 }
 
@@ -109,20 +105,6 @@ impl CachedUsage {
         let Some(snapshot) = snapshot else {
             return Self::Unknown(None);
         };
-        if let Some(error) = snapshot.last_error.as_deref()
-            && crate::auth::error_is_http_401(error)
-        {
-            if snapshot.access_generation.as_deref() == request.access_generation.as_deref()
-                && request.access_generation.is_some()
-                && http_401_is_durable(request, unix_now_millis())
-            {
-                return Self::AuthRejectedWithGeneration {
-                    reason: error.to_string(),
-                    access_generation: request.access_generation.clone().unwrap_or_default(),
-                };
-            }
-            return Self::Unknown(snapshot.payload);
-        }
         let Some(payload) = snapshot.payload else {
             return Self::Unknown(None);
         };
@@ -330,7 +312,7 @@ pub fn read_agent_snapshot(agent: &crate::config::AgentConfig) -> Option<Snapsho
         UsageSourceConfig::CodexRollout => (
             account_cache_name("codex.json", Some(agent), "CODEX_HOME", ".codex"),
             crate::usage::codex_account_fingerprint(Some(agent))?,
-            None,
+            crate::credentials::access_generation(agent),
         ),
     };
     let snapshot = read_snapshot(&snapshot_path(&file)?)?;
@@ -449,25 +431,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-fn unix_now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// A 401 is durable only when the credential is definitely the current,
-/// unexpired access token, or when an explicitly expired token has no refresh
-/// material and is therefore a nonrefreshable sentinel. Missing expiry is
-/// deliberately unknown: opaque tokens cannot prove that they are current.
-fn http_401_is_durable(request: &CacheRequest, now_ms: u64) -> bool {
-    match request.access_expires_at {
-        Some(expires_at) if expires_at > now_ms => true,
-        Some(_) => !request.has_refresh_token,
-        None => false,
-    }
-}
-
 /// Curl's fail mode reports HTTP errors as e.g. "The requested URL returned
 /// error: 429" on stderr (exit 22) — surface the interesting one distinctly.
 fn classify_error(err: &str) -> String {
@@ -492,6 +455,7 @@ pub(crate) async fn cached_anthropic_usage_for_agent(
     let Some(initial) = anthropic_cache_request(agent) else {
         return CachedUsage::Unknown(None);
     };
+    let observed = agent.and_then(crate::credentials::request_generation);
     let file_name = account_cache_name(
         "anthropic-oauth.json",
         agent,
@@ -505,11 +469,22 @@ pub(crate) async fn cached_anthropic_usage_for_agent(
         min_refresh_secs,
         true,
         || anthropic_cache_request(agent),
-        |token| async move {
-            let Some(token) = token else {
-                return Err("Claude access credential is unavailable".to_string());
-            };
-            crate::usage::fetch_anthropic_usage(&token).await
+        |token| {
+            let observed = observed.clone();
+            async move {
+                let Some(token) = token else {
+                    return Err("Claude access credential is unavailable".to_string());
+                };
+                let result = crate::usage::fetch_anthropic_usage(&token).await;
+                if result
+                    .as_ref()
+                    .is_err_and(|e| crate::auth::error_is_auth_rejection(e))
+                    && let Some(agent) = agent
+                {
+                    crate::credentials::repair(agent, observed.as_deref()).await;
+                }
+                result
+            }
         },
     )
     .await
@@ -528,32 +503,32 @@ pub(crate) async fn cached_codex_usage_for_agent(
     min_refresh_secs: u64,
     agent: Option<&crate::config::AgentConfig>,
 ) -> CachedUsage {
-    let Some(fp) = crate::usage::codex_account_fingerprint(agent) else {
+    let Some(initial) = codex_cache_request(agent) else {
         return CachedUsage::Unknown(None);
     };
+    let observed = agent.and_then(crate::credentials::request_generation);
     let file_name = account_cache_name("codex.json", agent, "CODEX_HOME", ".codex");
     cached_usage(
         CODEX_SOURCE,
         &file_name,
-        CacheRequest {
-            account: fp,
-            access_generation: None,
-            access_expires_at: None,
-            has_refresh_token: false,
-            access_token: None,
-        },
+        initial,
         min_refresh_secs,
-        false,
-        || {
-            crate::usage::codex_account_fingerprint(agent).map(|account| CacheRequest {
-                account,
-                access_generation: None,
-                access_expires_at: None,
-                has_refresh_token: false,
-                access_token: None,
-            })
+        true,
+        || codex_cache_request(agent),
+        |_token| {
+            let observed = observed.clone();
+            async move {
+                let result = crate::usage::fetch_codex_usage(agent).await;
+                if result
+                    .as_ref()
+                    .is_err_and(|e| crate::auth::error_is_auth_rejection(e))
+                    && let Some(agent) = agent
+                {
+                    crate::credentials::repair(agent, observed.as_deref()).await;
+                }
+                result
+            }
         },
-        |_token| async { crate::usage::fetch_codex_usage(agent).await },
     )
     .await
 }
@@ -562,10 +537,17 @@ pub(crate) async fn cached_codex_usage_for_agent(
 struct CacheRequest {
     account: String,
     access_generation: Option<String>,
-    access_expires_at: Option<u64>,
-    has_refresh_token: bool,
+
     /// Held only in memory; snapshots contain fingerprints, never credentials.
     access_token: Option<String>,
+}
+
+fn codex_cache_request(agent: Option<&crate::config::AgentConfig>) -> Option<CacheRequest> {
+    Some(CacheRequest {
+        account: crate::usage::codex_account_fingerprint(agent)?,
+        access_generation: agent.and_then(crate::credentials::access_generation),
+        access_token: None,
+    })
 }
 
 fn account_cache_name(
@@ -603,8 +585,7 @@ fn anthropic_cache_request(agent: Option<&crate::config::AgentConfig>) -> Option
     Some(CacheRequest {
         account,
         access_generation: Some(fingerprint(&creds.access_token)),
-        access_expires_at: creds.expires_at,
-        has_refresh_token: creds.refresh_token.is_some(),
+
         access_token: Some(creds.access_token),
     })
 }
@@ -720,8 +701,9 @@ where
         .as_ref()
         .is_err_and(|err| crate::auth::error_is_http_401(err))
         && let Some(current) = reread()
-        && current.access_token != used.access_token
-        && current.access_token.is_some()
+        && (current.access_token != used.access_token
+            || current.access_generation != used.access_generation)
+        && current.access_generation.is_some()
     {
         used = current;
         outcome = fetch(used.access_token.clone()).await;
@@ -1004,8 +986,7 @@ mod tests {
                 &CacheRequest {
                     account: "account".to_string(),
                     access_generation: Some("current-access".to_string()),
-                    access_expires_at: Some(u64::MAX),
-                    has_refresh_token: false,
+
                     access_token: None,
                 },
             ),
@@ -1018,58 +999,13 @@ mod tests {
                 &CacheRequest {
                     account: "account".to_string(),
                     access_generation: Some("current-access".to_string()),
-                    access_expires_at: Some(u64::MAX),
-                    has_refresh_token: false,
+
                     access_token: None,
                 },
             ),
             CachedUsage::Unknown(Some(_))
         ));
         assert!(serde_json::from_str::<Snapshot>("not json").is_err());
-    }
-
-    #[test]
-    fn http_401_requires_known_expiry_or_nonrefreshable_expired_sentinel() {
-        assert!(http_401_is_durable(
-            &CacheRequest {
-                account: "account".to_string(),
-                access_generation: Some("current".to_string()),
-                access_expires_at: Some(u64::MAX),
-                has_refresh_token: false,
-                access_token: None,
-            },
-            1,
-        ));
-        assert!(http_401_is_durable(
-            &CacheRequest {
-                account: "account".to_string(),
-                access_generation: Some("expired".to_string()),
-                access_expires_at: Some(1),
-                has_refresh_token: false,
-                access_token: None,
-            },
-            2,
-        ));
-        assert!(!http_401_is_durable(
-            &CacheRequest {
-                account: "account".to_string(),
-                access_generation: Some("refreshable".to_string()),
-                access_expires_at: Some(1),
-                has_refresh_token: true,
-                access_token: None,
-            },
-            2,
-        ));
-        assert!(!http_401_is_durable(
-            &CacheRequest {
-                account: "account".to_string(),
-                access_generation: Some("unknown".to_string()),
-                access_expires_at: None,
-                has_refresh_token: false,
-                access_token: None,
-            },
-            2,
-        ));
     }
 
     #[tokio::test]
@@ -1098,8 +1034,7 @@ mod tests {
             Some(CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some(generation.to_string()),
-                access_expires_at: Some(u64::MAX),
-                has_refresh_token: false,
+
                 access_token: Some(token.to_string()),
             })
         };
@@ -1110,8 +1045,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some("old-access".to_string()),
-                access_expires_at: Some(u64::MAX),
-                has_refresh_token: false,
+
                 access_token: Some("old-token".to_string()),
             },
             0,
@@ -1152,8 +1086,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some("old-access".to_string()),
-                access_expires_at: Some(u64::MAX),
-                has_refresh_token: false,
+
                 access_token: Some("old-token".to_string()),
             },
             0,
@@ -1167,8 +1100,7 @@ mod tests {
                 Some(CacheRequest {
                     account: "account".to_string(),
                     access_generation: Some(generation.to_string()),
-                    access_expires_at: Some(u64::MAX),
-                    has_refresh_token: false,
+
                     access_token: Some(token.to_string()),
                 })
             },
@@ -1178,10 +1110,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(
-            result,
-            CachedUsage::AuthRejectedWithGeneration { .. }
-        ));
+        assert!(matches!(result, CachedUsage::Unknown(_)));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1197,8 +1126,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some("old-access".to_string()),
-                access_expires_at: Some(u64::MAX),
-                has_refresh_token: false,
+
                 access_token: Some("old-token".to_string()),
             },
             0,
@@ -1207,8 +1135,7 @@ mod tests {
                 Some(CacheRequest {
                     account: "account".to_string(),
                     access_generation: Some("new-access".to_string()),
-                    access_expires_at: Some(u64::MAX),
-                    has_refresh_token: false,
+
                     access_token: Some("new-token".to_string()),
                 })
             },
@@ -1231,8 +1158,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some("expired".to_string()),
-                access_expires_at: Some(0),
-                has_refresh_token: true,
+
                 access_token: Some("expired-token".to_string()),
             },
             0,
@@ -1241,8 +1167,7 @@ mod tests {
                 Some(CacheRequest {
                     account: "account".to_string(),
                     access_generation: Some("expired".to_string()),
-                    access_expires_at: Some(0),
-                    has_refresh_token: true,
+
                     access_token: Some("expired-token".to_string()),
                 })
             },
@@ -1261,8 +1186,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some("opaque".to_string()),
-                access_expires_at: None,
-                has_refresh_token: false,
+
                 access_token: Some("opaque-token".to_string()),
             },
             0,
@@ -1271,8 +1195,7 @@ mod tests {
                 Some(CacheRequest {
                     account: "account".to_string(),
                     access_generation: Some("opaque".to_string()),
-                    access_expires_at: None,
-                    has_refresh_token: false,
+
                     access_token: Some("opaque-token".to_string()),
                 })
             },
@@ -1301,8 +1224,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: None,
-                access_expires_at: None,
-                has_refresh_token: false,
+
                 access_token: None,
             },
             0,
@@ -1332,8 +1254,7 @@ mod tests {
             CacheRequest {
                 account: "account".to_string(),
                 access_generation: Some("new-access".to_string()),
-                access_expires_at: Some(u64::MAX),
-                has_refresh_token: false,
+
                 access_token: Some("new-token".to_string()),
             },
             0,

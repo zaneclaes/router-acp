@@ -97,6 +97,7 @@ pub struct TargetRuntime {
     pub init: Option<InitializeResponse>,
     pub model_config_id: Option<SessionConfigId>,
     pub auth_pending: bool,
+    pub credential_generation: Option<String>,
     pub dead: Option<String>,
     /// Last respawn attempt for a dead target (cooldown bookkeeping).
     pub last_respawn: Option<std::time::Instant>,
@@ -642,6 +643,7 @@ impl Shared {
             targets.insert(
                 spec.key.clone(),
                 TargetRuntime {
+                    credential_generation: None,
                     spec,
                     conn: None,
                     init: None,
@@ -906,6 +908,21 @@ impl Shared {
         self.candidate_runtime(id).map(|c| c.status)
     }
 
+    /// Managed credentials use shared, generation-bound evidence on every
+    /// decision. A process-local probe or stale success cannot lift rejection.
+    pub fn auth_rejection(&self, name: &str) -> Option<String> {
+        let agent = self.agent_configs().into_iter().find(|a| a.name == name)?;
+        let state = if crate::accounts::provider(&agent).is_some() {
+            crate::credentials::availability(&agent)
+        } else {
+            self.auth.lock().unwrap().availability(name)
+        };
+        match state {
+            crate::auth::AuthAvailability::Unauthenticated { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Downstream session routing
     // ------------------------------------------------------------------
@@ -1143,13 +1160,7 @@ impl Shared {
             if target.conn.is_none() && !(explicit_pick && target.dead.is_some()) {
                 continue;
             }
-            if self
-                .auth
-                .lock()
-                .unwrap()
-                .unauthenticated(&c.id.agent)
-                .is_some()
-            {
+            if self.auth_rejection(&c.id.agent).is_some() {
                 continue;
             }
             let caps_ok = target
@@ -1311,12 +1322,7 @@ impl Shared {
                 .filter(|c| {
                     c.id.agent == agent.name
                         && (c.status == CandidateStatus::Routeable
-                            || self
-                                .auth
-                                .lock()
-                                .unwrap()
-                                .unauthenticated(&c.id.agent)
-                                .is_some())
+                            || self.auth_rejection(&c.id.agent).is_some())
                 })
                 .map(|c| {
                     let opt =
@@ -1357,9 +1363,7 @@ impl Shared {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(cordon.reason);
                         router_meta["resets_at"] = json!(cordon.resets_at_rfc3339);
-                    } else if let Some(reason) =
-                        self.auth.lock().unwrap().unauthenticated(&c.id.agent)
-                    {
+                    } else if let Some(reason) = self.auth_rejection(&c.id.agent) {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(reason);
                     }
@@ -2593,6 +2597,54 @@ pub async fn open_downstream_session(
     mcp_servers: Vec<McpServer>,
     route: DownstreamRoute,
 ) -> Result<OpenedSession, AcpError> {
+    let observed = crate::auth::request_access_generation(shared, candidate);
+    let result = open_downstream_session_once(
+        shared,
+        candidate,
+        cwd.clone(),
+        additional_directories.clone(),
+        mcp_servers.clone(),
+        route.clone(),
+    )
+    .await;
+    if result.as_ref().is_err_and(is_auth_required) {
+        let observed =
+            observed.or_else(|| crate::auth::request_access_generation(shared, candidate));
+        let outcome = crate::auth::note_auth_failure_for_request(
+            shared,
+            &candidate.agent,
+            "Authentication unavailable",
+            observed.as_deref(),
+        )
+        .await;
+        if outcome == crate::credentials::RepairOutcome::Repaired
+            && let Some(runtime) = shared.candidate_runtime(candidate)
+            && crate::downstream::restart_after_repair(shared, &runtime.process_key)
+                .await
+                .is_ok()
+        {
+            return open_downstream_session_once(
+                shared,
+                candidate,
+                cwd,
+                additional_directories,
+                mcp_servers,
+                route,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+async fn open_downstream_session_once(
+    shared: &Arc<Shared>,
+    candidate: &CandidateId,
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+    route: DownstreamRoute,
+) -> Result<OpenedSession, AcpError> {
     let runtime = shared
         .candidate_runtime(candidate)
         .ok_or_else(|| AcpError::invalid_params().data(format!("unknown candidate {candidate}")))?;
@@ -3151,6 +3203,13 @@ pub(crate) fn apply_failure(
     class: &crate::limits::FailureClass,
 ) -> String {
     use crate::limits::{FailureClass, humanize};
+    // Auth indicators are inputs to credential repair, never outage or quota
+    // evidence. Only the credential manager may exclude an account for auth.
+    if is_auth_required(err) {
+        return shared
+            .auth_rejection(&candidate.agent)
+            .unwrap_or_else(|| "authentication status unavailable".into());
+    }
     match class {
         FailureClass::RateLimited {
             retry_after,
@@ -3269,7 +3328,11 @@ async fn revive_dead_targets(shared: &Arc<Shared>) {
         else {
             continue;
         };
-        let _gate = gate.lock().await;
+        let Ok(_gate) = tokio::time::timeout(std::time::Duration::from_secs(30), gate.lock()).await
+        else {
+            tracing::warn!(target = %key, "downstream respawn skipped: its adapter startup is still in progress");
+            continue;
+        };
         if shared.target_conn(&key).is_some() {
             continue; // a session open already restarted it
         }
@@ -3296,11 +3359,16 @@ pub(crate) async fn ensure_target_ready(
     key: &ProcessKey,
 ) -> Result<(), AcpError> {
     let ready = |shared: &Arc<Shared>| -> Result<bool, AcpError> {
-        let targets = shared.targets.lock().unwrap();
-        let t = targets
-            .get(key)
-            .ok_or_else(|| AcpError::internal_error().data(format!("unknown target {key}")))?;
-        Ok(t.conn.is_some() && t.init.is_some() && !t.auth_pending)
+        let initialized = {
+            let targets = shared.targets.lock().unwrap();
+            let t = targets
+                .get(key)
+                .ok_or_else(|| AcpError::internal_error().data(format!("unknown target {key}")))?;
+            t.conn.is_some() && t.init.is_some() && !t.auth_pending
+        };
+        // initialize returns before the probe discovers the model selector.
+        // A relogin replacement must finish that probe before it can reopen.
+        Ok(initialized && shared.candidate_status(candidate) == Some(CandidateStatus::Routeable))
     };
     if ready(shared)? {
         return Ok(());
@@ -3312,7 +3380,13 @@ pub(crate) async fn ensure_target_ready(
         .get(key)
         .map(|t| t.start_gate.clone())
         .expect("target checked above");
-    let _gate = gate.lock().await;
+    let _gate = tokio::time::timeout(std::time::Duration::from_secs(30), gate.lock())
+        .await
+        .map_err(|_| {
+            AcpError::internal_error().data(format!(
+                "Timed out waiting for {candidate}: its adapter startup is still in progress"
+            ))
+        })?;
     if ready(shared)? {
         return Ok(());
     }
@@ -3336,7 +3410,15 @@ pub(crate) async fn ensure_target_ready(
     }
     match probe_target(shared, key).await {
         crate::downstream::ProbeOutcome::Routeable => {
-            crate::auth::note_authenticated(&shared.auth, &candidate.agent);
+            if let Some(agent) = shared
+                .agent_configs()
+                .into_iter()
+                .find(|a| a.name == candidate.agent && crate::accounts::provider(a).is_some())
+            {
+                crate::auth::sync_from_manager(shared, &agent);
+            } else {
+                crate::auth::note_authenticated(&shared.auth, &candidate.agent);
+            }
             Ok(())
         }
         crate::downstream::ProbeOutcome::AuthPending => {
@@ -3700,11 +3782,7 @@ async fn pin_session(
                 .and_then(CandidateId::parse)
         });
         if let Some(candidate) = static_candidate
-            && let Some(reason) = shared
-                .auth
-                .lock()
-                .unwrap()
-                .unauthenticated(&candidate.agent)
+            && let Some(reason) = shared.auth_rejection(&candidate.agent)
         {
             return Err(AcpError::auth_required().data(format!(
                 "static candidate `{candidate}` requires authentication ({reason}); sign in to `{}` and retry",
@@ -3756,10 +3834,9 @@ async fn pin_session(
             return Ok(PinOutcome::Cancelled);
         }
         let candidate = rc.candidate.clone();
-        let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
         let (mcp_servers, delegate_attached) =
             mcp_servers_for_pin(shared, router_sid, &candidate, &client_mcp)?;
-        match open_downstream_session(
+        let opened = open_downstream_session(
             shared,
             &candidate,
             cwd.clone(),
@@ -3769,8 +3846,8 @@ async fn pin_session(
                 router_sid: router_sid.to_string(),
             },
         )
-        .await
-        {
+        .await;
+        match opened {
             Ok(opened) => {
                 // 5-6. Commit the pin only now; persist.
                 let available_modes: Vec<String> = opened
@@ -4130,21 +4207,12 @@ async fn pin_session(
                     "candidate failed pre-prompt; walking fallback chain"
                 );
                 let why = if is_auth_required(&err) {
-                    crate::auth::note_auth_failure_for_request(
-                        shared,
-                        &candidate.agent,
-                        format!("{} is not signed in", candidate.agent),
-                        request_generation.as_deref(),
-                    );
-                    if let Some(rt) = shared.candidate_runtime(&candidate) {
+                    if shared.auth_rejection(&candidate.agent).is_some()
+                        && let Some(rt) = shared.candidate_runtime(&candidate)
+                    {
                         shared.set_target_auth_pending(&rt.process_key);
                     }
-                    shared
-                        .headroom
-                        .lock()
-                        .unwrap()
-                        .record_exhausted(&candidate.agent);
-                    "authentication required".to_string()
+                    "authentication unavailable".to_string()
                 } else {
                     let class = crate::limits::classify_failure(&err);
                     apply_failure(shared, &candidate, &err, &class)
@@ -4497,13 +4565,7 @@ fn candidate_unavailable_reason(shared: &Arc<Shared>, candidate: &CandidateId) -
             return Some("account plan exhausted with no usable overage".into());
         }
     }
-    if shared
-        .auth
-        .lock()
-        .unwrap()
-        .unauthenticated(&candidate.agent)
-        .is_some()
-    {
+    if shared.auth_rejection(&candidate.agent).is_some() {
         return Some("account is not signed in".into());
     }
     shared
@@ -4620,8 +4682,9 @@ async fn send_prompt_with_failover(
 
     // Loop budget covers both failover attempts and escalation replays.
     let max_attempts = shared.cfg.failover.max_attempts.max(1);
-    let max_iters = max_attempts.max(shared.cfg.routers.escalation.max_escalations + 1);
+    let max_iters = max_attempts.max(shared.cfg.routers.escalation.max_escalations + 1) + 1;
     let mut continuing = false;
+    let mut repaired_once = false;
     for attempt in 1..=max_iters {
         let Some((process_key, down_sid, candidate)) = shared
             .with_session(&router_sid, |s| {
@@ -4750,7 +4813,7 @@ async fn send_prompt_with_failover(
             .flatten()
             .unwrap_or(TaskClass::CodingGeneral);
         let _llm_turn = shared.llm_proxy.begin_turn(
-            process_key,
+            process_key.clone(),
             router_sid.clone(),
             router_sid.clone(),
             down_sid.clone(),
@@ -4758,7 +4821,7 @@ async fn send_prompt_with_failover(
             class,
             req.meta.as_ref(),
         );
-        let request_generation = crate::auth::request_access_generation(&shared, &candidate.agent);
+        let request_generation = crate::auth::request_access_generation(&shared, &candidate);
         // Compute-time = the model's actual turn (excludes user idle between
         // turns, unlike updated_at − created_at).
         let turn_start = std::time::Instant::now();
@@ -4825,6 +4888,18 @@ async fn send_prompt_with_failover(
             continue; // replay on the new pin (or the old one if the switch failed)
         }
 
+        let result = result.and_then(|resp| {
+            let auth_error = shared
+                .with_session(&router_sid, |s| {
+                    crate::auth::response_is_auth_error(&s.turn_output)
+                })
+                .unwrap_or(false);
+            if auth_error && resp.stop_reason != StopReason::Cancelled {
+                Err(AcpError::auth_required().data("Provider reported an authentication error"))
+            } else {
+                Ok(resp)
+            }
+        });
         match result {
             Ok(resp) => {
                 // If the model produced no text to carry the disclosure,
@@ -4886,6 +4961,53 @@ async fn send_prompt_with_failover(
                     || shared
                         .with_session(&router_sid, |s| s.cancelled)
                         .unwrap_or(false);
+                let auth_rejected = is_auth_required(&err);
+                if auth_rejected {
+                    let outcome = crate::auth::note_auth_failure_for_request(
+                        &shared,
+                        &candidate.agent,
+                        "Authentication unavailable",
+                        request_generation.as_deref(),
+                    )
+                    .await;
+                    if !cancelled
+                        && !responder.cancellation().is_cancelled()
+                        && !shared
+                            .with_session(&router_sid, |s| s.cancelled)
+                            .unwrap_or(false)
+                        && outcome == crate::credentials::RepairOutcome::Repaired
+                        && !repaired_once
+                    {
+                        repaired_once = true;
+                        if crate::downstream::restart_after_repair(&shared, &process_key)
+                            .await
+                            .is_ok()
+                            && switch_pin(
+                                &shared,
+                                &router_sid,
+                                &candidate,
+                                "Credential repaired",
+                                HandoffStyle::Full,
+                                false,
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            continuing = partial_work;
+                            notify_user(
+                                &shared,
+                                &router_sid,
+                                "router-acp · credential repaired; continuing this session",
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let cancelled = cancelled
+                    || responder.cancellation().is_cancelled()
+                    || shared
+                        .with_session(&router_sid, |s| s.cancelled)
+                        .unwrap_or(false);
                 let class = classify_failure(&err);
                 let already_unavailable = unavailability.is_some();
                 let human = unavailability
@@ -4894,15 +5016,6 @@ async fn send_prompt_with_failover(
                 // A credential rejection is not the per-candidate `Other` that
                 // must not fail over: it takes out the whole seat, and every
                 // other agent is still able to serve the turn.
-                let auth_rejected = is_auth_required(&err);
-                if auth_rejected {
-                    crate::auth::note_auth_failure_for_request(
-                        &shared,
-                        &candidate.agent,
-                        format!("{} is not signed in", candidate.agent),
-                        request_generation.as_deref(),
-                    );
-                }
 
                 let can_fail_over = shared.cfg.failover.enabled
                     && !cancelled
@@ -4916,7 +5029,7 @@ async fn send_prompt_with_failover(
                 let symptom = if matches!(class, FailureClass::ContextOverflow) {
                     "could not fit this turn in its context window"
                 } else if auth_rejected {
-                    "is not signed in"
+                    "authentication unavailable"
                 } else {
                     "unavailable"
                 };
@@ -7003,13 +7116,7 @@ fn on_initialize(
             }
             if task_shared
                 .target_spec(key)
-                .and_then(|spec| {
-                    task_shared
-                        .auth
-                        .lock()
-                        .unwrap()
-                        .unauthenticated(&spec.agent_name)
-                })
+                .and_then(|spec| task_shared.auth_rejection(&spec.agent_name))
                 .is_some()
             {
                 continue;
@@ -7064,6 +7171,15 @@ fn on_authenticate(
             "auth method id `{method}` is not namespaced; expected `<agent>/<methodId>`"
         )));
     };
+    if shared
+        .agent_configs()
+        .iter()
+        .any(|a| a.name == agent && crate::accounts::provider(a).is_some())
+    {
+        return responder.respond_with_error(AcpError::invalid_params().data(
+            "Use /login to authenticate this account through router-acp's credential manager.",
+        ));
+    }
     let keys = shared.target_keys_for_agent(agent);
     if keys.is_empty() {
         return responder.respond_with_error(

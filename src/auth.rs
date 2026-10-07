@@ -154,6 +154,7 @@ impl AuthTracker {
     }
 
     /// Was this agent rejected by evidence recorded at or after `since`?
+    #[cfg(test)]
     fn rejected_since(&self, agent: &str, since: Instant) -> bool {
         self.agents.get(agent).is_some_and(|entry| {
             entry.at >= since
@@ -175,39 +176,67 @@ pub async fn refresh_before_selection(shared: &Arc<Shared>) {
     if !shared.auth.lock().unwrap().refresh_due() {
         return;
     }
-    let cycle_start = Instant::now();
     let probes: Vec<_> = shared
         .agent_configs()
-        .iter()
+        .into_iter()
         .filter(|agent| {
             !agent.account_disabled && !shared.account_login.lock().unwrap().contains(&agent.name)
         })
-        .filter_map(|agent| {
-            agent
-                .auth_probe
-                .clone()
-                .map(|probe| (agent.name.clone(), probe, agent.command.env.clone()))
-        })
+        .filter(|agent| agent.auth_probe.is_some())
         .collect();
-    let probe_results =
-        futures::future::join_all(probes.into_iter().map(|(agent, probe, env)| async move {
-            let isolated = agent.contains('@');
-            let result = run_probe_isolated(&probe, &env, isolated).await;
-            (agent, result)
-        }));
-    let (results, ()) = tokio::join!(probe_results, crate::usage::refresh_and_install(shared));
-    let mut tracker = shared.auth.lock().unwrap();
-    for (agent, result) in results {
-        // Evidence precedence within one cycle: an authenticated read that came
-        // back with an explicit credential rejection outranks a status command
-        // that merely exited zero. Negatives never lose to a same-cycle probe.
-        if result == AuthAvailability::Authenticated && tracker.rejected_since(&agent, cycle_start)
-        {
-            continue;
+    let probes = futures::future::join_all(probes.into_iter().map(|agent| async move {
+        let observed = crate::credentials::request_generation(&agent);
+        let access = crate::credentials::access_generation(&agent);
+        let mut env = agent
+            .command
+            .env
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect();
+        let runtime = crate::credentials::runtime(&agent, &mut env).await;
+        let observed = runtime
+            .as_ref()
+            .ok()
+            .and_then(|r| r.as_ref())
+            .map(|r| r.generation.clone())
+            .or(observed);
+        let result = match &runtime {
+            Ok(_) => {
+                let env = env
+                    .into_iter()
+                    .map(|(name, value)| crate::config::EnvVarConfig { name, value })
+                    .collect::<Vec<_>>();
+                run_probe_isolated(
+                    agent.auth_probe.as_ref().unwrap(),
+                    &env,
+                    crate::accounts::provider(&agent).is_some(),
+                )
+                .await
+            }
+            Err(_) => AuthAvailability::Unknown,
+        };
+        if crate::accounts::provider(&agent).is_some() {
+            match result {
+                AuthAvailability::Unauthenticated { .. } => {
+                    crate::credentials::repair(&agent, observed.as_deref()).await;
+                }
+                AuthAvailability::Authenticated => {
+                    if let Some(access) = access {
+                        crate::credentials::observe_success(&agent, &access).await;
+                    }
+                }
+                AuthAvailability::Unknown => {}
+            }
+            sync_from_manager(shared, &agent);
+        } else {
+            // A probe without managed credential material cannot prove logout.
+            if result == AuthAvailability::Authenticated {
+                shared.auth.lock().unwrap().set(&agent.name, result);
+            }
         }
-        tracker.set(&agent, result);
-    }
-    tracker.mark_refreshed();
+    }));
+    tokio::join!(probes, crate::usage::refresh_and_install(shared));
+    shared.auth.lock().unwrap().mark_refreshed();
 }
 
 #[cfg(test)]
@@ -281,6 +310,19 @@ pub fn error_is_auth_rejection(text: &str) -> bool {
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
+}
+
+/// Some adapters end a successful ACP request with their native auth-error
+/// text. Treat only complete, known error replies as repair signals. Ordinary
+/// model prose mentioning authentication must never affect account state.
+pub fn response_is_auth_error(text: &str) -> bool {
+    let text = text.trim();
+    matches!(
+        text.trim_end_matches('.'),
+        "Failed to authenticate: OAuth session expired and could not be refreshed"
+            | "Authentication required"
+            | "Not logged in. Please run /login"
+    )
 }
 
 /// Whether an error identifies an HTTP 401 response. Authentication wording
@@ -403,19 +445,38 @@ fn uses_claude_credentials(shared: &Arc<Shared>, agent: &str) -> bool {
 
 /// Capture the credential generation before an ACP request begins. This is a
 /// passive local read; it never invokes a provider login/status command.
-pub fn request_access_generation(shared: &Arc<Shared>, agent: &str) -> Option<String> {
+pub fn request_access_generation(
+    shared: &Arc<Shared>,
+    candidate: &crate::candidate::CandidateId,
+) -> Option<String> {
+    if let Some(runtime) = shared.candidate_runtime(candidate)
+        && let Some(generation) = shared
+            .targets
+            .lock()
+            .unwrap()
+            .get(&runtime.process_key)
+            .and_then(|t| t.credential_generation.clone())
+    {
+        return Some(generation);
+    }
     shared
         .agent_configs()
         .iter()
-        .find(|a| a.name == agent && uses_claude_credentials(shared, agent))
-        .and_then(crate::usage::anthropic_access_generation)
+        .find(|a| a.name == candidate.agent)
+        .and_then(crate::credentials::request_generation)
 }
 
 /// A missing credential store is live negative information, unlike an
 /// ordinary usage-fetch failure. Remove only generation-tied state so a
 /// generation-less probe result can still be applied afterward.
 pub fn clear_generation_if_credentials_missing(shared: &Arc<Shared>, agent: &str) -> bool {
-    if !uses_claude_credentials(shared, agent) || request_access_generation(shared, agent).is_some()
+    if !uses_claude_credentials(shared, agent)
+        || shared
+            .agent_configs()
+            .iter()
+            .find(|a| a.name == agent)
+            .and_then(crate::credentials::request_generation)
+            .is_some()
     {
         return false;
     }
@@ -426,66 +487,45 @@ pub fn clear_generation_if_credentials_missing(shared: &Arc<Shared>, agent: &str
 /// Record an ACP auth failure only when the same Claude access credential is
 /// still current. A rotation, unreadable credential, or missing request
 /// generation is unknown rather than durable logout evidence.
-pub fn note_auth_failure_for_request(
+pub async fn note_auth_failure_for_request(
     shared: &Arc<Shared>,
     agent: &str,
     reason: impl Into<String>,
     request_generation: Option<&str>,
-) {
-    let current_generation = uses_claude_credentials(shared, agent)
-        .then(|| request_access_generation(shared, agent))
-        .flatten();
-    note_auth_failure_for_request_with_current_generation(
-        shared,
-        agent,
-        reason,
-        request_generation,
-        current_generation,
-    );
+) -> crate::credentials::RepairOutcome {
+    let _ = reason.into();
+    let Some(configured) = shared.agent_configs().into_iter().find(|a| a.name == agent) else {
+        return crate::credentials::RepairOutcome::Unknown;
+    };
+    let outcome = crate::credentials::repair(&configured, request_generation).await;
+    sync_from_manager(shared, &configured);
+    outcome
 }
 
-fn note_auth_failure_for_request_with_current_generation(
-    shared: &Arc<Shared>,
-    agent: &str,
-    reason: impl Into<String>,
-    request_generation: Option<&str>,
-    current_generation: Option<String>,
-) {
-    let reason = reason.into();
-    if !uses_claude_credentials(shared, agent) {
-        note_unauthenticated(&shared.auth, agent, reason);
-        return;
-    }
-    let Some(current_generation) = current_generation else {
-        let mut tracker = shared.auth.lock().unwrap();
-        tracker.clear_current_generation(agent);
-        if request_generation.is_none() {
-            tracker.set(agent, AuthAvailability::Unauthenticated { reason });
-        }
-        return;
-    };
+pub(crate) fn sync_from_manager(shared: &Arc<Shared>, agent: &crate::config::AgentConfig) {
+    let state = crate::credentials::availability(agent);
     let mut tracker = shared.auth.lock().unwrap();
-    // This is a live read, so it is allowed to establish the current
-    // generation before comparing it with the request's captured generation.
-    tracker.observe_generation(agent, &current_generation);
-    let Some(request_generation) = request_generation else {
-        // A delayed generation-less 401 cannot replace positive evidence for
-        // the still-live credential.
-        return;
-    };
-    if current_generation != request_generation {
-        return;
-    }
-    tracker.set_with_generation(
-        agent,
-        AuthAvailability::Unauthenticated { reason },
-        &current_generation,
-    );
+    tracker.clear_current_generation(&agent.name);
+    // Clear process-local negatives too: only the shared manager may reject.
+    tracker.force_set(&agent.name, state);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_complete_native_auth_errors_trigger_repair() {
+        let error = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        assert!(response_is_auth_error(error));
+        assert!(response_is_auth_error(&format!("  {error}.\n")));
+        assert!(!response_is_auth_error(&format!(
+            "The previous error was: {error}"
+        )));
+        assert!(!response_is_auth_error(
+            "Here is how to repair Authentication required errors."
+        ));
+    }
 
     #[test]
     fn unknown_does_not_erase_definite_state() {
@@ -637,67 +677,22 @@ mod tests {
         assert!(!error_is_http_401("request id 401 was not found"));
     }
 
-    #[test]
-    fn missing_credentials_clear_generation_before_generationless_acp_failure() {
+    #[tokio::test]
+    async fn missing_evidence_never_records_provider_logout() {
         let state = tempfile::tempdir().unwrap();
         let yaml = format!(
-            "state_file: {}/state.sqlite\nagents:\n  - name: claude\n    command:\n      type: stdio\n      command: claude\n    model_selection:\n      type: config-option\n    usage_source:\n      type: anthropic-oauth\n    models:\n      - id: sonnet\n        cost_rank: 1\n",
+            "state_file: {}/state.sqlite\nagents:\n  - name: grok\n    command: {{type: stdio, command: mock-agent, env: [{{name: HOME, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: grok, cost_rank: 1}}]\n",
+            state.path().display(),
             state.path().display()
         );
         let shared = Shared::new(crate::config::Config::from_yaml(&yaml).unwrap()).unwrap();
-        {
-            let mut tracker = shared.auth.lock().unwrap();
-            tracker.observe_generation("claude", "current-access");
-            tracker.set_with_generation(
-                "claude",
-                AuthAvailability::Authenticated,
-                "current-access",
-            );
-        }
-
-        note_auth_failure_for_request_with_current_generation(
-            &shared,
-            "claude",
-            "Claude is not signed in",
-            None,
-            None,
-        );
-
-        assert!(matches!(
-            shared.auth.lock().unwrap().availability("claude"),
-            AuthAvailability::Unauthenticated { .. } | AuthAvailability::Unknown
-        ));
-
-        let live_generation = "live-access";
-        {
-            let mut tracker = shared.auth.lock().unwrap();
-            tracker.observe_generation("claude", live_generation);
-            tracker.set_with_generation("claude", AuthAvailability::Authenticated, live_generation);
-        }
-        // A generation-less delayed ACP failure must not replace positive
-        // evidence for the credential that is still live.
-        note_auth_failure_for_request_with_current_generation(
-            &shared,
-            "claude",
-            "Claude is not signed in",
-            None,
-            Some(live_generation.to_string()),
+        assert_eq!(
+            note_auth_failure_for_request(&shared, "grok", "Grok is not signed in", None).await,
+            crate::credentials::RepairOutcome::Unknown
         );
         assert_eq!(
-            shared.auth.lock().unwrap().availability("claude"),
-            AuthAvailability::Authenticated
-        );
-
-        // The public entry point still records non-Claude ACP auth failures
-        // directly; no credential-store read is needed for that path.
-        note_auth_failure_for_request(&shared, "grok", "Grok is not signed in", None);
-        assert!(
-            shared
-                .auth
-                .lock()
-                .unwrap()
-                .unauthenticated("grok")
-                .is_some()
+            shared.auth.lock().unwrap().availability("grok"),
+            AuthAvailability::Unknown
         );
     }
 

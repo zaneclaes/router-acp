@@ -122,23 +122,22 @@ Manage logins
 1. claude (1 account)
 2. codex (2 accounts)
 3. grok (0 accounts)
+4. kimi (0 accounts)
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its cached usage, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Browser sign-in uses the provider's own CLI. New accounts get private directories without replacing your other logins. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
-The provider's ACP adapter must be configured and its login CLI installed. The router validates and atomically saves membership in the configuration passed to `serve --config`. It makes a new login available in the current router too. Deleting removes membership, stops that account's local adapters, and deletes its saved provider credentials. This also signs out a provider CLI that uses the same directory. Credentials stay on disk if another configured account shares that directory. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
+The provider's ACP adapter must be configured. The router validates and atomically saves membership in the configuration passed to `serve --config`. It makes a new login available in the current router too. Deleting removes membership and the router-owned credential. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
 
-When a host generates this configuration, it must preserve the router's membership changes. Kory Code currently generates membership from its own Connected Tools store. Native-added accounts do not appear there and can be overwritten when Kory regenerates the file. Use Connected Tools to manage Kory accounts until those stores are unified. Standalone clients use the router's file directly.
+When a host generates this configuration, it must preserve the router's membership changes. Kory Code keeps its Connected Tools controls and delegates them to the router. Standalone clients use the router's file directly.
 
 Type `/usage` for a deterministic account report with ASCII bars, percentages, reset times, reserve ceilings, credits, cache timestamps and errors. It reads router snapshots and never sends your command to a model or starts an upstream usage request. Grok reports its access gate because it has no numeric plan meter.
 
-Hosts that also offer direct Claude or Codex sessions should supervise
-`router-acp usage-monitor --config ~/.config/router-acp/router.yaml`. The
-monitor reloads that config before each cycle and keeps every account's shared
-snapshot current when no router conversation is active. Provider requests,
-credential isolation, cache locking and refresh cadence remain inside
+Hosts supervise `router-acp usage-monitor --config ~/.config/router-acp/router.yaml`
+when account snapshots must stay current without a router conversation. Provider
+requests, credential isolation, cache locking, and refresh cadence remain inside
 router-acp. The host only reads the published snapshots.
 
 Accounts use lower `priority` numbers first. For example, `priority: 0`, `priority: 1`, and `priority: 2` drain in that order. A configured `agents[].accounts` list defaults to its list order. The expanded standalone form uses `agents[].account_priority`. This is an eligibility gate before model ranking. A later account becomes eligible when earlier accounts are cordoned, exhausted or unavailable. Remaining included plans take precedence over paid overage. Explicit account picks can override order, but cannot bypass reserves or cordons.
@@ -152,9 +151,9 @@ A saved account pin also yields when its included plan is exhausted and paid usa
 The router degrades gracefully when seats run dry or adapters fall over, and it always tells the user what happened.
 
 - **Token/usage limits cordon the agent until reset.** When a downstream reports a rate/usage limit, the router parses the reset time out of the error — Claude Code's `usage limit reached|<epoch>`, Codex's `try again in 2 hours 30 minutes`, `retry-after: 120`, `resets_in_seconds`, epoch and ISO-8601 timestamps are all understood and unit-tested (`src/limits.rs`). The agent is cordoned off from routing until that reset (or `headroom.cordon_default_secs` when no time was reported), and later routing disclosures include the cordon and its remaining time.
-- **Auth-aware availability.** A provider you're signed out of still advertises its models from a static manifest — *advertisement is not availability*. The router tracks authentication per **agent** (a provider seat, never an individual model) as authenticated / unauthenticated / unknown, where unknown fails open and only definite evidence changes eligibility. Evidence comes from an optional non-interactive `auth_probe`, the authenticated usage read itself (a clean read proves the seat works, an explicit credential rejection disproves it, a timeout or parse error proves nothing), and runtime ACP rejections. All configured probes run concurrently before every routing decision — startup, `session/new`, pre-classification, pin, dispatch, delegate selection — on a 5-second freshness TTL, so one routing pipeline costs one round of probes, not one per decision. A logged-out agent isn't spawned at startup, is excluded everywhere (the pre-classifier's evaluator pool, `auto`, failover, skill routing, delegates), and its candidates show on the `router.candidate` picker as `available: false` with the auth reason and **no** `resets_at` — signing in fixes it, waiting doesn't. An exact static pin to that candidate returns ACP `auth_required`, even when another provider remains routeable, so the client can present the reconnect flow instead of a configuration error. A runtime `Authentication required` pulls the whole agent immediately and fails the turn over to a live peer rather than surfacing the provider's sign-in error. Reactive negatives decay after 15 minutes so an out-of-band login on an agent with no configured probe isn't ignored forever, and a successful ACP `authenticate` clears the state outright.
+- **Auth-aware availability.** A provider still advertises models from a static manifest when its account cannot serve work. The router tracks authentication per account as authenticated, unauthenticated, or unknown. Unknown fails open. A probe result, a 401 alone, a timeout, a parse error, or a network failure cannot prove logout. The first authentication rejection requests repair. The router uses a per-credential OS lock only while login, automatic repair, or removal changes that credential. It never holds the lock during a session or turn. Concurrent waiters re-read and reuse the completed repair result. Credential generation and router epoch guard every completion. Only a definitive refresh rejection for the current generation durably marks an account unauthenticated. A stale failure or success cannot alter a newer credential. Native adapters get private access-only runtime stores, so adapter refreshers cannot write canonical credentials. Different accounts remain eligible for concurrent sessions.
 - **Proactive per-candidate usage cordons.** Beyond reacting to errors, the router can read a provider's own usage state and cordon an *exhausted model* before it's ever tried. Enable per-agent with `usage_source`: `anthropic-oauth` polls the Claude usage API (`GET /api/oauth/usage`); `codex-rollout` polls Codex live over one `codex app-server` JSON-RPC round-trip (`account/rateLimits/read`), sharing that result box-wide through a snapshot cache, and falls back to Codex's own on-disk rollout-file snapshots only if the RPC itself fails (no binary, signed out) — either way, the reactive cordon above is the backstop for staleness or a parse miss. A model-scoped weekly cap at 100% cordons just that candidate; an all-models or session cap cordons the whole agent — but only when the overage/credit pool has no *usable* headroom (Anthropic: overage/spend not exhausted; Codex: `unlimited` credits or a positive `balance` — a bare `has_credits` flag doesn't count). It's **generic** (which models are exhausted is read from the API, never hardcoded), **fails open** (a usage-endpoint hiccup never makes a model unroutable), and self-lifts at the reported reset. **Grok** exposes no usage meter at all, so it needs no `usage_source`: the router instead watches Grok's own subscription **access gate** in its ACP stream and cordons the agent the moment Grok reports the gate closed — the same effect, driven by the only signal Grok gives (no reset time, so it uses `cordon_default_secs`). Cordoned candidates are excluded from `auto`, skipped by failover, and an explicit pin to one is refused with a fallback (disclosed as `router-acp · failover: cordon → claude/sonnet · task … (Weekly Fable limit reached, resets …)`). If every eligible candidate is unavailable, the router reports why it cannot continue; it never bypasses a cordon or reserve. Each candidate's cordon state rides the `router.candidate` picker option (`_meta.router_acp.available/unavailable_reason/resets_at`) at `session/new`, and the full current cordon set also rides every turn's routing metadata as `_meta.router_acp.usage_cordons` so a client that cached the candidate list can refresh availability mid-session. Gate the whole mechanism with `cordon.enabled`.
-- The shared usage snapshots are safe to consume across credential changes: `account` identifies the seat, while the additive optional `access_generation` identifies the access credential used for that fetch. Missing or legacy generation data, malformed credentials, and cache contention are treated as unknown; contenders return promptly without waiting for a model turn. A current-generation 401 is durable evidence for that generation only, and a changed access credential gets at most one bounded retry.
+- The shared usage snapshots are safe to consume across credential changes: `account` identifies the seat, while the additive optional `access_generation` identifies the access credential used for that fetch. Missing or legacy generation data, malformed credentials, and cache contention are unknown. A 401 or probe result alone is unknown. Only a definitive current-generation refresh rejection is durable authentication evidence.
 - **Outage failover.** If the pinned model fails mid-session (process death, connection loss, provider overload) or hits a limit, the router fails the session over to the next best candidate: the failure and its reason are announced in the transcript, the strategy re-ranks the remaining pool, a fresh downstream session is opened (mode re-applied), and the prompt is retried there, seeded with the same truncated log transcript a switch falls back to (the failed model is in no state to summarize), so the replacement continues the work. Hot failover also works after partial output: the replacement receives the partial response and tool statuses with continuation instructions to inspect uncertain effects and avoid repeating completed actions. Availability is watched during the turn, so an account or model cordon interrupts that session and triggers the same handoff. Client cancellation never triggers failover. Configure with `failover.enabled` / `failover.max_attempts`.
 - **Automatic respawn.** A downstream process that died is respawned and re-probed at the next routing decision (subject to `failover.respawn_cooldown_secs`), so a recovered agent rejoins the pool without restarting the router. An explicit switch to a dead model revives it immediately, cooldown or not.
 
@@ -446,11 +445,11 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `agents[].account_priority` | unset | Native priority for an expanded account. Lower numbers drain first within the adapter group, before strategy ranking. Explicit picks still respect cordons. |
 | `agents[].account_disabled` / `accounts[].disabled` | `false` | Membership tombstone saved by `/login` deletion. Keeps the adapter template available to add another login while excluding deleted accounts from routing and usage. |
 | `agents[].reserve_capacity.weekly` / `.session` | `0` | Percentage of each included-plan window kept unused, in [0,100]. Positive reserves cordon at `100 - reserve` even when paid overage is available, and require enabled cordoning plus a usage source. Account entries may override this block. |
-| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. `{ type: anthropic-oauth }` reads the Claude CLI OAuth token (`~/.claude/.credentials.json` or the macOS Keychain) and polls `GET /api/oauth/usage`. `{ type: codex-rollout }` polls Codex live over one `codex app-server` JSON-RPC round-trip (`account/rateLimits/read`, shared box-wide via a snapshot cache), falling back to Codex's own on-disk rollout-file snapshots only if that RPC fails; credits only bypass a saturated window when actually usable (`unlimited` or positive `balance`). |
-| `agents[].auth_probe` | – | Optional non-interactive login check for this agent's provider seat. Run concurrently with every other probe before selection. Output matching `unauthenticated_patterns` (case-insensitive substring) means signed out; otherwise exit zero means signed in; a non-zero exit that matches nothing, a spawn failure, or a timeout is **unknown** and fails open. Omit it for providers with no reliable non-interactive status command — they stay fail-open and reactive. |
-| `agents[].login_command` | provider CLI | Optional executable, args and env for interactive `/login` sign-in. Uses the isolated account directory. It never reuses `auth_probe.command`. |
+| `agents[].usage_source` | – | Optional provider usage source for proactive cordons. The router credential manager reads canonical credentials and owns provider access. `{ type: anthropic-oauth }` polls `GET /api/oauth/usage`. `{ type: codex-rollout }` polls Codex through one `codex app-server` JSON-RPC round-trip (`account/rateLimits/read`, shared box-wide through a snapshot cache). Credits bypass a saturated window only when usable (`unlimited` or positive `balance`). |
+| `agents[].auth_probe` | – | Optional advisory status check. Its result cannot prove logout or make an account unauthenticated. Timeouts, spawn failures, network errors, and unrecognized output are unknown and fail open. |
+| `agents[].login_command` | native ACP `/login` | Optional native login configuration. The router credential manager owns the credential mutation and runtime-store setup. |
 | `agents[].auth_probe.timeout_ms` | `2000` | Probe timeout. Exceeding it is unknown, not a failure. |
-| `agents[].auth_probe.unauthenticated_patterns` | `not logged in`, `not signed in`, `authentication required`, `sign in`, `log in`, `login required` | Substrings that make the probe's output definite negative evidence. Set explicitly when a provider's logged-*in* output also mentions signing in. |
+| `agents[].auth_probe.unauthenticated_patterns` | unset | Advisory output patterns only. They cannot prove logout or create an authentication cordon. |
 
 ### Failover & mid-session switching
 
@@ -545,14 +544,35 @@ Pre-classifier sessions are intentionally different: an adapter that advertises 
 
 ## First-run authentication
 
-Adapters guard subscription seats behind their own auth. `initialize` is two-phase:
+`src/credentials.rs` is the canonical credential authority for Claude, Codex,
+Grok, and Kimi. It owns login, refresh, repair, removal, generation, and
+per-credential OS locking. The lock covers only login, automatic repair, and
+removal. It never covers a session or model turn. Adapter runtime stores are
+private and access-only.
 
-1. The router spawns and initializes every configured adapter, then probes `session/new` on each. Agents whose probe returns `auth_required` are marked **auth-pending**: their candidates are declared but not routeable yet, and the router still initializes so your client can authenticate.
-2. Downstream auth methods are advertised **namespaced** as `<agent>/<methodId>` (e.g. `claude/claude-login`). Pick one in your client; the router relays `authenticate` to that agent and re-runs probe verification. As soon as one candidate verifies, `session/new` works.
+```mermaid
+flowchart TD
+    E[Session reports an authentication error] --> L[Acquire this credential's shared lock]
+    L --> G{Has its generation changed?}
+    G -->|Yes| R[Reuse the completed repair]
+    G -->|No| F[Refresh the current credential]
+    F -->|Success| A[Publish tokens and keep the account eligible]
+    F -->|Network or unknown failure| U[Keep status unknown and retryable]
+    F -->|Definitive refresh rejection| C[Cordon this account and request sign-in]
+```
 
-While only auth-pending candidates exist, `session/new` returns `auth_required`. If zero candidates are routeable and none are auth-pending, `initialize` fails with a configuration error.
+Use `/login` in a router session to choose a provider and complete browser
+authentication. Account management remains available even when no account can
+serve a model turn. Managed providers reject downstream `authenticate` requests
+and direct users to this single login flow.
 
-Tip: adapters usually persist auth in your home directory, so it is often easiest to log in once with the vendor CLI (`claude`, `codex login`) before starting the router.
+An adapter authentication error requests credential repair before the router
+marks an account auth-pending. A definitive refresh rejection for the current
+credential generation removes that account from routing. Unknown failures stay
+retryable. Successful login restores the account and hands existing sessions
+back to its replacement adapter. Other accounts continue concurrently.
+
+Do not launch a provider CLI against canonical credentials outside the router.
 
 ## Session lifecycle
 

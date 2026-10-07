@@ -93,6 +93,13 @@ pub fn spawn_usage_poller(shared: &Arc<Shared>) -> Option<tokio::task::JoinHandl
 /// periodic poller tick and the turn-end refresh ([`refresh_after_turn`]).
 pub async fn refresh_and_install(shared: &Arc<Shared>) {
     let (cordons, availability, observed_agents) = poll_all(shared).await;
+    for agent in shared
+        .agent_configs()
+        .iter()
+        .filter(|a| crate::accounts::provider(a).is_some())
+    {
+        crate::auth::sync_from_manager(shared, agent);
+    }
     let a = availability.len();
     let n = {
         let mut headroom = shared.headroom.lock().unwrap();
@@ -197,6 +204,7 @@ async fn poll_all(
                         payload,
                         access_generation,
                     } => {
+                        crate::credentials::observe_success(agent, &access_generation).await;
                         crate::auth::note_authenticated_from_usage_with_generation(
                             &shared.auth,
                             &agent.name,
@@ -216,18 +224,6 @@ async fn poll_all(
                                 SystemTime::now(),
                             ),
                         )
-                    }
-                    crate::usage_cache::CachedUsage::AuthRejectedWithGeneration {
-                        reason,
-                        access_generation,
-                    } => {
-                        crate::auth::note_unauthenticated_from_usage_with_generation(
-                            &shared.auth,
-                            &agent.name,
-                            reason,
-                            &access_generation,
-                        );
-                        continue;
                     }
                     crate::usage_cache::CachedUsage::Unknown(payload) => {
                         let Some(payload) = payload else {
@@ -275,24 +271,13 @@ async fn poll_all(
                         payload,
                         access_generation,
                     } => {
+                        crate::credentials::observe_success(agent, &access_generation).await;
                         crate::auth::note_authenticated_from_usage_with_generation(
                             &shared.auth,
                             &agent.name,
                             &access_generation,
                         );
                         codex_pools_from_payload(&payload)
-                    }
-                    crate::usage_cache::CachedUsage::AuthRejectedWithGeneration {
-                        reason,
-                        access_generation,
-                    } => {
-                        crate::auth::note_unauthenticated_from_usage_with_generation(
-                            &shared.auth,
-                            &agent.name,
-                            reason,
-                            &access_generation,
-                        );
-                        continue;
                     }
                     crate::usage_cache::CachedUsage::Unknown(payload) => payload
                         .as_ref()
@@ -411,7 +396,6 @@ async fn curl_with_config(config: &str) -> Result<String, String> {
 pub(crate) struct OauthCredentials {
     pub access_token: String,
     pub refresh_token: Option<String>,
-    pub expires_at: Option<u64>,
 }
 
 /// Read the Claude CLI OAuth credentials: first `~/.claude/.credentials.json`
@@ -477,6 +461,7 @@ fn anthropic_keychain_service(agent: Option<&crate::config::AgentConfig>) -> Str
     }
 }
 
+#[cfg(test)]
 pub(crate) fn anthropic_access_generation(agent: &crate::config::AgentConfig) -> Option<String> {
     anthropic_oauth_credentials(Some(agent))
         .map(|creds| crate::usage_cache::fingerprint(&creds.access_token))
@@ -499,7 +484,6 @@ fn credentials_from_json(text: &str) -> Option<OauthCredentials> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        expires_at,
     })
 }
 
@@ -1397,6 +1381,12 @@ async fn codex_rate_limits_rpc(
     if let Some(agent) = agent {
         command.envs(agent.command.env.iter().map(|v| (&v.name, &v.value)));
     }
+    let mut isolated_env = Vec::new();
+    let _credential = match agent {
+        Some(agent) => crate::credentials::runtime(agent, &mut isolated_env).await?,
+        None => None,
+    };
+    command.envs(isolated_env);
     let mut child = command
         .arg("app-server")
         // The caller can be aborted mid-RPC (timeout, turn-end refresh task,
@@ -2046,12 +2036,9 @@ agents:
             r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh","expiresAt":1234}}"#,
         )
         .unwrap();
-        assert_eq!(credentials.expires_at, Some(1234));
         assert!(credentials.refresh_token.is_some());
 
-        let missing_expiry =
-            credentials_from_json(r#"{"claudeAiOauth":{"accessToken":"access"}}"#).unwrap();
-        assert_eq!(missing_expiry.expires_at, None);
+        assert!(credentials_from_json(r#"{"claudeAiOauth":{"accessToken":"access"}}"#).is_some());
     }
 
     #[test]

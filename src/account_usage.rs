@@ -18,6 +18,26 @@ use crate::usage_cache::Snapshot;
 const DEFAULT_CACHE_MAX_AGE_SECS: u64 = 5 * 60;
 const BAR_WIDTH: usize = 10;
 
+/// Passive machine-readable account metadata for a host's existing login UI.
+/// No provider processes or refresh requests run on this read path.
+pub fn status(config: &crate::config::Config) -> Value {
+    let accounts = config.agents.iter().filter(|a| crate::accounts::registered(a)).map(|agent| {
+        let (label, plan) = crate::accounts::identity(agent);
+        let snapshot = crate::usage_cache::read_agent_snapshot(agent);
+        let auth = match crate::credentials::availability(agent) {
+            AuthAvailability::Authenticated => "authenticated",
+            AuthAvailability::Unauthenticated { .. } => "rejected",
+            AuthAvailability::Unknown => "unknown",
+        };
+        serde_json::json!({"id":agent.name,"provider":crate::accounts::provider(agent),
+            "label":safe_text(&label),"plan":plan.map(|p| safe_text(&p)),"authState":auth,
+            "snapshot":snapshot.map(|s| serde_json::json!({"account":s.account,"access_generation":s.access_generation,
+                "updatedAt":chrono::DateTime::from_timestamp(s.fetched_at as i64, 0).map(|t| t.to_rfc3339()),
+                "fetched_at":s.fetched_at,"known":s.payload.is_some()}))})
+    }).collect::<Vec<_>>();
+    serde_json::json!({"accounts":accounts})
+}
+
 /// Format all configured runtime accounts, grouped by provider.
 pub fn summarize(shared: &Arc<Shared>) -> String {
     let mut accounts: Vec<(usize, AgentConfig, String)> = shared
@@ -84,7 +104,7 @@ fn account_title(agent: &AgentConfig) -> String {
 fn account_lines(shared: &Arc<Shared>, agent: &AgentConfig) -> Vec<String> {
     let provider = crate::accounts::provider(agent).unwrap_or("unknown");
     let (_, plan) = crate::accounts::identity(agent);
-    let mut lines = Vec::new();
+    let mut lines = vec![format!("account id: {}", safe_text(&agent.name))];
     if let Some(plan) = plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
         lines.push(format!("plan: {}", safe_text(plan)));
     }
@@ -97,7 +117,7 @@ fn account_lines(shared: &Arc<Shared>, agent: &AgentConfig) -> Vec<String> {
         }
     }
 
-    let auth = shared.auth.lock().unwrap().availability(&agent.name);
+    let auth = crate::credentials::availability(agent);
     match auth {
         AuthAvailability::Authenticated => lines.push("auth: authenticated".to_string()),
         AuthAvailability::Unknown => lines.push("auth: unknown".to_string()),

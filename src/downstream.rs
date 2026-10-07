@@ -118,6 +118,7 @@ pub fn make_process_transport(shared: &Arc<Shared>, spec: &ProcessTargetSpec) ->
         command: spec.command.clone(),
         args: spec.args.clone(),
         env: shared.llm_proxy.process_env(spec),
+        scrub_auth_env: false,
     }
 }
 
@@ -131,7 +132,20 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     let upstream = shared
         .upstream()
         .ok_or_else(|| AcpError::internal_error().data("upstream not connected"))?;
-    let acp_agent = make_process_transport(shared, &spec);
+    let mut acp_agent = make_process_transport(shared, &spec);
+    let configured = shared
+        .agent_configs()
+        .into_iter()
+        .find(|a| a.name == spec.agent_name);
+    let credential = match configured.as_ref() {
+        Some(agent) => {
+            acp_agent.scrub_auth_env = crate::accounts::provider(agent).is_some();
+            crate::credentials::runtime(agent, &mut acp_agent.env)
+                .await
+                .map_err(|message| AcpError::internal_error().data(message))?
+        }
+        None => None,
+    };
 
     let relay_shared = shared.clone();
     let relay_key = key.clone();
@@ -153,6 +167,7 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     let (stop, stopped) = {
         let mut targets = shared.targets.lock().unwrap();
         let target = targets.get_mut(key).unwrap();
+        target.credential_generation = credential.as_ref().map(|c| c.generation.clone());
         if shared
             .account_login
             .lock()
@@ -170,6 +185,7 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
         (target.stop.clone(), target.stopped.clone())
     };
     upstream.spawn(async move {
+        let _credential = credential;
         let connect = builder
             .connect_with(acp_agent, async |cx| {
                 let _ = conn_tx.send(cx.clone());
@@ -207,6 +223,132 @@ pub enum ProbeOutcome {
 /// Initialize a downstream target and probe `session/new` to verify its
 /// configured models. Updates candidate statuses in shared state.
 pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcome {
+    let generation = shared
+        .targets
+        .lock()
+        .unwrap()
+        .get(key)
+        .and_then(|t| t.credential_generation.clone());
+    let outcome = probe_target_once(shared, key).await;
+    let Some(agent) = shared.target_spec(key).and_then(|t| {
+        shared
+            .agent_configs()
+            .into_iter()
+            .find(|a| a.name == t.agent_name)
+    }) else {
+        return outcome;
+    };
+    if crate::accounts::provider(&agent).is_none() {
+        if matches!(outcome, ProbeOutcome::AuthPending) {
+            shared.set_target_auth_pending(key);
+        }
+        return outcome;
+    }
+    if matches!(outcome, ProbeOutcome::Routeable) {
+        if let Some(observed) = generation.as_deref() {
+            crate::credentials::observe_request_success(&agent, observed).await;
+        }
+        crate::auth::sync_from_manager(shared, &agent);
+        return outcome;
+    }
+    if !matches!(outcome, ProbeOutcome::AuthPending) {
+        return outcome;
+    }
+    let repaired = crate::credentials::repair(&agent, generation.as_deref()).await;
+    crate::auth::sync_from_manager(shared, &agent);
+    if repaired == crate::credentials::RepairOutcome::Repaired
+        && restart_target(shared, key).await.is_ok()
+    {
+        let retried = probe_target_once(shared, key).await;
+        if !matches!(retried, ProbeOutcome::AuthPending) {
+            return retried;
+        }
+    }
+    if matches!(
+        crate::credentials::availability(&agent),
+        crate::auth::AuthAvailability::Unauthenticated { .. }
+    ) {
+        shared.set_target_auth_pending(key);
+        ProbeOutcome::AuthPending
+    } else {
+        // Unconfirmed failures remain retryable process failures, never logout.
+        if let Some(target) = shared.targets.lock().unwrap().get(key) {
+            target.stop.cancel();
+        }
+        shared.mark_target_dead(key, "Authentication status unavailable");
+        ProbeOutcome::Failed(
+            "Authentication status unavailable; credential repair could not confirm logout".into(),
+        )
+    }
+}
+
+async fn restart_target(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), AcpError> {
+    let stopped = {
+        let targets = shared.targets.lock().unwrap();
+        let target = targets.get(key).ok_or_else(AcpError::internal_error)?;
+        if target.conn.is_some() {
+            target.stop.cancel();
+            Some(target.stopped.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(stopped) = stopped {
+        tokio::time::timeout(std::time::Duration::from_secs(5), stopped.notified())
+            .await
+            .map_err(|_| {
+                AcpError::internal_error()
+                    .data("This account's adapter did not stop after credential repair")
+            })?;
+    }
+    start_downstream(shared, key).await
+}
+
+pub(crate) async fn restart_after_repair(
+    shared: &Arc<Shared>,
+    key: &ProcessKey,
+) -> Result<(), AcpError> {
+    let gate = shared
+        .targets
+        .lock()
+        .unwrap()
+        .get(key)
+        .map(|t| t.start_gate.clone())
+        .ok_or_else(AcpError::internal_error)?;
+    let _gate = tokio::time::timeout(std::time::Duration::from_secs(30), gate.lock())
+        .await
+        .map_err(|_| {
+            AcpError::internal_error().data("Timed out waiting for this account's adapter restart")
+        })?;
+    let agent = shared
+        .target_spec(key)
+        .and_then(|t| {
+            shared
+                .agent_configs()
+                .into_iter()
+                .find(|a| a.name == t.agent_name)
+        })
+        .ok_or_else(AcpError::internal_error)?;
+    let current = crate::credentials::request_generation(&agent);
+    let ready = shared.targets.lock().unwrap().get(key).is_some_and(|t| {
+        t.conn.is_some()
+            && t.init.is_some()
+            && t.credential_generation == current
+            && !t.auth_pending
+            && (t.spec.selection == SelectionKind::SpawnConfig || t.model_config_id.is_some())
+    });
+    if ready {
+        return Ok(());
+    }
+    restart_target(shared, key).await?;
+    match probe_target_once(shared, key).await {
+        ProbeOutcome::Routeable => Ok(()),
+        _ => Err(AcpError::internal_error()
+            .data("This account's adapter remains unavailable after credential repair")),
+    }
+}
+
+async fn probe_target_once(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcome {
     let timeout = Duration::from_millis(shared.cfg.probe_timeout_ms);
     match tokio::time::timeout(timeout, probe_target_inner(shared, key)).await {
         Ok(outcome) => outcome,
@@ -247,7 +389,6 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
     let probe: NewSessionResponse = match conn.send_request(probe_req).block_task().await {
         Ok(resp) => resp,
         Err(err) if is_auth_required(&err) => {
-            shared.set_target_auth_pending(key);
             return ProbeOutcome::AuthPending;
         }
         Err(err) => {

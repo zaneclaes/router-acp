@@ -801,8 +801,8 @@ pub async fn evaluate(
             continue;
         }
 
-        let request_generation = crate::auth::request_access_generation(shared, &candidate.agent);
-        let outcome = evaluate_on_candidate(
+        let mut request_generation = crate::auth::request_access_generation(shared, &candidate);
+        let mut outcome = evaluate_on_candidate(
             shared,
             router_sid,
             &candidate,
@@ -814,6 +814,36 @@ pub async fn evaluate(
             cancel,
         )
         .await;
+        if outcome
+            .as_ref()
+            .is_err_and(crate::downstream::is_auth_required)
+            && crate::auth::note_auth_failure_for_request(
+                shared,
+                &candidate.agent,
+                "Authentication unavailable",
+                request_generation.as_deref(),
+            )
+            .await
+                == crate::credentials::RepairOutcome::Repaired
+            && let Some(runtime) = shared.candidate_runtime(&candidate)
+            && crate::downstream::restart_after_repair(shared, &runtime.process_key)
+                .await
+                .is_ok()
+        {
+            request_generation = crate::auth::request_access_generation(shared, &candidate);
+            outcome = evaluate_on_candidate(
+                shared,
+                router_sid,
+                &candidate,
+                cwd.clone(),
+                dirs.clone(),
+                &eval_prompt,
+                &cfg,
+                started,
+                cancel,
+            )
+            .await;
+        }
         attempts.push(cand_str.clone());
 
         match outcome {
@@ -841,7 +871,8 @@ pub async fn evaluate(
                         &candidate.agent,
                         format!("{} is not signed in", candidate.agent),
                         request_generation.as_deref(),
-                    );
+                    )
+                    .await;
                 }
                 let class = crate::limits::classify_failure(&err);
                 let human = crate::session::apply_failure(shared, &candidate, &err, &class);
@@ -849,7 +880,7 @@ pub async fn evaluate(
                     session = router_sid,
                     evaluator = %cand_str,
                     %human,
-                    "pre-class evaluator failed; cordoned and failing over"
+                    "pre-class evaluator failed; trying another candidate"
                 );
                 last_fail = Some(fail_open(
                     format!("evaluator {cand_str} failed: {human}"),
@@ -1012,6 +1043,9 @@ async fn evaluate_on_candidate(
             ));
         }
         Ok(Err(err)) => {
+            if crate::downstream::is_auth_required(&err) {
+                return Err(err);
+            }
             return Ok(fail_open(
                 format!("evaluator session open failed: {err}"),
                 Some(cand_str),
@@ -1091,6 +1125,11 @@ async fn evaluate_on_candidate(
         Err(err) => Err(err),
         Ok(_) => {
             let raw = capture.lock().unwrap().clone();
+            if crate::auth::response_is_auth_error(&raw) {
+                return Err(
+                    AcpError::auth_required().data("Provider reported an authentication error")
+                );
+            }
             // mock-agent echoes `echo:<model>:<text>` — strip that wrapper when present.
             let body = strip_mock_echo(&raw);
             match parse_evaluator_json(&body) {
@@ -1220,18 +1259,7 @@ async fn open_evaluator_session(
     dirs: Vec<std::path::PathBuf>,
     capture: Arc<Mutex<String>>,
     violation: Arc<AtomicBool>,
-) -> Result<OpenedSession, String> {
-    // Ensure the target process is live (same as pin/delegate).
-    let runtime = shared
-        .candidate_runtime(candidate)
-        .ok_or_else(|| format!("unknown candidate {candidate}"))?;
-    let key = runtime.process_key.clone();
-    if shared.target_conn(&key).is_none() {
-        crate::downstream::start_downstream(shared, &key)
-            .await
-            .map_err(|e| format!("start_downstream: {e}"))?;
-    }
-
+) -> Result<OpenedSession, AcpError> {
     let opened = open_downstream_session(
         shared,
         candidate,
@@ -1240,8 +1268,7 @@ async fn open_evaluator_session(
         Vec::<McpServer>::new(), // tool-less
         DownstreamRoute::PreClass { capture, violation },
     )
-    .await
-    .map_err(|e| format!("session/new: {e}"))?;
+    .await?;
 
     let available_modes: Vec<String> = opened
         .modes
@@ -1269,16 +1296,16 @@ async fn open_evaluator_session(
             .cloned();
         let Some(mode_id) = mode_id else {
             close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-            return Err(format!(
+            return Err(AcpError::internal_error().data(format!(
                 "no advertised mode_map.preclass target; modes={available_modes:?}"
-            ));
+            )));
         };
         let set = SetSessionModeRequest::new(opened.downstream_sid.clone(), mode_id.clone());
         if let Err(err) = opened.conn.send_request(set).block_task().await {
             close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-            return Err(format!(
+            return Err(AcpError::internal_error().data(format!(
                 "set_mode preclass ({mode_id}) rejected; modes={available_modes:?}: {err}"
-            ));
+            )));
         }
         tracing::info!(
             session = router_sid,

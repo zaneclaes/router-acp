@@ -918,6 +918,10 @@ fn finish_prompt(
     cx: &ConnectionTo<ClientRole>,
     responder: Responder<PromptResponse>,
 ) -> Result<(), AcpError> {
+    if let Ok(text) = std::env::var("MOCK_REPLY_TEXT") {
+        let _ = cx.send_notification(chunk(&session_id, text));
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
     if reply.is_empty() {
         reply.push(format!("echo:{model}:{text}"));
     }
