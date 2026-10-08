@@ -287,12 +287,20 @@ pub(crate) async fn runtime(
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "router-acp".into());
         let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        let helper = format!(
-            "{} credential-token --provider grok --directory {} --runtime-directory {}",
+        let helper = runtime.root.join(".router-acp-auth-provider");
+        let script = format!(
+            "#!/bin/sh\nexec {} credential-token --provider grok --directory {} --runtime-directory {}\n",
             quote(&binary),
             quote(&dir.to_string_lossy()),
             quote(&runtime.root.to_string_lossy()),
         );
+        write_private_bytes(&helper, script.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| "Could not isolate Grok authentication")?;
+        }
         write_private(
             &runtime.root.join(".router-acp-token.json"),
             &json!({"generation":runtime.generation}),
@@ -300,7 +308,10 @@ pub(crate) async fn runtime(
         env.retain(|(k, _)| k != "HOME" && k != "GROK_HOME" && k != "GROK_AUTH_PROVIDER_COMMAND");
         env.push(("HOME".into(), isolated_home.to_string_lossy().into()));
         env.push(("GROK_HOME".into(), runtime.root.to_string_lossy().into()));
-        env.push(("GROK_AUTH_PROVIDER_COMMAND".into(), helper));
+        env.push((
+            "GROK_AUTH_PROVIDER_COMMAND".into(),
+            helper.to_string_lossy().into(),
+        ));
     } else {
         write_private(
             &runtime.root.join(if provider == "claude" {
@@ -1818,10 +1829,24 @@ flag = 7
             let mut env = vec![];
             let view = runtime(&agent, &mut env).await.unwrap().unwrap();
             if provider == "grok" {
-                assert!(
-                    env.iter().any(|(k, v)| k == "GROK_AUTH_PROVIDER_COMMAND"
-                        && v.contains("credential-token"))
+                let helper = env
+                    .iter()
+                    .find_map(|(k, v)| (k == "GROK_AUTH_PROVIDER_COMMAND").then_some(v))
+                    .unwrap();
+                assert_eq!(
+                    Path::new(helper),
+                    view.root.join(".router-acp-auth-provider")
                 );
+                let metadata = std::fs::metadata(helper).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+                }
+                let output = std::process::Command::new(helper).output().unwrap();
+                assert!(output.status.success());
+                let returned: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(returned.get("refresh_token").is_none());
                 let returned =
                     token_for_helper("grok", &directory(&agent).unwrap(), false, &view.root)
                         .await

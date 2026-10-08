@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    Error as AcpError, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    AuthMethod, AuthenticateRequest, Error as AcpError, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory,
 };
 use agent_client_protocol::{Client as ClientRole, on_receive_dispatch};
@@ -254,6 +254,17 @@ pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcom
     if !matches!(outcome, ProbeOutcome::AuthPending) {
         return outcome;
     }
+    // Grok's external credential provider is an ACP authentication method.
+    // A valid managed credential therefore still needs one `authenticate`
+    // request before the adapter will accept `session/new`.
+    if crate::accounts::provider(&agent) == Some("grok")
+        && authenticate_from_manager(shared, key).await.is_ok()
+    {
+        let retried = probe_target_once(shared, key).await;
+        if !matches!(retried, ProbeOutcome::AuthPending) {
+            return retried;
+        }
+    }
     let repaired = crate::credentials::repair(&agent, generation.as_deref()).await;
     crate::auth::sync_from_manager(shared, &agent);
     if repaired == crate::credentials::RepairOutcome::Repaired
@@ -280,6 +291,27 @@ pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcom
             "Authentication status unavailable; credential repair could not confirm logout".into(),
         )
     }
+}
+
+async fn authenticate_from_manager(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), AcpError> {
+    let conn = shared
+        .target_conn(key)
+        .ok_or_else(AcpError::internal_error)?;
+    let init = shared
+        .target_init(key)
+        .ok_or_else(AcpError::internal_error)?;
+    let method = init
+        .auth_methods
+        .iter()
+        .find_map(|method| match method {
+            AuthMethod::Agent(method) => Some(method.id.0.to_string()),
+            _ => None,
+        })
+        .ok_or_else(AcpError::internal_error)?;
+    conn.send_request(AuthenticateRequest::new(method))
+        .block_task()
+        .await?;
+    Ok(())
 }
 
 async fn restart_target(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), AcpError> {
