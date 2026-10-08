@@ -1074,6 +1074,11 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         text.contains("Signed in as fixture-new@example.test"),
         "{text}"
     );
+    let updates = serde_json::to_string(&client.events).unwrap();
+    assert!(
+        !updates.contains("downstream connection failed"),
+        "planned account replacement must not publish a downstream failure: {updates}"
+    );
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
     assert_eq!(cfg.agents.len(), 1);
     let account = &cfg.agents[0];

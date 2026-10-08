@@ -186,18 +186,18 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     };
     upstream.spawn(async move {
         let _credential = credential;
-        let connect = builder
-            .connect_with(acp_agent, async |cx| {
-                let _ = conn_tx.send(cx.clone());
-                std::future::pending::<Result<(), AcpError>>().await
-            });
-        let result = tokio::select! {
-            result = connect => result,
-            () = stop.cancelled() => Err(AcpError::internal_error().data("Account authentication changed")),
+        let connect = builder.connect_with(acp_agent, async |cx| {
+            let _ = conn_tx.send(cx.clone());
+            std::future::pending::<Result<(), AcpError>>().await
+        });
+        let (result, planned_stop) = tokio::select! {
+            result = connect => (result, false),
+            () = stop.cancelled() => (Err(AcpError::internal_error()), true),
         };
-        let reason = match result {
-            Ok(()) => "downstream connection closed".to_string(),
-            Err(err) => format!("downstream connection failed: {err}"),
+        let reason = match (result, planned_stop) {
+            (_, true) => "Account adapter restarting".to_string(),
+            (Ok(()), false) => "downstream connection closed".to_string(),
+            (Err(err), false) => format!("downstream connection failed: {err}"),
         };
         task_shared.mark_target_dead_if_current(&task_key, &stopped, &reason);
         stopped.notify_one();
