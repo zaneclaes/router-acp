@@ -552,6 +552,12 @@ per-credential OS locking. The lock covers only login, automatic repair, and
 removal. It never covers a session or model turn. Adapter runtime stores are
 private and access-only.
 
+Grok uses `GROK_HOME` when set, with `HOME/.grok` as its legacy fallback.
+Symlinked stores retain their canonical identity for locking and shared-account
+removal protection. Native login writes that store without changing the
+configured HOME. Each adapter gets a private GROK_HOME and an access-only token
+hook, including when the canonical directory has a different basename.
+
 ```mermaid
 flowchart TD
     E[Session reports an authentication error] --> L[Acquire this credential's shared lock]

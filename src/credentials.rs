@@ -33,9 +33,7 @@ pub(crate) fn directory(agent: &AgentConfig) -> Option<PathBuf> {
     let dir = match crate::accounts::provider(agent)? {
         "claude" => agent.config_dir("CLAUDE_CONFIG_DIR", ".claude"),
         "codex" => agent.config_dir("CODEX_HOME", ".codex"),
-        "grok" => agent
-            .env_var("HOME")
-            .map(|h| PathBuf::from(h).join(".grok")),
+        "grok" => agent.config_dir("GROK_HOME", ".grok"),
         "kimi" => agent
             .env_var("KIMI_SHARE_DIR")
             .or_else(|| agent.env_var("KIMI_CODE_HOME"))
@@ -285,8 +283,9 @@ pub(crate) async fn runtime(
             &runtime.root.join(".router-acp-token.json"),
             &json!({"generation":runtime.generation}),
         )?;
-        env.retain(|(k, _)| k != "HOME" && k != "GROK_AUTH_PROVIDER_COMMAND");
+        env.retain(|(k, _)| k != "HOME" && k != "GROK_HOME" && k != "GROK_AUTH_PROVIDER_COMMAND");
         env.push(("HOME".into(), isolated_home.to_string_lossy().into()));
+        env.push(("GROK_HOME".into(), runtime.root.to_string_lossy().into()));
         env.push(("GROK_AUTH_PROVIDER_COMMAND".into(), helper));
     } else {
         write_private(
@@ -1052,9 +1051,7 @@ pub async fn token_for_helper(
 
 fn helper_agent(provider: &str, dir: &Path) -> Result<AgentConfig, String> {
     let (variable, value) = match provider {
-        "grok" if dir.file_name().and_then(|n| n.to_str()) == Some(".grok") => {
-            ("HOME", dir.parent().ok_or("Invalid credential directory")?)
-        }
+        "grok" => ("GROK_HOME", dir),
         "kimi" => ("KIMI_SHARE_DIR", dir),
         _ => return Err("Unsupported credential helper".into()),
     };
@@ -1146,6 +1143,66 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
         )
         .unwrap();
         (root, config.agents[0].clone())
+    }
+
+    #[tokio::test]
+    async fn grok_symlinked_store_keeps_helper_and_runtime_isolation() {
+        let (root, agent) = fixture("grok");
+        let legacy = root.path().join(".grok");
+        let durable = root.path().join("durable-grok");
+        std::fs::rename(&legacy, &durable).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&durable, &legacy).unwrap();
+        let before = std::fs::read(durable.join("auth.json")).unwrap();
+        let mut first_env = vec![("GROK_HOME".into(), durable.to_string_lossy().into())];
+        let mut second_env = first_env.clone();
+        let (first, second) = tokio::join!(
+            runtime(&agent, &mut first_env),
+            runtime(&agent, &mut second_env)
+        );
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert_ne!(first.root, second.root);
+        for (view, env) in [(&first, &first_env), (&second, &second_env)] {
+            assert_eq!(
+                env.iter()
+                    .filter(|(key, _)| key == "GROK_HOME")
+                    .collect::<Vec<_>>(),
+                vec![&("GROK_HOME".into(), view.root.to_string_lossy().into())]
+            );
+            let token = token_for_helper("grok", &durable, false, &view.root)
+                .await
+                .unwrap();
+            assert_eq!(token["access_token"], "synthetic-access");
+            assert!(token.get("refresh_token").is_none());
+            assert!(!view.root.join("auth.json").exists());
+        }
+        assert_eq!(std::fs::read(durable.join("auth.json")).unwrap(), before);
+        let helper = helper_agent("grok", &durable).unwrap();
+        assert_eq!(directory(&agent), directory(&helper));
+        let held = lock(&agent).await.unwrap();
+        assert!(
+            !std::process::Command::new("flock")
+                .args(["--nonblock"])
+                .arg(directory(&helper).unwrap().join(".router-acp-auth.lock"))
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn grok_home_precedes_legacy_home_and_uses_canonical_identity() {
+        let (root, mut agent) = fixture("grok");
+        let custom = root.path().join("custom-store");
+        std::fs::create_dir(&custom).unwrap();
+        agent.command.env.push(crate::config::EnvVarConfig {
+            name: "GROK_HOME".into(),
+            value: custom.to_string_lossy().into(),
+        });
+        assert_eq!(directory(&agent), Some(custom.canonicalize().unwrap()));
     }
 
     #[tokio::test]

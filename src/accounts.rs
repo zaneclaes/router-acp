@@ -887,6 +887,7 @@ fn new_account(shared: &Arc<Shared>, p: &str) -> Result<(AgentConfig, String), A
     let variable = match p {
         "claude" => "CLAUDE_CONFIG_DIR",
         "codex" => "CODEX_HOME",
+        "grok" => "GROK_HOME",
         "kimi" => "KIMI_SHARE_DIR",
         _ => "HOME",
     };
@@ -923,6 +924,7 @@ pub(crate) fn isolated_environment(env: &[(String, String)]) -> bool {
             name.as_str(),
             "CLAUDE_CONFIG_DIR"
                 | "CODEX_HOME"
+                | "GROK_HOME"
                 | "GROK_AUTH_PROVIDER_COMMAND"
                 | "KIMI_SHARE_DIR"
                 | "KIMI_CODE_HOME"
@@ -1126,9 +1128,11 @@ async fn run_login(
             "kimi" => {
                 cmd.env("KIMI_SHARE_DIR", &dir).env("KIMI_CODE_HOME", dir);
             }
-            _ => {
-                cmd.env("HOME", dir.parent().unwrap());
+            "grok" => {
+                cmd.env("GROK_HOME", dir)
+                    .env_remove("GROK_AUTH_PROVIDER_COMMAND");
             }
+            _ => {}
         }
     }
     #[cfg(unix)]
@@ -1391,6 +1395,7 @@ async fn publish_added(
         let variable = match provider(agent) {
             Some("claude") => "CLAUDE_CONFIG_DIR",
             Some("codex") => "CODEX_HOME",
+            Some("grok") => "GROK_HOME",
             Some("kimi") => "KIMI_SHARE_DIR",
             _ => "HOME",
         };

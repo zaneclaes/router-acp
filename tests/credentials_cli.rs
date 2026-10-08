@@ -42,7 +42,12 @@ async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair()
         }));
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let root = tempfile::tempdir().unwrap();
-    let dir = root.path().join(".grok");
+    let home = root.path().join("home");
+    let dir = root.path().join("durable-grok");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, home.join(".grok")).unwrap();
     let runtime = dir.join(".router-acp-runtime/test");
     std::fs::create_dir_all(&runtime).unwrap();
     let credentials = dir.join("auth.json");
@@ -57,7 +62,7 @@ async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair()
     .unwrap();
     let config = router_acp::config::Config::from_yaml(&format!(
         "agents:\n  - name: grok\n    command: {{type: stdio, command: grok, env: [{{name: HOME, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: grok, cost_rank: 1}}]\n",
-        root.path().display()
+        home.display()
     )).unwrap();
     let agent = &config.agents[0];
     let observed = router_acp::credentials::request_generation(agent).unwrap();
