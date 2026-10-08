@@ -161,10 +161,10 @@ pub fn identity(agent: &AgentConfig) -> (String, Option<String>) {
                     .and_then(Value::as_str)
                     .unwrap_or(&fallback)
                     .to_string(),
-                None,
+                agent.account_plan.clone(),
             )
         }
-        _ => (fallback, None),
+        _ => (fallback, agent.account_plan.clone()),
     }
 }
 

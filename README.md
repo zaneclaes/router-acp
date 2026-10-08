@@ -46,7 +46,7 @@ goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp   
                           │
                           ├──────ACP──▶ codex-acp             (codex/gpt-5.5, codex/gpt-5.6-sol)
                           │
-                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.6)
+                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.7 or grok-4.6)
                           │
                           └──────ACP──▶ kimi acp              (kimi/kimi-k2)
 ```
@@ -125,7 +125,7 @@ Manage logins
 4. kimi (0 accounts)
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Its `credentialPresent` field distinguishes a saved but unprobed credential from a configured account with no credential. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 

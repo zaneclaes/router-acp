@@ -823,6 +823,24 @@ impl Shared {
         });
     }
 
+    /// Ignore a replaced process that finishes after its successor is ready.
+    pub fn mark_target_dead_if_current(
+        &self,
+        key: &ProcessKey,
+        process: &Arc<tokio::sync::Notify>,
+        reason: &str,
+    ) {
+        let current = self
+            .targets
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|target| Arc::ptr_eq(&target.stopped, process));
+        if current {
+            self.mark_target_dead(key, reason);
+        }
+    }
+
     pub fn set_models_routeable(&self, key: &ProcessKey, model_ids: Vec<String>) {
         if let Some(t) = self.targets.lock().unwrap().get_mut(key) {
             t.auth_pending = false;
@@ -1352,6 +1370,7 @@ impl Shared {
                 .unwrap()
                 .iter()
                 .filter(|c| c.id.agent == agent.name)
+                .filter(|c| !matches!(c.status, CandidateStatus::Invalid(_)))
                 .map(|c| {
                     let opt =
                         SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
@@ -8660,6 +8679,44 @@ mod xai_gate_tests {
         // A gate_message alone (allow_access absent) still closes the gate.
         let r = xai_gate_reason(&json!({"gate_message": "rate limited"})).unwrap();
         assert!(r.contains("rate limited"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod downstream_generation_tests {
+    use super::*;
+
+    #[test]
+    fn late_exit_from_replaced_process_does_not_mark_successor_dead() {
+        let cfg = Config::from_yaml(
+            r#"
+agents:
+  - name: grok
+    command: {type: stdio, command: mock-agent}
+    model_selection: {type: config-option}
+    models: [{id: grok-4.7, cost_rank: 5}]
+"#,
+        )
+        .unwrap();
+        let shared = Shared::new(cfg).unwrap();
+        let key = shared.target_keys().into_iter().next().unwrap();
+        let old_process = shared.targets.lock().unwrap()[&key].stopped.clone();
+        shared
+            .targets
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .stopped = Arc::default();
+        shared.set_models_routeable(&key, vec!["grok-4.7".into()]);
+
+        shared.mark_target_dead_if_current(&key, &old_process, "old process exited");
+
+        assert_eq!(
+            shared.candidate_status(&CandidateId::new("grok", "grok-4.7")),
+            Some(CandidateStatus::Routeable)
+        );
+        assert!(shared.targets.lock().unwrap()[&key].dead.is_none());
     }
 }
 

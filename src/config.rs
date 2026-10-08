@@ -917,6 +917,9 @@ pub struct AgentConfig {
     /// Unset standalone agents keep ordinary strategy ranking.
     #[serde(default)]
     pub account_priority: Option<u32>,
+    /// Optional human-facing plan when local provider metadata omits it.
+    #[serde(default)]
+    pub account_plan: Option<String>,
     /// Deleted membership keeps an adapter template for adding a new login.
     #[serde(default)]
     pub account_disabled: bool,
@@ -976,6 +979,8 @@ pub struct AccountConfig {
     pub env: Vec<EnvVarConfig>,
     #[serde(default)]
     pub reserve_capacity: Option<ReserveCapacityConfig>,
+    #[serde(default)]
+    pub account_plan: Option<String>,
 }
 
 impl AgentConfig {
@@ -1674,6 +1679,9 @@ impl Config {
                 seat.command.env.extend(account.env);
                 if let Some(reserve) = account.reserve_capacity {
                     seat.reserve_capacity = reserve;
+                }
+                if account.account_plan.is_some() {
+                    seat.account_plan = account.account_plan;
                 }
                 agents.push(seat);
             }
@@ -2669,6 +2677,17 @@ agents:
             cfg.agents[0].config_dir("CLAUDE_CONFIG_DIR", ".claude"),
             cfg.agents[1].config_dir("CLAUDE_CONFIG_DIR", ".claude")
         );
+    }
+
+    #[test]
+    fn expands_account_plan_from_each_nested_account() {
+        let yaml = format!(
+            "{}\n    account_plan: pro\n    accounts:\n      - name: work\n        account_plan: team\n      - name: personal\n",
+            minimal_yaml().trim_end()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(cfg.agents[0].account_plan.as_deref(), Some("team"));
+        assert_eq!(cfg.agents[1].account_plan.as_deref(), Some("pro"));
     }
 
     #[test]

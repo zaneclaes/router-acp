@@ -571,6 +571,14 @@ pub fn availability(agent: &AgentConfig) -> AuthAvailability {
     }
 }
 
+/// Whether the canonical store contains usable credential material.
+///
+/// This is separate from availability: an unprobed credential is present but
+/// still has unknown authentication status.
+pub fn present(agent: &AgentConfig) -> bool {
+    read(agent).is_some()
+}
+
 /// OS locks release on cancellation, crash and process exit. There is no
 /// stale-age lock breaking that could permit two live repair owners.
 pub(crate) async fn lock(agent: &AgentConfig) -> Result<File, String> {
@@ -1519,6 +1527,22 @@ flag = 7
             value: custom.to_string_lossy().into(),
         });
         assert_eq!(directory(&agent), Some(custom.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn credential_presence_is_independent_of_authentication_evidence() {
+        let (_root, agent) = fixture("kimi");
+        assert!(present(&agent));
+        assert_eq!(availability(&agent), AuthAvailability::Unknown);
+
+        std::fs::remove_file(
+            directory(&agent)
+                .unwrap()
+                .join("credentials/kimi-code.json"),
+        )
+        .unwrap();
+        assert!(!present(&agent));
+        assert_eq!(availability(&agent), AuthAvailability::Unknown);
     }
 
     #[tokio::test]

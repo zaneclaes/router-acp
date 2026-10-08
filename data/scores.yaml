@@ -407,7 +407,8 @@ candidates:
       Ops: 2.11
       CodingGeneral: 2.11
 
-  # xAI Grok. `*grok*code*` MUST precede `*grok*` (first-match-wins).
+  # xAI Grok. Narrow versions and `*grok*code*` MUST precede `*grok*`
+  # (first-match-wins).
   # Grok 4.5 is calibrated from xAI's SWE-Bench Pro, DeepSWE, and
   # Terminal-Bench results. The disabled code-fast entry remains provisional.
   - pattern: "*grok*code*"           # grok-code-fast-* (cheap fast coder)
@@ -427,7 +428,27 @@ candidates:
       Ops: 0.72
       CodingGeneral: 0.8
 
-  - pattern: "*grok*"                # grok-4.5 and future frontier grok
+  # Grok 4.7 has its own published DeepSWE evidence. The model updater owns
+  # these quality values; this entry exists separately so 4.7 cannot silently
+  # inherit 4.6's older family score.
+  - pattern: "*grok-4.7*"
+    coding_tier: high
+    coding_percentile: 0.88
+    context_window: 256000
+    default_quality: 3.10
+    quality:
+      UiTweak: 3.10
+      BugFix: 3.10
+      Feature: 3.10
+      Refactor: 3.10
+      Algorithms: 3.10
+      Architecture: 3.10
+      Research: 3.10
+      Writing: 3.10
+      Ops: 3.10
+      CodingGeneral: 3.10
+
+  - pattern: "*grok*"                # Grok 4.6 and earlier frontier Grok
     coding_tier: high
     coding_percentile: 0.88
     context_window: 256000

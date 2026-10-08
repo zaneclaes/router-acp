@@ -1223,7 +1223,7 @@ async fn account_commands_survive_goose_turn_context_block() {
 }
 
 #[tokio::test]
-async fn declared_model_missing_downstream_is_retained_but_unavailable() {
+async fn declared_model_missing_downstream_is_omitted_from_client_options() {
     let state = temp_state_file("missing-model");
     // Config declares m1 and bogus; mock only offers m1.
     let yaml = format!(
@@ -1237,8 +1237,7 @@ async fn declared_model_missing_downstream_is_retained_but_unavailable() {
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let session = new_session(&cx).await?;
-        // The router.candidate select must retain configured models so the
-        // client can explain their current availability.
+        // The router.candidate select is the supported-model contract.
         let options = session.config_options.clone().unwrap_or_default();
         let candidate_opt = options
             .iter()
@@ -1259,20 +1258,9 @@ async fn declared_model_missing_downstream_is_retained_but_unavailable() {
             values.contains(&"mock/m1".to_string()),
             "values: {values:?}"
         );
-        let bogus = choices
-            .iter()
-            .find(|o| o.value.0.as_ref() == "mock/bogus")
-            .expect("configured model remains visible");
-        let value = serde_json::to_value(bogus).unwrap();
-        assert_eq!(
-            value.pointer("/_meta/router_acp/available"),
-            Some(&serde_json::json!(false))
-        );
-        assert_eq!(
-            value.pointer("/_meta/router_acp/unavailable_reason"),
-            Some(&serde_json::json!(
-                "not offered by downstream model selector"
-            ))
+        assert!(
+            !values.contains(&"mock/bogus".to_string()),
+            "values: {values:?}"
         );
         Ok(())
     })

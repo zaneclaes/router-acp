@@ -199,7 +199,7 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
             Ok(()) => "downstream connection closed".to_string(),
             Err(err) => format!("downstream connection failed: {err}"),
         };
-        task_shared.mark_target_dead(&task_key, &reason);
+        task_shared.mark_target_dead_if_current(&task_key, &stopped, &reason);
         stopped.notify_one();
         // Contained: a downstream death must not tear down the router.
         Ok(())

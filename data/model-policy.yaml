@@ -134,6 +134,10 @@ benchmark_scoring:
       - { benchmark: SWE-Bench-Pro, result: 79.2, source: "https://www.anthropic.com/news/claude-opus-5" }
       - { benchmark: DeepSWE-v1.1, result: 73.6, source: "https://deepswe.datacurve.ai/" }
       - { benchmark: Terminal-Bench-2.1, result: 89.1, source: "https://artificialanalysis.ai/evaluations/terminalbench-v2-1" }
+    "*grok-4.7*":
+      # Same-harness DeepSWE v1.1 is the strongest comparable published coding
+      # receipt. Grok 4.7 scores 71.0% versus 4.6's 62.1% in the launch table.
+      - { benchmark: DeepSWE-v1.1, result: 71.0, source: "https://x.ai/news/grok-4-7" }
     "*grok*":
       # Grok 4.6 launched 2026-08-12 (id bumped below; see witnesses/
       # resolves_to/rank_exceptions/published_pricing). Evidence intentionally
@@ -274,6 +278,7 @@ witnesses:
   luna: "codex/gpt-5.6-luna"
   luna_6: "codex/gpt-6-luna"
   grok: "grok/grok-4.6"
+  grok_4_7: "grok/grok-4.7"
   grok_code: "grok/grok-code-fast-1"
   kimi: "kimi/kimi-k2"
   kimi_thinking: "kimi/kimi-k2-thinking"
@@ -288,6 +293,8 @@ witnesses:
 invariants:
   # Strictly decreasing quality, every TaskClass, left to right.
   strict_desc:
+    - chain: [grok_4_7, grok]
+      why: Grok 4.7's published same-harness DeepSWE result exceeds Grok 4.6
     - chain: [fable, opus, sonnet, haiku]
       why: >-
         the claude ladder every golden routing case depends on. Fable-ahead is
@@ -392,6 +399,7 @@ invariants:
     "gemini/gemini-3-pro": "*gemini*pro*"
     "gemini/gemini-3-flash": "*gemini*flash*"
     "grok/grok-4.6": "*grok*"
+    "grok/grok-4.7": "*grok-4.7*"
     "grok/grok-code-fast-1": "*grok*code*"
     "kimi/kimi-k2": "*kimi*"
     "kimi/kimi-k2-thinking": "*kimi*k2*thinking*"
@@ -445,6 +453,8 @@ published_pricing:
     "codex/gpt-6.1-sol":
       { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.10 }
     "grok/grok-4.6":
+      { input_per_mtok: 2.00, output_per_mtok: 6.00, cache_read_per_mtok: 0.50 }
+    "grok/grok-4.7":
       { input_per_mtok: 2.00, output_per_mtok: 6.00, cache_read_per_mtok: 0.50 }
     "kimi/kimi-k2": { input_per_mtok: 0.55, output_per_mtok: 2.20 }
 
