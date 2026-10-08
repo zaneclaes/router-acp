@@ -504,10 +504,13 @@ pub async fn note_auth_failure_for_request(
 
 pub(crate) fn sync_from_manager(shared: &Arc<Shared>, agent: &crate::config::AgentConfig) {
     let state = crate::credentials::availability(agent);
-    let mut tracker = shared.auth.lock().unwrap();
-    tracker.clear_current_generation(&agent.name);
-    // Clear process-local negatives too: only the shared manager may reject.
-    tracker.force_set(&agent.name, state);
+    {
+        let mut tracker = shared.auth.lock().unwrap();
+        tracker.clear_current_generation(&agent.name);
+        // Clear process-local negatives too: only the shared manager may reject.
+        tracker.force_set(&agent.name, state);
+    }
+    shared.publish_config_options();
 }
 
 #[cfg(test)]

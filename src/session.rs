@@ -13,14 +13,14 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
-    ContentBlock, ContentChunk, DeleteSessionRequest, Error as AcpError, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, SessionCapabilities,
-    SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    StopReason,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, DeleteSessionRequest, Error as AcpError,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, McpCapabilities, McpServer, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    SessionCapabilities, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Client as ClientPeer, ConnectTo, ConnectionTo, Dispatch, Handled,
@@ -845,14 +845,27 @@ impl Shared {
     }
 
     fn update_candidates(&self, key: &ProcessKey, f: impl Fn(&mut CandidateRuntime)) {
-        for c in self
-            .candidates
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .filter(|c| &c.process_key == key)
         {
-            f(c);
+            let mut candidates = self.candidates.lock().unwrap();
+            for c in candidates.iter_mut().filter(|c| &c.process_key == key) {
+                f(c);
+            }
+        }
+        self.publish_config_options();
+    }
+
+    pub fn publish_config_options(&self) {
+        let Some(cx) = self.upstream() else {
+            return;
+        };
+        let sessions: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
+        for sid in sessions {
+            let _ = cx.send_notification(SessionNotification::new(
+                sid.clone(),
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                    self.router_config_options(&sid),
+                )),
+            ));
         }
     }
 
@@ -1300,24 +1313,45 @@ impl Shared {
         // Snapshot usage cordons so cordoned candidates can be advertised as
         // unavailable (kept in the list, not dropped, so the client shows them
         // disabled with a reason).
-        let usage_cordons: std::collections::HashMap<_, _> = self
-            .headroom
+        let candidate_ids: Vec<_> = self
+            .candidates
             .lock()
             .unwrap()
-            .active_usage_cordons()
-            .into_iter()
+            .iter()
+            .map(|candidate| candidate.id.clone())
             .collect();
+        let (usage_cordons, agent_cordons, exhausted, quarantined): (
+            HashMap<_, _>,
+            HashMap<_, _>,
+            HashSet<_>,
+            HashSet<_>,
+        ) = {
+            let mut headroom = self.headroom.lock().unwrap();
+            let usage = headroom.active_usage_cordons().into_iter().collect();
+            let agents = headroom
+                .active_cordons()
+                .into_iter()
+                .map(|(agent, _, reason)| (agent, reason))
+                .collect();
+            let exhausted = candidate_ids
+                .iter()
+                .filter(|candidate| headroom.seat_exhausted(candidate))
+                .cloned()
+                .collect();
+            let quarantined = candidate_ids
+                .iter()
+                .filter(|candidate| headroom.is_quarantined(candidate))
+                .cloned()
+                .collect();
+            (usage, agents, exhausted, quarantined)
+        };
         for agent in self.agent_configs().iter().filter(|a| !a.account_disabled) {
             let options: Vec<SessionConfigSelectOption> = self
                 .candidates
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| {
-                    c.id.agent == agent.name
-                        && (c.status == CandidateStatus::Routeable
-                            || self.auth_rejection(&c.id.agent).is_some())
-                })
+                .filter(|c| c.id.agent == agent.name)
                 .map(|c| {
                     let opt =
                         SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
@@ -1357,9 +1391,29 @@ impl Shared {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(cordon.reason);
                         router_meta["resets_at"] = json!(cordon.resets_at_rfc3339);
+                    } else if let Some(reason) = agent_cordons.get(&c.id.agent) {
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] = json!(reason);
+                    } else if exhausted.contains(&c.id) {
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] = json!("Plan capacity exhausted");
+                    } else if quarantined.contains(&c.id) {
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] =
+                            json!("Temporarily unavailable after repeated service failures");
                     } else if let Some(reason) = self.auth_rejection(&c.id.agent) {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(reason);
+                    } else if c.status != CandidateStatus::Routeable {
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] = json!(match &c.status {
+                            CandidateStatus::AuthPending => "Sign in required".to_string(),
+                            CandidateStatus::Down(reason) | CandidateStatus::Invalid(reason) => {
+                                reason.clone()
+                            }
+                            CandidateStatus::Unverified => "Checking availability".to_string(),
+                            CandidateStatus::Routeable => unreachable!(),
+                        });
                     }
                     let mut meta = serde_json::Map::new();
                     meta.insert("router_acp".to_string(), router_meta);
@@ -2119,6 +2173,7 @@ fn note_xai_gate(shared: &Arc<Shared>, key: &ProcessKey, params: &serde_json::Va
         .lock()
         .unwrap()
         .cordon(&agent, None, reason.clone());
+    shared.publish_config_options();
     tracing::warn!(
         agent = agent,
         cordon_secs = dur.as_secs(),
@@ -3356,6 +3411,7 @@ pub(crate) fn apply_failure(
                     "agent cordoned by token/usage limit"
                 );
             }
+            shared.publish_config_options();
             reason
         }
         FailureClass::Outage => {
@@ -3366,6 +3422,7 @@ pub(crate) fn apply_failure(
                     .lock()
                     .unwrap()
                     .cordon(&candidate.agent, None, reason.clone());
+                shared.publish_config_options();
                 return reason;
             }
             shared
@@ -3373,6 +3430,7 @@ pub(crate) fn apply_failure(
                 .lock()
                 .unwrap()
                 .record_pre_prompt_failure(candidate);
+            shared.publish_config_options();
             let mut msg = format!("{err}");
             msg.truncate(160);
             format!("outage ({msg})")
@@ -6919,7 +6977,7 @@ fn build_agent(
                   responder: Responder<SetSessionConfigOptionResponse>,
                   _cx| {
                 let shared = s_cfg.clone();
-                async move { on_set_config_option(shared, req, responder) }
+                async move { on_set_config_option(shared, req, responder).await }
             },
             on_receive_request!(),
         )
@@ -7322,7 +7380,43 @@ fn on_session_new(
     })
 }
 
-fn on_set_config_option(
+async fn refresh_provider_targets(shared: &Arc<Shared>, provider: &str) {
+    let keys: Vec<ProcessKey> = shared
+        .target_keys()
+        .into_iter()
+        .filter(|key| {
+            let Some(spec) = shared.target_spec(key) else {
+                return false;
+            };
+            let Some(agent) = shared
+                .agent_configs()
+                .into_iter()
+                .find(|agent| agent.name == spec.agent_name)
+            else {
+                return false;
+            };
+            if crate::accounts::provider(&agent) != Some(provider) {
+                return false;
+            }
+            shared.candidates.lock().unwrap().iter().any(|candidate| {
+                candidate.process_key == *key
+                    && matches!(
+                        candidate.status,
+                        CandidateStatus::AuthPending
+                            | CandidateStatus::Unverified
+                            | CandidateStatus::Down(_)
+                    )
+            })
+        })
+        .collect();
+    for key in keys {
+        if let Err(err) = crate::downstream::restart_after_repair(shared, &key).await {
+            tracing::warn!(target = %key, %err, "signed-in target did not refresh");
+        }
+    }
+}
+
+async fn on_set_config_option(
     shared: Arc<Shared>,
     req: SetSessionConfigOptionRequest,
     responder: Responder<SetSessionConfigOptionResponse>,
@@ -7330,6 +7424,19 @@ fn on_set_config_option(
     let router_sid = sid_str(&req.session_id);
     let config_id = req.config_id.0.to_string();
     let is_router_option = config_id.starts_with("router.");
+
+    // Connected Tools signs providers in through a short-lived router process.
+    // A live chat asks for its current router options after that flow finishes.
+    // Re-probe only targets whose credential store now proves authenticated so
+    // the returned candidate list reflects the completed sign-in immediately.
+    let refresh_provider = serde_json::to_value(&req.meta).ok().and_then(|meta| {
+        meta.pointer("/router_acp/refresh_provider")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    if is_router_option && let Some(provider) = refresh_provider {
+        refresh_provider_targets(&shared, &provider).await;
+    }
 
     enum Action {
         RouterUpdated,

@@ -342,7 +342,10 @@ pub(crate) async fn restart_after_repair(
     }
     restart_target(shared, key).await?;
     match probe_target_once(shared, key).await {
-        ProbeOutcome::Routeable => Ok(()),
+        ProbeOutcome::Routeable => {
+            crate::auth::sync_from_manager(shared, &agent);
+            Ok(())
+        }
         _ => Err(AcpError::internal_error()
             .data("This account's adapter remains unavailable after credential repair")),
     }

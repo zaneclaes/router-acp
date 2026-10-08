@@ -1223,7 +1223,7 @@ async fn account_commands_survive_goose_turn_context_block() {
 }
 
 #[tokio::test]
-async fn declared_model_missing_downstream_is_removed() {
+async fn declared_model_missing_downstream_is_retained_but_unavailable() {
     let state = temp_state_file("missing-model");
     // Config declares m1 and bogus; mock only offers m1.
     let yaml = format!(
@@ -1237,7 +1237,8 @@ async fn declared_model_missing_downstream_is_removed() {
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let session = new_session(&cx).await?;
-        // The router.candidate select must offer m1 but not bogus.
+        // The router.candidate select must retain configured models so the
+        // client can explain their current availability.
         let options = session.config_options.clone().unwrap_or_default();
         let candidate_opt = options
             .iter()
@@ -1246,23 +1247,32 @@ async fn declared_model_missing_downstream_is_removed() {
         let SessionConfigKind::Select(select) = &candidate_opt.kind else {
             panic!("router.candidate must be a select");
         };
-        let values: Vec<String> = match &select.options {
-            SessionConfigSelectOptions::Grouped(groups) => groups
-                .iter()
-                .flat_map(|g| g.options.iter().map(|o| o.value.0.to_string()))
-                .collect(),
-            SessionConfigSelectOptions::Ungrouped(opts) => {
-                opts.iter().map(|o| o.value.0.to_string()).collect()
+        let choices: Vec<_> = match &select.options {
+            SessionConfigSelectOptions::Grouped(groups) => {
+                groups.iter().flat_map(|g| g.options.iter()).collect()
             }
+            SessionConfigSelectOptions::Ungrouped(opts) => opts.iter().collect(),
             _ => vec![],
         };
+        let values: Vec<_> = choices.iter().map(|o| o.value.0.to_string()).collect();
         assert!(
             values.contains(&"mock/m1".to_string()),
             "values: {values:?}"
         );
-        assert!(
-            !values.contains(&"mock/bogus".to_string()),
-            "values: {values:?}"
+        let bogus = choices
+            .iter()
+            .find(|o| o.value.0.as_ref() == "mock/bogus")
+            .expect("configured model remains visible");
+        let value = serde_json::to_value(bogus).unwrap();
+        assert_eq!(
+            value.pointer("/_meta/router_acp/available"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            value.pointer("/_meta/router_acp/unavailable_reason"),
+            Some(&serde_json::json!(
+                "not offered by downstream model selector"
+            ))
         );
         Ok(())
     })
@@ -4505,6 +4515,118 @@ async fn switch_starts_a_target_skipped_at_boot_and_hands_off() {
         );
         assert!(text.contains("echo:m2:"), "new model answered: {text}");
         assert!(!text.contains("no live downstream"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn config_refresh_advertises_a_target_signed_in_after_boot() {
+    let state = temp_state_file("config-refresh-signed-in");
+    let a_log = temp_log("config-refresh-signed-in-a");
+    let b_log = temp_log("config-refresh-signed-in-b");
+    let credential = claude_credential_fixture(Some("Rejected"));
+    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, credential.path(), &[]);
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        let before = serde_json::to_value(&session.config_options)?;
+        let before_text = serde_json::to_string(&before)?;
+        assert!(
+            before_text.contains("claude@cold/m2"),
+            "configured target stays visible"
+        );
+        assert!(
+            before_text.contains("\"available\":false"),
+            "signed-out target is disabled"
+        );
+
+        std::fs::remove_file(credential.path().join(".router-acp-auth.json")).unwrap();
+        let refreshed = cx
+            .send_request(
+                SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "router.effort".to_string(),
+                    SessionConfigOptionValue::value_id("auto"),
+                )
+                .meta(
+                    serde_json::json!({"router_acp": {"refresh_provider": "claude"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .block_task()
+            .await?;
+
+        let refreshed = serde_json::to_string(&refreshed.config_options)?;
+        assert!(
+            refreshed.contains("claude@cold/m2"),
+            "completed login stays visible"
+        );
+        assert!(
+            !refreshed.contains("\"available\":false"),
+            "completed login becomes available: {refreshed}"
+        );
+        assert!(
+            observed.lock().unwrap().updates.iter().any(|notification| {
+                notification.session_id.0.as_ref() == sid
+                    && matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+            }),
+            "completed login publishes a config update"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn candidate_status_change_publishes_disabled_model() {
+    let state = temp_state_file("candidate-status-update");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        observed.lock().unwrap().updates.clear();
+
+        let key = shared.target_keys().into_iter().next().unwrap();
+        shared.mark_target_dead(&key, "provider unavailable");
+
+        for _ in 0..50 {
+            if observed.lock().unwrap().updates.iter().any(|notification| {
+                notification.session_id.0.as_ref() == sid
+                    && matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let updates = observed.lock().unwrap();
+        let notification = updates
+            .updates
+            .iter()
+            .find(|notification| {
+                notification.session_id.0.as_ref() == sid
+                    && matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+            })
+            .expect("candidate status change publishes a config update");
+        let value = serde_json::to_value(notification).unwrap();
+        assert_eq!(
+            value.pointer("/update/configOptions/1/options/1/options/0/_meta/router_acp/available"),
+            Some(&serde_json::json!(false)),
+            "notification: {value}"
+        );
+        assert!(
+            value.to_string().contains("provider unavailable"),
+            "notification: {value}"
+        );
         Ok(())
     })
     .await;

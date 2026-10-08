@@ -858,6 +858,7 @@ async fn reject_pinned_rewrite(
             reason,
             std::time::SystemTime::now() + reset,
         );
+        state.shared.publish_config_options();
         tracing::warn!(
             target = %target.key,
             candidate = %active.candidate,
