@@ -1216,16 +1216,28 @@ async fn standalone_relogin_cancel_keeps_membership_and_kills_login() {
         "{response}\n{}",
         client.text()
     );
+    let delivered = log_events(&fixture.original_log)
+        .into_iter()
+        .rfind(|event| event["event"] == "prompt")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(delivered.contains(&sid) && delivered.contains("after cancelled re-login"));
+    assert!(!delivered.contains("context before cancelled re-login"));
+    let command = delivered
+        .lines()
+        .find(|line| line.contains(" transcript --state "))
+        .unwrap();
+    let output = std::process::Command::new("sh")
+        .args(["-c", command.trim()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     assert!(
-        log_events(&fixture.original_log).iter().any(|event| {
-            event["event"] == "prompt"
-                && event["text"].as_str().is_some_and(|text| {
-                    text.contains("context before cancelled re-login")
-                        && text.contains("after cancelled re-login")
-                })
-        }),
-        "cancelled re-login did not hand off the pinned transcript: {:?}",
-        log_events(&fixture.original_log)
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("context before cancelled re-login")
     );
     client.close().await;
 }
@@ -1277,16 +1289,28 @@ async fn standalone_failed_relogin_preserves_credentials_and_hands_off_pinned_se
         "{response}\n{}",
         client.text()
     );
+    let delivered = log_events(&fixture.original_log)
+        .into_iter()
+        .rfind(|event| event["event"] == "prompt")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(delivered.contains(&sid) && delivered.contains("after failed re-login"));
+    assert!(!delivered.contains("context before failed re-login"));
+    let command = delivered
+        .lines()
+        .find(|line| line.contains(" transcript --state "))
+        .unwrap();
+    let output = std::process::Command::new("sh")
+        .args(["-c", command.trim()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     assert!(
-        log_events(&fixture.original_log).iter().any(|event| {
-            event["event"] == "prompt"
-                && event["text"].as_str().is_some_and(|text| {
-                    text.contains("context before failed re-login")
-                        && text.contains("after failed re-login")
-                })
-        }),
-        "failed re-login did not hand off the pinned transcript: {:?}",
-        log_events(&fixture.original_log)
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("context before failed re-login")
     );
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
     assert_eq!(cfg.agents[0].name, "claude@old");

@@ -18,7 +18,7 @@
 //! mechanism (it replaces the earlier count/age logic).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -198,9 +198,27 @@ impl StateFile {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Concurrent router startups can contend while enabling WAL. Install
+        // the wait first so a transient lock cannot select the memory fallback.
         conn.busy_timeout(Duration::from_secs(5))?;
+        // SQLite can refuse a journal-mode lock upgrade without invoking its
+        // busy handler. Retry the statement after concurrent startup releases it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
     }
 
@@ -1047,6 +1065,52 @@ pub fn estimate_tokens(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_first_open_keeps_every_connection_on_the_shared_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let connection = StateFile::open_conn(&path).unwrap();
+                    let mode: String = connection
+                        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(mode, "wal");
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn opening_state_waits_for_a_concurrent_startup_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let opening = std::thread::spawn(move || {
+            ready.wait();
+            StateFile::open_conn(&path)
+        });
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        writer.execute_batch("COMMIT").unwrap();
+        let conn = opening.join().unwrap().expect("startup waits for SQLite");
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
 
     fn store() -> (tempfile::TempDir, StateFile) {
         let dir = tempfile::tempdir().unwrap();

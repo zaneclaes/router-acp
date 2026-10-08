@@ -272,6 +272,19 @@ fn assert_restore_metadata(meta: &Value) {
     }
 }
 
+fn lookup_from_prompt(prompt: &str) -> String {
+    let command = prompt
+        .lines()
+        .find(|line| line.contains(" transcript --state "))
+        .expect("incoming agent received a history lookup command");
+    let output = std::process::Command::new("sh")
+        .args(["-c", command.trim()])
+        .output()
+        .expect("incoming agent can execute lookup");
+    assert!(output.status.success(), "lookup failed: {:?}", output);
+    String::from_utf8(output.stdout).expect("history is UTF-8")
+}
+
 fn router_meta(role: Option<&str>, continue_from: Option<&str>) -> Value {
     let mut router_acp = serde_json::Map::new();
     if let Some(role) = role {
@@ -297,7 +310,7 @@ async fn select_m2_high(client: &mut Client, session_id: &str) {
 }
 
 #[tokio::test]
-async fn resume_after_router_exit_replays_full_sqlite_context_and_keeps_router_settings() {
+async fn resume_after_router_exit_provides_sqlite_lookup_and_keeps_router_settings() {
     let fixture = fixture("resume-full-context");
     let quoted_invalid_route = r#"`[router: candidate=not/a-real-route]` must remain quoted text"#;
     let long_tail = format!("tail-marker:{}", "x".repeat(8_300));
@@ -385,15 +398,20 @@ async fn resume_after_router_exit_replays_full_sqlite_context_and_keeps_router_s
         .into_iter()
         .last()
         .expect("fresh adapter received resumed prompt");
+    assert!(restored_prompt.len() < 4_000);
+    assert!(restored_prompt.contains(&source));
+    assert!(!restored_prompt.contains(&long_tail));
+    assert!(restored_prompt.contains("continue after native restore"));
+    let retrieved = lookup_from_prompt(&restored_prompt);
     for required in [
         quoted_invalid_route,
         long_tail.as_str(),
         "assistant context before restart",
-        "Read [completed]",
+        "Read",
         "continue after native restore",
     ] {
         assert!(
-            restored_prompt.contains(required),
+            retrieved.contains(required),
             "fresh adapter did not receive reconstructed context {required:?}"
         );
     }
@@ -495,6 +513,7 @@ async fn unprompted_unknown_and_concurrent_resume_ids_stay_isolated() {
         ("alpha-only source", "bravo-only source", alpha_text),
         ("bravo-only source", "alpha-only source", bravo_text),
     ] {
+        let text = lookup_from_prompt(&text);
         assert!(
             text.contains(own_source),
             "missing own restored history: {text}"
@@ -598,9 +617,12 @@ async fn continue_from_creates_a_new_restorable_router_session_without_kory_cont
         .rev()
         .find(|text| text.contains("child first prompt"))
         .expect("child adapter prompt");
+    assert!(!delivered.contains(source_text));
+    assert!(delivered.contains(&child));
+    let retrieved = lookup_from_prompt(&delivered);
     for required in [source_text, "source assistant reply", "child first prompt"] {
         assert!(
-            delivered.contains(required),
+            retrieved.contains(required),
             "continue_from did not reconstruct source history {required:?}: {delivered}"
         );
     }
@@ -662,8 +684,11 @@ async fn rich_content_and_long_assistant_output_survive_restart_without_replay_d
         .rev()
         .find(|e| e["event"] == "prompt")
         .unwrap();
-    assert!(prompt["content"].as_array().unwrap().contains(&image));
-    assert!(prompt["text"].as_str().unwrap().contains(&assistant));
+    assert!(!prompt["content"].as_array().unwrap().contains(&image));
+    let delivered = prompt["text"].as_str().unwrap();
+    assert!(!delivered.contains(&assistant));
+    let retrieved = lookup_from_prompt(delivered);
+    assert!(retrieved.contains(&assistant) && retrieved.contains("aW1hZ2U="));
     assert_eq!(
         state(&fixture)
             .log_for_all(&sid)
@@ -731,12 +756,7 @@ async fn a_canceled_first_delivery_keeps_restored_context_for_the_next_prompt() 
     );
     resumed.close().await;
     let prompts = mock_prompts(&fixture.mock_log);
-    assert!(
-        prompts
-            .last()
-            .unwrap()
-            .contains("source-before-cancellation")
-    );
+    assert!(lookup_from_prompt(prompts.last().unwrap()).contains("source-before-cancellation"));
 }
 
 #[tokio::test]
@@ -788,21 +808,9 @@ async fn tool_only_load_deduplicates_notifications_and_restores_typed_tool_conte
         "prompt",
     );
     loaded.close().await;
-    let records = std::fs::read_to_string(&fixture.mock_log).unwrap();
-    let content = records
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .rfind(|e| e["event"] == "prompt")
-        .unwrap()["content"]
-        .clone();
-    assert!(
-        content
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| b["type"] == "image" && b["data"] == "aW1hZ2U="),
-        "tool image must remain a typed block"
-    );
+    let delivered = mock_prompts(&fixture.mock_log).pop().unwrap();
+    let retrieved = lookup_from_prompt(&delivered);
+    assert!(retrieved.contains("Rich tool") && retrieved.contains("aW1hZ2U="));
 }
 
 #[tokio::test]
@@ -855,6 +863,8 @@ async fn accepted_mid_turn_messages_survive_restart_without_recording_declined_s
     let entries = state(&fixture).log_for_all(&sid).unwrap();
     assert_eq!(entries.iter().filter(|e| e.kind == "user_steer").count(), 1);
     let delivered = resume_and_prompt(&fixture, &sid, "after steering restart").await;
-    assert!(delivered.contains("accepted steering message"));
-    assert!(!delivered.contains("DECLINED-STEER"));
+    assert!(!delivered.contains("accepted steering message"));
+    let retrieved = lookup_from_prompt(&delivered);
+    assert!(retrieved.contains("accepted steering message"));
+    assert!(!retrieved.contains("DECLINED-STEER"));
 }

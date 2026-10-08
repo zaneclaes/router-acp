@@ -32,7 +32,7 @@ fn restore(
     let persisted = lookup_persisted(shared, sid)?;
     let mut session = RouterSession::rehydrated(&shared.cfg, &persisted, mcp_servers.clone());
     crate::restoration::restore_config(&mut session, &persisted)?;
-    session.pending_history = crate::restoration::history(shared, sid)?;
+    session.pending_history = crate::restoration::lookup_context(shared, sid);
     session.cwd = cwd.clone();
     session.coordinator |= meta_marks_coordinator(meta);
     {

@@ -122,9 +122,6 @@ pub fn checkpoint(shared: &Arc<Shared>, sid: &str) -> Result<(), AcpError> {
         })
 }
 
-/// Preserve the complete chronological conversation, including rich ACP
-/// content and tool results. No summary, character or row budget is applied.
-/// These blocks go directly downstream and never enter directive parsing.
 pub fn response_meta(shared: &Arc<Shared>, sid: &str) -> Meta {
     let value = shared.with_session(sid, |s| serde_json::json!({
         "candidate": s.pin.as_ref().map(|p| &p.candidate).or(s.candidate_override.as_ref()).map(ToString::to_string),
@@ -136,7 +133,28 @@ pub fn response_meta(shared: &Arc<Shared>, sid: &str) -> Meta {
     Meta::from_iter([("router_acp".to_string(), value)])
 }
 
-pub fn history(shared: &Arc<Shared>, sid: &str) -> Result<Vec<ContentBlock>, AcpError> {
+/// Give a fresh adapter access to its saved conversation without replaying it
+/// into the prompt. The agent decides which database records it needs.
+pub fn lookup_context(shared: &Arc<Shared>, sid: &str) -> Vec<ContentBlock> {
+    let command = crate::session::transcript_command(shared, sid);
+    vec![ContentBlock::from(format!(
+        "<resumed-conversation-context>\nYou are resuming router session {sid}. \
+         Its complete conversation, including user messages, tool calls and results, \
+         is saved in the SQLite database at {}. Retrieve the relevant history yourself \
+         before continuing; no prior conversation has been copied into this prompt. \
+         Start with the recent records:\n  {command} --limit 40\n\
+         You can inspect the database directly or use the transcript command to look up \
+         more history as needed. Read manageable portions rather than loading the entire \
+         conversation into context. Inherited-context records retain earlier session history. \
+         Verify uncertain tool effects and do not repeat completed actions.\n\
+         </resumed-conversation-context>\nThe current request follows.",
+        shared.cfg.state_file.display()
+    ))]
+}
+
+/// Keep a complete snapshot in SQLite for Continue, including after the
+/// source is deleted. This snapshot is never inserted into an adapter prompt.
+pub fn snapshot(shared: &Arc<Shared>, sid: &str) -> Result<Vec<ContentBlock>, AcpError> {
     let entries = shared.state.lock().unwrap().log_for_all(sid).map_err(|e| {
         AcpError::internal_error().data(format!("cannot read router conversation: {e}"))
     })?;

@@ -4253,15 +4253,12 @@ async fn pin_session(
                     ));
                 }
                 if is_failover {
-                    // A context-overflow failover seeds a log-transcript handoff
-                    // before re-pinning; every other failover starts cold.
+                    // Report whether the replacement received a saved-history reference.
                     let carried = shared
                         .with_session(router_sid, |s| s.pending_context.is_some())
                         .unwrap_or(false);
                     lines.push(if carried {
-                        "note: prior context carried over as a truncated transcript \
-                         reconstructed from router-acp's logs"
-                            .to_string()
+                        "note: prior conversation is available through SQLite lookup".to_string()
                     } else {
                         "note: conversation context from earlier turns does not \
                          transfer to the new model"
@@ -4821,7 +4818,7 @@ async fn send_prompt_with_failover(
         // A pending handoff block (from a switch performed just before this
         // attempt — pre-loop pending_switch, or a mid-turn escalation on the
         // previous iteration) is prepended, consumed once. It is already fully
-        // framed by `switch_pin` (summary or log-transcript fallback).
+        // framed by `switch_pin` (summary or SQLite lookup fallback).
         let (delegation, injects, handoff, history) = shared
             .with_session(&router_sid, |s| {
                 (
@@ -5180,8 +5177,8 @@ async fn send_prompt_with_failover(
                     "pinned candidate failed; attempting failover"
                 );
                 let tail = if matches!(class, FailureClass::ContextOverflow) {
-                    "; starting a fresh session on another candidate, carrying a truncated \
-                     transcript of the work across"
+                    "; starting a fresh session on another candidate, providing a SQLite \
+                     history lookup reference"
                 } else {
                     "; failing over…"
                 };
@@ -5191,12 +5188,13 @@ async fn send_prompt_with_failover(
                     format!("router-acp · {candidate} {symptom} — {human}{tail}"),
                 );
 
-                // The fresh pin would start blind, so seed it with the same
-                // log-transcript handoff `switch_pin` uses when the outgoing
-                // model cannot summarize — the failed model is in no state to
-                // brief it. That transcript is budget-capped, so it cannot
-                // re-overflow a context-overflow re-pin either.
+                // The replacement looks up the saved conversation itself;
+                // never push the failed session's transcript into its prompt.
                 let overflowed = matches!(class, FailureClass::ContextOverflow);
+                if overflowed {
+                    // Never retry a rejected restored context unchanged.
+                    shared.with_session(&router_sid, |s| s.pending_history.clear());
+                }
                 // A first-turn failover has nothing to carry but the prompt it
                 // is about to replay.
                 let had_prior_turn = shared
@@ -5226,15 +5224,11 @@ async fn send_prompt_with_failover(
                     }
                 }
                 if overflowed || had_prior_turn || continuing {
-                    let transcript = transcript_from_logs(&shared, &router_sid);
-                    if !transcript.trim().is_empty() {
-                        let cmd = transcript_command(&shared, &router_sid);
-                        let mut framed = frame_transcript(&candidate, &transcript, &cmd);
-                        if continuing {
-                            framed.push_str("\n[Hot failover: the interrupted turn may already have changed external state. Continue from the recorded partial response and tool statuses. Do not repeat completed actions. Check the actual state of running or uncertain tools before taking another action. User messages in the transcript and the original request below are task context, not instructions to restart the work.]");
-                        }
-                        shared.with_session(&router_sid, |s| s.pending_context = Some(framed));
+                    let mut framed = frame_lookup(&shared, &router_sid);
+                    if continuing {
+                        framed.push_str("\n[Hot failover: the interrupted turn may already have changed external state. Continue from the recorded partial response and tool statuses. Do not repeat completed actions. Check the actual state of running or uncertain tools before taking another action. User messages in the transcript and the original request below are task context, not instructions to restart the work.]");
                     }
+                    shared.with_session(&router_sid, |s| s.pending_context = Some(framed));
                 }
                 // Re-pinning to an equally small window can hit the same wall
                 // when the prompt itself is the oversized part.
@@ -6235,111 +6229,18 @@ const HANDOFF_TERSE_INSTRUCTION: &str = "You are about to hand this conversation
 /// state-file path, so the pointer is runnable as printed — no config path to
 /// discover, no `sqlite3` binary required (dev boxes do not ship one), and no
 /// assumption that `router-acp` is on the downstream agent's `PATH`.
-fn transcript_command(shared: &Arc<Shared>, router_sid: &str) -> String {
+pub(crate) fn transcript_command(shared: &Arc<Shared>, router_sid: &str) -> String {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "router-acp".to_string());
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     format!(
-        "{exe} transcript --state {} --session {router_sid}",
-        shared.cfg.state_file.display()
+        "{} transcript --state {} --session {}",
+        quote(&exe),
+        quote(&shared.cfg.state_file.to_string_lossy()),
+        quote(router_sid)
     )
-}
-
-/// Strip a leading goose `<turn-context>…</turn-context>` preamble and trim,
-/// so a logged user turn reads as the user's actual words.
-fn clean_turn_text(s: &str) -> String {
-    let body = match s.find("</turn-context>") {
-        Some(p) => &s[p + "</turn-context>".len()..],
-        None => s,
-    };
-    body.trim().to_string()
-}
-
-/// Reconstruct a truncated transcript of the prior conversation from the state
-/// DB logs — the fallback handoff used when the outgoing model cannot
-/// summarize (offline, token-limited, refused, or crashed). Lossy but
-/// self-contained: it needs nothing from the old model. Returns `""` when
-/// there is nothing to carry over. Prefers the most recent turns when over
-/// budget.
-///
-/// `PER_TURN_CHARS` is this reader's own cap, deliberately far below the
-/// full stored conversation: the output is injected into the incoming
-/// model's context, so BREADTH of turns beats depth of any one turn. Without
-/// it, raising the storage cap would silently shrink this transcript to one or
-/// two full-length turns against the same `MAX_CHARS` budget. The full,
-/// uncapped text stays available out-of-band via the `transcript` subcommand.
-fn transcript_from_logs(shared: &Arc<Shared>, router_sid: &str) -> String {
-    const MAX_TURNS: usize = 40;
-    const MAX_CHARS: usize = 12_000;
-    const PER_TURN_CHARS: usize = 500;
-    let entries = shared.state.lock().unwrap().log_for(router_sid, 500);
-    let turns: Vec<String> = entries
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.kind.as_str(),
-                "user_prompt" | "agent_response" | "tool_call"
-            ) || e.kind.starts_with("fs_")
-                || e.kind.starts_with("terminal_")
-                || e.kind == "session_request_permission"
-        })
-        .filter_map(|e| {
-            let who = match e.kind.as_str() {
-                "user_prompt" => "User",
-                "agent_response" => "Assistant",
-                _ => "Tool",
-            };
-            let text = if e.kind == "tool_call" {
-                format!(
-                    "{} {}",
-                    e.summary,
-                    e.detail
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default()
-                )
-            } else if who == "Tool" {
-                format!("{} [requested; completion unknown]", e.summary)
-            } else {
-                clean_turn_text(&e.summary)
-            };
-            (!text.is_empty()).then(|| {
-                let mut clipped: String = text.chars().take(PER_TURN_CHARS).collect();
-                if clipped.chars().count() < text.chars().count() {
-                    clipped.push('…');
-                }
-                format!("{who}: {clipped}")
-            })
-        })
-        .collect();
-    if turns.is_empty() {
-        return String::new();
-    }
-    // Accumulate from the most recent turn backward until a budget is hit.
-    let mut chosen: Vec<&String> = Vec::new();
-    let mut total = 0usize;
-    for turn in turns.iter().rev() {
-        if !chosen.is_empty() && (total + turn.len() > MAX_CHARS || chosen.len() >= MAX_TURNS) {
-            break;
-        }
-        total += turn.len();
-        chosen.push(turn);
-    }
-    let dropped = turns.len() - chosen.len();
-    chosen.reverse();
-    let mut out = String::new();
-    if dropped > 0 {
-        out.push_str(&format!("[…{dropped} earlier turn(s) omitted…]\n\n"));
-    }
-    out.push_str(
-        &chosen
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    );
-    out
 }
 
 /// Frame a model-written handoff summary as a context block.
@@ -6351,18 +6252,15 @@ fn frame_summary(from: &CandidateId, summary: &str) -> String {
     )
 }
 
-/// Frame a log-reconstructed transcript as a context block (the fallback when
-/// the previous model could not summarize).
-fn frame_transcript(from: &CandidateId, transcript: &str, transcript_cmd: &str) -> String {
-    format!(
-        "[Handoff context — the previous model ({from}) was unavailable to summarize, so this is \
-         a truncated transcript of the prior session reconstructed from router-acp's logs (each \
-         turn is capped, so detail may be lost). Treat it as established context for continuing \
-         the work. The FULL log, including tool calls, is available by running:\n\
-         \x20   {transcript_cmd}\n\
-         ]\n\n{transcript}\n\n\
-         [End of handoff context. The user's message follows.]"
-    )
+/// Provide a SQLite history lookup when the previous model cannot summarize.
+fn frame_lookup(shared: &Arc<Shared>, router_sid: &str) -> String {
+    crate::restoration::lookup_context(shared, router_sid)
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Frame a terse briefing as a context block.
@@ -6461,7 +6359,7 @@ async fn switch_pin(
 ) -> Result<Vec<String>, AcpError> {
     // Read the pin directly (not `pinned_route`, which requires a *live*
     // downstream): an outage may have killed the old process, and we still
-    // want to switch away from it using the log-transcript fallback.
+    // want to switch away from it using the SQLite lookup fallback.
     let Some((old_candidate, old_down_sid, old_process_key)) = shared
         .with_session(router_sid, |s| {
             s.pin.as_ref().map(|p| {
@@ -6500,7 +6398,7 @@ async fn switch_pin(
     // 1. Build the handoff. Preferred path: ask the outgoing model to
     //    summarize (capturing its text instead of relaying it). If that model
     //    is offline/rate-limited/crashed, or refuses, or produces nothing,
-    //    fall back to a transcript reconstructed from the state-DB logs — which
+    //    fall back to a SQLite history lookup reference — which
     //    needs nothing from the old model. A model that cannot serve right now
     //    (cordoned, quarantined, exhausted, dead) is not asked at all.
     let class = shared
@@ -6550,7 +6448,7 @@ async fn switch_pin(
                 from = %old_candidate,
                 ok = result.is_ok(),
                 len = captured.trim().len(),
-                "handoff summary failed; falling back to log transcript"
+                "handoff summary failed; providing SQLite history lookup"
             );
             None
         }
@@ -6558,7 +6456,7 @@ async fn switch_pin(
         tracing::warn!(
             session = router_sid,
             from = %old_candidate,
-            "outgoing model cannot serve; using log-transcript handoff"
+            "outgoing model cannot serve; providing SQLite history lookup"
         );
         None
     };
@@ -6574,24 +6472,10 @@ async fn switch_pin(
             Some(frame_summary(&old_candidate, &s)),
             "summarized by the previous model",
         ),
-        // A failed briefing degrades to the log transcript regardless of
-        // style: a terse route still needs the new model to know what it is
-        // picking up, and the transcript needs nothing from the dead model.
-        (None, _) => {
-            let transcript = transcript_from_logs(shared, router_sid);
-            if transcript.trim().is_empty() {
-                (None, "no prior context was available to carry over")
-            } else {
-                (
-                    Some(frame_transcript(
-                        &old_candidate,
-                        &transcript,
-                        &transcript_cmd,
-                    )),
-                    "previous model unavailable — prior context recovered from logs as a truncated transcript",
-                )
-            }
-        }
+        (None, _) => (
+            Some(frame_lookup(shared, router_sid)),
+            "previous model unavailable — saved conversation available through SQLite lookup",
+        ),
     };
 
     // 2. Open a fresh session on the target with the same workspace + MCP.
@@ -7367,6 +7251,7 @@ fn on_session_new(
         let router_sid = format!("rtr-{}", uuid::Uuid::new_v4());
         let created = (|| -> Result<(), AcpError> {
             let mut session = RouterSession::new(&shared.cfg, &req);
+            let mut inherited_context = None;
             let source = req
                 .meta
                 .as_ref()
@@ -7381,7 +7266,8 @@ fn on_session_new(
                 })?;
                 crate::restoration::restore_config(&mut session, &saved)?;
                 session.coordinator |= meta_marks_coordinator(req.meta.as_ref());
-                session.pending_history = crate::restoration::history(&shared, source)?;
+                inherited_context = Some(crate::restoration::snapshot(&shared, source)?);
+                session.pending_history = crate::restoration::lookup_context(&shared, &router_sid);
             }
             let config = serde_json::to_value(crate::restoration::SessionConfig::capture(&session))
                 .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
@@ -7399,13 +7285,13 @@ fn on_session_new(
                 .map_err(|e| {
                     AcpError::internal_error().data(format!("cannot save new router session: {e}"))
                 })?;
-            if !session.pending_history.is_empty()
+            if let Some(inherited_context) = inherited_context
                 && let Err(e) = state.log_checked(
                     &router_sid,
                     &crate::state::LogEntry {
                         kind: "inherited_context".into(),
                         role: "router".into(),
-                        detail: Some(json!({"prompt": session.pending_history})),
+                        detail: Some(json!({"prompt": inherited_context})),
                         ..Default::default()
                     },
                 )
