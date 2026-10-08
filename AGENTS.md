@@ -395,7 +395,7 @@ SDK traps below, which were all discovered the hard way.
   remap path.
 - **Prompt directives**
   (`[router: candidate=…|prefer=…|switch=…|strategy=…|exclude=…|label=…]`)
-  are located anywhere in the first text block by finding `[router:` and
+  are located in active text across all text blocks by finding `[router:` and
   **bracket-matching** to the closing `]` (depth-tracked, so nested `[1m]`
   model ids work) — NOT a per-line/ends-in-`]` parse, which broke on goose's
   `<turn-context>` preamble, on inline `[router: …] task` (directive + task on
@@ -415,6 +415,14 @@ SDK traps below, which were all discovered the hard way.
   (`[router: candidate=…] [router: effort=…]`) merge as if they were one
   comma-separated tag — a later key overrides an earlier one, `exclude` lists
   combine, every tag is stripped (`several_directive_tags_merge`).
+  `find_prompt_directive` skips inline backtick code, backtick/tilde fences,
+  Markdown blockquote lines, escaped brackets, and the nested history frames
+  `<resumed-conversation-context>`, `<continued-work-handoff>`, `<turn-context>`.
+  Keep frame/code state across text blocks and scan code inside frames: a
+  quoted frame marker must not open or close a real frame. Preserve original
+  byte offsets and literal history bytes. Invalid active commands still fail.
+  Regressions: `directive_tests` and
+  `concurrent_resumes_keep_history_examples_and_current_model_choices`.
 - **Exhausted prompt pins** — `pin_session` drops an explicit/saved candidate
   override when either `usage_cordon` or `seat_exhausted` excludes it. Paid-usage
   denial can exhaust a seat without installing a usage cordon. Keep both gates,
