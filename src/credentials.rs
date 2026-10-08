@@ -423,10 +423,13 @@ fn read(agent: &AgentConfig) -> Option<Credential> {
                 .or_else(|| value.get("OPENAI_API_KEY")),
             value.pointer("/tokens/refresh_token"),
         ],
-        "grok" => [
-            value.get(GROK_LOGIN).and_then(|v| v.get("key")),
-            value.get(GROK_LOGIN).and_then(|v| v.get("refresh_token")),
-        ],
+        "grok" => {
+            let auth = grok_auth(&value);
+            [
+                auth.and_then(|v| v.get("key")),
+                auth.and_then(|v| v.get("refresh_token")),
+            ]
+        }
         "kimi" => [value.get("access_token"), value.get("refresh_token")],
         _ => return None,
     };
@@ -472,7 +475,7 @@ pub(crate) fn access_generation(agent: &AgentConfig) -> Option<String> {
             .value
             .pointer("/tokens/access_token")
             .or_else(|| credential.value.get("OPENAI_API_KEY")),
-        "grok" => credential.value.get(GROK_LOGIN)?.get("key"),
+        "grok" => grok_auth(&credential.value)?.get("key"),
         "kimi" => credential.value.get("access_token"),
         _ => None,
     }?
@@ -500,7 +503,7 @@ pub(crate) async fn observe_request_success(agent: &AgentConfig, observed: &str)
     record_success(agent);
 }
 
-fn record_success(agent: &AgentConfig) {
+pub(crate) fn record_success(agent: &AgentConfig) {
     let Some(credential) = read(agent) else {
         return;
     };
@@ -873,6 +876,47 @@ async fn refresh(mut value: Value, provider: String) -> Refresh {
 }
 
 const GROK_LOGIN: &str = "https://accounts.x.ai/sign-in";
+const GROK_LOGIN_PREFIX: &str = "https://auth.x.ai::";
+
+/// Grok 1.0.46 keys logins by issuer and principal id. Older releases used
+/// one fixed URL. Prefer the newest current-format entry, then accept legacy.
+pub(crate) fn grok_auth(value: &Value) -> Option<&Value> {
+    value
+        .as_object()?
+        .iter()
+        .filter(|(key, auth)| is_current_grok_auth(key, auth))
+        .max_by_key(|(_, auth)| {
+            auth.get("create_time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        })
+        .map(|(_, auth)| auth)
+        .or_else(|| value.get(GROK_LOGIN))
+}
+
+fn grok_auth_key(value: &Value) -> Option<String> {
+    value
+        .as_object()?
+        .iter()
+        .filter(|(key, auth)| is_current_grok_auth(key, auth))
+        .max_by_key(|(_, auth)| {
+            auth.get("create_time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        })
+        .map(|(key, _)| key.clone())
+        .or_else(|| value.get(GROK_LOGIN).map(|_| GROK_LOGIN.to_string()))
+}
+
+fn is_current_grok_auth(key: &str, auth: &Value) -> bool {
+    key.starts_with(GROK_LOGIN_PREFIX)
+        && auth.as_object().is_some()
+        && ["key", "refresh_token"].into_iter().any(|field| {
+            auth.get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+}
 
 async fn refresh_kimi(mut value: Value, host: &str) -> Refresh {
     let unknown = || Refresh {
@@ -952,9 +996,10 @@ async fn refresh_grok(mut value: Value) -> Refresh {
         outcome: RepairOutcome::Unknown,
         value: None,
     };
-    let Some(auth) = value.get(GROK_LOGIN) else {
+    let Some(auth_key) = grok_auth_key(&value) else {
         return unknown();
     };
+    let auth = &value[&auth_key];
     let Some(token) = auth
         .get("refresh_token")
         .and_then(Value::as_str)
@@ -1031,16 +1076,16 @@ async fn refresh_grok(mut value: Value) -> Refresh {
     else {
         return unknown();
     };
-    value[GROK_LOGIN]["key"] = access.into();
+    value[&auth_key]["key"] = access.into();
     if let Some(token) = body
         .get("refresh_token")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
     {
-        value[GROK_LOGIN]["refresh_token"] = token.into();
+        value[&auth_key]["refresh_token"] = token.into();
     }
     if let Some(seconds) = body.get("expires_in").and_then(Value::as_i64) {
-        value[GROK_LOGIN]["expires_at"] = (chrono::Utc::now() + chrono::Duration::seconds(seconds))
+        value[&auth_key]["expires_at"] = (chrono::Utc::now() + chrono::Duration::seconds(seconds))
             .to_rfc3339()
             .into();
     }
@@ -1105,10 +1150,7 @@ pub async fn token_for_helper(
         return Err("Credential refresh rejected. Sign in again with /login.".into());
     }
     let credential = read(&agent).ok_or("Grok credential unavailable")?;
-    let auth = credential
-        .value
-        .get(GROK_LOGIN)
-        .ok_or("Grok credential unavailable")?;
+    let auth = grok_auth(&credential.value).ok_or("Grok credential unavailable")?;
     let access = auth
         .get("key")
         .and_then(Value::as_str)
@@ -1284,6 +1326,42 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
                 .success()
         );
         drop(held);
+    }
+
+    #[test]
+    fn grok_reads_current_principal_key_and_retains_legacy_support() {
+        let current = json!({
+            "https://auth.x.ai::older": {
+                "key": "older-access",
+                "refresh_token": "older-refresh",
+                "create_time": "2026-10-07T00:00:00Z"
+            },
+            "https://auth.x.ai::current": {
+                "key": "current-access",
+                "refresh_token": "current-refresh",
+                "create_time": "2026-10-08T00:00:00Z",
+                "email": "grok@example.test"
+            }
+        });
+        assert_eq!(grok_auth(&current).unwrap()["key"], "current-access");
+        assert_eq!(
+            grok_auth_key(&current).as_deref(),
+            Some("https://auth.x.ai::current")
+        );
+
+        let legacy = json!({GROK_LOGIN: {"key": "legacy-access"}});
+        assert_eq!(grok_auth(&legacy).unwrap()["key"], "legacy-access");
+        assert_eq!(grok_auth_key(&legacy).as_deref(), Some(GROK_LOGIN));
+
+        let (_root, agent) = fixture("grok");
+        std::fs::write(
+            directory(&agent).unwrap().join("auth.json"),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert!(request_generation(&agent).is_some());
+        record_success(&agent);
+        assert_eq!(availability(&agent), AuthAvailability::Authenticated);
     }
 
     #[tokio::test]

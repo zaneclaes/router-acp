@@ -119,8 +119,10 @@ pub fn identity(agent: &AgentConfig) -> (String, Option<String>) {
             let plan = creds
                 .as_ref()
                 .and_then(|v| {
-                    v.pointer("/claudeAiOauth/rateLimitTier")
-                        .or_else(|| v.pointer("/claudeAiOauth/subscriptionType"))
+                    // Subscription ownership is the plan shown to the user.
+                    // A Team account can still carry a Max-shaped rate tier.
+                    v.pointer("/claudeAiOauth/subscriptionType")
+                        .or_else(|| v.pointer("/claudeAiOauth/rateLimitTier"))
                 })
                 .and_then(Value::as_str)
                 .map(|plan| plan_label("claude", plan));
@@ -150,10 +152,11 @@ pub fn identity(agent: &AgentConfig) -> (String, Option<String>) {
                 .map(|plan| plan_label("codex", plan));
             (label, plan)
         }
-        _ => {
+        Some("grok") => {
             let auth = read_json(&dir.join("auth.json"));
             (
                 auth.as_ref()
+                    .and_then(crate::credentials::grok_auth)
                     .and_then(|v| v.get("email"))
                     .and_then(Value::as_str)
                     .unwrap_or(&fallback)
@@ -161,6 +164,7 @@ pub fn identity(agent: &AgentConfig) -> (String, Option<String>) {
                 None,
             )
         }
+        _ => (fallback, None),
     }
 }
 
@@ -987,6 +991,9 @@ fn start_login(
             Ok(()) if runner.cancel.is_cancelled() => {
                 Err("Login cancelled. Existing accounts remain registered.".into())
             }
+            Ok(()) if crate::credentials::request_generation(&agent).is_none() => Err(format!(
+                "{p} reported a successful sign-in, but did not publish a usable credential. Retry sign-in."
+            )),
             Ok(()) if adding => {
                 publish_added(&shared, &agent, source.as_deref().unwrap(), &runner.cancel).await
             }
@@ -1024,6 +1031,7 @@ fn start_login(
         };
         match result {
             Ok(()) => {
+                crate::credentials::record_success(&agent);
                 crate::auth::note_authenticated(&shared.auth, &agent.name);
                 for key in shared.target_keys_for_agent(&agent.name) {
                     if crate::downstream::start_downstream(&shared, &key)
@@ -1822,6 +1830,32 @@ mod tests {
         assert_eq!(
             plan_label("claude", "default_claude_max_20x"),
             "Personal 20x Max"
+        );
+    }
+
+    #[test]
+    fn claude_subscription_ownership_precedes_its_rate_tier() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("claude");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"subscriptionType":"team","rateLimitTier":"default_claude_max_5x"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"team@example.test"}}"#,
+        )
+        .unwrap();
+        let agent: AgentConfig = serde_yaml::from_str(&format!(
+            "name: claude@team\ncommand: {{type: stdio, command: mock, env: [{{name: CLAUDE_CONFIG_DIR, value: {}}}]}}\nmodel_selection: {{type: config-option}}\nmodels: [{{id: opus, cost_rank: 3}}]\n",
+            dir.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            identity(&agent),
+            ("team@example.test".into(), Some("Team".into()))
         );
     }
 
