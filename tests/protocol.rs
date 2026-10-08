@@ -635,6 +635,61 @@ async fn passthrough_prompt_roundtrip_with_disclosure_and_remapping() {
 }
 
 #[tokio::test]
+async fn concurrent_resumes_keep_history_examples_and_current_model_choices() {
+    let state = temp_state_file("resume-examples");
+    let log = temp_log("resume-examples");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1), ("m2", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        )
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let first = new_session(&cx).await?.session_id.0.to_string();
+        let second = new_session(&cx).await?.session_id.0.to_string();
+        let history = "<resumed-conversation-context>\n\
+                       Earlier instructions: `[router: candidate=…]`\n\
+                       [router: switch=mock/old, effort=low, version=old, exclude=mock]\n\
+                       </resumed-conversation-context>\n\
+                       ```text\n[router: candidate=…]\n```\nResume";
+        let first_prompt =
+            format!("[router: candidate=mock/m1, effort=high, version=default]\n{history}");
+        let second_prompt =
+            format!("[router: candidate=mock/m2, effort=medium, version=default]\n{history}");
+        let (first_result, second_result) = tokio::join!(
+            prompt_text(&cx, &first, &first_prompt),
+            prompt_text(&cx, &second, &second_prompt)
+        );
+        assert_eq!(first_result?.stop_reason, StopReason::EndTurn);
+        assert_eq!(second_result?.stop_reason, StopReason::EndTurn);
+        assert_eq!(open_state(&state).get(&first).unwrap().model, "m1");
+        assert_eq!(open_state(&state).get(&second).unwrap().model, "m2");
+        for sid in [&first, &second] {
+            let text = agent_text(&observed, sid);
+            assert!(text.contains(history), "history changed: {text}");
+        }
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|event| event["event"] == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        for event in prompts {
+            assert!(
+                event["text"].as_str().unwrap().starts_with(history),
+                "history changed before adapter dispatch: {}",
+                event["text"]
+            );
+        }
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn permission_and_fs_callbacks_remap_to_router_session() {
     let state = temp_state_file("callbacks");
     let yaml = format!(

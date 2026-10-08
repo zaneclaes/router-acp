@@ -2829,9 +2829,9 @@ pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
 /// This is how recipe/script authors steer routing from clients that cannot
 /// set ACP session config options (e.g. the goose CLI). The directive line
 /// is stripped before classification and never reaches the downstream model.
-/// It is matched on any line of the first text block, not just the first —
-/// goose prepends a `<turn-context>…</turn-context>` preamble to prompts, so
-/// requiring line 1 would miss it.
+/// Active tags match across text blocks outside quoted code and framed history.
+/// Goose prepends a `<turn-context>…</turn-context>` preamble to prompts, so
+/// requiring line 1 would miss a command after it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PromptDirectives {
     pub candidate: Option<CandidateId>,
@@ -2850,7 +2850,7 @@ pub struct PromptDirectives {
     pub phase: Option<crate::config::PlannerPhase>,
 }
 
-/// Parse (and strip) every routing directive in the prompt. Several tags
+/// Parse (and strip) every active routing directive in the prompt. Several tags
 /// (`[router: candidate=…] [router: effort=…]`) merge as if they were one
 /// comma-separated tag: a later key overrides an earlier one, and `exclude`
 /// lists combine. Returns `Ok(None)` when no directive is present; `Err`
@@ -2877,9 +2877,112 @@ pub fn parse_prompt_directives(
     Ok(merged.map(|directives| (directives, remaining)))
 }
 
-/// Parse (and strip) the first routing directive in the prompt.
+/// Locate commands without interpreting quoted code or framed history. Keep
+/// byte offsets into the original text so those examples reach the model intact.
+fn find_prompt_directive(prompt: &[ContentBlock]) -> Option<(usize, String, usize)> {
+    const FRAMES: [(&str, &str); 3] = [
+        (
+            "<resumed-conversation-context>",
+            "</resumed-conversation-context>",
+        ),
+        ("<continued-work-handoff>", "</continued-work-handoff>"),
+        ("<turn-context>", "</turn-context>"),
+    ];
+    let mut frames: Vec<usize> = Vec::new();
+    // Delimiter byte, opening run length, and whether this is a fenced block.
+    let mut code: Option<(u8, usize, bool)> = None;
+    for (block_idx, block) in prompt.iter().enumerate() {
+        let ContentBlock::Text(text) = block else {
+            continue;
+        };
+        let bytes = text.text.as_bytes();
+        let mut pos = 0;
+        let mut line_start = 0;
+        while pos < bytes.len() {
+            let rest = &bytes[pos..];
+            if rest[0] == b'\n' {
+                line_start = pos + 1;
+                pos += 1;
+                continue;
+            }
+            let line_prefix = pos - line_start <= 3
+                && bytes[line_start..pos]
+                    .iter()
+                    .all(|b| matches!(b, b' ' | b'\t'));
+            if let Some((delimiter, length, fenced)) = code {
+                if rest[0] == delimiter {
+                    let run = rest.iter().take_while(|&&b| b == delimiter).count();
+                    let closes = if fenced {
+                        run >= length
+                            && line_prefix
+                            && rest[run..]
+                                .iter()
+                                .take_while(|&&b| b != b'\n')
+                                .all(u8::is_ascii_whitespace)
+                    } else {
+                        run == length
+                    };
+                    if closes {
+                        code = None;
+                    }
+                    pos += run;
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            if rest[0] == b'\\' && rest.get(1).is_some_and(u8::is_ascii_punctuation) {
+                pos += 2;
+                continue;
+            }
+            if line_prefix && rest[0] == b'>' {
+                pos += rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+                continue;
+            }
+            if matches!(rest[0], b'`' | b'~') {
+                let delimiter = rest[0];
+                let run = rest.iter().take_while(|&&b| b == delimiter).count();
+                if delimiter == b'`' || (line_prefix && run >= 3) {
+                    code = Some((delimiter, run, line_prefix && run >= 3));
+                }
+                pos += run;
+                continue;
+            }
+            if let Some(&frame) = frames.last()
+                && rest.starts_with(FRAMES[frame].1.as_bytes())
+            {
+                frames.pop();
+                pos += FRAMES[frame].1.len();
+                continue;
+            }
+            if let Some(frame) = FRAMES
+                .iter()
+                .position(|(open, _)| rest.starts_with(open.as_bytes()))
+            {
+                frames.push(frame);
+                pos += FRAMES[frame].0.len();
+                continue;
+            }
+            if !frames.is_empty() {
+                pos += 1;
+                continue;
+            }
+            if rest
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"[router:"))
+            {
+                return Some((block_idx, text.text.clone(), pos));
+            }
+            pos += 1;
+        }
+    }
+    None
+}
+
+/// Parse (and strip) the first active routing directive in the prompt.
 ///
-/// The directive is matched on any line of ANY text block — goose both wraps
+/// The directive is matched outside quoted code and history on any line of
+/// ANY text block — goose both wraps
 /// prompts in a `<turn-context>` preamble AND may split it into a separate
 /// content block, so neither "line 1" nor "first block" is safe. Only the
 /// directive line is removed; the surrounding text (preamble + task) is kept.
@@ -2891,24 +2994,8 @@ fn parse_one_prompt_directive(
     // in model ids (`opus[1m]`) are handled, and the directive may sit
     // anywhere — on its own line, after a `<turn-context>` preamble, or inline
     // with task text before/after it on the same line.
-    fn find_ci_ascii(haystack: &str, needle: &str) -> Option<usize> {
-        let (hb, nb) = (haystack.as_bytes(), needle.as_bytes());
-        if nb.is_empty() || hb.len() < nb.len() {
-            return None;
-        }
-        (0..=hb.len() - nb.len()).find(|&i| hb[i..i + nb.len()].eq_ignore_ascii_case(nb))
-    }
     const OPEN: &str = "[router:";
-    let mut found: Option<(usize, String, usize)> = None; // (block_idx, text, start)
-    for (i, b) in prompt.iter().enumerate() {
-        if let ContentBlock::Text(t) = b
-            && let Some(pos) = find_ci_ascii(&t.text, OPEN)
-        {
-            found = Some((i, t.text.clone(), pos));
-            break;
-        }
-    }
-    let Some((block_idx, text, start)) = found else {
+    let Some((block_idx, text, start)) = find_prompt_directive(prompt) else {
         return Ok(None);
     };
     // Scan from the opening `[` for the matching `]`, tracking bracket depth.
@@ -8631,6 +8718,128 @@ mod directive_tests {
         assert_eq!(dir.effort, Some(EffortLevel::Low));
         assert_eq!(dir.exclude, vec!["grok".to_string(), "kimi".to_string()]);
         assert_eq!(text(&stripped), "task");
+    }
+
+    #[test]
+    fn quoted_directive_examples_are_preserved() {
+        for example in [
+            "Explain `[router: candidate=…]` without running it.",
+            "Explain ``a `backtick` and [router: candidate=…]``.",
+            "```text\n`a backtick`\n[router: candidate=…]\n```\nExplain it.",
+            "~~~~text\n[router: candidate=…]\n~~~\n~~~~\nExplain it.",
+            "> [router: candidate=…]\nExplain the quote.",
+            "Explain `an unfinished [router: candidate=…]",
+            r"An escaped \[router: candidate=…] is literal text.",
+        ] {
+            let prompt = vec![ContentBlock::from(example.to_string())];
+            assert!(
+                parse_prompt_directives(&prompt).unwrap().is_none(),
+                "example became a command: {example}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_directives_do_not_override_current_commands() {
+        for frame in [
+            "resumed-conversation-context",
+            "continued-work-handoff",
+            "turn-context",
+        ] {
+            let history = format!(
+                "<{frame}>\n[router: candidate=…]\n\
+                 [router: candidate=mock/other, switch=mock/other, effort=low, \
+                 version=old, phase=implementation, exclude=mock/current]\n</{frame}>"
+            );
+            let prompt = vec![ContentBlock::from(format!(
+                "[router: candidate=mock/current, effort=high, version=default, \
+                 phase=planning, exclude=grok]\n{history}\nResume [router: label=live]"
+            ))];
+            let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+            assert_eq!(dir.candidate.unwrap().to_string(), "mock/current");
+            assert!(dir.switch.is_none());
+            assert_eq!(dir.effort, Some(EffortLevel::High));
+            assert_eq!(dir.version.as_deref(), Some("default"));
+            assert_eq!(dir.phase, Some(crate::config::PlannerPhase::Planning));
+            assert_eq!(dir.exclude, vec!["grok".to_string()]);
+            assert_eq!(dir.label.as_deref(), Some("live"));
+            assert_eq!(text(&stripped), format!("{history}\nResume"));
+        }
+    }
+
+    #[test]
+    fn history_frames_can_nest_and_cross_text_blocks() {
+        let prompt = vec![
+            ContentBlock::from("<resumed-conversation-context>".to_string()),
+            ContentBlock::from(
+                "<continued-work-handoff>[router: candidate=…]</continued-work-handoff>\n\
+                 [router: switch=mock/old]"
+                    .to_string(),
+            ),
+            ContentBlock::from(
+                "</resumed-conversation-context>\n[router: candidate=mock/current] Resume"
+                    .to_string(),
+            ),
+        ];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.candidate.unwrap().to_string(), "mock/current");
+        assert!(dir.switch.is_none());
+        assert!(text(&stripped).contains("[router: candidate=…]"));
+        assert!(text(&stripped).contains("[router: switch=mock/old]"));
+        assert!(text(&stripped).ends_with("Resume"));
+    }
+
+    #[test]
+    fn quoted_frame_markers_do_not_hide_commands_after_history() {
+        let history = "<resumed-conversation-context>\n\
+                       ```xml\n<continued-work-handoff>\n```\n\
+                       `</resumed-conversation-context>`\n\
+                       > <continued-work-handoff>\n\
+                       </resumed-conversation-context>";
+        let prompt = vec![
+            ContentBlock::from("[router: candidate=mock/current]".to_string()),
+            ContentBlock::from(history.to_string()),
+            ContentBlock::from("[router: effort=high] Resume".to_string()),
+        ];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.candidate.unwrap().to_string(), "mock/current");
+        assert_eq!(dir.effort, Some(EffortLevel::High));
+        assert_eq!(text(&stripped), format!("{history}\nResume"));
+    }
+
+    #[test]
+    fn live_commands_after_unicode_and_code_keep_offsets_and_precedence() {
+        let prompt = vec![ContentBlock::from(
+            "é `[router: candidate=…]`\n[RoUtEr: candidate=mock/current, effort=high]\n\
+             ```\n[router: effort=low]\n```\n[router: effort=medium] Resume"
+                .to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.candidate.unwrap().to_string(), "mock/current");
+        assert_eq!(dir.effort, Some(EffortLevel::Medium));
+        let out = text(&stripped);
+        assert!(out.contains("é `[router: candidate=…]`"));
+        assert!(out.contains("```\n[router: effort=low]\n```"));
+        assert!(out.ends_with("Resume"));
+    }
+
+    #[test]
+    fn malformed_live_commands_still_fail_after_examples() {
+        let prompt = vec![ContentBlock::from(
+            "Example: `[router: candidate=…]`\n[router: candidate=invalid] Resume".to_string(),
+        )];
+        let error = parse_prompt_directives(&prompt).unwrap_err();
+        assert!(error.contains("candidate `invalid`"), "{error}");
+    }
+
+    #[test]
+    fn escaped_backticks_do_not_hide_live_commands() {
+        let prompt = vec![ContentBlock::from(
+            r"A literal \` before [router: candidate=mock/current] Resume".to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.candidate.unwrap().to_string(), "mock/current");
+        assert_eq!(text(&stripped), r"A literal \` before  Resume");
     }
 
     #[test]
