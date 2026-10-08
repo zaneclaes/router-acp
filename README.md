@@ -584,12 +584,16 @@ Do not launch a provider CLI against canonical credentials outside the router.
 
 ## Session lifecycle
 
-`session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are implemented end-to-end and advertised **only when at least one downstream supports them**:
+`session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are router capabilities. They do not depend on provider lifecycle support:
 
-- `list` merges downstream lists, rewriting downstream ids to router ids via the state file (sessions the router can't route back are omitted).
-- `load`/`resume` require a known router session id in the state file, route to the owning downstream only, rehydrate the pin before any prompt, reattach the router's own tools (delegation, managed terminals), and relay replayed transcript updates under the router id. `router-acp prompt --session` does the same without a client (see [Host-directed workers](#host-directed-workers)).
-- `delete` routes to the owning downstream, then removes router state.
-- `close` closes the live downstream session (state-file entries survive so `load`/`resume` keep working when the downstream persists sessions).
+- `session/new` saves the router id and configuration before the first prompt. `_meta.router_acp.continue_from` snapshots another router conversation into the new id.
+- Every user content block and downstream update is stored in SQLite without a row or character cap.
+- `load` and `resume` require a known router id. They rebuild routing settings and the complete conversation from SQLite. The next prompt opens a fresh private adapter runtime and sends the saved context as ordinary history. Provider-local session files are optional.
+- `load` also replays saved ACP updates to the client. `resume` restores model context without duplicating a host's existing UI transcript.
+- `list` reads router SQLite. `close` ends the live adapter but retains the conversation. `delete` removes the router conversation.
+- Unknown ids fail. SQLite write failures fail the ACP operation rather than creating an unresumable conversation.
+
+Hosts own presentation state and queued UI actions. They must retain the router id and call these lifecycle methods. They must not synthesize an LLM recap or manage provider conversation files.
 
 ## Troubleshooting
 

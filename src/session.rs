@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use agent_client_protocol::schema::ProtocolVersion;
 
@@ -48,21 +48,6 @@ use crate::state::{PersistedSession, StateFile};
 use crate::strategies::{
     CandidateView, OverrideSource, RankedCandidate, RouteContext, make_strategy,
 };
-
-/// Cap on the stored text of a logged prose turn (`user_prompt` /
-/// `agent_response`).
-///
-/// Applied at WRITE time, so it is the hard ceiling on what any later reader —
-/// `transcript_from_logs`, the `transcript` subcommand, the Kory Code UI — can
-/// ever recover. It was 500, which truncated most real turns mid-sentence and
-/// made a handoff transcript promise a fidelity it did not have.
-///
-/// Raising it is cheap because prose rows are rare: on a representative
-/// 1.7 GB state DB, `user_prompt` + `agent_response` together were ~2.2k rows
-/// against ~320k `tool_call` rows, so the added storage is single-digit MB
-/// even at the ceiling. Tool-call summaries are NOT capped here — they carry
-/// their own sizing and are the bulk of the table.
-const LOG_TEXT_CAP: usize = 8_000;
 
 /// Status of one `(agent, model)` candidate.
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +276,11 @@ pub struct RouterSession {
     /// Summary text from the previous model, prepended to the next prompt
     /// sent to the new model after a switch.
     pub pending_context: Option<String>,
+    /// Complete SQLite conversation restored by the router, consumed by the
+    /// first prompt sent to the fresh adapter. Never parsed as live commands.
+    pub pending_history: Vec<ContentBlock>,
+    /// A transcript write failure must not be reported as a successful turn.
+    pub persistence_error: Option<String>,
     /// When set, agent text on the pinned session is captured here instead
     /// of relayed (used to collect a summary during a switch).
     pub capturing_summary: Option<Arc<Mutex<String>>>,
@@ -439,6 +429,8 @@ impl RouterSession {
             pending_switch: None,
             escalation_requested: None,
             pending_context: None,
+            pending_history: Vec::new(),
+            persistence_error: None,
             capturing_summary: None,
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
@@ -505,6 +497,8 @@ impl RouterSession {
             pending_switch: None,
             escalation_requested: None,
             pending_context: None,
+            pending_history: Vec::new(),
+            persistence_error: None,
             capturing_summary: None,
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
@@ -1543,6 +1537,22 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
     let Some(update) = params.get("update") else {
         return;
     };
+    // Raw ACP updates preserve rich content, streaming output, plans and full
+    // tool results, including output from a cancelled or interrupted turn.
+    let saved = shared.state.lock().unwrap().log_checked(
+        router_sid,
+        &crate::state::LogEntry {
+            kind: "session_update".into(),
+            role: "agent".into(),
+            detail: Some(update.clone()),
+            ..Default::default()
+        },
+    );
+    if let Err(err) = saved {
+        shared.with_session(router_sid, |s| {
+            s.persistence_error = Some(format!("cannot save provider conversation update: {err}"));
+        });
+    }
     let kind = update
         .get("sessionUpdate")
         .and_then(|k| k.as_str())
@@ -4285,6 +4295,7 @@ async fn pin_session(
                 {
                     return Ok(PinOutcome::Cancelled);
                 }
+                crate::restoration::checkpoint(shared, router_sid)?;
                 return Ok(PinOutcome::Pinned);
             }
             Err(err) => {
@@ -4807,34 +4818,20 @@ async fn send_prompt_with_failover(
             s.turn_native_subagent_warned = false;
         });
         shared.state.lock().unwrap().touch(&router_sid);
-        // Log the user prompt (once, on the first attempt).
-        if attempt == 1 {
-            let prompt_text = prompt_display_text(&req.prompt);
-            shared.state.lock().unwrap().log(
-                &router_sid,
-                &crate::state::LogEntry {
-                    kind: "user_prompt".to_string(),
-                    role: "user".to_string(),
-                    summary: prompt_text.chars().take(LOG_TEXT_CAP).collect(),
-                    tokens_input: crate::state::estimate_tokens(&prompt_text),
-                    tokens_estimated: true,
-                    ..Default::default()
-                },
-            );
-        }
         // A pending handoff block (from a switch performed just before this
         // attempt — pre-loop pending_switch, or a mid-turn escalation on the
         // previous iteration) is prepended, consumed once. It is already fully
         // framed by `switch_pin` (summary or log-transcript fallback).
-        let (delegation, injects, handoff) = shared
+        let (delegation, injects, handoff, history) = shared
             .with_session(&router_sid, |s| {
                 (
                     s.pending_delegation_directive.take(),
                     std::mem::take(&mut s.pending_injects),
                     s.pending_context.take(),
+                    std::mem::take(&mut s.pending_history),
                 )
             })
-            .unwrap_or((None, Vec::new(), None));
+            .unwrap_or((None, Vec::new(), None, Vec::new()));
         let effective_prompt = {
             let mut blocks = Vec::new();
             // Router framing first (background contract, then the scoped
@@ -4873,11 +4870,21 @@ async fn send_prompt_with_failover(
                 );
             }
             for inj in injects {
+                shared.state.lock().unwrap().log(
+                    &router_sid,
+                    &crate::state::LogEntry {
+                        kind: "context_injection".into(),
+                        role: "router".into(),
+                        detail: Some(json!({"prompt": [ContentBlock::from(inj.clone())]})),
+                        ..Default::default()
+                    },
+                );
                 blocks.push(ContentBlock::from(inj));
             }
             if let Some(ctx) = handoff {
                 blocks.push(ContentBlock::from(ctx));
             }
+            blocks.extend(history.clone());
             blocks.extend(req.prompt.clone());
             if continuing {
                 blocks.push(ContentBlock::from("Continue the interrupted task using the original request above as context. Verify uncertain tool effects and do not repeat completed actions.".to_string()));
@@ -4921,11 +4928,27 @@ async fn send_prompt_with_failover(
             responder.cancellation(),
         )
         .await;
+        // A failed/cancelled send cannot discard the restored conversation.
+        // If another attempt opens a fresh adapter it must receive it too.
+        if result.is_err()
+            || responder.cancellation().is_cancelled()
+            || shared
+                .with_session(&router_sid, |s| s.cancelled)
+                .unwrap_or(true)
+        {
+            shared.with_session(&router_sid, |s| s.pending_history = history);
+        }
         shared
             .state
             .lock()
             .unwrap()
             .add_compute_ms(&router_sid, turn_start.elapsed().as_millis() as u64);
+        if let Some(err) = shared
+            .with_session(&router_sid, |s| s.persistence_error.clone())
+            .flatten()
+        {
+            return responder.respond_with_error(AcpError::internal_error().data(err));
+        }
 
         // A human cancellation is never provider-health evidence and never
         // triggers a replacement, even if the adapter reports a transport error.
@@ -4997,12 +5020,12 @@ async fn send_prompt_with_failover(
                     .with_session(&router_sid, |s| s.turn_output.clone())
                     .unwrap_or_default();
                 let tu = turn_tokens(&resp, &output);
-                shared.state.lock().unwrap().log(
+                if let Err(err) = shared.state.lock().unwrap().log_checked(
                     &router_sid,
                     &crate::state::LogEntry {
                         kind: "agent_response".to_string(),
                         role: "agent".to_string(),
-                        summary: output.chars().take(LOG_TEXT_CAP).collect(),
+                        summary: output.clone(),
                         detail: Some(
                             serde_json::json!({"stop_reason": format!("{:?}", resp.stop_reason)}),
                         ),
@@ -5013,7 +5036,12 @@ async fn send_prompt_with_failover(
                         tokens_estimated: tu.estimated,
                         model: Some(candidate.to_string()),
                     },
-                );
+                ) {
+                    return responder.respond_with_error(
+                        AcpError::internal_error()
+                            .data(format!("cannot save assistant response: {err}")),
+                    );
+                }
                 // Synthesize cost for adapters that report none of their own
                 // (only claude reports `usage_update.cost`; codex/grok/kimi
                 // sessions otherwise record 0 forever).
@@ -5034,6 +5062,9 @@ async fn send_prompt_with_failover(
                 // if it has fallen below the configured threshold, queue an
                 // auto-upgrade to a more capable model for the next prompt.
                 update_confidence_and_maybe_upgrade(&shared, &router_sid, &resp);
+                if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
+                    return responder.respond_with_error(err);
+                }
                 // The turn just changed real usage — nudge the shared usage
                 // snapshot (self-throttled and fire-and-forget; never delays
                 // the turn).
@@ -5186,7 +5217,7 @@ async fn send_prompt_with_failover(
                             &crate::state::LogEntry {
                                 kind: "agent_response".into(),
                                 role: "agent".into(),
-                                summary: output.chars().take(LOG_TEXT_CAP).collect(),
+                                summary: output.clone(),
                                 detail: Some(serde_json::json!({"interrupted": true})),
                                 model: Some(candidate.to_string()),
                                 ..Default::default()
@@ -6233,7 +6264,7 @@ fn clean_turn_text(s: &str) -> String {
 /// budget.
 ///
 /// `PER_TURN_CHARS` is this reader's own cap, deliberately far below the
-/// storage cap (`LOG_TEXT_CAP`): the output is injected into the incoming
+/// full stored conversation: the output is injected into the incoming
 /// model's context, so BREADTH of turns beats depth of any one turn. Without
 /// it, raising the storage cap would silently shrink this transcript to one or
 /// two full-length turns against the same `MAX_CHARS` budget. The full,
@@ -6678,6 +6709,7 @@ async fn switch_pin(
             ..Default::default()
         },
     );
+    crate::restoration::checkpoint(shared, router_sid)?;
     // A restarted adapter may reuse its session ids from the beginning. In
     // that case the replacement route has the same process key and session id
     // as the stale pin. Closing the stale tuple would unregister the fresh
@@ -6811,11 +6843,6 @@ fn build_initialize_response(shared: &Arc<Shared>) -> InitializeResponse {
     let targets = shared.targets.lock().unwrap();
     let mut prompt = PromptCapabilities::new();
     let mut mcp = McpCapabilities::new();
-    let mut load_session = false;
-    let mut any_list = false;
-    let mut any_delete = false;
-    let mut any_resume = false;
-    let mut any_close = false;
     let mut any_dirs = false;
     let mut auth_methods: Vec<AuthMethod> = Vec::new();
 
@@ -6831,11 +6858,6 @@ fn build_initialize_response(shared: &Arc<Shared>) -> InitializeResponse {
         prompt.embedded_context |= caps.prompt_capabilities.embedded_context;
         mcp.http |= caps.mcp_capabilities.http;
         mcp.sse |= caps.mcp_capabilities.sse;
-        load_session |= caps.load_session;
-        any_list |= caps.session_capabilities.list.is_some();
-        any_delete |= caps.session_capabilities.delete.is_some();
-        any_resume |= caps.session_capabilities.resume.is_some();
-        any_close |= caps.session_capabilities.close.is_some();
         any_dirs |= caps.session_capabilities.additional_directories.is_some();
 
         // Namespace downstream auth methods as `<agent>/<methodId>`. Only
@@ -6864,25 +6886,17 @@ fn build_initialize_response(shared: &Arc<Shared>) -> InitializeResponse {
         }
     }
 
-    let mut session_caps = SessionCapabilities::new();
-    if any_list {
-        session_caps = session_caps.list(Some(Default::default()));
-    }
-    if any_delete {
-        session_caps = session_caps.delete(Some(Default::default()));
-    }
-    if any_resume {
-        session_caps = session_caps.resume(Some(Default::default()));
-    }
-    if any_close {
-        session_caps = session_caps.close(Some(Default::default()));
-    }
+    let mut session_caps = SessionCapabilities::new()
+        .list(Some(Default::default()))
+        .delete(Some(Default::default()))
+        .resume(Some(Default::default()))
+        .close(Some(Default::default()));
     if any_dirs {
         session_caps = session_caps.additional_directories(Some(Default::default()));
     }
 
     let capabilities = AgentCapabilities::new()
-        .load_session(load_session)
+        .load_session(true)
         .prompt_capabilities(prompt)
         .mcp_capabilities(mcp)
         .session_capabilities(session_caps);
@@ -7049,7 +7063,21 @@ fn build_agent(
                                 Some(mode_id) => {
                                     let fwd = SetSessionModeRequest::new(down_sid, mode_id)
                                         .meta(req.meta.clone());
-                                    relay_request_to_downstream(&shared, conn, fwd, responder)
+                                    let task_shared = shared.clone();
+                                    let task_conn = conn.clone();
+                                    conn.spawn(async move {
+                                        match task_conn.send_request(fwd).block_task().await {
+                                            Ok(resp) => {
+                                                task_shared.with_session(&sid, |s| s.applied_mode = Some(requested));
+                                                match crate::restoration::checkpoint(&task_shared, &sid) {
+                                                    Ok(()) => { let _ = responder.respond(resp); }
+                                                    Err(err) => { let _ = responder.respond_with_error(err); }
+                                                }
+                                            }
+                                            Err(err) => { let _ = responder.respond_with_error(err); }
+                                        }
+                                        Ok(())
+                                    })
                                 }
                                 None => {
                                     // Lenient: report success so mode-eager
@@ -7077,6 +7105,9 @@ fn build_agent(
                                 })
                                 .is_some();
                             if known {
+                                if let Err(err) = crate::restoration::checkpoint(&shared, &sid) {
+                                    return responder.respond_with_error(err);
+                                }
                                 tracing::debug!(
                                     session = sid,
                                     mode = requested,
@@ -7334,14 +7365,72 @@ fn on_session_new(
         // Management commands must remain accessible when every login is
         // expired. Normal prompts still enforce eligibility at pin time.
         let router_sid = format!("rtr-{}", uuid::Uuid::new_v4());
-        shared
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(router_sid.clone(), RouterSession::new(&shared.cfg, &req));
+        let created = (|| -> Result<(), AcpError> {
+            let mut session = RouterSession::new(&shared.cfg, &req);
+            let source = req
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("router_acp"))
+                .and_then(|m| m.get("continue_from"));
+            if let Some(source) = source {
+                let source = source.as_str().ok_or_else(|| {
+                    AcpError::invalid_params().data("continue_from must be a router session id")
+                })?;
+                let saved = shared.state.lock().unwrap().get(source).ok_or_else(|| {
+                    AcpError::invalid_params().data(format!("unknown router session id `{source}`"))
+                })?;
+                crate::restoration::restore_config(&mut session, &saved)?;
+                session.coordinator |= meta_marks_coordinator(req.meta.as_ref());
+                session.pending_history = crate::restoration::history(&shared, source)?;
+            }
+            let config = serde_json::to_value(crate::restoration::SessionConfig::capture(&session))
+                .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+            let state = shared.state.lock().unwrap();
+            state
+                .upsert_checked(
+                    router_sid.clone(),
+                    PersistedSession {
+                        cwd: req.cwd.clone(),
+                        additional_directories: req.additional_directories.clone(),
+                        session_config: Some(config),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| {
+                    AcpError::internal_error().data(format!("cannot save new router session: {e}"))
+                })?;
+            if !session.pending_history.is_empty()
+                && let Err(e) = state.log_checked(
+                    &router_sid,
+                    &crate::state::LogEntry {
+                        kind: "inherited_context".into(),
+                        role: "router".into(),
+                        detail: Some(json!({"prompt": session.pending_history})),
+                        ..Default::default()
+                    },
+                )
+            {
+                state.remove(&router_sid);
+                return Err(AcpError::internal_error()
+                    .data(format!("cannot save continued conversation: {e}")));
+            }
+            drop(state);
+            shared
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(router_sid.clone(), session);
+            Ok(())
+        })();
+        if let Err(err) = created {
+            return responder.respond_with_error(err);
+        }
         let options = shared.router_config_options(&router_sid);
-        let _ =
-            responder.respond(NewSessionResponse::new(router_sid.clone()).config_options(options));
+        let _ = responder.respond(
+            NewSessionResponse::new(router_sid.clone())
+                .config_options(options)
+                .meta(crate::restoration::response_meta(&shared, &router_sid)),
+        );
         crate::accounts::advertise(&shared, &router_sid);
         Ok(())
     })
@@ -7483,6 +7572,9 @@ fn on_set_config_option(
 
     match action {
         Action::RouterUpdated => {
+            if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
+                return responder.respond_with_error(err);
+            }
             let options = shared.router_config_options(&router_sid);
             responder.respond(SetSessionConfigOptionResponse::new(options))
         }
@@ -7538,6 +7630,27 @@ fn on_prompt(
             req,
             responder,
         ));
+    }
+
+    if shared.with_session(&router_sid, |_| ()).is_none() {
+        return responder.respond_with_error(AcpError::invalid_params().data("unknown session id"));
+    }
+    let prompt_text = prompt_display_text(&req.prompt);
+    if let Err(err) = shared.state.lock().unwrap().log_checked(
+        &router_sid,
+        &crate::state::LogEntry {
+            kind: "user_prompt".into(),
+            role: "user".into(),
+            summary: prompt_text.clone(),
+            detail: Some(json!({"prompt": req.prompt})),
+            tokens_input: crate::state::estimate_tokens(&prompt_text),
+            tokens_estimated: true,
+            ..Default::default()
+        },
+    ) {
+        return responder.respond_with_error(
+            AcpError::internal_error().data(format!("cannot save router conversation: {err}")),
+        );
     }
 
     // Tracks whether the user steered routing explicitly (a `[router: …]`
@@ -7913,8 +8026,25 @@ fn on_prompt(
     // The rest of prompt handling runs in a spawned task: ticket-context
     // enrichment shells out (async), and classification must see the ENRICHED
     // prompt — "Fix HAI-1234" routes on the ticket's real content.
+    if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
+        return responder.respond_with_error(err);
+    }
     cx.spawn(async move {
+        let original_blocks = req.prompt.len();
         let req = crate::tickets::enrich_prompt(&shared, &router_sid, req).await;
+        if req.prompt.len() > original_blocks {
+            shared.state.lock().unwrap().log(
+                &router_sid,
+                &crate::state::LogEntry {
+                    kind: "context_injection".into(),
+                    role: "router".into(),
+                    detail: Some(
+                        json!({"prompt": req.prompt[..req.prompt.len() - original_blocks]}),
+                    ),
+                    ..Default::default()
+                },
+            );
+        }
         dispatch_prompt(
             shared,
             router_sid,
@@ -8306,6 +8436,9 @@ async fn dispatch_prompt(
         }
     };
 
+    if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
+        return responder.respond_with_error(err);
+    }
     match action {
         Action::Relay => {
             // A new turn starts: clear the previous turn's cancel flag so it
@@ -8352,57 +8485,29 @@ fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpEr
 
 fn on_session_list(
     shared: Arc<Shared>,
-    _req: ListSessionsRequest,
+    req: ListSessionsRequest,
     responder: Responder<ListSessionsResponse>,
-    cx: ConnectionTo<ClientPeer>,
+    _cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
-    cx.spawn(async move {
-        let mut merged = Vec::new();
-        for key in shared.target_keys() {
-            let (conn, agent_name, supports) = {
-                let targets = shared.targets.lock().unwrap();
-                let Some(t) = targets.get(&key) else { continue };
-                let supports = t
-                    .init
-                    .as_ref()
-                    .map(|i| i.agent_capabilities.session_capabilities.list.is_some())
-                    .unwrap_or(false);
-                (t.conn.clone(), t.spec.agent_name.clone(), supports)
-            };
-            let Some(conn) = conn else { continue };
-            if !supports {
-                continue;
-            }
-            match conn
-                .send_request(ListSessionsRequest::new())
-                .block_task()
-                .await
-            {
-                Ok(resp) => {
-                    for info in resp.sessions {
-                        // Rewrite downstream ids to router ids; include only
-                        // sessions the router knows how to route back.
-                        let down_sid = sid_str(&info.session_id);
-                        let router_sid = shared
-                            .state
-                            .lock()
-                            .unwrap()
-                            .find_by_downstream(&agent_name, &down_sid);
-                        if let Some(router_sid) = router_sid {
-                            let mut info = info;
-                            info.session_id = router_sid.into();
-                            merged.push(info);
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(target = %key, error = %err, "session/list failed downstream");
-                }
-            }
-        }
-        let _ = responder.respond(ListSessionsResponse::new(merged));
-        Ok(())
-    })
+    let sessions = shared
+        .state
+        .lock()
+        .unwrap()
+        .all()
+        .into_iter()
+        .filter(|(_, s)| s.kind != "delegate" && req.cwd.as_ref().is_none_or(|cwd| *cwd == s.cwd))
+        .map(|(id, s)| {
+            agent_client_protocol::schema::v1::SessionInfo::new(id, s.cwd)
+                .additional_directories(s.additional_directories)
+                .title(s.title)
+                .updated_at(
+                    s.updated_at
+                        .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+                        .map(|ts| ts.to_rfc3339()),
+                )
+        })
+        .collect();
+    responder.respond(ListSessionsResponse::new(sessions))
 }
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
@@ -8457,7 +8562,60 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
     match message {
         Dispatch::Request(msg, responder) => {
             let fwd = relay::with_session_id(&msg, &down_sid)?;
-            relay_request_to_downstream(&shared, conn, fwd, responder)?;
+            if msg.method() == "_session/steering" {
+                let prompt: Vec<ContentBlock> = match serde_json::from_value(
+                    msg.params().get("prompt").cloned().unwrap_or(Value::Null),
+                ) {
+                    Ok(prompt) => prompt,
+                    Err(err) => {
+                        return responder
+                            .respond_with_error(AcpError::invalid_params().data(err.to_string()))
+                            .map(|_| Handled::Yes);
+                    }
+                };
+                let task_shared = shared.clone();
+                shared
+                    .upstream()
+                    .ok_or_else(AcpError::internal_error)?
+                    .spawn(async move {
+                        let result = conn
+                            .send_request(fwd)
+                            .forward_cancellation_from(responder.cancellation())
+                            .block_task()
+                            .await;
+                        if result
+                            .as_ref()
+                            .ok()
+                            .and_then(|v| v.get("outcome"))
+                            .and_then(Value::as_str)
+                            == Some("injected")
+                        {
+                            let saved = task_shared.state.lock().unwrap().log_checked(
+                                &router_sid,
+                                &crate::state::LogEntry {
+                                    kind: "user_steer".into(),
+                                    role: "user".into(),
+                                    summary: prompt_display_text(&prompt),
+                                    detail: Some(json!({"prompt": prompt})),
+                                    ..Default::default()
+                                },
+                            );
+                            if let Err(err) = saved {
+                                let message = format!("cannot save injected user message: {err}");
+                                task_shared.with_session(&router_sid, |s| {
+                                    s.persistence_error = Some(message.clone())
+                                });
+                                let _ = responder
+                                    .respond_with_error(AcpError::internal_error().data(message));
+                                return Ok(());
+                            }
+                        }
+                        let _ = responder.respond_with_result(result);
+                        Ok(())
+                    })?;
+            } else {
+                relay_request_to_downstream(&shared, conn, fwd, responder)?;
+            }
             Ok(Handled::Yes)
         }
         Dispatch::Notification(msg) => {

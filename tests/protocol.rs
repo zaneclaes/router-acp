@@ -4102,10 +4102,8 @@ async fn title_generation_does_not_hijack_the_pin() {
             "---BEGIN USER MESSAGES--- do stuff ---END USER MESSAGES---               Generate a short title for the above messages.",
         )
         .await?;
-        assert!(
-            open_state(&state_path).get(&sid).is_none(),
-            "title-gen must not create a pinned session row"
-        );
+        let unpinned = open_state(&state_path).get(&sid).expect("session/new persists its router id");
+        assert!(unpinned.agent.is_empty() && unpinned.downstream_session_id.is_empty());
 
         // Real prompt WITH a directive now pins per the directive, not the
         // default the title-gen would have caused.
@@ -6651,17 +6649,22 @@ async fn lifecycle_list_load_delete_roundtrip() {
             .block_task()
             .await?;
         assert!(load.config_options.is_some());
-        // The replayed transcript update relays under the router id.
+        // The router replays its own SQLite transcript under the router id.
         let text = agent_text(&observed, &sid);
         assert!(
-            text.contains("replayed:mock-sess-"),
+            text.contains("echo:m1:persist me"),
             "replay relayed: {text}"
         );
 
         // The rehydrated pin routes follow-up prompts to the same session.
         let resp = prompt_text(&cx, &sid, "after load").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        assert!(agent_text(&observed, &sid).contains("echo:m1:after load"));
+        let restored = agent_text(&observed, &sid);
+        assert!(
+            restored.contains("after load"),
+            "follow-up delivered: {restored}"
+        );
+        assert!(restored.contains("<resumed-conversation-context>"));
 
         // Delete removes downstream and router state.
         cx.send_request(agent_client_protocol::schema::v1::DeleteSessionRequest::new(sid.clone()))
@@ -6675,7 +6678,7 @@ async fn lifecycle_list_load_delete_roundtrip() {
 }
 
 #[tokio::test]
-async fn mock_lifecycle_capabilities_not_advertised_when_unsupported() {
+async fn router_lifecycle_capabilities_are_independent_of_downstream_support() {
     let state = temp_state_file("caps-adv");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
@@ -6685,10 +6688,10 @@ async fn mock_lifecycle_capabilities_not_advertised_when_unsupported() {
     run_test(yaml, async |cx, _observed| {
         let init_resp = init(&cx).await?;
         let caps = &init_resp.agent_capabilities;
-        assert!(!caps.load_session);
-        assert!(caps.session_capabilities.list.is_none());
-        assert!(caps.session_capabilities.resume.is_none());
-        assert!(caps.session_capabilities.close.is_none());
+        assert!(caps.load_session);
+        assert!(caps.session_capabilities.list.is_some());
+        assert!(caps.session_capabilities.resume.is_some());
+        assert!(caps.session_capabilities.close.is_some());
         // The mock advertises embedded_context: the union carries it.
         assert!(caps.prompt_capabilities.embedded_context);
         assert!(!caps.prompt_capabilities.image);

@@ -55,6 +55,9 @@ pub struct PersistedSession {
     /// Full routing decision (strategy, candidate, weights, class,
     /// complexity, skipped, cordons) — the `_meta.router_acp` payload.
     pub routing: Option<serde_json::Value>,
+    /// Native downstream session configuration checkpoint, used to restore a
+    /// provider session after the router restarts.
+    pub session_config: Option<serde_json::Value>,
     /// Router session id of the parent, for delegated sub-agent sessions.
     pub parent_session_id: Option<String>,
     /// The downstream session id this router session was pinned to *before*
@@ -212,6 +215,7 @@ impl StateFile {
             additional_directories TEXT NOT NULL DEFAULT '[]',
             title                 TEXT,
             routing               TEXT,
+            session_config        TEXT,
             parent_session_id     TEXT,
             prior_session_id      TEXT,
             kind                  TEXT NOT NULL DEFAULT 'primary',
@@ -338,6 +342,7 @@ impl StateFile {
             "ALTER TABLE sessions ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN llm_request_cost_usd REAL NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN llm_requests_total INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN session_config TEXT",
             "ALTER TABLE session_log ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_log ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_log ADD COLUMN model TEXT",
@@ -411,6 +416,7 @@ impl StateFile {
     fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedSession> {
         let dirs: String = row.get("additional_directories")?;
         let routing: Option<String> = row.get("routing")?;
+        let session_config: Option<String> = row.get("session_config")?;
         Ok(PersistedSession {
             agent: row.get("agent")?,
             model: row.get("model")?,
@@ -419,6 +425,7 @@ impl StateFile {
             additional_directories: serde_json::from_str(&dirs).unwrap_or_default(),
             title: row.get("title")?,
             routing: routing.and_then(|r| serde_json::from_str(&r).ok()),
+            session_config: session_config.and_then(|config| serde_json::from_str(&config).ok()),
             parent_session_id: row.get("parent_session_id")?,
             prior_session_id: row.get("prior_session_id")?,
             kind: row.get("kind")?,
@@ -495,14 +502,27 @@ impl StateFile {
             .flatten()
     }
 
-    pub fn upsert(&self, router_session_id: String, mut session: PersistedSession) {
+    pub fn upsert(&self, router_session_id: String, session: PersistedSession) {
+        if let Err(err) = self.upsert_checked(router_session_id, session) {
+            tracing::error!(%err, "failed to upsert session");
+        }
+    }
+
+    pub fn upsert_checked(
+        &self,
+        router_session_id: String,
+        mut session: PersistedSession,
+    ) -> rusqlite::Result<()> {
         let now = now_epoch();
-        // Preserve creation time, title, and accumulated token counters
+        // Preserve creation time, title, session configuration, and accumulated token counters
         // across re-pins (failover) unless fresh values are supplied.
         if let Some(existing) = self.get(&router_session_id) {
             session.created_at = session.created_at.or(existing.created_at);
             if session.title.is_none() {
                 session.title = existing.title;
+            }
+            if session.session_config.is_none() {
+                session.session_config = existing.session_config;
             }
             if session.parent_session_id.is_none() {
                 session.parent_session_id = existing.parent_session_id;
@@ -526,17 +546,22 @@ impl StateFile {
         let dirs =
             serde_json::to_string(&session.additional_directories).unwrap_or_else(|_| "[]".into());
         let routing = session.routing.as_ref().map(|r| r.to_string());
-        let res = self.conn.execute(
+        let session_config = session
+            .session_config
+            .as_ref()
+            .map(|config| config.to_string());
+        self.conn.execute(
             "INSERT INTO sessions (router_session_id, agent, model, downstream_session_id, cwd,
-                additional_directories, title, routing, parent_session_id, prior_session_id, kind,
+                additional_directories, title, routing, session_config, parent_session_id, prior_session_id, kind,
                 run_label, created_at, updated_at, tokens_input, tokens_output, tokens_total,
                 context_used)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(router_session_id) DO UPDATE SET
                 agent=excluded.agent, model=excluded.model,
                 downstream_session_id=excluded.downstream_session_id, cwd=excluded.cwd,
                 additional_directories=excluded.additional_directories, title=excluded.title,
-                routing=excluded.routing, parent_session_id=excluded.parent_session_id,
+                routing=excluded.routing, session_config=excluded.session_config,
+                parent_session_id=excluded.parent_session_id,
                 prior_session_id=excluded.prior_session_id,
                 kind=excluded.kind, run_label=excluded.run_label,
                 created_at=excluded.created_at, updated_at=excluded.updated_at,
@@ -551,6 +576,7 @@ impl StateFile {
                 dirs,
                 session.title,
                 routing,
+                session_config,
                 session.parent_session_id,
                 session.prior_session_id,
                 session.kind,
@@ -562,11 +588,25 @@ impl StateFile {
                 session.tokens_total as i64,
                 session.context_used as i64,
             ],
-        );
-        if let Err(err) = res {
-            tracing::error!(%err, "failed to upsert session");
-        }
+        )?;
         self.prune();
+        Ok(())
+    }
+
+    /// Persist a native downstream session configuration checkpoint.
+    pub fn set_session_config(
+        &self,
+        router_session_id: &str,
+        value: &serde_json::Value,
+    ) -> rusqlite::Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET session_config=?2, updated_at=?3 WHERE router_session_id=?1",
+            params![router_session_id, value.to_string(), now_epoch() as i64],
+        )?;
+        if changed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
     }
 
     pub fn set_title(&self, router_session_id: &str, title: &str) {
@@ -603,9 +643,15 @@ impl StateFile {
 
     /// Append a `session_log` row and increment the session's counters.
     pub fn log(&self, router_session_id: &str, entry: &LogEntry) {
+        if let Err(err) = self.log_checked(router_session_id, entry) {
+            tracing::debug!(%err, session = router_session_id, "session_log insert skipped");
+        }
+    }
+
+    pub fn log_checked(&self, router_session_id: &str, entry: &LogEntry) -> rusqlite::Result<()> {
         let now = now_epoch() as i64;
         let detail = entry.detail.as_ref().map(|d| d.to_string());
-        let res = self.conn.execute(
+        self.conn.execute(
             "INSERT INTO session_log
                 (router_session_id, ts, kind, role, summary, detail,
                  tokens_input, tokens_output, tokens_cache_read,
@@ -625,13 +671,8 @@ impl StateFile {
                 entry.tokens_estimated as i64,
                 entry.model,
             ],
-        );
-        if let Err(err) = res {
-            // A log row for an unknown session (FK violation) is non-fatal.
-            tracing::debug!(%err, session = router_session_id, "session_log insert skipped");
-            return;
-        }
-        let _ = self.conn.execute(
+        )?;
+        self.conn.execute(
             "UPDATE sessions SET
                 tokens_input = tokens_input + ?2,
                 tokens_output = tokens_output + ?3,
@@ -649,7 +690,8 @@ impl StateFile {
                 entry.tokens_cache_write as i64,
                 now,
             ],
-        );
+        )?;
+        Ok(())
     }
 
     /// Record the latest context-window usage for a session.
@@ -877,6 +919,33 @@ impl StateFile {
         );
     }
 
+    fn row_to_log_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
+        let detail: Option<String> = row.get("detail")?;
+        Ok(LogEntry {
+            kind: row.get("kind")?,
+            role: row.get("role")?,
+            summary: row.get("summary")?,
+            detail: detail.and_then(|detail| serde_json::from_str(&detail).ok()),
+            tokens_input: row.get::<_, i64>("tokens_input")? as u64,
+            tokens_output: row.get::<_, i64>("tokens_output")? as u64,
+            tokens_cache_read: row.get::<_, i64>("tokens_cache_read").unwrap_or(0) as u64,
+            tokens_cache_write: row.get::<_, i64>("tokens_cache_write").unwrap_or(0) as u64,
+            tokens_estimated: row.get::<_, i64>("tokens_estimated")? != 0,
+            model: row.get("model").unwrap_or(None),
+        })
+    }
+
+    /// Every log entry for a session, in chronological order.
+    pub fn log_for_all(&self, router_session_id: &str) -> rusqlite::Result<Vec<LogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, role, summary, detail, tokens_input, tokens_output,
+                    tokens_cache_read, tokens_cache_write, tokens_estimated, model
+             FROM session_log WHERE router_session_id=?1 ORDER BY id",
+        )?;
+        stmt.query_map(params![router_session_id], Self::row_to_log_entry)?
+            .collect()
+    }
+
     /// Recent log entries for a session (chronological).
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
         let mut out = Vec::new();
@@ -887,21 +956,10 @@ impl StateFile {
         ) else {
             return out;
         };
-        let rows = stmt.query_map(params![router_session_id, limit as i64], |row| {
-            let detail: Option<String> = row.get("detail")?;
-            Ok(LogEntry {
-                kind: row.get("kind")?,
-                role: row.get("role")?,
-                summary: row.get("summary")?,
-                detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
-                tokens_input: row.get::<_, i64>("tokens_input")? as u64,
-                tokens_output: row.get::<_, i64>("tokens_output")? as u64,
-                tokens_cache_read: row.get::<_, i64>("tokens_cache_read").unwrap_or(0) as u64,
-                tokens_cache_write: row.get::<_, i64>("tokens_cache_write").unwrap_or(0) as u64,
-                tokens_estimated: row.get::<_, i64>("tokens_estimated")? != 0,
-                model: row.get("model").unwrap_or(None),
-            })
-        });
+        let rows = stmt.query_map(
+            params![router_session_id, limit as i64],
+            Self::row_to_log_entry,
+        );
         if let Ok(rows) = rows {
             for r in rows.flatten() {
                 out.push(r);
@@ -1097,6 +1155,39 @@ mod tests {
     }
 
     #[test]
+    fn log_for_all_replays_every_entry_in_order_without_cross_session_rows() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("a"));
+        s.upsert("r2".into(), session("b"));
+        for i in 0..501 {
+            s.log(
+                "r1",
+                &LogEntry {
+                    kind: "event".into(),
+                    role: "router".into(),
+                    summary: i.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        s.log(
+            "r2",
+            &LogEntry {
+                kind: "other".into(),
+                role: "router".into(),
+                summary: "not r1".into(),
+                ..Default::default()
+            },
+        );
+
+        let entries = s.log_for_all("r1").unwrap();
+        assert_eq!(entries.len(), 501);
+        assert_eq!(entries.first().unwrap().summary, "0");
+        assert_eq!(entries.last().unwrap().summary, "500");
+        assert!(entries.iter().all(|entry| entry.kind == "event"));
+    }
+
+    #[test]
     fn removing_session_cascades_logs() {
         let (_d, s) = store();
         s.upsert("r1".into(), session("a"));
@@ -1147,6 +1238,7 @@ mod tests {
             "r1".into(),
             PersistedSession {
                 title: Some("orig".into()),
+                session_config: Some(serde_json::json!({"mode": "native"})),
                 ..session("a")
             },
         );
@@ -1165,6 +1257,109 @@ mod tests {
         assert_eq!(got.created_at, created);
         assert_eq!(got.title.as_deref(), Some("orig"));
         assert_eq!(got.tokens_output, 5, "token counters survive re-pin");
+        assert_eq!(
+            got.session_config,
+            Some(serde_json::json!({"mode": "native"}))
+        );
+    }
+
+    #[test]
+    fn session_config_survives_close_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let s = StateFile::load(&path, Retention::default());
+            s.upsert("r1".into(), session("a"));
+            s.set_session_config(
+                "r1",
+                &serde_json::json!({"approval": "on-request", "attempt": 3}),
+            )
+            .unwrap();
+        }
+
+        let reopened = StateFile::load(&path, Retention::default());
+        assert_eq!(
+            reopened.get("r1").unwrap().session_config,
+            Some(serde_json::json!({"approval": "on-request", "attempt": 3}))
+        );
+    }
+
+    #[test]
+    fn explicit_session_config_with_null_replaces_the_prior_checkpoint() {
+        let (_d, s) = store();
+        s.upsert(
+            "r1".into(),
+            PersistedSession {
+                session_config: Some(serde_json::json!({"mode": "native", "resume": true})),
+                ..session("a")
+            },
+        );
+        s.upsert(
+            "r1".into(),
+            PersistedSession {
+                session_config: Some(serde_json::json!({"mode": null, "resume": false})),
+                ..session("b")
+            },
+        );
+
+        assert_eq!(
+            s.get("r1").unwrap().session_config,
+            Some(serde_json::json!({"mode": null, "resume": false}))
+        );
+    }
+
+    #[test]
+    fn migrates_old_sessions_schema_with_nullable_session_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                router_session_id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                model TEXT NOT NULL,
+                downstream_session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                additional_directories TEXT NOT NULL DEFAULT '[]',
+                title TEXT,
+                routing TEXT,
+                parent_session_id TEXT,
+                prior_session_id TEXT,
+                kind TEXT NOT NULL DEFAULT 'primary',
+                run_label TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                tokens_input INTEGER NOT NULL DEFAULT 0,
+                tokens_output INTEGER NOT NULL DEFAULT 0,
+                tokens_total INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+                context_used INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                cost_estimated INTEGER NOT NULL DEFAULT 0,
+                llm_request_cost_usd REAL NOT NULL DEFAULT 0,
+                llm_requests_total INTEGER NOT NULL DEFAULT 0,
+                native_subagent_calls INTEGER NOT NULL DEFAULT 0,
+                delegation_directive_injections INTEGER NOT NULL DEFAULT 0,
+                compute_ms INTEGER NOT NULL DEFAULT 0,
+                git_branch TEXT,
+                git_sha TEXT
+            );
+            INSERT INTO sessions
+                (router_session_id, agent, model, downstream_session_id, cwd)
+            VALUES ('legacy', 'a', 'm', 'd', '/');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let s = StateFile::load(&path, Retention::default());
+        assert_eq!(s.get("legacy").unwrap().session_config, None);
+        s.set_session_config("legacy", &serde_json::json!({"resume": null}))
+            .unwrap();
+        assert_eq!(
+            s.get("legacy").unwrap().session_config,
+            Some(serde_json::json!({"resume": null}))
+        );
     }
 
     #[test]
