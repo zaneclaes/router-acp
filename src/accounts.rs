@@ -1203,11 +1203,14 @@ async fn run_login(
 }
 
 fn browser_message(output: &str, p: &str) -> Option<String> {
-    // Do not publish a URL while its final bytes are still arriving.
-    let matched = regex::Regex::new(r#"https://[^\s\x1b\"'<>]+"#)
+    let clean = regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]")
         .ok()?
-        .find(output)?;
-    if matched.end() == output.len() {
+        .replace_all(output, "");
+    // Do not publish a URL while its final bytes are still arriving.
+    let matched = regex::Regex::new(r#"https://[^\s\"'<>]+"#)
+        .ok()?
+        .find(&clean)?;
+    if matched.end() == clean.len() {
         return None;
     }
     let url = matched.as_str().to_string();
@@ -1216,10 +1219,8 @@ fn browser_message(output: &str, p: &str) -> Option<String> {
     } else {
         regex::Regex::new(r"\b[A-Z0-9]{4,10}(?:-[A-Z0-9]{4,10})+\b")
             .ok()?
-            .find(output)
-            .filter(|m| {
-                m.end() < output.len() && output[m.end()..].starts_with(char::is_whitespace)
-            })
+            .find(&clean)
+            .filter(|m| m.end() < clean.len() && clean[m.end()..].starts_with(char::is_whitespace))
             .map(|m| m.as_str().to_string())
     };
     if !matches!(p, "claude" | "kimi") && code.is_none() {
@@ -1826,6 +1827,14 @@ mod tests {
         assert_eq!(
             browser_message("https://example.test/device\nABCD-EFGH-4242\n", "codex").as_deref(),
             Some("Open https://example.test/device\nDevice code: ABCD-EFGH-4242")
+        );
+        assert_eq!(
+            browser_message(
+                "\x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\x1b[94mLWD3-2FXYY\x1b[0m\n",
+                "codex",
+            )
+            .as_deref(),
+            Some("Open https://auth.openai.com/codex/device\nDevice code: LWD3-2FXYY")
         );
         assert_eq!(
             plan_label("claude", "default_claude_max_20x"),
