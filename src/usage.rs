@@ -107,6 +107,7 @@ pub async fn refresh_and_install(shared: &Arc<Shared>) {
         headroom.set_polled_availability(availability);
         headroom.active_usage_cordons().len()
     };
+    shared.publish_config_options();
     tracing::debug!(
         cordoned_candidates = n,
         availability_candidates = a,

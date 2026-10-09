@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    Error as AcpError, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    AuthMethod, AuthenticateRequest, Error as AcpError, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory,
 };
 use agent_client_protocol::{Client as ClientRole, on_receive_dispatch};
@@ -186,20 +186,20 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     };
     upstream.spawn(async move {
         let _credential = credential;
-        let connect = builder
-            .connect_with(acp_agent, async |cx| {
-                let _ = conn_tx.send(cx.clone());
-                std::future::pending::<Result<(), AcpError>>().await
-            });
-        let result = tokio::select! {
-            result = connect => result,
-            () = stop.cancelled() => Err(AcpError::internal_error().data("Account authentication changed")),
+        let connect = builder.connect_with(acp_agent, async |cx| {
+            let _ = conn_tx.send(cx.clone());
+            std::future::pending::<Result<(), AcpError>>().await
+        });
+        let (result, planned_stop) = tokio::select! {
+            result = connect => (result, false),
+            () = stop.cancelled() => (Err(AcpError::internal_error()), true),
         };
-        let reason = match result {
-            Ok(()) => "downstream connection closed".to_string(),
-            Err(err) => format!("downstream connection failed: {err}"),
+        let reason = match (result, planned_stop) {
+            (_, true) => "Account adapter restarting".to_string(),
+            (Ok(()), false) => "downstream connection closed".to_string(),
+            (Err(err), false) => format!("downstream connection failed: {err}"),
         };
-        task_shared.mark_target_dead(&task_key, &reason);
+        task_shared.mark_target_dead_if_current(&task_key, &stopped, &reason);
         stopped.notify_one();
         // Contained: a downstream death must not tear down the router.
         Ok(())
@@ -254,6 +254,17 @@ pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcom
     if !matches!(outcome, ProbeOutcome::AuthPending) {
         return outcome;
     }
+    // Grok's external credential provider is an ACP authentication method.
+    // A valid managed credential therefore still needs one `authenticate`
+    // request before the adapter will accept `session/new`.
+    if crate::accounts::provider(&agent) == Some("grok")
+        && authenticate_from_manager(shared, key).await.is_ok()
+    {
+        let retried = probe_target_once(shared, key).await;
+        if !matches!(retried, ProbeOutcome::AuthPending) {
+            return retried;
+        }
+    }
     let repaired = crate::credentials::repair(&agent, generation.as_deref()).await;
     crate::auth::sync_from_manager(shared, &agent);
     if repaired == crate::credentials::RepairOutcome::Repaired
@@ -280,6 +291,27 @@ pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcom
             "Authentication status unavailable; credential repair could not confirm logout".into(),
         )
     }
+}
+
+async fn authenticate_from_manager(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), AcpError> {
+    let conn = shared
+        .target_conn(key)
+        .ok_or_else(AcpError::internal_error)?;
+    let init = shared
+        .target_init(key)
+        .ok_or_else(AcpError::internal_error)?;
+    let method = init
+        .auth_methods
+        .iter()
+        .find_map(|method| match method {
+            AuthMethod::Agent(method) => Some(method.id.0.to_string()),
+            _ => None,
+        })
+        .ok_or_else(AcpError::internal_error)?;
+    conn.send_request(AuthenticateRequest::new(method))
+        .block_task()
+        .await?;
+    Ok(())
 }
 
 async fn restart_target(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), AcpError> {
@@ -342,7 +374,10 @@ pub(crate) async fn restart_after_repair(
     }
     restart_target(shared, key).await?;
     match probe_target_once(shared, key).await {
-        ProbeOutcome::Routeable => Ok(()),
+        ProbeOutcome::Routeable => {
+            crate::auth::sync_from_manager(shared, &agent);
+            Ok(())
+        }
         _ => Err(AcpError::internal_error()
             .data("This account's adapter remains unavailable after credential repair")),
     }

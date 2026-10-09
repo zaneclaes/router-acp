@@ -46,7 +46,7 @@ goose / Zed ──ACP──▶ router-acp ──ACP──▶ claude-agent-acp   
                           │
                           ├──────ACP──▶ codex-acp             (codex/gpt-5.5, codex/gpt-5.6-sol)
                           │
-                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.6)
+                          ├──────ACP──▶ grok agent stdio      (grok/grok-4.7 or grok-4.6)
                           │
                           └──────ACP──▶ kimi acp              (kimi/kimi-k2)
 ```
@@ -125,7 +125,7 @@ Manage logins
 4. kimi (0 accounts)
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Its `credentialPresent` field distinguishes a saved but unprobed credential from a configured account with no credential. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
@@ -154,7 +154,7 @@ The router degrades gracefully when seats run dry or adapters fall over, and it 
 - **Auth-aware availability.** A provider still advertises models from a static manifest when its account cannot serve work. The router tracks authentication per account as authenticated, unauthenticated, or unknown. Unknown fails open. A probe result, a 401 alone, a timeout, a parse error, or a network failure cannot prove logout. The first authentication rejection requests repair. The router uses a per-credential OS lock only while login, automatic repair, or removal changes that credential. It never holds the lock during a session or turn. Concurrent waiters re-read and reuse the completed repair result. Credential generation and router epoch guard every completion. Only a definitive refresh rejection for the current generation durably marks an account unauthenticated. A stale failure or success cannot alter a newer credential. Native adapters get private access-only runtime stores, so adapter refreshers cannot write canonical credentials. Different accounts remain eligible for concurrent sessions.
 - **Proactive per-candidate usage cordons.** Beyond reacting to errors, the router can read a provider's own usage state and cordon an *exhausted model* before it's ever tried. Enable per-agent with `usage_source`: `anthropic-oauth` polls the Claude usage API (`GET /api/oauth/usage`); `codex-rollout` polls Codex live over one `codex app-server` JSON-RPC round-trip (`account/rateLimits/read`), sharing that result box-wide through a snapshot cache, and falls back to Codex's own on-disk rollout-file snapshots only if the RPC itself fails (no binary, signed out) — either way, the reactive cordon above is the backstop for staleness or a parse miss. A model-scoped weekly cap at 100% cordons just that candidate; an all-models or session cap cordons the whole agent — but only when the overage/credit pool has no *usable* headroom (Anthropic: overage/spend not exhausted; Codex: `unlimited` credits or a positive `balance` — a bare `has_credits` flag doesn't count). It's **generic** (which models are exhausted is read from the API, never hardcoded), **fails open** (a usage-endpoint hiccup never makes a model unroutable), and self-lifts at the reported reset. **Grok** exposes no usage meter at all, so it needs no `usage_source`: the router instead watches Grok's own subscription **access gate** in its ACP stream and cordons the agent the moment Grok reports the gate closed — the same effect, driven by the only signal Grok gives (no reset time, so it uses `cordon_default_secs`). Cordoned candidates are excluded from `auto`, skipped by failover, and an explicit pin to one is refused with a fallback (disclosed as `router-acp · failover: cordon → claude/sonnet · task … (Weekly Fable limit reached, resets …)`). If every eligible candidate is unavailable, the router reports why it cannot continue; it never bypasses a cordon or reserve. Each candidate's cordon state rides the `router.candidate` picker option (`_meta.router_acp.available/unavailable_reason/resets_at`) at `session/new`, and the full current cordon set also rides every turn's routing metadata as `_meta.router_acp.usage_cordons` so a client that cached the candidate list can refresh availability mid-session. Gate the whole mechanism with `cordon.enabled`.
 - The shared usage snapshots are safe to consume across credential changes: `account` identifies the seat, while the additive optional `access_generation` identifies the access credential used for that fetch. Missing or legacy generation data, malformed credentials, and cache contention are unknown. A 401 or probe result alone is unknown. Only a definitive current-generation refresh rejection is durable authentication evidence.
-- **Outage failover.** If the pinned model fails mid-session (process death, connection loss, provider overload) or hits a limit, the router fails the session over to the next best candidate: the failure and its reason are announced in the transcript, the strategy re-ranks the remaining pool, a fresh downstream session is opened (mode re-applied), and the prompt is retried there, seeded with the same truncated log transcript a switch falls back to (the failed model is in no state to summarize), so the replacement continues the work. Hot failover also works after partial output: the replacement receives the partial response and tool statuses with continuation instructions to inspect uncertain effects and avoid repeating completed actions. Availability is watched during the turn, so an account or model cordon interrupts that session and triggers the same handoff. Client cancellation never triggers failover. Configure with `failover.enabled` / `failover.max_attempts`.
+- **Outage failover.** If the pinned model fails mid-session (process death, connection loss, provider overload) or hits a limit, the router fails the session over to the next best candidate: the failure and its reason are announced in the transcript, the strategy re-ranks the remaining pool, a fresh downstream session is opened (mode re-applied), and the prompt is retried there, given the same SQLite history lookup reference a switch falls back to (the failed model is in no state to summarize), so the replacement continues the work. Hot failover also works after partial output: the replacement looks up the partial response and tool statuses with continuation instructions to inspect uncertain effects and avoid repeating completed actions. Availability is watched during the turn, so an account or model cordon interrupts that session and triggers the same handoff. Client cancellation never triggers failover. Configure with `failover.enabled` / `failover.max_attempts`.
 - **Automatic respawn.** A downstream process that died is respawned and re-probed at the next routing decision (subject to `failover.respawn_cooldown_secs`), so a recovered agent rejoins the pool without restarting the router. An explicit switch to a dead model revives it immediately, cooldown or not.
 
 ### Headroom, quarantine, and availability-aware preference
@@ -305,7 +305,7 @@ The router strips the tag (downstream models never see it), fails loudly on inva
 
 ## Switching models mid-session
 
-A pinned session isn't stuck. Because ACP can't transfer a live transcript between agents, the router bridges with a **summary**: it asks the current model to write a handoff (task, decisions, files touched, what's left), opens a fresh downstream session on the target, prepends that summary to your next prompt, re-pins, and closes the old session — the summary turn is captured internally, never shown, and the switch is disclosed like any other routing decision. **If the old model can't summarize** (offline, rate-limited, spend-capped, crashed, refuses), the router falls back to a truncated transcript reconstructed from its own SQLite `session_log` and seeds that instead — so a switch, including an auto-upgrade fired *because* the model is failing, still completes without the dead model's help. A model that is cordoned, quarantined, or dead is not asked for a summary at all, and a summary refused with a limit error cordons it.
+A pinned session isn't stuck. Because ACP can't transfer a live transcript between agents, the router bridges with a **summary**: it asks the current model to write a handoff (task, decisions, files touched, what's left), opens a fresh downstream session on the target, prepends that summary to your next prompt, re-pins, and closes the old session — the summary turn is captured internally, never shown, and the switch is disclosed like any other routing decision. **If the old model can't summarize** (offline, rate-limited, spend-capped, crashed, refuses), the router provides the session id and a SQLite history lookup command for the incoming agent — so a switch, including an auto-upgrade fired *because* the model is failing, still completes without the dead model's help. A model that is cordoned, quarantined, or dead is not asked for a summary at all, and a summary refused with a limit error cordons it.
 
 Three triggers:
 
@@ -552,6 +552,12 @@ per-credential OS locking. The lock covers only login, automatic repair, and
 removal. It never covers a session or model turn. Adapter runtime stores are
 private and access-only.
 
+Grok uses `GROK_HOME` when set, with `HOME/.grok` as its legacy fallback.
+Symlinked stores retain their canonical identity for locking and shared-account
+removal protection. Native login writes that store without changing the
+configured HOME. Each adapter gets a private GROK_HOME and an access-only token
+hook, including when the canonical directory has a different basename.
+
 ```mermaid
 flowchart TD
     E[Session reports an authentication error] --> L[Acquire this credential's shared lock]
@@ -578,12 +584,16 @@ Do not launch a provider CLI against canonical credentials outside the router.
 
 ## Session lifecycle
 
-`session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are implemented end-to-end and advertised **only when at least one downstream supports them**:
+`session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are router capabilities. They do not depend on provider lifecycle support:
 
-- `list` merges downstream lists, rewriting downstream ids to router ids via the state file (sessions the router can't route back are omitted).
-- `load`/`resume` require a known router session id in the state file, route to the owning downstream only, rehydrate the pin before any prompt, reattach the router's own tools (delegation, managed terminals), and relay replayed transcript updates under the router id. `router-acp prompt --session` does the same without a client (see [Host-directed workers](#host-directed-workers)).
-- `delete` routes to the owning downstream, then removes router state.
-- `close` closes the live downstream session (state-file entries survive so `load`/`resume` keep working when the downstream persists sessions).
+- `session/new` saves the router id and configuration before the first prompt. `_meta.router_acp.continue_from` snapshots another router conversation into the new id.
+- Every user content block and downstream update is stored in SQLite without a row or character cap.
+- `load` and `resume` require a known router id. They restore routing settings and open a fresh private adapter runtime. The incoming agent receives the router session id, SQLite database path, and a runnable history lookup command, then retrieves the records it needs itself. Provider-local session files are optional.
+- `load` also replays saved ACP updates to the client. `resume` restores model context without duplicating a host's existing UI transcript.
+- `list` reads router SQLite. `close` ends the live adapter but retains the conversation. `delete` removes the router conversation.
+- Unknown ids fail. SQLite write failures fail the ACP operation rather than creating an unresumable conversation.
+
+Hosts own presentation state and queued UI actions. They must retain the router id and call these lifecycle methods. They must not synthesize an LLM recap or manage provider conversation files.
 
 ## Troubleshooting
 

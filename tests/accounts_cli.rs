@@ -644,6 +644,73 @@ agents:
 }
 
 #[tokio::test]
+async fn standalone_grok_delete_preserves_a_shared_symlinked_store() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let durable = root.path().join("durable-grok");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&durable).unwrap();
+    let alias = home.join(".grok");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&durable, &alias).unwrap();
+    let credential = durable.join("auth.json");
+    let before = br#"{"https://accounts.x.ai/sign-in":{"key":"synthetic-access","refresh_token":"synthetic-refresh"}}"#;
+    std::fs::write(&credential, before).unwrap();
+    let config = root.path().join("router.yaml");
+    std::fs::write(&config, format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n  - name: grok\n    command: {{type: stdio, command: {}, env: [{{name: HOME, value: {}}}, {{name: GROK_HOME, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: grok, cost_rank: 1}}]\n  - name: grok@alias\n    command: {{type: stdio, command: {}, env: [{{name: HOME, value: {}}}, {{name: GROK_HOME, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: grok, cost_rank: 1}}]\n",
+        root.path().join("state.db").display(),
+        env!("CARGO_BIN_EXE_mock-agent"), home.display(), durable.display(),
+        env!("CARGO_BIN_EXE_mock-agent"), home.display(), alias.display()
+    )).unwrap();
+    let mut client = spawn_with_env(&config, &[("GROK_HOME", durable.to_str().unwrap())]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":home,"mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    client
+        .answers
+        .extend(["3".into(), "1".into(), "2".into(), "2".into()]);
+    client.prompt(&sid, "/login").await;
+    assert!(
+        client.text().contains(
+            "Credentials were retained because another configured account shares that directory"
+        ),
+        "{}",
+        client.text()
+    );
+    assert_eq!(std::fs::read(&credential).unwrap(), before);
+    let saved = router_acp::config::Config::from_file(&config).unwrap();
+    assert_eq!(
+        saved
+            .agents
+            .iter()
+            .filter(|agent| !agent.account_disabled)
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["grok@alias"]
+    );
+    assert!(
+        saved
+            .agents
+            .iter()
+            .any(|agent| agent.name == "grok" && agent.account_disabled)
+    );
+    client
+        .answers
+        .extend(["3".into(), "1".into(), "2".into(), "2".into()]);
+    client.prompt(&sid, "/login").await;
+    assert!(!credential.exists());
+    client.close().await;
+}
+
+#[tokio::test]
 async fn standalone_usage_reads_two_account_snapshots_without_spawning_provider_commands() {
     let (_dir, config, home, bin, provider_marker, curl_marker) = cache_usage_fixture();
     let path = format!(
@@ -1007,6 +1074,11 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         text.contains("Signed in as fixture-new@example.test"),
         "{text}"
     );
+    let updates = serde_json::to_string(&client.events).unwrap();
+    assert!(
+        !updates.contains("downstream connection failed"),
+        "planned account replacement must not publish a downstream failure: {updates}"
+    );
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
     assert_eq!(cfg.agents.len(), 1);
     let account = &cfg.agents[0];
@@ -1149,16 +1221,28 @@ async fn standalone_relogin_cancel_keeps_membership_and_kills_login() {
         "{response}\n{}",
         client.text()
     );
+    let delivered = log_events(&fixture.original_log)
+        .into_iter()
+        .rfind(|event| event["event"] == "prompt")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(delivered.contains(&sid) && delivered.contains("after cancelled re-login"));
+    assert!(!delivered.contains("context before cancelled re-login"));
+    let command = delivered
+        .lines()
+        .find(|line| line.contains(" transcript --state "))
+        .unwrap();
+    let output = std::process::Command::new("sh")
+        .args(["-c", command.trim()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     assert!(
-        log_events(&fixture.original_log).iter().any(|event| {
-            event["event"] == "prompt"
-                && event["text"].as_str().is_some_and(|text| {
-                    text.contains("context before cancelled re-login")
-                        && text.contains("after cancelled re-login")
-                })
-        }),
-        "cancelled re-login did not hand off the pinned transcript: {:?}",
-        log_events(&fixture.original_log)
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("context before cancelled re-login")
     );
     client.close().await;
 }
@@ -1210,16 +1294,28 @@ async fn standalone_failed_relogin_preserves_credentials_and_hands_off_pinned_se
         "{response}\n{}",
         client.text()
     );
+    let delivered = log_events(&fixture.original_log)
+        .into_iter()
+        .rfind(|event| event["event"] == "prompt")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(delivered.contains(&sid) && delivered.contains("after failed re-login"));
+    assert!(!delivered.contains("context before failed re-login"));
+    let command = delivered
+        .lines()
+        .find(|line| line.contains(" transcript --state "))
+        .unwrap();
+    let output = std::process::Command::new("sh")
+        .args(["-c", command.trim()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     assert!(
-        log_events(&fixture.original_log).iter().any(|event| {
-            event["event"] == "prompt"
-                && event["text"].as_str().is_some_and(|text| {
-                    text.contains("context before failed re-login")
-                        && text.contains("after failed re-login")
-                })
-        }),
-        "failed re-login did not hand off the pinned transcript: {:?}",
-        log_events(&fixture.original_log)
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("context before failed re-login")
     );
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
     assert_eq!(cfg.agents[0].name, "claude@old");

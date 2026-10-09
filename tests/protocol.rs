@@ -1223,7 +1223,7 @@ async fn account_commands_survive_goose_turn_context_block() {
 }
 
 #[tokio::test]
-async fn declared_model_missing_downstream_is_removed() {
+async fn declared_model_missing_downstream_is_omitted_from_client_options() {
     let state = temp_state_file("missing-model");
     // Config declares m1 and bogus; mock only offers m1.
     let yaml = format!(
@@ -1237,7 +1237,7 @@ async fn declared_model_missing_downstream_is_removed() {
     run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let session = new_session(&cx).await?;
-        // The router.candidate select must offer m1 but not bogus.
+        // The router.candidate select is the supported-model contract.
         let options = session.config_options.clone().unwrap_or_default();
         let candidate_opt = options
             .iter()
@@ -1246,16 +1246,14 @@ async fn declared_model_missing_downstream_is_removed() {
         let SessionConfigKind::Select(select) = &candidate_opt.kind else {
             panic!("router.candidate must be a select");
         };
-        let values: Vec<String> = match &select.options {
-            SessionConfigSelectOptions::Grouped(groups) => groups
-                .iter()
-                .flat_map(|g| g.options.iter().map(|o| o.value.0.to_string()))
-                .collect(),
-            SessionConfigSelectOptions::Ungrouped(opts) => {
-                opts.iter().map(|o| o.value.0.to_string()).collect()
+        let choices: Vec<_> = match &select.options {
+            SessionConfigSelectOptions::Grouped(groups) => {
+                groups.iter().flat_map(|g| g.options.iter()).collect()
             }
+            SessionConfigSelectOptions::Ungrouped(opts) => opts.iter().collect(),
             _ => vec![],
         };
+        let values: Vec<_> = choices.iter().map(|o| o.value.0.to_string()).collect();
         assert!(
             values.contains(&"mock/m1".to_string()),
             "values: {values:?}"
@@ -3395,7 +3393,10 @@ async fn mid_session_rate_limit_fails_over_on_later_prompt() {
         // The replacement is seeded with the transcript, then the turn.
         let answer = text.rsplit("echo:haiku:").next().unwrap_or_default();
         assert!(
-            answer.contains("turn one") && answer.contains("turn two"),
+            answer.contains("transcript --state")
+                && answer.contains(&sid)
+                && !answer.contains("turn one")
+                && answer.contains("turn two"),
             "answer arrived with prior context: {text}"
         );
         Ok(())
@@ -3404,7 +3405,82 @@ async fn mid_session_rate_limit_fails_over_on_later_prompt() {
 }
 
 #[tokio::test]
-async fn context_overflow_fails_over_to_a_larger_window_and_carries_a_transcript() {
+async fn resume_of_oversized_history_provides_only_sqlite_lookup() {
+    let state = temp_state_file("resume-character-overflow");
+    let log = temp_log("resume-character-overflow");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nauto_upgrade: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "fancy",
+            &[("opus", 3)],
+            &[("MOCK_LOG", log.to_str().unwrap()),]
+        ),
+        agent_yaml(
+            "cheap",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "turn one").await?;
+        let output = "saved tool output ".repeat(90_000);
+        shared.state.lock().unwrap().log(
+            &sid,
+            &router_acp::state::LogEntry {
+                kind: "tool_call".into(),
+                role: "agent".into(),
+                summary: "completed inspection".into(),
+                detail: Some(serde_json::json!({"output": output})),
+                ..Default::default()
+            },
+        );
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+        cx.send_request(
+            agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(),
+                std::env::temp_dir(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let response = prompt_text(&cx, &sid, "continue the work").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|event| event["event"] == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        let replacement = prompts.last().unwrap()["text"].as_str().unwrap();
+        assert!(
+            replacement.len() < 4_000,
+            "overflowing history was replayed: {}",
+            replacement.len()
+        );
+        assert!(!replacement.contains("turn one") && !replacement.contains("saved tool output"));
+        assert!(replacement.contains(&sid) && replacement.contains("transcript --state"));
+        assert!(replacement.contains("continue the work"));
+        let stored = shared.state.lock().unwrap().log_for_all(&sid).unwrap();
+        assert!(stored.iter().any(|entry| {
+            entry
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("output"))
+                .and_then(|value| value.as_str())
+                == Some(output.as_str())
+        }));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn context_overflow_fails_over_to_a_larger_window_with_sqlite_lookup() {
     // The dead-end this reproduces: a resumed session pinned on a small-window
     // model hits `Compacting failed: too_few_groups` then `Prompt is too long`.
     // Before ContextOverflow existed this classified as `Other`, which
@@ -3471,11 +3547,11 @@ async fn context_overflow_fails_over_to_a_larger_window_and_carries_a_transcript
             "failed over to the larger-window candidate: {text}"
         );
         assert!(
-            text.contains("carrying a truncated transcript"),
+            text.contains("providing a SQLite history lookup reference"),
             "fresh session told it isn't starting blind: {text}"
         );
         assert!(
-            text.contains("prior context carried over as a truncated transcript"),
+            text.contains("prior conversation is available through SQLite lookup"),
             "the failover note reflects that context DID transfer here: {text}"
         );
         assert!(
@@ -3486,7 +3562,7 @@ async fn context_overflow_fails_over_to_a_larger_window_and_carries_a_transcript
         // block carrying the earlier turn — not a blind `turn two`.
         assert!(text.contains("echo:haiku:"), "answer arrived: {text}");
         assert!(
-            text.contains("Assistant: echo:opus:turn one"),
+            text.contains(&sid) && text.contains("transcript --state"),
             "the earlier turn reached the new model: {text}"
         );
 
@@ -3507,7 +3583,7 @@ async fn context_overflow_fails_over_to_a_larger_window_and_carries_a_transcript
 }
 
 #[tokio::test]
-async fn hot_failover_after_output_carries_partial_text_and_completed_tools() {
+async fn hot_failover_after_output_provides_history_lookup_and_continuation() {
     let state = temp_state_file("hot-failover");
     let log = temp_log("hot-failover");
     let yaml = format!(
@@ -3546,11 +3622,12 @@ async fn hot_failover_after_output_carries_partial_text_and_completed_tools() {
         assert!(
             handoff.contains("Hot failover:")
                 && handoff.contains("Do not repeat completed actions")
-                && handoff.contains("partial output before crash"),
+                && handoff.contains(&sid)
+                && !handoff.contains("partial output before crash"),
             "successor receives partial text and continuation instructions: {handoff}"
         );
         assert!(
-            handoff.contains("Tool: Bash [completed]") && handoff.contains("write-file"),
+            handoff.contains("transcript --state") && handoff.contains("write-file"),
             "tool evidence carried: {handoff}"
         );
         Ok(())
@@ -3592,7 +3669,7 @@ async fn chained_hot_failover_preserves_completed_tools_across_a_silent_failure(
         let handoff = prompts[0]["text"].as_str().unwrap();
         assert!(
             handoff.contains("Hot failover:")
-                && handoff.contains("Tool: Bash [completed]")
+                && handoff.contains("transcript --state")
                 && handoff.contains("write-file"),
             "third model retains the original tool evidence: {handoff}"
         );
@@ -3639,7 +3716,9 @@ async fn downstream_death_between_turns_fails_over_with_prior_context() {
             .collect();
         let handoff = prompts.last().unwrap()["text"].as_str().unwrap();
         assert!(
-            handoff.contains("Assistant: echo:opus:remember 4271")
+            handoff.contains("transcript --state")
+                && handoff.contains(&sid)
+                && !handoff.contains("remember 4271")
                 && handoff.contains("second task"),
             "replacement receives both turns: {handoff}"
         );
@@ -4102,10 +4181,8 @@ async fn title_generation_does_not_hijack_the_pin() {
             "---BEGIN USER MESSAGES--- do stuff ---END USER MESSAGES---               Generate a short title for the above messages.",
         )
         .await?;
-        assert!(
-            open_state(&state_path).get(&sid).is_none(),
-            "title-gen must not create a pinned session row"
-        );
+        let unpinned = open_state(&state_path).get(&sid).expect("session/new persists its router id");
+        assert!(unpinned.agent.is_empty() && unpinned.downstream_session_id.is_empty());
 
         // Real prompt WITH a directive now pins per the directive, not the
         // default the title-gen would have caused.
@@ -4432,6 +4509,118 @@ async fn switch_starts_a_target_skipped_at_boot_and_hands_off() {
 }
 
 #[tokio::test]
+async fn config_refresh_advertises_a_target_signed_in_after_boot() {
+    let state = temp_state_file("config-refresh-signed-in");
+    let a_log = temp_log("config-refresh-signed-in-a");
+    let b_log = temp_log("config-refresh-signed-in-b");
+    let credential = claude_credential_fixture(Some("Rejected"));
+    let yaml = logged_out_at_boot_yaml(&state, &a_log, &b_log, credential.path(), &[]);
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        let before = serde_json::to_value(&session.config_options)?;
+        let before_text = serde_json::to_string(&before)?;
+        assert!(
+            before_text.contains("claude@cold/m2"),
+            "configured target stays visible"
+        );
+        assert!(
+            before_text.contains("\"available\":false"),
+            "signed-out target is disabled"
+        );
+
+        std::fs::remove_file(credential.path().join(".router-acp-auth.json")).unwrap();
+        let refreshed = cx
+            .send_request(
+                SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "router.effort".to_string(),
+                    SessionConfigOptionValue::value_id("auto"),
+                )
+                .meta(
+                    serde_json::json!({"router_acp": {"refresh_provider": "claude"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .block_task()
+            .await?;
+
+        let refreshed = serde_json::to_string(&refreshed.config_options)?;
+        assert!(
+            refreshed.contains("claude@cold/m2"),
+            "completed login stays visible"
+        );
+        assert!(
+            !refreshed.contains("\"available\":false"),
+            "completed login becomes available: {refreshed}"
+        );
+        assert!(
+            observed.lock().unwrap().updates.iter().any(|notification| {
+                notification.session_id.0.as_ref() == sid
+                    && matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+            }),
+            "completed login publishes a config update"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn candidate_status_change_publishes_disabled_model() {
+    let state = temp_state_file("candidate-status-update");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        observed.lock().unwrap().updates.clear();
+
+        let key = shared.target_keys().into_iter().next().unwrap();
+        shared.mark_target_dead(&key, "provider unavailable");
+
+        for _ in 0..50 {
+            if observed.lock().unwrap().updates.iter().any(|notification| {
+                notification.session_id.0.as_ref() == sid
+                    && matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let updates = observed.lock().unwrap();
+        let notification = updates
+            .updates
+            .iter()
+            .find(|notification| {
+                notification.session_id.0.as_ref() == sid
+                    && matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+            })
+            .expect("candidate status change publishes a config update");
+        let value = serde_json::to_value(notification).unwrap();
+        assert_eq!(
+            value.pointer("/update/configOptions/1/options/1/options/0/_meta/router_acp/available"),
+            Some(&serde_json::json!(false)),
+            "notification: {value}"
+        );
+        assert!(
+            value.to_string().contains("provider unavailable"),
+            "notification: {value}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn switch_to_a_still_signed_out_target_fails_before_the_summary() {
     let state = temp_state_file("switch-boot-signed-out");
     let a_log = temp_log("switch-boot-signed-out-a");
@@ -4598,7 +4787,7 @@ async fn switch_to_unknown_candidate_fails_the_turn_and_keeps_the_session() {
 }
 
 #[tokio::test]
-async fn switch_falls_back_to_log_transcript_when_summary_fails() {
+async fn switch_falls_back_to_sqlite_lookup_when_summary_fails() {
     // When the outgoing model can't summarize (here: a/m1 fails every prompt
     // after the first — a token limit / outage), the handoff is reconstructed
     // from the state-DB logs and seeded into the new model.
@@ -4635,9 +4824,11 @@ async fn switch_falls_back_to_log_transcript_when_summary_fails() {
         let text = agent_text(&observed, &sid);
         assert!(text.contains("switched a/m1 → b/m2"), "switched: {text}");
         assert!(text.contains("echo:m2:"), "ran on b/m2: {text}");
-        // The fallback transcript carried the prior turn's content to b/m2.
+        let answer = text.rsplit("echo:m2:").next().unwrap_or_default();
         assert!(
-            text.contains("4271"),
+            answer.contains("transcript --state")
+                && answer.contains(&sid)
+                && !answer.contains("4271"),
             "log transcript carried prior context: {text}"
         );
         // The disclosure explains that the fallback (not a model summary) was used.
@@ -4715,7 +4906,7 @@ async fn model_shorthand_revives_a_dead_target_and_switches_to_it() {
 }
 
 #[tokio::test]
-async fn spend_capped_model_is_cordoned_and_handoff_uses_the_transcript() {
+async fn spend_capped_model_is_cordoned_and_handoff_provides_sqlite_lookup() {
     // The live failure: Sol's plan hit codex's workspace spend cap, so its
     // handoff summary errored. The switch must still land, seeded from the
     // log transcript, and the capped model must be cordoned.
@@ -4749,7 +4940,12 @@ async fn spend_capped_model_is_cordoned_and_handoff_uses_the_transcript() {
         let text = agent_text(&observed, &sid);
         assert!(text.contains("switched a/m1 → b/m2"), "switched: {text}");
         assert!(text.contains("echo:m2:"), "ran on b/m2: {text}");
-        assert!(text.contains("4271"), "transcript carried context: {text}");
+        let answer = text.rsplit("echo:m2:").next().unwrap_or_default();
+        assert!(
+            answer.contains("transcript --state")
+                && answer.contains(&sid)
+                && !answer.contains("4271")
+        );
         let a = CandidateId::parse("a/m1").unwrap();
         assert!(
             shared.headroom.lock().unwrap().usage_cordon(&a).is_some(),
@@ -4761,7 +4957,7 @@ async fn spend_capped_model_is_cordoned_and_handoff_uses_the_transcript() {
 }
 
 #[tokio::test]
-async fn spend_cap_failover_carries_the_transcript_to_the_new_model() {
+async fn spend_cap_failover_provides_sqlite_lookup_to_the_new_model() {
     // Failover off a capped pin used to start the replacement blind (only a
     // context overflow seeded the transcript), so it could not continue.
     let state = temp_state_file("failover-transcript");
@@ -4791,7 +4987,9 @@ async fn spend_cap_failover_carries_the_transcript_to_the_new_model() {
         assert!(text.contains("spend limit"), "cap recognized: {text}");
         let answer = text.rsplit("echo:haiku:").next().unwrap_or_default();
         assert!(
-            answer.contains("4271"),
+            answer.contains("transcript --state")
+                && answer.contains(&sid)
+                && !answer.contains("4271"),
             "replacement got the transcript: {text}"
         );
         Ok(())
@@ -6651,17 +6849,22 @@ async fn lifecycle_list_load_delete_roundtrip() {
             .block_task()
             .await?;
         assert!(load.config_options.is_some());
-        // The replayed transcript update relays under the router id.
+        // The router replays its own SQLite transcript under the router id.
         let text = agent_text(&observed, &sid);
         assert!(
-            text.contains("replayed:mock-sess-"),
+            text.contains("echo:m1:persist me"),
             "replay relayed: {text}"
         );
 
         // The rehydrated pin routes follow-up prompts to the same session.
         let resp = prompt_text(&cx, &sid, "after load").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        assert!(agent_text(&observed, &sid).contains("echo:m1:after load"));
+        let restored = agent_text(&observed, &sid);
+        assert!(
+            restored.contains("after load"),
+            "follow-up delivered: {restored}"
+        );
+        assert!(restored.contains("<resumed-conversation-context>"));
 
         // Delete removes downstream and router state.
         cx.send_request(agent_client_protocol::schema::v1::DeleteSessionRequest::new(sid.clone()))
@@ -6675,7 +6878,7 @@ async fn lifecycle_list_load_delete_roundtrip() {
 }
 
 #[tokio::test]
-async fn mock_lifecycle_capabilities_not_advertised_when_unsupported() {
+async fn router_lifecycle_capabilities_are_independent_of_downstream_support() {
     let state = temp_state_file("caps-adv");
     let yaml = format!(
         "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
@@ -6685,10 +6888,10 @@ async fn mock_lifecycle_capabilities_not_advertised_when_unsupported() {
     run_test(yaml, async |cx, _observed| {
         let init_resp = init(&cx).await?;
         let caps = &init_resp.agent_capabilities;
-        assert!(!caps.load_session);
-        assert!(caps.session_capabilities.list.is_none());
-        assert!(caps.session_capabilities.resume.is_none());
-        assert!(caps.session_capabilities.close.is_none());
+        assert!(caps.load_session);
+        assert!(caps.session_capabilities.list.is_some());
+        assert!(caps.session_capabilities.resume.is_some());
+        assert!(caps.session_capabilities.close.is_some());
         // The mock advertises embedded_context: the union carries it.
         assert!(caps.prompt_capabilities.embedded_context);
         assert!(!caps.prompt_capabilities.image);
@@ -7141,7 +7344,9 @@ async fn cordon_during_active_tool_turn_interrupts_and_continues_on_peer() {
         assert_eq!(prompts.len(), 1, "one continuation reaches the peer");
         let handoff = prompts[0]["text"].as_str().unwrap();
         assert!(
-            handoff.contains("Tool: Edit [completed]"),
+            handoff.contains("transcript --state")
+                && handoff.contains(&sid)
+                && !handoff.contains("Tool: Edit [completed]"),
             "handoff preserves tool status: {handoff}"
         );
         Ok(())
@@ -7194,7 +7399,8 @@ async fn cordon_after_terminal_callback_without_text_uses_hot_continuation() {
         let handoff = prompts[0]["text"].as_str().unwrap();
         assert!(
             handoff.contains("Hot failover:")
-                && handoff.contains("Tool: terminal/create [requested; completion unknown]"),
+                && handoff.contains("transcript --state")
+                && handoff.contains(&sid),
             "callback side effects must reach the handoff: {handoff}"
         );
         Ok(())

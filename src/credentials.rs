@@ -33,9 +33,7 @@ pub(crate) fn directory(agent: &AgentConfig) -> Option<PathBuf> {
     let dir = match crate::accounts::provider(agent)? {
         "claude" => agent.config_dir("CLAUDE_CONFIG_DIR", ".claude"),
         "codex" => agent.config_dir("CODEX_HOME", ".codex"),
-        "grok" => agent
-            .env_var("HOME")
-            .map(|h| PathBuf::from(h).join(".grok")),
+        "grok" => agent.config_dir("GROK_HOME", ".grok"),
         "kimi" => agent
             .env_var("KIMI_SHARE_DIR")
             .or_else(|| agent.env_var("KIMI_CODE_HOME"))
@@ -177,8 +175,19 @@ pub(crate) async fn runtime(
         let name = entry.file_name();
         if name == ".credentials.json"
             || name == "auth.json"
-            || (provider == "kimi"
+            || ((provider == "kimi"
                 && (name == "credentials" || name == "config.toml" || name == "config.json"))
+                || (matches!(provider, "codex" | "grok") && name == "config.toml"))
+            || matches!(
+                name.to_string_lossy().as_ref(),
+                "projects"
+                    | "sessions"
+                    | "archived_sessions"
+                    | "history.jsonl"
+                    | "session_log"
+                    | "session.db"
+                    | "sessions.db"
+            )
             || name.to_string_lossy().starts_with(".router-acp-")
         {
             continue;
@@ -186,6 +195,9 @@ pub(crate) async fn runtime(
         #[cfg(unix)]
         std::os::unix::fs::symlink(entry.path(), runtime.root.join(name))
             .map_err(|_| "Could not preserve adapter configuration")?;
+    }
+    if matches!(provider, "codex" | "grok") {
+        write_runtime_config(provider, &dir, &runtime.root)?;
     }
     let mut value = credential.map(|c| c.value).unwrap_or_else(|| json!({}));
     if provider == "claude" {
@@ -275,19 +287,31 @@ pub(crate) async fn runtime(
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "router-acp".into());
         let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        let helper = format!(
-            "{} credential-token --provider grok --directory {} --runtime-directory {}",
+        let helper = runtime.root.join(".router-acp-auth-provider");
+        let script = format!(
+            "#!/bin/sh\nexec {} credential-token --provider grok --directory {} --runtime-directory {}\n",
             quote(&binary),
             quote(&dir.to_string_lossy()),
             quote(&runtime.root.to_string_lossy()),
         );
+        write_private_bytes(&helper, script.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| "Could not isolate Grok authentication")?;
+        }
         write_private(
             &runtime.root.join(".router-acp-token.json"),
             &json!({"generation":runtime.generation}),
         )?;
-        env.retain(|(k, _)| k != "HOME" && k != "GROK_AUTH_PROVIDER_COMMAND");
+        env.retain(|(k, _)| k != "HOME" && k != "GROK_HOME" && k != "GROK_AUTH_PROVIDER_COMMAND");
         env.push(("HOME".into(), isolated_home.to_string_lossy().into()));
-        env.push(("GROK_AUTH_PROVIDER_COMMAND".into(), helper));
+        env.push(("GROK_HOME".into(), runtime.root.to_string_lossy().into()));
+        env.push((
+            "GROK_AUTH_PROVIDER_COMMAND".into(),
+            helper.to_string_lossy().into(),
+        ));
     } else {
         write_private(
             &runtime.root.join(if provider == "claude" {
@@ -306,6 +330,85 @@ pub(crate) async fn runtime(
         env.push((variable.into(), runtime.root.to_string_lossy().into()));
     }
     Ok(Some(runtime))
+}
+
+fn write_runtime_config(provider: &str, dir: &Path, root: &Path) -> Result<(), String> {
+    let source = dir.join("config.toml");
+    let mut config = if source.exists() {
+        toml::from_str(
+            &std::fs::read_to_string(&source)
+                .map_err(|_| format!("{provider} configuration unavailable"))?,
+        )
+        .map_err(|_| format!("Invalid {provider} configuration"))?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let root_table = config
+        .as_table_mut()
+        .ok_or_else(|| format!("Invalid {provider} configuration"))?;
+    match provider {
+        "codex" => {
+            let features = root_table
+                .entry("features")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .ok_or("Invalid codex configuration")?;
+            features.insert(
+                "default_mode_request_user_input".into(),
+                toml::Value::Boolean(true),
+            );
+        }
+        "grok" => {
+            let folder_trust = root_table
+                .entry("folder_trust")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .ok_or("Invalid grok configuration")?;
+            folder_trust.insert("enabled".into(), toml::Value::Boolean(false));
+
+            let skills = root_table
+                .entry("skills")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .ok_or("Invalid grok configuration")?;
+            merge_toml_strings(
+                skills,
+                "disabled",
+                &["resume-codex", "resume-claude", "resume-cursor"],
+            )?;
+            merge_toml_strings(
+                skills,
+                "ignore",
+                &[
+                    "~/.grok/bundled/skills/resume-codex",
+                    "~/.grok/bundled/skills/resume-claude",
+                    "~/.grok/bundled/skills/resume-cursor",
+                ],
+            )?;
+        }
+        _ => return Ok(()),
+    }
+    let config = toml::to_string(&config)
+        .map_err(|_| format!("Could not isolate {provider} configuration"))?;
+    write_private_bytes(&root.join("config.toml"), config.as_bytes())
+}
+
+fn merge_toml_strings(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    required: &[&str],
+) -> Result<(), String> {
+    let values = table
+        .entry(key)
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("Invalid grok configuration")?;
+    for required in required {
+        if !values.iter().any(|value| value.as_str() == Some(*required)) {
+            values.push(toml::Value::String((*required).into()));
+        }
+    }
+    Ok(())
 }
 
 fn read(agent: &AgentConfig) -> Option<Credential> {
@@ -331,10 +434,13 @@ fn read(agent: &AgentConfig) -> Option<Credential> {
                 .or_else(|| value.get("OPENAI_API_KEY")),
             value.pointer("/tokens/refresh_token"),
         ],
-        "grok" => [
-            value.get(GROK_LOGIN).and_then(|v| v.get("key")),
-            value.get(GROK_LOGIN).and_then(|v| v.get("refresh_token")),
-        ],
+        "grok" => {
+            let auth = grok_auth(&value);
+            [
+                auth.and_then(|v| v.get("key")),
+                auth.and_then(|v| v.get("refresh_token")),
+            ]
+        }
         "kimi" => [value.get("access_token"), value.get("refresh_token")],
         _ => return None,
     };
@@ -380,7 +486,7 @@ pub(crate) fn access_generation(agent: &AgentConfig) -> Option<String> {
             .value
             .pointer("/tokens/access_token")
             .or_else(|| credential.value.get("OPENAI_API_KEY")),
-        "grok" => credential.value.get(GROK_LOGIN)?.get("key"),
+        "grok" => grok_auth(&credential.value)?.get("key"),
         "kimi" => credential.value.get("access_token"),
         _ => None,
     }?
@@ -408,7 +514,7 @@ pub(crate) async fn observe_request_success(agent: &AgentConfig, observed: &str)
     record_success(agent);
 }
 
-fn record_success(agent: &AgentConfig) {
+pub(crate) fn record_success(agent: &AgentConfig) {
     let Some(credential) = read(agent) else {
         return;
     };
@@ -474,6 +580,14 @@ pub fn availability(agent: &AgentConfig) -> AuthAvailability {
         },
         _ => AuthAvailability::Unknown,
     }
+}
+
+/// Whether the canonical store contains usable credential material.
+///
+/// This is separate from availability: an unprobed credential is present but
+/// still has unknown authentication status.
+pub fn present(agent: &AgentConfig) -> bool {
+    read(agent).is_some()
 }
 
 /// OS locks release on cancellation, crash and process exit. There is no
@@ -781,6 +895,47 @@ async fn refresh(mut value: Value, provider: String) -> Refresh {
 }
 
 const GROK_LOGIN: &str = "https://accounts.x.ai/sign-in";
+const GROK_LOGIN_PREFIX: &str = "https://auth.x.ai::";
+
+/// Grok 1.0.46 keys logins by issuer and principal id. Older releases used
+/// one fixed URL. Prefer the newest current-format entry, then accept legacy.
+pub(crate) fn grok_auth(value: &Value) -> Option<&Value> {
+    value
+        .as_object()?
+        .iter()
+        .filter(|(key, auth)| is_current_grok_auth(key, auth))
+        .max_by_key(|(_, auth)| {
+            auth.get("create_time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        })
+        .map(|(_, auth)| auth)
+        .or_else(|| value.get(GROK_LOGIN))
+}
+
+fn grok_auth_key(value: &Value) -> Option<String> {
+    value
+        .as_object()?
+        .iter()
+        .filter(|(key, auth)| is_current_grok_auth(key, auth))
+        .max_by_key(|(_, auth)| {
+            auth.get("create_time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        })
+        .map(|(key, _)| key.clone())
+        .or_else(|| value.get(GROK_LOGIN).map(|_| GROK_LOGIN.to_string()))
+}
+
+fn is_current_grok_auth(key: &str, auth: &Value) -> bool {
+    key.starts_with(GROK_LOGIN_PREFIX)
+        && auth.as_object().is_some()
+        && ["key", "refresh_token"].into_iter().any(|field| {
+            auth.get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+}
 
 async fn refresh_kimi(mut value: Value, host: &str) -> Refresh {
     let unknown = || Refresh {
@@ -860,9 +1015,10 @@ async fn refresh_grok(mut value: Value) -> Refresh {
         outcome: RepairOutcome::Unknown,
         value: None,
     };
-    let Some(auth) = value.get(GROK_LOGIN) else {
+    let Some(auth_key) = grok_auth_key(&value) else {
         return unknown();
     };
+    let auth = &value[&auth_key];
     let Some(token) = auth
         .get("refresh_token")
         .and_then(Value::as_str)
@@ -939,16 +1095,16 @@ async fn refresh_grok(mut value: Value) -> Refresh {
     else {
         return unknown();
     };
-    value[GROK_LOGIN]["key"] = access.into();
+    value[&auth_key]["key"] = access.into();
     if let Some(token) = body
         .get("refresh_token")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
     {
-        value[GROK_LOGIN]["refresh_token"] = token.into();
+        value[&auth_key]["refresh_token"] = token.into();
     }
     if let Some(seconds) = body.get("expires_in").and_then(Value::as_i64) {
-        value[GROK_LOGIN]["expires_at"] = (chrono::Utc::now() + chrono::Duration::seconds(seconds))
+        value[&auth_key]["expires_at"] = (chrono::Utc::now() + chrono::Duration::seconds(seconds))
             .to_rfc3339()
             .into();
     }
@@ -1013,10 +1169,7 @@ pub async fn token_for_helper(
         return Err("Credential refresh rejected. Sign in again with /login.".into());
     }
     let credential = read(&agent).ok_or("Grok credential unavailable")?;
-    let auth = credential
-        .value
-        .get(GROK_LOGIN)
-        .ok_or("Grok credential unavailable")?;
+    let auth = grok_auth(&credential.value).ok_or("Grok credential unavailable")?;
     let access = auth
         .get("key")
         .and_then(Value::as_str)
@@ -1052,9 +1205,7 @@ pub async fn token_for_helper(
 
 fn helper_agent(provider: &str, dir: &Path) -> Result<AgentConfig, String> {
     let (variable, value) = match provider {
-        "grok" if dir.file_name().and_then(|n| n.to_str()) == Some(".grok") => {
-            ("HOME", dir.parent().ok_or("Invalid credential directory")?)
-        }
+        "grok" => ("GROK_HOME", dir),
         "kimi" => ("KIMI_SHARE_DIR", dir),
         _ => return Err("Unsupported credential helper".into()),
     };
@@ -1146,6 +1297,263 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
         )
         .unwrap();
         (root, config.agents[0].clone())
+    }
+
+    #[tokio::test]
+    async fn grok_symlinked_store_keeps_helper_and_runtime_isolation() {
+        let (root, agent) = fixture("grok");
+        let legacy = root.path().join(".grok");
+        let durable = root.path().join("durable-grok");
+        std::fs::rename(&legacy, &durable).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&durable, &legacy).unwrap();
+        let before = std::fs::read(durable.join("auth.json")).unwrap();
+        let mut first_env = vec![("GROK_HOME".into(), durable.to_string_lossy().into())];
+        let mut second_env = first_env.clone();
+        let (first, second) = tokio::join!(
+            runtime(&agent, &mut first_env),
+            runtime(&agent, &mut second_env)
+        );
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert_ne!(first.root, second.root);
+        for (view, env) in [(&first, &first_env), (&second, &second_env)] {
+            assert_eq!(
+                env.iter()
+                    .filter(|(key, _)| key == "GROK_HOME")
+                    .collect::<Vec<_>>(),
+                vec![&("GROK_HOME".into(), view.root.to_string_lossy().into())]
+            );
+            let token = token_for_helper("grok", &durable, false, &view.root)
+                .await
+                .unwrap();
+            assert_eq!(token["access_token"], "synthetic-access");
+            assert!(token.get("refresh_token").is_none());
+            assert!(!view.root.join("auth.json").exists());
+        }
+        assert_eq!(std::fs::read(durable.join("auth.json")).unwrap(), before);
+        let helper = helper_agent("grok", &durable).unwrap();
+        assert_eq!(directory(&agent), directory(&helper));
+        let held = lock(&agent).await.unwrap();
+        assert!(
+            !std::process::Command::new("flock")
+                .args(["--nonblock"])
+                .arg(directory(&helper).unwrap().join(".router-acp-auth.lock"))
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn grok_reads_current_principal_key_and_retains_legacy_support() {
+        let current = json!({
+            "https://auth.x.ai::older": {
+                "key": "older-access",
+                "refresh_token": "older-refresh",
+                "create_time": "2026-10-07T00:00:00Z"
+            },
+            "https://auth.x.ai::current": {
+                "key": "current-access",
+                "refresh_token": "current-refresh",
+                "create_time": "2026-10-08T00:00:00Z",
+                "email": "grok@example.test"
+            }
+        });
+        assert_eq!(grok_auth(&current).unwrap()["key"], "current-access");
+        assert_eq!(
+            grok_auth_key(&current).as_deref(),
+            Some("https://auth.x.ai::current")
+        );
+
+        let legacy = json!({GROK_LOGIN: {"key": "legacy-access"}});
+        assert_eq!(grok_auth(&legacy).unwrap()["key"], "legacy-access");
+        assert_eq!(grok_auth_key(&legacy).as_deref(), Some(GROK_LOGIN));
+
+        let (_root, agent) = fixture("grok");
+        std::fs::write(
+            directory(&agent).unwrap().join("auth.json"),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert!(request_generation(&agent).is_some());
+        record_success(&agent);
+        assert_eq!(availability(&agent), AuthAvailability::Authenticated);
+    }
+
+    #[tokio::test]
+    async fn router_runtime_config_is_private_complete_and_preserves_custom_toml() {
+        for provider in ["codex", "grok"] {
+            let (_root, agent) = fixture(provider);
+            let canonical = directory(&agent).unwrap().join("config.toml");
+            let source = match provider {
+                "codex" => {
+                    r#"outside = "keep"
+[features]
+custom = "keep"
+[custom]
+flag = 7
+"#
+                }
+                "grok" => {
+                    r#"outside = "keep"
+[folder_trust]
+enabled = true
+scope = "custom"
+[skills]
+disabled = ["resume-codex", "custom-disabled"]
+ignore = ["custom/path"]
+custom_setting = "keep"
+[custom]
+flag = 7
+"#
+                }
+                _ => unreachable!(),
+            };
+            std::fs::write(&canonical, source).unwrap();
+            let before = std::fs::read(&canonical).unwrap();
+
+            let mut first_env = vec![];
+            let mut second_env = vec![];
+            let first = runtime(&agent, &mut first_env).await.unwrap().unwrap();
+            let second = runtime(&agent, &mut second_env).await.unwrap().unwrap();
+            let first_config = first.root.join("config.toml");
+            let second_config = second.root.join("config.toml");
+            assert_ne!(first.root, second.root);
+            assert!(
+                !std::fs::symlink_metadata(&first_config)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                !std::fs::symlink_metadata(&second_config)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&canonical).unwrap(), before);
+
+            let config: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&first_config).unwrap()).unwrap();
+            assert_eq!(config["outside"].as_str(), Some("keep"));
+            assert_eq!(config["custom"]["flag"].as_integer(), Some(7));
+            match provider {
+                "codex" => {
+                    assert_eq!(config["features"]["custom"].as_str(), Some("keep"));
+                    assert_eq!(
+                        config["features"]["default_mode_request_user_input"].as_bool(),
+                        Some(true)
+                    );
+                }
+                "grok" => {
+                    assert_eq!(config["folder_trust"]["scope"].as_str(), Some("custom"));
+                    assert_eq!(config["folder_trust"]["enabled"].as_bool(), Some(false));
+                    assert_eq!(config["skills"]["custom_setting"].as_str(), Some("keep"));
+                    let disabled = config["skills"]["disabled"].as_array().unwrap();
+                    for name in [
+                        "resume-codex",
+                        "resume-claude",
+                        "resume-cursor",
+                        "custom-disabled",
+                    ] {
+                        assert!(disabled.iter().any(|value| value.as_str() == Some(name)));
+                    }
+                    assert_eq!(
+                        disabled
+                            .iter()
+                            .filter(|value| value.as_str() == Some("resume-codex"))
+                            .count(),
+                        1
+                    );
+                    let ignored = config["skills"]["ignore"].as_array().unwrap();
+                    for path in [
+                        "~/.grok/bundled/skills/resume-codex",
+                        "~/.grok/bundled/skills/resume-claude",
+                        "~/.grok/bundled/skills/resume-cursor",
+                        "custom/path",
+                    ] {
+                        assert!(ignored.iter().any(|value| value.as_str() == Some(path)));
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            let second_before = std::fs::read(&second_config).unwrap();
+            write_private_bytes(&first_config, b"[runtime]\nchanged = true\n").unwrap();
+            assert_eq!(std::fs::read(&canonical).unwrap(), before);
+            assert_eq!(std::fs::read(&second_config).unwrap(), second_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_session_state_is_private_to_each_runtime() {
+        for provider in ["claude", "codex", "grok", "kimi"] {
+            let (_root, agent) = fixture(provider);
+            let canonical = directory(&agent).unwrap();
+            for name in [
+                "projects",
+                "sessions",
+                "archived_sessions",
+                "history.jsonl",
+                "session_log",
+                "session.db",
+                "sessions.db",
+            ] {
+                std::fs::create_dir_all(canonical.join(name)).unwrap();
+            }
+
+            let mut env = vec![];
+            let runtime = runtime(&agent, &mut env).await.unwrap().unwrap();
+            for name in [
+                "projects",
+                "sessions",
+                "archived_sessions",
+                "history.jsonl",
+                "session_log",
+                "session.db",
+                "sessions.db",
+            ] {
+                assert!(
+                    !runtime.root.join(name).exists(),
+                    "{provider} leaked {name}"
+                );
+                assert!(
+                    canonical.join(name).is_dir(),
+                    "{provider} changed canonical {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grok_home_precedes_legacy_home_and_uses_canonical_identity() {
+        let (root, mut agent) = fixture("grok");
+        let custom = root.path().join("custom-store");
+        std::fs::create_dir(&custom).unwrap();
+        agent.command.env.push(crate::config::EnvVarConfig {
+            name: "GROK_HOME".into(),
+            value: custom.to_string_lossy().into(),
+        });
+        assert_eq!(directory(&agent), Some(custom.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn credential_presence_is_independent_of_authentication_evidence() {
+        let (_root, agent) = fixture("kimi");
+        assert!(present(&agent));
+        assert_eq!(availability(&agent), AuthAvailability::Unknown);
+
+        std::fs::remove_file(
+            directory(&agent)
+                .unwrap()
+                .join("credentials/kimi-code.json"),
+        )
+        .unwrap();
+        assert!(!present(&agent));
+        assert_eq!(availability(&agent), AuthAvailability::Unknown);
     }
 
     #[tokio::test]
@@ -1421,10 +1829,24 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
             let mut env = vec![];
             let view = runtime(&agent, &mut env).await.unwrap().unwrap();
             if provider == "grok" {
-                assert!(
-                    env.iter().any(|(k, v)| k == "GROK_AUTH_PROVIDER_COMMAND"
-                        && v.contains("credential-token"))
+                let helper = env
+                    .iter()
+                    .find_map(|(k, v)| (k == "GROK_AUTH_PROVIDER_COMMAND").then_some(v))
+                    .unwrap();
+                assert_eq!(
+                    Path::new(helper),
+                    view.root.join(".router-acp-auth-provider")
                 );
+                let metadata = std::fs::metadata(helper).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+                }
+                let output = std::process::Command::new(helper).output().unwrap();
+                assert!(output.status.success());
+                let returned: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(returned.get("refresh_token").is_none());
                 let returned =
                     token_for_helper("grok", &directory(&agent).unwrap(), false, &view.root)
                         .await

@@ -87,8 +87,8 @@ use agent_client_protocol::schema::v1::{
     StringPropertySchema, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
-    Agent as AgentRole, Client as ClientRole, ConnectionTo, Responder, UntypedMessage,
-    on_receive_notification, on_receive_request,
+    Agent as AgentRole, Client as ClientRole, ConnectionTo, Dispatch, Handled, Responder,
+    UntypedMessage, on_receive_dispatch, on_receive_notification, on_receive_request,
 };
 
 struct SessionState {
@@ -365,6 +365,7 @@ async fn run_prompt(
         "event": "prompt",
         "sessionId": session_id,
         "text": text,
+        "content": req.prompt,
         "model": model,
         "startedAtMs": started_at_ms,
     }));
@@ -961,6 +962,7 @@ async fn main() {
     let m_close = mock.clone();
     let m_delete = mock.clone();
     let m_resume = mock.clone();
+    let m_steer = mock.clone();
 
     let result = AgentRole
         .builder()
@@ -1324,6 +1326,30 @@ async fn main() {
                 }
             },
             on_receive_notification!(),
+        )
+        .on_receive_dispatch(
+            move |message: Dispatch, _cx| {
+                let mock = m_steer.clone();
+                async move {
+                    match message {
+                        Dispatch::Request(msg, responder)
+                            if msg.method() == "_session/steering" =>
+                        {
+                            mock.log(json!({"event": "steer", "params": msg.params()}));
+                            let declined = msg.params().to_string().contains("DECLINED-STEER");
+                            responder.respond(
+                                json!({"outcome": if declined { "declined" } else { "injected" }}),
+                            )?;
+                            Ok(Handled::Yes)
+                        }
+                        message => Ok(Handled::No {
+                            message,
+                            retry: false,
+                        }),
+                    }
+                }
+            },
+            on_receive_dispatch!(),
         )
         .connect_to(router_acp::transport::stdio_lines())
         .await;

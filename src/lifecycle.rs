@@ -1,80 +1,18 @@
-//! Session lifecycle methods: `session/load`, `session/resume`,
-//! `session/delete`, `session/close`.
-//!
-//! All of these require a known router session id in the state file, route
-//! only to the owning downstream, and remap ids before/after forwarding.
+//! Router-owned session lifecycle, backed by SQLite rather than adapter files.
 
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    CloseSessionRequest, CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
-    Error as AcpError, LoadSessionRequest, LoadSessionResponse, ResumeSessionRequest,
-    ResumeSessionResponse,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, DeleteSessionRequest,
+    DeleteSessionResponse, Error as AcpError, LoadSessionRequest, LoadSessionResponse, McpServer,
+    Meta, ResumeSessionRequest, ResumeSessionResponse, SessionNotification, SessionUpdate,
 };
-use agent_client_protocol::{Agent as AgentPeer, Client as ClientPeer, ConnectionTo, Responder};
+use agent_client_protocol::{Client as ClientPeer, ConnectionTo, Responder};
 
-use crate::candidate::CandidateId;
-use crate::downstream::ProcessKey;
 use crate::session::{
-    DownstreamRoute, PinInfo, RouterSession, Shared, close_downstream_session, sid_str,
+    RouterSession, Shared, close_downstream_session, meta_marks_coordinator, sid_str,
 };
 use crate::state::PersistedSession;
-
-/// The MCP servers a reloaded or resumed session gets: the client's servers
-/// plus the router's own delegate/terminal endpoint, exactly as when it was
-/// first pinned — otherwise a parent reattached after a restart would have
-/// lost `delegate_task` and the rest of its router tools.
-fn reattached_mcp_servers(
-    shared: &Arc<Shared>,
-    router_sid: &str,
-    persisted: &PersistedSession,
-    client_mcp: &[agent_client_protocol::schema::v1::McpServer],
-) -> Vec<agent_client_protocol::schema::v1::McpServer> {
-    let candidate = CandidateId::new(&persisted.agent, &persisted.model);
-    match crate::session::mcp_servers_for_pin(shared, router_sid, &candidate, client_mcp) {
-        Ok((servers, _)) => servers,
-        Err(err) => {
-            tracing::warn!(session = router_sid, %err, "reattaching without router tools");
-            client_mcp.to_vec()
-        }
-    }
-}
-
-/// Resolve the owning downstream for a persisted session: the target, its
-/// connection, and whether it advertises the given capability.
-fn owning_target(
-    shared: &Arc<Shared>,
-    persisted: &PersistedSession,
-    cap: impl Fn(&agent_client_protocol::schema::v1::AgentCapabilities) -> bool,
-    cap_name: &str,
-) -> Result<(ProcessKey, ConnectionTo<AgentPeer>), AcpError> {
-    let candidate = CandidateId::new(&persisted.agent, &persisted.model);
-    let runtime = shared.candidate_runtime(&candidate).ok_or_else(|| {
-        AcpError::invalid_params().data(format!(
-            "session belongs to `{candidate}` which is no longer configured"
-        ))
-    })?;
-    let key = runtime.process_key;
-    let init = shared.target_init(&key).ok_or_else(|| {
-        AcpError::internal_error().data(format!(
-            "downstream `{}` is not initialized; authenticate or check its process",
-            persisted.agent
-        ))
-    })?;
-    if !cap(&init.agent_capabilities) {
-        return Err(AcpError::method_not_found().data(format!(
-            "downstream agent `{}` does not support {cap_name}",
-            persisted.agent
-        )));
-    }
-    let conn = shared.target_conn(&key).ok_or_else(|| {
-        AcpError::internal_error().data(format!(
-            "downstream process for `{}` is not running",
-            persisted.agent
-        ))
-    })?;
-    Ok((key, conn))
-}
 
 fn lookup_persisted(shared: &Arc<Shared>, router_sid: &str) -> Result<PersistedSession, AcpError> {
     shared.state.lock().unwrap().get(router_sid).ok_or_else(|| {
@@ -82,28 +20,54 @@ fn lookup_persisted(shared: &Arc<Shared>, router_sid: &str) -> Result<PersistedS
     })
 }
 
-/// Rehydrate the in-memory session record and pin before any prompt.
-fn rehydrate(
+/// Restore logical state now. Pin a fresh adapter lazily on the next prompt,
+/// after the client can change its model and before native auth repair runs.
+fn restore(
     shared: &Arc<Shared>,
-    router_sid: &str,
-    persisted: &PersistedSession,
-    key: &ProcessKey,
-    mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
-) {
-    let candidate = CandidateId::new(&persisted.agent, &persisted.model);
-    let mut sessions = shared.sessions.lock().unwrap();
-    let session = sessions
-        .entry(router_sid.to_string())
-        .or_insert_with(|| RouterSession::rehydrated(&shared.cfg, persisted, mcp_servers.clone()));
-    session.pin = Some(PinInfo {
-        candidate,
-        process_key: key.clone(),
-        downstream_sid: persisted.downstream_session_id.clone(),
-        // Loaded/resumed sessions rediscover modes lazily; exact-id mode
-        // relays still work because unknown ids fall back leniently.
-        available_modes: Vec::new(),
-    });
-    session.pinning = false;
+    sid: &str,
+    cwd: std::path::PathBuf,
+    mcp_servers: Vec<McpServer>,
+    meta: Option<&Meta>,
+) -> Result<(), AcpError> {
+    let persisted = lookup_persisted(shared, sid)?;
+    let mut session = RouterSession::rehydrated(&shared.cfg, &persisted, mcp_servers.clone());
+    crate::restoration::restore_config(&mut session, &persisted)?;
+    session.pending_history = crate::restoration::lookup_context(shared, sid);
+    session.cwd = cwd.clone();
+    session.coordinator |= meta_marks_coordinator(meta);
+    {
+        let mut sessions = shared.sessions.lock().unwrap();
+        if let Some(live) = sessions.get_mut(sid) {
+            if live.pinning {
+                return Err(AcpError::invalid_request()
+                    .data("session is already restoring or serving a prompt"));
+            }
+            // Reattachment must not discard a live adapter's conversation.
+            live.cwd = cwd;
+            live.mcp_servers = mcp_servers;
+            live.coordinator |= session.coordinator;
+        } else {
+            sessions.insert(sid.to_string(), session);
+        }
+    }
+    crate::restoration::checkpoint(shared, sid)
+}
+
+pub fn on_session_resume(
+    shared: Arc<Shared>,
+    req: ResumeSessionRequest,
+    responder: Responder<ResumeSessionResponse>,
+    _cx: ConnectionTo<ClientPeer>,
+) -> Result<(), AcpError> {
+    let sid = sid_str(&req.session_id);
+    match restore(&shared, &sid, req.cwd, req.mcp_servers, req.meta.as_ref()) {
+        Ok(()) => responder.respond(
+            ResumeSessionResponse::new()
+                .config_options(shared.router_config_options(&sid))
+                .meta(crate::restoration::response_meta(&shared, &sid)),
+        ),
+        Err(err) => responder.respond_with_error(err),
+    }
 }
 
 pub fn on_session_load(
@@ -112,185 +76,100 @@ pub fn on_session_load(
     responder: Responder<LoadSessionResponse>,
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
-    let router_sid = sid_str(&req.session_id);
-    let persisted = match lookup_persisted(&shared, &router_sid) {
-        Ok(p) => p,
-        Err(e) => return responder.respond_with_error(e),
-    };
-    let (key, conn) = match owning_target(
-        &shared,
-        &persisted,
-        |caps| caps.load_session,
-        "session/load",
-    ) {
-        Ok(v) => v,
-        Err(e) => return responder.respond_with_error(e),
-    };
-
-    // Register the route BEFORE forwarding so replayed session/update
-    // notifications relay to the client under the router id.
-    shared.register_route(
-        &key,
-        &persisted.downstream_session_id,
-        DownstreamRoute::Primary {
-            router_sid: router_sid.clone(),
-        },
-    );
-    rehydrate(
-        &shared,
-        &router_sid,
-        &persisted,
-        &key,
-        req.mcp_servers.clone(),
-    );
-
-    let fwd = LoadSessionRequest::new(persisted.downstream_session_id.clone(), req.cwd.clone())
-        .mcp_servers(reattached_mcp_servers(
-            &shared,
-            &router_sid,
-            &persisted,
-            &req.mcp_servers,
-        ))
-        .meta(req.meta.clone());
-
-    cx.spawn(async move {
-        match conn.send_request(fwd).block_task().await {
-            Ok(resp) => {
-                if let Some(modes) = &resp.modes {
-                    let ids: Vec<String> = modes
-                        .available_modes
-                        .iter()
-                        .map(|m| m.id.0.to_string())
-                        .collect();
-                    shared.with_session(&router_sid, |s| {
-                        if let Some(pin) = &mut s.pin {
-                            pin.available_modes = ids;
-                        }
-                    });
-                }
-                let _ = responder.respond(resp);
-            }
-            Err(err) => {
-                shared.unregister_route(&key, &persisted.downstream_session_id);
-                shared.with_session(&router_sid, |s| s.pin = None);
-                let _ = responder.respond_with_error(err);
-            }
+    let sid = sid_str(&req.session_id);
+    if let Err(err) = restore(&shared, &sid, req.cwd, req.mcp_servers, req.meta.as_ref()) {
+        return responder.respond_with_error(err);
+    }
+    let entries = match shared.state.lock().unwrap().log_for_all(&sid) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return responder.respond_with_error(AcpError::internal_error().data(err.to_string()));
         }
-        Ok(())
-    })
-}
-
-pub fn on_session_resume(
-    shared: Arc<Shared>,
-    req: ResumeSessionRequest,
-    responder: Responder<ResumeSessionResponse>,
-    cx: ConnectionTo<ClientPeer>,
-) -> Result<(), AcpError> {
-    let router_sid = sid_str(&req.session_id);
-    let persisted = match lookup_persisted(&shared, &router_sid) {
-        Ok(p) => p,
-        Err(e) => return responder.respond_with_error(e),
     };
-    let (key, conn) = match owning_target(
-        &shared,
-        &persisted,
-        |caps| caps.session_capabilities.resume.is_some(),
-        "session/resume",
-    ) {
-        Ok(v) => v,
-        Err(e) => return responder.respond_with_error(e),
-    };
-
-    shared.register_route(
-        &key,
-        &persisted.downstream_session_id,
-        DownstreamRoute::Primary {
-            router_sid: router_sid.clone(),
-        },
-    );
-    rehydrate(
-        &shared,
-        &router_sid,
-        &persisted,
-        &key,
-        req.mcp_servers.clone(),
-    );
-
-    let fwd = ResumeSessionRequest::new(persisted.downstream_session_id.clone(), req.cwd.clone())
-        .mcp_servers(reattached_mcp_servers(
-            &shared,
-            &router_sid,
-            &persisted,
-            &req.mcp_servers,
-        ))
-        .meta(req.meta.clone());
-
-    cx.spawn(async move {
-        match conn.send_request(fwd).block_task().await {
-            Ok(resp) => {
-                if let Some(modes) = &resp.modes {
-                    let ids: Vec<String> = modes
-                        .available_modes
-                        .iter()
-                        .map(|m| m.id.0.to_string())
-                        .collect();
-                    shared.with_session(&router_sid, |s| {
-                        if let Some(pin) = &mut s.pin {
-                            pin.available_modes = ids;
-                        }
-                    });
+    let mut raw_response = false;
+    let mut last_raw_tool = None;
+    for entry in entries {
+        let updates = match entry.kind.as_str() {
+            "user_prompt" | "user_steer" => {
+                if entry.kind == "user_prompt" {
+                    raw_response = false;
                 }
-                let _ = responder.respond(resp);
+                let blocks: Vec<ContentBlock> = entry
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("prompt"))
+                    .and_then(|p| serde_json::from_value(p.clone()).ok())
+                    .unwrap_or_else(|| vec![ContentBlock::from(entry.summary)]);
+                blocks
+                    .into_iter()
+                    .map(|b| SessionUpdate::UserMessageChunk(ContentChunk::new(b)))
+                    .collect()
             }
-            Err(err) => {
-                shared.unregister_route(&key, &persisted.downstream_session_id);
-                shared.with_session(&router_sid, |s| s.pin = None);
-                let _ = responder.respond_with_error(err);
+            "session_update" => {
+                let update = entry
+                    .detail
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value::<SessionUpdate>(v.clone()).ok());
+                if matches!(update, Some(SessionUpdate::AgentMessageChunk(_))) {
+                    raw_response = true;
+                }
+                if matches!(
+                    update,
+                    Some(SessionUpdate::ToolCall(_)) | Some(SessionUpdate::ToolCallUpdate(_))
+                ) {
+                    last_raw_tool = entry.detail.clone();
+                }
+                // The client's prompt is already replayed from user_prompt.
+                update
+                    .filter(|u| !matches!(u, SessionUpdate::UserMessageChunk(_)))
+                    .into_iter()
+                    .collect()
             }
+            "agent_response" if !raw_response => vec![SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(entry.summary.into()),
+            )],
+            "tool_call" if entry.detail != last_raw_tool => entry
+                .detail
+                .and_then(|v| serde_json::from_value(v).ok())
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        for update in updates {
+            cx.send_notification(SessionNotification::new(sid.clone(), update))?;
         }
-        Ok(())
-    })
+    }
+    responder.respond(
+        LoadSessionResponse::new()
+            .config_options(shared.router_config_options(&sid))
+            .meta(crate::restoration::response_meta(&shared, &sid)),
+    )
 }
 
 pub fn on_session_delete(
     shared: Arc<Shared>,
     req: DeleteSessionRequest,
     responder: Responder<DeleteSessionResponse>,
-    cx: ConnectionTo<ClientPeer>,
+    _cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
-    let router_sid = sid_str(&req.session_id);
-    let persisted = match lookup_persisted(&shared, &router_sid) {
-        Ok(p) => p,
-        Err(e) => return responder.respond_with_error(e),
-    };
-    let (key, conn) = match owning_target(
-        &shared,
-        &persisted,
-        |caps| caps.session_capabilities.delete.is_some(),
-        "session/delete",
-    ) {
-        Ok(v) => v,
-        Err(e) => return responder.respond_with_error(e),
-    };
+    let sid = sid_str(&req.session_id);
+    if let Err(err) = lookup_persisted(&shared, &sid) {
+        return responder.respond_with_error(err);
+    }
+    close(&shared, &sid);
+    shared.state.lock().unwrap().remove(&sid);
+    responder.respond(DeleteSessionResponse::new())
+}
 
-    let fwd =
-        DeleteSessionRequest::new(persisted.downstream_session_id.clone()).meta(req.meta.clone());
-    cx.spawn(async move {
-        match conn.send_request(fwd).block_task().await {
-            Ok(resp) => {
-                crate::session::close_live_delegates_for(&shared, &router_sid);
-                crate::accounts::cancel_login(&shared, &router_sid);
-                shared.unregister_route(&key, &persisted.downstream_session_id);
-                shared.sessions.lock().unwrap().remove(&router_sid);
-                shared.state.lock().unwrap().remove(&router_sid);
-                let _ = responder.respond(resp);
-            }
-            Err(err) => {
-                let _ = responder.respond_with_error(err);
-            }
-        }
-        Ok(())
-    })
+fn close(shared: &Arc<Shared>, sid: &str) {
+    // The conversation and checkpoint survive close. Provider-local storage
+    // is never needed to reopen it.
+    let session = shared.sessions.lock().unwrap().remove(sid);
+    crate::accounts::cancel_login(shared, sid);
+    crate::session::close_live_delegates_for(shared, sid);
+    if let Some(pin) = session.and_then(|s| s.pin) {
+        close_downstream_session(shared, &pin.process_key, &pin.downstream_sid);
+    }
 }
 
 pub fn on_session_close(
@@ -298,38 +177,15 @@ pub fn on_session_close(
     req: CloseSessionRequest,
     responder: Responder<CloseSessionResponse>,
 ) -> Result<(), AcpError> {
-    let router_sid = sid_str(&req.session_id);
-    let pin = shared
-        .sessions
-        .lock()
-        .unwrap()
-        .get(&router_sid)
-        .and_then(|s| s.pin.clone());
-    match pin {
-        Some(pin) => {
-            crate::accounts::cancel_login(&shared, &router_sid);
-            // Close the live downstream session when supported; state-file
-            // entries survive so resume/load keep working if the downstream
-            // persists sessions.
-            crate::session::close_live_delegates_for(&shared, &router_sid);
-            close_downstream_session(&shared, &pin.process_key, &pin.downstream_sid);
-            shared.sessions.lock().unwrap().remove(&router_sid);
-            responder.respond(CloseSessionResponse::new())
-        }
-        None => {
-            // Unpinned session: remove only router state.
-            let existed = shared
-                .sessions
-                .lock()
-                .unwrap()
-                .remove(&router_sid)
-                .is_some();
-            if existed {
-                crate::accounts::cancel_login(&shared, &router_sid);
-                responder.respond(CloseSessionResponse::new())
-            } else {
-                responder.respond_with_error(AcpError::invalid_params().data("unknown session id"))
-            }
-        }
+    let sid = sid_str(&req.session_id);
+    if let Err(err) = lookup_persisted(&shared, &sid) {
+        return responder.respond_with_error(err);
     }
+    if shared.with_session(&sid, |_| ()).is_some()
+        && let Err(err) = crate::restoration::checkpoint(&shared, &sid)
+    {
+        return responder.respond_with_error(err);
+    }
+    close(&shared, &sid);
+    responder.respond(CloseSessionResponse::new())
 }

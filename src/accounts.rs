@@ -119,8 +119,10 @@ pub fn identity(agent: &AgentConfig) -> (String, Option<String>) {
             let plan = creds
                 .as_ref()
                 .and_then(|v| {
-                    v.pointer("/claudeAiOauth/rateLimitTier")
-                        .or_else(|| v.pointer("/claudeAiOauth/subscriptionType"))
+                    // Subscription ownership is the plan shown to the user.
+                    // A Team account can still carry a Max-shaped rate tier.
+                    v.pointer("/claudeAiOauth/subscriptionType")
+                        .or_else(|| v.pointer("/claudeAiOauth/rateLimitTier"))
                 })
                 .and_then(Value::as_str)
                 .map(|plan| plan_label("claude", plan));
@@ -150,17 +152,19 @@ pub fn identity(agent: &AgentConfig) -> (String, Option<String>) {
                 .map(|plan| plan_label("codex", plan));
             (label, plan)
         }
-        _ => {
+        Some("grok") => {
             let auth = read_json(&dir.join("auth.json"));
             (
                 auth.as_ref()
+                    .and_then(crate::credentials::grok_auth)
                     .and_then(|v| v.get("email"))
                     .and_then(Value::as_str)
                     .unwrap_or(&fallback)
                     .to_string(),
-                None,
+                agent.account_plan.clone(),
             )
         }
+        _ => (fallback, agent.account_plan.clone()),
     }
 }
 
@@ -887,6 +891,7 @@ fn new_account(shared: &Arc<Shared>, p: &str) -> Result<(AgentConfig, String), A
     let variable = match p {
         "claude" => "CLAUDE_CONFIG_DIR",
         "codex" => "CODEX_HOME",
+        "grok" => "GROK_HOME",
         "kimi" => "KIMI_SHARE_DIR",
         _ => "HOME",
     };
@@ -923,6 +928,7 @@ pub(crate) fn isolated_environment(env: &[(String, String)]) -> bool {
             name.as_str(),
             "CLAUDE_CONFIG_DIR"
                 | "CODEX_HOME"
+                | "GROK_HOME"
                 | "GROK_AUTH_PROVIDER_COMMAND"
                 | "KIMI_SHARE_DIR"
                 | "KIMI_CODE_HOME"
@@ -985,6 +991,9 @@ fn start_login(
             Ok(()) if runner.cancel.is_cancelled() => {
                 Err("Login cancelled. Existing accounts remain registered.".into())
             }
+            Ok(()) if crate::credentials::request_generation(&agent).is_none() => Err(format!(
+                "{p} reported a successful sign-in, but did not publish a usable credential. Retry sign-in."
+            )),
             Ok(()) if adding => {
                 publish_added(&shared, &agent, source.as_deref().unwrap(), &runner.cancel).await
             }
@@ -1022,6 +1031,7 @@ fn start_login(
         };
         match result {
             Ok(()) => {
+                crate::credentials::record_success(&agent);
                 crate::auth::note_authenticated(&shared.auth, &agent.name);
                 for key in shared.target_keys_for_agent(&agent.name) {
                     if crate::downstream::start_downstream(&shared, &key)
@@ -1126,9 +1136,11 @@ async fn run_login(
             "kimi" => {
                 cmd.env("KIMI_SHARE_DIR", &dir).env("KIMI_CODE_HOME", dir);
             }
-            _ => {
-                cmd.env("HOME", dir.parent().unwrap());
+            "grok" => {
+                cmd.env("GROK_HOME", dir)
+                    .env_remove("GROK_AUTH_PROVIDER_COMMAND");
             }
+            _ => {}
         }
     }
     #[cfg(unix)]
@@ -1191,11 +1203,14 @@ async fn run_login(
 }
 
 fn browser_message(output: &str, p: &str) -> Option<String> {
-    // Do not publish a URL while its final bytes are still arriving.
-    let matched = regex::Regex::new(r#"https://[^\s\x1b\"'<>]+"#)
+    let clean = regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]")
         .ok()?
-        .find(output)?;
-    if matched.end() == output.len() {
+        .replace_all(output, "");
+    // Do not publish a URL while its final bytes are still arriving.
+    let matched = regex::Regex::new(r#"https://[^\s\"'<>]+"#)
+        .ok()?
+        .find(&clean)?;
+    if matched.end() == clean.len() {
         return None;
     }
     let url = matched.as_str().to_string();
@@ -1204,10 +1219,8 @@ fn browser_message(output: &str, p: &str) -> Option<String> {
     } else {
         regex::Regex::new(r"\b[A-Z0-9]{4,10}(?:-[A-Z0-9]{4,10})+\b")
             .ok()?
-            .find(output)
-            .filter(|m| {
-                m.end() < output.len() && output[m.end()..].starts_with(char::is_whitespace)
-            })
+            .find(&clean)
+            .filter(|m| m.end() < clean.len() && clean[m.end()..].starts_with(char::is_whitespace))
             .map(|m| m.as_str().to_string())
     };
     if !matches!(p, "claude" | "kimi") && code.is_none() {
@@ -1391,6 +1404,7 @@ async fn publish_added(
         let variable = match provider(agent) {
             Some("claude") => "CLAUDE_CONFIG_DIR",
             Some("codex") => "CODEX_HOME",
+            Some("grok") => "GROK_HOME",
             Some("kimi") => "KIMI_SHARE_DIR",
             _ => "HOME",
         };
@@ -1815,8 +1829,42 @@ mod tests {
             Some("Open https://example.test/device\nDevice code: ABCD-EFGH-4242")
         );
         assert_eq!(
+            browser_message(
+                "\x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\x1b[94mLWD3-2FXYY\x1b[0m\n",
+                "codex",
+            )
+            .as_deref(),
+            Some("Open https://auth.openai.com/codex/device\nDevice code: LWD3-2FXYY")
+        );
+        assert_eq!(
             plan_label("claude", "default_claude_max_20x"),
             "Personal 20x Max"
+        );
+    }
+
+    #[test]
+    fn claude_subscription_ownership_precedes_its_rate_tier() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("claude");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"subscriptionType":"team","rateLimitTier":"default_claude_max_5x"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"team@example.test"}}"#,
+        )
+        .unwrap();
+        let agent: AgentConfig = serde_yaml::from_str(&format!(
+            "name: claude@team\ncommand: {{type: stdio, command: mock, env: [{{name: CLAUDE_CONFIG_DIR, value: {}}}]}}\nmodel_selection: {{type: config-option}}\nmodels: [{{id: opus, cost_rank: 3}}]\n",
+            dir.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            identity(&agent),
+            ("team@example.test".into(), Some("Team".into()))
         );
     }
 

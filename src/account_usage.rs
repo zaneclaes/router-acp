@@ -31,6 +31,7 @@ pub fn status(config: &crate::config::Config) -> Value {
         };
         serde_json::json!({"id":agent.name,"provider":crate::accounts::provider(agent),
             "label":safe_text(&label),"plan":plan.map(|p| safe_text(&p)),"authState":auth,
+            "credentialPresent":crate::credentials::present(agent),
             "snapshot":snapshot.map(|s| serde_json::json!({"account":s.account,"access_generation":s.access_generation,
                 "updatedAt":chrono::DateTime::from_timestamp(s.fetched_at as i64, 0).map(|t| t.to_rfc3339()),
                 "fetched_at":s.fetched_at,"known":s.payload.is_some()}))})

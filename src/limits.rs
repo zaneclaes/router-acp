@@ -110,6 +110,7 @@ pub fn is_context_overflow_text(lower: &str) -> bool {
         || lower.contains("exceed context limit")
         || lower.contains("compacting failed")
         || lower.contains("too_few_groups")
+        || lower.contains("input exceeds the maximum length")
 }
 
 pub fn is_outage_text(lower: &str) -> bool {
@@ -406,6 +407,14 @@ mod tests {
 
         let too_long = AcpError::internal_error().data("Prompt is too long");
         assert_eq!(classify_failure(&too_long), FailureClass::ContextOverflow);
+
+        let character_limit = AcpError::internal_error().data(serde_json::json!({
+            "details": "Input exceeds the maximum length of 1048576 characters."
+        }));
+        assert_eq!(
+            classify_failure(&character_limit),
+            FailureClass::ContextOverflow
+        );
 
         let openai_shaped = AcpError::invalid_params()
             .data("This model's maximum context length is exceeded: context_length_exceeded");
