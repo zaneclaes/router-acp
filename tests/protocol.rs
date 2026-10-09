@@ -9883,3 +9883,80 @@ async fn coordinator_role_pulls_an_automatic_workhorse_pin_back_to_planning() {
     })
     .await;
 }
+
+fn capacity_failover_yaml(label: &str, failover: &str) -> String {
+    let state = temp_state_file(label);
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-{label}-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"a/*\", default_quality: 0.90 }\n\
+         \x20 - { pattern: \"b/*\", default_quality: 0.50 }\n\
+         \x20 - { pattern: \"c/*\", default_quality: 0.85 }\n",
+    )
+    .unwrap();
+    format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\nfailover: {failover}\nagents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 3)],
+            &[(
+                "MOCK_REPLY_TEXT",
+                "Selected model is at capacity. Please try a different model.\n\n"
+            )]
+        ),
+        agent_yaml("b", &[("m2", 1)], &[]),
+        agent_yaml("c", &[("m3", 2)], &[]),
+    )
+}
+
+/// Live bug: Codex answered a human-picked Sol with "Selected model is at
+/// capacity" as a normal reply, so the turn ended there and every Retry hit
+/// the same wall. The router must cordon that model and move the pick to the
+/// model nearest its quality (c/m3, not the cheaper b/m2), and stay there.
+#[tokio::test]
+async fn model_at_capacity_reply_cordons_and_moves_pick_to_nearest_quality() {
+    let yaml = capacity_failover_yaml("capacity-failover", "{}");
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        prompt_text(&cx, &sid, "next").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("a/m1 is at capacity"), "{text}");
+        assert!(
+            text.contains("failover: static → c/m3"),
+            "the replay must land on the nearest-quality model: {text}"
+        );
+        assert!(
+            text.contains("echo:m3:next"),
+            "the next turn must stay on it: {text}"
+        );
+        assert!(!text.contains("echo:m2:"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn model_at_capacity_reply_passes_through_when_disabled() {
+    let yaml = capacity_failover_yaml("capacity-off", "{ on_model_capacity: false }");
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("Selected model is at capacity"), "{text}");
+        assert!(!text.contains("echo:m3:"), "{text}");
+        Ok(())
+    })
+    .await;
+}

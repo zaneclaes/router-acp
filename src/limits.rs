@@ -36,6 +36,11 @@ pub enum FailureClass {
     /// so the caller fails over (fresh session, roomier window) and cordons
     /// nothing.
     ContextOverflow,
+    /// The provider has no room for this one model right now (Codex: "Selected
+    /// model is at capacity. Please try a different model."). The account and
+    /// its other models are healthy, so the caller cordons only this candidate
+    /// and fails over to a comparable model.
+    ModelAtCapacity,
     /// Anything else (bad params, refusals, ...): surface to the caller.
     Other,
 }
@@ -53,6 +58,9 @@ pub fn classify_failure(err: &AcpError) -> FailureClass {
     if is_context_overflow_text(&text) {
         return FailureClass::ContextOverflow;
     }
+    if is_model_capacity_text(&text) {
+        return FailureClass::ModelAtCapacity;
+    }
     if is_rate_limit_text(&text) {
         return FailureClass::RateLimited {
             retry_after: parse_reset_delay_at(&text, SystemTime::now()),
@@ -63,6 +71,21 @@ pub fn classify_failure(err: &AcpError) -> FailureClass {
         return FailureClass::Outage;
     }
     FailureClass::Other
+}
+
+/// One model is out of serving capacity. Narrower than `is_outage_text`'s
+/// "overloaded": this names the model, and the provider asks for another one.
+pub fn is_model_capacity_text(lower: &str) -> bool {
+    lower.contains("model is at capacity")
+}
+
+/// Codex ends the turn normally with this notice as the whole reply instead
+/// of an ACP error. Only an exact whole-reply match counts, so a model quoting
+/// the phrase never trips it.
+pub fn response_is_model_capacity(text: &str) -> bool {
+    text.trim()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("Selected model is at capacity. Please try a different model")
 }
 
 pub fn is_rate_limit_text(lower: &str) -> bool {
@@ -498,6 +521,24 @@ mod tests {
             "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai to continue.",
         );
         assert_eq!(classify_failure(&err), FailureClass::Outage);
+    }
+
+    #[test]
+    fn model_capacity_is_its_own_class() {
+        let err = AcpError::internal_error()
+            .data("Selected model is at capacity. Please try a different model.");
+        assert_eq!(classify_failure(&err), FailureClass::ModelAtCapacity);
+    }
+
+    #[test]
+    fn only_a_whole_capacity_reply_counts() {
+        assert!(response_is_model_capacity(
+            "Selected model is at capacity. Please try a different model.\n\n"
+        ));
+        assert!(!response_is_model_capacity(
+            "Codex said \"Selected model is at capacity. Please try a different model.\""
+        ));
+        assert!(!response_is_model_capacity(""));
     }
 
     #[test]

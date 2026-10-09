@@ -754,10 +754,22 @@ pub struct FailoverConfig {
     /// Maximum candidates tried per prompt (initial + failovers).
     #[serde(default = "default_failover_attempts")]
     pub max_attempts: u32,
+    /// When the provider reports the pinned model at capacity, cordon that
+    /// model for `capacity_cordon_secs` and fail over to the eligible model
+    /// nearest its quality. A human pick moves to that model for the session.
+    #[serde(default = "default_true")]
+    pub on_model_capacity: bool,
+    /// How long a model reported at capacity stays cordoned.
+    #[serde(default = "default_capacity_cordon_secs")]
+    pub capacity_cordon_secs: u64,
 }
 
 fn default_respawn_cooldown_secs() -> u64 {
     30
+}
+
+fn default_capacity_cordon_secs() -> u64 {
+    900
 }
 
 fn default_failover_attempts() -> u32 {
@@ -770,6 +782,8 @@ impl Default for FailoverConfig {
             enabled: true,
             respawn_cooldown_secs: default_respawn_cooldown_secs(),
             max_attempts: default_failover_attempts(),
+            on_model_capacity: true,
+            capacity_cordon_secs: default_capacity_cordon_secs(),
         }
     }
 }
