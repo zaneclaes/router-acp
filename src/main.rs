@@ -120,6 +120,22 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         limit: usize,
     },
+    /// Print the state DB's size facts (file, WAL, free pages, auto_vacuum,
+    /// last maintenance tick) as JSON. Read-only; no row counts.
+    StateStats {
+        /// Path to the state DB (router.yaml's `state_file`, tilde-expanded).
+        #[arg(long)]
+        state: PathBuf,
+    },
+    /// One-off: rewrite the state DB with a full VACUUM and switch it to
+    /// incremental auto_vacuum, so maintenance can shrink it from then on.
+    /// Holds the write lock for the whole rewrite and needs free disk of
+    /// about twice the DB size; set SQLITE_TMPDIR to a large disk.
+    StateCompact {
+        /// Path to the state DB (router.yaml's `state_file`, tilde-expanded).
+        #[arg(long)]
+        state: PathBuf,
+    },
     /// Report adoption of the ordinary scoped delegation directive: how often
     /// it was injected, how often a real router delegate child was created,
     /// and whether a provider-native subagent bypassed the router.
@@ -445,6 +461,21 @@ async fn main() -> anyhow::Result<()> {
                     println!("    detail: {detail}");
                 }
             }
+            Ok(())
+        }
+        Command::StateStats { state } => {
+            let path = router_acp::config::expand_tilde(&state);
+            let stats = router_acp::maintenance::stats(&path)?;
+            println!("{}", serde_json::to_string_pretty(&stats)?);
+            Ok(())
+        }
+        Command::StateCompact { state } => {
+            let path = router_acp::config::expand_tilde(&state);
+            let (before, after) = router_acp::maintenance::compact(&path)?;
+            println!(
+                "compacted {}: {before} -> {after} bytes (file + WAL); auto_vacuum is incremental",
+                path.display()
+            );
             Ok(())
         }
         Command::DelegationReport { config, limit } => {

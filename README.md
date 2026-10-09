@@ -333,6 +333,23 @@ router-acp transcript --state ~/.local/state/router-acp/sessions.db --session rt
 
 This takes the state DB path directly rather than a `--config`, so it runs standalone: a model that has just been handed a session (a `terse_handoff` briefing embeds this command already resolved to the running binary and live state file) can read what its briefing omitted, without a router config and without `sqlite3` installed.
 
+### State DB maintenance
+
+Every `router-acp serve` process sharing a state file ticks every 5 minutes, but only the holder of the `maintenance_lease` row does work (lease TTL 15 minutes, so a dead holder is replaced). A tick has a 2-second budget, waits at most 200 ms for the write lock, and stops on a busy database to resume next tick. It:
+
+1. deletes sessions idle past `history` with their `session_log`, `tool_calls` and `llm_requests` rows, in batches of a few thousand rows;
+2. clears `tool_calls.detail` on finished calls (new rows never store it; only `active_tool_calls` reads it, and `session_log` keeps the output);
+3. returns free pages to the filesystem with `PRAGMA incremental_vacuum` in 8 MB steps once 10 MB are free;
+4. runs `wal_checkpoint(PASSIVE)`, or `TRUNCATE` when the WAL is over 64 MB and nothing has logged for a minute.
+
+Step 3 needs `auto_vacuum = INCREMENTAL`, and an existing file can only switch with one full rewrite:
+
+```sh
+SQLITE_TMPDIR=/path/on/a/large/disk router-acp state-compact --state ~/.local/state/router-acp/sessions.db
+```
+
+`state-compact` holds the write lock for the whole rewrite (other routers' writes wait up to 30 s, then fail), so run it while sessions are idle. It needs free disk of about twice the DB size; SQLite puts its temporary copy in `SQLITE_TMPDIR`. `router-acp state-stats --state …` prints the file and WAL bytes, free pages, `auto_vacuum` mode, and the last tick's result as JSON, read-only.
+
 ## In-session delegation
 
 The pinned primary agent gets a router-provided MCP tool, `delegate_task`, for small self-contained subtasks — mechanical edits, isolated bug fixes, focused research. Each delegated subtask runs in an **ephemeral downstream session on a strictly lower-`cost_rank` candidate** (preferring a same-agent sibling before falling back to other agents — so a Sol primary delegates ordinary work to Terra/Luna when they're eligible), returns the sub-agent's output as the tool result, and forwards the sub-session's permission/fs/terminal callbacks to the original client under the parent session id — permission UX stays intact without interleaving sub-agent transcript streaming into the parent's. Delegates have no upstream client of their own, so the router applies each candidate's `auto` `mode_map` entry itself at session creation (for example Claude `bypassPermissions` or Codex `agent-full-access`), and each delegate's full task, final response, streamed progress, and tool activity land in its `session_log` row for UIs.
@@ -410,7 +427,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | --- | --- | --- |
 | `router` | `auto` | Default strategy: `auto`, `pareto-code`, `escalation`, `static`. |
 | `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` records pins, lineage, token/context totals, and per-request aggregate cost/count. `session_log` records ACP and proxy events. `llm_requests` records each attributed provider request's model, policy event, latency, exact/cache tokens, and cost. `tool_calls` plus `active_tool_calls` expose tool/model lifecycle. A legacy `sessions.json` beside it is imported once. |
-| `history` | `30d` | How long to keep sessions before auto-pruning (and their logs, by cascade). Duration string: `30d`, `12h`, `90m`, `3600s`, or a bare number of days. Pruned on open and after each write. |
+| `history` | `30d` | How long to keep sessions before auto-pruning (with their rows in every table). Duration string: `30d`, `12h`, `90m`, `3600s`, or a bare number of days. Pruned by the background maintenance worker (see [State DB maintenance](#state-db-maintenance)). |
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
 | `probe_timeout_ms` | `120000` | Timeout for downstream initialize/probe/session-open calls. |
