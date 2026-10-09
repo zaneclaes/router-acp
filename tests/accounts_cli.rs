@@ -643,6 +643,70 @@ agents:
     (dir, config, home, bin, provider_marker, curl_marker)
 }
 
+#[test]
+fn account_status_reports_router_owned_capacity_outcomes() {
+    let (_dir, config, home, _bin, _provider_marker, _curl_marker) = cache_usage_fixture();
+    let cfg = router_acp::config::Config::from_file(&config).unwrap();
+    let agent = cfg
+        .agents
+        .iter()
+        .find(|agent| agent.name == "claude@work")
+        .unwrap();
+    let config_dir = PathBuf::from(agent.env_var("CLAUDE_CONFIG_DIR").unwrap())
+        .canonicalize()
+        .unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let snapshot = router_acp::usage_cache::Snapshot {
+        source: "anthropic-oauth".into(),
+        account: router_acp::usage_cache::fingerprint("work-refresh"),
+        access_generation: Some(router_acp::usage_cache::fingerprint("work-access")),
+        fetched_at: now,
+        attempted_at: now,
+        consecutive_failures: 0,
+        last_error: None,
+        payload: Some(json!({"limits":[{
+            "kind":"weekly",
+            "percent":100,
+            "resets_at":chrono::DateTime::from_timestamp((now + 3600) as i64, 0).unwrap().to_rfc3339()
+        }]})),
+    };
+    let snapshot_path = home.join(".local/state/router-acp/usage").join(format!(
+        "anthropic-oauth-{}.json",
+        router_acp::usage_cache::fingerprint(&config_dir.to_string_lossy())
+    ));
+    router_acp::usage_cache::write_snapshot(&snapshot_path, &snapshot).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        .args(["account-status", "--config"])
+        .arg(&config)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let accounts = status["accounts"].as_array().unwrap();
+    let work = accounts
+        .iter()
+        .find(|account| account["id"] == "claude@work")
+        .unwrap();
+    let personal = accounts
+        .iter()
+        .find(|account| account["id"] == "claude@personal")
+        .unwrap();
+    assert_eq!(work["routing"]["available"], false);
+    assert_eq!(work["routing"]["reason"], "capacity");
+    assert!(work["routing"]["resetsAt"].is_string());
+    assert_eq!(personal["routing"]["available"], true);
+    assert!(personal["routing"]["reason"].is_null());
+}
+
 #[tokio::test]
 async fn standalone_grok_delete_preserves_a_shared_symlinked_store() {
     let root = tempfile::tempdir().unwrap();

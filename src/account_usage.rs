@@ -24,19 +24,91 @@ pub fn status(config: &crate::config::Config) -> Value {
     let accounts = config.agents.iter().filter(|a| crate::accounts::registered(a)).map(|agent| {
         let (label, plan) = crate::accounts::identity(agent);
         let snapshot = crate::usage_cache::read_agent_snapshot(agent);
-        let auth = match crate::credentials::availability(agent) {
+        let auth_availability = crate::credentials::availability(agent);
+        let auth = match &auth_availability {
             AuthAvailability::Authenticated => "authenticated",
             AuthAvailability::Unauthenticated { .. } => "rejected",
             AuthAvailability::Unknown => "unknown",
         };
+        let routing = routing_status(
+            agent,
+            snapshot.as_ref(),
+            &auth_availability,
+            config.cordon.enabled,
+            SystemTime::now(),
+        );
         serde_json::json!({"id":agent.name,"provider":crate::accounts::provider(agent),
             "label":safe_text(&label),"plan":plan.map(|p| safe_text(&p)),"authState":auth,
             "credentialPresent":crate::credentials::present(agent),
+            "routing":routing,
             "snapshot":snapshot.map(|s| serde_json::json!({"account":s.account,"access_generation":s.access_generation,
                 "updatedAt":chrono::DateTime::from_timestamp(s.fetched_at as i64, 0).map(|t| t.to_rfc3339()),
                 "fetched_at":s.fetched_at,"known":s.payload.is_some()}))})
     }).collect::<Vec<_>>();
     serde_json::json!({"accounts":accounts})
+}
+
+fn routing_status(
+    agent: &AgentConfig,
+    snapshot: Option<&Snapshot>,
+    auth: &AuthAvailability,
+    cordon_enabled: bool,
+    now: SystemTime,
+) -> Value {
+    if matches!(auth, AuthAvailability::Unauthenticated { .. }) {
+        return serde_json::json!({"available":false,"reason":"authentication","resetsAt":null});
+    }
+    if !cordon_enabled {
+        return serde_json::json!({"available":true,"reason":null,"resetsAt":null});
+    }
+    let candidates = agent
+        .models
+        .iter()
+        .map(|model| {
+            (
+                CandidateId::new(&agent.name, &model.id),
+                model
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| model.id.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let cordons = match (
+        agent.usage_source.as_ref(),
+        snapshot.and_then(|value| value.payload.as_ref()),
+    ) {
+        (Some(crate::config::UsageSourceConfig::AnthropicOauth), Some(payload)) => {
+            crate::usage::anthropic_cordons_with_reserve(
+                payload,
+                &candidates,
+                &agent.reserve_capacity,
+                now,
+            )
+        }
+        (Some(crate::config::UsageSourceConfig::CodexRollout), Some(payload)) => {
+            crate::usage::codex_cordons_with_reserve(
+                &crate::usage::codex_pools_from_payload(payload),
+                &candidates,
+                &agent.reserve_capacity,
+                now,
+            )
+        }
+        _ => Default::default(),
+    };
+    if candidates.is_empty()
+        || candidates
+            .iter()
+            .any(|(candidate, _)| !cordons.contains_key(candidate))
+    {
+        return serde_json::json!({"available":true,"reason":null,"resetsAt":null});
+    }
+    let resets_at = candidates
+        .iter()
+        .filter_map(|(candidate, _)| cordons.get(candidate))
+        .min_by_key(|cordon| cordon.resets_at)
+        .map(|cordon| cordon.resets_at_rfc3339.clone());
+    serde_json::json!({"available":false,"reason":"capacity","resetsAt":resets_at})
 }
 
 /// Format all configured runtime accounts, grouped by provider.
