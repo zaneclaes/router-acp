@@ -7595,7 +7595,7 @@ fn on_session_new(
                 let saved = shared.state.lock().unwrap().get(source).ok_or_else(|| {
                     AcpError::invalid_params().data(format!("unknown router session id `{source}`"))
                 })?;
-                crate::restoration::restore_config(&mut session, &saved)?;
+                crate::restoration::restore_continued_config(&mut session, &saved)?;
                 session.coordinator |= meta_marks_coordinator(req.meta.as_ref());
                 inherited_context = Some(crate::restoration::snapshot(&shared, source)?);
                 session.pending_history = crate::restoration::lookup_context(&shared, &router_sid);

@@ -634,6 +634,120 @@ async fn continue_from_creates_a_new_restorable_router_session_without_kory_cont
     );
 }
 
+/// A source session whose saved config looks like the end of a ship flow.
+async fn shipped_source(fixture: &Fixture, edit: impl FnOnce(&mut Value)) -> String {
+    let mut client = spawn(fixture);
+    client.initialize().await;
+    let source = session_id(&client.new_session(&fixture.home, None).await);
+    assert_success(
+        &client.prompt(&source, "source work", None).await,
+        "source prompt",
+    );
+    client.close().await;
+
+    let state = state(fixture);
+    let mut config = state
+        .get(&source)
+        .and_then(|s| s.session_config)
+        .expect("source config checkpoint");
+    config["candidate"] = json!("mock/m1");
+    config["candidate_user_pick"] = json!(false);
+    config["planner_phase"] = json!("implementation");
+    config["preclass_done"] = json!(true);
+    config["task_class"] = json!("Ops");
+    config["task_complexity"] = json!(0.15);
+    config["elevation"] = json!("skill `ship-pr`");
+    config["elevation_skill"] = json!("ship-pr");
+    config["quiet_turns"] = json!(3);
+    edit(&mut config);
+    state
+        .set_session_config(&source, &config)
+        .expect("save shipped source config");
+    source
+}
+
+#[tokio::test]
+async fn continue_from_a_shipped_session_plans_the_new_request_first() {
+    let fixture = fixture("continue-plans-first");
+    let source = shipped_source(&fixture, |_| {}).await;
+
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    let created = client
+        .new_session(&fixture.home, Some(router_meta(None, Some(&source))))
+        .await;
+    assert_success(&created, "session/new continue_from");
+    assert!(created["result"]["_meta"]["router_acp"]["planner_phase"].is_null());
+    let child = session_id(&created);
+    let saved = state(&fixture)
+        .get(&child)
+        .and_then(|s| s.session_config)
+        .unwrap();
+    for (field, fresh) in [
+        ("candidate", Value::Null),
+        ("planner_phase", Value::Null),
+        ("preclass_done", json!(false)),
+        ("task_class", Value::Null),
+        ("elevation", Value::Null),
+        ("elevation_skill", Value::Null),
+        ("quiet_turns", json!(0)),
+    ] {
+        assert_eq!(
+            saved[field], fresh,
+            "continue_from inherited {field}: {saved}"
+        );
+    }
+
+    assert_success(
+        &client.prompt(&child, "new bug report", None).await,
+        "child first prompt",
+    );
+    client.close().await;
+    let delivered = std::fs::read_to_string(&fixture.mock_log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|e| e["event"] == "prompt" && contains_string(&e["text"], "new bug report"))
+        .expect("child prompt reached an adapter");
+    assert!(
+        contains_string(&delivered["text"], "[router-acp planner protocol]"),
+        "a continued shipped session must enter planning: {delivered}"
+    );
+
+    // Resuming the source itself keeps the phase it reached.
+    let mut resumed = spawn(&fixture);
+    resumed.initialize().await;
+    let frame = resumed.resume(&source, &fixture.home).await;
+    assert_success(&frame, "resume source");
+    assert_eq!(
+        frame["result"]["_meta"]["router_acp"]["planner_phase"],
+        "implementation"
+    );
+    resumed.close().await;
+}
+
+#[tokio::test]
+async fn continue_from_keeps_a_human_model_pick_and_the_coordinator_role() {
+    let fixture = fixture("continue-keeps-human-choices");
+    let source = shipped_source(&fixture, |config| {
+        config["candidate_user_pick"] = json!(true);
+        config["coordinator"] = json!(true);
+    })
+    .await;
+
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    let created = client
+        .new_session(&fixture.home, Some(router_meta(None, Some(&source))))
+        .await;
+    assert_success(&created, "session/new continue_from");
+    let meta = &created["result"]["_meta"]["router_acp"];
+    assert_eq!(meta["candidate"], "mock/m1");
+    assert_eq!(meta["coordinator"], true);
+    assert!(meta["planner_phase"].is_null());
+    client.close().await;
+}
+
 #[tokio::test]
 async fn rich_content_and_long_assistant_output_survive_restart_without_replay_duplicates() {
     let fixture = fixture("rich-content");

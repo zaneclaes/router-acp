@@ -641,7 +641,7 @@ Do not launch a provider CLI against canonical credentials outside the router.
 
 `session/list`, `session/load`, `session/resume`, `session/delete`, and `session/close` are router capabilities. They do not depend on provider lifecycle support:
 
-- `session/new` saves the router id and configuration before the first prompt. `_meta.router_acp.continue_from` snapshots another router conversation into the new id.
+- `session/new` saves the router id and configuration before the first prompt. `_meta.router_acp.continue_from` snapshots another router conversation into the new id. The new id keeps the source's human choices (strategy, a user-picked model, effort, version, exclusions, coordinator role) and drops what the source's own work derived (planner phase, pre-class verdict, skill elevation, an automatically chosen model, escalation counters), so its first turn routes the new request afresh. Resuming the same id keeps everything.
 - Every user content block and downstream update is stored in SQLite without a row or character cap.
 - `load` and `resume` require a known router id. They restore routing settings and open a fresh private adapter runtime. The incoming agent receives the router session id, SQLite database path, and a runnable history lookup command, then retrieves the records it needs itself. Provider-local session files are optional.
 - `load` also replays saved ACP updates to the client. `resume` restores model context without duplicating a host's existing UI transcript.
