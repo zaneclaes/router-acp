@@ -276,8 +276,8 @@ fn v1_state_queries_keep_kory_consumer_shapes_and_retention_boundary() {
                  "tokensInput":0, "tokensOutput":0, "tokensTotal":0, "contextUsed":0, "costUsd":0.0}
             ],
             "daily":[
-                {"date":"2026-01-01", "agent":"mock", "class":null, "kind":"primary", "tokensInput":3, "tokensOutput":5, "entries":2},
-                {"date":"2026-01-01", "agent":"mock", "class":"Ops", "kind":"delegate", "tokensInput":1, "tokensOutput":2, "entries":3}
+                {"date":"2026-01-01", "agent":"mock", "class":"Ops", "kind":"delegate", "tokensInput":1, "tokensOutput":2, "entries":3},
+                {"date":"2026-01-01", "agent":"mock", "class":null, "kind":"primary", "tokensInput":3, "tokensOutput":5, "entries":2}
             ],
             "llmRequests":[{
                 "pinned_model":"mock/m1", "model":"mock/m1", "protocol":"openai", "started_at":DAY_START + 20,
@@ -286,7 +286,7 @@ fn v1_state_queries_keep_kory_consumer_shapes_and_retention_boundary() {
         })
     );
 
-    // Matches relay/status.mjs while retaining StateStore's retention/counts.
+    // Matches relay/status.mjs without a table-wide row count on each refresh.
     let health = query(&config, &["health"]);
     assert_envelope(&health, "health");
     let data = health["data"].as_object().unwrap();
@@ -295,21 +295,16 @@ fn v1_state_queries_keep_kory_consumer_shapes_and_retention_boundary() {
     assert_eq!(
         keys,
         [
-            "activeToolCalls",
             "autoVacuum",
             "dbBytes",
             "dbPath",
             "freelistBytes",
-            "logEntries",
             "maintenance",
             "retentionSeconds",
-            "sessions",
             "walBytes",
         ]
     );
     assert_eq!(health["data"]["retentionSeconds"], 7 * 24 * 60 * 60);
-    assert_eq!(health["data"]["sessions"], 4);
-    assert_eq!(health["data"]["logEntries"], 6);
     assert!(health["data"]["dbBytes"].as_u64().unwrap() > 0);
     assert_eq!(
         health["data"]["maintenance"],

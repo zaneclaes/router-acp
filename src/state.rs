@@ -438,31 +438,43 @@ impl StateStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut daily = std::collections::BTreeMap::new();
-        let mut stmt = self.file.conn.prepare(
-            "SELECT date(log.ts, 'unixepoch') AS date, session.agent, session.kind, session.routing,
-                    SUM(log.tokens_input), SUM(log.tokens_output), COUNT(*)
-             FROM session_log AS log
-             LEFT JOIN sessions AS session ON session.router_session_id = log.router_session_id
-             WHERE (?1 IS NULL OR log.ts >= ?1) AND (?2 IS NULL OR log.ts < ?2)
-             GROUP BY date, log.router_session_id, session.agent, session.kind, session.routing
-             ORDER BY date, log.router_session_id",
-        )?;
-        for row in stmt.query_map(params![range.from_sec, range.to_end_sec], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })? {
-            let (date, agent, kind, routing, tokens_input, tokens_output, entries) = row?;
+        let mut attribution = std::collections::HashMap::new();
+        let mut attribution_stmt = self
+            .file
+            .conn
+            .prepare("SELECT router_session_id, agent, kind, routing FROM sessions")?;
+        for row in attribution_stmt.query_map([], |row| {
+            let routing: Option<String> = row.get(3)?;
             let routing = routing.and_then(|value| serde_json::from_str(&value).ok());
             let (class, _) = routing_class_reason(routing.as_ref());
-            let key = (date.clone(), agent.clone(), class.clone(), kind.clone());
+            let agent: Option<String> = row.get(1)?;
+            let kind: Option<String> = row.get(2)?;
+            Ok((row.get::<_, String>(0)?, (agent, class, kind)))
+        })? {
+            let (session_id, values) = row?;
+            attribution.insert(session_id, values);
+        }
+
+        let (log_sql, log_params) = analytics_log_range_sql(range);
+        let mut daily = std::collections::BTreeMap::new();
+        let mut stmt = self.file.conn.prepare(&log_sql)?;
+        for row in stmt.query_map(rusqlite::params_from_iter(log_params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })? {
+            let (date, session_id, tokens_input, tokens_output, entries) = row?;
+            let (agent, class, kind) = attribution.get(&session_id).cloned().unwrap_or_default();
+            let key = format!(
+                "{date}\0{}\0{}\0{}",
+                agent.as_deref().unwrap_or("null"),
+                class.as_deref().unwrap_or("null"),
+                kind.as_deref().unwrap_or("null"),
+            );
             let bucket = daily.entry(key).or_insert_with(|| AnalyticsDaily {
                 date,
                 agent,
@@ -508,12 +520,6 @@ impl StateStore {
     }
 
     pub fn health(&self) -> rusqlite::Result<StateHealth> {
-        let (sessions, logs, active_tools): (i64, i64, i64) = self.file.conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM session_log),
-                    (SELECT COUNT(*) FROM active_tool_calls)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
         let pragma = |name| {
             self.file
                 .conn
@@ -561,9 +567,6 @@ impl StateStore {
             auto_vacuum,
             maintenance,
             retention_seconds: self.retention.max_age.as_secs(),
-            sessions: sessions.max(0) as u64,
-            log_entries: logs.max(0) as u64,
-            active_tool_calls: active_tools.max(0) as u64,
         })
     }
 
@@ -922,9 +925,6 @@ pub struct StateHealth {
     pub auto_vacuum: &'static str,
     pub maintenance: Option<StateMaintenance>,
     pub retention_seconds: u64,
-    pub sessions: u64,
-    pub log_entries: u64,
-    pub active_tool_calls: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -980,6 +980,27 @@ fn routing_class_reason(routing: Option<&serde_json::Value>) -> (Option<String>,
         .and_then(serde_json::Value::as_str)
         .map(|value| value.chars().take(200).collect());
     (class, reason)
+}
+
+/// The full range uses the covering `idx_log_ts` index. The partial and open
+/// forms retain the same inclusive-start/exclusive-end semantics without an
+/// optimizer-blocking optional-bound predicate.
+fn analytics_log_range_sql(range: AnalyticsRange) -> (String, Vec<i64>) {
+    let (where_clause, params) = match (range.from_sec, range.to_end_sec) {
+        (Some(from), Some(to)) => ("WHERE ts >= ?1 AND ts < ?2", vec![from, to]),
+        (Some(from), None) => ("WHERE ts >= ?1", vec![from]),
+        (None, Some(to)) => ("WHERE ts < ?1", vec![to]),
+        (None, None) => ("", Vec::new()),
+    };
+    (
+        format!(
+            "SELECT date(ts, 'unixepoch') AS date, router_session_id, \
+                    SUM(tokens_input), SUM(tokens_output), COUNT(*) \
+             FROM session_log {where_clause} \
+             GROUP BY date, router_session_id ORDER BY date, router_session_id"
+        ),
+        params,
+    )
 }
 
 /// Raw single-file SQLite implementation. `StateStore` is the public
@@ -2771,6 +2792,35 @@ mod tests {
                 "{index} must lead with {first_col} to serve time-range scans: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn analytics_range_plan_scans_log_index_before_session_attribution() {
+        let (_d, s) = store();
+        let (sql, params) = analytics_log_range_sql(AnalyticsRange {
+            from_sec: Some(1_000),
+            to_end_sec: Some(2_000),
+        });
+        let plan = format!("EXPLAIN QUERY PLAN {sql}");
+        let steps: Vec<String> = s
+            .file
+            .conn
+            .prepare(&plan)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(params), |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = steps.join("\n");
+
+        assert!(
+            plan.contains("USING COVERING INDEX idx_log_ts"),
+            "analytics must range-scan the narrow log index: {plan}"
+        );
+        assert!(
+            !plan.contains("sessions"),
+            "session attribution must happen after log aggregation: {plan}"
+        );
     }
 
     #[test]

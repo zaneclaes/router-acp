@@ -360,7 +360,8 @@ returns the relay-compatible `sessions` and daily UTC token buckets grouped by
 agent, routing class, and kind. Its `fromSec` bound is inclusive and its
 `toEndSec` bound is exclusive. `llmRequests` exposes the rows used by the
 savings aggregate. `health` includes database/WAL/freelist bytes,
-auto-vacuum, maintenance lease status, retention, and counts.
+auto-vacuum, maintenance lease status, and retention. It deliberately avoids
+table-wide row counts, so status refreshes remain cheap as retained history grows.
 `delegation-report` is the JSON form of the existing adoption report.
 
 The query command opens the configured state file read-only. It does not create
