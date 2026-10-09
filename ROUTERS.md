@@ -459,8 +459,12 @@ initialize capabilities. They receive `router-acp/planner-child-update` and
 child-scoped callbacks. A child update's `effort` is usable only when
 `effort_confirmed` is true. Missing confirmation means unavailable effort.
 Controls use `router-acp/planner-child` with the exact
-parent `sessionId`, durable `child_id`, and `action` of `prompt`, `cancel`, or
-`close`. A child presentation must never launch another coordinator.
+parent `sessionId`, durable `child_id`, and `action` of `status`, `prompt`, `cancel`, or
+`close`. Status returns the current attempt, owning-router activity, confirmed effort,
+and durable revision. Restore that state before accepting child input or replaying
+callbacks after client reattachment. Child updates include the durable revision,
+so older buffered start notifications cannot replace a restored attempt.
+A child presentation must never launch another coordinator.
 
 See [consumer migration assets](docs/migrations/planner-skills.md) for Hickory
 and exact Chordzy role templates, rollout, parity tests, drain, and rollback.
