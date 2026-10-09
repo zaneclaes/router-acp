@@ -181,16 +181,20 @@ impl std::fmt::Debug for StateFile {
 impl StateFile {
     /// Open (creating/migrating) the database at `path`, then prune.
     pub fn load(path: &Path, retention: Retention) -> Self {
-        let conn = Self::open_conn(path).unwrap_or_else(|err| {
-            tracing::error!(%err, path = %path.display(), "cannot open state DB; using in-memory");
-            Connection::open_in_memory().expect("in-memory sqlite")
-        });
+        Self::try_load(path, retention)
+            .unwrap_or_else(|err| panic!("cannot open state DB at {}: {err}", path.display()))
+    }
+
+    /// Open durable state or fail. A disposable fallback would return session
+    /// ids that cannot survive the next router process.
+    pub fn try_load(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
+        let conn = Self::open_conn(path)?;
         let store = Self { conn, retention };
-        store.init_schema();
+        store.init_schema()?;
         // One-time import of a legacy sessions.json sitting next to the DB.
         store.import_legacy_json(path);
         store.prune();
-        store
+        Ok(store)
     }
 
     fn open_conn(path: &Path) -> rusqlite::Result<Connection> {
@@ -222,7 +226,7 @@ impl StateFile {
         Ok(conn)
     }
 
-    fn init_schema(&self) {
+    fn init_schema(&self) -> rusqlite::Result<()> {
         let sql = r#"
         CREATE TABLE IF NOT EXISTS sessions (
             router_session_id     TEXT PRIMARY KEY,
@@ -341,9 +345,7 @@ impl StateFile {
             attempts   INTEGER NOT NULL DEFAULT 0
         );
         "#;
-        if let Err(err) = self.conn.execute_batch(sql) {
-            tracing::error!(%err, "failed to initialize state schema");
-        }
+        self.conn.execute_batch(sql)?;
         // Migrations for DBs created by older versions: add columns that the
         // `CREATE TABLE IF NOT EXISTS` above skips on an existing table. A
         // duplicate-column error just means the migration already ran.
@@ -365,12 +367,14 @@ impl StateFile {
             "ALTER TABLE session_log ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_log ADD COLUMN model TEXT",
         ] {
-            if let Err(err) = self.conn.execute(stmt, [])
-                && !err.to_string().contains("duplicate column")
-            {
-                tracing::error!(%err, stmt, "session state migration failed");
+            if let Err(err) = self.conn.execute(stmt, []) {
+                if err.to_string().contains("duplicate column") {
+                    continue;
+                }
+                return Err(err);
             }
         }
+        Ok(())
     }
 
     fn import_legacy_json(&self, db_path: &Path) {
@@ -1110,6 +1114,20 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn durable_state_open_failure_never_falls_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = StateFile::try_load(&path, Retention::default()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("unable to open database file"),
+            "unexpected SQLite error: {err}"
+        );
     }
 
     fn store() -> (tempfile::TempDir, StateFile) {
