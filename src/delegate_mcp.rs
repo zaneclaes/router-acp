@@ -1960,18 +1960,6 @@ async fn run_delegate_task_inner(
                     crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
                 }
                 shared.planner_deliveries.lock().unwrap().remove(&sub_sid);
-                if result.is_ok()
-                    && let Some(identity) = &args.planner_identity
-                {
-                    for id in &args.planner_receipt_ids {
-                        crate::planner_workflow::mark_input_delivered(
-                            shared,
-                            router_sid,
-                            id,
-                            &identity.work_id,
-                        )?;
-                    }
-                }
                 // The host may send the worker back to finish before the turn
                 // returns to the parent (`delegate_turn_end`).
                 let mut turns = 1;
@@ -2589,18 +2577,6 @@ async fn run_delegate_followup_inner(
         crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
     }
     shared.planner_deliveries.lock().unwrap().remove(&sub_sid);
-    if result.is_ok()
-        && let Some(identity) = &args.planner_identity
-    {
-        for id in &args.planner_receipt_ids {
-            crate::planner_workflow::mark_input_delivered(
-                shared,
-                router_sid,
-                id,
-                &identity.work_id,
-            )?;
-        }
-    }
     let mut turns = turns + 1;
     let result = match result {
         Ok(resp) => {

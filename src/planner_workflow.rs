@@ -166,6 +166,7 @@ pub struct PendingDelivery {
     pub parent_sid: String,
     pub owner: String,
     pub input_ids: Vec<String>,
+    pub persistence_failed: bool,
 }
 
 pub fn queue_delivery(
@@ -182,13 +183,23 @@ pub fn queue_delivery(
                 parent_sid: parent_sid.into(),
                 owner: owner.into(),
                 input_ids: ids,
+                persistence_failed: false,
             },
         );
     }
 }
 
 pub fn confirm_delivery(shared: &Shared, state_sid: &str) -> Result<(), String> {
-    let delivery = shared.planner_deliveries.lock().unwrap().remove(state_sid);
+    let delivery = {
+        let mut deliveries = shared.planner_deliveries.lock().unwrap();
+        if deliveries
+            .get(state_sid)
+            .is_some_and(|delivery| delivery.persistence_failed)
+        {
+            return Ok(());
+        }
+        deliveries.remove(state_sid)
+    };
     if let Some(delivery) = delivery {
         for id in &delivery.input_ids {
             if let Err(error) =

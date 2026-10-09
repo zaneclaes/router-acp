@@ -289,9 +289,6 @@ pub struct RouterSession {
     pub pending_history: Vec<ContentBlock>,
     /// A transcript write failure must not be reported as a successful turn.
     pub persistence_error: Option<String>,
-    /// A pending planner input remains unreceipted when its first streamed
-    /// provider update cannot be stored. A later input may proceed normally.
-    pub planner_delivery_persistence_failed: bool,
     /// When set, agent text on the pinned session is captured here instead
     /// of relayed (used to collect a summary during a switch).
     pub capturing_summary: Option<Arc<Mutex<String>>>,
@@ -469,7 +466,6 @@ impl RouterSession {
             pending_context: None,
             pending_history: Vec::new(),
             persistence_error: None,
-            planner_delivery_persistence_failed: false,
             capturing_summary: None,
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
@@ -556,7 +552,6 @@ impl RouterSession {
             pending_context: None,
             pending_history: Vec::new(),
             persistence_error: None,
-            planner_delivery_persistence_failed: false,
             capturing_summary: None,
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
@@ -1834,8 +1829,8 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
     };
     if let Err(err) = &saved {
         tracing::warn!(session = router_sid, %err, "could not persist provider conversation update");
-        if pending_delivery {
-            shared.with_session(router_sid, |s| s.planner_delivery_persistence_failed = true);
+        if let Some(delivery) = shared.planner_deliveries.lock().unwrap().get_mut(router_sid) {
+            delivery.persistence_failed = true;
         }
     }
     let kind = update
@@ -1843,9 +1838,6 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         .and_then(|k| k.as_str())
         .unwrap_or("");
     if saved.is_ok()
-        && !shared
-            .with_session(router_sid, |s| s.planner_delivery_persistence_failed)
-            .unwrap_or(true)
         && matches!(
         kind,
         "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"
@@ -5687,10 +5679,7 @@ pub(crate) async fn run_primary_turn(
         // turns, unlike updated_at − created_at).
         let turn_start = std::time::Instant::now();
         // A save failure belongs to the turn that hit it, never to later ones.
-        shared.with_session(&router_sid, |s| {
-            s.persistence_error = None;
-            s.planner_delivery_persistence_failed = false;
-        });
+        shared.with_session(&router_sid, |s| s.persistence_error = None);
         if let Some(input_id) = crate::planner_workflow::prompt_input_id(&req) {
             crate::planner_workflow::queue_delivery(
                 &shared,
@@ -5719,11 +5708,15 @@ pub(crate) async fn run_primary_turn(
         {
             shared.with_session(&router_sid, |s| s.pending_history = history);
         }
-        let (persistence_error, planner_delivery_persistence_failed) = shared
-            .with_session(&router_sid, |s| {
-                (s.persistence_error.clone(), s.planner_delivery_persistence_failed)
-            })
-            .unwrap_or((None, true));
+        let persistence_error = shared
+            .with_session(&router_sid, |s| s.persistence_error.clone())
+            .flatten();
+        let planner_delivery_persistence_failed = shared
+            .planner_deliveries
+            .lock()
+            .unwrap()
+            .get(&router_sid)
+            .is_some_and(|delivery| delivery.persistence_failed);
         if result.is_ok() && persistence_error.is_none() && !planner_delivery_persistence_failed {
             crate::planner_workflow::confirm_delivery(&shared, &router_sid)
                 .map_err(|e| AcpError::internal_error().data(e))?;
