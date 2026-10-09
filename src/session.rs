@@ -3391,8 +3391,9 @@ pub fn flush_pending_disclosure(shared: &Arc<Shared>, router_sid: &str) {
 ///
 /// Token/usage limits cordon the whole agent until the reset time the model
 /// reported (or `headroom.cordon_default_secs` when it reported none); a spend
-/// cap on the seat's money cordons only the candidate that hit it. Outages
-/// count toward candidate quarantine; process death is already tracked by the
+/// cap on the seat's money cordons only the candidate that hit it, and so does
+/// a model reported at capacity (`failover.on_model_capacity`). Outages count
+/// toward candidate quarantine; process death is already tracked by the
 /// connection watchdog.
 pub(crate) fn apply_failure(
     shared: &Arc<Shared>,
@@ -3480,6 +3481,33 @@ pub(crate) fn apply_failure(
             let mut msg = format!("{err}");
             msg.truncate(160);
             format!("outage ({msg})")
+        }
+        FailureClass::ModelAtCapacity if shared.cfg.failover.on_model_capacity => {
+            // Only this model is full: the account and its other models still
+            // serve, so the cordon is scoped to the candidate.
+            let cordon = std::time::Duration::from_secs(shared.cfg.failover.capacity_cordon_secs);
+            let reason = format!("model at capacity (retrying in {})", humanize(cordon));
+            shared.headroom.lock().unwrap().cordon_candidate(
+                candidate,
+                reason.clone(),
+                std::time::SystemTime::now() + cordon,
+            );
+            tracing::warn!(
+                candidate = %candidate,
+                cordon_secs = cordon.as_secs(),
+                "candidate cordoned: model at capacity"
+            );
+            shared.publish_config_options();
+            reason
+        }
+        FailureClass::ModelAtCapacity => {
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .record_pre_prompt_failure(candidate);
+            shared.publish_config_options();
+            "model at capacity".to_string()
         }
         FailureClass::ContextOverflow => {
             // Deliberately no cordon and no quarantine: the model is healthy,
@@ -5176,7 +5204,26 @@ async fn send_prompt_with_failover(
                 })
                 .unwrap_or(false);
             if auth_error && resp.stop_reason != StopReason::Cancelled {
-                Err(AcpError::auth_required().data("Provider reported an authentication error"))
+                return Err(
+                    AcpError::auth_required().data("Provider reported an authentication error")
+                );
+            }
+            // The notice is not a partial answer to carry. Tool activity in
+            // the same turn still makes the failover a hot continuation.
+            let at_capacity = shared.cfg.failover.on_model_capacity
+                && resp.stop_reason != StopReason::Cancelled
+                && shared
+                    .with_session(&router_sid, |s| {
+                        let full = crate::limits::response_is_model_capacity(&s.turn_output);
+                        if full {
+                            s.turn_output.clear();
+                        }
+                        full
+                    })
+                    .unwrap_or(false);
+            if at_capacity {
+                Err(AcpError::internal_error()
+                    .data("Selected model is at capacity. Please try a different model."))
             } else {
                 Ok(resp)
             }
@@ -5425,6 +5472,12 @@ async fn send_prompt_with_failover(
                     .then(|| shared.scores_for(&router_sid, &candidate).context_window)
                     .flatten();
 
+                if matches!(class, FailureClass::ModelAtCapacity)
+                    && shared.cfg.failover.on_model_capacity
+                {
+                    adopt_capacity_substitute(&shared, &router_sid, &candidate);
+                }
+
                 // Tear down the failed downstream session and re-pin.
                 let old_key = shared
                     .with_session(&router_sid, |s| {
@@ -5465,6 +5518,72 @@ async fn send_prompt_with_failover(
     responder.respond_with_error(
         AcpError::internal_error().data("all failover attempts exhausted for this prompt"),
     )
+}
+
+/// A human picked `failed`, and the provider says that model is at capacity.
+/// Move the pick to the eligible model nearest its quality, as the human would,
+/// so the session stays on that model after this turn instead of reverting to
+/// automatic routing. Ties prefer the stronger model, then config order. With
+/// no eligible substitute the pick stays and failover ranks normally.
+fn adopt_capacity_substitute(shared: &Arc<Shared>, router_sid: &str, failed: &CandidateId) {
+    let Some((class, excluded, coordinator)) = shared
+        .with_session(router_sid, |s| {
+            // A resumed session keeps only the pin's `user_pick` flag.
+            let human_pick = match &s.candidate_override {
+                Some(pick) => {
+                    pick == failed
+                        && matches!(s.candidate_override_source, Some(OverrideSource::UserPick))
+                }
+                None => s.pin_user_pick,
+            };
+            human_pick.then(|| {
+                let mut excluded = s.excluded.clone();
+                excluded.push(failed.to_string());
+                (
+                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                    excluded,
+                    s.coordinator,
+                )
+            })
+        })
+        .flatten()
+    else {
+        return;
+    };
+    let target = shared.scores_for(router_sid, failed).quality(class);
+    let substitute = shared
+        .eligible_views_filtered(
+            &RequiredCaps::default(),
+            class,
+            None,
+            false,
+            &excluded,
+            |view| !coordinator || shared.in_planning_pool(&view.id),
+        )
+        .into_iter()
+        .min_by(|a, b| {
+            (a.quality - target)
+                .abs()
+                .total_cmp(&(b.quality - target).abs())
+                .then(b.quality.total_cmp(&a.quality))
+                .then(a.config_index.cmp(&b.config_index))
+        });
+    let Some(substitute) = substitute else {
+        return;
+    };
+    shared.with_session(router_sid, |s| {
+        s.candidate_override = Some(substitute.id.clone());
+        s.candidate_override_source = Some(OverrideSource::UserPick);
+    });
+    notify_user(
+        shared,
+        router_sid,
+        format!(
+            "router-acp · {failed} is at capacity; switching this session's pick to {} \
+             (nearest quality)",
+            substitute.id
+        ),
+    );
 }
 
 /// True when `pattern` (an exact `agent/model` id, a glob like `*opus*`, or a
@@ -6627,9 +6746,20 @@ async fn switch_pin(
             apply_failure(shared, &old_candidate, err, &failure);
         }
         let captured = buffer.lock().unwrap().clone();
+        // A capacity notice in place of the summary is the same failure.
+        let at_capacity = result.is_ok() && crate::limits::response_is_model_capacity(&captured);
+        if at_capacity {
+            let err = AcpError::internal_error().data(captured.trim().to_string());
+            apply_failure(
+                shared,
+                &old_candidate,
+                &err,
+                &crate::limits::FailureClass::ModelAtCapacity,
+            );
+        }
         // Accept only a real summary; a too-short/empty capture or an error
         // means the model didn't actually summarize.
-        if result.is_ok() && captured.trim().len() >= 20 {
+        if result.is_ok() && !at_capacity && captured.trim().len() >= 20 {
             Some(captured)
         } else {
             tracing::warn!(
