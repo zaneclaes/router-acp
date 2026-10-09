@@ -13,9 +13,10 @@
 //!   tool call, permission/fs/terminal callback, router notice) with a token
 //!   count; each insert also increments the owning session's counters.
 //!
-//! Retention: sessions (and their logs, via cascade) older than the `history`
-//! window are pruned on open and after each write. This is the only pruning
-//! mechanism (it replaces the earlier count/age logic).
+//! Retention: sessions (and their logs) older than the `history` window are
+//! pruned in small batches by the elected maintenance worker
+//! (`crate::maintenance`), which also reclaims free pages and checkpoints the
+//! WAL. Writes never prune inline.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -25,14 +26,14 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 /// How long a write waits for another router process to release the
 /// shared database. Many routers share one file on a workstation.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Streaming rows are written together once this many are queued...
 const LOG_BATCH_ROWS: usize = 256;
 /// ...or once the oldest queued row is this old.
 const LOG_FLUSH_WINDOW: Duration = Duration::from_millis(500);
 /// A flush that may defer waits this long for the lock. It runs under the
 /// process-wide state mutex, so a long wait would stall every state access.
-const DEFERRABLE_BUSY_WAIT: Duration = Duration::from_millis(200);
+pub(crate) const DEFERRABLE_BUSY_WAIT: Duration = Duration::from_millis(200);
 /// After a busy flush, chunks stop retrying inline for this long.
 const FLUSH_BACKOFF: Duration = Duration::from_secs(1);
 /// Past this many queued rows the oldest are dropped, bounding memory.
@@ -44,6 +45,13 @@ const WARN_EVERY: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy)]
 pub struct Retention {
     pub max_age: Duration,
+}
+
+impl Retention {
+    /// Epoch seconds before which an idle session is expired.
+    pub fn cutoff(&self, now: u64) -> i64 {
+        now.saturating_sub(self.max_age.as_secs()) as i64
+    }
 }
 
 impl Default for Retention {
@@ -209,7 +217,7 @@ impl std::fmt::Debug for StateFile {
 }
 
 impl StateFile {
-    /// Open (creating/migrating) the database at `path`, then prune.
+    /// Open (creating/migrating) the database at `path`.
     pub fn load(path: &Path, retention: Retention) -> Self {
         Self::try_load(path, retention)
             .unwrap_or_else(|err| panic!("cannot open state DB at {}: {err}", path.display()))
@@ -230,11 +238,10 @@ impl StateFile {
         store.init_schema()?;
         // One-time import of a legacy sessions.json sitting next to the DB.
         store.import_legacy_json(path);
-        store.prune();
         Ok(store)
     }
 
-    fn open_conn(path: &Path) -> rusqlite::Result<Connection> {
+    pub(crate) fn open_conn(path: &Path) -> rusqlite::Result<Connection> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -380,6 +387,15 @@ impl StateFile {
             payload    TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             attempts   INTEGER NOT NULL DEFAULT 0
+        );
+        -- One row: which router process runs maintenance, until when, and
+        -- what its last tick did. See `crate::maintenance`.
+        CREATE TABLE IF NOT EXISTS maintenance_lease (
+            id           INTEGER PRIMARY KEY CHECK (id = 1),
+            holder       TEXT NOT NULL,
+            expires_at   INTEGER NOT NULL,
+            last_tick_at INTEGER,
+            last_result  TEXT
         );
         "#;
         self.conn.execute_batch(sql)?;
@@ -648,7 +664,6 @@ impl StateFile {
                 session.context_used as i64,
             ],
         )?;
-        self.prune();
         Ok(())
     }
 
@@ -1024,7 +1039,8 @@ impl StateFile {
     }
 
     /// Upsert one tool's lifecycle. `active_tool_calls` exposes rows without a
-    /// terminal completion timestamp.
+    /// terminal completion timestamp. A finished call keeps no `detail`: only
+    /// the in-flight view reads it, and `session_log` already holds the output.
     pub fn record_tool_call(
         &self,
         router_session_id: &str,
@@ -1043,6 +1059,7 @@ impl StateFile {
             "completed" | "failed" | "cancelled" | "canceled" | "rejected"
         );
         let completed_at = terminal.then_some(now);
+        let detail = (!terminal).then(|| detail.to_string());
         let _ = self.conn.execute(
             "INSERT INTO tool_calls
                 (router_session_id, tool_call_id, title, status, model,
@@ -1063,7 +1080,7 @@ impl StateFile {
                 model,
                 now,
                 completed_at,
-                detail.to_string(),
+                detail,
             ],
         );
     }
@@ -1156,7 +1173,7 @@ impl StateFile {
         out
     }
 
-    /// Delete sessions (and, by cascade, their logs) idle past `max_age`.
+    /// Delete sessions idle past `max_age`, with their rows in every table.
     pub fn prune(&self) -> usize {
         self.prune_at(now_epoch())
     }
@@ -1201,23 +1218,11 @@ impl StateFile {
         );
     }
 
+    /// `prune` against a fixed clock, in the maintenance worker's batches.
     pub fn prune_at(&self, now: u64) -> usize {
-        let cutoff = now.saturating_sub(self.retention.max_age.as_secs()) as i64;
-        // An event the host never accepted within the history window is moot.
-        let _ = self.conn.execute(
-            "DELETE FROM hook_outbox WHERE created_at < ?1",
-            params![cutoff],
-        );
-        match self.conn.execute(
-            "DELETE FROM sessions WHERE updated_at IS NOT NULL AND updated_at < ?1",
-            params![cutoff],
-        ) {
-            Ok(n) => {
-                if n > 0 {
-                    tracing::info!(pruned = n, "pruned sessions past the history window");
-                }
-                n
-            }
+        let cutoff = self.retention.cutoff(now);
+        match crate::maintenance::prune_expired(&self.conn, cutoff, None) {
+            Ok(n) => n,
             Err(err) => {
                 tracing::error!(%err, "prune failed");
                 0
@@ -1236,7 +1241,7 @@ fn throttle(last: &Cell<Option<Instant>>) -> bool {
 }
 
 /// Another connection holds the lock; the same write can succeed later.
-fn is_busy(err: &rusqlite::Error) -> bool {
+pub(crate) fn is_busy(err: &rusqlite::Error) -> bool {
     matches!(
         err.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)

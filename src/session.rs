@@ -7036,6 +7036,11 @@ pub async fn serve_shared(
     let outbox_task =
         crate::delegate_hook::spawn_outbox_flusher(&shared, std::time::Duration::from_secs(30));
     let log_task = spawn_log_flusher(&shared, std::time::Duration::from_secs(1));
+    let maintenance_task = crate::maintenance::spawn(
+        shared.cfg.state_file.clone(),
+        shared.cfg.retention(),
+        crate::maintenance::TICK_EVERY,
+    );
 
     let result = build_agent(shared.clone()).connect_to(transport).await;
     crate::accounts::cancel_all(&shared);
@@ -7053,6 +7058,7 @@ pub async fn serve_shared(
         task.abort();
     }
     log_task.abort();
+    maintenance_task.abort();
     if let Err(err) = shared.state.lock().unwrap().flush_log_final() {
         tracing::warn!(%err, "session_log rows lost at shutdown");
     }
