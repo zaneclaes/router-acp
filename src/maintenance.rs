@@ -88,6 +88,7 @@ pub struct Maintenance {
     retention: Retention,
     holder: String,
     conn: Option<Connection>,
+    trim_cursor: i64,
     warned_no_vacuum: bool,
 }
 
@@ -102,6 +103,7 @@ impl Maintenance {
             retention,
             holder: format!("{}-{started}", std::process::id()),
             conn: None,
+            trim_cursor: 0,
             warned_no_vacuum: false,
         }
     }
@@ -135,7 +137,7 @@ impl Maintenance {
         let mut report = TickReport::default();
         let steps = prune_expired(conn, self.retention.cutoff(now), Some(deadline))
             .map(|n| report.sessions_pruned = n)
-            .and_then(|()| trim_tool_details(conn, deadline))
+            .and_then(|()| trim_tool_details(conn, deadline, &mut self.trim_cursor))
             .map(|n| report.tool_details_trimmed = n)
             .and_then(|()| incremental_vacuum(conn, deadline, &mut self.warned_no_vacuum))
             .map(|n| report.pages_vacuumed = n);
@@ -262,28 +264,42 @@ pub fn prune_expired(
 
 /// Drop `detail` from finished tool calls written before it was dropped at
 /// write time. The scan is a read; only the matched rows are written.
-fn trim_tool_details(conn: &Connection, deadline: Instant) -> rusqlite::Result<usize> {
+/// `cursor` is the rowid already scanned, so a finished backfill costs
+/// nothing on later ticks. (A row an older router binary finishes below the
+/// cursor keeps its detail until the next process restart rescans.)
+fn trim_tool_details(
+    conn: &Connection,
+    deadline: Instant,
+    cursor: &mut i64,
+) -> rusqlite::Result<usize> {
     let mut trimmed = 0;
     while Instant::now() < deadline {
+        let end: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM tool_calls",
+            [],
+            |row| row.get(0),
+        )?;
         let ids: Vec<i64> = conn
             .prepare(
                 "SELECT rowid FROM tool_calls
-                 WHERE completed_at IS NOT NULL AND detail IS NOT NULL LIMIT ?1",
+                 WHERE rowid > ?1 AND rowid <= ?2 AND completed_at IS NOT NULL AND detail IS NOT NULL
+                 ORDER BY rowid LIMIT ?3",
             )?
-            .query_map(params![TRIM_ROWS_PER_BATCH], |row| row.get(0))?
+            .query_map(params![*cursor, end, TRIM_ROWS_PER_BATCH], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        if ids.is_empty() {
-            break;
+        if !ids.is_empty() {
+            trimmed += conn.execute(
+                "UPDATE tool_calls SET detail = NULL
+                 WHERE rowid IN (SELECT value FROM json_each(?1)) AND completed_at IS NOT NULL",
+                params![serde_json::to_string(&ids).unwrap_or_default()],
+            )?;
         }
-        trimmed += conn.execute(
-            "UPDATE tool_calls SET detail = NULL
-             WHERE rowid IN (SELECT value FROM json_each(?1)) AND completed_at IS NOT NULL",
-            params![serde_json::to_string(&ids).unwrap_or_default()],
-        )?;
-        std::thread::sleep(BATCH_PAUSE);
         if (ids.len() as i64) < TRIM_ROWS_PER_BATCH {
+            *cursor = end;
             break;
         }
+        *cursor = *ids.last().unwrap_or(&end);
+        std::thread::sleep(BATCH_PAUSE);
     }
     Ok(trimmed)
 }
@@ -613,9 +629,15 @@ mod tests {
             1
         );
 
-        let trimmed = trim_tool_details(&conn, Instant::now() + TICK_BUDGET).unwrap();
+        let mut cursor = 0;
+        let trimmed = trim_tool_details(&conn, Instant::now() + TICK_BUDGET, &mut cursor).unwrap();
 
         assert_eq!(trimmed, 3);
+        assert_eq!(
+            cursor,
+            count(&conn, "SELECT MAX(rowid) FROM tool_calls"),
+            "a finished pass starts the next tick past every scanned row"
+        );
         assert_eq!(
             count(
                 &conn,

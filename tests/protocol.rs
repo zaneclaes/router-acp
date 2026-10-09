@@ -4222,8 +4222,8 @@ async fn state_db_prunes_by_history_window() {
         Ok(())
     })
     .await;
-    // Reopen with the same 1s window after idling; load-time prune removes it.
-    // Sleep well past the window — updated_at has second granularity, so a
+    // Reopen with the same 1s window after idling; the maintenance prune
+    // (opening no longer prunes) removes it. Sleep well past the window — updated_at has second granularity, so a
     // margin under ~2s can round to "not yet expired".
     tokio::time::sleep(Duration::from_secs(3)).await;
     let db = router_acp::state::StateFile::load(
@@ -4232,6 +4232,8 @@ async fn state_db_prunes_by_history_window() {
             max_age: std::time::Duration::from_secs(1),
         },
     );
+    assert_eq!(db.all().len(), 1, "opening the state DB never prunes");
+    assert_eq!(db.prune(), 1);
     assert_eq!(db.all().len(), 0, "history window pruned the idle session");
 }
 
