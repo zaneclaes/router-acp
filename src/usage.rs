@@ -716,7 +716,7 @@ pub fn window_remaining_dollars(spent: f64, percent: f64) -> Option<f64> {
 
 /// Router-metered spend lookup: total `cost_usd` for one agent, optionally
 /// restricted to specific `"agent/model"` strings (a scoped window), since a
-/// given instant. `poll_all` builds the real one over `StateFile::
+/// given instant. `poll_all` builds the real one over `StateStore::
 /// llm_cost_since`; tests that don't care about dollar estimation pass
 /// `None` and every plan window falls back to its percent fraction.
 pub type SpendLookup<'a> = dyn Fn(Option<&[String]>, SystemTime) -> Option<f64> + 'a;

@@ -229,8 +229,8 @@ fn session_id(frame: &Value) -> String {
         .to_string()
 }
 
-fn state(fixture: &Fixture) -> router_acp::state::StateFile {
-    router_acp::state::StateFile::load(&fixture.state, router_acp::state::Retention::default())
+fn state(fixture: &Fixture) -> router_acp::state::StateStore {
+    router_acp::state::StateStore::load(&fixture.state, router_acp::state::Retention::default())
 }
 
 fn mock_prompts(path: &Path) -> Vec<String> {

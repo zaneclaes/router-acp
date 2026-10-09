@@ -296,8 +296,11 @@ That line is your proof the router is serving the session. Also sanity-check:
   `--session <rtr-id>` for the full picture: the routing `why` (weights +
   utility math), token usage (input/output/context), and the `session_log`
   of every prompt, response, and tool call with per-entry token counts.
-  It's a SQLite DB (`~/.local/state/router-acp/sessions.db`) — query it
-  directly with `sqlite3` if you like. Delegated sub-agents appear as child
+  Router-acp owns its SQLite state file (`~/.local/state/router-acp/sessions.db`).
+  Hosts query it through `router-acp state-query --config
+  ~/.config/router-acp/router.yaml v1 session --session <rtr-id>`. Use `v1
+  delegates`, `logs`, `analytics`, `health`, `delegation-report`, and
+  `transcript` for the other supported JSON views. Delegated sub-agents appear as child
   rows linked to their parent. The
   DB auto-prunes to the `history` window (default 30d).
 - A plain `goose session` (no `GOOSE_PROVIDER`) must still start the real
