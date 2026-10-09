@@ -17,7 +17,7 @@
 //! window are pruned on open and after each write. This is the only pruning
 //! mechanism (it replaces the earlier count/age logic).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,15 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_BATCH_ROWS: usize = 256;
 /// ...or once the oldest queued row is this old.
 const LOG_FLUSH_WINDOW: Duration = Duration::from_millis(500);
+/// A flush that may defer waits this long for the lock. It runs under the
+/// process-wide state mutex, so a long wait would stall every state access.
+const DEFERRABLE_BUSY_WAIT: Duration = Duration::from_millis(200);
+/// After a busy flush, chunks stop retrying inline for this long.
+const FLUSH_BACKOFF: Duration = Duration::from_secs(1);
+/// Past this many queued rows the oldest are dropped, bounding memory.
+const LOG_QUEUE_CAP: usize = 50_000;
+/// Deferral and drop warnings repeat at most this often.
+const WARN_EVERY: Duration = Duration::from_secs(30);
 
 /// Retention policy: sessions idle longer than `max_age` are pruned.
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +190,9 @@ pub struct StateFile {
     retention: Retention,
     /// Streaming `session_log` rows not yet written, oldest first.
     pending_log: RefCell<Vec<PendingLog>>,
+    flush_backoff_until: Cell<Option<Instant>>,
+    defer_warned_at: Cell<Option<Instant>>,
+    drop_warned_at: Cell<Option<Instant>>,
 }
 
 struct PendingLog {
@@ -211,6 +223,9 @@ impl StateFile {
             conn,
             retention,
             pending_log: RefCell::default(),
+            flush_backoff_until: Cell::default(),
+            defer_warned_at: Cell::default(),
+            drop_warned_at: Cell::default(),
         };
         store.init_schema()?;
         // One-time import of a legacy sessions.json sitting next to the DB.
@@ -700,6 +715,7 @@ impl StateFile {
         Self::insert_log(&tx, router_session_id, now_epoch() as i64, entry)?;
         tx.commit()?;
         self.pending_log.borrow_mut().drain(..written);
+        self.flush_backoff_until.set(None);
         Ok(())
     }
 
@@ -713,25 +729,80 @@ impl StateFile {
             queued_at: Instant::now(),
             entry,
         });
+        if pending.len() > LOG_QUEUE_CAP {
+            let dropped = pending.len() - LOG_QUEUE_CAP;
+            pending.drain(..dropped);
+            if throttle(&self.drop_warned_at) {
+                tracing::warn!(
+                    dropped,
+                    "session_log queue full; dropping the oldest streaming rows"
+                );
+            }
+        }
         let due =
             pending.len() >= LOG_BATCH_ROWS || pending[0].queued_at.elapsed() >= LOG_FLUSH_WINDOW;
         drop(pending);
-        if due && let Err(err) = self.flush_log() {
-            tracing::warn!(%err, "session_log batch deferred; retrying on the next flush");
+        let backing_off = self
+            .flush_backoff_until
+            .get()
+            .is_some_and(|until| Instant::now() < until);
+        if due && !backing_off {
+            self.flush_log_or_warn();
         }
     }
 
-    /// Write every queued streaming row in one transaction. When the database
-    /// is busy the rows stay queued, in order, for the next flush.
+    /// Write every queued streaming row in one transaction, waiting only
+    /// briefly for the lock. When the database is busy the rows stay queued,
+    /// in order, and inline flushes pause for `FLUSH_BACKOFF`.
     pub fn flush_log(&self) -> rusqlite::Result<()> {
+        self.flush_log_waiting(DEFERRABLE_BUSY_WAIT)
+    }
+
+    /// Final flush at shutdown: nothing else is waiting on the state mutex,
+    /// so wait the full lock timeout rather than lose the rows.
+    pub fn flush_log_final(&self) -> rusqlite::Result<()> {
+        self.flush_log_waiting(BUSY_TIMEOUT)
+    }
+
+    fn flush_log_waiting(&self, wait: Duration) -> rusqlite::Result<()> {
         if self.pending_log.borrow().is_empty() {
             return Ok(());
         }
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let written = self.write_pending(&tx)?;
-        tx.commit()?;
-        self.pending_log.borrow_mut().drain(..written);
-        Ok(())
+        self.conn.busy_timeout(wait)?;
+        let result = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .and_then(|tx| {
+                let written = self.write_pending(&tx)?;
+                tx.commit()?;
+                Ok(written)
+            });
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        match result {
+            Ok(written) => {
+                self.pending_log.borrow_mut().drain(..written);
+                self.flush_backoff_until.set(None);
+                Ok(())
+            }
+            Err(err) => {
+                if is_busy(&err) {
+                    self.flush_backoff_until
+                        .set(Some(Instant::now() + FLUSH_BACKOFF));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// `flush_log`, warning at most once per `WARN_EVERY` when it defers.
+    pub fn flush_log_or_warn(&self) {
+        if let Err(err) = self.flush_log()
+            && throttle(&self.defer_warned_at)
+        {
+            tracing::warn!(
+                %err,
+                queued = self.pending_log_rows(),
+                "session_log batch deferred; retrying on the next flush"
+            );
+        }
     }
 
     /// Number of streaming rows waiting for a flush.
@@ -1051,7 +1122,7 @@ impl StateFile {
 
     /// Every log entry for a session, in chronological order.
     pub fn log_for_all(&self, router_session_id: &str) -> rusqlite::Result<Vec<LogEntry>> {
-        self.flush_log()?;
+        self.flush_log_or_warn();
         let mut stmt = self.conn.prepare(
             "SELECT kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
@@ -1064,9 +1135,7 @@ impl StateFile {
     /// Recent log entries for a session (chronological).
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
         let mut out = Vec::new();
-        if let Err(err) = self.flush_log() {
-            tracing::warn!(%err, "session_log batch deferred; recent rows may be missing");
-        }
+        self.flush_log_or_warn();
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
@@ -1155,6 +1224,15 @@ impl StateFile {
             }
         }
     }
+}
+
+/// True at most once per `WARN_EVERY` for the warning tracked by `last`.
+fn throttle(last: &Cell<Option<Instant>>) -> bool {
+    if last.get().is_some_and(|at| at.elapsed() < WARN_EVERY) {
+        return false;
+    }
+    last.set(Some(Instant::now()));
+    true
 }
 
 /// Another connection holds the lock; the same write can succeed later.
@@ -1433,24 +1511,68 @@ mod tests {
         assert_eq!(s.pending_log_rows(), 0);
     }
 
-    #[test]
-    fn a_locked_database_keeps_chunks_queued_until_a_later_flush() {
+    /// A store plus a second connection holding the write lock.
+    fn locked_store() -> (tempfile::TempDir, StateFile, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let s = StateFile::load(&path, Retention::default());
-        s.conn.busy_timeout(Duration::from_millis(50)).unwrap();
         s.upsert("r1".into(), session("a"));
         let other = Connection::open(&path).unwrap();
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        (dir, s, other)
+    }
 
-        s.log_buffered("r1", chunk("kept"));
+    #[test]
+    fn a_locked_database_keeps_chunks_queued_until_a_later_flush() {
+        let (_d, s, other) = locked_store();
+        for i in 0..LOG_BATCH_ROWS - 1 {
+            s.log_buffered("r1", chunk(&i.to_string()));
+        }
+
+        // The row that completes a batch triggers a flush; it must not stall
+        // the caller for the 30 s lock timeout.
+        let started = Instant::now();
+        s.log_buffered("r1", chunk("last"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(s.pending_log_rows(), LOG_BATCH_ROWS);
         let err = s.flush_log().unwrap_err();
         assert!(is_busy(&err), "unexpected error: {err}");
-        assert_eq!(s.pending_log_rows(), 1);
 
         other.execute_batch("COMMIT").unwrap();
         s.flush_log().unwrap();
-        assert_eq!(texts(&s.log_for_all("r1").unwrap()), ["kept"]);
+        let saved = texts(&s.log_for_all("r1").unwrap());
+        assert_eq!(saved.len(), LOG_BATCH_ROWS);
+        assert_eq!(saved.first().unwrap(), "0");
+        assert_eq!(saved.last().unwrap(), "last");
+    }
+
+    #[test]
+    fn a_full_queue_drops_its_oldest_rows_and_keeps_order() {
+        let (_d, s, other) = locked_store();
+        let extra = 5;
+        for i in 0..LOG_QUEUE_CAP + extra {
+            s.log_buffered("r1", chunk(&i.to_string()));
+        }
+        assert_eq!(s.pending_log_rows(), LOG_QUEUE_CAP);
+
+        other.execute_batch("COMMIT").unwrap();
+        s.flush_log().unwrap();
+        let saved = texts(&s.log_for_all("r1").unwrap());
+        assert_eq!(saved.len(), LOG_QUEUE_CAP);
+        assert_eq!(saved.first().unwrap(), &extra.to_string());
+        assert_eq!(
+            saved.last().unwrap(),
+            &(LOG_QUEUE_CAP + extra - 1).to_string()
+        );
+        assert!(
+            saved
+                .windows(2)
+                .all(|w| w[0].parse::<usize>().unwrap() + 1 == w[1].parse::<usize>().unwrap())
+        );
     }
 
     #[test]

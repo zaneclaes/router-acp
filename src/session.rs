@@ -1722,9 +1722,13 @@ fn spawn_log_flusher(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(err) = shared.state.lock().unwrap().flush_log() {
-                tracing::warn!(%err, "session_log batch deferred; retrying on the next flush");
-            }
+            // The flush holds the std state mutex while SQLite waits; keep
+            // that off the async workers.
+            let shared = shared.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                shared.state.lock().unwrap().flush_log_or_warn();
+            })
+            .await;
         }
     })
 }
@@ -5108,9 +5112,7 @@ async fn send_prompt_with_failover(
         {
             let state = shared.state.lock().unwrap();
             state.add_compute_ms(&router_sid, turn_start.elapsed().as_millis() as u64);
-            if let Err(err) = state.flush_log() {
-                tracing::warn!(%err, session = %router_sid, "session_log batch deferred at turn end");
-            }
+            state.flush_log_or_warn();
         }
         if let Some(err) = shared
             .with_session(&router_sid, |s| s.persistence_error.clone())
@@ -7051,7 +7053,7 @@ pub async fn serve_shared(
         task.abort();
     }
     log_task.abort();
-    if let Err(err) = shared.state.lock().unwrap().flush_log() {
+    if let Err(err) = shared.state.lock().unwrap().flush_log_final() {
         tracing::warn!(%err, "session_log rows lost at shutdown");
     }
     result
