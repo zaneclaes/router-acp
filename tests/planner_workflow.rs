@@ -295,6 +295,161 @@ fn stale_cas_update_is_rejected_across_two_state_files() {
 }
 
 #[test]
+fn planner_delete_fences_revision_and_releases_only_owned_workspace_claims() {
+    let fixture = fixture(|_| {});
+    let owned_workspace = fixture._tmp.path().join("owned-workspace");
+    let other_workspace = fixture._tmp.path().join("other-workspace");
+    let repository_artifact = fixture.repo.join("planner-artifact.txt");
+    std::fs::write(&repository_artifact, "keep this repository artifact\n").unwrap();
+
+    let state = fixture.shared.state.lock().unwrap();
+    state.upsert(
+        "other-session".into(),
+        PersistedSession {
+            agent: "test".into(),
+            model: "model".into(),
+            downstream_session_id: "other-downstream".into(),
+            cwd: fixture.repo.clone(),
+            kind: "primary".into(),
+            ..PersistedSession::default()
+        },
+    );
+    assert_eq!(
+        state.save_planner_run(SID, 0, &json!({"status": "running"})),
+        Ok(1)
+    );
+    state
+        .claim_planner_workspace(&owned_workspace, SID, "work-1", "owned-lease")
+        .unwrap();
+    state
+        .claim_planner_workspace(&other_workspace, "other-session", "work-2", "other-lease")
+        .unwrap();
+    assert_eq!(
+        state.save_planner_run(SID, 1, &json!({"status": "complete"})),
+        Ok(2)
+    );
+
+    let error = state.remove_planner_session(SID, 1).unwrap_err();
+    assert!(error.contains("changed concurrently"), "{error}");
+    assert_eq!(
+        state.planner_run(SID).unwrap(),
+        Some((2, json!({"status": "complete"})))
+    );
+    assert!(state.get(SID).is_some());
+    assert!(
+        state
+            .claim_planner_workspace(&owned_workspace, "other-session", "work-3", "other-lease")
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&repository_artifact).unwrap(),
+        "keep this repository artifact\n"
+    );
+
+    state.remove_planner_session(SID, 2).unwrap();
+    assert_eq!(state.planner_run(SID).unwrap(), None);
+    assert!(state.get(SID).is_none());
+    state
+        .claim_planner_workspace(&owned_workspace, "other-session", "work-3", "new-lease")
+        .unwrap();
+    assert!(
+        state
+            .claim_planner_workspace(&other_workspace, "third-session", "work-4", "third-lease")
+            .is_err()
+    );
+    assert!(state.get("other-session").is_some());
+    assert_eq!(
+        std::fs::read_to_string(&repository_artifact).unwrap(),
+        "keep this repository artifact\n"
+    );
+}
+
+#[test]
+fn native_rehydration_keeps_planner_routing_without_claiming_old_effort() {
+    let fixture = fixture(|_| {});
+    fixture
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .patch_session_routing(
+            SID,
+            &json!({
+                "planner_phase": "implementation",
+                "coordinator": true,
+                "effort": {
+                    "requested": "high",
+                    "explicit": true,
+                    "confirmed": true
+                }
+            }),
+        )
+        .unwrap();
+
+    let persisted = fixture.shared.state.lock().unwrap().get(SID).unwrap();
+    let restored = RouterSession::rehydrated(&fixture.shared.cfg, &persisted, Vec::new());
+    assert_eq!(
+        restored.planner_phase,
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    assert!(restored.coordinator);
+    assert_eq!(
+        restored.effort_request,
+        Some(router_acp::candidate::EffortLevel::High)
+    );
+    assert!(
+        restored.resolved_effort.is_none(),
+        "a fresh native adapter must confirm effort again"
+    );
+}
+
+#[tokio::test]
+async fn close_keeps_terminal_planner_runs_and_durable_assignment() {
+    let fixture = fixture(|_| {});
+    admit(&fixture.shared, work("work-1"));
+    let (_, workspace, child_id, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    fixture.shared.with_session(SID, |session| {
+        session.delegates.push(router_acp::session::DelegateHandle {
+            process_key: router_acp::downstream::ProcessKey("test".into()),
+            downstream_sid: "running-child".into(),
+        });
+    });
+
+    for terminal in [RunStatus::Complete, RunStatus::Cancelled] {
+        planner_workflow::mutate(&fixture.shared, SID, |run| {
+            run.status = terminal;
+            Ok(())
+        })
+        .unwrap();
+        router_acp::session::close_live_delegates_for(&fixture.shared, SID);
+
+        let run = planner_workflow::load(&fixture.shared, SID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, terminal);
+        assert_eq!(run.works["work-1"].child_id, child_id);
+        assert_eq!(
+            run.works["work-1"].workspace.as_ref().unwrap().path,
+            workspace.path
+        );
+    }
+    assert!(
+        fixture
+            .shared
+            .with_session(SID, |session| session.cancelled)
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .shared
+            .with_session(SID, |session| session.delegates.is_empty())
+            .unwrap()
+    );
+}
+
+#[test]
 fn duplicate_admission_is_idempotent_but_conflicting_identity_fails() {
     let fixture = fixture(|_| {});
     let mut spec = work("work-1");

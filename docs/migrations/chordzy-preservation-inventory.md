@@ -1,16 +1,20 @@
 # Chordzy implementation inventory
 
-Read-only audit of `Tuneality/Tuneality` staging. The audit used authenticated `gh api` reads at one fixed SHA. It did not modify the checkout, repository, ticket, branch, or runtime.
+Read-only audit of `Tuneality/Tuneality` staging. The audit used authenticated `gh api` reads at immutable SHAs. It did not modify the checkout, repository, ticket, branch, or runtime.
 
 ## Decisions I made
 
-- I pin every source claim below to staging SHA `6cbc9e04dc83f49c1f663f969edf5568d3c53992`.
+- I retain `6cbc9e04dc83f49c1f663f969edf5568d3c53992` as the immutable source baseline.
+- I refresh register and continuation receipts against current staging SHA `dae86ddb2c6a4d03921c71cf2b99d33a2accdfad`.
+- The current comparison shows the core planner, release, smoke, review, roadmap, and hook source blobs are unchanged. Their 6cbc source receipts remain authoritative.
 - I classify source and fixture coverage as existing evidence. I classify live hook delivery, router execution, deployed release behavior, and end-to-end parity as pending unless a source test directly proves them.
 - I apply the approved Chordzy change. `implement` becomes bounded implementation work. Selection, coordination, release, disposition, and roadmap ownership move to the six planner roles.
+- Runtime registers, capacity, queue state, and watcher state are current-at-audit inputs. They are not baked queue policy.
+- The active legacy run keeps only its authorized existing watcher until explicit migration or drain authorization and native parity evidence exist.
 
-## Baseline and instruction inventory
+## Baseline and current staging receipt
 
-Staging resolves to:
+The immutable source baseline resolves to:
 
 ```text
 Repository: Tuneality/Tuneality
@@ -21,18 +25,62 @@ Commit date: 2026-10-07T05:38:26Z
 Parent: 01262fdda722fac3f1bcf93f800b5bb6f63dd1ac
 ```
 
-The source links below all use this SHA:
+The source links below intentionally use this immutable baseline SHA:
 
 `https://github.com/Tuneality/Tuneality/tree/6cbc9e04dc83f49c1f663f969edf5568d3c53992`
 
 The root contract is [`AGENTS.md`](https://github.com/Tuneality/Tuneality/blob/6cbc9e04dc83f49c1f663f969edf5568d3c53992/AGENTS.md), blob `63dcdb5a20fe72c427d1d49dd369f47cf15d4ef6`. It defines the staging branch model, worktree ownership, release train, plan registers, hook installation, safe-change checks, deployment, and smokescreen gates.
+
+The current staging audit resolves to:
+
+```text
+Repository: Tuneality/Tuneality
+Branch: staging
+SHA: dae86ddb2c6a4d03921c71cf2b99d33a2accdfad
+Commit: fix: use the mounted artifacts path when the agent mount is missing
+Commit date: 2026-10-08T09:52:08Z
+Parent: 413743fb5a021f80aa7fa02db5e5e4469a75a8a9
+```
+
+The [current staging tree](https://github.com/Tuneality/Tuneality/tree/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad) is a receipt for this audit only. The cached compare is [`6cbc9e0...dae86dd`](https://github.com/Tuneality/Tuneality/compare/6cbc9e04dc83f49c1f663f969edf5568d3c53992...dae86ddb2c6a4d03921c71cf2b99d33a2accdfad).
+
+The core source blobs are unchanged between the immutable baseline and current staging:
+
+| Source | Blob at both SHAs |
+|---|---|
+| `.agents/skills/plan/SKILL.md` | `2af8a15cdb8da524bccfc1eb0c511ebab48cb4f2` |
+| `.agents/skills/implement/SKILL.md` | `aeb925061ee23ce3865381637c5778fba0597df1` |
+| `.agents/skills/implement-all/SKILL.md` | `8b916e4bb8b9bfd860f885eda16fbf72c740ea75` |
+| `.agents/skills/deploy/SKILL.md` | `62a2dfd62a962fe998cc55a89d2ac9b418c3e686` |
+| `.agents/skills/smokescreen/SKILL.md` | `8c50dac03c9032ef17b81582fd11dc9246638571` |
+| `.agents/skills/review/SKILL.md` | `e560f0b0a05f0f6a67be67b0d284f593c7c55236` |
+| `.agents/skills/roadmap/SKILL.md` | `62122d0a80476b1aea7c42e6ade22f21ed4f1a1c` |
+| `.agents/hooks/ImplementAllGuard.cs` | `23f69587f52a9b16f9c10b4814f0a8ffafd23e55` |
+| `.agents/hooks/RepoGuard.cs` | `0c843f77e6ee4203430e0d6aa774f2431b5e9bed` |
+| `ci/agent-hooks.json` | `6f86cd6ddf27693ed6f2141eeedbd3a8f1ced98b` |
+| `ci/hooks/pre-commit` | `8abfac2d080eccd6042ba3f651496511d5ab6812` |
+| `ci/hooks/pre-push` | `5ee09ca0fb2edfee72e0835cec70b1c8ead987e0` |
 
 The nested `AGENTS.md` files form two content groups:
 
 - Blob `42061c01a1c70097d1e4579f29a5adf40abdec95` is shared by `Assets/`, `ChordzyGame/`, `JUCE/`, `TuneClient/`, `TuneCore/`, `TuneData/`, `TuneGpt/`, `TuneML/`, `TuneMidi/`, `TuneSvgs/`, `TuneTests/`, `TuneWeb/`, their listed server subtrees, and `ci/`. These files provide area maps and shared implementation constraints.
 - `Smokescreen/AGENTS.md`, blob `9e486f5d492e90007c2f984186f7e9d1aa0a08c2`, is the separate Smokescreen area contract.
 
-The relevant planning registers are `Docs/Plans/README.md`, `Docs/ROADMAP.md`, `Docs/WATCH.md`, `Docs/BLOCKED.md`, and `Docs/CONTINUE.md`. `Docs/Completed/README.md` and `Docs/Reviewed/README.md` define the later disposition states. The plan contract preserves every Why/Do/Done and forbids treating Completed or Reviewed as an implementation queue.
+The current register receipts are:
+
+| Register | Current staging blob |
+|---|---|
+| [`Docs/Plans/README.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/Plans/README.md) | `ddc548634c8510824e0a8d173fc6f065839e23bc` |
+| [`Docs/ROADMAP.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/ROADMAP.md) | `714b938375b9a2da26dbb15298cbc0e02d6d1e26` |
+| [`Docs/WATCH.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/WATCH.md) | `c23d990b9a6d3ce0f29d4b84a25f8279bc7950e9` |
+| [`Docs/BLOCKED.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/BLOCKED.md) | `f9a8b038589f39b67e5c0e084f191f961098b335` |
+| [`Docs/CONTINUE.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/CONTINUE.md) | `918a40ce7efa40af551d64a1947c02761dbc9585` |
+| [`Docs/Completed/README.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/Completed/README.md) | `fe7683e267d1ef6303bf7d5c2e896612c2f56d3d` |
+| [`Docs/Reviewed/README.md`](https://github.com/Tuneality/Tuneality/blob/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad/Docs/Reviewed/README.md) | `f15b85b4e7a0dcb252a0ff6966706bff029a835e` |
+
+`Docs/Completed/README.md` and `Docs/Reviewed/README.md` define the later disposition states. The plan contract preserves every Why/Do/Done and forbids treating Completed or Reviewed as an implementation queue. The register contents above are current-at-audit evidence. Runtime selection must reread them and must not embed their queue, capacity, or active-run values in planner YAML or role templates.
+
+`Docs/CONTINUE.md` records active legacy run `ia-20261006-223316-891c8f27` with the existing watcher only. That record authorizes watcher continuity only. It does not authorize router wake ownership, migration, drain, legacy retirement, or a native parity claim. Keep the legacy source owners until explicit migration or drain authorization and native parity evidence.
 
 ## Exact current source ownership
 

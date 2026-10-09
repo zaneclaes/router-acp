@@ -38,6 +38,7 @@ Keep these exact owners and paths:
 
 `ImplementAllGuard`, `Supervisor.cs`, and `CliAdapter.cs` remain available for existing runs during drain.
 They must not create a second durable ledger, coordinator, or wake owner.
+The active legacy run retains only its authorized existing watcher until explicit migration or drain authorization and native parity evidence exist.
 
 ## Authorization and evidence
 

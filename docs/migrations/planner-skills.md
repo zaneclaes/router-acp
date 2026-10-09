@@ -3,8 +3,14 @@
 This document defines planner schema v1 and the consumer migration templates.
 It matches the current `src/config.rs`, `src/planner_skills.rs`, `src/planner_workflow.rs`, `src/delegate_mcp.rs`, and `src/delegate_hook.rs` implementation on this branch.
 
-The Chordzy inventory is evidence from staging SHA `6cbc9e04dc83f49c1f663f969edf5568d3c53992`.
-It does not prove router execution, live hook delivery, deployed release behavior, or end-to-end parity.
+The Chordzy inventory retains immutable source baseline `6cbc9e04dc83f49c1f663f969edf5568d3c53992` and refreshes register receipts against current staging `dae86ddb2c6a4d03921c71cf2b99d33a2accdfad`.
+The core planner, release, smoke, review, roadmap, and hook source blobs are unchanged between those SHAs.
+It does not prove router execution, live hook delivery, deployed release behavior, native consumer parity, or end-to-end parity.
+
+Runtime register contents, capacity, queue state, active runs, and watcher state are current-at-audit inputs.
+They must be reread at invocation and must not become baked queue policy in this document, the YAML, or the role templates.
+The current `Docs/CONTINUE.md` receipt records one legacy run with only its authorized existing watcher.
+Keep that watcher until explicit migration or drain authorization and native parity evidence exist.
 
 ## Decisions I made
 
