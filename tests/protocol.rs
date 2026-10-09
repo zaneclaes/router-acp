@@ -18,7 +18,8 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionValue,
     SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    StopReason,
+    StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Channel, Client as ClientPeer, ConnectionTo, Dispatch, Handled, Responder,
@@ -224,6 +225,7 @@ struct Observed {
     elicitation_session_ids: Vec<String>,
     xai_ask_session_ids: Vec<String>,
     terminal_creates: Vec<(String, String, Vec<String>, Option<PathBuf>)>,
+    terminal_create_meta: Vec<Option<serde_json::Map<String, serde_json::Value>>>,
 }
 
 type ObservedHandle = Arc<Mutex<Observed>>;
@@ -374,8 +376,27 @@ where
                             req.args,
                             req.cwd,
                         ));
+                        observed.lock().unwrap().terminal_create_meta.push(req.meta);
                         responder.respond(CreateTerminalResponse::new("managed-terminal-1"))
                     }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                move |_req: WaitForTerminalExitRequest,
+                      responder: Responder<WaitForTerminalExitResponse>,
+                      _cx| async move {
+                    responder.respond(WaitForTerminalExitResponse::new(
+                        TerminalExitStatus::new().exit_code(0),
+                    ))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                move |_req: TerminalOutputRequest,
+                      responder: Responder<TerminalOutputResponse>,
+                      _cx| async move {
+                    responder.respond(TerminalOutputResponse::new("watch-fired\n", false))
                 },
                 on_receive_request!(),
             )
@@ -744,6 +765,11 @@ async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
             text.contains("background-start:Background terminal managed-terminal-1 started"),
             "managed terminal tool result expected, got: {text}"
         );
+        assert!(
+            text.contains("router-acp managed background completed")
+                && text.contains("watch-fired"),
+            "router must resume the agent with terminal completion, got: {text}"
+        );
         assert_eq!(
             observed.lock().unwrap().terminal_creates,
             vec![(
@@ -752,6 +778,14 @@ async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
                 vec!["-lc".to_string(), "echo managed".to_string()],
                 None,
             )]
+        );
+        assert_eq!(
+            observed.lock().unwrap().terminal_create_meta[0]
+                .as_ref()
+                .and_then(|meta| meta.get("router_acp"))
+                .and_then(|router| router.get("managed_background"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
         Ok(())
     })
