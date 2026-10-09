@@ -168,14 +168,14 @@ pub fn on_session_delete(
     };
     if let Some(run) = run {
         let has_durable_work = !run.works.is_empty();
-        if has_durable_work
+        if (has_durable_work
             && (run.works.values().any(|work| {
                 work.status != crate::planner_workflow::WorkStatus::Integrated
                     || work.attempt.as_ref().is_some_and(|attempt| !attempt.ended)
             }) || run.inputs.values().any(|input| !input.acknowledged)
-                || run.wakes.values().any(|wake| !wake.acknowledged)
-                || !run.parent_queue.is_empty()
-                || !run.approval_waits.is_empty())
+                || run.wakes.values().any(|wake| !wake.acknowledged)))
+            || !run.parent_queue.is_empty()
+            || !run.approval_waits.is_empty()
         {
             return responder.respond_with_error(
                 AcpError::invalid_request()
