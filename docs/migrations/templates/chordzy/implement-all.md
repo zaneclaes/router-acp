@@ -36,6 +36,9 @@ An unowned bug may create one focused guide only after normal admission.
 It reports Production, Staging, and WIP with build numbers, deployment times, smoke verdicts, follow-ups, and honest unknowns.
 It does not pause active work or start duplicate verification.
 
+Register contents, capacity, queue state, active runs, and watcher state are current-at-invocation inputs.
+They are not baked into this wrapper or its planner YAML.
+
 Side questions receive a response while work continues.
 Busy lanes do not end the run.
 
@@ -51,6 +54,7 @@ Keep separate Completed-to-Reviewed processing from `.agents/skills/review/SKILL
 
 During drain, `ImplementAllGuard`, `Supervisor.cs`, and `CliAdapter.cs` remain available for existing runs.
 They must not start a second coordinator or duplicate the router ledger.
+The active legacy run retains only its authorized existing watcher until explicit migration or drain authorization and native parity evidence exist.
 
 After parity tests pass, the router owns new-run activation and wake scheduling.
 The guard remains the policy enforcement boundary.

@@ -8,7 +8,7 @@ It returns one durable selection result.
 
 ## Steps
 
-1. Read `Docs/ROADMAP.md`, `Docs/Plans/README.md`, `Docs/WATCH.md`, `Docs/BLOCKED.md`, and `Docs/CONTINUE.md`.
+1. Read the current-at-invocation versions of `Docs/ROADMAP.md`, `Docs/Plans/README.md`, `Docs/WATCH.md`, `Docs/BLOCKED.md`, and `Docs/CONTINUE.md`.
 2. Read the approved scope from the authentic `/implement` or `implement-all` invocation.
 3. Apply the existing eligibility rules.
 4. Preserve full-roadmap and explicit-subset invocation.
@@ -18,6 +18,10 @@ It returns one durable selection result.
 8. Return `actionable`, `waiting`, `blocked`, or `complete` with a durable `plan_id`, `work_id`, assigned scope, base SHA, dependency receipts, authorization source, capacity decision, and workspace policy.
 9. For a missing argument, perform this selection once and persist the result before dispatch.
 10. Admit work with `planner_workflow` `admit` using an idempotency key.
+
+Register contents, capacity, queue state, active runs, and watcher state are runtime inputs.
+Do not copy them into this role, the planner YAML, or a durable queue policy snapshot.
+The active legacy run keeps only its authorized existing watcher until explicit migration or drain authorization and native parity evidence exist.
 
 The result must identify the original guide owner.
 The result must not create a second scheduler or coordinator.

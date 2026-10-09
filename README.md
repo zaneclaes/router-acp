@@ -715,6 +715,12 @@ Do not launch a provider CLI against canonical credentials outside the router.
 - `list` reads router SQLite. `close` ends the live adapter but retains the conversation. `delete` removes the router conversation.
 - Unknown ids fail. SQLite write failures fail the ACP operation rather than creating an unresumable conversation.
 
+Planner Resume also restores the durable phase, coordinator role, and assignments.
+Restored effort preferences do not establish confirmed active effort.
+Planner close pauses running work while retaining assignments and repository artifacts.
+Planner delete refuses unfinished assignments, including their live attempts, pending inputs, wakes, and approval waits.
+After reconciliation, deletion removes only that run's planner state and workspace claims.
+
 Hosts own presentation state and queued UI actions. They must retain the router id and call these lifecycle methods. They must not synthesize an LLM recap or manage provider conversation files.
 
 ## Troubleshooting

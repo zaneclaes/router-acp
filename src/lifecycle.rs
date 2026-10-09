@@ -162,17 +162,47 @@ pub fn on_session_delete(
     if let Err(err) = lookup_persisted(&shared, &sid) {
         return responder.respond_with_error(err);
     }
+    let run = match crate::planner_workflow::load(&shared, &sid) {
+        Ok(run) => run,
+        Err(err) => return responder.respond_with_error(AcpError::internal_error().data(err)),
+    };
+    if let Some(run) = run {
+        let has_durable_work = !run.works.is_empty();
+        if has_durable_work
+            && (run.works.values().any(|work| {
+                work.status != crate::planner_workflow::WorkStatus::Integrated
+                    || work.attempt.as_ref().is_some_and(|attempt| !attempt.ended)
+            }) || run.inputs.values().any(|input| !input.acknowledged)
+                || run.wakes.values().any(|wake| !wake.acknowledged)
+                || !run.parent_queue.is_empty()
+                || !run.approval_waits.is_empty())
+        {
+            return responder.respond_with_error(
+                AcpError::invalid_request()
+                    .data("reconcile unfinished planner work before deleting the session"),
+            );
+        }
+        if let Err(err) = shared
+            .state
+            .lock()
+            .unwrap()
+            .remove_planner_session(&sid, run.revision)
+        {
+            return responder.respond_with_error(AcpError::internal_error().data(err));
+        }
+    } else {
+        shared.state.lock().unwrap().remove(&sid);
+    }
     close(&shared, &sid);
-    shared.state.lock().unwrap().remove(&sid);
     responder.respond(DeleteSessionResponse::new())
 }
 
 fn close(shared: &Arc<Shared>, sid: &str) {
     // The conversation and checkpoint survive close. Provider-local storage
     // is never needed to reopen it.
+    crate::session::close_live_delegates_for(shared, sid);
     let session = shared.sessions.lock().unwrap().remove(sid);
     crate::accounts::cancel_login(shared, sid);
-    crate::session::close_live_delegates_for(shared, sid);
     if let Some(pin) = session.and_then(|s| s.pin) {
         close_downstream_session(shared, &pin.process_key, &pin.downstream_sid);
     }

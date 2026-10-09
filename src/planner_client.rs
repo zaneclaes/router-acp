@@ -119,6 +119,7 @@ pub(crate) async fn open_child(
             init: None,
             model_config_id: None,
             auth_pending: false,
+            credential_generation: None,
             dead: None,
             last_respawn: None,
             start_gate: Arc::default(),

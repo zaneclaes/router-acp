@@ -448,6 +448,12 @@ automatic execution. Resume requires the exact parent identity. `/plan` pauses
 new dispatch while preserving running assignments. `/implement` explicitly
 resumes admitted execution. An empty runnable queue is not completion.
 
+Native Resume restores the durable phase and coordinator role before opening a fresh adapter.
+Effective effort remains unavailable until the adapter or provider confirms it.
+Close retains the run and its assignments. Delete requires reconciled assigned work, inputs,
+wakes, and approval waits, then removes only that run's state and workspace claims.
+Repository artifacts and other sessions' claims remain intact.
+
 Clients can negotiate `_meta.router_acp.planner_children: true` in their
 initialize capabilities. They receive `router-acp/planner-child-update` and
 child-scoped callbacks. A child update's `effort` is usable only when
