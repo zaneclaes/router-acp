@@ -656,6 +656,48 @@ async fn passthrough_prompt_roundtrip_with_disclosure_and_remapping() {
 }
 
 #[tokio::test]
+async fn a_failed_streaming_log_write_fails_neither_that_turn_nor_later_ones() {
+    let state = temp_state_file("chunk-write-fails");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // Reproduce the production failure: SQLite refuses every streaming row
+        // for one turn, then recovers.
+        let db = rusqlite::Connection::open(&state).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_chunks BEFORE INSERT ON session_log
+             WHEN NEW.kind = 'session_update'
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+        )
+        .unwrap();
+
+        let first = prompt_text(&cx, &sid, "first").await?;
+        assert_eq!(first.stop_reason, StopReason::EndTurn);
+
+        db.execute_batch("DROP TRIGGER reject_chunks").unwrap();
+        let second = prompt_text(&cx, &sid, "second").await?;
+        assert_eq!(second.stop_reason, StopReason::EndTurn);
+
+        let saved = open_state(&state).log_for_all(&sid).unwrap();
+        assert!(
+            saved.iter().any(|entry| entry.kind == "session_update"
+                && entry
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.to_string().contains("echo:m1:second"))),
+            "the recovered turn's stream was saved: {saved:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn concurrent_resumes_keep_history_examples_and_current_model_choices() {
     let state = temp_state_file("resume-examples");
     let log = temp_log("resume-examples");

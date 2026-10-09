@@ -17,10 +17,19 @@
 //! window are pruned on open and after each write. This is the only pruning
 //! mechanism (it replaces the earlier count/age logic).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+/// How long a write waits for another router process to release the
+/// shared database. Many routers share one file on a workstation.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Streaming rows are written together once this many are queued...
+const LOG_BATCH_ROWS: usize = 256;
+/// ...or once the oldest queued row is this old.
+const LOG_FLUSH_WINDOW: Duration = Duration::from_millis(500);
 
 /// Retention policy: sessions idle longer than `max_age` are pruned.
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +179,15 @@ pub struct LlmRequestUsage {
 pub struct StateFile {
     conn: Connection,
     retention: Retention,
+    /// Streaming `session_log` rows not yet written, oldest first.
+    pending_log: RefCell<Vec<PendingLog>>,
+}
+
+struct PendingLog {
+    router_session_id: String,
+    ts: i64,
+    queued_at: Instant,
+    entry: LogEntry,
 }
 
 impl std::fmt::Debug for StateFile {
@@ -189,7 +207,11 @@ impl StateFile {
     /// ids that cannot survive the next router process.
     pub fn try_load(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
         let conn = Self::open_conn(path)?;
-        let store = Self { conn, retention };
+        let store = Self {
+            conn,
+            retention,
+            pending_log: RefCell::default(),
+        };
         store.init_schema()?;
         // One-time import of a legacy sessions.json sitting next to the DB.
         store.import_legacy_json(path);
@@ -204,7 +226,7 @@ impl StateFile {
         let conn = Connection::open(path)?;
         // Concurrent router startups can contend while enabling WAL. Install
         // the wait first so a transient lock cannot select the memory fallback.
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // SQLite can refuse a journal-mode lock upgrade without invoking its
         // busy handler. Retry the statement after concurrent startup releases it.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -670,10 +692,80 @@ impl StateFile {
         }
     }
 
+    /// Append a row now, after any queued streaming rows so the log keeps
+    /// arrival order. All of them commit in one transaction.
     pub fn log_checked(&self, router_session_id: &str, entry: &LogEntry) -> rusqlite::Result<()> {
-        let now = now_epoch() as i64;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let written = self.write_pending(&tx)?;
+        Self::insert_log(&tx, router_session_id, now_epoch() as i64, entry)?;
+        tx.commit()?;
+        self.pending_log.borrow_mut().drain(..written);
+        Ok(())
+    }
+
+    /// Queue a streaming row (raw ACP update, tool progress). It is written
+    /// with the next batch, so one SQLite write covers many chunks.
+    pub fn log_buffered(&self, router_session_id: &str, entry: LogEntry) {
+        let mut pending = self.pending_log.borrow_mut();
+        pending.push(PendingLog {
+            router_session_id: router_session_id.to_string(),
+            ts: now_epoch() as i64,
+            queued_at: Instant::now(),
+            entry,
+        });
+        let due =
+            pending.len() >= LOG_BATCH_ROWS || pending[0].queued_at.elapsed() >= LOG_FLUSH_WINDOW;
+        drop(pending);
+        if due && let Err(err) = self.flush_log() {
+            tracing::warn!(%err, "session_log batch deferred; retrying on the next flush");
+        }
+    }
+
+    /// Write every queued streaming row in one transaction. When the database
+    /// is busy the rows stay queued, in order, for the next flush.
+    pub fn flush_log(&self) -> rusqlite::Result<()> {
+        if self.pending_log.borrow().is_empty() {
+            return Ok(());
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let written = self.write_pending(&tx)?;
+        tx.commit()?;
+        self.pending_log.borrow_mut().drain(..written);
+        Ok(())
+    }
+
+    /// Number of streaming rows waiting for a flush.
+    pub fn pending_log_rows(&self) -> usize {
+        self.pending_log.borrow().len()
+    }
+
+    /// Insert the queued rows into `tx` and return how many it covered. A
+    /// busy/locked error aborts so the caller keeps them; a row SQLite rejects
+    /// outright (its session was deleted) can never succeed and is skipped.
+    fn write_pending(&self, tx: &Transaction<'_>) -> rusqlite::Result<usize> {
+        let pending = self.pending_log.borrow();
+        for row in pending.iter() {
+            match Self::insert_log(tx, &row.router_session_id, row.ts, &row.entry) {
+                Ok(()) => {}
+                Err(err) if is_busy(&err) => return Err(err),
+                Err(err) => tracing::warn!(
+                    %err,
+                    session = row.router_session_id,
+                    "session_log row dropped"
+                ),
+            }
+        }
+        Ok(pending.len())
+    }
+
+    fn insert_log(
+        conn: &Connection,
+        router_session_id: &str,
+        now: i64,
+        entry: &LogEntry,
+    ) -> rusqlite::Result<()> {
         let detail = entry.detail.as_ref().map(|d| d.to_string());
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO session_log
                 (router_session_id, ts, kind, role, summary, detail,
                  tokens_input, tokens_output, tokens_cache_read,
@@ -694,7 +786,7 @@ impl StateFile {
                 entry.model,
             ],
         )?;
-        self.conn.execute(
+        conn.execute(
             "UPDATE sessions SET
                 tokens_input = tokens_input + ?2,
                 tokens_output = tokens_output + ?3,
@@ -959,6 +1051,7 @@ impl StateFile {
 
     /// Every log entry for a session, in chronological order.
     pub fn log_for_all(&self, router_session_id: &str) -> rusqlite::Result<Vec<LogEntry>> {
+        self.flush_log()?;
         let mut stmt = self.conn.prepare(
             "SELECT kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
@@ -971,6 +1064,9 @@ impl StateFile {
     /// Recent log entries for a session (chronological).
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
         let mut out = Vec::new();
+        if let Err(err) = self.flush_log() {
+            tracing::warn!(%err, "session_log batch deferred; recent rows may be missing");
+        }
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
@@ -1059,6 +1155,14 @@ impl StateFile {
             }
         }
     }
+}
+
+/// Another connection holds the lock; the same write can succeed later.
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 /// Cheap token estimate when the protocol provides none: ~4 chars/token.
@@ -1267,6 +1371,99 @@ mod tests {
         assert_eq!(entries.first().unwrap().summary, "0");
         assert_eq!(entries.last().unwrap().summary, "500");
         assert!(entries.iter().all(|entry| entry.kind == "event"));
+    }
+
+    fn chunk(text: &str) -> LogEntry {
+        LogEntry {
+            kind: "session_update".into(),
+            role: "agent".into(),
+            detail: Some(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Chunk text, or the summary for a row without a chunk.
+    fn texts(entries: &[LogEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match &e.detail {
+                Some(detail) => detail["content"]["text"].as_str().unwrap().to_string(),
+                None => e.summary.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batched_chunks_keep_order_and_content_around_direct_rows() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("a"));
+        s.log_buffered("r1", chunk("one"));
+        s.log_buffered("r1", chunk("two"));
+        s.log_checked(
+            "r1",
+            &LogEntry {
+                kind: "user_steer".into(),
+                role: "user".into(),
+                summary: "steer".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.log_buffered("r1", chunk("three"));
+        assert_eq!(s.pending_log_rows(), 1, "one row still waits for its batch");
+
+        let entries = s.log_for_all("r1").unwrap();
+
+        assert_eq!(s.pending_log_rows(), 0);
+        assert_eq!(texts(&entries), ["one", "two", "steer", "three"]);
+        assert_eq!(entries[0].kind, "session_update");
+        assert_eq!(entries[0].detail, chunk("one").detail);
+    }
+
+    #[test]
+    fn a_full_batch_is_written_without_an_explicit_flush() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("a"));
+        for i in 0..LOG_BATCH_ROWS {
+            s.log_buffered("r1", chunk(&i.to_string()));
+        }
+        assert_eq!(s.pending_log_rows(), 0);
+    }
+
+    #[test]
+    fn a_locked_database_keeps_chunks_queued_until_a_later_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let s = StateFile::load(&path, Retention::default());
+        s.conn.busy_timeout(Duration::from_millis(50)).unwrap();
+        s.upsert("r1".into(), session("a"));
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        s.log_buffered("r1", chunk("kept"));
+        let err = s.flush_log().unwrap_err();
+        assert!(is_busy(&err), "unexpected error: {err}");
+        assert_eq!(s.pending_log_rows(), 1);
+
+        other.execute_batch("COMMIT").unwrap();
+        s.flush_log().unwrap();
+        assert_eq!(texts(&s.log_for_all("r1").unwrap()), ["kept"]);
+    }
+
+    #[test]
+    fn a_chunk_for_a_deleted_session_is_dropped_without_blocking_others() {
+        let (_d, s) = store();
+        s.upsert("r1".into(), session("a"));
+        s.log_buffered("gone", chunk("orphan"));
+        s.log_buffered("r1", chunk("kept"));
+
+        s.flush_log().unwrap();
+
+        assert_eq!(s.pending_log_rows(), 0);
+        assert_eq!(texts(&s.log_for_all("r1").unwrap()), ["kept"]);
     }
 
     #[test]

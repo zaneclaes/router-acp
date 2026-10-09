@@ -1622,20 +1622,16 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
     };
     // Raw ACP updates preserve rich content, streaming output, plans and full
     // tool results, including output from a cancelled or interrupted turn.
-    let saved = shared.state.lock().unwrap().log_checked(
+    // They are batched: a busy database delays them but never fails the turn.
+    shared.state.lock().unwrap().log_buffered(
         router_sid,
-        &crate::state::LogEntry {
+        crate::state::LogEntry {
             kind: "session_update".into(),
             role: "agent".into(),
             detail: Some(update.clone()),
             ..Default::default()
         },
     );
-    if let Err(err) = saved {
-        shared.with_session(router_sid, |s| {
-            s.persistence_error = Some(format!("cannot save provider conversation update: {err}"));
-        });
-    }
     let kind = update
         .get("sessionUpdate")
         .and_then(|k| k.as_str())
@@ -1712,8 +1708,25 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         _ => None,
     };
     if let Some(entry) = entry {
-        shared.state.lock().unwrap().log(router_sid, &entry);
+        shared.state.lock().unwrap().log_buffered(router_sid, entry);
     }
+}
+
+/// Write queued streaming log rows every `interval`, so a quiet stream (a
+/// long tool run) still reaches the database between turns.
+fn spawn_log_flusher(
+    shared: &Arc<Shared>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Err(err) = shared.state.lock().unwrap().flush_log() {
+                tracing::warn!(%err, "session_log batch deferred; retrying on the next flush");
+            }
+        }
+    })
 }
 
 /// Handle one message arriving from a downstream agent connection.
@@ -5071,6 +5084,8 @@ async fn send_prompt_with_failover(
         // Compute-time = the model's actual turn (excludes user idle between
         // turns, unlike updated_at − created_at).
         let turn_start = std::time::Instant::now();
+        // A save failure belongs to the turn that hit it, never to later ones.
+        shared.with_session(&router_sid, |s| s.persistence_error = None);
         let (result, unavailability) = send_primary_prompt(
             &shared,
             &router_sid,
@@ -5090,11 +5105,13 @@ async fn send_prompt_with_failover(
         {
             shared.with_session(&router_sid, |s| s.pending_history = history);
         }
-        shared
-            .state
-            .lock()
-            .unwrap()
-            .add_compute_ms(&router_sid, turn_start.elapsed().as_millis() as u64);
+        {
+            let state = shared.state.lock().unwrap();
+            state.add_compute_ms(&router_sid, turn_start.elapsed().as_millis() as u64);
+            if let Err(err) = state.flush_log() {
+                tracing::warn!(%err, session = %router_sid, "session_log batch deferred at turn end");
+            }
+        }
         if let Some(err) = shared
             .with_session(&router_sid, |s| s.persistence_error.clone())
             .flatten()
@@ -7016,6 +7033,7 @@ pub async fn serve_shared(
     crate::delegate_hook::process_identity();
     let outbox_task =
         crate::delegate_hook::spawn_outbox_flusher(&shared, std::time::Duration::from_secs(30));
+    let log_task = spawn_log_flusher(&shared, std::time::Duration::from_secs(1));
 
     let result = build_agent(shared.clone()).connect_to(transport).await;
     crate::accounts::cancel_all(&shared);
@@ -7031,6 +7049,10 @@ pub async fn serve_shared(
     }
     if let Some(task) = llm_proxy_task {
         task.abort();
+    }
+    log_task.abort();
+    if let Err(err) = shared.state.lock().unwrap().flush_log() {
+        tracing::warn!(%err, "session_log rows lost at shutdown");
     }
     result
 }
@@ -8781,15 +8803,19 @@ mod downstream_generation_tests {
 
     #[test]
     fn late_exit_from_replaced_process_does_not_mark_successor_dead() {
-        let cfg = Config::from_yaml(
+        // A private state file: the default path is the machine's live DB.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_yaml(&format!(
             r#"
+state_file: {}
 agents:
   - name: grok
-    command: {type: stdio, command: mock-agent}
-    model_selection: {type: config-option}
-    models: [{id: grok-4.7, cost_rank: 5}]
+    command: {{type: stdio, command: mock-agent}}
+    model_selection: {{type: config-option}}
+    models: [{{id: grok-4.7, cost_rank: 5}}]
 "#,
-        )
+            dir.path().join("state.db").display()
+        ))
         .unwrap();
         let shared = Shared::new(cfg).unwrap();
         let key = shared.target_keys().into_iter().next().unwrap();
