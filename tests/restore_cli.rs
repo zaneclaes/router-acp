@@ -814,7 +814,7 @@ async fn tool_only_load_deduplicates_notifications_and_restores_typed_tool_conte
 }
 
 #[tokio::test]
-async fn transcript_write_failures_cannot_be_reported_as_successful_turns() {
+async fn a_rejected_streaming_row_still_saves_the_turns_answer() {
     let fixture = fixture("write-failure");
     let mut client = spawn(&fixture);
     client.initialize().await;
@@ -822,14 +822,17 @@ async fn transcript_write_failures_cannot_be_reported_as_successful_turns() {
     select_m2_high(&mut client, &sid).await;
     let db = rusqlite::Connection::open(&fixture.state).unwrap();
     db.execute_batch("CREATE TRIGGER synthetic_write_failure BEFORE INSERT ON session_log WHEN NEW.kind = 'session_update' BEGIN SELECT RAISE(FAIL, 'synthetic transcript write failure'); END;").unwrap();
-    let response = client.prompt(&sid, "TEXT:cannot-be-durable", None).await;
-    assert!(response["error"].is_object(), "{response}");
-    assert!(
-        response
-            .to_string()
-            .contains("cannot save provider conversation update")
-    );
+    let response = client.prompt(&sid, "TEXT:still-durable", None).await;
+    assert_success(&response, "prompt");
     client.close().await;
+    // Restore falls back to the turn's answer row when its stream is missing.
+    let entries = state(&fixture).log_for_all(&sid).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "agent_response" && e.summary.contains("still-durable")),
+        "{entries:?}"
+    );
 }
 
 #[tokio::test]
