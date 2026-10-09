@@ -10386,3 +10386,172 @@ async fn sharded_delegates_live_with_their_parent_and_stay_queryable() {
     let delegates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(delegates["data"]["children"][0]["id"], ids[1].as_str());
 }
+
+#[tokio::test]
+async fn planner_child_status_restores_only_the_current_router_attempt() {
+    let state = temp_state_file("planner-child-status");
+    let log = temp_log("planner-child-status");
+    let repo = planner_wire_repository();
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        cx.send_request(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                serde_json::from_value(serde_json::json!({
+                    "_meta": {"router_acp": {"planner_children": true}}
+                }))
+                .unwrap(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        let mut run = router_acp::planner_workflow::ensure(&shared, &sid).unwrap();
+        run.phase = router_acp::config::PlannerPhase::Implementation;
+        run.execution_request = Some("authorized test execution".into());
+        router_acp::planner_workflow::save(&shared, &sid, &mut run).unwrap();
+        router_acp::planner_workflow::operate(
+            &shared,
+            &sid,
+            None,
+            router_acp::planner_workflow::Operation::Admit {
+                key: "admit-status-wire".into(),
+                work: router_acp::planner_workflow::WorkSpec {
+                    work_id: "work-1".into(),
+                    plan_id: "plan-1".into(),
+                    scope: "restore the child presentation".into(),
+                    dependencies: Vec::new(),
+                    required_checks: Vec::new(),
+                    required_integration_evidence: Vec::new(),
+                    external_id: Some("external-work".into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        let child = run.works["work-1"].child_id.clone();
+        let request = || {
+            agent_client_protocol::UntypedMessage::new(
+                "router-acp/planner-child",
+                serde_json::json!({
+                    "sessionId": sid, "child_id": child, "action": "status"
+                }),
+            )
+            .unwrap()
+        };
+        let idle = cx.send_request(request()).block_task().await?;
+        assert_eq!(idle["active"], false);
+        assert_eq!(idle["effort_confirmed"], false);
+        let (actor, _, _, _) = router_acp::planner_workflow::begin_work(&shared, &sid, "work-1")
+            .await
+            .unwrap();
+        let state_sid = format!("{sid}::attempt-state");
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(
+                state_sid.clone(),
+                router_acp::state::PersistedSession {
+                    routing: Some(
+                        serde_json::json!({"effort": {"resolved": "high", "confirmed": false}}),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        shared.planner_child_routes.lock().unwrap().insert(
+            (
+                router_acp::downstream::ProcessKey("test".into()),
+                "downstream".into(),
+            ),
+            router_acp::planner_client::ChildRoute {
+                parent_sid: sid.clone(),
+                work_id: "work-1".into(),
+                child_id: child.clone(),
+                attempt_id: actor.attempt_id.clone(),
+                candidate: "test/model".into(),
+                state_sid: state_sid.clone(),
+            },
+        );
+        let active = cx.send_request(request()).block_task().await?;
+        assert_eq!(active["active"], true);
+        assert_eq!(active["attempt_id"], actor.attempt_id);
+        assert_eq!(active["child_id"], child);
+        assert_eq!(active["work_id"], "work-1");
+        assert_eq!(active["effort_confirmed"], false);
+        assert!(active["effort"].is_null());
+        assert_eq!(
+            active["revision"],
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .revision
+        );
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .patch_session_routing(
+                &state_sid,
+                &serde_json::json!({
+                    "effort": {"resolved": "high", "confirmed": true}
+                }),
+            )
+            .unwrap();
+        let confirmed = cx.send_request(request()).block_task().await?;
+        assert_eq!(confirmed["effort_confirmed"], true);
+        assert_eq!(confirmed["effort"], "high");
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.works
+                .get_mut("work-1")
+                .unwrap()
+                .attempt
+                .as_mut()
+                .unwrap()
+                .ended = true;
+            Ok(())
+        })
+        .unwrap();
+        let ended = cx.send_request(request()).block_task().await?;
+        assert_eq!(ended["active"], false);
+        assert_eq!(ended["effort_confirmed"], false);
+        assert!(ended["effort"].is_null());
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            let attempt = run
+                .works
+                .get_mut("work-1")
+                .unwrap()
+                .attempt
+                .as_mut()
+                .unwrap();
+            attempt.ended = false;
+            attempt.router_pid = 0;
+            Ok(())
+        })
+        .unwrap();
+        let stale = cx.send_request(request()).block_task().await?;
+        assert_eq!(
+            stale["active"], false,
+            "a different router generation cannot claim the saved attempt"
+        );
+        assert_eq!(stale["effort_confirmed"], false);
+        let wrong_child = agent_client_protocol::UntypedMessage::new(
+            "router-acp/planner-child",
+            serde_json::json!({
+                "sessionId": sid, "child_id": "another-child", "action": "status"
+            }),
+        )
+        .unwrap();
+        assert!(cx.send_request(wrong_child).block_task().await.is_err());
+        Ok(())
+    })
+    .await;
+}

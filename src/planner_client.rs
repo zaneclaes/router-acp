@@ -197,6 +197,17 @@ pub(crate) fn turn_state(
     Ok(())
 }
 
+fn confirmed_effort(shared: &Shared, state_sid: &str) -> Option<Value> {
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .get(state_sid)
+        .and_then(|s| s.routing)
+        .filter(|r| r.pointer("/effort/confirmed").and_then(Value::as_bool) == Some(true))
+        .and_then(|r| r.pointer("/effort/resolved").cloned())
+}
+
 pub(crate) fn notify(
     shared: &Shared,
     route: &ChildRoute,
@@ -207,20 +218,16 @@ pub(crate) fn notify(
         return Ok(());
     }
     if let Some(upstream) = shared.upstream() {
-        let effort = shared
-            .state
-            .lock()
-            .unwrap()
-            .get(&route.state_sid)
-            .and_then(|s| s.routing)
-            .filter(|r| r.pointer("/effort/confirmed").and_then(Value::as_bool) == Some(true))
-            .and_then(|r| r.pointer("/effort/resolved").cloned());
+        let revision = planner_workflow::load(shared, &route.parent_sid)
+            .map_err(|e| agent_client_protocol::schema::v1::Error::internal_error().data(e))?
+            .map(|run| run.revision);
+        let effort = confirmed_effort(shared, &route.state_sid);
         let effort_confirmed = effort.is_some();
         let msg = agent_client_protocol::UntypedMessage::new(
             "router-acp/planner-child-update",
             json!({
                 "sessionId":route.parent_sid,"child_id":route.child_id,"work_id":route.work_id,"attempt_id":route.attempt_id,
-                "state_session_id":route.state_sid,"candidate":route.candidate,"effort":effort,"effort_confirmed":effort_confirmed,"state":state,"update":update
+                "revision":revision,"state_session_id":route.state_sid,"candidate":route.candidate,"effort":effort,"effort_confirmed":effort_confirmed,"state":state,"update":update
             }),
         )?;
         upstream.send_notification(msg)?;
@@ -289,6 +296,40 @@ pub async fn control(shared: &Arc<Shared>, params: Value) -> Result<Value, Strin
         .get("action")
         .and_then(Value::as_str)
         .ok_or("child action required")?;
+    if action == "status" {
+        let active = work.attempt.as_ref().is_some_and(|attempt| {
+            !attempt.ended
+                && (attempt.router_pid, attempt.router_started_at_ms)
+                    == planner_workflow::process_identity()
+        });
+        let route = shared
+            .planner_child_routes
+            .lock()
+            .unwrap()
+            .values()
+            .find(|route| {
+                route.parent_sid == sid
+                    && route.child_id == child
+                    && work
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.id == route.attempt_id)
+            })
+            .cloned();
+        let effort = if active {
+            route
+                .as_ref()
+                .and_then(|route| confirmed_effort(shared, &route.state_sid))
+        } else {
+            None
+        };
+        return Ok(json!({
+            "sessionId": sid, "child_id": child, "work_id": work_id,
+            "attempt_id": work.attempt.as_ref().map(|attempt| &attempt.id),
+            "revision": run.revision, "active": active, "candidate": route.map(|route| route.candidate),
+            "effort_confirmed": effort.is_some(), "effort": effort
+        }));
+    }
     if matches!(action, "cancel" | "close") {
         planner_workflow::mutate(shared, sid, |run| {
             run.works
