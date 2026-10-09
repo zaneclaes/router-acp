@@ -340,9 +340,9 @@ versioned JSON command instead of opening `sessions.db` or embedding SQL:
 
 ```sh
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 session --session rtr-…
-router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegates --session rtr-…
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegates --session rtr-… --session rtr-…
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 logs --session rtr-… --kind tool_call
-router-acp state-query --config ~/.config/router-acp/router.yaml v1 analytics --from 1760000000 --to 1760086400
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 analytics --from-sec 1760000000 --to-end-sec 1760086400
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 health
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegation-report
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 transcript --session rtr-…
@@ -350,10 +350,18 @@ router-acp state-query --config ~/.config/router-acp/router.yaml v1 transcript -
 
 Every command prints one JSON object with `version: 1`, `command`, and `data`.
 `session` includes metadata and title. `title` returns only a title.
-`delegates` returns child sessions. `logs` selects a chronological bounded log
-slice. `analytics` aggregates a closed or open epoch-second range. `health`
-includes the configured retention window. `delegation-report` is the JSON form
-of the existing adoption report. `transcript` is the chronological lookup form.
+`delegates` accepts one or more parent ids and returns every child panel in one
+call. Each child includes its chronological log, parsed routing, token and
+context totals, and response-complete state. Only `delegate_task`,
+`delegate_followup`, and `agent_response` retain `detail` there.
+
+`logs` and `transcript` include each row's Unix-second `ts`. `analytics`
+returns the relay-compatible `sessions` and daily UTC token buckets grouped by
+agent, routing class, and kind. Its `fromSec` bound is inclusive and its
+`toEndSec` bound is exclusive. `llmRequests` exposes the rows used by the
+savings aggregate. `health` includes database/WAL/freelist bytes,
+auto-vacuum, maintenance lease status, retention, and counts.
+`delegation-report` is the JSON form of the existing adoption report.
 
 The query command opens the configured state file read-only. It does not create
 or migrate schemas, import legacy JSON, flush buffered rows, prune retained

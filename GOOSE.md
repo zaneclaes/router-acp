@@ -300,8 +300,10 @@ That line is your proof the router is serving the session. Also sanity-check:
   Hosts query it through `router-acp state-query --config
   ~/.config/router-acp/router.yaml v1 session --session <rtr-id>`. Use `v1
   delegates`, `logs`, `analytics`, `health`, `delegation-report`, and
-  `transcript` for the other supported JSON views. Delegated sub-agents appear as child
-  rows linked to their parent. The
+  `transcript` for the other supported JSON views. Repeat `delegates --session`
+  for a batch of parents: one query returns child panels and their filtered
+  chronological logs. Analytics uses inclusive `--from-sec` and exclusive
+  `--to-end-sec` bounds. Delegated sub-agents appear as child rows linked to their parent. The
   DB auto-prunes to the `history` window (default 30d).
 - A plain `goose session` (no `GOOSE_PROVIDER`) must still start the real
   Claude adapter with **no** `[router-acp]` line — proving claude-acp was

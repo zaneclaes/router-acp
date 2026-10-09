@@ -179,10 +179,11 @@ enum StateQueryV1 {
         #[arg(long)]
         session: String,
     },
-    /// Delegate child session metadata for one parent.
+    /// Delegate child session panels for one or more parents, including their
+    /// filtered chronological logs. Repeat --session for every parent.
     Delegates {
-        #[arg(long)]
-        session: String,
+        #[arg(long, required = true, num_args = 1..)]
+        session: Vec<String>,
     },
     /// Selected session log rows. Pass --kind to select one log kind.
     Logs {
@@ -193,12 +194,13 @@ enum StateQueryV1 {
         #[arg(long)]
         kind: Option<String>,
     },
-    /// Aggregate log and provider-request metrics within an epoch-second range.
+    /// Kory-compatible usage and savings rows for an epoch-second range. The
+    /// upper bound is exclusive, matching `fromSec` / `toEndSec`.
     Analytics {
-        #[arg(long)]
-        from: Option<i64>,
-        #[arg(long)]
-        to: Option<i64>,
+        #[arg(long, alias = "from")]
+        from_sec: Option<i64>,
+        #[arg(long, alias = "to")]
+        to_end_sec: Option<i64>,
     },
     /// Aggregate state health, including the configured retention window.
     Health,
@@ -603,7 +605,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 StateQueryV1::Delegates { session } => (
                     "delegates",
-                    serde_json::json!({"parent_session_id": session, "children": store.delegate_children(&session)?}),
+                    serde_json::json!({"children": store.delegate_children(&session)?}),
                 ),
                 StateQueryV1::Logs {
                     session,
@@ -613,11 +615,15 @@ async fn main() -> anyhow::Result<()> {
                     "logs",
                     serde_json::json!({"session_id": session, "kind": kind, "entries": store.selected_logs(&session, limit, kind.as_deref())?}),
                 ),
-                StateQueryV1::Analytics { from, to } => (
+                StateQueryV1::Analytics {
+                    from_sec,
+                    to_end_sec,
+                } => (
                     "analytics",
-                    serde_json::to_value(
-                        store.analytics(router_acp::state::AnalyticsRange { from, to })?,
-                    )?,
+                    serde_json::to_value(store.analytics(router_acp::state::AnalyticsRange {
+                        from_sec,
+                        to_end_sec,
+                    })?)?,
                 ),
                 StateQueryV1::Health => ("health", serde_json::to_value(store.health()?)?),
                 StateQueryV1::DelegationReport { limit } => (

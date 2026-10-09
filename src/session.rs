@@ -5241,6 +5241,7 @@ async fn send_prompt_with_failover(
                 if let Err(err) = shared.state.lock().unwrap().log_checked(
                     &router_sid,
                     &crate::state::LogEntry {
+                        ts: None,
                         kind: "agent_response".to_string(),
                         role: "agent".to_string(),
                         summary: output.clone(),

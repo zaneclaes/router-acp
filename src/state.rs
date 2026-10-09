@@ -142,6 +142,8 @@ pub struct PersistedSession {
 /// One `session_log` row: a single ACP interaction.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LogEntry {
+    /// Unix timestamp when the router recorded this interaction.
+    pub ts: Option<i64>,
     /// `user_prompt`, `agent_response`, `agent_thought`, `tool_call`,
     /// `permission`, `fs_read`, `fs_write`, `terminal`, `router_notice`, …
     pub kind: String,
@@ -267,20 +269,98 @@ impl StateStore {
             })
     }
 
+    /// Delegate-panel rows for every requested parent. This issues one child
+    /// query and one log query, never one query per child.
     pub fn delegate_children(
         &self,
-        parent_session_id: &str,
-    ) -> rusqlite::Result<Vec<SessionRecord>> {
-        let mut stmt = self.file.conn.prepare(
-            "SELECT router_session_id, * FROM sessions WHERE parent_session_id=?1 ORDER BY updated_at DESC",
-        )?;
-        stmt.query_map(params![parent_session_id], |row| {
-            Ok(SessionRecord {
-                router_session_id: row.get("router_session_id")?,
-                session: StateFile::row_to_session(row)?,
+        parent_session_ids: &[String],
+    ) -> rusqlite::Result<Vec<DelegateSession>> {
+        let mut parent_ids = parent_session_ids.to_vec();
+        parent_ids.sort();
+        parent_ids.dedup();
+        if parent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", parent_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT router_session_id, * FROM sessions WHERE parent_session_id IN ({placeholders}) \
+             ORDER BY created_at, router_session_id"
+        );
+        let mut stmt = self.file.conn.prepare(&sql)?;
+        let children: Vec<SessionRecord> = stmt
+            .query_map(rusqlite::params_from_iter(parent_ids.iter()), |row| {
+                Ok(SessionRecord {
+                    router_session_id: row.get("router_session_id")?,
+                    session: StateFile::row_to_session(row)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let child_ids: Vec<_> = children
+            .iter()
+            .map(|child| child.router_session_id.clone())
+            .collect();
+        let placeholders = std::iter::repeat_n("?", child_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT router_session_id, ts, kind, role, summary,
+                    CASE WHEN kind IN ('delegate_task', 'delegate_followup', 'agent_response')
+                         THEN detail END AS detail
+             FROM session_log WHERE router_session_id IN ({placeholders}) ORDER BY router_session_id, id"
+        );
+        let mut logs = self.file.conn.prepare(&sql)?;
+        let mut logs_by_child: std::collections::HashMap<String, Vec<DelegateLog>> =
+            std::collections::HashMap::new();
+        for row in logs.query_map(rusqlite::params_from_iter(child_ids.iter()), |row| {
+            let detail: Option<String> = row.get("detail")?;
+            Ok((
+                row.get::<_, String>("router_session_id")?,
+                DelegateLog {
+                    ts: iso_timestamp(row.get("ts")?),
+                    kind: row.get("kind")?,
+                    role: row.get("role")?,
+                    summary: row.get("summary")?,
+                    detail: detail.and_then(|detail| serde_json::from_str(&detail).ok()),
+                },
+            ))
+        })? {
+            let (session_id, log) = row?;
+            logs_by_child.entry(session_id).or_default().push(log);
+        }
+
+        Ok(children
+            .into_iter()
+            .map(|child| {
+                let log = logs_by_child
+                    .remove(&child.router_session_id)
+                    .unwrap_or_default();
+                DelegateSession {
+                    id: child.router_session_id,
+                    title: child.session.title.unwrap_or_default(),
+                    agent: non_empty(child.session.agent),
+                    model: non_empty(child.session.model),
+                    created_at: child
+                        .session
+                        .created_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    updated_at: child
+                        .session
+                        .updated_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    tokens_total: child.session.tokens_total,
+                    context_used: child.session.context_used,
+                    routing: child.session.routing,
+                    has_response: log.iter().any(|entry| entry.kind == "agent_response"),
+                    log,
+                }
             })
-        })?
-        .collect()
+            .collect())
     }
 
     pub fn selected_logs(
@@ -290,7 +370,7 @@ impl StateStore {
         kind: Option<&str>,
     ) -> rusqlite::Result<Vec<LogEntry>> {
         let mut stmt = self.file.conn.prepare(
-            "SELECT kind, role, summary, detail, tokens_input, tokens_output,
+            "SELECT ts, kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
              FROM session_log
              WHERE router_session_id=?1 AND (?2 IS NULL OR kind=?2)
@@ -314,55 +394,116 @@ impl StateStore {
         self.selected_logs(router_session_id, limit, None)
     }
 
-    pub fn analytics(&self, range: AnalyticsRange) -> rusqlite::Result<AnalyticsRangeReport> {
+    pub fn analytics(&self, range: AnalyticsRange) -> rusqlite::Result<AnalyticsReport> {
         if range
-            .from
-            .is_some_and(|from| range.to.is_some_and(|to| from > to))
+            .from_sec
+            .is_some_and(|from| range.to_end_sec.is_some_and(|to| from > to))
         {
             return Err(rusqlite::Error::InvalidParameterName(
-                "from must not exceed to".into(),
+                "from_sec must not exceed to_end_sec".into(),
             ));
         }
-        let log: (i64, i64, i64, i64, i64, i64) = self.file.conn.query_row(
-            "SELECT COUNT(DISTINCT router_session_id), COUNT(*),
-                    COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),
-                    COALESCE(SUM(tokens_cache_read), 0), COALESCE(SUM(tokens_cache_write), 0)
-             FROM session_log WHERE (?1 IS NULL OR ts >= ?1) AND (?2 IS NULL OR ts <= ?2)",
-            params![range.from, range.to],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
+        let sessions = self
+            .file
+            .conn
+            .prepare(
+                "SELECT router_session_id, * FROM sessions
+                 WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2)
+                 ORDER BY created_at, router_session_id",
+            )?
+            .query_map(params![range.from_sec, range.to_end_sec], |row| {
+                let router_session_id: String = row.get("router_session_id")?;
+                let session = StateFile::row_to_session(row)?;
+                let (class, reason) = routing_class_reason(session.routing.as_ref());
+                Ok(AnalyticsSession {
+                    id: router_session_id,
+                    agent: non_empty(session.agent),
+                    model: non_empty(session.model),
+                    kind: non_empty(session.kind),
+                    run_label: session.run_label,
+                    class,
+                    reason,
+                    created_at: session
+                        .created_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    updated_at: session
+                        .updated_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    tokens_input: session.tokens_input,
+                    tokens_output: session.tokens_output,
+                    tokens_total: session.tokens_total,
+                    context_used: session.context_used,
+                    cost_usd: session.cost_usd,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut daily = std::collections::BTreeMap::new();
+        let mut stmt = self.file.conn.prepare(
+            "SELECT date(log.ts, 'unixepoch') AS date, session.agent, session.kind, session.routing,
+                    SUM(log.tokens_input), SUM(log.tokens_output), COUNT(*)
+             FROM session_log AS log
+             LEFT JOIN sessions AS session ON session.router_session_id = log.router_session_id
+             WHERE (?1 IS NULL OR log.ts >= ?1) AND (?2 IS NULL OR log.ts < ?2)
+             GROUP BY date, log.router_session_id, session.agent, session.kind, session.routing
+             ORDER BY date, log.router_session_id",
         )?;
-        let requests: (i64, i64, i64, i64, i64, f64, i64) = self.file.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),
-                    COALESCE(SUM(tokens_cache_read), 0), COALESCE(SUM(tokens_cache_write), 0),
-                    COALESCE(SUM(cost_usd), 0), COALESCE(SUM(duration_ms), 0)
-             FROM llm_requests WHERE (?1 IS NULL OR started_at >= ?1) AND (?2 IS NULL OR started_at <= ?2)",
-            params![range.from, range.to],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-        )?;
-        Ok(AnalyticsRangeReport {
-            range,
-            sessions: log.0.max(0) as u64,
-            log_entries: log.1.max(0) as u64,
-            tokens_input: log.2.max(0) as u64,
-            tokens_output: log.3.max(0) as u64,
-            tokens_cache_read: log.4.max(0) as u64,
-            tokens_cache_write: log.5.max(0) as u64,
-            llm_requests: requests.0.max(0) as u64,
-            llm_tokens_input: requests.1.max(0) as u64,
-            llm_tokens_output: requests.2.max(0) as u64,
-            llm_tokens_cache_read: requests.3.max(0) as u64,
-            llm_tokens_cache_write: requests.4.max(0) as u64,
-            llm_cost_usd: requests.5,
-            llm_duration_ms: requests.6.max(0) as u64,
+        for row in stmt.query_map(params![range.from_sec, range.to_end_sec], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })? {
+            let (date, agent, kind, routing, tokens_input, tokens_output, entries) = row?;
+            let routing = routing.and_then(|value| serde_json::from_str(&value).ok());
+            let (class, _) = routing_class_reason(routing.as_ref());
+            let key = (date.clone(), agent.clone(), class.clone(), kind.clone());
+            let bucket = daily.entry(key).or_insert_with(|| AnalyticsDaily {
+                date,
+                agent,
+                class,
+                kind,
+                tokens_input: 0,
+                tokens_output: 0,
+                entries: 0,
+            });
+            bucket.tokens_input += tokens_input.max(0) as u64;
+            bucket.tokens_output += tokens_output.max(0) as u64;
+            bucket.entries += entries.max(0) as u64;
+        }
+
+        let llm_requests = self
+            .file
+            .conn
+            .prepare(
+                "SELECT pinned_model, model, protocol, started_at, tokens_input, tokens_output,
+                        tokens_cache_read, tokens_cache_write
+                 FROM llm_requests
+                 WHERE (?1 IS NULL OR started_at >= ?1) AND (?2 IS NULL OR started_at < ?2)
+                 ORDER BY started_at, request_id",
+            )?
+            .query_map(params![range.from_sec, range.to_end_sec], |row| {
+                Ok(SavingsRequest {
+                    pinned_model: row.get(0)?,
+                    model: row.get(1)?,
+                    protocol: row.get(2)?,
+                    started_at: row.get(3)?,
+                    tokens_input: row.get::<_, i64>(4)?.max(0) as u64,
+                    tokens_output: row.get::<_, i64>(5)?.max(0) as u64,
+                    tokens_cache_read: row.get::<_, i64>(6)?.max(0) as u64,
+                    tokens_cache_write: row.get::<_, i64>(7)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(AnalyticsReport {
+            sessions,
+            daily: daily.into_values().collect(),
+            llm_requests,
         })
     }
 
@@ -373,8 +514,52 @@ impl StateStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let pragma = |name| {
+            self.file
+                .conn
+                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+        };
+        let page_size = pragma("page_size")?;
+        let freelist_count = pragma("freelist_count")?;
+        let auto_vacuum = match pragma("auto_vacuum")? {
+            1 => "full",
+            2 => "incremental",
+            _ => "none",
+        };
+        let has_lease = self
+            .file
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_lease'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let maintenance = has_lease
+            .then(|| {
+                self.file.conn.query_row(
+                    "SELECT holder, last_tick_at, last_result FROM maintenance_lease WHERE id = 1",
+                    [],
+                    |row| {
+                        let result: Option<String> = row.get(2)?;
+                        Ok(StateMaintenance {
+                            holder: row.get(0)?,
+                            last_tick_at: row.get::<_, Option<i64>>(1)?.map(|value| value.max(0) as u64 * 1000),
+                            last_result: result.and_then(|value| serde_json::from_str(&value).ok()),
+                        })
+                    },
+                ).optional()
+            })
+            .transpose()?
+            .flatten();
         Ok(StateHealth {
-            path: self.path.display().to_string(),
+            db_path: self.path.display().to_string(),
+            db_bytes: file_len(&self.path),
+            wal_bytes: file_len(&wal_path(&self.path)),
+            freelist_bytes: (page_size * freelist_count).max(0) as u64,
+            auto_vacuum,
+            maintenance,
             retention_seconds: self.retention.max_age.as_secs(),
             sessions: sessions.max(0) as u64,
             log_entries: logs.max(0) as u64,
@@ -632,33 +817,110 @@ pub struct SessionRecord {
     pub session: PersistedSession,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct AnalyticsRange {
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegateLog {
+    pub ts: Option<String>,
+    pub kind: String,
+    pub role: String,
+    pub summary: String,
+    pub detail: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct AnalyticsRangeReport {
-    pub range: AnalyticsRange,
-    pub sessions: u64,
-    pub log_entries: u64,
+#[serde(rename_all = "camelCase")]
+pub struct DelegateSession {
+    pub id: String,
+    pub title: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub tokens_total: u64,
+    pub context_used: u64,
+    pub routing: Option<serde_json::Value>,
+    pub has_response: bool,
+    pub log: Vec<DelegateLog>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AnalyticsRange {
+    /// Inclusive Unix-second start of the range.
+    pub from_sec: Option<i64>,
+    /// Exclusive Unix-second end of the range.
+    pub to_end_sec: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsSession {
+    pub id: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub kind: Option<String>,
+    pub run_label: Option<String>,
+    pub class: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_total: u64,
+    pub context_used: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsDaily {
+    pub date: String,
+    pub agent: Option<String>,
+    pub class: Option<String>,
+    pub kind: Option<String>,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub entries: u64,
+}
+
+/// Fields consumed by the existing router savings aggregation. Field names
+/// deliberately match its prior SQLite row shape.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SavingsRequest {
+    pub pinned_model: String,
+    pub model: String,
+    pub protocol: String,
+    pub started_at: i64,
     pub tokens_input: u64,
     pub tokens_output: u64,
     pub tokens_cache_read: u64,
     pub tokens_cache_write: u64,
-    pub llm_requests: u64,
-    pub llm_tokens_input: u64,
-    pub llm_tokens_output: u64,
-    pub llm_tokens_cache_read: u64,
-    pub llm_tokens_cache_write: u64,
-    pub llm_cost_usd: f64,
-    pub llm_duration_ms: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsReport {
+    pub sessions: Vec<AnalyticsSession>,
+    pub daily: Vec<AnalyticsDaily>,
+    pub llm_requests: Vec<SavingsRequest>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateMaintenance {
+    pub holder: String,
+    pub last_tick_at: Option<u64>,
+    pub last_result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StateHealth {
-    pub path: String,
+    pub db_path: String,
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub freelist_bytes: u64,
+    pub auto_vacuum: &'static str,
+    pub maintenance: Option<StateMaintenance>,
     pub retention_seconds: u64,
     pub sessions: u64,
     pub log_entries: u64,
@@ -685,6 +947,39 @@ pub struct DelegationReport {
     pub delegate_cost_usd: f64,
     pub total_cost_usd: f64,
     pub sessions: Vec<DelegationSessionReport>,
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn wal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", path.display()))
+}
+
+fn iso_timestamp(seconds: i64) -> Option<String> {
+    (seconds > 0)
+        .then(|| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
+        .flatten()
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn routing_class_reason(routing: Option<&serde_json::Value>) -> (Option<String>, Option<String>) {
+    let class = routing
+        .and_then(|value| value.get("class"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let reason = routing
+        .and_then(|value| value.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.chars().take(200).collect());
+    (class, reason)
 }
 
 /// Raw single-file SQLite implementation. `StateStore` is the public
@@ -1622,6 +1917,7 @@ impl StateFile {
     fn row_to_log_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
         let detail: Option<String> = row.get("detail")?;
         Ok(LogEntry {
+            ts: row.get("ts").ok(),
             kind: row.get("kind")?,
             role: row.get("role")?,
             summary: row.get("summary")?,
@@ -1639,7 +1935,7 @@ impl StateFile {
     pub fn log_for_all(&self, router_session_id: &str) -> rusqlite::Result<Vec<LogEntry>> {
         self.flush_log_or_warn();
         let mut stmt = self.conn.prepare(
-            "SELECT kind, role, summary, detail, tokens_input, tokens_output,
+            "SELECT ts, kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
              FROM session_log WHERE router_session_id=?1 ORDER BY id",
         )?;
@@ -1652,7 +1948,7 @@ impl StateFile {
         let mut out = Vec::new();
         self.flush_log_or_warn();
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT kind, role, summary, detail, tokens_input, tokens_output,
+            "SELECT ts, kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
              FROM session_log WHERE router_session_id=?1 ORDER BY id DESC LIMIT ?2",
         ) else {
