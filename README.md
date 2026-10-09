@@ -333,6 +333,42 @@ router-acp transcript --state ~/.local/state/router-acp/sessions.db --session rt
 
 This takes the state DB path directly rather than a `--config`, so it runs standalone: a model that has just been handed a session (a `terse_handoff` briefing embeds this command already resolved to the running binary and live state file) can read what its briefing omitted, without a router config and without `sqlite3` installed.
 
+### State query boundary
+
+Router-acp is the only reader of router-owned SQLite state. Hosts use the
+versioned JSON command instead of opening `sessions.db` or embedding SQL:
+
+```sh
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 session --session rtr-…
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegates --session rtr-… --session rtr-…
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 logs --session rtr-… --kind tool_call
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 analytics --from-sec 1760000000 --to-end-sec 1760086400
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 health
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegation-report
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 transcript --session rtr-…
+```
+
+Every command prints one JSON object with `version: 1`, `command`, and `data`.
+`session` includes metadata and title. `title` returns only a title.
+`delegates` accepts one or more parent ids and returns every child panel in one
+call. Each child includes its chronological log, parsed routing, token and
+context totals, and response-complete state. Only `delegate_task`,
+`delegate_followup`, and `agent_response` retain `detail` there.
+
+`logs` and `transcript` include each row's Unix-second `ts`. `analytics`
+returns the relay-compatible `sessions` and daily UTC token buckets grouped by
+agent, routing class, and kind. Its `fromSec` bound is inclusive and its
+`toEndSec` bound is exclusive. `llmRequests` exposes the rows used by the
+savings aggregate. `health` includes database/WAL/freelist bytes,
+auto-vacuum, maintenance lease status, retention, and counts.
+`delegation-report` is the JSON form of the existing adoption report.
+
+The query command opens the configured state file read-only. It does not create
+or migrate schemas, import legacy JSON, flush buffered rows, prune retained
+history, vacuum, or checkpoint the WAL. The configured `history` duration stays
+explicit at the `StateStore` boundary so a future sharded store can apply the
+same policy to legacy, active, and inactive shards.
+
 ### State DB maintenance
 
 Every `router-acp serve` process sharing a state file ticks every 5 minutes, but only the holder of the `maintenance_lease` row does work (lease TTL 15 minutes, so a dead holder is replaced). A tick has a 2-second budget, waits at most 200 ms for the write lock, and stops on a busy database to resume next tick. It:

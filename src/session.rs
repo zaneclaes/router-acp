@@ -45,7 +45,7 @@ use crate::downstream::{
 };
 use crate::headroom::HeadroomTracker;
 use crate::relay;
-use crate::state::{PersistedSession, StateFile};
+use crate::state::{PersistedSession, StateStore};
 use crate::strategies::{
     CandidateView, OverrideSource, RankedCandidate, RouteContext, make_strategy,
 };
@@ -541,7 +541,7 @@ pub struct Shared {
     pub account_write: tokio::sync::Mutex<()>,
     pub scores: ScoreTable,
     pub rules: ClassifierRules,
-    pub state: Mutex<StateFile>,
+    pub state: Mutex<StateStore>,
     pub llm_proxy: Arc<crate::llm_proxy::LlmProxyRuntime>,
     pub headroom: Mutex<HeadroomTracker>,
     pub auth: Mutex<crate::auth::AuthTracker>,
@@ -604,7 +604,7 @@ impl Shared {
             .map(|a| (a.name.clone(), a.budget_prompts_5h))
             .collect();
         let headroom = HeadroomTracker::new(&cfg.headroom, budgets);
-        let state = StateFile::try_load(&cfg.state_file, cfg.retention()).map_err(|e| {
+        let state = StateStore::try_load(&cfg.state_file, cfg.retention()).map_err(|e| {
             AcpError::internal_error().data(format!(
                 "cannot open durable router state at {}: {e}",
                 cfg.state_file.display()
@@ -5241,6 +5241,7 @@ async fn send_prompt_with_failover(
                 if let Err(err) = shared.state.lock().unwrap().log_checked(
                     &router_sid,
                     &crate::state::LogEntry {
+                        ts: None,
                         kind: "agent_response".to_string(),
                         role: "agent".to_string(),
                         summary: output.clone(),

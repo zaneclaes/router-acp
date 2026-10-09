@@ -146,6 +146,76 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Read router-owned state through the versioned, read-only JSON boundary.
+    /// Hosts must use this instead of opening the SQLite database themselves.
+    StateQuery {
+        /// Path to the router configuration file. Its state path and history
+        /// retention are both passed explicitly to the StateStore.
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        query: StateQueryCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateQueryCommand {
+    /// Version 1 of the stable JSON contract.
+    V1 {
+        #[command(subcommand)]
+        query: StateQueryV1,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateQueryV1 {
+    /// Session metadata, including its title when one exists.
+    Session {
+        #[arg(long)]
+        session: String,
+    },
+    /// A session title without its full metadata record.
+    Title {
+        #[arg(long)]
+        session: String,
+    },
+    /// Delegate child session panels for one or more parents, including their
+    /// filtered chronological logs. Repeat --session for every parent.
+    Delegates {
+        #[arg(long, required = true, num_args = 1..)]
+        session: Vec<String>,
+    },
+    /// Selected session log rows. Pass --kind to select one log kind.
+    Logs {
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Kory-compatible usage and savings rows for an epoch-second range. The
+    /// upper bound is exclusive, matching `fromSec` / `toEndSec`.
+    Analytics {
+        #[arg(long, alias = "from")]
+        from_sec: Option<i64>,
+        #[arg(long, alias = "to")]
+        to_end_sec: Option<i64>,
+    },
+    /// Aggregate state health, including the configured retention window.
+    Health,
+    /// Existing ordinary delegation adoption report as stable JSON.
+    DelegationReport {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Chronological transcript lookup for a router session.
+    Transcript {
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value_t = 100_000)]
+        limit: usize,
+    },
 }
 
 #[cfg(unix)]
@@ -331,7 +401,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
         } => {
             let cfg = Config::from_file(&config)?;
-            let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
+            let state = router_acp::state::StateStore::load(&cfg.state_file, cfg.retention());
             match session {
                 Some(sid) => {
                     let Some(s) = state.get(&sid) else {
@@ -427,7 +497,7 @@ async fn main() -> anyhow::Result<()> {
                 max_age: std::time::Duration::MAX,
             };
             let path = router_acp::config::expand_tilde(&state);
-            let state = router_acp::state::StateFile::load(&path, never_prune);
+            let state = router_acp::state::StateStore::load(&path, never_prune);
             let entries = state.log_for(&session, limit.max(1));
             if entries.is_empty() {
                 println!(
@@ -480,90 +550,98 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::DelegationReport { config, limit } => {
             let cfg = Config::from_file(&config)?;
-            let state = router_acp::state::StateFile::load(&cfg.state_file, cfg.retention());
-            let all = state.all();
-            let mut children: std::collections::HashMap<String, Vec<_>> =
-                std::collections::HashMap::new();
-            for (id, session) in &all {
-                if let Some(parent) = &session.parent_session_id {
-                    children
-                        .entry(parent.clone())
-                        .or_default()
-                        .push((id.clone(), session.clone()));
-                }
-            }
-            let prompted: Vec<_> = all
-                .iter()
-                .filter(|(_, session)| {
-                    session.kind == "primary" && session.delegation_directive_injections > 0
-                })
-                .collect();
-            let adopted = prompted
-                .iter()
-                .filter(|(id, _)| children.get(id).is_some_and(|kids| !kids.is_empty()))
-                .count();
-            let injections: u64 = prompted
-                .iter()
-                .map(|(_, session)| session.delegation_directive_injections)
-                .sum();
-            let native_bypasses: u64 = prompted
-                .iter()
-                .map(|(_, session)| session.native_subagent_calls)
-                .sum();
-            let effective_cost = |session: &router_acp::state::PersistedSession| {
-                if session.llm_requests_total > 0 && session.llm_request_cost_usd > 0.0 {
-                    session.llm_request_cost_usd
-                } else {
-                    session.cost_usd
-                }
-            };
-            let parent_cost: f64 = prompted
-                .iter()
-                .map(|(_, session)| effective_cost(session))
-                .sum();
-            let delegate_cost: f64 = prompted
-                .iter()
-                .flat_map(|(id, _)| children.get(id).into_iter().flatten())
-                .map(|(_, session)| effective_cost(session))
-                .sum();
-            let delegate_cost = if delegate_cost == 0.0 {
-                0.0
-            } else {
-                delegate_cost
-            };
+            let state = router_acp::state::StateStore::load(&cfg.state_file, cfg.retention());
+            let report = state.delegation_report(limit);
 
             println!(
                 "ordinary delegation adoption report ({} prompted sessions)\n",
-                prompted.len()
+                report.prompted_sessions
             );
-            for (id, session) in prompted.iter().take(limit.max(1)) {
-                let kid_count = children.get(id).map_or(0, Vec::len);
+            for session in &report.sessions {
                 println!(
                     "{}  {}/{}  injections {} | delegates {} | native bypasses {}",
-                    &id[..id.len().min(20)],
+                    &session.router_session_id[..session.router_session_id.len().min(20)],
                     session.agent,
                     session.model,
-                    session.delegation_directive_injections,
-                    kid_count,
-                    session.native_subagent_calls,
+                    session.directive_injections,
+                    session.delegates,
+                    session.native_bypass_calls,
                 );
             }
             println!("\n── summary ──");
-            println!("  prompted sessions      : {}", prompted.len());
-            println!("  directive injections   : {injections}");
+            println!("  prompted sessions      : {}", report.prompted_sessions);
+            println!("  directive injections   : {}", report.directive_injections);
+            let adoption_percent = report
+                .sessions_that_delegated
+                .saturating_mul(100)
+                .checked_div(report.prompted_sessions)
+                .unwrap_or(0);
             println!(
                 "  sessions that delegated: {} ({}%)",
-                adopted,
-                if prompted.is_empty() {
-                    0
-                } else {
-                    adopted * 100 / prompted.len()
-                }
+                report.sessions_that_delegated, adoption_percent
             );
-            println!("  native bypass calls    : {native_bypasses}");
+            println!("  native bypass calls    : {}", report.native_bypass_calls);
             println!(
-                "  cost: parents ${parent_cost:.2} + delegates ${delegate_cost:.2} = ${:.2}",
-                parent_cost + delegate_cost
+                "  cost: parents ${:.2} + delegates ${:.2} = ${:.2}",
+                report.parent_cost_usd,
+                report.delegate_cost_usd,
+                report.parent_cost_usd + report.delegate_cost_usd
+            );
+            Ok(())
+        }
+        Command::StateQuery { config, query } => {
+            let cfg = Config::from_file(&config)?;
+            let store =
+                router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
+            let StateQueryCommand::V1 { query } = query;
+            let (command, data) = match query {
+                StateQueryV1::Session { session } => (
+                    "session",
+                    serde_json::json!({"session": store.session_metadata(&session)}),
+                ),
+                StateQueryV1::Title { session } => (
+                    "title",
+                    serde_json::json!({"session_id": session, "title": store.session_metadata(&session).and_then(|record| record.session.title)}),
+                ),
+                StateQueryV1::Delegates { session } => (
+                    "delegates",
+                    serde_json::json!({"children": store.delegate_children(&session)?}),
+                ),
+                StateQueryV1::Logs {
+                    session,
+                    limit,
+                    kind,
+                } => (
+                    "logs",
+                    serde_json::json!({"session_id": session, "kind": kind, "entries": store.selected_logs(&session, limit, kind.as_deref())?}),
+                ),
+                StateQueryV1::Analytics {
+                    from_sec,
+                    to_end_sec,
+                } => (
+                    "analytics",
+                    serde_json::to_value(store.analytics(router_acp::state::AnalyticsRange {
+                        from_sec,
+                        to_end_sec,
+                    })?)?,
+                ),
+                StateQueryV1::Health => ("health", serde_json::to_value(store.health()?)?),
+                StateQueryV1::DelegationReport { limit } => (
+                    "delegation_report",
+                    serde_json::to_value(store.delegation_report(limit))?,
+                ),
+                StateQueryV1::Transcript { session, limit } => (
+                    "transcript",
+                    serde_json::json!({"session_id": session, "entries": store.transcript(&session, limit)?}),
+                ),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "version": router_acp::state::STATE_QUERY_VERSION,
+                    "command": command,
+                    "data": data,
+                }))?
             );
             Ok(())
         }

@@ -1794,6 +1794,7 @@ pub async fn run_delegate_task(
                         shared.state.lock().unwrap().log(
                             &sub_sid,
                             &crate::state::LogEntry {
+                                ts: None,
                                 kind: "agent_response".to_string(),
                                 role: "agent".to_string(),
                                 summary: text.chars().take(200).collect(),
@@ -2278,6 +2279,7 @@ pub async fn run_delegate_followup(
             shared.state.lock().unwrap().log(
                 &sub_sid,
                 &crate::state::LogEntry {
+                    ts: None,
                     kind: "agent_response".to_string(),
                     role: "agent".to_string(),
                     summary: text.chars().take(200).collect(),

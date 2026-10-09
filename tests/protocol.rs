@@ -549,8 +549,8 @@ fn temp_state_file(tag: &str) -> PathBuf {
 }
 
 /// Open the state DB the router wrote (read-only view via the lib API).
-fn open_state(path: &std::path::Path) -> router_acp::state::StateFile {
-    router_acp::state::StateFile::load(path, router_acp::state::Retention::default())
+fn open_state(path: &std::path::Path) -> router_acp::state::StateStore {
+    router_acp::state::StateStore::load(path, router_acp::state::Retention::default())
 }
 
 fn temp_log(tag: &str) -> PathBuf {
@@ -4226,7 +4226,7 @@ async fn state_db_prunes_by_history_window() {
     // (opening no longer prunes) removes it. Sleep well past the window — updated_at has second granularity, so a
     // margin under ~2s can round to "not yet expired".
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let db = router_acp::state::StateFile::load(
+    let db = router_acp::state::StateStore::load(
         &state,
         router_acp::state::Retention {
             max_age: std::time::Duration::from_secs(1),
@@ -6856,7 +6856,7 @@ async fn prompt_command_answers_without_a_client_and_finds_sessions_by_provider_
         .unwrap_or_else(|| panic!("session id reported: {stderr}"));
 
     // A supervisor knows only the provider session id its hooks recorded.
-    let downstream = router_acp::state::StateFile::load(
+    let downstream = router_acp::state::StateStore::load(
         &dir.path().join("state.db"),
         router_acp::state::Retention::default(),
     )

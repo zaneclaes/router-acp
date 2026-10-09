@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::state::{BUSY_TIMEOUT, DEFERRABLE_BUSY_WAIT, Retention, StateFile, is_busy};
+use crate::state::{BUSY_TIMEOUT, DEFERRABLE_BUSY_WAIT, Retention, StateStore, is_busy};
 
 pub const TICK_EVERY: Duration = Duration::from_secs(5 * 60);
 const LEASE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -112,7 +112,7 @@ impl Maintenance {
     /// the lease could not be read.
     pub fn tick_at(&mut self, now: u64, budget: Duration) -> Option<TickReport> {
         if self.conn.is_none() {
-            let opened = StateFile::open_conn(&self.path)
+            let opened = StateStore::open_conn(&self.path)
                 .and_then(|conn| conn.busy_timeout(DEFERRABLE_BUSY_WAIT).map(|()| conn));
             match opened {
                 Ok(conn) => self.conn = Some(conn),
@@ -437,7 +437,7 @@ pub fn compact(db: &Path) -> rusqlite::Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{PersistedSession, StateFile};
+    use crate::state::{PersistedSession, StateStore};
 
     const DAY: u64 = 24 * 60 * 60;
 
@@ -461,7 +461,7 @@ mod tests {
     /// A session with `rows` log rows, tool calls and requests, last
     /// active at `updated_at`.
     fn seed(path: &Path, id: &str, rows: usize, updated_at: i64) {
-        let state = StateFile::load(path, Retention::default());
+        let state = StateStore::load(path, Retention::default());
         state.upsert(id.into(), session());
         let conn = open(path);
         conn.execute_batch("BEGIN").unwrap();
@@ -578,7 +578,7 @@ mod tests {
     fn only_one_router_holds_the_lease_until_it_expires() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        StateFile::load(&path, Retention::default());
+        StateStore::load(&path, Retention::default());
         let mut first = Maintenance::new(path.clone(), Retention::default());
         let mut second = Maintenance::new(path.clone(), Retention::default());
         second.holder.push_str("-second");
@@ -603,7 +603,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         seed(&path, "r1", 3, now_epoch() as i64);
-        let state = StateFile::load(&path, Retention::default());
+        let state = StateStore::load(&path, Retention::default());
         state.record_tool_call(
             "r1",
             "live",
@@ -687,8 +687,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let now = now_epoch() as i64;
-        StateFile::load(&path, Retention::default());
-        let conn = StateFile::open_conn(&path).unwrap();
+        StateStore::load(&path, Retention::default());
+        let conn = StateStore::open_conn(&path).unwrap();
         // No automatic checkpoint, so the WAL grows past the limit.
         conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
         conn.execute_batch(
@@ -697,7 +697,7 @@ mod tests {
              INSERT INTO filler SELECT zeroblob(1024 * 1024) FROM n;",
         )
         .unwrap();
-        StateFile::load(&path, Retention::default()).upsert("r1".into(), session());
+        StateStore::load(&path, Retention::default()).upsert("r1".into(), session());
         let log = |ts: i64| {
             conn.execute(
                 "INSERT INTO session_log (router_session_id, ts, kind, role, summary)
