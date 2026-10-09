@@ -83,7 +83,9 @@ const BACKGROUND_START_TOOL_DESCRIPTION: &str = "Start a long-running shell, wat
      or monitor in the ACP client's managed background-terminal lifecycle. Use this instead of \
      provider-native run_in_background/background shell modes: the client can keep it alive \
      across relay restarts and lets the user inspect its output or cancel it independently. \
-     Returns immediately after the process starts; do not wait for it to exit.";
+     Returns immediately after the process starts. By default router-acp keeps the current prompt \
+     open and resumes the agent when the process exits. Persistent servers must set wake_on_exit \
+     false.";
 
 // ----------------------------------------------------------------------
 // MCP wire types (minimal, hand-typed over the SDK's JSON-RPC layer)
@@ -261,6 +263,12 @@ pub struct BackgroundStartArgs {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub output_byte_limit: Option<u64>,
+    #[serde(default = "default_true")]
+    pub wake_on_exit: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -497,6 +505,11 @@ fn background_start_tool_definition() -> Value {
                     "type": "integer",
                     "minimum": 0,
                     "description": "Optional retained-output byte limit."
+                },
+                "wake_on_exit": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Resume the agent with exit status and output. Set false only for a persistent server."
                 }
             },
             "required": ["command"]
@@ -913,8 +926,13 @@ async fn run_background_start(
     let upstream = shared
         .upstream()
         .ok_or_else(|| "ACP client connection is unavailable".to_string())?;
-    let mut request =
-        CreateTerminalRequest::new(router_sid.to_string(), args.command).args(args.args);
+    let mut request = CreateTerminalRequest::new(router_sid.to_string(), args.command)
+        .args(args.args)
+        .meta(
+            json!({"router_acp": {"managed_background": true}})
+                .as_object()
+                .cloned(),
+        );
     if let Some(cwd) = args.cwd {
         request = request.cwd(cwd);
     }
@@ -926,6 +944,15 @@ async fn run_background_start(
         .block_task()
         .await
         .map_err(|err| format!("ACP terminal/create failed: {err}"))?;
+    if args.wake_on_exit {
+        shared
+            .managed_backgrounds
+            .lock()
+            .unwrap()
+            .entry(router_sid.to_string())
+            .or_default()
+            .push(response.terminal_id.0.to_string());
+    }
     Ok(format!(
         "Background terminal {} started. It continues independently; the user can inspect or cancel it from the client.",
         response.terminal_id
@@ -2443,6 +2470,19 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("run_in_background"))
         );
+        assert_eq!(
+            def["inputSchema"]["properties"]["wake_on_exit"]["default"],
+            true
+        );
+        let default_args: BackgroundStartArgs =
+            serde_json::from_value(json!({"command": "/bin/true"})).unwrap();
+        assert!(default_args.wake_on_exit);
+        let server_args: BackgroundStartArgs = serde_json::from_value(json!({
+            "command": "/usr/bin/server",
+            "wake_on_exit": false
+        }))
+        .unwrap();
+        assert!(!server_args.wake_on_exit);
     }
 
     #[test]

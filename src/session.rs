@@ -20,7 +20,8 @@ use agent_client_protocol::schema::v1::{
     SessionCapabilities, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigSelectGroup, SessionConfigSelectOption,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalOutputRequest,
+    WaitForTerminalExitRequest,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Client as ClientPeer, ConnectTo, ConnectionTo, Dispatch, Handled,
@@ -558,6 +559,9 @@ pub struct Shared {
     /// Signaled whenever any background delegate finishes, waking waiters in
     /// `delegate_await`.
     pub background_notify: tokio::sync::Notify,
+    /// Managed terminals whose exit resumes the agent within the current
+    /// upstream prompt, keyed by router session id.
+    pub managed_backgrounds: Mutex<HashMap<String, Vec<String>>>,
     /// Per-delegate effort from `delegate_task` `hints.effort`, keyed by the
     /// delegate's state-session id. The LLM proxy reads it in place of the
     /// parent session's effort while that delegate runs.
@@ -683,6 +687,7 @@ impl Shared {
             live_delegates: Mutex::new(HashMap::new()),
             background_delegates: Mutex::new(HashMap::new()),
             background_notify: tokio::sync::Notify::new(),
+            managed_backgrounds: Mutex::new(HashMap::new()),
             delegate_effort: Mutex::new(HashMap::new()),
             agent_delegate_slots,
             worker_handoffs: Mutex::new(HashMap::new()),
@@ -4700,10 +4705,12 @@ fn build_background_instructions() -> String {
     "[router-acp managed backgrounds]\n\
      The router's `background_start` tool is available. Use it for every \
      long-running watcher, monitor, server, or background shell instead of a \
-     provider-native `run_in_background` mode. It returns immediately while the \
-     ACP client keeps the process visible, inspectable, and cancellable. A \
-     watcher should exit when its condition fires; Kory Code wakes you with its \
-     exit status and output."
+     provider-native `run_in_background` mode. The tool call returns immediately \
+     while the ACP client keeps the process visible, inspectable, and cancellable. \
+     A watcher should exit when its condition fires. End your turn after starting it. \
+     router-acp keeps the upstream prompt \
+     open and resumes you with its exit status and output. Set `wake_on_exit: false` \
+     only for a persistent server that must not resume this turn."
         .to_string()
 }
 
@@ -4797,6 +4804,62 @@ async fn send_primary_prompt(
     }
 }
 
+async fn wait_for_managed_backgrounds(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    cancellation: RequestCancellation,
+) -> Result<Option<String>, AcpError> {
+    let terminal_ids = shared
+        .managed_backgrounds
+        .lock()
+        .unwrap()
+        .remove(router_sid)
+        .unwrap_or_default();
+    if terminal_ids.is_empty() {
+        return Ok(None);
+    }
+    let upstream = shared.upstream().ok_or_else(AcpError::internal_error)?;
+    let mut completions = Vec::with_capacity(terminal_ids.len());
+    for terminal_id in terminal_ids {
+        let exited = upstream
+            .send_request(WaitForTerminalExitRequest::new(
+                router_sid.to_string(),
+                terminal_id.clone(),
+            ))
+            .forward_cancellation_from(cancellation.clone())
+            .block_task()
+            .await?;
+        let output = upstream
+            .send_request(TerminalOutputRequest::new(
+                router_sid.to_string(),
+                terminal_id.clone(),
+            ))
+            .block_task()
+            .await?;
+        let status = exited
+            .exit_status
+            .exit_code
+            .map(|code| format!("exit code {code}"))
+            .or_else(|| {
+                exited
+                    .exit_status
+                    .signal
+                    .map(|signal| format!("signal {signal}"))
+            })
+            .unwrap_or_else(|| "unknown status".to_string());
+        let retained = output.output.trim();
+        completions.push(if retained.is_empty() {
+            format!("Terminal {terminal_id} exited with {status}. No output was captured.")
+        } else {
+            format!("Terminal {terminal_id} exited with {status}.\nOutput:\n{retained}")
+        });
+    }
+    Ok(Some(format!(
+        "[router-acp managed background completed]\n{}\nContinue the original task now.",
+        completions.join("\n\n")
+    )))
+}
+
 async fn send_prompt_with_failover(
     shared: Arc<Shared>,
     router_sid: String,
@@ -4857,7 +4920,13 @@ async fn send_prompt_with_failover(
     let max_iters = max_attempts.max(shared.cfg.routers.escalation.max_escalations + 1) + 1;
     let mut continuing = false;
     let mut repaired_once = false;
-    for attempt in 1..=max_iters {
+    let mut background_completion: Option<String> = None;
+    let mut attempt = 0;
+    // Managed watcher completions are continuations of the same provider
+    // attempt. Give them their own bounded budget so repeated CI waits do not
+    // consume failover attempts or hold an upstream prompt forever.
+    for _iteration in 1..=(max_iters + 20) {
+        attempt += 1;
         let Some((process_key, down_sid, candidate)) = shared
             .with_session(&router_sid, |s| {
                 s.pin.as_ref().map(|p| {
@@ -4959,7 +5028,11 @@ async fn send_prompt_with_failover(
                 blocks.push(ContentBlock::from(ctx));
             }
             blocks.extend(history.clone());
-            blocks.extend(req.prompt.clone());
+            if let Some(completion) = background_completion.take() {
+                blocks.push(ContentBlock::from(completion));
+            } else {
+                blocks.extend(req.prompt.clone());
+            }
             if continuing {
                 blocks.push(ContentBlock::from("Continue the interrupted task using the original request above as context. Verify uncertain tool effects and do not repeat completed actions.".to_string()));
             }
@@ -5138,6 +5211,21 @@ async fn send_prompt_with_failover(
                 update_confidence_and_maybe_upgrade(&shared, &router_sid, &resp);
                 if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
                     return responder.respond_with_error(err);
+                }
+                match wait_for_managed_backgrounds(&shared, &router_sid, responder.cancellation())
+                    .await
+                {
+                    Ok(Some(completion)) => {
+                        background_completion = Some(completion);
+                        continuing = false;
+                        attempt -= 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(_err) if responder.cancellation().is_cancelled() => {
+                        return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                    }
+                    Err(err) => return responder.respond_with_error(err),
                 }
                 // The turn just changed real usage — nudge the shared usage
                 // snapshot (self-throttled and fire-and-forget; never delays
@@ -8841,7 +8929,10 @@ mod prompt_framing_tests {
         assert!(text.contains("background_start"), "{text}");
         assert!(text.contains("run_in_background"), "{text}");
         assert!(text.contains("exit when its condition fires"), "{text}");
-        assert!(text.contains("Kory Code wakes you"), "{text}");
+        assert!(
+            text.contains("router-acp keeps the upstream prompt"),
+            "{text}"
+        );
         assert!(
             text.contains("visible, inspectable, and cancellable"),
             "{text}"
