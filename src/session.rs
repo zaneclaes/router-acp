@@ -604,7 +604,12 @@ impl Shared {
             .map(|a| (a.name.clone(), a.budget_prompts_5h))
             .collect();
         let headroom = HeadroomTracker::new(&cfg.headroom, budgets);
-        let state = StateFile::load(&cfg.state_file, cfg.retention());
+        let state = StateFile::try_load(&cfg.state_file, cfg.retention()).map_err(|e| {
+            AcpError::internal_error().data(format!(
+                "cannot open durable router state at {}: {e}",
+                cfg.state_file.display()
+            ))
+        })?;
 
         let specs = build_targets(&cfg);
         let llm_proxy = crate::llm_proxy::LlmProxyRuntime::new(&cfg, &specs)
