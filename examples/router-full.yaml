@@ -65,6 +65,10 @@ failover:
   enabled: true
   respawn_cooldown_secs: 30
   max_attempts: 3
+  # A provider outage cordons the model on every account for this long.
+  outage_cordon_secs: 300
+  # With no other model available, wait up to this long for the cordon to end.
+  max_wait_secs: 1800
 
 # Per-LLM-request routing. When enabled, router-acp binds one loopback HTTP
 # listener and injects each configured adapter's base-URL override. It keeps

@@ -4027,6 +4027,248 @@ async fn outage_after_a_human_switch_respawns_the_pick_before_failing_over() {
 }
 
 #[tokio::test]
+async fn repeat_outage_on_a_human_pick_fails_over_to_another_model() {
+    // The live failure: a human-picked Codex model hit transport 503s three
+    // times in one long prompt. Every outage re-pinned the same pick, so the
+    // turn never left the failing model and ended at the attempt limit. One
+    // same-model recovery is enough; the repeat takes the ordinary failover.
+    let state = temp_state_file("pick-repeat-outage");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         failover: {{ respawn_cooldown_secs: 0, max_attempts: 3 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 2)],
+            &[("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable")]
+        ),
+        agent_yaml("b", &[("m2", 1)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let result = prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(result?.stop_reason, StopReason::EndTurn, "{text}");
+        assert!(text.contains("echo:m2:"), "replacement answered: {text}");
+        assert!(
+            !text.contains("failover attempt limit reached"),
+            "never stuck on the failing pick: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Every typed notice a session received on its `agent_message_chunk`s.
+fn notices_for(observed: &ObservedHandle, session_id: &str) -> Vec<serde_json::Value> {
+    observed
+        .lock()
+        .unwrap()
+        .updates
+        .iter()
+        .filter(|n| n.session_id.0.as_ref() == session_id)
+        .filter(|n| matches!(n.update, SessionUpdate::AgentMessageChunk(_)))
+        .filter_map(|n| n.meta.as_ref()?.get("router_acp")?.get("notices").cloned())
+        .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+#[tokio::test]
+async fn provider_outage_cordons_the_model_on_every_account_and_crosses_families() {
+    // During an outage the same model on another account is down too. The
+    // failover must leave the model, even for a human pick, and say why.
+    let state = temp_state_file("outage-every-account");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}    lineage: x\n{}    lineage: x\n{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 3)],
+            &[("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable")]
+        ),
+        agent_yaml("a2", &[("m1", 3)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let result = prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(result?.stop_reason, StopReason::EndTurn, "{text}");
+        assert!(text.contains("echo:m2:"), "another family answered: {text}");
+        assert!(
+            !text.contains("echo:m1:"),
+            "never the same model on another account: {text}"
+        );
+        assert!(
+            text.contains("router-acp · m1 outage: switching to m2"),
+            "labeled failover line: {text}"
+        );
+        let notices = notices_for(&observed, &sid);
+        let failover = notices
+            .iter()
+            .find(|n| n["kind"] == "failover")
+            .unwrap_or_else(|| panic!("typed failover notice: {notices:?}"));
+        assert_eq!(failover["reason"], "outage");
+        assert_eq!(failover["cordon"], "hard");
+        assert_eq!(failover["from"], "a/m1");
+        assert_eq!(failover["to"], "b/m2");
+        assert!(failover["detail"].as_str().unwrap().contains("unavailable"));
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .model_outage("x", "m1")
+                .is_some()
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_fallback_the_prompt_waits_out_the_outage_and_retries() {
+    // Nothing else can serve: keep the prompt open, show the wait, retry the
+    // old model when its cordon ends. A reload replays the same notices.
+    let state = temp_state_file("outage-wait");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         failover: {{ outage_cordon_secs: 1 }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable"),
+                ("MOCK_FAIL_PROMPT_TIMES", "1"),
+                ("MOCK_SUPPORTS_LIFECYCLE", "1"),
+            ]
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let result = prompt_text(&cx, &sid, "start").await;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(result?.stop_reason, StopReason::EndTurn, "{text}");
+        assert!(
+            text.contains("m1 outage: no other model can serve; retrying m1 in"),
+            "the wait is announced: {text}"
+        );
+        assert!(text.contains("m1 outage: retrying m1 now"), "{text}");
+        assert!(text.contains("echo:m1:"), "the old model answered: {text}");
+        let notices = notices_for(&observed, &sid);
+        let wait = notices
+            .iter()
+            .find(|n| n["kind"] == "retry_wait")
+            .unwrap_or_else(|| panic!("typed wait notice: {notices:?}"));
+        assert!(wait["retry_at"].as_str().is_some_and(|at| at.contains('T')));
+
+        observed.lock().unwrap().updates.clear();
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+        cx.send_request(agent_client_protocol::schema::v1::LoadSessionRequest::new(
+            sid.clone(),
+            std::env::temp_dir(),
+        ))
+        .block_task()
+        .await?;
+        let replay = agent_text(&observed, &sid);
+        assert!(
+            replay.contains("no other model can serve") && replay.contains("retrying m1 now"),
+            "session/load replays the notices: {replay}"
+        );
+        assert!(
+            notices_for(&observed, &sid)
+                .iter()
+                .any(|n| n["kind"] == "retry_wait"),
+            "replayed with their typed copy"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_soft_cordon_finishes_the_turn_then_switches_with_a_summary() {
+    // A reserve breach is a saving, not a wall: the running turn completes,
+    // and the next turn moves with the outgoing model's own summary.
+    let state = temp_state_file("soft-cordon");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\n\
+         auto_upgrade: {{ enabled: false }}\nrouters:\n  auto: {{cost_quality_tradeoff: 0}}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("opus", 3)], &[]),
+        agent_yaml("b", &[("sonnet", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = prompt_text(&cx, &sid, "start\nTOOL:edit\nSLEEP:1500");
+        let cordon = async {
+            for _ in 0..300 {
+                if observed
+                    .lock()
+                    .unwrap()
+                    .updates
+                    .iter()
+                    .any(|n| matches!(&n.update, SessionUpdate::ToolCall(_)))
+                {
+                    shared.headroom.lock().unwrap().set_usage_cordons(
+                        [(
+                            CandidateId::new("a", "opus"),
+                            router_acp::headroom::UsageCordon {
+                                reason: "Weekly usage limit reached (10% capacity reserved)".into(),
+                                resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                                resets_at_rfc3339: "2099-01-01T00:00:00Z".into(),
+                                soft: true,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("tool activity was never observed");
+        };
+        let (response, ()) = tokio::join!(prompt, cordon);
+        assert_eq!(response?.stop_reason, StopReason::EndTurn);
+        let first = agent_text(&observed, &sid);
+        assert!(
+            !first.contains("failover"),
+            "a soft cordon never interrupts: {first}"
+        );
+
+        let before = first.len();
+        prompt_text(&cx, &sid, "next").await?;
+        let text = agent_text(&observed, &sid)[before..].to_string();
+        assert!(
+            text.contains("router-acp · Reserve reached: switching to sonnet"),
+            "labeled reserve switch: {text}"
+        );
+        assert!(text.contains("summarized by the previous model"), "{text}");
+        assert!(text.contains("echo:sonnet:"), "{text}");
+        let notices = notices_for(&observed, &sid);
+        let switch = notices
+            .iter()
+            .find(|n| n["kind"] == "switch")
+            .unwrap_or_else(|| panic!("typed switch notice: {notices:?}"));
+        assert_eq!(switch["cordon"], "soft");
+        assert_eq!(switch["handoff"], "summary");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn delegate_choice_is_disclosed_to_the_user() {
     let state = temp_state_file("delegate-why");
     let log = temp_log("delegate-why");
@@ -5413,6 +5655,7 @@ async fn skill_routing_switches_off_usage_cordoned_pin() {
                 reason: "5-hour usage limit reached".to_string(),
                 resets_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
                 resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+                soft: false,
             },
         );
         shared.headroom.lock().unwrap().set_usage_cordons(cordons);
@@ -6022,6 +6265,7 @@ async fn usage_cordoned_pin_switches_proactively() {
                 reason: "Weekly usage limit reached".to_string(),
                 resets_at: std::time::SystemTime::now() + std::time::Duration::from_secs(7200),
                 resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+                soft: false,
             },
         );
         shared.headroom.lock().unwrap().set_usage_cordons(cordons);
@@ -6099,6 +6343,7 @@ async fn usage_cordon_escape_skips_equal_quality_peer() {
                 reason: "provider rejected pin rewrite".to_string(),
                 resets_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
                 resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+                soft: false,
             },
         );
         shared.headroom.lock().unwrap().set_usage_cordons(cordons);
@@ -7565,6 +7810,7 @@ async fn all_usage_cordoned_returns_unavailable_without_prompting_any_model() {
                         reason: "Weekly usage limit reached (10% capacity reserved)".into(),
                         resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
                         resets_at_rfc3339: "2099-01-01T00:00:00Z".into(),
+                        soft: false,
                     },
                 )
             })
@@ -10211,7 +10457,8 @@ async fn transport_error_as_text_recovers_the_human_pick_with_hot_context() {
         let yaml = format!(
             "state_file: {}\ndelegation: {{ enabled: false }}\n\
              auto_upgrade: {{ enabled: false }}\n\
-             failover: {{ enabled: {enabled}, respawn_cooldown_secs: 0, max_attempts: 2 }}\n\
+             failover: {{ enabled: {enabled}, respawn_cooldown_secs: 0, max_attempts: 2, \
+             outage_cordon_secs: 1 }}\n\
              llm_proxy: {{ enabled: true, listen: '127.0.0.1:0' }}\nagents:\n{}\
              \x20   llm_proxy:\n      base_url_env: OPENAI_BASE_URL\n\
              \x20     upstream_base_url: 'http://{address}'\n      protocol: openai\n",
@@ -10240,6 +10487,10 @@ async fn transport_error_as_text_recovers_the_human_pick_with_hot_context() {
                 result?;
                 assert_eq!(requests.load(Ordering::SeqCst), 2, "one recovery, same pin");
                 assert!(text.contains("Provider transport unavailable"), "{text}");
+                assert!(
+                    text.contains("> provider: unexpected status 503"),
+                    "the raw error rides the notice, not the prose: {text}"
+                );
                 assert!(text.contains("tool:edit"), "replacement answered: {text}");
                 let prompts: Vec<_> = read_log(&log_for_test)
                     .into_iter()

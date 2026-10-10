@@ -442,8 +442,13 @@ dead adapter process is respawned in the background so it can rejoin once
 healthy. After partial output, the router transfers partial text and tool
 statuses and asks the replacement to continue, inspect uncertain effects and
 avoid repeating completed actions. Client cancellation never fails over.
-If no eligible account/model remains, the router reports its inability. Tune with `failover.{enabled,max_attempts,
-respawn_cooldown_secs}` and `headroom.cordon_default_secs` in `router.yaml`.
+A provider outage cordons that model on every account, so the replacement
+is a different model. If no eligible account/model remains, the prompt stays
+open and goose shows `router-acp · <model> outage: no other model can serve;
+retrying <model> in …`; the router retries when the cordon ends, or reports
+its inability when that is beyond `failover.max_wait_secs`. Tune with
+`failover.{enabled,max_attempts,respawn_cooldown_secs,outage_cordon_secs,max_wait_secs}`
+and `headroom.cordon_default_secs` in `router.yaml`.
 
 For two Claude logins, type `/login`, choose Claude, then **Add Account**.
 The router preserves the first login and isolates the second. Type `/usage`
