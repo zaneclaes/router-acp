@@ -5289,7 +5289,7 @@ enum BackgroundWait {
 async fn wait_for_managed_backgrounds(
     shared: &Arc<Shared>,
     router_sid: &str,
-    cancellation: RequestCancellation,
+    cancellation: Option<RequestCancellation>,
 ) -> Result<Option<BackgroundWait>, AcpError> {
     let terminal_ids = shared
         .managed_backgrounds
@@ -5315,14 +5315,14 @@ async fn wait_for_managed_backgrounds(
     let waited = async {
         let mut completions = Vec::with_capacity(terminal_ids.len());
         for terminal_id in &terminal_ids {
-            let exited = upstream
-                .send_request(WaitForTerminalExitRequest::new(
-                    router_sid.to_string(),
-                    terminal_id.clone(),
-                ))
-                .forward_cancellation_from(cancellation.clone())
-                .block_task()
-                .await?;
+            let mut request = upstream.send_request(WaitForTerminalExitRequest::new(
+                router_sid.to_string(),
+                terminal_id.clone(),
+            ));
+            if let Some(cancellation) = cancellation.as_ref() {
+                request = request.forward_cancellation_from(cancellation.clone());
+            }
+            let exited = request.block_task().await?;
             let output = upstream
                 .send_request(TerminalOutputRequest::new(
                     router_sid.to_string(),
@@ -5362,7 +5362,12 @@ async fn wait_for_managed_backgrounds(
                 Ok(BackgroundInterrupt::Steer(prompt)) => BackgroundWait::Steered(prompt),
                 Ok(BackgroundInterrupt::Cancel) | Err(_) => BackgroundWait::Cancelled,
             }),
-            () = cancellation.cancelled() => Ok(BackgroundWait::Cancelled),
+            () = async {
+                match cancellation.as_ref() {
+                    Some(cancellation) => cancellation.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => Ok(BackgroundWait::Cancelled),
         }
     };
     shared
@@ -5711,7 +5716,9 @@ pub(crate) async fn run_primary_turn(
         // A failed/cancelled send cannot discard the restored conversation.
         // If another attempt opens a fresh adapter it must receive it too.
         if result.is_err()
-            || responder.cancellation().is_cancelled()
+            || cancellation
+                .as_ref()
+                .is_some_and(RequestCancellation::is_cancelled)
             || shared
                 .with_session(&router_sid, |s| s.cancelled)
                 .unwrap_or(true)
@@ -5762,7 +5769,7 @@ pub(crate) async fn run_primary_turn(
             state.flush_log_or_warn();
         }
         if let Some(err) = persistence_error {
-            return responder.respond_with_error(AcpError::internal_error().data(err));
+            return Err(AcpError::internal_error().data(err));
         }
 
         // A human cancellation is never provider-health evidence and never
@@ -5894,10 +5901,8 @@ pub(crate) async fn run_primary_turn(
                         model: Some(candidate.to_string()),
                     },
                 ) {
-                    return responder.respond_with_error(
-                        AcpError::internal_error()
-                            .data(format!("cannot save assistant response: {err}")),
-                    );
+                    return Err(AcpError::internal_error()
+                        .data(format!("cannot save assistant response: {err}")));
                 }
                 // Synthesize cost for adapters that report none of their own
                 // (only claude reports `usage_update.cost`; codex/grok/kimi
@@ -5920,10 +5925,9 @@ pub(crate) async fn run_primary_turn(
                 // auto-upgrade to a more capable model for the next prompt.
                 update_confidence_and_maybe_upgrade(&shared, &router_sid, &resp);
                 if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
-                    return responder.respond_with_error(err);
+                    return Err(err);
                 }
-                match wait_for_managed_backgrounds(&shared, &router_sid, responder.cancellation())
-                    .await
+                match wait_for_managed_backgrounds(&shared, &router_sid, cancellation.clone()).await
                 {
                     Ok(Some(BackgroundWait::Completed(completion))) => {
                         background_completion = Some(vec![ContentBlock::from(completion)]);
@@ -5938,13 +5942,17 @@ pub(crate) async fn run_primary_turn(
                         continue;
                     }
                     Ok(Some(BackgroundWait::Cancelled)) => {
-                        return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                        return Ok(PromptResponse::new(StopReason::Cancelled));
                     }
                     Ok(None) => {}
-                    Err(_err) if responder.cancellation().is_cancelled() => {
-                        return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                    Err(_err)
+                        if cancellation
+                            .as_ref()
+                            .is_some_and(RequestCancellation::is_cancelled) =>
+                    {
+                        return Ok(PromptResponse::new(StopReason::Cancelled));
                     }
-                    Err(err) => return responder.respond_with_error(err),
+                    Err(err) => return Err(err),
                 }
                 // The turn just changed real usage — nudge the shared usage
                 // snapshot (self-throttled and fire-and-forget; never delays
@@ -5972,7 +5980,9 @@ pub(crate) async fn run_primary_turn(
                     )
                     .await;
                     if !cancelled
-                        && !responder.cancellation().is_cancelled()
+                        && !cancellation
+                            .as_ref()
+                            .is_some_and(RequestCancellation::is_cancelled)
                         && !shared
                             .with_session(&router_sid, |s| s.cancelled)
                             .unwrap_or(false)
@@ -6007,7 +6017,9 @@ pub(crate) async fn run_primary_turn(
                     }
                 }
                 let cancelled = cancelled
-                    || responder.cancellation().is_cancelled()
+                    || cancellation
+                        .as_ref()
+                        .is_some_and(RequestCancellation::is_cancelled)
                     || shared
                         .with_session(&router_sid, |s| s.cancelled)
                         .unwrap_or(false);
@@ -6151,7 +6163,7 @@ pub(crate) async fn run_primary_turn(
                         &shared,
                         &router_sid,
                         &req.prompt,
-                        &responder.cancellation(),
+                        cancellation.as_ref(),
                         None,
                         true,
                         None,
@@ -6160,7 +6172,7 @@ pub(crate) async fn run_primary_turn(
                     {
                         Ok(PinOutcome::Pinned) => continue,
                         Ok(PinOutcome::Cancelled) => {
-                            return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                            return Ok(PromptResponse::new(StopReason::Cancelled));
                         }
                         Err(_) => {}
                     }
