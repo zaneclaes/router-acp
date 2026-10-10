@@ -280,7 +280,13 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
         let stderr_task = async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "downstream_stderr", agent = %name, "{line}");
+                // Adapter ERROR lines (e.g. Codex's "failed to flush logs to
+                // SQLite error=…") must reach the relay log; the rest is noise.
+                if line.contains("ERROR") {
+                    tracing::warn!(target: "downstream_stderr", agent = %name, "{line}");
+                } else {
+                    tracing::debug!(target: "downstream_stderr", agent = %name, "{line}");
+                }
             }
             std::future::pending::<()>().await
         };
@@ -473,6 +479,54 @@ mod tests {
             20,
             "all buffered frames reached their handlers"
         );
+    }
+
+    #[tokio::test]
+    async fn adapter_stderr_error_lines_are_logged_at_warn() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // A synthetic adapter that logs like codex app-server, then exits.
+        let transport = ProcessTransport {
+            name: "codex#gpt".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(),
+                "echo ' INFO codex: chatter' >&2; echo ' ERROR codex_state: failed to flush logs to SQLite error=database is locked' >&2; sleep 0.2; exit 1".into()],
+            env: vec![],
+            scrub_auth_env: false,
+        };
+        let _ = UntypedRole
+            .builder()
+            .connect_with(transport, async |_cx| {
+                std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+            })
+            .await;
+
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("WARN") && logged.contains("error=database is locked"),
+            "{logged}"
+        );
+        assert!(!logged.contains("chatter"), "{logged}");
     }
 
     #[tokio::test]
