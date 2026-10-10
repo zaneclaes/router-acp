@@ -45,7 +45,7 @@ pub enum FailureClass {
     Other,
 }
 
-fn error_text(err: &AcpError) -> String {
+pub(crate) fn error_text(err: &AcpError) -> String {
     format!("{} {}", err.message, err.data.clone().unwrap_or_default())
 }
 
@@ -177,6 +177,24 @@ pub fn is_context_overflow_text(lower: &str) -> bool {
         || lower.contains("compacting failed")
         || lower.contains("too_few_groups")
         || lower.contains("input exceeds the maximum length")
+}
+
+/// A failure of the local adapter process or its pipe, not of the provider.
+/// It says nothing about the model on other accounts, so it never cordons the
+/// model fleet-wide.
+pub fn is_local_adapter_failure(lower: &str) -> bool {
+    lower.contains("process exited")
+        || lower.contains("connection closed")
+        || lower.contains("never received")
+        || lower.contains("peer disconnected")
+        || lower.contains("broken pipe")
+}
+
+/// The start of a Codex transport failure printed as reply text (see
+/// [`response_transport_outage`]). The router holds such a chunk back from
+/// the model's prose until the turn shows whether it ended the turn.
+pub fn is_transport_error_start(text: &str) -> bool {
+    text.trim_start().starts_with("unexpected status 5")
 }
 
 pub fn is_outage_text(lower: &str) -> bool {

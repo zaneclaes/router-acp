@@ -214,6 +214,15 @@ pub struct RouterSession {
     /// Router notice lines queued to ride the model's next response chunk
     /// (routing disclosure, failover/cordon notices). See `notify_user`.
     pub pending_disclosure: Vec<String>,
+    /// Typed notices (`notice::Notice::to_json`) for the queued lines; they
+    /// ride `_meta.router_acp.notices` on the chunk that carries the text.
+    pub pending_notices: Vec<serde_json::Value>,
+    /// The reason a queued `pending_switch` was a cordon escape, so the switch
+    /// is announced with its label.
+    pub pending_switch_notice: Option<crate::notice::Reason>,
+    /// A Codex transport failure printed as reply text, held out of the
+    /// model's prose until the turn shows whether it ended the turn.
+    pub held_transport_text: Option<String>,
     /// A `session/set_mode` received before the pin (some clients, e.g.
     /// goose, set a mode right after `session/new`). Deferred and applied
     /// to the downstream session at pin time.
@@ -411,6 +420,9 @@ impl RouterSession {
             delegate_token: None,
             pending_meta_disclosure: None,
             pending_disclosure: Vec::new(),
+            pending_notices: Vec::new(),
+            pending_switch_notice: None,
+            held_transport_text: None,
             pending_mode: None,
             applied_mode: None,
             excluded: Vec::new(),
@@ -480,6 +492,9 @@ impl RouterSession {
             delegate_token: None,
             pending_meta_disclosure: None,
             pending_disclosure: Vec::new(),
+            pending_notices: Vec::new(),
+            pending_switch_notice: None,
+            held_transport_text: None,
             pending_mode: None,
             applied_mode: None,
             excluded: Vec::new(),
@@ -1178,6 +1193,66 @@ impl Shared {
         excluded: &[String],
         matches: impl Fn(&CandidateView) -> bool,
     ) -> Vec<CandidateView> {
+        self.eligible_views_core(
+            required,
+            class,
+            admit,
+            explicit_pick,
+            excluded,
+            None,
+            matches,
+        )
+    }
+
+    /// `candidate_view` for a candidate that is already serving: a soft
+    /// (reserve) cordon or a model outage does not stop it finishing work
+    /// it holds — a running turn or a handoff summary.
+    pub fn candidate_view_serving(
+        &self,
+        id: &CandidateId,
+        class: TaskClass,
+    ) -> Option<CandidateView> {
+        self.eligible_views_core(
+            &RequiredCaps::default(),
+            class,
+            Some(id),
+            false,
+            &[],
+            Some(id),
+            |_| true,
+        )
+        .into_iter()
+        .find(|v| &v.id == id)
+    }
+
+    /// Cordon `candidate`'s model on every account of its lineage after a
+    /// provider outage.
+    pub fn cordon_model_outage(&self, candidate: &CandidateId, reason: &str) {
+        let secs = self.cfg.failover.outage_cordon_secs;
+        if secs == 0 {
+            return;
+        }
+        let lineage = self.runtime_config().lineage_of(&candidate.agent);
+        self.headroom.lock().unwrap().cordon_model_outage(
+            &lineage,
+            &candidate.model,
+            reason,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(secs),
+        );
+        tracing::warn!(%candidate, %lineage, cordon_secs = secs, "model cordoned on every account: provider outage");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eligible_views_core(
+        &self,
+        required: &RequiredCaps,
+        class: TaskClass,
+        admit: Option<&CandidateId>,
+        explicit_pick: bool,
+        excluded: &[String],
+        serving: Option<&CandidateId>,
+        matches: impl Fn(&CandidateView) -> bool,
+    ) -> Vec<CandidateView> {
         let candidates = self.routeable_candidates_inner(explicit_pick);
         let cfg = self.runtime_config();
         let logging_in = self.account_login.lock().unwrap().clone();
@@ -1221,8 +1296,21 @@ impl Shared {
                 continue;
             }
             // Candidates proactively cordoned by the provider's usage API (cap
-            // exhausted, no overage headroom) sit out until their reset.
-            if headroom.usage_cordon(&c.id).is_some() {
+            // exhausted, no overage headroom) sit out until their reset. A
+            // serving candidate finishes its work through a soft cordon.
+            let serving_this = serving == Some(&c.id);
+            if headroom
+                .usage_cordon(&c.id)
+                .is_some_and(|cordon| !(serving_this && cordon.soft))
+            {
+                continue;
+            }
+            // A provider outage takes the model down on every account.
+            if !serving_this
+                && headroom
+                    .model_outage(&cfg.lineage_of(&c.id.agent), &c.id.model)
+                    .is_some()
+            {
                 continue;
             }
             // Seat availability reporting an exhausted plan with no overage
@@ -2315,6 +2403,29 @@ pub fn handle_downstream_dispatch(
                     return Ok(Handled::Yes);
                 }
                 let mut fwd = relay::with_session_id(&msg, &router_sid)?;
+                // Codex prints a transport failure ("unexpected status 503 …")
+                // as reply text. Hold it out of the model's prose: a failover
+                // carries it in the notice detail, and any other outcome
+                // releases it unchanged before the next text.
+                if relay::is_agent_text_chunk(&fwd) {
+                    let text = agent_chunk_text(msg.params()).unwrap_or_default();
+                    if crate::limits::is_transport_error_start(&text) {
+                        shared.with_session(&router_sid, |s| {
+                            s.turn_last_text_start = s.turn_output.len();
+                            s.turn_output.push_str(&text);
+                            s.held_transport_text
+                                .get_or_insert_with(String::new)
+                                .push_str(&text);
+                        });
+                        return Ok(Handled::Yes);
+                    }
+                    if let Some(held) = shared
+                        .with_session(&router_sid, |s| s.held_transport_text.take())
+                        .flatten()
+                    {
+                        fwd = relay::prepend_agent_text(&fwd, &held)?;
+                    }
+                }
                 if msg.method() == "session/update" {
                     // Escalation router: classify each tool-call frame and drive
                     // mid-turn escalation. Investigation (file read, read-only
@@ -2415,16 +2526,15 @@ pub fn handle_downstream_dispatch(
                     // turns the disclosure shows early rather than beside the
                     // final answer.
                     if relay::is_agent_text_chunk(&fwd) {
-                        let pending = shared
-                            .with_session(&router_sid, |s| {
-                                std::mem::take(&mut s.pending_disclosure)
-                            })
-                            .unwrap_or_default();
-                        if !pending.is_empty() {
-                            fwd = relay::prepend_agent_text(&fwd, &router_block(&pending))?;
+                        let block = take_router_block(shared, &router_sid);
+                        if let Some((text, _)) = &block {
+                            fwd = relay::prepend_agent_text(&fwd, text)?;
                         }
                         if let Some(details) = shared.take_meta_disclosure(&router_sid) {
                             fwd = relay::with_router_meta(&fwd, details)?;
+                        }
+                        if let Some((_, notices)) = &block {
+                            fwd = relay::with_router_notices(&fwd, notices)?;
                         }
                     }
                     // Attribute each tool call to the model that produced it, as
@@ -3303,6 +3413,108 @@ pub fn queue_notice(shared: &Arc<Shared>, router_sid: &str, lines: Vec<String>) 
     shared.with_session(router_sid, |s| s.pending_disclosure.extend(lines));
 }
 
+/// Number of queued notice lines: a mark to label the lines queued after it.
+fn notice_mark(shared: &Arc<Shared>, router_sid: &str) -> usize {
+    shared
+        .with_session(router_sid, |s| s.pending_disclosure.len())
+        .unwrap_or(0)
+}
+
+/// Queue a typed notice. Its headline line is inserted at `mark`, ahead of
+/// the lines queued since — they become the notice's expandable detail.
+fn queue_router_notice(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    mark: usize,
+    mut notice: crate::notice::Notice,
+) {
+    shared.with_session(router_sid, |s| {
+        let at = mark.min(s.pending_disclosure.len());
+        let mut detail = s.pending_disclosure[at..].to_vec();
+        detail.append(&mut notice.detail);
+        notice.detail = detail;
+        s.pending_disclosure.insert(at, notice.line());
+        s.pending_notices.push(notice.to_json());
+    });
+}
+
+/// Take the queued router block and its typed notices for delivery, and log
+/// what the client is about to see as a `router_notice` row so `session/load`
+/// replays it. The block starts a fresh paragraph when this turn already
+/// streamed text, so it never glues onto a sentence.
+fn take_router_block(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+) -> Option<(String, Vec<serde_json::Value>)> {
+    let (lines, notices, lead) = shared.with_session(router_sid, |s| {
+        let lead = if s.turn_output.is_empty() || s.turn_output.ends_with("\n\n") {
+            ""
+        } else if s.turn_output.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        (
+            std::mem::take(&mut s.pending_disclosure),
+            std::mem::take(&mut s.pending_notices),
+            lead,
+        )
+    })?;
+    if lines.is_empty() {
+        return None;
+    }
+    let block = format!("{lead}{}", router_block(&lines));
+    shared.state.lock().unwrap().log_buffered(
+        router_sid,
+        crate::state::LogEntry {
+            kind: "router_notice".into(),
+            role: "router".into(),
+            summary: block.clone(),
+            detail: Some(json!({ "notices": notices })),
+            ..Default::default()
+        },
+    );
+    Some((block, notices))
+}
+
+/// Release a held transport-error paragraph as ordinary reply text: the turn
+/// did not fail over on it, so it is the model's (adapter's) own output.
+fn release_held_text(shared: &Arc<Shared>, router_sid: &str) {
+    let Some(text) = shared
+        .with_session(router_sid, |s| s.held_transport_text.take())
+        .flatten()
+    else {
+        return;
+    };
+    let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text)));
+    if let Ok(detail) = serde_json::to_value(&update) {
+        shared.state.lock().unwrap().log_buffered(
+            router_sid,
+            crate::state::LogEntry {
+                kind: "session_update".into(),
+                role: "agent".into(),
+                detail: Some(detail),
+                ..Default::default()
+            },
+        );
+    }
+    if let Some(upstream) = shared.upstream() {
+        let _ =
+            upstream.send_notification(SessionNotification::new(router_sid.to_string(), update));
+    }
+}
+
+/// Move a held transport-error paragraph into the queued notice detail: the
+/// turn failed on it, so it is diagnostic, not prose.
+fn queue_held_text(shared: &Arc<Shared>, router_sid: &str) {
+    if let Some(text) = shared
+        .with_session(router_sid, |s| s.held_transport_text.take())
+        .flatten()
+    {
+        notify_user(shared, router_sid, format!("provider: {}", text.trim()));
+    }
+}
+
 /// Token usage for one completed turn.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TurnUsage {
@@ -3382,19 +3594,28 @@ pub(crate) fn synth_turn_cost(
 /// the disclosure renders at the end of the answer. Called right before the
 /// prompt response is returned.
 pub fn flush_pending_disclosure(shared: &Arc<Shared>, router_sid: &str) {
-    let lines = shared
-        .with_session(router_sid, |s| std::mem::take(&mut s.pending_disclosure))
-        .unwrap_or_default();
-    if lines.is_empty() {
+    let Some((block, notices)) = take_router_block(shared, router_sid) else {
         return;
+    };
+    // The routing details would otherwise wait for a text chunk that never
+    // comes; they ride this standalone chunk with the notices.
+    let mut router = match shared.take_meta_disclosure(router_sid) {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    if !notices.is_empty() {
+        router.insert("notices".into(), serde_json::Value::Array(notices));
     }
     if let Some(upstream) = shared.upstream() {
-        let notif = SessionNotification::new(
+        let mut notif = SessionNotification::new(
             router_sid.to_string(),
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(router_block(
-                &lines,
-            )))),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(block))),
         );
+        if !router.is_empty() {
+            let mut meta = serde_json::Map::new();
+            meta.insert("router_acp".into(), serde_json::Value::Object(router));
+            notif = notif.meta(meta);
+        }
         let _ = upstream.send_notification(notif);
     }
 }
@@ -3490,9 +3711,14 @@ pub(crate) fn apply_failure(
                 .lock()
                 .unwrap()
                 .record_pre_prompt_failure(candidate);
-            shared.publish_config_options();
             let mut msg = format!("{err}");
             msg.truncate(160);
+            // A provider outage takes the model down on every account; a
+            // local adapter failure only concerns this process.
+            if !crate::limits::is_local_adapter_failure(&msg.to_lowercase()) {
+                shared.cordon_model_outage(candidate, &format!("provider outage ({msg})"));
+            }
+            shared.publish_config_options();
             format!("outage ({msg})")
         }
         FailureClass::ModelAtCapacity if shared.cfg.failover.on_model_capacity => {
@@ -4788,36 +5014,61 @@ fn build_question_instructions() -> String {
 /// Forward a prompt to the pinned downstream, failing over to the next best
 /// candidate when the pinned model is rate-limited or down, unless the client
 /// cancelled. Partial work is handed off as a continuation.
-fn candidate_unavailable_reason(shared: &Arc<Shared>, candidate: &CandidateId) -> Option<String> {
+///
+/// A soft (reserve) cordon never stops a send or a running turn: the pre-turn
+/// cordon escape moves the session at the next turn boundary instead. A model
+/// outage stops a new send, but not a turn already running (`mid_turn`).
+fn candidate_unavailable_reason(
+    shared: &Arc<Shared>,
+    candidate: &CandidateId,
+    mid_turn: bool,
+) -> Option<(crate::notice::Reason, String)> {
+    use crate::notice::Reason;
+    let lineage = shared.runtime_config().lineage_of(&candidate.agent);
     {
         let mut headroom = shared.headroom.lock().unwrap();
-        if let Some(cordon) = headroom.usage_cordon(candidate) {
-            return Some(format!(
-                "{} (resets {})",
-                cordon.reason, cordon.resets_at_rfc3339
+        if let Some(cordon) = headroom.usage_cordon(candidate)
+            && !cordon.soft
+        {
+            return Some((
+                Reason::AccountLimit,
+                format!("{} (resets {})", cordon.reason, cordon.resets_at_rfc3339),
+            ));
+        }
+        if !mid_turn && let Some(outage) = headroom.model_outage(&lineage, &candidate.model) {
+            return Some((
+                Reason::Outage,
+                format!(
+                    "{} (cordoned until {})",
+                    outage.reason, outage.resets_at_rfc3339
+                ),
             ));
         }
         if let Some((remaining, reason)) = headroom.cordon_active(&candidate.agent) {
-            return Some(format!(
-                "{reason} ({} left)",
-                crate::limits::humanize(remaining)
+            return Some((
+                Reason::AccountLimit,
+                format!("{reason} ({} left)", crate::limits::humanize(remaining)),
             ));
         }
         if headroom.seat_exhausted(candidate) {
-            return Some("account plan exhausted with no usable overage".into());
+            return Some((
+                Reason::AccountLimit,
+                "account plan exhausted with no usable overage".into(),
+            ));
         }
     }
     if shared.auth_rejection(&candidate.agent).is_some() {
-        return Some("account is not signed in".into());
+        return Some((Reason::SignIn, "account is not signed in".into()));
     }
     shared
-        .candidate_view(
-            candidate,
-            &RequiredCaps::default(),
-            TaskClass::CodingGeneral,
-        )
+        .candidate_view_serving(candidate, TaskClass::CodingGeneral)
         .is_none()
-        .then(|| "downstream is unavailable or quarantined".into())
+        .then(|| {
+            (
+                Reason::Outage,
+                "downstream is unavailable or quarantined".into(),
+            )
+        })
 }
 
 /// Watch availability while a provider is serving a turn, including cordons
@@ -4830,18 +5081,24 @@ async fn send_primary_prompt(
     conn: Option<ConnectionTo<AgentPeer>>,
     fwd: PromptRequest,
     cancellation: RequestCancellation,
-) -> (Result<PromptResponse, AcpError>, Option<String>) {
-    let unavailable = |reason: String| {
+) -> (
+    Result<PromptResponse, AcpError>,
+    Option<(crate::notice::Reason, String)>,
+) {
+    let unavailable = |(kind, reason): (crate::notice::Reason, String)| {
         (
             Err(AcpError::internal_error().data(format!("candidate unavailable — {reason}"))),
-            Some(reason),
+            Some((kind, reason)),
         )
     };
-    if let Some(reason) = candidate_unavailable_reason(shared, candidate) {
+    if let Some(reason) = candidate_unavailable_reason(shared, candidate, false) {
         return unavailable(reason);
     }
     let Some(conn) = conn else {
-        return unavailable("downstream session is no longer live after an adapter outage".into());
+        return unavailable((
+            crate::notice::Reason::Outage,
+            "downstream session is no longer live after an adapter outage".into(),
+        ));
     };
     let down_sid = fwd.session_id.clone();
     let sent = conn
@@ -4858,7 +5115,7 @@ async fn send_primary_prompt(
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
                     return (Ok(PromptResponse::new(StopReason::Cancelled)), None);
                 }
-                if let Some(reason) = candidate_unavailable_reason(shared, candidate) {
+                if let Some(reason) = candidate_unavailable_reason(shared, candidate, true) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
                     return unavailable(reason);
                 }
@@ -5031,11 +5288,18 @@ async fn send_prompt_with_failover(
     // A requested/auto-detected model switch fires here, before this turn is
     // forwarded, so the prompt lands on the new model. The current model first
     // summarizes the work; that summary becomes `pending_context`.
+    let switch_notice = shared
+        .with_session(&router_sid, |s| s.pending_switch_notice.take())
+        .flatten();
     if let Some(sw) = shared
         .with_session(&router_sid, |s| s.pending_switch.take())
         .flatten()
         .filter(|sw| !refuse_coordinator_switch(&shared, &router_sid, sw))
     {
+        let from = shared
+            .with_session(&router_sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+            .flatten();
+        let mark = notice_mark(&shared, &router_sid);
         match switch_pin(
             &shared,
             &router_sid,
@@ -5046,7 +5310,23 @@ async fn send_prompt_with_failover(
         )
         .await
         {
-            Ok(lines) if !lines.is_empty() => queue_notice(&shared, &router_sid, lines),
+            Ok(lines) if !lines.is_empty() => {
+                let summarized = lines
+                    .iter()
+                    .any(|l| l.contains("summarized by") || l.contains("briefed by"));
+                queue_notice(&shared, &router_sid, lines);
+                if let (Some(reason), Some(from)) = (switch_notice, from) {
+                    announce_switch(
+                        &shared,
+                        &router_sid,
+                        mark,
+                        "switch",
+                        reason,
+                        &from,
+                        Some(if summarized { "summary" } else { "lookup" }),
+                    );
+                }
+            }
             Ok(_) => {}
             // The human named a model: running the turn on the model they
             // picked away from is never the answer. Fail it, naming why the
@@ -5082,6 +5362,9 @@ async fn send_prompt_with_failover(
     let mut repaired_once = false;
     let mut background_completion: Option<Vec<ContentBlock>> = None;
     let mut attempt = 0;
+    // A human pick gets one same-model recovery per prompt. A repeat outage
+    // means the pick keeps failing, so it takes the ordinary failover.
+    let mut pick_recovered = false;
     // Managed watcher completions are continuations of the same provider
     // attempt. Give them their own bounded budget so repeated CI waits do not
     // consume failover attempts or hold an upstream prompt forever.
@@ -5361,6 +5644,7 @@ async fn send_prompt_with_failover(
         });
         match result {
             Ok(resp) => {
+                release_held_text(&shared, &router_sid);
                 // If the model produced no text to carry the disclosure,
                 // flush it now as its own chunk so it still shows.
                 flush_pending_disclosure(&shared, &router_sid);
@@ -5418,16 +5702,20 @@ async fn send_prompt_with_failover(
                 match wait_for_managed_backgrounds(&shared, &router_sid, responder.cancellation())
                     .await
                 {
+                    // This turn completed, so the pin serves. The continuation
+                    // starts a fresh failover budget: one upstream prompt can
+                    // run for hours of background waits, and failures from
+                    // earlier, already-recovered turns must not exhaust it.
                     Ok(Some(BackgroundWait::Completed(completion))) => {
                         background_completion = Some(vec![ContentBlock::from(completion)]);
                         continuing = false;
-                        attempt -= 1;
+                        attempt = 0;
                         continue;
                     }
                     Ok(Some(BackgroundWait::Steered(prompt))) => {
                         background_completion = Some(prompt);
                         continuing = false;
-                        attempt -= 1;
+                        attempt = 0;
                         continue;
                     }
                     Ok(Some(BackgroundWait::Cancelled)) => {
@@ -5504,8 +5792,21 @@ async fn send_prompt_with_failover(
                         .unwrap_or(false);
                 let class = classify_failure(&err);
                 let already_unavailable = unavailability.is_some();
+                let local_failure = crate::limits::is_local_adapter_failure(
+                    &crate::limits::error_text(&err).to_lowercase(),
+                );
+                let notice_reason = match (&unavailability, &class) {
+                    (Some((kind, _)), _) => *kind,
+                    _ if auth_rejected => crate::notice::Reason::SignIn,
+                    (None, FailureClass::RateLimited { .. }) => crate::notice::Reason::AccountLimit,
+                    (None, FailureClass::ModelAtCapacity) => crate::notice::Reason::Capacity,
+                    (None, FailureClass::ContextOverflow) => crate::notice::Reason::ContextFull,
+                    (None, _) => crate::notice::Reason::Outage,
+                };
                 let human = unavailability
+                    .map(|(_, reason)| reason)
                     .unwrap_or_else(|| apply_failure(&shared, &candidate, &err, &class));
+                let mark = notice_mark(&shared, &router_sid);
 
                 // A credential rejection is not the per-candidate `Other` that
                 // must not fail over: it takes out the whole seat, and every
@@ -5542,6 +5843,7 @@ async fn send_prompt_with_failover(
                             format!("router-acp · {candidate} {symptom} — {human}{detail}"),
                         );
                     }
+                    queue_held_text(&shared, &router_sid);
                     // The turn ends in error, so no model chunk will carry the
                     // queued notice — flush it as its own chunk now.
                     flush_pending_disclosure(&shared, &router_sid);
@@ -5566,6 +5868,7 @@ async fn send_prompt_with_failover(
                     &router_sid,
                     format!("router-acp · {candidate} {symptom} — {human}{tail}"),
                 );
+                queue_held_text(&shared, &router_sid);
 
                 // The replacement looks up the saved conversation itself;
                 // never push the failed session's transcript into its prompt.
@@ -5630,14 +5933,20 @@ async fn send_prompt_with_failover(
                 if let Some(key) = old_key {
                     close_downstream_session(&shared, &key, &down_sid);
                 }
-                // An outage on a human pick first re-pins that pick, which
-                // respawns its adapter. Only when it cannot route does the
-                // ordinary failover below choose a replacement.
+                // A dead adapter on a human pick first re-pins that pick, which
+                // respawns its adapter. Only when it cannot route, or when it
+                // already failed again after one recovery in this prompt, does
+                // the ordinary failover below choose a replacement. A provider
+                // outage has cordoned the model on every account, so it always
+                // takes the ordinary failover.
                 if matches!(class, FailureClass::Outage)
+                    && (already_unavailable || local_failure)
+                    && !pick_recovered
                     && shared
                         .with_session(&router_sid, |s| human_pick(s, &candidate))
                         .unwrap_or(false)
                 {
+                    pick_recovered = true;
                     match pin_session(
                         &shared,
                         &router_sid,
@@ -5649,7 +5958,18 @@ async fn send_prompt_with_failover(
                     )
                     .await
                     {
-                        Ok(PinOutcome::Pinned) => continue,
+                        Ok(PinOutcome::Pinned) => {
+                            announce_switch(
+                                &shared,
+                                &router_sid,
+                                mark,
+                                "failover",
+                                notice_reason,
+                                &candidate,
+                                Some("lookup"),
+                            );
+                            continue;
+                        }
                         Ok(PinOutcome::Cancelled) => {
                             return responder.respond(PromptResponse::new(StopReason::Cancelled));
                         }
@@ -5667,7 +5987,18 @@ async fn send_prompt_with_failover(
                 )
                 .await
                 {
-                    Ok(PinOutcome::Pinned) => continue,
+                    Ok(PinOutcome::Pinned) => {
+                        announce_switch(
+                            &shared,
+                            &router_sid,
+                            mark,
+                            "failover",
+                            notice_reason,
+                            &candidate,
+                            Some("lookup"),
+                        );
+                        continue;
+                    }
                     Ok(PinOutcome::Cancelled) => {
                         return responder.respond(PromptResponse::new(StopReason::Cancelled));
                     }
@@ -5677,6 +6008,50 @@ async fn send_prompt_with_failover(
                             &router_sid,
                             format!("router-acp · no fallback candidate available — {pin_err}"),
                         );
+                        // Nothing else can serve. Keep the prompt open and
+                        // retry the old model when its cordon ends.
+                        if let Some(until) = retry_wait_until(&shared, &candidate) {
+                            if !wait_for_retry(
+                                &shared,
+                                &router_sid,
+                                responder.cancellation(),
+                                mark,
+                                notice_reason,
+                                &candidate,
+                                until,
+                            )
+                            .await
+                            {
+                                return responder
+                                    .respond(PromptResponse::new(StopReason::Cancelled));
+                            }
+                            match pin_session(
+                                &shared,
+                                &router_sid,
+                                &req.prompt,
+                                &responder.cancellation(),
+                                None,
+                                true,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(PinOutcome::Pinned) => continue,
+                                Ok(PinOutcome::Cancelled) => {
+                                    return responder
+                                        .respond(PromptResponse::new(StopReason::Cancelled));
+                                }
+                                Err(retry_err) => {
+                                    notify_user(
+                                        &shared,
+                                        &router_sid,
+                                        format!("router-acp · retry failed — {retry_err}"),
+                                    );
+                                    flush_pending_disclosure(&shared, &router_sid);
+                                    return responder.respond_with_error(retry_err);
+                                }
+                            }
+                        }
                         flush_pending_disclosure(&shared, &router_sid);
                         return responder.respond_with_error(pin_err);
                     }
@@ -5687,6 +6062,196 @@ async fn send_prompt_with_failover(
     responder.respond_with_error(
         AcpError::internal_error().data("all failover attempts exhausted for this prompt"),
     )
+}
+
+/// Label the lines queued since `mark` as one switch/failover notice from
+/// `from` to the session's current pin.
+fn announce_switch(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    mark: usize,
+    kind: &'static str,
+    reason: crate::notice::Reason,
+    from: &CandidateId,
+    handoff: Option<&'static str>,
+) {
+    let Some(to) = shared
+        .with_session(router_sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+        .flatten()
+    else {
+        return;
+    };
+    let cfg = shared.runtime_config();
+    let label = reason.label(&crate::notice::display(&cfg, from));
+    let target = crate::notice::display(&cfg, &to);
+    let headline = if &to == from {
+        format!("{label}: retrying {target}")
+    } else {
+        format!("{label}: switching to {target}")
+    };
+    queue_router_notice(
+        shared,
+        router_sid,
+        mark,
+        crate::notice::Notice {
+            kind,
+            reason,
+            label,
+            headline,
+            from: Some(from.to_string()),
+            to: Some(to.to_string()),
+            handoff,
+            retry_at: None,
+            detail: Vec::new(),
+        },
+    );
+}
+
+/// When `candidate` becomes routeable again, if a cordon with a known end is
+/// all that keeps it out and that end is within `failover.max_wait_secs`.
+fn retry_wait_until(
+    shared: &Arc<Shared>,
+    candidate: &CandidateId,
+) -> Option<std::time::SystemTime> {
+    let now = std::time::SystemTime::now();
+    let lineage = shared.runtime_config().lineage_of(&candidate.agent);
+    let until = {
+        let mut headroom = shared.headroom.lock().unwrap();
+        [
+            headroom
+                .model_outage(&lineage, &candidate.model)
+                .map(|c| c.resets_at),
+            headroom
+                .usage_cordon(candidate)
+                .filter(|c| !c.soft)
+                .map(|c| c.resets_at),
+            headroom
+                .cordon_active(&candidate.agent)
+                .map(|(remaining, _)| now + remaining),
+        ]
+        .into_iter()
+        .flatten()
+        .max()?
+    };
+    let wait = until.duration_since(now).unwrap_or_default();
+    (wait <= std::time::Duration::from_secs(shared.cfg.failover.max_wait_secs)).then_some(until)
+}
+
+/// Announce a cordon wait, keep the prompt open until `until`, and announce
+/// the retry. Returns false when the client cancelled during the wait.
+async fn wait_for_retry(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    cancellation: RequestCancellation,
+    mark: usize,
+    reason: crate::notice::Reason,
+    candidate: &CandidateId,
+    until: std::time::SystemTime,
+) -> bool {
+    let cfg = shared.runtime_config();
+    let model = crate::notice::display(&cfg, candidate);
+    let label = reason.label(&model);
+    let wait = until
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    let retry_at = crate::usage::epoch_to_rfc3339(
+        until
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    queue_router_notice(
+        shared,
+        router_sid,
+        mark,
+        crate::notice::Notice {
+            kind: "retry_wait",
+            reason,
+            headline: format!(
+                "{label}: no other model can serve; retrying {model} in {} (at {retry_at})",
+                crate::limits::humanize(wait)
+            ),
+            label: label.clone(),
+            from: Some(candidate.to_string()),
+            to: Some(candidate.to_string()),
+            handoff: None,
+            retry_at: Some(retry_at),
+            detail: Vec::new(),
+        },
+    );
+    flush_pending_disclosure(shared, router_sid);
+    tracing::info!(session = router_sid, %candidate, wait_secs = wait.as_secs(), "no fallback; waiting for cordon to end");
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tick.tick() => {
+                if cancellation.is_cancelled()
+                    || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    let mark = notice_mark(shared, router_sid);
+    queue_router_notice(
+        shared,
+        router_sid,
+        mark,
+        crate::notice::Notice {
+            kind: "retry",
+            reason,
+            headline: format!("{label}: retrying {model} now"),
+            label,
+            from: Some(candidate.to_string()),
+            to: Some(candidate.to_string()),
+            handoff: None,
+            retry_at: None,
+            detail: Vec::new(),
+        },
+    );
+    true
+}
+
+/// Disclose a per-request fallback: the proxy rewrote a request onto
+/// `alternate`, the provider refused it, and the request was retried on the
+/// session's own pin.
+pub(crate) fn queue_proxy_fallback(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    alternate: &CandidateId,
+    pin: &CandidateId,
+    outage: bool,
+    detail: &str,
+) {
+    let cfg = shared.runtime_config();
+    let model = crate::notice::display(&cfg, alternate);
+    let reason = if outage {
+        crate::notice::Reason::Outage
+    } else {
+        crate::notice::Reason::Rejected
+    };
+    let label = reason.label(&model);
+    let mark = notice_mark(shared, router_sid);
+    notify_user(shared, router_sid, format!("router-acp · {detail}"));
+    queue_router_notice(
+        shared,
+        router_sid,
+        mark,
+        crate::notice::Notice {
+            kind: "retry",
+            reason,
+            headline: format!("{label}: retried on {}", crate::notice::display(&cfg, pin)),
+            label,
+            from: Some(alternate.to_string()),
+            to: Some(pin.to_string()),
+            handoff: None,
+            retry_at: None,
+            detail: Vec::new(),
+        },
+    );
 }
 
 /// True when a human chose `candidate` for this session.
@@ -6886,8 +7451,10 @@ async fn switch_pin(
         .with_session(router_sid, |session| session.task_class)
         .flatten()
         .unwrap_or(TaskClass::CodingGeneral);
+    // A soft (reserve) cordon still lets the outgoing model write the summary:
+    // the account has headroom, the router is only saving it.
     let live_conn = shared
-        .candidate_view(&old_candidate, &RequiredCaps::default(), class)
+        .candidate_view_serving(&old_candidate, class)
         .and_then(|_| shared.route_for(&old_process_key, &old_down_sid))
         .and_then(|_| shared.target_conn(&old_process_key));
     let summary = if let Some(conn) = &live_conn {
@@ -8848,15 +9415,15 @@ async fn dispatch_prompt(
                             handoff: HandoffStyle::Full,
                             user_pick: false,
                         });
+                        s.pending_switch_notice = Some(if c.soft {
+                            crate::notice::Reason::Reserve
+                        } else {
+                            crate::notice::Reason::AccountLimit
+                        });
                         // Not an elevation: this is escaping a dead seat, not
                         // climbing the capability ladder.
                         s.quiet_turns = 0;
                     });
-                    notify_user(
-                        &shared,
-                        &router_sid,
-                        format!("router-acp · {reason}; next turn on {target}"),
-                    );
                     tracing::info!(
                         session = router_sid,
                         from = %cur,

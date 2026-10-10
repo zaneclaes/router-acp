@@ -21,6 +21,12 @@ pub struct UsageCordon {
     pub resets_at: SystemTime,
     /// The provider's reset timestamp, verbatim (RFC 3339), for advertising.
     pub resets_at_rfc3339: String,
+    /// A reserve-capacity cordon: the seat crossed its configured reserve but
+    /// still has plan or overage headroom. A soft cordon moves new turns off
+    /// the seat at the next turn boundary, with a handoff summary from the
+    /// outgoing model, and never interrupts a running turn. Every other cordon
+    /// (true exhaustion, a member limit, a provider error) is hard.
+    pub soft: bool,
 }
 
 /// Graded seat availability for one candidate — the input to dynamic
@@ -174,6 +180,9 @@ pub struct HeadroomTracker {
     /// agent's other models still have theirs). Held apart from
     /// `usage_cordons` so the poller's wholesale refresh cannot erase them.
     candidate_cordons: HashMap<CandidateId, UsageCordon>,
+    /// Provider outages, per `(lineage, model)`: the model is down on every
+    /// account of that provider until `resets_at`.
+    model_outages: HashMap<(String, String), UsageCordon>,
     /// Seat availability from the router's own usage poller. Recomputed
     /// wholesale each poll cycle.
     availability_poll: HashMap<CandidateId, SeatAvailability>,
@@ -199,6 +208,7 @@ impl HeadroomTracker {
             cordons: HashMap::new(),
             usage_cordons: HashMap::new(),
             candidate_cordons: HashMap::new(),
+            model_outages: HashMap::new(),
             availability_poll: HashMap::new(),
             availability_hints: HashMap::new(),
             overage_permissions: HashMap::new(),
@@ -257,8 +267,48 @@ impl HeadroomTracker {
                 reason: reason.into(),
                 resets_at,
                 resets_at_rfc3339: crate::usage::epoch_to_rfc3339(epoch),
+                soft: false,
             },
         );
+    }
+
+    /// Cordon `model` on every account of `lineage` until `resets_at`. A
+    /// later outage only ever extends the cordon.
+    pub fn cordon_model_outage(
+        &mut self,
+        lineage: &str,
+        model: &str,
+        reason: impl Into<String>,
+        resets_at: SystemTime,
+    ) {
+        let key = (lineage.to_string(), model.to_string());
+        if self
+            .model_outages
+            .get(&key)
+            .is_some_and(|c| c.resets_at >= resets_at)
+        {
+            return;
+        }
+        let epoch = resets_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.model_outages.insert(
+            key,
+            UsageCordon {
+                reason: reason.into(),
+                resets_at,
+                resets_at_rfc3339: crate::usage::epoch_to_rfc3339(epoch),
+                soft: false,
+            },
+        );
+    }
+
+    /// The active provider outage for `model` under `lineage`, if any.
+    pub fn model_outage(&self, lineage: &str, model: &str) -> Option<&UsageCordon> {
+        self.model_outages
+            .get(&(lineage.to_string(), model.to_string()))
+            .filter(|c| c.resets_at > SystemTime::now())
     }
 
     /// The active usage cordon for a candidate, if any (i.e. `now < resets_at`).
@@ -268,11 +318,15 @@ impl HeadroomTracker {
 
     /// The polled and reactive cordons are independent sources; whichever
     /// resets later governs, so a candidate hit by both stays out until the
-    /// last one clears.
+    /// last one clears. A hard cordon always outranks a soft one: the seat
+    /// cannot serve, whatever the reserve says.
     pub fn usage_cordon_at(&self, id: &CandidateId, now: SystemTime) -> Option<&UsageCordon> {
         let polled = self.usage_cordons.get(id).filter(|c| c.resets_at > now);
         let reactive = self.candidate_cordons.get(id).filter(|c| c.resets_at > now);
         match (polled, reactive) {
+            (Some(polled), Some(reactive)) if polled.soft != reactive.soft => {
+                Some(if polled.soft { reactive } else { polled })
+            }
             (Some(polled), Some(reactive)) => Some(if reactive.resets_at > polled.resets_at {
                 reactive
             } else {

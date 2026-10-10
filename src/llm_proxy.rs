@@ -756,6 +756,13 @@ async fn proxy_request(
         let retry_alternate = decision.as_ref().is_some_and(|decision| decision.rewrite);
         if retry_alternate {
             let failed_status = upstream.status();
+            let alternate_tried =
+                attributed
+                    .as_ref()
+                    .zip(decision.as_ref())
+                    .map(|(active, decision)| {
+                        CandidateId::new(&active.candidate.agent, &decision.selected_model)
+                    });
             // 404/400 on a rewritten request means this target cannot serve it —
             // an api model id the provider doesn't recognise, or a parameter it
             // rejects. Remember it so the next request routes around it instead of
@@ -813,6 +820,29 @@ async fn proxy_request(
                             .as_ref()
                             .map(|decision| decision.model.clone())
                             .unwrap_or_else(|| "<unknown>".to_string());
+                        // A 5xx says the alternate model is down: cordon it on
+                        // every account for the outage period. A 400/404 is a
+                        // durable rejection, recorded above for the session.
+                        let alternate = decision.as_ref().map(|decision| {
+                            CandidateId::new(&active.candidate.agent, &decision.selected_model)
+                        });
+                        let outage = failed_status.is_server_error();
+                        if outage && let Some(alternate) = &alternate {
+                            state.shared.cordon_model_outage(
+                                alternate,
+                                &format!("provider outage (HTTP {failed_status})"),
+                            );
+                        }
+                        let afterwards = if outage {
+                            format!(
+                                "model cordoned for {}",
+                                crate::limits::humanize(std::time::Duration::from_secs(
+                                    state.shared.cfg.failover.outage_cordon_secs
+                                ))
+                            )
+                        } else {
+                            "not retried again this session".to_string()
+                        };
                         decision = Some(RequestDecision {
                             model: parsed
                                 .as_ref()
@@ -827,7 +857,7 @@ async fn proxy_request(
                             honors_pin: false,
                             reason: format!(
                                 "alternate model `{attempted}` returned HTTP {failed_status}; \
-                                 retried unchanged on {} (not retried again this session)",
+                                 retried unchanged on {} ({afterwards})",
                                 active.candidate
                             ),
                             event: "proxy-fallback".to_string(),
@@ -845,6 +875,29 @@ async fn proxy_request(
                                 &active.candidate,
                             ),
                         });
+                    }
+                    if let (Some(active), Some(fallback)) = (attributed.as_ref(), decision.as_ref())
+                        && let Some(alternate) = alternate_tried.as_ref()
+                    {
+                        let first_time = state
+                            .runtime
+                            .policy
+                            .lock()
+                            .unwrap()
+                            .entry(active.state_sid.clone())
+                            .or_default()
+                            .disclosed_events
+                            .insert(format!("proxy-fallback:{alternate}"));
+                        if first_time {
+                            crate::session::queue_proxy_fallback(
+                                &state.shared,
+                                &active.parent_router_sid,
+                                alternate,
+                                &active.candidate,
+                                failed_status.is_server_error(),
+                                &fallback.reason,
+                            );
+                        }
                     }
                     upstream = response;
                 }
@@ -1239,26 +1292,8 @@ fn start_request_record(
     // rejection is also recorded so the model is not retried, but the dedup
     // keeps a pre-fix binary or a transient rejection from flooding the
     // transcript regardless.
-    if event == "proxy-fallback" {
-        let first_time = state
-            .runtime
-            .policy
-            .lock()
-            .unwrap()
-            .entry(active.state_sid.clone())
-            .or_default()
-            .disclosed_events
-            .insert(format!("{event}:{model_id}"));
-        if first_time {
-            state
-                .shared
-                .with_session(&active.parent_router_sid, |session| {
-                    session
-                        .pending_disclosure
-                        .push(format!("router-acp · {reason}"));
-                });
-        }
-    }
+    // Disclosed once per (alternate, session) where the fallback happens; see
+    // `session::queue_proxy_fallback`.
     Some(CompletionContext {
         request_id: request_id.to_string(),
         response_status: active.response_status.clone(),
@@ -1723,6 +1758,7 @@ fn select_request_model(
         .unwrap_or((false, None));
     let version = version.as_deref();
     let candidates = shared.routeable_candidates();
+    let lineage = shared.runtime_config().lineage_of(&active.candidate.agent);
     let mut headroom = shared.headroom.lock().unwrap();
     let mut models: Vec<ModelOption> = candidates
         .into_iter()
@@ -1736,6 +1772,9 @@ fn select_request_model(
             !headroom.is_quarantined(&candidate.id)
                 && headroom.cordon_active(&candidate.id.agent).is_none()
                 && headroom.usage_cordon(&candidate.id).is_none()
+                && headroom
+                    .model_outage(&lineage, &candidate.id.model)
+                    .is_none()
                 && !headroom.seat_exhausted(&candidate.id)
         })
         .map(|candidate| {

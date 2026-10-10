@@ -559,6 +559,9 @@ pub fn anthropic_cordons_with_reserve(
                 )
             });
         let resets_str = reset.as_str();
+        // Only the reserve put this window over the line: the plan (or paid
+        // overage) still has room, so moving off is a saving, not a wall.
+        let soft = reserved > 0.0 && (percent < 100.0 || overage);
 
         let scope_model = lim.get("scope").and_then(|s| s.get("model")).and_then(|m| {
             m.get("display_name")
@@ -579,7 +582,7 @@ pub fn anthropic_cordons_with_reserve(
                 }
                 for (id, display) in candidates {
                     if model_matches(model, id, display) {
-                        upsert_latest(&mut out, id, &reason, resets_at, resets_str);
+                        upsert_latest(&mut out, id, &reason, resets_at, resets_str, soft);
                     }
                 }
             }
@@ -596,7 +599,7 @@ pub fn anthropic_cordons_with_reserve(
                     reason.push_str("; provider reset unknown, temporary cordon");
                 }
                 for (id, _) in candidates {
-                    upsert_latest(&mut out, id, &reason, resets_at, resets_str);
+                    upsert_latest(&mut out, id, &reason, resets_at, resets_str, soft);
                 }
             }
         }
@@ -651,15 +654,23 @@ fn model_matches(api_name: &str, id: &CandidateId, display: &str) -> bool {
 }
 
 /// Insert, or replace only if the new cordon resets later — a candidate hit by
-/// several caps stays cordoned until the last one clears.
+/// several caps stays cordoned until the last one clears. A hard cap always
+/// replaces a soft (reserve-only) one; a soft one never replaces a hard one.
 fn upsert_latest(
     map: &mut HashMap<CandidateId, UsageCordon>,
     id: &CandidateId,
     reason: &str,
     resets_at: SystemTime,
     resets_at_rfc3339: &str,
+    soft: bool,
 ) {
-    let replace = map.get(id).is_none_or(|c| resets_at > c.resets_at);
+    let replace = map.get(id).is_none_or(|c| {
+        if c.soft != soft {
+            c.soft
+        } else {
+            resets_at > c.resets_at
+        }
+    });
     if replace {
         map.insert(
             id.clone(),
@@ -667,6 +678,7 @@ fn upsert_latest(
                 reason: reason.to_string(),
                 resets_at,
                 resets_at_rfc3339: resets_at_rfc3339.to_string(),
+                soft,
             },
         );
     }
@@ -1628,6 +1640,7 @@ pub fn codex_cordons_with_reserve(
                         "Codex member usage limit reached",
                         resets_at,
                         &rfc,
+                        false,
                     );
                 }
             }
@@ -1669,6 +1682,7 @@ pub fn codex_cordons_with_reserve(
             if reported.is_none() {
                 reason.push_str("; provider reset unknown, temporary cordon");
             }
+            let soft = reserved > 0.0 && (used < 100.0 || overage);
             let rfc = epoch_to_rfc3339(
                 resets_at
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -1676,7 +1690,7 @@ pub fn codex_cordons_with_reserve(
                     .as_secs(),
             );
             for (id, _) in candidates {
-                upsert_latest(&mut out, id, &reason, resets_at, &rfc);
+                upsert_latest(&mut out, id, &reason, resets_at, &rfc, soft);
             }
         }
     }
@@ -1828,6 +1842,34 @@ agents:
         );
         payload["limits"][0]["resets_at"] = json!("2000-01-01T00:00:00Z");
         assert!(anthropic_cordons_with_reserve(&payload, &cands(), &reserve, now).is_empty());
+    }
+
+    #[test]
+    fn a_reserve_breach_with_headroom_is_soft_and_true_exhaustion_is_hard() {
+        let reserve = crate::config::ReserveCapacityConfig {
+            weekly: 10.0,
+            session: 0.0,
+        };
+        let now = SystemTime::now();
+        let weekly = |percent: f64| {
+            json!({"limits": [{"kind": "weekly", "percent": percent,
+                "resets_at": "2099-01-01T00:00:00Z"}]})
+        };
+        let soft = anthropic_cordons_with_reserve(&weekly(95.0), &cands(), &reserve, now);
+        assert!(soft.values().all(|c| c.soft), "plan headroom left: soft");
+        let hard = anthropic_cordons_with_reserve(&weekly(100.0), &cands(), &reserve, now);
+        assert!(hard.values().all(|c| !c.soft), "plan exhausted: hard");
+        let mut both = weekly(95.0);
+        both["limits"].as_array_mut().unwrap().push(
+            json!({"kind": "weekly_scoped", "percent": 100,
+                "resets_at": "2098-01-01T00:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}}}),
+        );
+        let merged = anthropic_cordons_with_reserve(&both, &cands(), &reserve, now);
+        assert!(
+            !merged[&fable()].soft,
+            "a hard cap outranks a later soft one"
+        );
     }
 
     #[test]

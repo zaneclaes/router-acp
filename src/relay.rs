@@ -122,6 +122,32 @@ pub fn with_router_meta(msg: &UntypedMessage, details: Value) -> Result<UntypedM
     UntypedMessage::new(msg.method(), params)
 }
 
+/// Return a copy of `msg` with `notices` added under
+/// `_meta.router_acp.notices`, keeping any routing details already there.
+pub fn with_router_notices(
+    msg: &UntypedMessage,
+    notices: &[Value],
+) -> Result<UntypedMessage, Error> {
+    if notices.is_empty() {
+        return UntypedMessage::new(msg.method(), msg.params().clone());
+    }
+    let mut params = msg.params().clone();
+    if let Value::Object(map) = &mut params {
+        let meta = map
+            .entry("_meta".to_string())
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Value::Object(meta_map) = meta {
+            let router = meta_map
+                .entry("router_acp".to_string())
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Value::Object(router_map) = router {
+                router_map.insert("notices".to_string(), Value::Array(notices.to_vec()));
+            }
+        }
+    }
+    UntypedMessage::new(msg.method(), params)
+}
+
 /// True when `msg` is a tool-call frame (`tool_call` or its later updates).
 /// These are the frames a client attributes to a model, so they carry the
 /// per-request routing metadata.

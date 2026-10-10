@@ -89,6 +89,29 @@ pub fn on_session_load(
     let mut raw_response = false;
     let mut last_raw_tool = None;
     for entry in entries {
+        if entry.kind == "router_notice" {
+            let mut notif = SessionNotification::new(
+                sid.clone(),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                    entry.summary,
+                ))),
+            );
+            if let Some(notices) = entry
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("notices"))
+                .filter(|n| n.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                let mut meta = serde_json::Map::new();
+                meta.insert(
+                    "router_acp".into(),
+                    serde_json::json!({ "notices": notices }),
+                );
+                notif = notif.meta(meta);
+            }
+            cx.send_notification(notif)?;
+            continue;
+        }
         let updates = match entry.kind.as_str() {
             "user_prompt" | "user_steer" => {
                 if entry.kind == "user_prompt" {

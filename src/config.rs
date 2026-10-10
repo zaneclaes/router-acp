@@ -762,6 +762,25 @@ pub struct FailoverConfig {
     /// How long a model reported at capacity stays cordoned.
     #[serde(default = "default_capacity_cordon_secs")]
     pub capacity_cordon_secs: u64,
+    /// How long a provider outage cordons the failed model across every
+    /// account of its lineage. The same model on another account is down too,
+    /// so failover moves to a different model until the cordon ends. 0 keeps
+    /// only the per-candidate quarantine.
+    #[serde(default = "default_outage_cordon_secs")]
+    pub outage_cordon_secs: u64,
+    /// When no other model can serve a failed turn, the prompt stays open and
+    /// the router retries the old model once its cordon ends — if that is
+    /// within this many seconds. A longer wait fails the turn as before.
+    #[serde(default = "default_max_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+fn default_outage_cordon_secs() -> u64 {
+    300
+}
+
+fn default_max_wait_secs() -> u64 {
+    1800
 }
 
 fn default_respawn_cooldown_secs() -> u64 {
@@ -784,6 +803,8 @@ impl Default for FailoverConfig {
             max_attempts: default_failover_attempts(),
             on_model_capacity: true,
             capacity_cordon_secs: default_capacity_cordon_secs(),
+            outage_cordon_secs: default_outage_cordon_secs(),
+            max_wait_secs: default_max_wait_secs(),
         }
     }
 }
@@ -2185,6 +2206,16 @@ impl Config {
     }
 
     /// The declared model entry for a candidate, if it exists.
+    /// The model-company lineage of an agent: its declared `lineage`, else
+    /// its name. Every account of one provider shares it.
+    pub fn lineage_of(&self, agent: &str) -> String {
+        self.agents
+            .iter()
+            .find(|a| a.name == agent)
+            .and_then(|a| a.lineage.clone())
+            .unwrap_or_else(|| agent.to_string())
+    }
+
     pub fn model_config(&self, id: &CandidateId) -> Option<&ModelConfig> {
         self.agents
             .iter()
