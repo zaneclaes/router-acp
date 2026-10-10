@@ -397,14 +397,16 @@ default first turn):
    agent), then ask one structured question. The handoff question is
    forbidden until the session is ticket-bound. Offer exactly one pair —
    never both Proceed and Create EPIC in the same question:
-   - Default — anything that is not a single PR the planner is highly
-     confident in: `Create EPIC` and `Refine the plan`. The planning
-     session becomes the epic parent; children run in separate
-     ticket-bound sessions. Coordinating stays in Planning; there is no
-     phase switch.
-   - Only for one PR the planner is highly confident in:
-     `Proceed with implementation` and `Refine the plan`.
-   The choice is the planner's and defaults to Create EPIC; the router's
+   - Default — the work fits in one PR to the session's repository, even
+     when it also needs PRs in other repositories: `Proceed with
+     implementation` and `Refine the plan`.
+   - Only when the plan needs two or more PRs to that repository:
+     `Create EPIC` and `Refine the plan`. The planning session becomes the
+     epic parent; children run in separate ticket-bound sessions, each
+     child exactly one PR. The option preview lists the children, one
+     numbered line each ending `— 1 PR`. Coordinating stays in Planning;
+     there is no phase switch.
+   One PR is one ticket, never an epic. The choice defaults to Proceed; the router's
    complexity and confidence numbers are advisory, never a gate. The
    former coordinate label `Spawn sessions and coordinate` is no longer
    offered; hosts keep accepting it as a legacy synonym.

@@ -233,16 +233,20 @@ pub fn planner_plan_protocol() -> String {
          ticket-bound, ask one structured question. Offer exactly one of \
          these pairs — never both \"{HANDOFF_PROCEED}\" and \
          \"{HANDOFF_CREATE_EPIC}\" in the same question:\n\
-         - Default — anything that is not a single PR you are highly \
-         confident in: \"{HANDOFF_CREATE_EPIC}\" and \"{HANDOFF_REFINE}\". \
-         This session becomes the epic parent and the work runs in separate \
-         ticket-bound child sessions.\n\
-         - Only when the plan is one PR you are highly confident in: \
-         \"{HANDOFF_PROCEED}\" and \"{HANDOFF_REFINE}\". This session does \
-         the work.\n\
-         The choice is yours and defaults to \"{HANDOFF_CREATE_EPIC}\". Any \
-         complexity or confidence estimate from the router is advisory, not \
-         a gate.\n\
+         - Default — the work fits in ONE PR to this session's \
+         repository, even when it also needs PRs in other repositories: \"{HANDOFF_PROCEED}\" and \
+         \"{HANDOFF_REFINE}\". This session does the work.\n\
+         - Only when the plan needs two or more PRs to this session's \
+         repository: \
+         \"{HANDOFF_CREATE_EPIC}\" and \"{HANDOFF_REFINE}\". This session \
+         becomes the epic parent and the work runs in separate ticket-bound \
+         child sessions. Each child ticket is exactly one PR to that repository. Put \
+         the child breakdown in the \"{HANDOFF_CREATE_EPIC}\" option's \
+         preview as a numbered list, one line per child, each ending \
+         \"— 1 PR\".\n\
+         One PR is one ticket, never an epic. The choice defaults \
+         to \"{HANDOFF_PROCEED}\". Any complexity or confidence estimate \
+         from the router is advisory, not a gate.\n\
          5. Do not ask for implementation approval against a plan you have \
          not presented, or against a session with no Linear ticket.\n\
          \n\
@@ -606,8 +610,11 @@ mod tests {
             !protocol.contains(HANDOFF_COORDINATE),
             "legacy coordinate label must not be offered: {protocol}"
         );
-        assert!(protocol.contains("defaults to \"Create EPIC\""));
-        assert!(protocol.contains("one PR you are highly confident in"));
+        assert!(protocol.contains("defaults to \"Proceed with implementation\""));
+        assert!(protocol.contains("ONE PR to this session's"));
+        assert!(protocol.contains("two or more PRs"));
+        assert!(protocol.contains("exactly one PR to that repository"));
+        assert!(protocol.contains("One PR is one ticket, never an epic"));
         assert!(protocol.contains("advisory, not a gate"));
         assert!(protocol.contains("separate ticket-bound child sessions"));
         assert!(protocol.contains("without a phase switch"));
