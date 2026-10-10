@@ -908,6 +908,26 @@ async fn run_prompt(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         std::process::exit(1);
     }
+    if std::env::var("MOCK_PROXY_REPLY").as_deref() == Ok("1") {
+        let base = std::env::var("OPENAI_BASE_URL").unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{base}/responses"))
+            .json(&json!({"model": model, "session_id": session_id, "input": text}))
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_server_error() {
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            let _ = cx.send_notification(chunk(
+                &session_id,
+                format!("unexpected status {status}: {body}, url: {base}/responses, cf-ray: synthetic-IAD\n\n"),
+            ));
+            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        }
+        // Fully consume the response before the ACP completion, as an adapter does.
+        let _ = response.bytes().await.unwrap();
+    }
     finish_prompt(&text, model, session_id, reply, &cx, responder)
 }
 

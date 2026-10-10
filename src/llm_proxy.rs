@@ -7,7 +7,7 @@
 //! prompt); ambiguous traffic passes through unchanged.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,7 @@ struct ProxyTarget {
 #[derive(Debug, Clone)]
 struct ActiveTurn {
     registration_id: u64,
+    response_status: Arc<AtomicU16>,
     parent_router_sid: String,
     state_sid: String,
     downstream_sid: String,
@@ -297,6 +298,7 @@ impl LlmProxyRuntime {
                 runtime: None,
                 process_key,
                 registration_id: 0,
+                response_status: None,
             };
         }
         // A main-session repin can change providers before the new adapter
@@ -323,8 +325,10 @@ impl LlmProxyRuntime {
             }
         }
         let registration_id = self.next_registration.fetch_add(1, Ordering::Relaxed);
+        let response_status = Arc::new(AtomicU16::new(0));
         let active = ActiveTurn {
             registration_id,
+            response_status: response_status.clone(),
             parent_router_sid,
             state_sid,
             downstream_sid,
@@ -342,6 +346,7 @@ impl LlmProxyRuntime {
             runtime: Some(self.clone()),
             process_key,
             registration_id,
+            response_status: Some(response_status),
         }
     }
 
@@ -423,6 +428,16 @@ pub struct LlmTurnGuard {
     runtime: Option<Arc<LlmProxyRuntime>>,
     process_key: ProcessKey,
     registration_id: u64,
+    response_status: Option<Arc<AtomicU16>>,
+}
+
+impl LlmTurnGuard {
+    pub fn last_response_status(&self) -> Option<u16> {
+        self.response_status
+            .as_ref()
+            .map(|status| status.load(Ordering::Acquire))
+            .filter(|status| *status != 0)
+    }
 }
 
 /// Codex ChatGPT OAuth does not honor `OPENAI_BASE_URL` on its preferred
@@ -1246,6 +1261,7 @@ fn start_request_record(
     }
     Some(CompletionContext {
         request_id: request_id.to_string(),
+        response_status: active.response_status.clone(),
         state_sid: active.state_sid.clone(),
         model: model_id,
         protocol: target.config.protocol,
@@ -2471,6 +2487,7 @@ fn protocol_name(protocol: LlmWireProtocol) -> &'static str {
 
 struct CompletionContext {
     request_id: String,
+    response_status: Arc<AtomicU16>,
     state_sid: String,
     model: CandidateId,
     protocol: LlmWireProtocol,
@@ -2563,6 +2580,7 @@ fn complete_request(
     captured: &[u8],
     error: Option<String>,
 ) {
+    context.response_status.store(status, Ordering::Release);
     let usage = parse_response_usage(captured, context.protocol);
     let cost = request_cost(
         shared,
@@ -3286,6 +3304,7 @@ agents:
     fn active(candidate: &str) -> ActiveTurn {
         ActiveTurn {
             registration_id: 1,
+            response_status: Arc::new(AtomicU16::new(0)),
             parent_router_sid: "r1".to_string(),
             state_sid: "r1".to_string(),
             downstream_sid: "d1".to_string(),
@@ -3933,6 +3952,9 @@ agents:
             shared.llm_proxy.last_attribution("r1").unwrap().0,
             "claude/sonnet"
         );
+        let old_response = first.response_status.as_ref().unwrap().clone();
+        old_response.store(503, Ordering::Release);
+        assert_eq!(first.last_response_status(), Some(503));
         drop(first);
 
         let second = shared.llm_proxy.begin_turn(
@@ -3952,6 +3974,10 @@ agents:
             shared.llm_proxy.current_model("r1").as_deref(),
             Some("gpt-5.6-sol")
         );
+        assert_eq!(second.last_response_status(), None);
+        // A late completion from the old turn cannot poison the new turn.
+        old_response.store(502, Ordering::Release);
+        assert_eq!(second.last_response_status(), None);
         drop(second);
     }
 

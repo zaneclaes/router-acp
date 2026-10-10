@@ -233,6 +233,8 @@ pub struct RouterSession {
     pub turn_saw_output: bool,
     /// Accumulated agent text this turn, for token estimation + logging.
     pub turn_output: String,
+    /// Start of the last nonempty assistant chunk, before transcript framing.
+    pub turn_last_text_start: usize,
     pub delegates: Vec<DelegateHandle>,
     // ---- mid-session model switching / auto-upgrade ----
     /// Score-table quality of the current pin for `task_class` — the base of
@@ -415,6 +417,7 @@ impl RouterSession {
             run_label: None,
             turn_saw_output: false,
             turn_output: String::new(),
+            turn_last_text_start: 0,
             delegates: Vec::new(),
             pinned_quality: 0.0,
             task_class: None,
@@ -483,6 +486,7 @@ impl RouterSession {
             run_label: None,
             turn_saw_output: false,
             turn_output: String::new(),
+            turn_last_text_start: 0,
             delegates: Vec::new(),
             pinned_quality: 0.0,
             task_class: None,
@@ -2443,6 +2447,9 @@ pub fn handle_downstream_dispatch(
                     shared.with_session(&router_sid, |s| {
                         s.turn_saw_output = true;
                         if let Some(t) = &chunk_text {
+                            if !t.trim().is_empty() {
+                                s.turn_last_text_start = s.turn_output.len();
+                            }
                             s.turn_output.push_str(t);
                             // Streamed model output is a commit point: no more
                             // mid-turn escalation for the escalation router.
@@ -5104,6 +5111,7 @@ async fn send_prompt_with_failover(
         shared.with_session(&router_sid, |s| {
             s.turn_saw_output = false;
             s.turn_output.clear();
+            s.turn_last_text_start = 0;
             s.turn_reads = 0;
             s.turn_side_effect = false;
             s.turn_tool_failures = 0;
@@ -5301,6 +5309,26 @@ async fn send_prompt_with_failover(
         }
 
         let result = result.and_then(|resp| {
+            if resp.stop_reason != StopReason::Cancelled {
+                let outage = shared
+                    .with_session(&router_sid, |s| {
+                        let start = s.turn_last_text_start
+                            + crate::limits::response_transport_outage(
+                                &s.turn_output[s.turn_last_text_start..],
+                                _llm_turn.last_response_status(),
+                            )?;
+                        // Keep actual progress for the hot continuation, but
+                        // do not treat the adapter's error as a useful answer.
+                        s.turn_output.truncate(start);
+                        Some(())
+                    })
+                    .flatten()
+                    .is_some();
+                if outage {
+                    return Err(AcpError::internal_error()
+                        .data("Provider transport unavailable after HTTP retries"));
+                }
+            }
             let auth_error = shared
                 .with_session(&router_sid, |s| {
                     crate::auth::response_is_auth_error(&s.turn_output)
