@@ -19,11 +19,17 @@
 //! WAL. Writes never prune inline.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+
+use crate::state_layout::{
+    SessionHome, ShardTag, ShardingMode, StateLayout, canonical_cwd, home_of, legacy_session_id,
+    tag_for_cwd, tagged_session_id,
 };
 
 /// How long a write waits for another router process to release the
@@ -198,58 +204,92 @@ pub struct LlmRequestUsage {
 /// Version for the supported read-only state-query JSON contract.
 pub const STATE_QUERY_VERSION: u32 = 1;
 
-/// Router-owned state boundary. Every caller opens state through this type so
-/// future shard selection, retention, and query compatibility stay in the
-/// router rather than leaking SQLite details to hosts.
+/// Router-owned state boundary. Every caller opens state through this type:
+/// it routes each session id to the legacy file or its cwd shard
+/// (`crate::state_layout`) and fans aggregate reads out across every file,
+/// so neither callers nor hosts see the layout.
 pub struct StateStore {
-    path: PathBuf,
+    layout: StateLayout,
+    mode: ShardingMode,
     retention: Retention,
-    file: StateFile,
+    readonly: bool,
+    legacy: StateFile,
+    /// Shards this process has opened, by tag. Opened lazily, kept open.
+    shards: RefCell<BTreeMap<ShardTag, StateFile>>,
 }
 
 impl std::fmt::Debug for StateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateStore")
-            .field("path", &self.path)
+            .field("layout", &self.layout)
+            .field("mode", &self.mode)
             .field("retention", &self.retention)
             .finish_non_exhaustive()
     }
 }
 
 impl StateStore {
-    /// Open durable state for router reads and writes. Retention remains an
-    /// explicit input because a later sharded store must apply it to every
-    /// legacy, active, and inactive shard.
+    /// Open durable state for router reads and writes, minting legacy ids.
+    /// Tagged ids written by a sharded router still resolve to their shards.
     pub fn load(path: &Path, retention: Retention) -> Self {
         Self::try_load(path, retention)
             .unwrap_or_else(|err| panic!("cannot open state DB at {}: {err}", path.display()))
     }
 
     pub fn try_load(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
-        Ok(Self {
-            path: path.to_path_buf(),
-            retention,
-            file: StateFile::try_load(path, retention)?,
-        })
+        Self::try_load_with(path, retention, ShardingMode::Off)
     }
 
-    /// Open an existing database for query-only inspection. This deliberately
-    /// skips schema setup, legacy import, log flushing, and maintenance.
-    pub fn open_readonly(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
-        let conn = Connection::open_with_flags(
+    /// `mode` only decides how `new_session_id` mints ids. Every existing id
+    /// resolves by its shape in either mode.
+    pub fn try_load_with(
+        path: &Path,
+        retention: Retention,
+        mode: ShardingMode,
+    ) -> rusqlite::Result<Self> {
+        Ok(Self::with_legacy(
             path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(Self {
-            path: path.to_path_buf(),
             retention,
-            file: StateFile::from_connection(conn, retention),
-        })
+            mode,
+            false,
+            StateFile::try_load(path, retention)?,
+        ))
     }
 
+    /// Open existing state for query-only inspection. This deliberately
+    /// skips schema setup, legacy import, log flushing, and maintenance, and
+    /// never creates a shard.
+    pub fn open_readonly(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
+        let conn = StateFile::open_readonly_conn(path)?;
+        Ok(Self::with_legacy(
+            path,
+            retention,
+            ShardingMode::Off,
+            true,
+            StateFile::from_connection(conn, retention),
+        ))
+    }
+
+    fn with_legacy(
+        path: &Path,
+        retention: Retention,
+        mode: ShardingMode,
+        readonly: bool,
+        legacy: StateFile,
+    ) -> Self {
+        Self {
+            layout: StateLayout::new(path),
+            mode,
+            retention,
+            readonly,
+            legacy,
+            shards: RefCell::default(),
+        }
+    }
+
+    /// The legacy database path, which anchors the whole layout.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.layout.legacy_path
     }
 
     pub fn retention(&self) -> Retention {
@@ -260,107 +300,140 @@ impl StateStore {
         StateFile::open_conn(path)
     }
 
-    pub fn session_metadata(&self, router_session_id: &str) -> Option<SessionRecord> {
-        self.file
-            .get(router_session_id)
-            .map(|session| SessionRecord {
-                router_session_id: router_session_id.to_string(),
-                session,
-            })
+    /// Mint the id for a new session started in `cwd`. In `cwd` mode this
+    /// creates the checkout's shard, or verifies that the existing one was
+    /// created for the same directory.
+    pub fn new_session_id(&self, cwd: &Path) -> rusqlite::Result<String> {
+        if self.mode == ShardingMode::Off {
+            return Ok(legacy_session_id());
+        }
+        let tag = tag_for_cwd(cwd);
+        let cwd = canonical_cwd(cwd);
+        let mut shards = self.shards.borrow_mut();
+        match shards.get(&tag) {
+            Some(file) => file.verify_shard(&tag, Some(&cwd))?,
+            None => {
+                let file = StateFile::try_load_shard(
+                    &self.layout.shard_path(&tag),
+                    &tag,
+                    Some(&cwd),
+                    self.retention,
+                )?;
+                shards.insert(tag.clone(), file);
+            }
+        }
+        Ok(tagged_session_id(&tag))
     }
 
-    /// Delegate-panel rows for every requested parent. This issues one child
-    /// query and one log query, never one query per child.
+    /// Open `tag`'s shard if it exists on disk. `false` when it does not:
+    /// only `new_session_id` creates shards.
+    fn open_shard(&self, tag: &ShardTag) -> rusqlite::Result<bool> {
+        if self.shards.borrow().contains_key(tag) {
+            return Ok(true);
+        }
+        let path = self.layout.shard_path(tag);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let file = if self.readonly {
+            StateFile::open_readonly_shard(&path, tag, self.retention)?
+        } else {
+            StateFile::try_load_shard(&path, tag, None, self.retention)?
+        };
+        self.shards.borrow_mut().insert(tag.clone(), file);
+        Ok(true)
+    }
+
+    /// Run `f` on the file that holds `router_session_id`. `None` when the
+    /// id names a shard that does not exist.
+    fn with_file<R>(
+        &self,
+        router_session_id: &str,
+        f: impl FnOnce(&StateFile) -> R,
+    ) -> rusqlite::Result<Option<R>> {
+        match home_of(router_session_id) {
+            SessionHome::Legacy => Ok(Some(f(&self.legacy))),
+            SessionHome::Shard(tag) => {
+                if !self.open_shard(&tag)? {
+                    return Ok(None);
+                }
+                Ok(Some(f(&self.shards.borrow()[&tag])))
+            }
+        }
+    }
+
+    /// `with_file` for writes whose failure the caller does not handle.
+    fn write_to(&self, router_session_id: &str, f: impl FnOnce(&StateFile)) {
+        match self.with_file(router_session_id, f) {
+            Ok(Some(())) => {}
+            Ok(None) => tracing::debug!(
+                session = router_session_id,
+                "state shard missing; write skipped"
+            ),
+            Err(err) => tracing::warn!(
+                %err,
+                session = router_session_id,
+                "state shard unavailable; write skipped"
+            ),
+        }
+    }
+
+    /// Run `f` on the legacy file and then on every shard on disk, opening
+    /// the ones this process has not touched yet. An unreadable shard is
+    /// skipped with a warning so one bad file cannot hide every session.
+    fn each_file(
+        &self,
+        mut f: impl FnMut(&StateFile) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()> {
+        f(&self.legacy)?;
+        for tag in self.layout.list_shards() {
+            if let Err(err) = self.open_shard(&tag) {
+                tracing::warn!(%err, shard = %tag, "skipping unreadable state shard");
+            }
+        }
+        for file in self.shards.borrow().values() {
+            f(file)?;
+        }
+        Ok(())
+    }
+
+    /// The legacy file and every shard this process already has open.
+    fn each_open_file(&self, mut f: impl FnMut(&StateFile)) {
+        f(&self.legacy);
+        for file in self.shards.borrow().values() {
+            f(file);
+        }
+    }
+
+    pub fn session_metadata(&self, router_session_id: &str) -> Option<SessionRecord> {
+        self.get(router_session_id).map(|session| SessionRecord {
+            router_session_id: router_session_id.to_string(),
+            session,
+        })
+    }
+
+    /// Delegate-panel rows for every requested parent. Each file holding a
+    /// parent gets one child query and one log query, never one per child.
     pub fn delegate_children(
         &self,
         parent_session_ids: &[String],
     ) -> rusqlite::Result<Vec<DelegateSession>> {
-        let mut parent_ids = parent_session_ids.to_vec();
-        parent_ids.sort();
-        parent_ids.dedup();
-        if parent_ids.is_empty() {
-            return Ok(Vec::new());
+        let mut by_home: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for id in parent_session_ids {
+            let home = match home_of(id) {
+                SessionHome::Legacy => String::new(),
+                SessionHome::Shard(tag) => tag.to_string(),
+            };
+            by_home.entry(home).or_default().push(id.clone());
         }
-        let placeholders = std::iter::repeat_n("?", parent_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT router_session_id, * FROM sessions WHERE parent_session_id IN ({placeholders}) \
-             ORDER BY created_at, router_session_id"
-        );
-        let mut stmt = self.file.conn.prepare(&sql)?;
-        let children: Vec<SessionRecord> = stmt
-            .query_map(rusqlite::params_from_iter(parent_ids.iter()), |row| {
-                Ok(SessionRecord {
-                    router_session_id: row.get("router_session_id")?,
-                    session: StateFile::row_to_session(row)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        if children.is_empty() {
-            return Ok(Vec::new());
+        let mut children = Vec::new();
+        for ids in by_home.values() {
+            if let Some(found) = self.with_file(&ids[0], |file| file.delegate_children(ids))? {
+                children.extend(found?);
+            }
         }
-
-        let child_ids: Vec<_> = children
-            .iter()
-            .map(|child| child.router_session_id.clone())
-            .collect();
-        let placeholders = std::iter::repeat_n("?", child_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT router_session_id, ts, kind, role, summary,
-                    CASE WHEN kind IN ('delegate_task', 'delegate_followup', 'agent_response')
-                         THEN detail END AS detail
-             FROM session_log WHERE router_session_id IN ({placeholders}) ORDER BY router_session_id, id"
-        );
-        let mut logs = self.file.conn.prepare(&sql)?;
-        let mut logs_by_child: std::collections::HashMap<String, Vec<DelegateLog>> =
-            std::collections::HashMap::new();
-        for row in logs.query_map(rusqlite::params_from_iter(child_ids.iter()), |row| {
-            let detail: Option<String> = row.get("detail")?;
-            Ok((
-                row.get::<_, String>("router_session_id")?,
-                DelegateLog {
-                    ts: iso_timestamp(row.get("ts")?),
-                    kind: row.get("kind")?,
-                    role: row.get("role")?,
-                    summary: row.get("summary")?,
-                    detail: detail.and_then(|detail| serde_json::from_str(&detail).ok()),
-                },
-            ))
-        })? {
-            let (session_id, log) = row?;
-            logs_by_child.entry(session_id).or_default().push(log);
-        }
-
-        Ok(children
-            .into_iter()
-            .map(|child| {
-                let log = logs_by_child
-                    .remove(&child.router_session_id)
-                    .unwrap_or_default();
-                DelegateSession {
-                    id: child.router_session_id,
-                    title: child.session.title.unwrap_or_default(),
-                    agent: non_empty(child.session.agent),
-                    model: non_empty(child.session.model),
-                    created_at: child
-                        .session
-                        .created_at
-                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
-                    updated_at: child
-                        .session
-                        .updated_at
-                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
-                    tokens_total: child.session.tokens_total,
-                    context_used: child.session.context_used,
-                    routing: child.session.routing,
-                    has_response: log.iter().any(|entry| entry.kind == "agent_response"),
-                    log,
-                }
-            })
-            .collect())
+        children.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        Ok(children)
     }
 
     pub fn selected_logs(
@@ -369,21 +442,12 @@ impl StateStore {
         limit: usize,
         kind: Option<&str>,
     ) -> rusqlite::Result<Vec<LogEntry>> {
-        let mut stmt = self.file.conn.prepare(
-            "SELECT ts, kind, role, summary, detail, tokens_input, tokens_output,
-                    tokens_cache_read, tokens_cache_write, tokens_estimated, model
-             FROM session_log
-             WHERE router_session_id=?1 AND (?2 IS NULL OR kind=?2)
-             ORDER BY id DESC LIMIT ?3",
-        )?;
-        let mut entries: Vec<_> = stmt
-            .query_map(
-                params![router_session_id, kind, limit.max(1) as i64],
-                StateFile::row_to_log_entry,
-            )?
-            .collect::<rusqlite::Result<_>>()?;
-        entries.reverse();
-        Ok(entries)
+        Ok(self
+            .with_file(router_session_id, |file| {
+                file.selected_logs(router_session_id, limit, kind)
+            })?
+            .transpose()?
+            .unwrap_or_default())
     }
 
     pub fn transcript(
@@ -403,175 +467,42 @@ impl StateStore {
                 "from_sec must not exceed to_end_sec".into(),
             ));
         }
-        let sessions = self
-            .file
-            .conn
-            .prepare(
-                "SELECT router_session_id, * FROM sessions
-                 WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2)
-                 ORDER BY created_at, router_session_id",
-            )?
-            .query_map(params![range.from_sec, range.to_end_sec], |row| {
-                let router_session_id: String = row.get("router_session_id")?;
-                let session = StateFile::row_to_session(row)?;
-                let (class, reason) = routing_class_reason(session.routing.as_ref());
-                Ok(AnalyticsSession {
-                    id: router_session_id,
-                    agent: non_empty(session.agent),
-                    model: non_empty(session.model),
-                    kind: non_empty(session.kind),
-                    run_label: session.run_label,
-                    class,
-                    reason,
-                    created_at: session
-                        .created_at
-                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
-                    updated_at: session
-                        .updated_at
-                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
-                    tokens_input: session.tokens_input,
-                    tokens_output: session.tokens_output,
-                    tokens_total: session.tokens_total,
-                    context_used: session.context_used,
-                    cost_usd: session.cost_usd,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut attribution = std::collections::HashMap::new();
-        let mut attribution_stmt = self
-            .file
-            .conn
-            .prepare("SELECT router_session_id, agent, kind, routing FROM sessions")?;
-        for row in attribution_stmt.query_map([], |row| {
-            let routing: Option<String> = row.get(3)?;
-            let routing = routing.and_then(|value| serde_json::from_str(&value).ok());
-            let (class, _) = routing_class_reason(routing.as_ref());
-            let agent: Option<String> = row.get(1)?;
-            let kind: Option<String> = row.get(2)?;
-            Ok((row.get::<_, String>(0)?, (agent, class, kind)))
-        })? {
-            let (session_id, values) = row?;
-            attribution.insert(session_id, values);
-        }
-
-        let (log_sql, log_params) = analytics_log_range_sql(range);
-        let mut daily = std::collections::BTreeMap::new();
-        let mut stmt = self.file.conn.prepare(&log_sql)?;
-        for row in stmt.query_map(rusqlite::params_from_iter(log_params), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })? {
-            let (date, session_id, tokens_input, tokens_output, entries) = row?;
-            let (agent, class, kind) = attribution.get(&session_id).cloned().unwrap_or_default();
-            let key = format!(
-                "{date}\0{}\0{}\0{}",
-                agent.as_deref().unwrap_or("null"),
-                class.as_deref().unwrap_or("null"),
-                kind.as_deref().unwrap_or("null"),
-            );
-            let bucket = daily.entry(key).or_insert_with(|| AnalyticsDaily {
-                date,
-                agent,
-                class,
-                kind,
-                tokens_input: 0,
-                tokens_output: 0,
-                entries: 0,
-            });
-            bucket.tokens_input += tokens_input.max(0) as u64;
-            bucket.tokens_output += tokens_output.max(0) as u64;
-            bucket.entries += entries.max(0) as u64;
-        }
-
-        let llm_requests = self
-            .file
-            .conn
-            .prepare(
-                "SELECT pinned_model, model, protocol, started_at, tokens_input, tokens_output,
-                        tokens_cache_read, tokens_cache_write
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR started_at >= ?1) AND (?2 IS NULL OR started_at < ?2)
-                 ORDER BY started_at, request_id",
-            )?
-            .query_map(params![range.from_sec, range.to_end_sec], |row| {
-                Ok(SavingsRequest {
-                    pinned_model: row.get(0)?,
-                    model: row.get(1)?,
-                    protocol: row.get(2)?,
-                    started_at: row.get(3)?,
-                    tokens_input: row.get::<_, i64>(4)?.max(0) as u64,
-                    tokens_output: row.get::<_, i64>(5)?.max(0) as u64,
-                    tokens_cache_read: row.get::<_, i64>(6)?.max(0) as u64,
-                    tokens_cache_write: row.get::<_, i64>(7)?.max(0) as u64,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(AnalyticsReport {
-            sessions,
-            daily: daily.into_values().collect(),
-            llm_requests,
-        })
+        let mut report = AnalyticsReport {
+            sessions: Vec::new(),
+            daily: Vec::new(),
+            llm_requests: Vec::new(),
+        };
+        let mut daily = BTreeMap::new();
+        self.each_file(|file| file.analytics_into(range, &mut report, &mut daily))?;
+        report
+            .sessions
+            .sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        report.daily = daily.into_values().collect();
+        report
+            .llm_requests
+            .sort_by_key(|request| request.started_at);
+        Ok(report)
     }
 
+    /// v1 health: byte counts summed over the legacy file and every shard;
+    /// path, auto_vacuum, and the maintenance row describe the legacy file.
     pub fn health(&self) -> rusqlite::Result<StateHealth> {
-        let pragma = |name| {
-            self.file
-                .conn
-                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
-        };
-        let page_size = pragma("page_size")?;
-        let freelist_count = pragma("freelist_count")?;
-        let auto_vacuum = match pragma("auto_vacuum")? {
-            1 => "full",
-            2 => "incremental",
-            _ => "none",
-        };
-        let has_lease = self
-            .file
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_lease'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        let maintenance = has_lease
-            .then(|| {
-                self.file.conn.query_row(
-                    "SELECT holder, last_tick_at, last_result FROM maintenance_lease WHERE id = 1",
-                    [],
-                    |row| {
-                        let result: Option<String> = row.get(2)?;
-                        Ok(StateMaintenance {
-                            holder: row.get(0)?,
-                            last_tick_at: row.get::<_, Option<i64>>(1)?.map(|value| value.max(0) as u64 * 1000),
-                            last_result: result.and_then(|value| serde_json::from_str(&value).ok()),
-                        })
-                    },
-                ).optional()
-            })
-            .transpose()?
-            .flatten();
-        Ok(StateHealth {
-            db_path: self.path.display().to_string(),
-            db_bytes: file_len(&self.path),
-            wal_bytes: file_len(&wal_path(&self.path)),
-            freelist_bytes: (page_size * freelist_count).max(0) as u64,
-            auto_vacuum,
-            maintenance,
-            retention_seconds: self.retention.max_age.as_secs(),
-        })
+        let mut health = self.legacy.health(self.path(), self.retention)?;
+        health.db_bytes = 0;
+        health.wal_bytes = 0;
+        health.freelist_bytes = 0;
+        self.each_file(|file| {
+            let path = file.conn.path().map(PathBuf::from).unwrap_or_default();
+            health.db_bytes += file_len(&path);
+            health.wal_bytes += file_len(&wal_path(&path));
+            health.freelist_bytes += file.freelist_bytes()?;
+            Ok(())
+        })?;
+        Ok(health)
     }
 
     pub fn delegation_report(&self, limit: usize) -> DelegationReport {
-        let all = self.file.all();
+        let all = self.all();
         let mut children: std::collections::HashMap<String, Vec<_>> =
             std::collections::HashMap::new();
         for (id, session) in &all {
@@ -635,11 +566,21 @@ impl StateStore {
     }
 
     pub fn get(&self, router_session_id: &str) -> Option<PersistedSession> {
-        self.file.get(router_session_id)
+        self.with_file(router_session_id, |file| file.get(router_session_id))
+            .ok()
+            .flatten()
+            .flatten()
     }
 
+    /// Every session in every file, newest activity first.
     pub fn all(&self) -> Vec<(String, PersistedSession)> {
-        self.file.all()
+        let mut out = Vec::new();
+        let _ = self.each_file(|file| {
+            out.extend(file.all());
+            Ok(())
+        });
+        out.sort_by_key(|(_, session)| std::cmp::Reverse(session.updated_at));
+        out
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (String, PersistedSession)> {
@@ -647,11 +588,20 @@ impl StateStore {
     }
 
     pub fn find_by_downstream(&self, agent: &str, downstream_session_id: &str) -> Option<String> {
-        self.file.find_by_downstream(agent, downstream_session_id)
+        let mut found = None;
+        let _ = self.each_file(|file| {
+            if found.is_none() {
+                found = file.find_by_downstream(agent, downstream_session_id);
+            }
+            Ok(())
+        });
+        found
     }
 
     pub fn upsert(&self, router_session_id: String, session: PersistedSession) {
-        self.file.upsert(router_session_id, session);
+        if let Err(err) = self.upsert_checked(router_session_id, session) {
+            tracing::error!(%err, "failed to upsert session");
+        }
     }
 
     pub fn upsert_checked(
@@ -659,7 +609,11 @@ impl StateStore {
         router_session_id: String,
         session: PersistedSession,
     ) -> rusqlite::Result<()> {
-        self.file.upsert_checked(router_session_id, session)
+        let home = router_session_id.clone();
+        self.with_file(&home, |file| {
+            file.upsert_checked(router_session_id, session)
+        })?
+        .unwrap_or_else(|| Err(missing_shard(&home)))
     }
 
     pub fn set_session_config(
@@ -667,69 +621,124 @@ impl StateStore {
         router_session_id: &str,
         value: &serde_json::Value,
     ) -> rusqlite::Result<()> {
-        self.file.set_session_config(router_session_id, value)
+        self.with_file(router_session_id, |file| {
+            file.set_session_config(router_session_id, value)
+        })?
+        .unwrap_or_else(|| Err(missing_shard(router_session_id)))
     }
 
     pub fn set_title(&self, router_session_id: &str, title: &str) {
-        self.file.set_title(router_session_id, title);
+        self.write_to(router_session_id, |file| {
+            file.set_title(router_session_id, title)
+        });
     }
 
     pub fn touch(&self, router_session_id: &str) {
-        self.file.touch(router_session_id);
+        self.write_to(router_session_id, |file| file.touch(router_session_id));
     }
 
     pub fn remove(&self, router_session_id: &str) -> Option<PersistedSession> {
-        self.file.remove(router_session_id)
+        self.with_file(router_session_id, |file| file.remove(router_session_id))
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     pub fn log(&self, router_session_id: &str, entry: &LogEntry) {
-        self.file.log(router_session_id, entry);
+        if let Err(err) = self.log_checked(router_session_id, entry) {
+            tracing::debug!(%err, session = router_session_id, "session_log insert skipped");
+        }
     }
 
     pub fn log_checked(&self, router_session_id: &str, entry: &LogEntry) -> rusqlite::Result<()> {
-        self.file.log_checked(router_session_id, entry)
+        self.with_file(router_session_id, |file| {
+            file.log_checked(router_session_id, entry)
+        })?
+        .unwrap_or_else(|| Err(missing_shard(router_session_id)))
     }
 
     pub fn log_buffered(&self, router_session_id: &str, entry: LogEntry) {
-        self.file.log_buffered(router_session_id, entry);
+        self.write_to(router_session_id, |file| {
+            file.log_buffered(router_session_id, entry)
+        });
     }
 
+    /// Flush every open file's queue; one busy file does not stop the rest.
     pub fn flush_log(&self) -> rusqlite::Result<()> {
-        self.file.flush_log()
+        self.flush_each(StateFile::flush_log)
     }
 
     pub fn flush_log_final(&self) -> rusqlite::Result<()> {
-        self.file.flush_log_final()
+        self.flush_each(StateFile::flush_log_final)
+    }
+
+    fn flush_each(
+        &self,
+        flush: impl Fn(&StateFile) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()> {
+        let mut first_err = None;
+        self.each_open_file(|file| {
+            if let Err(err) = flush(file) {
+                first_err.get_or_insert(err);
+            }
+        });
+        first_err.map_or(Ok(()), Err)
     }
 
     pub fn flush_log_or_warn(&self) {
-        self.file.flush_log_or_warn();
+        self.each_open_file(StateFile::flush_log_or_warn);
     }
 
     pub fn pending_log_rows(&self) -> usize {
-        self.file.pending_log_rows()
+        let mut rows = 0;
+        self.each_open_file(|file| rows += file.pending_log_rows());
+        rows
+    }
+
+    /// Streaming rows dropped because a queue overflowed while its file
+    /// stayed busy, since this store opened.
+    pub fn dropped_log_rows(&self) -> u64 {
+        let mut rows = 0;
+        self.each_open_file(|file| rows += file.dropped_log_rows.get());
+        rows
     }
 
     pub fn set_context_used(&self, router_session_id: &str, used: u64) {
-        self.file.set_context_used(router_session_id, used);
+        self.write_to(router_session_id, |file| {
+            file.set_context_used(router_session_id, used)
+        });
     }
 
     pub fn set_cost_usd(&self, router_session_id: &str, cost: f64) {
-        self.file.set_cost_usd(router_session_id, cost);
+        self.write_to(router_session_id, |file| {
+            file.set_cost_usd(router_session_id, cost)
+        });
     }
 
     pub fn add_estimated_cost(&self, router_session_id: &str, delta: f64) {
-        self.file.add_estimated_cost(router_session_id, delta);
+        self.write_to(router_session_id, |file| {
+            file.add_estimated_cost(router_session_id, delta)
+        });
     }
 
+    /// Box-wide spend: the sum over the legacy file and every shard.
     pub fn llm_cost_since(&self, agent: &str, models: Option<&[String]>, since_epoch: i64) -> f64 {
-        self.file.llm_cost_since(agent, models, since_epoch)
+        let mut total = 0.0;
+        let _ = self.each_file(|file| {
+            total += file.llm_cost_since(agent, models, since_epoch);
+            Ok(())
+        });
+        total
     }
 
     pub fn start_llm_request(&self, request: &LlmRequestStart) {
-        self.file.start_llm_request(request);
+        self.write_to(&request.router_session_id, |file| {
+            file.start_llm_request(request)
+        });
     }
 
+    /// The request row lives with its session, in a file this process opened
+    /// when it started the request.
     pub fn finish_llm_request(
         &self,
         request_id: &str,
@@ -739,8 +748,11 @@ impl StateStore {
         cost_usd: f64,
         error: Option<&str>,
     ) {
-        self.file
-            .finish_llm_request(request_id, status, duration_ms, usage, cost_usd, error);
+        let mut done = false;
+        self.each_open_file(|file| {
+            done = done
+                || file.finish_llm_request(request_id, status, duration_ms, usage, cost_usd, error);
+        });
     }
 
     pub fn record_tool_call(
@@ -752,65 +764,100 @@ impl StateStore {
         model: Option<&str>,
         detail: &serde_json::Value,
     ) {
-        self.file.record_tool_call(
-            router_session_id,
-            tool_call_id,
-            title,
-            status,
-            model,
-            detail,
-        );
+        self.write_to(router_session_id, |file| {
+            file.record_tool_call(
+                router_session_id,
+                tool_call_id,
+                title,
+                status,
+                model,
+                detail,
+            )
+        });
     }
 
     pub fn note_native_subagent(&self, router_session_id: &str) {
-        self.file.note_native_subagent(router_session_id);
+        self.write_to(router_session_id, |file| {
+            file.note_native_subagent(router_session_id)
+        });
     }
 
     pub fn note_delegation_directive(&self, router_session_id: &str) {
-        self.file.note_delegation_directive(router_session_id);
+        self.write_to(router_session_id, |file| {
+            file.note_delegation_directive(router_session_id)
+        });
     }
 
     pub fn add_compute_ms(&self, router_session_id: &str, ms: u64) {
-        self.file.add_compute_ms(router_session_id, ms);
+        self.write_to(router_session_id, |file| {
+            file.add_compute_ms(router_session_id, ms)
+        });
     }
 
     pub fn set_git(&self, router_session_id: &str, branch: Option<&str>, sha: Option<&str>) {
-        self.file.set_git(router_session_id, branch, sha);
+        self.write_to(router_session_id, |file| {
+            file.set_git(router_session_id, branch, sha)
+        });
     }
 
     pub fn log_for_all(&self, router_session_id: &str) -> rusqlite::Result<Vec<LogEntry>> {
-        self.file.log_for_all(router_session_id)
+        Ok(self
+            .with_file(router_session_id, |file| {
+                file.log_for_all(router_session_id)
+            })?
+            .transpose()?
+            .unwrap_or_default())
     }
 
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
-        self.file.log_for(router_session_id, limit)
+        self.with_file(router_session_id, |file| {
+            file.log_for(router_session_id, limit)
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
     }
 
-    /// Keep legacy single-file pruning behavior behind the StateStore. The
-    /// sharding follow-up can replace this with cross-shard coordination.
+    /// Unpaced prune of every file. The serve path prunes through the
+    /// elected `crate::maintenance` worker instead.
     pub fn prune(&self) -> usize {
-        self.file.prune()
+        self.prune_at(now_epoch())
     }
 
     pub fn prune_at(&self, now: u64) -> usize {
-        self.file.prune_at(now)
+        let mut pruned = 0;
+        let _ = self.each_file(|file| {
+            pruned += file.prune_at(now);
+            Ok(())
+        });
+        pruned
     }
 
     pub fn outbox_push(&self, payload: &str) -> Option<i64> {
-        self.file.outbox_push(payload)
+        self.legacy.outbox_push(payload)
     }
 
     pub fn outbox_pending(&self, limit: usize) -> Vec<(i64, String)> {
-        self.file.outbox_pending(limit)
+        self.legacy.outbox_pending(limit)
     }
 
     pub fn outbox_done(&self, id: i64) {
-        self.file.outbox_done(id);
+        self.legacy.outbox_done(id);
     }
 
     pub fn outbox_attempted(&self, id: i64) {
-        self.file.outbox_attempted(id);
+        self.legacy.outbox_attempted(id);
     }
+}
+
+fn missing_shard(router_session_id: &str) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(format!(
+        "no state shard exists for session {router_session_id}"
+    ))
+}
+
+fn shard_error(path: &Path, problem: &str) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(format!("state shard {}: {problem}", path.display()))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1003,18 +1050,30 @@ fn analytics_log_range_sql(range: AnalyticsRange) -> (String, Vec<i64>) {
     )
 }
 
-/// Raw single-file SQLite implementation. `StateStore` is the public
-/// boundary; this remains private to the router so future shard layout does
-/// not leak to Kory Code or other hosts.
+/// One SQLite file: the legacy database or one cwd shard. `StateStore` is
+/// the public boundary; this stays private so the shard layout does not
+/// leak to Kory Code or other hosts.
 struct StateFile {
     conn: Connection,
     retention: Retention,
     /// Streaming `session_log` rows not yet written, oldest first.
     pending_log: RefCell<Vec<PendingLog>>,
+    /// Streaming rows dropped because the queue overflowed.
+    dropped_log_rows: Cell<u64>,
     flush_backoff_until: Cell<Option<Instant>>,
     defer_warned_at: Cell<Option<Instant>>,
     drop_warned_at: Cell<Option<Instant>>,
 }
+
+/// Which tables a file carries. Box-wide tables (lifecycle-hook outbox,
+/// maintenance election rows) live only in the legacy file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Legacy,
+    Shard,
+}
+
+const SHARD_SCHEMA_VERSION: i64 = 1;
 
 struct PendingLog {
     router_session_id: String,
@@ -1033,19 +1092,80 @@ impl StateFile {
     /// Open durable state or fail. A disposable fallback would return session
     /// ids that cannot survive the next router process.
     pub fn try_load(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
-        let conn = Self::open_conn(path)?;
-        let store = Self {
-            conn,
-            retention,
-            pending_log: RefCell::default(),
-            flush_backoff_until: Cell::default(),
-            defer_warned_at: Cell::default(),
-            drop_warned_at: Cell::default(),
-        };
-        store.init_schema()?;
+        let store = Self::from_connection(Self::open_conn(path)?, retention);
+        store.init_schema(FileKind::Legacy)?;
         // One-time import of a legacy sessions.json sitting next to the DB.
         store.import_legacy_json(path);
         Ok(store)
+    }
+
+    /// Open a shard read-write. With `cwd` it is created when missing (born
+    /// with incremental auto_vacuum, so it never needs `state-compact`) and
+    /// must have been created for that same directory.
+    fn try_load_shard(
+        path: &Path,
+        tag: &ShardTag,
+        cwd: Option<&Path>,
+        retention: Retention,
+    ) -> rusqlite::Result<Self> {
+        let store = Self::from_connection(Self::open_conn_with(path, true)?, retention);
+        store.init_schema(FileKind::Shard)?;
+        if let Some(cwd) = cwd {
+            store.conn.execute(
+                "INSERT OR IGNORE INTO shard_meta (id, tag, cwd, created_at, schema_version)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                params![
+                    tag.as_str(),
+                    cwd.to_string_lossy(),
+                    now_epoch() as i64,
+                    SHARD_SCHEMA_VERSION
+                ],
+            )?;
+        }
+        store.verify_shard(tag, cwd)?;
+        Ok(store)
+    }
+
+    fn open_readonly_shard(
+        path: &Path,
+        tag: &ShardTag,
+        retention: Retention,
+    ) -> rusqlite::Result<Self> {
+        let store = Self::from_connection(Self::open_readonly_conn(path)?, retention);
+        store.verify_shard(tag, None)?;
+        Ok(store)
+    }
+
+    /// Refuse a shard whose recorded tag is not its filename's, or (when
+    /// `cwd` is given) whose recorded directory differs: a tag collision or
+    /// a file copied into the wrong place.
+    fn verify_shard(&self, tag: &ShardTag, cwd: Option<&Path>) -> rusqlite::Result<()> {
+        let path = PathBuf::from(self.conn.path().unwrap_or_default());
+        let (stored_tag, stored_cwd): (String, String) = self
+            .conn
+            .query_row("SELECT tag, cwd FROM shard_meta WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?
+            .ok_or_else(|| shard_error(&path, "has no shard_meta row"))?;
+        if stored_tag != tag.as_str() {
+            return Err(shard_error(
+                &path,
+                &format!("records tag {stored_tag}, not its filename's {tag}"),
+            ));
+        }
+        if let Some(cwd) = cwd
+            && Path::new(&stored_cwd) != cwd
+        {
+            return Err(shard_error(
+                &path,
+                &format!(
+                    "belongs to {stored_cwd}, not {}; refusing a tag collision",
+                    cwd.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn from_connection(conn: Connection, retention: Retention) -> Self {
@@ -1053,17 +1173,36 @@ impl StateFile {
             conn,
             retention,
             pending_log: RefCell::default(),
+            dropped_log_rows: Cell::default(),
             flush_backoff_until: Cell::default(),
             defer_warned_at: Cell::default(),
             drop_warned_at: Cell::default(),
         }
     }
 
+    fn open_readonly_conn(path: &Path) -> rusqlite::Result<Connection> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(conn)
+    }
+
     pub(crate) fn open_conn(path: &Path) -> rusqlite::Result<Connection> {
+        Self::open_conn_with(path, false)
+    }
+
+    /// `incremental_vacuum` asks a NEW file for `auto_vacuum = INCREMENTAL`.
+    /// SQLite ignores the request once the file has tables.
+    fn open_conn_with(path: &Path, incremental_vacuum: bool) -> rusqlite::Result<Connection> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        if incremental_vacuum {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         // Concurrent router startups can contend while enabling WAL. Install
         // the wait first so a transient lock cannot select the memory fallback.
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -1088,7 +1227,7 @@ impl StateFile {
         Ok(conn)
     }
 
-    fn init_schema(&self) -> rusqlite::Result<()> {
+    fn init_schema(&self, kind: FileKind) -> rusqlite::Result<()> {
         let sql = r#"
         CREATE TABLE IF NOT EXISTS sessions (
             router_session_id     TEXT PRIMARY KEY,
@@ -1197,6 +1336,18 @@ impl StateFile {
                    started_at, updated_at, detail
             FROM tool_calls
             WHERE completed_at IS NULL;
+        "#;
+        let file_sql = match kind {
+            FileKind::Legacy => LEGACY_SCHEMA,
+            FileKind::Shard => SHARD_SCHEMA,
+        };
+        self.conn.execute_batch(&format!("{sql}{file_sql}"))?;
+        self.migrate()
+    }
+}
+
+/// Box-wide tables, legacy file only.
+const LEGACY_SCHEMA: &str = "
         -- Lifecycle-hook events (`delegate_stop`, `parent_repinned`) not yet
         -- accepted by the host. Every router process sharing this DB flushes
         -- it, so an event survives a hook failure or a router restart.
@@ -1215,8 +1366,28 @@ impl StateFile {
             last_tick_at INTEGER,
             last_result  TEXT
         );
-        "#;
-        self.conn.execute_batch(sql)?;
+        -- When maintenance last swept each shard, so the oldest goes first
+        -- across restarts and holder changes. See `crate::maintenance`.
+        CREATE TABLE IF NOT EXISTS shard_maintenance (
+            tag          TEXT PRIMARY KEY,
+            last_tick_at INTEGER NOT NULL,
+            last_result  TEXT
+        );
+";
+
+/// The checkout a shard belongs to, checked on every open.
+const SHARD_SCHEMA: &str = "
+        CREATE TABLE IF NOT EXISTS shard_meta (
+            id             INTEGER PRIMARY KEY CHECK (id = 1),
+            tag            TEXT NOT NULL,
+            cwd            TEXT NOT NULL,
+            created_at     INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL
+        );
+";
+
+impl StateFile {
+    fn migrate(&self) -> rusqlite::Result<()> {
         // Migrations for DBs created by older versions: add columns that the
         // `CREATE TABLE IF NOT EXISTS` above skips on an existing table. A
         // duplicate-column error just means the migration already ran.
@@ -1529,13 +1700,6 @@ impl StateFile {
         existing
     }
 
-    /// Append a `session_log` row and increment the session's counters.
-    pub fn log(&self, router_session_id: &str, entry: &LogEntry) {
-        if let Err(err) = self.log_checked(router_session_id, entry) {
-            tracing::debug!(%err, session = router_session_id, "session_log insert skipped");
-        }
-    }
-
     /// Append a row now, after any queued streaming rows so the log keeps
     /// arrival order. All of them commit in one transaction.
     pub fn log_checked(&self, router_session_id: &str, entry: &LogEntry) -> rusqlite::Result<()> {
@@ -1561,6 +1725,8 @@ impl StateFile {
         if pending.len() > LOG_QUEUE_CAP {
             let dropped = pending.len() - LOG_QUEUE_CAP;
             pending.drain(..dropped);
+            self.dropped_log_rows
+                .set(self.dropped_log_rows.get() + dropped as u64);
             if throttle(&self.drop_warned_at) {
                 tracing::warn!(
                     dropped,
@@ -1803,7 +1969,8 @@ impl StateFile {
     }
 
     /// Finish an interposed request and accumulate API-equivalent request cost.
-    /// ACP turn token totals are not incremented a second time.
+    /// ACP turn token totals are not incremented a second time. False when
+    /// this file has no such request.
     pub fn finish_llm_request(
         &self,
         request_id: &str,
@@ -1812,7 +1979,7 @@ impl StateFile {
         usage: &LlmRequestUsage,
         cost_usd: f64,
         error: Option<&str>,
-    ) {
+    ) -> bool {
         let now = now_epoch() as i64;
         let session_id: Option<String> = self
             .conn
@@ -1849,7 +2016,9 @@ impl StateFile {
                  WHERE router_session_id=?1",
                 params![session_id, cost_usd, now],
             );
+            return true;
         }
+        false
     }
 
     /// Upsert one tool's lifecycle. `active_tool_calls` exposes rows without a
@@ -1988,11 +2157,6 @@ impl StateFile {
         out
     }
 
-    /// Delete sessions idle past `max_age`, with their rows in every table.
-    pub fn prune(&self) -> usize {
-        self.prune_at(now_epoch())
-    }
-
     /// Queue a lifecycle-hook event; returns its outbox id.
     pub fn outbox_push(&self, payload: &str) -> Option<i64> {
         match self.conn.execute(
@@ -2043,6 +2207,296 @@ impl StateFile {
                 0
             }
         }
+    }
+}
+
+/// Per-file halves of the `StateStore` reads that fan out across files.
+impl StateFile {
+    fn delegate_children(
+        &self,
+        parent_session_ids: &[String],
+    ) -> rusqlite::Result<Vec<DelegateSession>> {
+        let mut parent_ids = parent_session_ids.to_vec();
+        parent_ids.sort();
+        parent_ids.dedup();
+        if parent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", parent_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT router_session_id, * FROM sessions WHERE parent_session_id IN ({placeholders}) \
+             ORDER BY created_at, router_session_id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let children: Vec<SessionRecord> = stmt
+            .query_map(rusqlite::params_from_iter(parent_ids.iter()), |row| {
+                Ok(SessionRecord {
+                    router_session_id: row.get("router_session_id")?,
+                    session: StateFile::row_to_session(row)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let child_ids: Vec<_> = children
+            .iter()
+            .map(|child| child.router_session_id.clone())
+            .collect();
+        let placeholders = std::iter::repeat_n("?", child_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT router_session_id, ts, kind, role, summary,
+                    CASE WHEN kind IN ('delegate_task', 'delegate_followup', 'agent_response')
+                         THEN detail END AS detail
+             FROM session_log WHERE router_session_id IN ({placeholders}) ORDER BY router_session_id, id"
+        );
+        let mut logs = self.conn.prepare(&sql)?;
+        let mut logs_by_child: std::collections::HashMap<String, Vec<DelegateLog>> =
+            std::collections::HashMap::new();
+        for row in logs.query_map(rusqlite::params_from_iter(child_ids.iter()), |row| {
+            let detail: Option<String> = row.get("detail")?;
+            Ok((
+                row.get::<_, String>("router_session_id")?,
+                DelegateLog {
+                    ts: iso_timestamp(row.get("ts")?),
+                    kind: row.get("kind")?,
+                    role: row.get("role")?,
+                    summary: row.get("summary")?,
+                    detail: detail.and_then(|detail| serde_json::from_str(&detail).ok()),
+                },
+            ))
+        })? {
+            let (session_id, log) = row?;
+            logs_by_child.entry(session_id).or_default().push(log);
+        }
+
+        Ok(children
+            .into_iter()
+            .map(|child| {
+                let log = logs_by_child
+                    .remove(&child.router_session_id)
+                    .unwrap_or_default();
+                DelegateSession {
+                    id: child.router_session_id,
+                    title: child.session.title.unwrap_or_default(),
+                    agent: non_empty(child.session.agent),
+                    model: non_empty(child.session.model),
+                    created_at: child
+                        .session
+                        .created_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    updated_at: child
+                        .session
+                        .updated_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    tokens_total: child.session.tokens_total,
+                    context_used: child.session.context_used,
+                    routing: child.session.routing,
+                    has_response: log.iter().any(|entry| entry.kind == "agent_response"),
+                    log,
+                }
+            })
+            .collect())
+    }
+
+    fn selected_logs(
+        &self,
+        router_session_id: &str,
+        limit: usize,
+        kind: Option<&str>,
+    ) -> rusqlite::Result<Vec<LogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, kind, role, summary, detail, tokens_input, tokens_output,
+                    tokens_cache_read, tokens_cache_write, tokens_estimated, model
+             FROM session_log
+             WHERE router_session_id=?1 AND (?2 IS NULL OR kind=?2)
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let mut entries: Vec<_> = stmt
+            .query_map(
+                params![router_session_id, kind, limit.max(1) as i64],
+                StateFile::row_to_log_entry,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        entries.reverse();
+        Ok(entries)
+    }
+
+    /// Add this file's sessions, daily buckets, and request rows. A file's
+    /// log rows only name its own sessions, so attribution stays per file;
+    /// `daily` merges buckets by key across files.
+    fn analytics_into(
+        &self,
+        range: AnalyticsRange,
+        report: &mut AnalyticsReport,
+        daily: &mut BTreeMap<String, AnalyticsDaily>,
+    ) -> rusqlite::Result<()> {
+        let sessions = self
+            .conn
+            .prepare(
+                "SELECT router_session_id, * FROM sessions
+                 WHERE (?1 IS NULL OR created_at >= ?1) AND (?2 IS NULL OR created_at < ?2)
+                 ORDER BY created_at, router_session_id",
+            )?
+            .query_map(params![range.from_sec, range.to_end_sec], |row| {
+                let router_session_id: String = row.get("router_session_id")?;
+                let session = StateFile::row_to_session(row)?;
+                let (class, reason) = routing_class_reason(session.routing.as_ref());
+                Ok(AnalyticsSession {
+                    id: router_session_id,
+                    agent: non_empty(session.agent),
+                    model: non_empty(session.model),
+                    kind: non_empty(session.kind),
+                    run_label: session.run_label,
+                    class,
+                    reason,
+                    created_at: session
+                        .created_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    updated_at: session
+                        .updated_at
+                        .and_then(|seconds| i64::try_from(seconds).ok().and_then(iso_timestamp)),
+                    tokens_input: session.tokens_input,
+                    tokens_output: session.tokens_output,
+                    tokens_total: session.tokens_total,
+                    context_used: session.context_used,
+                    cost_usd: session.cost_usd,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        report.sessions.extend(sessions);
+
+        let mut attribution = std::collections::HashMap::new();
+        let mut attribution_stmt = self
+            .conn
+            .prepare("SELECT router_session_id, agent, kind, routing FROM sessions")?;
+        for row in attribution_stmt.query_map([], |row| {
+            let routing: Option<String> = row.get(3)?;
+            let routing = routing.and_then(|value| serde_json::from_str(&value).ok());
+            let (class, _) = routing_class_reason(routing.as_ref());
+            let agent: Option<String> = row.get(1)?;
+            let kind: Option<String> = row.get(2)?;
+            Ok((row.get::<_, String>(0)?, (agent, class, kind)))
+        })? {
+            let (session_id, values) = row?;
+            attribution.insert(session_id, values);
+        }
+
+        let (log_sql, log_params) = analytics_log_range_sql(range);
+        let mut stmt = self.conn.prepare(&log_sql)?;
+        for row in stmt.query_map(rusqlite::params_from_iter(log_params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })? {
+            let (date, session_id, tokens_input, tokens_output, entries) = row?;
+            let (agent, class, kind) = attribution.get(&session_id).cloned().unwrap_or_default();
+            let key = format!(
+                "{date}\0{}\0{}\0{}",
+                agent.as_deref().unwrap_or("null"),
+                class.as_deref().unwrap_or("null"),
+                kind.as_deref().unwrap_or("null"),
+            );
+            let bucket = daily.entry(key).or_insert_with(|| AnalyticsDaily {
+                date,
+                agent,
+                class,
+                kind,
+                tokens_input: 0,
+                tokens_output: 0,
+                entries: 0,
+            });
+            bucket.tokens_input += tokens_input.max(0) as u64;
+            bucket.tokens_output += tokens_output.max(0) as u64;
+            bucket.entries += entries.max(0) as u64;
+        }
+
+        let llm_requests = self
+            .conn
+            .prepare(
+                "SELECT pinned_model, model, protocol, started_at, tokens_input, tokens_output,
+                        tokens_cache_read, tokens_cache_write
+                 FROM llm_requests
+                 WHERE (?1 IS NULL OR started_at >= ?1) AND (?2 IS NULL OR started_at < ?2)
+                 ORDER BY started_at, request_id",
+            )?
+            .query_map(params![range.from_sec, range.to_end_sec], |row| {
+                Ok(SavingsRequest {
+                    pinned_model: row.get(0)?,
+                    model: row.get(1)?,
+                    protocol: row.get(2)?,
+                    started_at: row.get(3)?,
+                    tokens_input: row.get::<_, i64>(4)?.max(0) as u64,
+                    tokens_output: row.get::<_, i64>(5)?.max(0) as u64,
+                    tokens_cache_read: row.get::<_, i64>(6)?.max(0) as u64,
+                    tokens_cache_write: row.get::<_, i64>(7)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        report.llm_requests.extend(llm_requests);
+        Ok(())
+    }
+
+    fn pragma_i64(&self, name: &str) -> rusqlite::Result<i64> {
+        self.conn
+            .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+    }
+
+    fn freelist_bytes(&self) -> rusqlite::Result<u64> {
+        Ok((self.pragma_i64("page_size")? * self.pragma_i64("freelist_count")?).max(0) as u64)
+    }
+
+    /// v1 health for this one file.
+    fn health(&self, path: &Path, retention: Retention) -> rusqlite::Result<StateHealth> {
+        let auto_vacuum = match self.pragma_i64("auto_vacuum")? {
+            1 => "full",
+            2 => "incremental",
+            _ => "none",
+        };
+        let has_lease = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_lease'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let maintenance = has_lease
+            .then(|| {
+                self.conn.query_row(
+                    "SELECT holder, last_tick_at, last_result FROM maintenance_lease WHERE id = 1",
+                    [],
+                    |row| {
+                        let result: Option<String> = row.get(2)?;
+                        Ok(StateMaintenance {
+                            holder: row.get(0)?,
+                            last_tick_at: row.get::<_, Option<i64>>(1)?.map(|value| value.max(0) as u64 * 1000),
+                            last_result: result.and_then(|value| serde_json::from_str(&value).ok()),
+                        })
+                    },
+                ).optional()
+            })
+            .transpose()?
+            .flatten();
+        Ok(StateHealth {
+            db_path: path.display().to_string(),
+            db_bytes: file_len(path),
+            wal_bytes: file_len(&wal_path(path)),
+            freelist_bytes: self.freelist_bytes()?,
+            auto_vacuum,
+            maintenance,
+            retention_seconds: retention.max_age.as_secs(),
+        })
     }
 }
 
@@ -2692,7 +3146,7 @@ mod tests {
             &serde_json::json!({"toolCallId":"tool-1"}),
         );
         let active: (String, String) = s
-            .file
+            .legacy
             .conn
             .query_row(
                 "SELECT tool_call_id, model FROM active_tool_calls",
@@ -2710,7 +3164,7 @@ mod tests {
             &serde_json::json!({"toolCallId":"tool-1","status":"completed"}),
         );
         let active_count: i64 = s
-            .file
+            .legacy
             .conn
             .query_row("SELECT COUNT(*) FROM active_tool_calls", [], |row| {
                 row.get(0)
@@ -2718,7 +3172,7 @@ mod tests {
             .unwrap();
         assert_eq!(active_count, 0);
         let tool_model: String = s
-            .file
+            .legacy
             .conn
             .query_row(
                 "SELECT model FROM tool_calls WHERE tool_call_id='tool-1'",
@@ -2737,7 +3191,7 @@ mod tests {
         // `started_at`) so the query can be exercised across a controlled
         // time boundary.
         let insert = |request_id: &str, agent: &str, model: &str, started_at: i64, cost: f64| {
-            s.file
+            s.legacy
                 .conn
                 .execute(
                     "INSERT INTO llm_requests
@@ -2778,7 +3232,7 @@ mod tests {
             ("llm_requests", "idx_llm_requests_started", "started_at"),
         ] {
             let sql: String = s
-                .file
+                .legacy
                 .conn
                 .query_row(
                     "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND name=?2",
@@ -2803,7 +3257,7 @@ mod tests {
         });
         let plan = format!("EXPLAIN QUERY PLAN {sql}");
         let steps: Vec<String> = s
-            .file
+            .legacy
             .conn
             .prepare(&plan)
             .unwrap()
@@ -2835,14 +3289,14 @@ mod tests {
         );
         s.upsert("old".into(), session("a"));
         s.upsert("new".into(), session("b"));
-        s.file
+        s.legacy
             .conn
             .execute(
                 "UPDATE sessions SET updated_at=1000 WHERE router_session_id='old'",
                 [],
             )
             .unwrap();
-        s.file
+        s.legacy
             .conn
             .execute(
                 "UPDATE sessions SET updated_at=1950 WHERE router_session_id='new'",
@@ -2892,5 +3346,274 @@ mod tests {
         // JSON was renamed so it doesn't re-import.
         assert!(!json.exists());
         assert!(json.with_extension("json.imported").exists());
+    }
+
+    fn sharded(dir: &Path) -> StateStore {
+        StateStore::try_load_with(
+            &dir.join("state.db"),
+            Retention::default(),
+            ShardingMode::Cwd,
+        )
+        .unwrap()
+    }
+
+    fn sessions_in(path: &Path) -> Vec<String> {
+        Connection::open(path)
+            .unwrap()
+            .prepare("SELECT router_session_id FROM sessions ORDER BY router_session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn request(request_id: &str, router_session_id: &str) -> LlmRequestStart {
+        LlmRequestStart {
+            request_id: request_id.into(),
+            router_session_id: router_session_id.into(),
+            parent_router_session_id: None,
+            agent: "claude".into(),
+            protocol: "anthropic".into(),
+            endpoint: "/v1/messages".into(),
+            pinned_model: "claude/opus".into(),
+            model: "claude/opus".into(),
+            routing_reason: "r".into(),
+            routing_event: "steady".into(),
+            estimated_input_tokens: 1,
+        }
+    }
+
+    #[test]
+    fn a_tagged_session_lives_in_its_checkout_shard_and_a_legacy_one_stays_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sharded(dir.path());
+        let checkout = dir.path().join("checkout-a");
+        let tag = tag_for_cwd(&checkout);
+
+        let sid = s.new_session_id(&checkout).unwrap();
+        assert!(sid.starts_with(&format!("rtr-{tag}-")), "{sid}");
+        s.upsert(sid.clone(), session("claude"));
+        s.log(&sid, &chunk("hello"));
+        s.log_buffered(&sid, chunk("streamed"));
+        s.flush_log().unwrap();
+        s.upsert("rtr-legacy".into(), session("codex"));
+
+        assert_eq!(
+            sessions_in(&s.layout.shard_path(&tag)),
+            std::slice::from_ref(&sid)
+        );
+        assert_eq!(sessions_in(&dir.path().join("state.db")), ["rtr-legacy"]);
+        assert_eq!(texts(&s.log_for_all(&sid).unwrap()), ["hello", "streamed"]);
+        assert_eq!(s.all().len(), 2);
+        // The next session in the same checkout shares its shard.
+        assert_ne!(s.new_session_id(&checkout).unwrap(), sid);
+        assert_eq!(s.layout.list_shards(), [tag]);
+    }
+
+    #[test]
+    fn sharding_off_still_reads_and_writes_tagged_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let s = sharded(dir.path());
+            let sid = s.new_session_id(dir.path()).unwrap();
+            s.upsert(sid.clone(), session("claude"));
+            sid
+        };
+
+        let off = StateStore::load(&dir.path().join("state.db"), Retention::default());
+        assert_eq!(
+            home_of(&off.new_session_id(dir.path()).unwrap()),
+            SessionHome::Legacy
+        );
+        assert_eq!(off.get(&sid).unwrap().agent, "claude");
+        off.set_title(&sid, "kept");
+        assert_eq!(off.get(&sid).unwrap().title.as_deref(), Some("kept"));
+        // An id naming a shard that was never created reads as absent, and
+        // writing to it creates nothing.
+        let ghost = tagged_session_id(&tag_for_cwd(Path::new("/nowhere")));
+        assert!(off.get(&ghost).is_none());
+        assert!(off.upsert_checked(ghost, session("x")).is_err());
+        assert_eq!(off.layout.list_shards().len(), 1);
+    }
+
+    #[test]
+    fn a_shard_recorded_for_another_directory_or_tag_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let layout = StateLayout::new(&dir.path().join("state.db"));
+        sharded(dir.path()).new_session_id(&a).unwrap();
+        // Another checkout that hashed to the same tag.
+        Connection::open(layout.shard_path(&tag_for_cwd(&a)))
+            .unwrap()
+            .execute("UPDATE shard_meta SET cwd = '/somewhere/else'", [])
+            .unwrap();
+        // A shard file copied under another checkout's name.
+        std::fs::copy(
+            layout.shard_path(&tag_for_cwd(&a)),
+            layout.shard_path(&tag_for_cwd(&b)),
+        )
+        .unwrap();
+
+        let s = sharded(dir.path());
+        let err = s.new_session_id(&a).unwrap_err().to_string();
+        assert!(err.contains("tag collision"), "{err}");
+        let err = s.new_session_id(&b).unwrap_err().to_string();
+        assert!(err.contains("records tag"), "{err}");
+        assert!(s.get(&tagged_session_id(&tag_for_cwd(&b))).is_none());
+    }
+
+    #[test]
+    fn box_wide_reads_cover_the_legacy_file_and_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sharded(dir.path());
+        let a = s.new_session_id(&dir.path().join("a")).unwrap();
+        let b = s.new_session_id(&dir.path().join("b")).unwrap();
+        for (sid, cost) in [("rtr-legacy", 0.10), (a.as_str(), 0.20), (b.as_str(), 0.40)] {
+            s.upsert(sid.into(), session("claude"));
+            let id = format!("{sid}-req");
+            s.start_llm_request(&request(&id, sid));
+            let usage = LlmRequestUsage {
+                input: 10,
+                output: 5,
+                ..Default::default()
+            };
+            s.finish_llm_request(&id, 200, 5, &usage, cost, None);
+            s.log(sid, &chunk("x"));
+        }
+
+        assert!((s.llm_cost_since("claude", None, 0) - 0.70).abs() < 1e-9);
+        // The finish found its request in the shard the start wrote.
+        assert!((s.get(&b).unwrap().llm_request_cost_usd - 0.40).abs() < 1e-9);
+
+        // A separate read-only process sees every file.
+        let legacy = dir.path().join("state.db");
+        let reader = StateStore::open_readonly(&legacy, Retention::default()).unwrap();
+        let analytics = reader
+            .analytics(AnalyticsRange {
+                from_sec: None,
+                to_end_sec: None,
+            })
+            .unwrap();
+        assert_eq!(analytics.sessions.len(), 3);
+        assert_eq!(analytics.llm_requests.len(), 3);
+        // Same day, agent, class, and kind in three files: one bucket.
+        assert_eq!(analytics.daily.len(), 1, "{:?}", analytics.daily);
+        assert_eq!(analytics.daily[0].entries, 3);
+        assert_eq!(reader.all().len(), 3);
+        assert!(reader.find_by_downstream("claude", "d").is_some());
+
+        let health = reader.health().unwrap();
+        let mut files = vec![legacy.clone()];
+        files.extend(
+            s.layout
+                .list_shards()
+                .iter()
+                .map(|t| s.layout.shard_path(t)),
+        );
+        let (db, wal): (Vec<u64>, Vec<u64>) = files
+            .iter()
+            .map(|path| (file_len(path), file_len(&wal_path(path))))
+            .unzip();
+        assert_eq!(health.db_bytes, db.iter().sum::<u64>());
+        assert_eq!(health.wal_bytes, wal.iter().sum::<u64>());
+        assert_eq!(health.db_path, legacy.display().to_string());
+    }
+
+    #[test]
+    fn delegates_live_with_their_parent_and_report_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sharded(dir.path());
+        let checkout = dir.path().join("a");
+        let parent = s.new_session_id(&checkout).unwrap();
+        let child = format!("{parent}::delegate-down-1");
+        s.upsert(parent.clone(), session("claude"));
+        s.note_delegation_directive(&parent);
+        s.upsert(
+            child.clone(),
+            PersistedSession {
+                parent_session_id: Some(parent.clone()),
+                kind: "delegate".into(),
+                ..session("grok")
+            },
+        );
+        s.log(
+            &child,
+            &LogEntry {
+                kind: "agent_response".into(),
+                role: "agent".into(),
+                summary: "done".into(),
+                ..Default::default()
+            },
+        );
+        s.upsert("rtr-legacy".into(), session("codex"));
+
+        let mut both = vec![parent.clone(), child.clone()];
+        both.sort();
+        assert_eq!(
+            sessions_in(&s.layout.shard_path(&tag_for_cwd(&checkout))),
+            both
+        );
+        let kids = s
+            .delegate_children(&[parent.clone(), "rtr-legacy".into()])
+            .unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].id, child);
+        assert!(kids[0].has_response);
+        let report = s.delegation_report(10);
+        assert_eq!(report.prompted_sessions, 1);
+        assert_eq!(report.sessions_that_delegated, 1);
+    }
+
+    #[test]
+    fn a_busy_shard_keeps_its_rows_queued_without_holding_back_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sharded(dir.path());
+        let a_dir = dir.path().join("a");
+        let a = s.new_session_id(&a_dir).unwrap();
+        let b = s.new_session_id(&dir.path().join("b")).unwrap();
+        s.upsert(a.clone(), session("claude"));
+        s.upsert(b.clone(), session("claude"));
+        let locker = Connection::open(s.layout.shard_path(&tag_for_cwd(&a_dir))).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        s.log_buffered(&a, chunk("a1"));
+        s.log_buffered(&b, chunk("b1"));
+        assert!(s.flush_log().is_err());
+        assert_eq!(s.pending_log_rows(), 1, "b's row is written");
+        assert_eq!(texts(&s.selected_logs(&b, 10, None).unwrap()), ["b1"]);
+
+        locker.execute_batch("COMMIT").unwrap();
+        s.flush_log().unwrap();
+        assert_eq!(s.pending_log_rows(), 0);
+        assert_eq!(s.dropped_log_rows(), 0);
+        assert_eq!(texts(&s.log_for_all(&a).unwrap()), ["a1"]);
+    }
+
+    #[test]
+    fn a_readonly_store_never_creates_a_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        StateStore::load(&path, Retention::default());
+        let reader = StateStore::open_readonly(&path, Retention::default()).unwrap();
+        let ghost = tagged_session_id(&tag_for_cwd(Path::new("/nowhere")));
+
+        assert!(reader.session_metadata(&ghost).is_none());
+        assert!(reader.selected_logs(&ghost, 10, None).unwrap().is_empty());
+        assert!(reader.delegate_children(&[ghost]).unwrap().is_empty());
+        assert!(!dir.path().join("shards").exists());
+    }
+
+    #[test]
+    fn a_new_shard_is_born_with_incremental_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sharded(dir.path());
+        s.new_session_id(dir.path()).unwrap();
+        let shard = Connection::open(s.layout.shard_path(&tag_for_cwd(dir.path()))).unwrap();
+        let mode: i64 = shard
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 2);
     }
 }

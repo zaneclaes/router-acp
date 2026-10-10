@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use router_acp::state::{LogEntry, PersistedSession, Retention, StateStore};
+use router_acp::state_layout::{ShardingMode, StateLayout, tag_for_cwd};
 use serde_json::{Value, json};
 
 const DAY_START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
@@ -323,4 +324,124 @@ fn v1_state_queries_keep_kory_consumer_shapes_and_retention_boundary() {
     assert_envelope(&transcript, "transcript");
     assert_eq!(transcript["data"]["entries"].as_array().unwrap().len(), 2);
     assert_eq!(transcript["data"]["entries"][0]["ts"], DAY_START + 10);
+}
+
+/// Keys only: two outputs with this shape differ in values, never in schema.
+fn shape(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), shape(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.first().map(shape).into_iter().collect()),
+        _ => Value::Null,
+    }
+}
+
+fn populate(store: &StateStore, parent: &str) {
+    let child = format!("{parent}::delegate-down");
+    store.upsert(parent.into(), session(None, "primary", "Parent", DAY_START));
+    store.note_delegation_directive(parent);
+    store.upsert(
+        child.clone(),
+        session(Some(parent), "delegate", "Child", DAY_START + 60),
+    );
+    for (sid, kind) in [
+        (parent, "user_prompt"),
+        (child.as_str(), "delegate_task"),
+        (child.as_str(), "agent_response"),
+    ] {
+        store.log(
+            sid,
+            &LogEntry {
+                kind: kind.into(),
+                role: "router".into(),
+                summary: kind.into(),
+                detail: Some(json!({"text": kind})),
+                tokens_input: 1,
+                ..Default::default()
+            },
+        );
+    }
+}
+
+#[test]
+fn v1_shapes_are_unchanged_when_sessions_live_in_shards() {
+    let week = Retention {
+        max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+    };
+    let plain = tempfile::tempdir().unwrap();
+    let plain_config = plain.path().join("router.yaml");
+    write_config(&plain_config, &plain.path().join("state.db"));
+    populate(
+        &StateStore::load(&plain.path().join("state.db"), week),
+        "rtr-parent",
+    );
+
+    let sharded = tempfile::tempdir().unwrap();
+    let sharded_state = sharded.path().join("state.db");
+    let sharded_config = sharded.path().join("router.yaml");
+    write_config(&sharded_config, &sharded_state);
+    let store = StateStore::try_load_with(&sharded_state, week, ShardingMode::Cwd).unwrap();
+    let parent = store
+        .new_session_id(&sharded.path().join("checkout"))
+        .unwrap();
+    populate(&store, &parent);
+    drop(store);
+    let shard =
+        StateLayout::new(&sharded_state).shard_path(&tag_for_cwd(&sharded.path().join("checkout")));
+    assert!(shard.exists());
+
+    let range = [
+        "analytics".to_string(),
+        "--from-sec".into(),
+        DAY_START.to_string(),
+        "--to-end-sec".into(),
+        (DAY_START + 86_400).to_string(),
+    ];
+    for (plain_args, sharded_args) in ["session", "title", "delegates", "logs", "transcript"]
+        .iter()
+        .map(|command| {
+            (
+                vec![command.to_string(), "--session".into(), "rtr-parent".into()],
+                vec![command.to_string(), "--session".into(), parent.clone()],
+            )
+        })
+        .chain(
+            [
+                vec!["health".to_string()],
+                vec!["delegation-report".into()],
+                range.to_vec(),
+            ]
+            .into_iter()
+            .map(|args| (args.clone(), args)),
+        )
+    {
+        fn args(list: &[String]) -> Vec<&str> {
+            list.iter().map(String::as_str).collect()
+        }
+        let expected = query(&plain_config, &args(&plain_args));
+        let actual = query(&sharded_config, &args(&sharded_args));
+        assert_eq!(shape(&actual), shape(&expected), "{sharded_args:?}");
+        assert_ne!(
+            actual["data"],
+            json!({}),
+            "{sharded_args:?} found the shard: {actual}"
+        );
+    }
+
+    let delegates = query(&sharded_config, &["delegates", "--session", &parent]);
+    assert_eq!(delegates["data"]["children"][0]["hasResponse"], true);
+    let health = query(&sharded_config, &["health"]);
+    let size = |path: &Path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        health["data"]["dbBytes"],
+        size(&sharded_state) + size(&shard),
+        "{health}"
+    );
+    assert_eq!(
+        health["data"]["dbPath"],
+        sharded_state.display().to_string()
+    );
 }
