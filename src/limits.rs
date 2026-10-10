@@ -88,6 +88,49 @@ pub fn response_is_model_capacity(text: &str) -> bool {
         .eq_ignore_ascii_case("Selected model is at capacity. Please try a different model")
 }
 
+/// A native Codex transport failure can arrive as ordinary assistant text,
+/// even after useful text and tools. Require the matching HTTP failure from
+/// this exact turn, so quoting an old error in a successful answer cannot
+/// initiate recovery. Return the start of the terminal error paragraph.
+pub fn response_transport_outage(text: &str, status: Option<u16>) -> Option<usize> {
+    let status = status.filter(|status| (500..600).contains(status))?;
+    let prefix = format!("unexpected status {status} ");
+    let start = text.rfind(&prefix)?;
+    if start != 0 && !text[..start].ends_with("\n\n") {
+        return None;
+    }
+    let error = text[start..].trim();
+    (error.contains(": upstream connect error or disconnect/reset before headers.")
+        && !error.contains('\n')
+        && error.contains("url: ")
+        && error.contains("cf-ray: "))
+    .then_some(start)
+}
+
+#[cfg(test)]
+mod transport_reply_tests {
+    use super::response_transport_outage;
+
+    const ERROR: &str = "unexpected status 503 Service Unavailable: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, url: http://127.0.0.1:1234/responses, cf-ray: synthetic-IAD";
+
+    #[test]
+    fn terminal_transport_error_requires_matching_turn_failure() {
+        assert_eq!(response_transport_outage(ERROR, Some(503)), Some(0));
+        let partial = format!("Published the completed artifact.\n\n{ERROR}\n\n");
+        assert_eq!(response_transport_outage(&partial, Some(503)), Some(35));
+        for status in [None, Some(200), Some(400), Some(502)] {
+            assert_eq!(response_transport_outage(ERROR, status), None);
+        }
+        for quoted in [
+            format!("The log says {ERROR}"),
+            format!("```\n{ERROR}\n```"),
+            format!("{ERROR}\nThe retry succeeded."),
+        ] {
+            assert_eq!(response_transport_outage(&quoted, Some(503)), None);
+        }
+    }
+}
+
 pub fn is_rate_limit_text(lower: &str) -> bool {
     lower.contains("rate limit")
         || lower.contains("rate-limit")

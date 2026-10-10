@@ -10180,3 +10180,109 @@ async fn model_at_capacity_reply_passes_through_when_disabled() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn transport_error_as_text_recovers_the_human_pick_with_hot_context() {
+    use axum::http::StatusCode;
+    use axum::{Router, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for (enabled, recovers) in [(true, true), (false, true), (true, false)] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = Router::new().route("/responses", post(move || {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 || !recovers {
+                    (StatusCode::SERVICE_UNAVAILABLE, "upstream connect error or disconnect/reset before headers. reset reason: remote connection failure")
+                } else {
+                    (StatusCode::OK, "{}")
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = temp_state_file("transport-text");
+        let log = temp_log("transport-text");
+        let yaml = format!(
+            "state_file: {}\ndelegation: {{ enabled: false }}\n\
+             auto_upgrade: {{ enabled: false }}\n\
+             failover: {{ enabled: {enabled}, respawn_cooldown_secs: 0, max_attempts: 2 }}\n\
+             llm_proxy: {{ enabled: true, listen: '127.0.0.1:0' }}\nagents:\n{}\
+             \x20   llm_proxy:\n      base_url_env: OPENAI_BASE_URL\n\
+             \x20     upstream_base_url: 'http://{address}'\n      protocol: openai\n",
+            state.display(),
+            agent_yaml(
+                "a",
+                &[("m1", 1)],
+                &[
+                    ("MOCK_PROXY_REPLY", "1"),
+                    ("MOCK_LOG", &log.display().to_string())
+                ]
+            ),
+        );
+        let log_for_test = log.clone();
+        run_test_shared(yaml, async move |cx, observed, shared| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            let result = prompt_text(
+                &cx,
+                &sid,
+                "[router: candidate=a/m1]\nTEXT:Artifact published.\nTOOL:edit",
+            )
+            .await;
+            let text = agent_text(&observed, &sid);
+            if enabled && recovers {
+                result?;
+                assert_eq!(requests.load(Ordering::SeqCst), 2, "one recovery, same pin");
+                assert!(text.contains("Provider transport unavailable"), "{text}");
+                assert!(text.contains("tool:edit"), "replacement answered: {text}");
+                let prompts: Vec<_> = read_log(&log_for_test)
+                    .into_iter()
+                    .filter(|e| e["event"] == "prompt")
+                    .collect();
+                assert_eq!(prompts.len(), 2);
+                assert_eq!(prompts[1]["model"], "m1");
+                let partial = shared.state.lock().unwrap().log_for(&sid, 100);
+                let saved = partial
+                    .iter()
+                    .find(|entry| {
+                        entry.kind == "agent_response"
+                            && entry
+                                .detail
+                                .as_ref()
+                                .and_then(|d| d["interrupted"].as_bool())
+                                == Some(true)
+                    })
+                    .expect("partial progress is saved for recovery");
+                assert!(saved.summary.contains("Artifact published."));
+                assert!(!saved.summary.contains("unexpected status"));
+                let retry = prompts[1]["text"].as_str().unwrap();
+                assert!(retry.contains("Do not repeat completed actions"), "{retry}");
+                assert!(
+                    retry.contains(" transcript --state "),
+                    "history lookup: {retry}"
+                );
+                // A later successful turn must not inherit the old HTTP 503.
+                prompt_text(&cx, &sid, "next task").await?;
+                assert_eq!(requests.load(Ordering::SeqCst), 3);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "failed HTTP request must not complete successfully"
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), if enabled { 2 } else { 1 });
+                assert!(text.contains("unexpected status 503"), "{text}");
+                if enabled {
+                    assert!(text.contains("failover attempt limit reached"), "{text}");
+                } else {
+                    assert!(!text.contains("failing over"), "{text}");
+                }
+            }
+            Ok(())
+        })
+        .await;
+        server.abort();
+    }
+}
