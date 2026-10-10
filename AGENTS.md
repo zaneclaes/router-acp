@@ -335,7 +335,10 @@ SDK traps below, which were all discovered the hard way.
     policy through ACP with native readings, sibling accounts and grant expiry.
 - **Per-request LLM proxy** (`llm_proxy.*` + `agents[].llm_proxy`, off by
   default): bind the loopback listener before spawning adapters, then inject
-  their process-level base URL. Forward auth, paths, query strings, and SSE;
+  their process-level base URL. Forward paths, query strings, and SSE;
+  managed Claude accounts read canonical authorization per request and retry
+  one HTTP 401 through the credential manager. Other targets pass auth through.
+  A 401 must never cordon a pinned model or trigger alternate-model retries.
   normalize upstream `Accept-Encoding` to `identity` so usage can be accounted;
   only rewrite the inference body's top-level `model`. `models[].
   api_model` maps ACP aliases to provider ids. Request routing stays within the

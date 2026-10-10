@@ -121,7 +121,7 @@ impl LlmProxyRuntime {
             let Some(proxy) = agent.llm_proxy.clone() else {
                 continue;
             };
-            let token = target_token(&spec.key);
+            let token = uuid::Uuid::new_v4().to_string();
             targets_by_token.insert(
                 token.clone(),
                 ProxyTarget {
@@ -161,7 +161,15 @@ impl LlmProxyRuntime {
             return;
         };
         for spec in specs {
-            let token = target_token(&spec.key);
+            // The route grants access to managed account credentials. Preserve
+            // it for existing adapters, but never derive it from a public key.
+            let token = self
+                .token_by_key
+                .lock()
+                .unwrap()
+                .get(&spec.key)
+                .cloned()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             self.targets_by_token.lock().unwrap().insert(
                 token.clone(),
                 ProxyTarget {
@@ -563,7 +571,7 @@ async fn proxy_request(
     };
     // A version without system turns gets neither the turns nor the beta
     // tokens that announce them — a beta the model lacks is itself a 400.
-    let outbound_headers = if decision.as_ref().is_some_and(|d| d.fold_system_turns) {
+    let mut outbound_headers = if decision.as_ref().is_some_and(|d| d.fold_system_turns) {
         strip_system_turn_betas(&parts.headers)
     } else {
         parts.headers.clone()
@@ -573,6 +581,29 @@ async fn proxy_request(
         Ok(url) => url,
         Err(err) => return error_response(StatusCode::BAD_GATEWAY, &err),
     };
+    // Authentication belongs to the account, even when concurrent ACP turns
+    // make model attribution ambiguous. Never use the adapter's launch token
+    // as a fallback for a removed or unreadable managed credential.
+    let managed_agent = state.shared.agent_configs().into_iter().find(|agent| {
+        agent.name == target.agent
+            && target.config.protocol == LlmWireProtocol::Anthropic
+            && crate::accounts::provider(agent) == Some("claude")
+    });
+    let mut observed = None;
+    if let Some(agent) = &managed_agent {
+        match crate::credentials::claude_access(agent).await {
+            Ok(access) => {
+                if set_claude_authorization(&mut outbound_headers, &access.token).is_err() {
+                    return credential_error(crate::credentials::RepairOutcome::Unknown);
+                }
+                observed = Some(access.generation);
+            }
+            Err(outcome) => {
+                crate::auth::sync_from_manager(&state.shared, agent);
+                return credential_error(outcome);
+            }
+        }
+    }
     let request_id = format!("llm-{}", uuid::Uuid::new_v4());
     let started = Instant::now();
     let first_request = build_upstream_request(
@@ -580,7 +611,7 @@ async fn proxy_request(
         &parts.method,
         upstream_url.clone(),
         &outbound_headers,
-        outbound_body,
+        outbound_body.clone(),
     );
     let mut upstream = match first_request.send().await {
         Ok(response) => response,
@@ -612,7 +643,74 @@ async fn proxy_request(
         }
     };
 
-    if upstream.status().is_client_error() || upstream.status().is_server_error() {
+    // Retry only the rejected HTTP request, before any response is streamed.
+    // Release that response first: repair takes the shared credential lock and
+    // must not pin an upstream connection. A sibling may already have rotated
+    // the credential. The manager compares the marker from the exact token sent
+    // and reuses that repair. A failed repair is not a second provider call.
+    if upstream.status() == StatusCode::UNAUTHORIZED
+        && let Some(agent) = &managed_agent
+    {
+        drop(upstream);
+        let outcome = crate::credentials::repair(agent, observed.as_deref()).await;
+        crate::auth::sync_from_manager(&state.shared, agent);
+        if outcome != crate::credentials::RepairOutcome::Repaired {
+            record_proxy_result(
+                &state,
+                &target,
+                attributed.as_ref(),
+                decision.as_ref(),
+                &rest,
+                &body,
+                &request_id,
+                started,
+                outcome_status(&outcome),
+                &[],
+                Some("credential repair did not replace the rejected request".into()),
+            );
+            return credential_error(outcome);
+        }
+        match crate::credentials::claude_access(agent).await {
+            Ok(access) => {
+                if set_claude_authorization(&mut outbound_headers, &access.token).is_err() {
+                    return credential_error(crate::credentials::RepairOutcome::Unknown);
+                }
+                match build_upstream_request(
+                    &state.runtime.client,
+                    &parts.method,
+                    upstream_url.clone(),
+                    &outbound_headers,
+                    outbound_body,
+                )
+                .send()
+                .await
+                {
+                    Ok(response) => upstream = response,
+                    Err(err) => {
+                        record_proxy_result(
+                            &state,
+                            &target,
+                            attributed.as_ref(),
+                            decision.as_ref(),
+                            &rest,
+                            &body,
+                            &request_id,
+                            started,
+                            StatusCode::BAD_GATEWAY,
+                            &[],
+                            Some(format!("credential retry failed: {err}")),
+                        );
+                        return error_response(StatusCode::BAD_GATEWAY, "credential retry failed");
+                    }
+                }
+            }
+            Err(outcome) => return credential_error(outcome),
+        }
+    }
+
+    if (upstream.status().is_client_error() || upstream.status().is_server_error())
+        && upstream.status() != StatusCode::UNAUTHORIZED
+    {
         // A rejected PIN rewrite is never recovered by retrying the original
         // body. The original names whatever the downstream alias resolves to,
         // so the retry would serve a different model while the session stays
@@ -667,11 +765,20 @@ async fn proxy_request(
                     .rejected_api_models
                     .insert(decision.model.clone());
             }
+            // The original body may carry system turns, so it needs the
+            // original beta headers. Keep the account's current authorization.
+            let mut retry_headers = parts.headers.clone();
+            if let Some(authorization) = outbound_headers.get(axum::http::header::AUTHORIZATION)
+                && managed_agent.is_some()
+            {
+                retry_headers.insert(axum::http::header::AUTHORIZATION, authorization.clone());
+                retry_headers.remove("x-api-key");
+            }
             let retry = build_upstream_request(
                 &state.runtime.client,
                 &parts.method,
                 upstream_url,
-                &parts.headers,
+                &retry_headers,
                 body.to_vec(),
             )
             .send()
@@ -799,6 +906,65 @@ fn build_upstream_request(
         }
     }
     request
+}
+
+fn set_claude_authorization(headers: &mut HeaderMap, token: &str) -> Result<(), ()> {
+    let mut value =
+        axum::http::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| ())?;
+    value.set_sensitive(true);
+    headers.insert(axum::http::header::AUTHORIZATION, value);
+    headers.remove("x-api-key");
+    Ok(())
+}
+
+fn credential_error(outcome: crate::credentials::RepairOutcome) -> Response<Body> {
+    if outcome == crate::credentials::RepairOutcome::Rejected {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "Credential refresh rejected. Sign in again with /login.",
+        )
+    } else {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Managed credential temporarily unavailable",
+        )
+    }
+}
+
+fn outcome_status(outcome: &crate::credentials::RepairOutcome) -> StatusCode {
+    if *outcome == crate::credentials::RepairOutcome::Rejected {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_proxy_result(
+    state: &ProxyServerState,
+    target: &ProxyTarget,
+    active: Option<&ActiveTurn>,
+    decision: Option<&RequestDecision>,
+    rest: &str,
+    body: &[u8],
+    request_id: &str,
+    started: Instant,
+    status: StatusCode,
+    captured: &[u8],
+    error: Option<String>,
+) {
+    if let Some(context) = start_request_record(
+        state, target, active, decision, rest, body, request_id, started,
+    ) {
+        complete_request(
+            &state.shared,
+            &state.runtime,
+            context,
+            status.as_u16(),
+            captured,
+            error,
+        );
+    }
 }
 
 /// A provider rejection of a PIN rewrite: cordon the pinned candidate with the
@@ -2296,11 +2462,6 @@ fn automation_hint(meta: Option<&agent_client_protocol::schema::v1::Meta>) -> bo
     matches!(hint, "automation" | "ci-poll" | "ship-nudge")
 }
 
-fn target_token(key: &ProcessKey) -> String {
-    let digest = format!("{:x}", Sha256::digest(key.0.as_bytes()));
-    digest[..20].to_string()
-}
-
 fn protocol_name(protocol: LlmWireProtocol) -> &'static str {
     match protocol {
         LlmWireProtocol::Anthropic => "anthropic",
@@ -2612,9 +2773,209 @@ fn request_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Two independent router runtimes share only the canonical store. The
+    // upstream rotates it while rejecting the old access token, like a sibling
+    // router completing refresh during an in-flight request.
+    #[tokio::test]
+    async fn managed_claude_proxy_reloads_credentials_without_replaying_the_turn() {
+        #[derive(Clone)]
+        struct Fixture {
+            path: std::path::PathBuf,
+            calls: Arc<Mutex<Vec<(String, Value)>>>,
+            reject_new: Arc<std::sync::atomic::AtomicBool>,
+        }
+        async fn upstream(
+            State(fixture): State<Fixture>,
+            headers: HeaderMap,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response<Body> {
+            let authorization = headers["authorization"].to_str().unwrap().to_string();
+            assert!(!headers.contains_key("x-api-key"));
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .push((authorization.clone(), body));
+            if authorization == "Bearer synthetic-old" {
+                let temp = fixture
+                    .path
+                    .with_extension(uuid::Uuid::new_v4().to_string());
+                std::fs::write(
+                    &temp,
+                    json!({"claudeAiOauth": {
+                        "accessToken": "synthetic-new", "expiresAt": 4070908800000u64
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+                std::fs::rename(temp, &fixture.path).unwrap();
+                return error_response(StatusCode::UNAUTHORIZED, "expired");
+            }
+            assert_eq!(authorization, "Bearer synthetic-new");
+            if fixture.reject_new.load(Ordering::SeqCst) {
+                return error_response(StatusCode::UNAUTHORIZED, "still rejected");
+            }
+            Response::new(Body::from("accepted"))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            json!({"claudeAiOauth": {
+                "accessToken":"synthetic-old", "expiresAt":4070908800000u64
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let fixture = Fixture {
+            path,
+            calls: Arc::new(Mutex::new(vec![])),
+            reject_new: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/messages", axum::routing::post(upstream))
+            .with_state(fixture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let make_state = |name: &str| {
+            let yaml = format!(
+                r#"
+state_file: {state}
+llm_proxy: {{ enabled: true }}
+agents:
+  - name: claude@test
+    command:
+      type: stdio
+      command: mock-agent
+      env: [{{ name: CLAUDE_CONFIG_DIR, value: {directory} }}]
+    model_selection: {{ type: config-option }}
+    models: [{{ id: opus, cost_rank: 1 }}]
+    llm_proxy:
+      protocol: anthropic
+      base_url_env: ANTHROPIC_BASE_URL
+      upstream_base_url: http://{addr}/v1
+"#,
+                state = dir.path().join(name).display(),
+                directory = dir.path().display()
+            );
+            let shared = Shared::new(crate::config::Config::from_yaml(&yaml).unwrap()).unwrap();
+            ProxyServerState {
+                runtime: shared.llm_proxy.clone(),
+                shared,
+            }
+        };
+        let states = [make_state("one.db"), make_state("two.db")];
+        assert_ne!(
+            states[0].runtime.token_by_key.lock().unwrap()[&ProcessKey("claude@test".into())],
+            states[1].runtime.token_by_key.lock().unwrap()[&ProcessKey("claude@test".into())],
+            "each router must grant an unguessable, independent account route"
+        );
+        let body = json!({"model":"opus", "messages":[{"role":"user","content":[
+            {"type":"tool_result", "tool_use_id":"already-completed", "content":"done"}
+        ]}]});
+        let requests = (0..8).map(|i| {
+            let state = states[i % 2].clone();
+            let body = body.clone();
+            async move {
+                let token = state.runtime.token_by_key.lock().unwrap()
+                    [&ProcessKey("claude@test".into())]
+                    .clone();
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("authorization", "Bearer synthetic-launch-snapshot")
+                    .header("x-api-key", "synthetic-wrong-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = proxy_request(state, token, "v1/messages".into(), request).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    to_bytes(response.into_body(), 1024).await.unwrap(),
+                    "accepted"
+                );
+            }
+        });
+        futures::future::join_all(requests).await;
+        {
+            let calls = fixture.calls.lock().unwrap();
+            assert!(calls.len() > 8 && calls.len() <= 16);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(auth, _)| auth == "Bearer synthetic-new")
+                    .count(),
+                8
+            );
+            assert!(calls.iter().all(|(_, sent)| sent == &body));
+        }
+        fixture.calls.lock().unwrap().clear();
+        fixture.reject_new.store(true, Ordering::SeqCst);
+        std::fs::write(
+            &fixture.path,
+            json!({"claudeAiOauth": {
+                "accessToken":"synthetic-old", "expiresAt":4070908800000u64
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let token = states[0].runtime.token_by_key.lock().unwrap()
+            [&ProcessKey("claude@test".into())]
+            .clone();
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer synthetic-launch-snapshot")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let response = proxy_request(
+            states[0].clone(),
+            token.clone(),
+            "v1/messages".into(),
+            request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(fixture.calls.lock().unwrap().len(), 2, "one retry only");
+        let agent = &states[0].shared.agent_configs()[0];
+        assert!(!matches!(
+            crate::credentials::availability(agent),
+            crate::auth::AuthAvailability::Unauthenticated { .. }
+        ));
+        std::fs::remove_file(&fixture.path).unwrap();
+        let response =
+            proxy_request(states[0].clone(), token, "v1/messages".into(), request()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            2,
+            "missing credentials never fall back to the launch token"
+        );
+        server.abort();
+    }
     use crate::candidate::EffortLevel;
     use crate::session::RouterSession;
     use crate::state::PersistedSession;
+
+    /// Wire tests name a Claude adapter, so the proxy reads canonical
+    /// credentials. Keep that store synthetic and inside the test directory.
+    fn claude_credential_dir(dir: &std::path::Path) -> std::path::PathBuf {
+        let store = dir.join("claude-home");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","expiresAt":4070908800000}}"#,
+        )
+        .unwrap();
+        store
+    }
 
     fn policy_shared(minimum_dwell_requests: u32) -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
@@ -2715,7 +3076,7 @@ llm_proxy:
   verdict_ttl_secs: 900
 agents:
   - name: claude
-    command: {{ type: stdio, command: claude-agent-acp }}
+    command: {{ type: stdio, command: claude-agent-acp, env: [{{ name: CLAUDE_CONFIG_DIR, value: {} }}] }}
     model_selection: {{ type: config-option }}
     llm_proxy:
       protocol: anthropic
@@ -2747,7 +3108,8 @@ agents:
           - api_model: claude-fable-5-1
             pricing: {{ input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }}
 {extra}"#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            claude_credential_dir(dir.path()).display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg).unwrap();
@@ -4348,7 +4710,7 @@ llm_proxy:
   minimum_dwell_requests: 0
 agents:
   - name: claude
-    command: {{ type: stdio, command: claude-agent-acp }}
+    command: {{ type: stdio, command: claude-agent-acp, env: [{{ name: CLAUDE_CONFIG_DIR, value: {} }}] }}
     model_selection: {{ type: config-option }}
     llm_proxy:
       protocol: anthropic
@@ -4362,7 +4724,8 @@ agents:
 pinned_versions:
   "claude/opus[1m]": claude-opus-4-6
 "#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            claude_credential_dir(dir.path()).display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg.clone()).unwrap();
@@ -4515,7 +4878,7 @@ llm_proxy:
   minimum_dwell_requests: 0
 agents:
   - name: claude
-    command: {{ type: stdio, command: claude-agent-acp }}
+    command: {{ type: stdio, command: claude-agent-acp, env: [{{ name: CLAUDE_CONFIG_DIR, value: {} }}] }}
     model_selection: {{ type: config-option }}
     llm_proxy:
       protocol: anthropic
@@ -4529,7 +4892,8 @@ agents:
 pinned_versions:
   "claude/opus[1m]": claude-opus-4-6
 "#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            claude_credential_dir(dir.path()).display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg.clone()).unwrap();
@@ -4701,7 +5065,7 @@ llm_proxy:
   minimum_dwell_requests: 0
 agents:
   - name: claude
-    command: {{ type: stdio, command: claude-agent-acp }}
+    command: {{ type: stdio, command: claude-agent-acp, env: [{{ name: CLAUDE_CONFIG_DIR, value: {} }}] }}
     model_selection: {{ type: config-option }}
     llm_proxy:
       protocol: anthropic
@@ -4717,7 +5081,8 @@ agents:
 pinned_versions:
   "claude/claude-fable-5[1m]": claude-fable-5-1
 "#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            claude_credential_dir(dir.path()).display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg.clone()).unwrap();
@@ -4903,7 +5268,7 @@ llm_proxy:
   minimum_dwell_requests: 0
 agents:
   - name: claude
-    command: {{ type: stdio, command: claude-agent-acp }}
+    command: {{ type: stdio, command: claude-agent-acp, env: [{{ name: CLAUDE_CONFIG_DIR, value: {} }}] }}
     model_selection: {{ type: config-option }}
     llm_proxy:
       protocol: anthropic
@@ -4919,7 +5284,8 @@ agents:
 pinned_versions:
   "claude/claude-fable-5[1m]": claude-fable-5-1
 "#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            claude_credential_dir(dir.path()).display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg).unwrap();
