@@ -1811,7 +1811,11 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
     // tool results, including output from a cancelled or interrupted turn.
     // Normal streaming stays batched. A pending planner delivery instead uses
     // a checked write, so its receipt never claims an unavailable transcript.
-    let pending_delivery = shared.planner_deliveries.lock().unwrap().contains_key(router_sid);
+    let pending_delivery = shared
+        .planner_deliveries
+        .lock()
+        .unwrap()
+        .contains_key(router_sid);
     let entry = crate::state::LogEntry {
         kind: "session_update".into(),
         role: "agent".into(),
@@ -1829,7 +1833,12 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
     };
     if let Err(err) = &saved {
         tracing::warn!(session = router_sid, %err, "could not persist provider conversation update");
-        if let Some(delivery) = shared.planner_deliveries.lock().unwrap().get_mut(router_sid) {
+        if let Some(delivery) = shared
+            .planner_deliveries
+            .lock()
+            .unwrap()
+            .get_mut(router_sid)
+        {
             delivery.persistence_failed = true;
         }
     }
@@ -1839,9 +1848,10 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         .unwrap_or("");
     if saved.is_ok()
         && matches!(
-        kind,
-        "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"
-    ) && let Err(error) = crate::planner_workflow::confirm_delivery(shared, router_sid)
+            kind,
+            "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"
+        )
+        && let Err(error) = crate::planner_workflow::confirm_delivery(shared, router_sid)
     {
         tracing::warn!(session = router_sid, %error, "could not persist original input delivery");
     }
@@ -5729,9 +5739,9 @@ pub(crate) async fn run_primary_turn(
         if persistence_error.is_none()
             && !planner_delivery_persistence_failed
             && (result.is_ok()
-            || shared
-                .with_session(&router_sid, |s| s.turn_saw_output)
-                .unwrap_or(false))
+                || shared
+                    .with_session(&router_sid, |s| s.turn_saw_output)
+                    .unwrap_or(false))
             && let Some(input_id) = crate::planner_workflow::prompt_input_id(&req)
             && crate::planner_workflow::load(&shared, &router_sid)
                 .ok()
@@ -8664,7 +8674,9 @@ fn on_prompt(
                 &crate::state::LogEntry {
                     kind: "context_injection".into(),
                     role: "router".into(),
-                    detail: Some(json!({"prompt": req.prompt[..req.prompt.len() - original_blocks]})),
+                    detail: Some(
+                        json!({"prompt": req.prompt[..req.prompt.len() - original_blocks]}),
+                    ),
                     ..Default::default()
                 },
             );
@@ -8758,18 +8770,25 @@ fn prepare_parent_prompt_inner(
         return Err(AcpError::invalid_params().data("unknown session id"));
     }
     let prompt_text = prompt_display_text(&req.prompt);
-    shared.state.lock().unwrap().log_checked(
-        &router_sid,
-        &crate::state::LogEntry {
-            kind: "user_prompt".into(),
-            role: "user".into(),
-            summary: prompt_text.clone(),
-            detail: Some(json!({"prompt": req.prompt})),
-            tokens_input: crate::state::estimate_tokens(&prompt_text),
-            tokens_estimated: true,
-            ..Default::default()
-        },
-    ).map_err(|err| AcpError::internal_error().data(format!("cannot save router conversation: {err}")))?;
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .log_checked(
+            &router_sid,
+            &crate::state::LogEntry {
+                kind: "user_prompt".into(),
+                role: "user".into(),
+                summary: prompt_text.clone(),
+                detail: Some(json!({"prompt": req.prompt})),
+                tokens_input: crate::state::estimate_tokens(&prompt_text),
+                tokens_estimated: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|err| {
+            AcpError::internal_error().data(format!("cannot save router conversation: {err}"))
+        })?;
     // Tracks whether the user steered routing explicitly (a `[router: …]`
     // directive or a `model:` shorthand). Either suppresses the pre-classifier
     // and planner-phase heuristics for this prompt.

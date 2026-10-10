@@ -6,6 +6,19 @@ Set `routers.planner.profile` to that repository-relative path.
 This profile supplies Chordzy policy to the generic planner roles.
 It does not add Chordzy terms to router core or to bundled generic Markdown assets.
 
+## Current staging receipt
+
+This template was refreshed against `Tuneality/Tuneality` staging
+`bb9d0c4058f12f18b4988b913c68c764c365c502`.
+Before applying it, verify the current `implement-all`, supervisor, guard, hook,
+and smokescreen sources against that receipt or a newer audited staging receipt.
+
+An explicit `implement-all` invocation transfers the existing fenced supervisor.
+It preserves worker receipts and worktrees until authoritative reconciliation.
+It never starts a second coordinator, scheduler, or watcher.
+The profile must retain the current receipt-census, checkpoint, capacity, and
+source-free handoff gates from `ImplementAllGuard`.
+
 ## Ownership
 
 `create-plan` uses the existing `.agents/skills/plan/SKILL.md` contract.
