@@ -661,6 +661,12 @@ async fn shipped_source(fixture: &Fixture, edit: impl FnOnce(&mut Value)) -> Str
     config["elevation_skill"] = json!("ship-pr");
     config["quiet_turns"] = json!(3);
     edit(&mut config);
+    // The planner run is authoritative on same-session resume. Keep this
+    // shipped fixture's durable phase consistent with its routing checkpoint.
+    if let Some((revision, mut run)) = state.planner_run(&source).unwrap() {
+        run["phase"] = json!("implementation");
+        state.save_planner_run(&source, revision, &run).unwrap();
+    }
     state
         .set_session_config(&source, &config)
         .expect("save shipped source config");
@@ -935,7 +941,10 @@ async fn a_rejected_streaming_row_still_saves_the_turns_answer() {
     client.initialize().await;
     let sid = session_id(&client.new_session(&fixture.home, None).await);
     select_m2_high(&mut client, &sid).await;
-    let db = rusqlite::Connection::open(&fixture.state).unwrap();
+    let db = rusqlite::Connection::open(
+        StateLayout::new(&fixture.state).shard_path(&tag_for_cwd(&fixture.home)),
+    )
+    .unwrap();
     db.execute_batch("CREATE TRIGGER synthetic_write_failure BEFORE INSERT ON session_log WHEN NEW.kind = 'session_update' BEGIN SELECT RAISE(FAIL, 'synthetic transcript write failure'); END;").unwrap();
     let response = client.prompt(&sid, "TEXT:still-durable", None).await;
     assert_success(&response, "prompt");

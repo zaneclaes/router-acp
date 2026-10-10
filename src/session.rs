@@ -3271,7 +3271,9 @@ pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
         .is_some()
     {
         let _ = crate::planner_workflow::mutate(shared, router_sid, |run| {
-            run.status = crate::planner_workflow::RunStatus::Paused;
+            if run.status == crate::planner_workflow::RunStatus::Running {
+                run.status = crate::planner_workflow::RunStatus::Paused;
+            }
             Ok(())
         });
     }
@@ -5924,9 +5926,7 @@ pub(crate) async fn run_primary_turn(
                 // if it has fallen below the configured threshold, queue an
                 // auto-upgrade to a more capable model for the next prompt.
                 update_confidence_and_maybe_upgrade(&shared, &router_sid, &resp);
-                if let Err(err) = crate::restoration::checkpoint(&shared, &router_sid) {
-                    return Err(err);
-                }
+                crate::restoration::checkpoint(&shared, &router_sid)?;
                 match wait_for_managed_backgrounds(&shared, &router_sid, cancellation.clone()).await
                 {
                     Ok(Some(BackgroundWait::Completed(completion))) => {

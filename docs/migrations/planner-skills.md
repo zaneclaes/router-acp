@@ -241,6 +241,25 @@ A replacement process receives a new attempt for the same work identity after th
 ## Wake and recovery
 
 The existing delegated lifecycle hook and SQLite outbox carry the `planner_wake` event.
+The parent checkout stores the planner run and its atomic wake save receipts.
+The shared control database stores workspace claims and the hook outbox.
+Only a committed save receipt permits a prepared wake to enter the outbox.
+Concurrent routers consume each prepared wake under one write transaction.
+Router startup recovers interrupted delivery and terminal cleanup.
+Terminal cleanup releases claims only after the parent session and planner run are absent.
+Older wake journals gain the save receipt column automatically.
+Existing rows without a commit receipt remain available for inspection and never enter the outbox.
+The upgrade logs their count because their original save cannot be verified.
+
+```text
+Parent checkout: planner run + atomic receipt
+                       |
+                       v
+Shared control: prepared wake -> hook outbox -> host hook
+                       |
+                       v
+Terminal cleanup journal -> verify parent absent -> release owned claims
+```
 The event includes `wake_id`, parent router session, `work_id`, `attempt_id`, revision, and router process identity.
 
 The outbox retries hook delivery.
