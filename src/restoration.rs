@@ -178,6 +178,33 @@ pub fn restore_config(
     Ok(())
 }
 
+/// Continue starts new work on the source's settings. Keep what a human chose
+/// (strategy, a user-picked model, effort, exclusions, coordinator role) and
+/// drop what the source's own work derived, so the first turn routes afresh:
+/// a finished ship flow's implementation phase, pre-class verdict, or ship-pr
+/// elevation must not skip planning for the new request.
+pub fn restore_continued_config(
+    s: &mut RouterSession,
+    persisted: &crate::state::PersistedSession,
+) -> Result<(), AcpError> {
+    restore_config(s, persisted)?;
+    if !s.pin_user_pick {
+        s.candidate_override = None;
+        s.candidate_override_source = None;
+    }
+    s.planner_phase = None;
+    s.preclass_done = false;
+    s.preclass_profile = None;
+    s.task_class = None;
+    s.task_complexity = 0.0;
+    s.elevation = None;
+    s.elevation_skill = None;
+    s.quiet_turns = 0;
+    s.escalations_done = 0;
+    s.struggle = 0.0;
+    Ok(())
+}
+
 fn stored_blocks(entry: &LogEntry) -> Option<Vec<ContentBlock>> {
     entry
         .detail
