@@ -41,6 +41,8 @@ pub fn status(config: &crate::config::Config) -> Value {
             "label":safe_text(&label),"plan":plan.map(|p| safe_text(&p)),"authState":auth,
             "credentialPresent":crate::credentials::present(agent),
             "routing":routing,
+            "windowCapacity":crate::window_capacity::status_json(snapshot.as_ref()
+                .and_then(|s| crate::window_capacity::read(&agent.name, &s.account)).as_ref()),
             "snapshot":snapshot.map(|s| serde_json::json!({"account":s.account,"access_generation":s.access_generation,
                 "updatedAt":chrono::DateTime::from_timestamp(s.fetched_at as i64, 0).map(|t| t.to_rfc3339()),
                 "fetched_at":s.fetched_at,"known":s.payload.is_some()}))})

@@ -310,6 +310,7 @@ async fn poll_all(
                 )
             }
         };
+        crate::window_capacity::record(agent, &spend_lookup, SystemTime::now());
         if !cordons.is_empty() {
             tracing::info!(
                 agent = %agent.name,
