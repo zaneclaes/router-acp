@@ -242,6 +242,22 @@ impl StateStore {
         ))
     }
 
+    /// True only when no router has created state at `path` yet: the legacy
+    /// file and the shards directory are both definitively missing (or the
+    /// directory holds no shard). Any other I/O answer, such as a permission
+    /// error, is not absence, so the caller's open reports it.
+    pub fn state_absent(path: &Path) -> bool {
+        let layout = StateLayout::new(path);
+        let missing = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        if !missing(&layout.legacy_path) {
+            return false;
+        }
+        match std::fs::read_dir(&layout.shards_dir) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(_) => layout.list_shards().is_empty(),
+        }
+    }
+
     /// Open existing state for query-only inspection. This deliberately
     /// skips schema setup, legacy import, log flushing, and maintenance, and
     /// never creates a shard.
@@ -562,7 +578,13 @@ impl StateStore {
         self.all().into_iter()
     }
 
-    pub fn find_by_downstream(&self, agent: &str, downstream_session_id: &str) -> Option<String> {
+    /// Router session id for a provider session id, searched across the
+    /// legacy file and every shard. `agent: None` matches any agent.
+    pub fn find_by_downstream(
+        &self,
+        agent: Option<&str>,
+        downstream_session_id: &str,
+    ) -> Option<String> {
         let mut found = None;
         let _ = self.each_file(|file| {
             if found.is_none() {
@@ -940,6 +962,9 @@ pub struct StateMaintenance {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateHealth {
+    /// Always true here; `state-query v1 health` answers `{"stateExists":
+    /// false}` alone before any router has created state.
+    pub state_exists: bool,
     pub db_path: String,
     pub db_bytes: u64,
     pub wal_bytes: u64,
@@ -1510,17 +1535,26 @@ impl StateFile {
         out
     }
 
-    pub fn find_by_downstream(&self, agent: &str, downstream_session_id: &str) -> Option<String> {
-        self.conn
-            .query_row(
+    pub fn find_by_downstream(
+        &self,
+        agent: Option<&str>,
+        downstream_session_id: &str,
+    ) -> Option<String> {
+        let found = match agent {
+            Some(agent) => self.conn.query_row(
                 "SELECT router_session_id FROM sessions \
                  WHERE agent = ?1 AND downstream_session_id = ?2 LIMIT 1",
                 params![agent, downstream_session_id],
                 |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
+            ),
+            None => self.conn.query_row(
+                "SELECT router_session_id FROM sessions \
+                 WHERE downstream_session_id = ?1 LIMIT 1",
+                params![downstream_session_id],
+                |r| r.get::<_, String>(0),
+            ),
+        };
+        found.optional().ok().flatten()
     }
 
     pub fn upsert(&self, router_session_id: String, session: PersistedSession) {
@@ -2450,6 +2484,7 @@ impl StateFile {
             .transpose()?
             .flatten();
         Ok(StateHealth {
+            state_exists: true,
             db_path: path.display().to_string(),
             db_bytes: file_len(path),
             wal_bytes: file_len(&wal_path(path)),
@@ -2602,7 +2637,7 @@ mod tests {
         assert_eq!(got.additional_directories, vec![PathBuf::from("/tmp/o")]);
         assert!(got.created_at.is_some() && got.updated_at.is_some());
         assert_eq!(
-            s.find_by_downstream("claude", "down-1").as_deref(),
+            s.find_by_downstream(Some("claude"), "down-1").as_deref(),
             Some("r1")
         );
     }
@@ -3471,7 +3506,7 @@ mod tests {
         assert_eq!(analytics.daily.len(), 1, "{:?}", analytics.daily);
         assert_eq!(analytics.daily[0].entries, 3);
         assert_eq!(reader.all().len(), 3);
-        assert!(reader.find_by_downstream("claude", "d").is_some());
+        assert!(reader.find_by_downstream(Some("claude"), "d").is_some());
 
         let health = reader.health().unwrap();
         let mut files = vec![legacy.clone()];

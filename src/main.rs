@@ -201,10 +201,20 @@ enum StateQueryCommand {
 
 #[derive(Subcommand)]
 enum StateQueryV1 {
-    /// Session metadata, including its title when one exists.
+    /// Session metadata, including its title when one exists. Look it up by
+    /// router session id, or by the provider's own session id with
+    /// --downstream (optionally narrowed by --agent).
     Session {
+        #[arg(
+            long,
+            required_unless_present = "downstream",
+            conflicts_with = "downstream"
+        )]
+        session: Option<String>,
         #[arg(long)]
-        session: String,
+        downstream: Option<String>,
+        #[arg(long, requires = "downstream")]
+        agent: Option<String>,
     },
     /// A session title without its full metadata record.
     Title {
@@ -623,14 +633,37 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::StateQuery { config, query } => {
             let cfg = Config::from_file(&config)?;
+            let StateQueryCommand::V1 { query } = query;
+            if matches!(query, StateQueryV1::Health)
+                && router_acp::state::StateStore::state_absent(&cfg.state_file)
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "version": router_acp::state::STATE_QUERY_VERSION,
+                        "command": "health",
+                        "data": {"stateExists": false},
+                    }))?
+                );
+                return Ok(());
+            }
             let store =
                 router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
-            let StateQueryCommand::V1 { query } = query;
             let (command, data) = match query {
-                StateQueryV1::Session { session } => (
-                    "session",
-                    serde_json::json!({"session": store.session_metadata(&session)}),
-                ),
+                StateQueryV1::Session {
+                    session,
+                    downstream,
+                    agent,
+                } => {
+                    let session = match downstream {
+                        Some(downstream) => store.find_by_downstream(agent.as_deref(), &downstream),
+                        None => session,
+                    };
+                    (
+                        "session",
+                        serde_json::json!({"session": session.and_then(|id| store.session_metadata(&id))}),
+                    )
+                }
                 StateQueryV1::Title { session } => (
                     "title",
                     serde_json::json!({"session_id": session, "title": store.session_metadata(&session).and_then(|record| record.session.title)}),

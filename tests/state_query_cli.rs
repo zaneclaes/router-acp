@@ -302,10 +302,12 @@ fn v1_state_queries_keep_kory_consumer_shapes_and_retention_boundary() {
             "freelistBytes",
             "maintenance",
             "retentionSeconds",
+            "stateExists",
             "walBytes",
         ]
     );
     assert_eq!(health["data"]["retentionSeconds"], 7 * 24 * 60 * 60);
+    assert_eq!(health["data"]["stateExists"], true);
     assert!(health["data"]["dbBytes"].as_u64().unwrap() > 0);
     assert_eq!(
         health["data"]["maintenance"],
@@ -444,4 +446,131 @@ fn v1_shapes_match_for_legacy_and_sharded_sessions() {
         health["data"]["dbPath"],
         sharded_state.display().to_string()
     );
+}
+
+#[test]
+fn v1_session_resolves_a_provider_session_id_in_any_state_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.db");
+    let config = dir.path().join("router.yaml");
+    write_config(&config, &state);
+    let store = StateStore::load(
+        &state,
+        Retention {
+            max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        },
+    );
+    store.upsert(
+        "rtr-legacy".into(),
+        PersistedSession {
+            downstream_session_id: "legacy-down".into(),
+            ..session(None, "primary", "Legacy", DAY_START)
+        },
+    );
+    let parent = store.new_session_id(&dir.path().join("checkout")).unwrap();
+    let child = format!("{parent}::delegate-down");
+    store.upsert(
+        parent.clone(),
+        PersistedSession {
+            downstream_session_id: "shard-parent-down".into(),
+            ..session(None, "primary", "Parent", DAY_START)
+        },
+    );
+    store.upsert(
+        child.clone(),
+        PersistedSession {
+            downstream_session_id: "shard-child-down".into(),
+            ..session(Some(&parent), "delegate", "Child", DAY_START + 60)
+        },
+    );
+    drop(store);
+
+    let lookup = |args: &[&str]| {
+        let mut full = vec!["session"];
+        full.extend_from_slice(args);
+        let value = query(&config, &full);
+        assert_envelope(&value, "session");
+        value["data"]["session"].clone()
+    };
+    let legacy = lookup(&["--downstream", "legacy-down"]);
+    assert_eq!(legacy["router_session_id"], "rtr-legacy");
+    assert_eq!(legacy["kind"], "primary");
+    let primary = lookup(&["--downstream", "shard-parent-down"]);
+    assert_eq!(primary["router_session_id"], parent.as_str());
+    assert_eq!(primary["kind"], "primary");
+    let delegate = lookup(&["--downstream", "shard-child-down", "--agent", "mock"]);
+    assert_eq!(delegate["router_session_id"], child.as_str());
+    assert_eq!(delegate["kind"], "delegate");
+    assert_eq!(
+        lookup(&["--downstream", "shard-child-down", "--agent", "other"]),
+        Value::Null
+    );
+    assert_eq!(lookup(&["--downstream", "unknown"]), Value::Null);
+}
+
+fn run(config: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        .args(["state-query", "--config", config.to_str().unwrap(), "v1"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn v1_health_reports_absent_state_explicitly_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("router.yaml");
+    let state_dir = dir.path().join("state");
+    write_config(&config, &state_dir.join("sessions.db"));
+
+    // No state directory at all, then an empty one with an empty shards dir.
+    for prepare in [false, true] {
+        if prepare {
+            std::fs::create_dir_all(state_dir.join("shards")).unwrap();
+        }
+        let health = query(&config, &["health"]);
+        assert_envelope(&health, "health");
+        assert_eq!(health["data"], json!({"stateExists": false}));
+    }
+    assert!(
+        !state_dir.join("sessions.db").exists(),
+        "health must not create state"
+    );
+
+    // Other queries still fail loudly without state.
+    assert!(!run(&config, &["title", "--session", "x"]).status.success());
+}
+
+#[test]
+fn v1_health_still_fails_for_corrupt_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("router.yaml");
+    let state = dir.path().join("sessions.db");
+    write_config(&config, &state);
+    std::fs::write(
+        &state,
+        b"not a sqlite database, just bytes long enough to have a header",
+    )
+    .unwrap();
+    let output = run(&config, &["health"]);
+    assert!(!output.status.success(), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn v1_health_still_fails_when_the_state_directory_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("router.yaml");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir(&state_dir).unwrap();
+    write_config(&config, &state_dir.join("sessions.db"));
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let probe = std::fs::symlink_metadata(state_dir.join("sessions.db"));
+    let output = run(&config, &["health"]);
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if probe.is_ok() || probe.unwrap_err().kind() != std::io::ErrorKind::PermissionDenied {
+        return; // running as root: permissions are not enforced
+    }
+    assert!(!output.status.success(), "{output:?}");
 }
