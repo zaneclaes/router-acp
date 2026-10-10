@@ -4,7 +4,7 @@ Read-only audit of `Tuneality/Tuneality` staging. The audit used authenticated `
 
 ## Decisions I made
 
-- I retain `6cbc9e04dc83f49c1f663f969edf5568d3c53992` as the immutable source baseline.
+- I retain `6cbc9e04dc83f49c1f663f969edf5568d3c53992` only as an immutable comparison baseline.
 - I refresh register, continuation, planner, and hook receipts against current staging SHA `bb9d0c4058f12f18b4988b913c68c764c365c502`.
 - The current comparison changes the implement-all supervisor, guard, hook manifest, and smokescreen contracts. The immutable 6cbc baseline remains the ownership source. The current receipts below define the preservation target for migration.
 - I classify source and fixture coverage as existing evidence. I classify live hook delivery, router execution, deployed release behavior, and end-to-end parity as pending unless a source test directly proves them.
@@ -25,11 +25,11 @@ Commit date: 2026-10-07T05:38:26Z
 Parent: 01262fdda722fac3f1bcf93f800b5bb6f63dd1ac
 ```
 
-The source links below intentionally use this immutable baseline SHA:
+The historical source links below use this immutable baseline SHA. They are comparison evidence, not claims about current staging:
 
 `https://github.com/Tuneality/Tuneality/tree/6cbc9e04dc83f49c1f663f969edf5568d3c53992`
 
-The root contract is [`AGENTS.md`](https://github.com/Tuneality/Tuneality/blob/6cbc9e04dc83f49c1f663f969edf5568d3c53992/AGENTS.md), blob `63dcdb5a20fe72c427d1d49dd369f47cf15d4ef6`. It defines the staging branch model, worktree ownership, release train, plan registers, hook installation, safe-change checks, deployment, and smokescreen gates.
+The historical root contract is [`AGENTS.md`](https://github.com/Tuneality/Tuneality/blob/6cbc9e04dc83f49c1f663f969edf5568d3c53992/AGENTS.md), blob `63dcdb5a20fe72c427d1d49dd369f47cf15d4ef6`. Current staging is represented by the receipt below and its current-source entries.
 
 The refreshed staging audit resolves to:
 
@@ -43,9 +43,9 @@ Commit date: 2026-10-10T16:17:45Z
 
 The [current staging tree](https://github.com/Tuneality/Tuneality/tree/bb9d0c4058f12f18b4988b913c68c764c365c502) is a receipt for this audit only. The refreshed compare is [`dae86dd...bb9d0c`](https://github.com/Tuneality/Tuneality/compare/dae86ddb2c6a4d03921c71cf2b99d33a2accdfad...bb9d0c4058f12f18b4988b913c68c764c365c502).
 
-The core source blobs at the immutable baseline are:
+The following are source blobs at the immutable comparison baseline:
 
-| Source | Blob at both SHAs |
+| Source | Blob at comparison baseline |
 |---|---|
 | `.agents/skills/plan/SKILL.md` | `2af8a15cdb8da524bccfc1eb0c511ebab48cb4f2` |
 | `.agents/skills/implement/SKILL.md` | `aeb925061ee23ce3865381637c5778fba0597df1` |

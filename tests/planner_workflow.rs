@@ -9,7 +9,7 @@ use router_acp::planner_workflow::{
     self, Artifact, Operation, Receipt, RunStatus, WorkSpec, WorkStatus,
 };
 use router_acp::session::{RouterSession, Shared};
-use router_acp::state::{PersistedSession, Retention, StateFile};
+use router_acp::state::{PersistedSession, Retention, StateStore};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -281,8 +281,8 @@ async fn return_to_planning_preserves_active_work_but_stops_new_dispatch() {
 fn stale_cas_update_is_rejected_across_two_state_files() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("state.db");
-    let first = StateFile::load(&path, Retention::default());
-    let second = StateFile::load(&path, Retention::default());
+    let first = StateStore::load(&path, Retention::default());
+    let second = StateStore::load(&path, Retention::default());
     let initial = json!({"status": "running"});
     assert_eq!(first.save_planner_run(SID, 0, &initial).unwrap(), 1);
     let (_, stale) = second.planner_run(SID).unwrap().unwrap();
@@ -1158,8 +1158,14 @@ async fn allocator_rejects_parent_workspace_and_claim_lease_is_unique() {
     assert!(error.contains("isolated workspace"), "{error}");
 
     let path = fixture._tmp.path().join("claimed");
-    let first = StateFile::load(&fixture._tmp.path().join("leases.db"), Retention::default());
-    let second = StateFile::load(&fixture._tmp.path().join("leases.db"), Retention::default());
+    let first = StateStore::load(
+        &fixture._tmp.path().join("leases.db"),
+        Retention::default(),
+    );
+    let second = StateStore::load(
+        &fixture._tmp.path().join("leases.db"),
+        Retention::default(),
+    );
     first
         .claim_planner_workspace(&path, SID, "work-1", "lease-1")
         .unwrap();

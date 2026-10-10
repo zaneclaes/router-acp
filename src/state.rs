@@ -641,11 +641,93 @@ impl StateStore {
             .flatten()
     }
 
+    /// Planner runs stay with their parent session. Workspace claims and wake
+    /// delivery live in the legacy control database because they are box-wide.
+    pub fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.with_file(sid, |file| file.planner_run(sid))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Optimistically save one planner document in its parent session shard.
+    pub fn save_planner_run(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        self.with_file(sid, |file| file.save_planner_run(sid, expected, document))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Save a planner revision and durably stage its hook wakes. The legacy
+    /// journal prevents a process crash between the shard commit and hook
+    /// outbox delivery from losing a wake. Outbox polling reconciles any
+    /// staged wake whose revision and document are now durable.
+    pub fn save_planner_run_with_wakes(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+        events: &[String],
+    ) -> Result<u64, String> {
+        let revision = expected + 1;
+        self.legacy.prepare_planner_wakes(sid, revision, events)?;
+        let revision = self.save_planner_run(sid, expected, document)?;
+        self.pending_planner_wakes(sid)?;
+        Ok(revision)
+    }
+
+    /// Materialize staged wake events only after the matching planner
+    /// revision contains the named wake. This is also called by outbox polling
+    /// to recover a router process interrupted after the shard commit.
+    pub fn pending_planner_wakes(&self, sid: &str) -> Result<(), String> {
+        let Some((revision, document)) = self.planner_run(sid)? else {
+            return Ok(());
+        };
+        self.legacy
+            .materialize_planner_wakes(sid, revision, &document)
+    }
+
+    fn reconcile_planner_wakes(&self) {
+        for sid in self.legacy.pending_planner_wake_sessions() {
+            if let Err(error) = self.pending_planner_wakes(&sid) {
+                tracing::warn!(%error, session = sid, "planner wake reconciliation deferred");
+            }
+        }
+    }
+
+    /// A workspace may be used by only one durable assignment across every
+    /// checkout shard, so claims always go through the legacy control DB.
+    pub fn claim_planner_workspace(
+        &self,
+        path: &Path,
+        sid: &str,
+        work_id: &str,
+        lease: &str,
+    ) -> Result<(), String> {
+        self.legacy
+            .claim_planner_workspace(path, sid, work_id, lease)
+    }
+
+    /// Merge routing state in the session's parent shard.
+    pub fn patch_session_routing(
+        &self,
+        sid: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.with_file(sid, |file| file.patch_session_routing(sid, patch))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
     /// Remove terminal planner state from the session's own state shard.
     pub fn remove_planner_session(&self, sid: &str, revision: u64) -> Result<(), String> {
         self.with_file(sid, |file| file.remove_planner_session(sid, revision))
             .map_err(|error| error.to_string())?
-            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))?;
+        self.legacy.remove_planner_control_rows(sid)
     }
 
     pub fn log(&self, router_session_id: &str, entry: &LogEntry) {
@@ -842,6 +924,7 @@ impl StateStore {
     }
 
     pub fn outbox_pending(&self, limit: usize) -> Vec<(i64, String)> {
+        self.reconcile_planner_wakes();
         self.legacy.outbox_pending(limit)
     }
 
@@ -1329,6 +1412,11 @@ impl StateFile {
                    started_at, updated_at, detail
             FROM tool_calls
             WHERE completed_at IS NULL;
+        CREATE TABLE IF NOT EXISTS planner_runs (
+            session_id TEXT PRIMARY KEY,
+            revision   INTEGER NOT NULL,
+            document   TEXT NOT NULL
+        );
         "#;
         let file_sql = match kind {
             FileKind::Legacy => LEGACY_SCHEMA,
@@ -1366,6 +1454,25 @@ const LEGACY_SCHEMA: &str = "
             last_tick_at INTEGER NOT NULL,
             last_result  TEXT
         );
+        -- Workspace paths are box-wide. A claim must conflict even when the
+        -- owning and requesting sessions live in different checkout shards.
+        CREATE TABLE IF NOT EXISTS planner_workspaces (
+            path       TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            work_id    TEXT NOT NULL,
+            lease      TEXT NOT NULL
+        );
+        -- A short journal bridges a planner shard commit and the legacy hook
+        -- outbox. The outbox poller emits entries only after the matching
+        -- planner document proves the wake is durable.
+        CREATE TABLE IF NOT EXISTS planner_wake_journal (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            revision   INTEGER NOT NULL,
+            payload    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_planner_wake_journal_session
+            ON planner_wake_journal(session_id, revision);
 ";
 
 /// The checkout a shard belongs to, checked on every open.
@@ -1410,6 +1517,223 @@ impl StateFile {
             }
         }
         Ok(())
+    }
+
+    fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.conn
+            .query_row(
+                "SELECT revision, document FROM planner_runs WHERE session_id = ?1",
+                [sid],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|(revision, document)| {
+                serde_json::from_str(&document)
+                    .map(|document| (revision, document))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    /// Optimistic concurrency protects planner receipts, assignments, and
+    /// acknowledgements from independent router processes.
+    fn save_planner_run(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        let document = serde_json::to_string(document).map_err(|error| error.to_string())?;
+        let changed = if expected == 0 {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO planner_runs (session_id, revision, document) VALUES (?1, 1, ?2)",
+                params![sid, document],
+            )
+        } else {
+            self.conn.execute(
+                "UPDATE planner_runs SET revision = revision + 1, document = ?1 \
+                 WHERE session_id = ?2 AND revision = ?3",
+                params![document, sid, expected as i64],
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("planner state changed concurrently; reload before retrying".into());
+        }
+        Ok(expected + 1)
+    }
+
+    fn prepare_planner_wakes(
+        &self,
+        sid: &str,
+        revision: u64,
+        events: &[String],
+    ) -> Result<(), String> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for payload in events {
+            transaction
+                .execute(
+                    "INSERT INTO planner_wake_journal (session_id, revision, payload) VALUES (?1, ?2, ?3)",
+                    params![sid, revision as i64, payload],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn pending_planner_wake_sessions(&self) -> Vec<String> {
+        let Ok(mut statement) = self
+            .conn
+            .prepare("SELECT DISTINCT session_id FROM planner_wake_journal ORDER BY session_id")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    fn materialize_planner_wakes(
+        &self,
+        sid: &str,
+        revision: u64,
+        document: &serde_json::Value,
+    ) -> Result<(), String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, revision, payload FROM planner_wake_journal \
+                 WHERE session_id = ?1 AND revision <= ?2 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<(i64, u64, String)> = statement
+            .query_map(params![sid, revision as i64], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)? as u64, row.get(2)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+
+        let mut ready = Vec::new();
+        let mut stale = Vec::new();
+        for (id, event_revision, payload) in rows {
+            let wake_id = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|event| {
+                    event
+                        .get("wake_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                });
+            let exists = wake_id
+                .as_deref()
+                .and_then(|wake_id| document.get("wakes")?.get(wake_id))
+                .is_some();
+            if exists {
+                ready.push((id, payload));
+            } else if event_revision <= revision {
+                stale.push(id);
+            }
+        }
+        if ready.is_empty() && stale.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for (id, payload) in ready {
+            transaction
+                .execute(
+                    "INSERT INTO hook_outbox (payload, created_at) VALUES (?1, ?2)",
+                    params![payload, now_epoch() as i64],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM planner_wake_journal WHERE id = ?1", [id])
+                .map_err(|error| error.to_string())?;
+        }
+        for id in stale {
+            transaction
+                .execute("DELETE FROM planner_wake_journal WHERE id = ?1", [id])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn claim_planner_workspace(
+        &self,
+        path: &Path,
+        sid: &str,
+        work_id: &str,
+        lease: &str,
+    ) -> Result<(), String> {
+        let canonical = path.display().to_string();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO planner_workspaces (path, session_id, work_id, lease) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![canonical, sid, work_id, lease],
+            )
+            .map_err(|error| error.to_string())?;
+        let owned: bool = self
+            .conn
+            .query_row(
+                "SELECT session_id = ?2 AND work_id = ?3 AND lease = ?4 \
+                 FROM planner_workspaces WHERE path = ?1",
+                params![canonical, sid, work_id, lease],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if owned {
+            Ok(())
+        } else {
+            Err(format!(
+                "workspace {canonical} is held by another durable assignment"
+            ))
+        }
+    }
+
+    fn remove_planner_control_rows(&self, sid: &str) -> Result<(), String> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM planner_workspaces WHERE session_id = ?1",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM planner_wake_journal WHERE session_id = ?1",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn patch_session_routing(&self, sid: &str, patch: &serde_json::Value) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE sessions SET routing = json_patch(COALESCE(routing, '{}'), ?1) \
+                 WHERE router_session_id = ?2",
+                params![patch.to_string(), sid],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("planner session no longer exists".into())
+        }
     }
 
     fn import_legacy_json(&self, db_path: &Path) {
@@ -1702,8 +2026,8 @@ impl StateFile {
         existing
     }
 
-    /// Remove terminal planner state and its claims under the checked revision.
-    /// Repository artifacts and claims belonging to other sessions stay intact.
+    /// Remove terminal planner state under the checked revision. Box-wide
+    /// workspace claims are released by `StateStore` after this shard commit.
     pub fn remove_planner_session(&self, sid: &str, revision: u64) -> Result<(), String> {
         let transaction = self
             .conn
@@ -1718,12 +2042,6 @@ impl StateFile {
         if changed != 1 {
             return Err("planner state changed concurrently; reconcile before deleting".into());
         }
-        transaction
-            .execute(
-                "DELETE FROM planner_workspaces WHERE session_id = ?1",
-                params![sid],
-            )
-            .map_err(|error| error.to_string())?;
         transaction
             .execute(
                 "DELETE FROM sessions WHERE router_session_id = ?1",
@@ -3606,6 +3924,76 @@ mod tests {
         let report = s.delegation_report(10);
         assert_eq!(report.prompted_sessions, 1);
         assert_eq!(report.sessions_that_delegated, 1);
+    }
+
+    #[test]
+    fn planner_state_is_sharded_cas_fenced_and_workspace_claims_are_box_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let first = StateStore::load(&path, Retention::default());
+        let parent_a = first.new_session_id(&dir.path().join("a")).unwrap();
+        let parent_b = first.new_session_id(&dir.path().join("b")).unwrap();
+        first.upsert(parent_a.clone(), session("claude"));
+        first.upsert(parent_b.clone(), session("codex"));
+
+        let initial = serde_json::json!({"wakes": {}});
+        assert_eq!(first.save_planner_run(&parent_a, 0, &initial), Ok(1));
+        first
+            .patch_session_routing(&parent_a, &serde_json::json!({"planner_phase": "planning"}))
+            .unwrap();
+        assert_eq!(
+            first
+                .get(&parent_a)
+                .unwrap()
+                .routing
+                .unwrap()
+                .get("planner_phase")
+                .and_then(serde_json::Value::as_str),
+            Some("planning")
+        );
+
+        let second = StateStore::load(&path, Retention::default());
+        let (_, stale) = second.planner_run(&parent_a).unwrap().unwrap();
+        assert_eq!(
+            first.save_planner_run(&parent_a, 1, &serde_json::json!({"wakes": {}})),
+            Ok(2)
+        );
+        let error = second.save_planner_run(&parent_a, 1, &stale).unwrap_err();
+        assert!(error.contains("changed concurrently"), "{error}");
+
+        let workspace_a = dir.path().join("workspace-a");
+        let workspace_b = dir.path().join("workspace-b");
+        first
+            .claim_planner_workspace(&workspace_a, &parent_a, "work-a", "lease-a")
+            .unwrap();
+        let error = first
+            .claim_planner_workspace(&workspace_a, &parent_b, "work-b", "lease-b")
+            .unwrap_err();
+        assert!(error.contains("held by another"), "{error}");
+        first
+            .claim_planner_workspace(&workspace_b, &parent_b, "work-b", "lease-b")
+            .unwrap();
+
+        let wake_document = serde_json::json!({"wakes": {"wake-1": {"acknowledged": false}}});
+        let wake = serde_json::json!({"wake_id": "wake-1", "revision": 3}).to_string();
+        assert_eq!(
+            first.save_planner_run_with_wakes(&parent_a, 2, &wake_document, &[wake]),
+            Ok(3)
+        );
+        assert_eq!(first.outbox_pending(10).len(), 1);
+
+        let error = first.remove_planner_session(&parent_a, 2).unwrap_err();
+        assert!(error.contains("changed concurrently"), "{error}");
+        first.remove_planner_session(&parent_a, 3).unwrap();
+        assert_eq!(first.planner_run(&parent_a).unwrap(), None);
+        assert!(first.get(&parent_a).is_none());
+        first
+            .claim_planner_workspace(&workspace_a, &parent_b, "work-b", "lease-new")
+            .unwrap();
+        let error = first
+            .claim_planner_workspace(&workspace_b, "third-session", "work-c", "lease-c")
+            .unwrap_err();
+        assert!(error.contains("held by another"), "{error}");
     }
 
     #[test]

@@ -3,8 +3,8 @@
 This document defines planner schema v1 and the consumer migration templates.
 It matches the current `src/config.rs`, `src/planner_skills.rs`, `src/planner_workflow.rs`, `src/delegate_mcp.rs`, and `src/delegate_hook.rs` implementation on this branch.
 
-The Chordzy inventory retains immutable source baseline `6cbc9e04dc83f49c1f663f969edf5568d3c53992` and refreshes register receipts against current staging `dae86ddb2c6a4d03921c71cf2b99d33a2accdfad`.
-The core planner, release, smoke, review, roadmap, and hook source blobs are unchanged between those SHAs.
+The Chordzy inventory compares its earlier review baseline with current Tuneality staging `bb9d0c4058f12f18b4988b913c68c764c365c502`.
+The planner, release, smoke, review, roadmap, and hook sources have changed since that earlier review. This document uses the current staging receipt and does not treat baseline blobs as current-source evidence.
 It does not prove router execution, live hook delivery, deployed release behavior, native consumer parity, or end-to-end parity.
 
 Runtime register contents, capacity, queue state, active runs, and watcher state are current-at-audit inputs.
