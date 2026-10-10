@@ -134,21 +134,22 @@ pub fn response_meta(shared: &Arc<Shared>, sid: &str) -> Meta {
 }
 
 /// Give a fresh adapter access to its saved conversation without replaying it
-/// into the prompt. The agent decides which database records it needs.
+/// into the prompt. The agent decides which records it needs, always through
+/// the router's command: the files behind it are the router's layout.
 pub fn lookup_context(shared: &Arc<Shared>, sid: &str) -> Vec<ContentBlock> {
     let command = crate::session::transcript_command(shared, sid);
     vec![ContentBlock::from(format!(
         "<resumed-conversation-context>\nYou are resuming router session {sid}. \
          Its complete conversation, including user messages, tool calls and results, \
-         is saved in the SQLite database at {}. Retrieve the relevant history yourself \
+         is saved in router-acp's state store. Retrieve the relevant history yourself \
          before continuing; no prior conversation has been copied into this prompt. \
          Start with the recent records:\n  {command} --limit 40\n\
-         You can inspect the database directly or use the transcript command to look up \
-         more history as needed. Read manageable portions rather than loading the entire \
-         conversation into context. Inherited-context records retain earlier session history. \
+         Run the same command with a larger --limit to look up more history as needed. \
+         Do not open the state database files directly. Read manageable portions rather \
+         than loading the entire conversation into context. Inherited-context records \
+         retain earlier session history. \
          Verify uncertain tool effects and do not repeat completed actions.\n\
-         </resumed-conversation-context>\nThe current request follows.",
-        shared.cfg.state_file.display()
+         </resumed-conversation-context>\nThe current request follows."
     ))]
 }
 

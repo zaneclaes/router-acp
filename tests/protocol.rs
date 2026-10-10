@@ -593,11 +593,14 @@ fn routing_meta_for(observed: &ObservedHandle, session_id: &str) -> Option<serde
         .find_map(|n| n.meta.as_ref()?.get("router_acp").cloned())
 }
 
+/// Each test gets its own directory: shards live beside the state file.
 fn temp_state_file(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "router-acp-test-{tag}-{}.db",
-        uuid::Uuid::new_v4().simple()
-    ))
+    std::env::temp_dir()
+        .join(format!(
+            "router-acp-test-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .join("state.db")
 }
 
 /// Open the state DB the router wrote (read-only view via the lib API).
@@ -10179,4 +10182,101 @@ async fn model_at_capacity_reply_passes_through_when_disabled() {
         Ok(())
     })
     .await;
+}
+
+#[tokio::test]
+async fn sharded_delegates_live_with_their_parent_and_stay_queryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.db");
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let log = temp_log("sharded-delegate");
+    let yaml = delegation_yaml(&state, &log, 3);
+    let config = dir.path().join("router.yaml");
+    std::fs::write(&config, &yaml).unwrap();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let shard = router_acp::state_layout::StateLayout::new(&state)
+        .shard_path(&router_acp::state_layout::tag_for_cwd(&checkout));
+    let parent = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = parent.clone();
+    run_test(yaml, async move |cx, observed| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(checkout.clone()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        *seen.lock().unwrap() = sid.clone();
+        let call = serde_json::json!({"task": "fix button color", "keep_open": true});
+        prompt_text(
+            &cx,
+            &sid,
+            &format!("hard integration work\nMCP_CALL:router-delegate delegate_task {call}"),
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        let delegate_id = regex::Regex::new(r"delegate_id: (d-[0-9a-f]+)")
+            .unwrap()
+            .captures(&text)
+            .map(|c| c[1].to_string())
+            .unwrap_or_else(|| panic!("keep_open returns a delegate_id: {text}"));
+        let result = serde_json::json!({"delegate_id": delegate_id});
+        prompt_text(
+            &cx,
+            &sid,
+            &format!(
+                "MCP_CALL:router-delegate delegate_result {result}\n\
+                 MCP_CALL:router-delegate delegate_close {result}"
+            ),
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains(&format!("delegate {delegate_id} on cheap/haiku")),
+            "delegate_result found the delegate in the parent's shard: {text}"
+        );
+        Ok(())
+    })
+    .await;
+
+    let parent = parent.lock().unwrap().clone();
+    let conn = rusqlite::Connection::open(&shard).unwrap();
+    let ids: Vec<String> = conn
+        .prepare("SELECT router_session_id FROM sessions ORDER BY created_at")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_eq!(ids[0], parent);
+    assert!(
+        ids[1].starts_with(&format!("{parent}::delegate-")),
+        "{ids:?}"
+    );
+    let delegate_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_log WHERE router_session_id = ?1",
+            [&ids[1]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(delegate_rows > 0);
+    assert!(open_state(&state).all().len() == 2);
+    let legacy = rusqlite::Connection::open(&state).unwrap();
+    let legacy_sessions: i64 = legacy
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(legacy_sessions, 0);
+
+    let output = std::process::Command::new(router_exe())
+        .args(["state-query", "--config", config.to_str().unwrap()])
+        .args(["v1", "delegates", "--session", &parent])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let delegates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(delegates["data"]["children"][0]["id"], ids[1].as_str());
 }

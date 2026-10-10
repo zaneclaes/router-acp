@@ -7731,7 +7731,17 @@ fn on_session_new(
         crate::auth::refresh_before_selection(&shared).await;
         // Management commands must remain accessible when every login is
         // expired. Normal prompts still enforce eligibility at pin time.
-        let router_sid = format!("rtr-{}", uuid::Uuid::new_v4());
+        // The id names this checkout's shard.
+        let minted = shared.state.lock().unwrap().new_session_id(&req.cwd);
+        let router_sid = match minted {
+            Ok(sid) => sid,
+            Err(e) => {
+                return responder.respond_with_error(AcpError::internal_error().data(format!(
+                    "cannot open router state for {}: {e}",
+                    req.cwd.display()
+                )));
+            }
+        };
         let created = (|| -> Result<(), AcpError> {
             let mut session = RouterSession::new(&shared.cfg, &req);
             let mut inherited_context = None;

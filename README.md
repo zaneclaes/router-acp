@@ -331,7 +331,7 @@ Read one session's **full** interaction log — including tool calls and their d
 router-acp transcript --state ~/.local/state/router-acp/sessions.db --session rtr-…
 ```
 
-This takes the state DB path directly rather than a `--config`, so it runs standalone: a model that has just been handed a session (a `terse_handoff` briefing embeds this command already resolved to the running binary and live state file) can read what its briefing omitted, without a router config and without `sqlite3` installed.
+This takes the legacy state file path directly rather than a `--config`, so it runs standalone (the router finds a sharded session's shard from its id): a model that has just been handed a session (a `terse_handoff` briefing embeds this command already resolved to the running binary and live state file) can read what its briefing omitted, without a router config and without `sqlite3` installed.
 
 ### State query boundary
 
@@ -359,20 +359,54 @@ context totals, and response-complete state. Only `delegate_task`,
 returns the relay-compatible `sessions` and daily UTC token buckets grouped by
 agent, routing class, and kind. Its `fromSec` bound is inclusive and its
 `toEndSec` bound is exclusive. `llmRequests` exposes the rows used by the
-savings aggregate. `health` includes database/WAL/freelist bytes,
+savings aggregate. `health` includes database/WAL/freelist bytes (summed
+over the legacy file and every shard), the legacy file's path and
 auto-vacuum, maintenance lease status, and retention. It deliberately avoids
 table-wide row counts, so status refreshes remain cheap as retained history grows.
 `delegation-report` is the JSON form of the existing adoption report.
 
-The query command opens the configured state file read-only. It does not create
-or migrate schemas, import legacy JSON, flush buffered rows, prune retained
-history, vacuum, or checkpoint the WAL. The configured `history` duration stays
-explicit at the `StateStore` boundary so a future sharded store can apply the
-same policy to legacy, active, and inactive shards.
+The query command opens the configured state file and every shard read-only.
+It does not create shards or schemas, migrate, import legacy JSON, flush
+buffered rows, prune retained history, vacuum, or checkpoint the WAL. The v1
+JSON shapes are identical for legacy and sharded sessions.
+
+### Cwd-sharded state
+
+Each checkout's sessions get their own SQLite file, so routers working in
+different checkouts stop queueing on one write lock:
+
+```text
+~/.local/state/router-acp/
+  sessions.db                 legacy file: legacy sessions, hook outbox, maintenance rows
+  maintenance.lock            maintenance election lock (never deleted)
+  shards/
+    sessions-<tag>.db         one checkout's sessions, delegates, logs, requests
+```
+
+`<tag>` is the first 16 bytes of SHA-256 over the canonical cwd (symlinks
+resolved), as 32 hex characters. A new session id carries it:
+`rtr-<tag>-<uuid>`. A delegate (`<parent>::delegate-…`) lives with its parent.
+The router finds a session's file from its id alone, so:
+
+- every session created before sharding (`rtr-<uuid>`) stays in `sessions.db` and stays resumable;
+- a session resumed from another checkout stays in its original shard, while
+  `continue_from` in another checkout starts a new id in that checkout's shard.
+
+Each shard records its tag and cwd. The router refuses a shard whose recorded
+tag differs from its filename, or whose cwd differs from the checkout asking
+for it. New shards start with `auto_vacuum = INCREMENTAL`, so they never need
+`state-compact`. Box-wide reads (`sessions`, analytics, spend windows, health,
+delegation reports) cover the legacy file and every shard.
+
+`router-acp state-bench --state <scratch>/sessions.db --processes 32
+--checkouts 8 --seconds 20` spawns router-shaped writer processes with the live
+write mix, spread over that many checkouts (one shard each; `--checkouts 1`
+puts them all on one file), and prints throughput, latency, and lost-write
+counts. It writes only beside `--state`; never point it at a live state file.
 
 ### State DB maintenance
 
-Every `router-acp serve` process sharing a state file ticks every 5 minutes, but only the holder of the `maintenance_lease` row does work (lease TTL 15 minutes, so a dead holder is replaced). A tick has a 2-second budget, waits at most 200 ms for the write lock, and stops on a busy database to resume next tick. It:
+Every `router-acp serve` process sharing a state file ticks every 5 minutes, but only the process holding a nonblocking exclusive lock on `maintenance.lock` (beside the state file) does work. A process that loses returns at once. The OS releases the lock when its holder exits, so the next tick elsewhere takes over. The `maintenance_lease` row only reports the holder and its last tick. A tick has a 2-second budget. It sweeps the legacy file, then shards oldest-swept first (`shard_maintenance` rows keep that order across restarts), at most 250 ms per shard. Each file waits at most 200 ms for its write lock; a busy file is recorded as deferred and the tick moves to the next. For each file it:
 
 1. deletes sessions idle past `history` with their `session_log`, `tool_calls` and `llm_requests` rows, in batches of a few thousand rows;
 2. clears `tool_calls.detail` on finished calls (new rows never store it; only `active_tool_calls` reads it, and `session_log` keeps the output);
@@ -385,7 +419,7 @@ Step 3 needs `auto_vacuum = INCREMENTAL`, and an existing file can only switch w
 SQLITE_TMPDIR=/path/on/a/large/disk router-acp state-compact --state ~/.local/state/router-acp/sessions.db
 ```
 
-`state-compact` holds the write lock for the whole rewrite (other routers' writes wait up to 30 s, then fail), so run it while sessions are idle. It needs free disk of about twice the DB size; SQLite puts its temporary copy in `SQLITE_TMPDIR`. `router-acp state-stats --state …` prints the file and WAL bytes, free pages, `auto_vacuum` mode, and the last tick's result as JSON, read-only.
+`state-compact` holds the write lock for the whole rewrite (other routers' writes wait up to 30 s, then fail), so run it while sessions are idle. It needs free disk of about twice the DB size; SQLite puts its temporary copy in `SQLITE_TMPDIR`. `router-acp state-stats --state …` prints the file and WAL bytes, free pages, `auto_vacuum` mode, and the last tick's result as JSON, read-only, plus a `shards` array with each shard's tag, cwd, sizes, and last sweep.
 
 ## In-session delegation
 

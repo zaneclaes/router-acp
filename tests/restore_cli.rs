@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use router_acp::state_layout::{SessionHome, StateLayout, home_of, tag_for_cwd};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -984,4 +985,149 @@ async fn accepted_mid_turn_messages_survive_restart_without_recording_declined_s
     let retrieved = lookup_from_prompt(&delivered);
     assert!(retrieved.contains("accepted steering message"));
     assert!(!retrieved.contains("DECLINED-STEER"));
+}
+
+fn sessions_in(db: &Path) -> Vec<String> {
+    rusqlite::Connection::open(db)
+        .expect("open state file")
+        .prepare("SELECT router_session_id FROM sessions")
+        .expect("sessions query")
+        .query_map([], |row| row.get(0))
+        .expect("sessions rows")
+        .collect::<rusqlite::Result<_>>()
+        .expect("session ids")
+}
+
+fn log_kinds_in(db: &Path, session_id: &str) -> Vec<String> {
+    rusqlite::Connection::open(db)
+        .expect("open state file")
+        .prepare("SELECT kind FROM session_log WHERE router_session_id = ?1 ORDER BY id")
+        .expect("log query")
+        .query_map([session_id], |row| row.get(0))
+        .expect("log rows")
+        .collect::<rusqlite::Result<_>>()
+        .expect("log kinds")
+}
+
+#[tokio::test]
+async fn sharded_sessions_resume_and_continue_from_another_checkout() {
+    let fixture = fixture("sharded");
+    let layout = StateLayout::new(&fixture.state);
+    let checkout_a = fixture.home.join("checkout-a");
+    let checkout_b = fixture.home.join("checkout-b");
+    std::fs::create_dir(&checkout_a).unwrap();
+    std::fs::create_dir(&checkout_b).unwrap();
+    let shard_a = layout.shard_path(&tag_for_cwd(&checkout_a));
+    let shard_b = layout.shard_path(&tag_for_cwd(&checkout_b));
+
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    let source = session_id(&client.new_session(&checkout_a, None).await);
+    assert!(
+        source.starts_with(&format!("rtr-{}-", tag_for_cwd(&checkout_a))),
+        "{source}"
+    );
+    assert_success(
+        &client
+            .prompt(&source, "TEXT:sharded reply\nsharded source history", None)
+            .await,
+        "source prompt",
+    );
+    client.close().await;
+
+    // A new router process resumes it from checkout B: the row stays in A.
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    assert_success(&client.resume(&source, &checkout_b).await, "resume from B");
+    assert_success(
+        &client
+            .prompt(&source, "resumed from checkout b", None)
+            .await,
+        "resumed prompt",
+    );
+    client.close().await;
+    assert_eq!(sessions_in(&shard_a), std::slice::from_ref(&source));
+    assert!(sessions_in(&fixture.state).is_empty());
+    assert!(!shard_b.exists());
+    let delivered = mock_prompts(&fixture.mock_log)
+        .into_iter()
+        .rev()
+        .find(|text| text.contains("resumed from checkout b"))
+        .expect("resumed adapter prompt");
+    // The lookup names the legacy anchor; the router finds the shard.
+    let anchor = format!("--state '{}'", fixture.state.display());
+    assert!(delivered.contains(&anchor), "{delivered}");
+    assert!(!delivered.contains("shards"), "{delivered}");
+    let retrieved = lookup_from_prompt(&delivered);
+    for required in ["sharded source history", "sharded reply"] {
+        assert!(retrieved.contains(required), "{required:?}: {retrieved}");
+    }
+
+    // Continue from checkout B: a new id for B, with its snapshot in B.
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    let created = client
+        .new_session(&checkout_b, Some(router_meta(None, Some(&source))))
+        .await;
+    let child = session_id(&created);
+    client.close().await;
+    assert!(
+        child.starts_with(&format!("rtr-{}-", tag_for_cwd(&checkout_b))),
+        "{child}"
+    );
+    assert_eq!(sessions_in(&shard_b), std::slice::from_ref(&child));
+    assert_eq!(log_kinds_in(&shard_b, &child), ["inherited_context"]);
+    assert_eq!(sessions_in(&shard_a), [source]);
+}
+
+#[tokio::test]
+async fn a_session_saved_before_sharding_still_resumes() {
+    let fixture = fixture("legacy-session");
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    let tagged = session_id(&client.new_session(&fixture.home, None).await);
+    assert_success(
+        &client.prompt(&tagged, "before the upgrade", None).await,
+        "first prompt",
+    );
+    client.close().await;
+    assert_eq!(
+        home_of(&tagged),
+        SessionHome::Shard(tag_for_cwd(&fixture.home))
+    );
+
+    // Rewrite it as a pre-sharding session: legacy id, legacy file.
+    let legacy = format!("rtr-{}", uuid::Uuid::new_v4());
+    {
+        let store = state(&fixture);
+        let row = store.get(&tagged).expect("tagged row");
+        store.upsert_checked(legacy.clone(), row).unwrap();
+        for entry in store.log_for_all(&tagged).unwrap() {
+            store.log_checked(&legacy, &entry).unwrap();
+        }
+        store.remove(&tagged);
+    }
+    assert_eq!(home_of(&legacy), SessionHome::Legacy);
+    assert_eq!(sessions_in(&fixture.state), std::slice::from_ref(&legacy));
+
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    assert_success(
+        &client.resume(&legacy, &fixture.home).await,
+        "resume legacy",
+    );
+    assert_success(
+        &client.prompt(&legacy, "after the upgrade", None).await,
+        "legacy prompt",
+    );
+    client.close().await;
+
+    let prompts: Vec<String> = state(&fixture)
+        .log_for(&legacy, 100)
+        .into_iter()
+        .filter(|entry| entry.kind == "user_prompt")
+        .map(|entry| entry.summary)
+        .collect();
+    assert_eq!(prompts, ["before the upgrade", "after the upgrade"]);
+    assert_eq!(sessions_in(&fixture.state), [legacy]);
 }

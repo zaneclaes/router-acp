@@ -156,6 +156,38 @@ enum Command {
         #[command(subcommand)]
         query: StateQueryCommand,
     },
+    /// Benchmark concurrent state writers. Prints one JSON report. Writes
+    /// only beside `--state`; never point it at a live state file.
+    #[command(hide = true)]
+    StateBench {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        processes: usize,
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        /// Checkout directories (one shard each) the workers are spread
+        /// over. `1` makes every process share one file.
+        #[arg(long, default_value_t = 8)]
+        checkouts: usize,
+        /// Write operations per second per process.
+        #[arg(long, default_value_t = 200)]
+        rate: u64,
+    },
+    /// Internal: one `state-bench` worker process.
+    #[command(hide = true)]
+    StateBenchWorker {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        seconds: u64,
+        #[arg(long)]
+        rate: u64,
+        #[arg(long)]
+        seed: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -643,6 +675,34 @@ async fn main() -> anyhow::Result<()> {
                     "data": data,
                 }))?
             );
+            Ok(())
+        }
+        Command::StateBench {
+            state,
+            processes,
+            seconds,
+            checkouts,
+            rate,
+        } => {
+            let report = router_acp::state_bench::run(
+                &router_acp::config::expand_tilde(&state),
+                processes,
+                seconds,
+                checkouts,
+                rate,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::StateBenchWorker {
+            state,
+            cwd,
+            seconds,
+            rate,
+            seed,
+        } => {
+            let report = router_acp::state_bench::worker(&state, &cwd, seconds, rate, seed)?;
+            println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
     }

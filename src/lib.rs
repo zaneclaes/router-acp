@@ -23,6 +23,8 @@ pub mod relay;
 pub mod restoration;
 pub mod session;
 pub mod state;
+pub mod state_bench;
+pub mod state_layout;
 pub mod strategies;
 pub mod tickets;
 pub mod transport;

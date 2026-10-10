@@ -296,7 +296,8 @@ That line is your proof the router is serving the session. Also sanity-check:
   `--session <rtr-id>` for the full picture: the routing `why` (weights +
   utility math), token usage (input/output/context), and the `session_log`
   of every prompt, response, and tool call with per-entry token counts.
-  Router-acp owns its SQLite state file (`~/.local/state/router-acp/sessions.db`).
+  Router-acp owns its SQLite state file (`~/.local/state/router-acp/sessions.db`),
+  plus one shard per checkout under `shards/` beside it.
   Hosts query it through `router-acp state-query --config
   ~/.config/router-acp/router.yaml v1 session --session <rtr-id>`. Use `v1
   delegates`, `logs`, `analytics`, `health`, `delegation-report`, and
