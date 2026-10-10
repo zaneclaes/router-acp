@@ -245,6 +245,22 @@ impl StateStore {
     /// Open existing state for query-only inspection. This deliberately
     /// skips schema setup, legacy import, log flushing, and maintenance, and
     /// never creates a shard.
+    /// True only when no router has created state at `path` yet: the legacy
+    /// file and the shards directory are both definitively missing (or the
+    /// directory holds no shard). Any other I/O answer, such as a permission
+    /// error, is not absence, so the caller's open reports it.
+    pub fn state_absent(path: &Path) -> bool {
+        let layout = StateLayout::new(path);
+        let missing = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        if !missing(&layout.legacy_path) {
+            return false;
+        }
+        match std::fs::read_dir(&layout.shards_dir) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(_) => layout.list_shards().is_empty(),
+        }
+    }
+
     pub fn open_readonly(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
         let conn = StateFile::open_readonly_conn(path)?;
         Ok(Self::with_legacy(
@@ -946,6 +962,9 @@ pub struct StateMaintenance {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateHealth {
+    /// Always true here; `state-query v1 health` answers `{"stateExists":
+    /// false}` alone before any router has created state.
+    pub state_exists: bool,
     pub db_path: String,
     pub db_bytes: u64,
     pub wal_bytes: u64,
@@ -2465,6 +2484,7 @@ impl StateFile {
             .transpose()?
             .flatten();
         Ok(StateHealth {
+            state_exists: true,
             db_path: path.display().to_string(),
             db_bytes: file_len(path),
             wal_bytes: file_len(&wal_path(path)),

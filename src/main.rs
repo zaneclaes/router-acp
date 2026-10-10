@@ -633,9 +633,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::StateQuery { config, query } => {
             let cfg = Config::from_file(&config)?;
+            let StateQueryCommand::V1 { query } = query;
+            if matches!(query, StateQueryV1::Health)
+                && router_acp::state::StateStore::state_absent(&cfg.state_file)
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "version": router_acp::state::STATE_QUERY_VERSION,
+                        "command": "health",
+                        "data": {"stateExists": false},
+                    }))?
+                );
+                return Ok(());
+            }
             let store =
                 router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
-            let StateQueryCommand::V1 { query } = query;
             let (command, data) = match query {
                 StateQueryV1::Session {
                     session,
