@@ -1158,14 +1158,8 @@ async fn allocator_rejects_parent_workspace_and_claim_lease_is_unique() {
     assert!(error.contains("isolated workspace"), "{error}");
 
     let path = fixture._tmp.path().join("claimed");
-    let first = StateStore::load(
-        &fixture._tmp.path().join("leases.db"),
-        Retention::default(),
-    );
-    let second = StateStore::load(
-        &fixture._tmp.path().join("leases.db"),
-        Retention::default(),
-    );
+    let first = StateStore::load(&fixture._tmp.path().join("leases.db"), Retention::default());
+    let second = StateStore::load(&fixture._tmp.path().join("leases.db"), Retention::default());
     first
         .claim_planner_workspace(&path, SID, "work-1", "lease-1")
         .unwrap();
