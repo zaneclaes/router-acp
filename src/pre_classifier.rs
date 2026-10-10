@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::candidate::{CandidateId, EffortLevel, TaskClass};
-use crate::classifier::{ClassifyInput, TaskProfile, classify, cwd_language_fingerprint};
+use crate::classifier::{
+    ClassifyInput, TaskProfile, automatic_effort_with_evidence, classify, cwd_language_fingerprint,
+};
 use crate::config::{ActWhen, Config, PreClassifierConfig};
 use crate::session::{
     DownstreamRoute, OpenedSession, Shared, close_downstream_session, first_eligible_candidate,
@@ -217,8 +219,11 @@ pub fn build_evaluator_prompt(cfg: &Config, user_text: &str) -> String {
          implementation work: class it by that substance rather than Writing, and score the \
          decisions, not the prose.\n\
          Also choose routing.effort from exactly: low, medium, high, xhigh, max. Use low for \
-         mechanical work, medium for bounded routine work, high for multi-file implementation, \
-         xhigh for ambiguous cross-system reasoning, and max only for novel or severe-risk work.\n\
+         mechanical work and medium for routine work, even when it is long, has a high complexity \
+         score, or carries an Architecture, Algorithms, or Research label. Use high only when the \
+         user's task reports concrete difficulty evidence, such as a reproduced failure, stack \
+         trace, regression, reopened issue, or repeated failed attempt. Never select xhigh or max \
+         automatically.\n\
          Return:\n\
          \"routing\": { \"task_class\": string, \"task_classes\": [strings], \
          \"categories\": [strings], \"complexity\": 0.0-1.0, \
@@ -393,10 +398,25 @@ fn parse_routing(v: &Value) -> Option<RoutingDecision> {
     if !complexity.is_finite() || !confidence.is_finite() {
         return None;
     }
-    let effort = match obj.get("effort") {
+    let requested_effort = match obj.get("effort") {
         Some(Value::String(value)) => Some(EffortLevel::parse(value)?),
         Some(_) => return None,
         None => None,
+    };
+    let reason = obj
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // Evaluator output is an automatic recommendation, not a human override.
+    // Preserve its low/medium choice only when it matches the conservative
+    // baseline, and allow high only with concrete evidence in its explanation.
+    let automatic = automatic_effort_with_evidence(task_class, complexity, &reason);
+    let effort = match requested_effort {
+        Some(EffortLevel::High) if automatic == EffortLevel::High => Some(EffortLevel::High),
+        Some(EffortLevel::Low) if automatic == EffortLevel::Low => Some(EffortLevel::Low),
+        Some(EffortLevel::Medium) => Some(EffortLevel::Medium),
+        _ => Some(automatic),
     };
     let mut task_classes: Vec<TaskClass> = obj
         .get("task_classes")
@@ -433,11 +453,7 @@ fn parse_routing(v: &Value) -> Option<RoutingDecision> {
         complexity: complexity.clamp(0.0, 1.0),
         confidence: confidence.clamp(0.0, 1.0),
         effort,
-        reason: obj
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        reason,
     })
 }
 
@@ -1550,7 +1566,7 @@ pre_classifier:
         assert!(p.contains("survived MULTIPLE"));
         assert!(p.contains("0.90-1.00"));
         assert!(p.contains("low, medium, high, xhigh, max"));
-        assert!(p.contains("xhigh for ambiguous cross-system reasoning"));
+        assert!(p.contains("medium for routine work"));
         assert!(
             !p.contains("orchestrate"),
             "no orchestration dimension: {p}"
@@ -1679,7 +1695,7 @@ pre_classifier:
     }
 
     #[test]
-    fn classifier_output_rejects_invalid_effort_and_accepts_canonical_level() {
+    fn classifier_output_rejects_invalid_effort_and_bounds_canonical_level() {
         let cfg = cfg_with_dims(vec![]);
         let invalid = json!({"routing": {
             "task_class": "BugFix", "complexity": 0.4, "confidence": 0.9, "effort": "turbo"
@@ -1698,7 +1714,35 @@ pre_classifier:
                 .routing
                 .unwrap()
                 .effort,
-            Some(EffortLevel::Xhigh)
+            Some(EffortLevel::Medium)
+        );
+    }
+
+    #[test]
+    fn evaluator_effort_is_bounded_without_concrete_difficulty_evidence() {
+        let cfg = cfg_with_dims(vec![]);
+        let routine = json!({"routing": {
+            "task_class": "Architecture", "complexity": 0.98, "confidence": 0.9,
+            "effort": "max", "reason": "Long detailed design and implementation instructions"
+        }});
+        assert_eq!(
+            apply_thresholds(&cfg, &routine, Some("a/m1"), 1, "")
+                .routing
+                .unwrap()
+                .effort,
+            Some(EffortLevel::Medium)
+        );
+
+        let hard_debugging = json!({"routing": {
+            "task_class": "BugFix", "complexity": 0.4, "confidence": 0.9,
+            "effort": "high", "reason": "Regression is still failing after multiple attempts; stack trace attached."
+        }});
+        assert_eq!(
+            apply_thresholds(&cfg, &hard_debugging, Some("a/m1"), 1, "")
+                .routing
+                .unwrap()
+                .effort,
+            Some(EffortLevel::High)
         );
     }
 

@@ -723,7 +723,7 @@ async fn a_failed_streaming_log_write_fails_neither_that_turn_nor_later_ones() {
         let sid = new_session(&cx).await?.session_id.0.to_string();
         // Reproduce the production failure: SQLite refuses every streaming row
         // for one turn, then recovers.
-        let db = rusqlite::Connection::open(&state).unwrap();
+        let db = rusqlite::Connection::open(session_state_path(&state, &sid)).unwrap();
         db.execute_batch(
             "CREATE TRIGGER reject_chunks BEFORE INSERT ON session_log
              WHEN NEW.kind = 'session_update'
@@ -1964,8 +1964,15 @@ async fn explicit_effort_precedes_automatic_and_is_reresolved_on_failover() {
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nrouters:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
         state.display(),
         scores.display(),
-        agent_yaml("a", &[("m1", 2)], &[("MOCK_FAIL_PROMPT_MSG", "rate limit")]),
-        agent_yaml("b", &[("m2", 1)], &[]),
+        agent_yaml(
+            "a",
+            &[("m1", 2)],
+            &[
+                ("MOCK_FAIL_PROMPT_MSG", "rate limit"),
+                ("MOCK_NATIVE_EFFORTS", "1")
+            ]
+        ),
+        agent_yaml("b", &[("m2", 1)], &[("MOCK_NATIVE_EFFORTS", "1")]),
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
@@ -1997,7 +2004,7 @@ async fn explicit_effort_precedes_automatic_and_is_reresolved_on_failover() {
         let routing = open_state(&state).get(&sid).unwrap().routing.unwrap();
         assert_eq!(routing["effort"]["requested"], "max");
         assert_eq!(routing["effort"]["resolved"], "max");
-        assert_eq!(routing["effort"]["provider_value"], "tiny");
+        assert_eq!(routing["effort"]["provider_value"], "max");
         Ok(())
     })
     .await;
@@ -2109,8 +2116,11 @@ async fn preclassifier_omitted_effort_falls_back_to_task_depth_recommendation() 
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "design the architecture").await?;
         let routing = open_state(&state).get(&sid).unwrap().routing.unwrap();
-        assert_eq!(routing["effort"]["requested"], "xhigh");
-        assert_eq!(routing["effort"]["provider_value"], "deep");
+        assert_eq!(routing["effort"]["requested"], "medium");
+        assert!(
+            routing["effort"]["provider_value"].is_null(),
+            "automatic effort must not round up to xhigh"
+        );
         Ok(())
     })
     .await;
@@ -2262,7 +2272,7 @@ async fn post_pin_effort_config_and_directives_apply_without_ignore_notices() {
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
         state.display(),
         scores.display(),
-        agent_yaml("mock", &[("m1", 1)], &[]),
+        agent_yaml("mock", &[("m1", 1)], &[("MOCK_NATIVE_EFFORTS", "1")]),
     );
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
@@ -2937,7 +2947,11 @@ async fn lifecycle_hook_registers_each_delegate_before_it_runs() {
         assert_eq!(stop["worker_id"], start["worker_id"]);
         assert_eq!(start["candidate"], "peer/sonnet");
         assert_eq!(start["parent_candidate"], "fancy/opus");
-        assert_eq!(start["effort"], "low");
+        assert_eq!(
+            start["effort"],
+            serde_json::Value::Null,
+            "adapter did not advertise native effort"
+        );
         let parent_downstream = open_state(&state)
             .all()
             .into_iter()
@@ -4692,7 +4706,7 @@ async fn switch_directive_hands_off_to_new_model_mid_session() {
             .updates
             .iter()
             .filter(|n| n.session_id.0.as_ref() == sid)
-            .filter(|n| matches!(n.update, SessionUpdate::AgentMessageChunk(_)))
+            .filter(|n| matches!(&n.update, SessionUpdate::AgentMessageChunk(c) if matches!(&c.content, ContentBlock::Text(t) if !t.text.is_empty())))
             .count();
         assert_eq!(chunk_count, 2, "summary turn was not suppressed: {text}");
 
@@ -9429,6 +9443,209 @@ async fn pinned_version_keeps_the_candidate_and_discloses_the_version() {
     .await;
 }
 
+#[tokio::test]
+async fn native_effort_is_confirmed_before_account_failover_prompt() {
+    let state = temp_state_file("native-effort-account-failover");
+    let log = temp_log("native-effort-account-failover");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-native-effort-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        r#"candidates:
+  - { pattern: "claude@work/*", default_quality: 3.0, effort_levels: [high], effort_mapping: { high: high } }
+  - { pattern: "claude@personal/*", default_quality: 2.0, effort_levels: [high], effort_mapping: { high: xhigh } }
+"#,
+    )
+    .unwrap();
+    let mut claude = agent_yaml(
+        "claude",
+        &[("sonnet", 2)],
+        &[
+            ("MOCK_LOG", log.to_str().unwrap()),
+            ("MOCK_NATIVE_EFFORTS", "1"),
+        ],
+    );
+    claude.push_str(
+        r#"    accounts:
+      - name: work
+        env: [{ name: MOCK_NAME, value: "claude@work" }, { name: MOCK_FAIL_PROMPT_MSG, value: "rate limit" }]
+      - name: personal
+        env: [{ name: MOCK_NAME, value: "claude@personal" }]
+"#,
+    );
+    let yaml = format!(
+        r#"state_file: {}
+score_table: {}
+delegation: {{ enabled: false }}
+routers:
+  auto: {{ cost_quality_tradeoff: 0 }}
+agents:
+{}"#,
+        state.display(),
+        scores.display(),
+        claude
+    );
+    run_test_shared(yaml, async |cx, observed, _shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.candidate".to_string(),
+            SessionConfigOptionValue::value_id("claude@work/sonnet"),
+        ))
+        .block_task()
+        .await?;
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.effort".to_string(),
+            SessionConfigOptionValue::value_id("high"),
+        ))
+        .block_task()
+        .await?;
+
+        let response = prompt_text(&cx, &sid, "Fix the login bug").await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("failover: auto → claude@personal/sonnet")
+                && text.contains("echo:sonnet:Fix the login bug"),
+            "the failed account resumed on its sibling: {text}"
+        );
+
+        let events = read_log(&log);
+        let work_effort = events.iter().position(|event| {
+            event["event"] == "set_config_option"
+                && event["agent"] == "claude@work"
+                && event["configId"] == "reasoning_effort"
+                && event["value"] == "high"
+        });
+        let work_prompt = events
+            .iter()
+            .position(|event| event["event"] == "prompt" && event["agent"] == "claude@work");
+        let personal_effort = events.iter().position(|event| {
+            event["event"] == "set_config_option"
+                && event["agent"] == "claude@personal"
+                && event["configId"] == "reasoning_effort"
+                && event["value"] == "xhigh"
+        });
+        let personal_prompt = events
+            .iter()
+            .position(|event| event["event"] == "prompt" && event["agent"] == "claude@personal");
+        assert!(
+            work_effort
+                .zip(work_prompt)
+                .is_some_and(|(effort, prompt)| effort < prompt),
+            "work native effort must be confirmed before its prompt: {events:?}"
+        );
+        assert!(
+            personal_effort
+                .zip(personal_prompt)
+                .is_some_and(|(effort, prompt)| effort < prompt),
+            "failover native effort must be confirmed before its prompt: {events:?}"
+        );
+        let routing = open_state(&state).get(&sid).unwrap().routing.unwrap();
+        assert_eq!(routing["class"], "BugFix");
+        assert_eq!(routing["effort"]["provider_value"], "xhigh");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn effort_auto_switch_resets_native_metadata_without_losing_classification() {
+    let state = temp_state_file("native-effort-switch-auto");
+    let log = temp_log("native-effort-switch-auto");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-native-switch-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        r#"candidates:
+  - { pattern: "claude@work/*", default_quality: 3.0, effort_levels: [medium, high], effort_mapping: { medium: medium, high: high } }
+  - { pattern: "claude@personal/*", default_quality: 2.0, effort_levels: [medium, high], effort_mapping: { medium: max, high: xhigh } }
+"#,
+    )
+    .unwrap();
+    let mut claude = agent_yaml(
+        "claude",
+        &[("sonnet", 2)],
+        &[
+            ("MOCK_LOG", log.to_str().unwrap()),
+            ("MOCK_NATIVE_EFFORTS", "1"),
+        ],
+    );
+    claude.push_str(
+        r#"    accounts:
+      - name: work
+        env: [{ name: MOCK_NAME, value: "claude@work" }]
+      - name: personal
+        env: [{ name: MOCK_NAME, value: "claude@personal" }]
+"#,
+    );
+    let yaml = format!(
+        r#"state_file: {}
+score_table: {}
+delegation: {{ enabled: false }}
+agents:
+{}"#,
+        state.display(),
+        scores.display(),
+        claude
+    );
+    run_test_shared(yaml, async |cx, observed, _shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.candidate".to_string(),
+            SessionConfigOptionValue::value_id("claude@work/sonnet"),
+        ))
+        .block_task()
+        .await?;
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.effort".to_string(),
+            SessionConfigOptionValue::value_id("high"),
+        ))
+        .block_task()
+        .await?;
+        prompt_text(&cx, &sid, "Fix the login bug").await?;
+        let before = open_state(&state).get(&sid).unwrap().routing.unwrap();
+        assert_eq!(before["class"], "BugFix");
+        assert_eq!(before["effort"]["provider_value"], "high");
+
+        cx.send_request(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            "router.effort".to_string(),
+            SessionConfigOptionValue::value_id("auto"),
+        ))
+        .block_task()
+        .await?;
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: switch=claude@personal/sonnet]\nFix the login bug",
+        )
+        .await?;
+
+        let after = open_state(&state).get(&sid).unwrap().routing.unwrap();
+        assert_eq!(after["class"], before["class"]);
+        assert_eq!(after["effort"]["explicit"], false);
+        assert_eq!(after["effort"]["requested"], "medium");
+        assert_eq!(after["effort"]["provider_value"], "max");
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched claude@work/sonnet → claude@personal/sonnet")
+                && text.contains("echo:sonnet:Fix the login bug"),
+            "switch ran with the reset effort metadata: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
 // ======================================================================
 // Planner strategy: plan-first protocol and phase-directive handoff
 // ======================================================================
@@ -9494,17 +9711,14 @@ async fn planner_plan_ready_false_injects_protocol_not_current_plan_question() {
             prompt.contains(router_acp::strategies::planner::PLAN_PROTOCOL_HEADER),
             "built-in plan-first protocol missing: {prompt}"
         );
+        assert!(prompt.contains("Local Markdown workflow"));
         assert!(
-            prompt.contains(router_acp::strategies::planner::HANDOFF_PROCEED),
-            "stable proceed choice missing: {prompt}"
+            !prompt.contains("Linear"),
+            "default must not require a ticket service"
         );
         assert!(
-            prompt.contains(router_acp::strategies::planner::HANDOFF_REFINE),
-            "stable refine choice missing: {prompt}"
-        );
-        assert!(
-            prompt.contains(router_acp::strategies::planner::HANDOFF_CREATE_EPIC),
-            "stable Create EPIC choice missing: {prompt}"
+            !prompt.contains("Create EPIC"),
+            "handoff policy belongs to the repository"
         );
         assert!(
             prompt.contains("HOST-PLAN-INSTRUCTIONS-MARKER"),
@@ -9677,7 +9891,9 @@ async fn planner_ready_implementation_plan_picks_boosted_implementation_candidat
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "Implement the attached ticket").await?;
+        // Exercise the classifier route. A leading `implement` explicitly
+        // enters select-plan instead, covered by the durable-work command test.
+        prompt_text(&cx, &sid, "Build the attached ticket").await?;
 
         let phase = shared
             .with_session(&sid, |s| s.planner_phase)
@@ -9849,7 +10065,8 @@ const PLANNING_PRECLASS: &str = r#"{"routing":{"task_class":"BugFix","complexity
 async fn coordinator_ignores_implementation_preclass_directive_and_heuristic() {
     // The live incident: an automated "Review Sub-tasks" nudge classified
     // implementation / plan_ready=true and re-pinned the parent onto the
-    // workhorse. A coordinator must stay in Planning on every such signal.
+    // workhorse. Automatic signals must not move a coordinator off a planning
+    // model, while an authentic phase directive may update the workflow phase.
     let yaml = coordinator_yaml("coord-phase", IMPL_READY_PRECLASS, "", &[]);
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
@@ -9865,23 +10082,26 @@ async fn coordinator_ignores_implementation_preclass_directive_and_heuristic() {
         coordinator_prompt(&cx, &sid, "[router: phase=implementation]\nstart the work").await?;
         assert_eq!(
             shared.with_session(&sid, |s| s.planner_phase).flatten(),
-            planning
+            Some(router_acp::config::PlannerPhase::Implementation)
         );
 
         coordinator_prompt(&cx, &sid, "ok, implement the plan").await?;
         assert_eq!(
             shared.with_session(&sid, |s| s.planner_phase).flatten(),
-            planning
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.to_string())
+                .unwrap(),
+            "plan/sol"
         );
 
         let text = agent_text(&observed, &sid);
         assert!(
             !text.contains("echo:opus:"),
             "coordinator reached the workhorse: {text}"
-        );
-        assert!(
-            text.contains("coordinator: rejected [router: phase=implementation]"),
-            "the rejected directive is disclosed: {text}"
         );
         Ok(())
     })
@@ -10100,7 +10320,14 @@ async fn coordinator_role_pulls_an_automatic_workhorse_pin_back_to_planning() {
         );
         assert_eq!(
             shared.with_session(&sid, |s| s.planner_phase).flatten(),
-            Some(router_acp::config::PlannerPhase::Planning)
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.to_string())
+                .unwrap(),
+            "plan/sol"
         );
         Ok(())
     })
@@ -10385,4 +10612,1321 @@ async fn sharded_delegates_live_with_their_parent_and_stay_queryable() {
     assert!(output.status.success(), "{output:?}");
     let delegates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(delegates["data"]["children"][0]["id"], ids[1].as_str());
+}
+
+#[tokio::test]
+async fn planner_commands_reverse_phase_and_preserve_repository_guidance_once() {
+    let repo = tempfile::tempdir().unwrap();
+    for (name, text) in [
+        ("plan", "REPOSITORY-PLAN-SENTINEL"),
+        ("implement", "REPOSITORY-WORK-SENTINEL"),
+    ] {
+        let dir = repo.path().join(".agents/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), text).unwrap();
+    }
+    let log = temp_log("explicit-workflow-commands");
+    let state = temp_state_file("explicit-workflow-commands");
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\ndelegation: {{ enabled: false }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*']\n    implementation_candidates: ['work/*']\n    create-plan: {{ skill: plan }}\n    implement-work: {{ skill: implement }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/plan a local Markdown change").await?;
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                .unwrap(),
+            "plan"
+        );
+        let delivered = planner_user_prompts(&log);
+        assert_eq!(
+            delivered
+                .last()
+                .unwrap()
+                .matches("REPOSITORY-PLAN-SENTINEL")
+                .count(),
+            1
+        );
+        assert!(
+            delivered
+                .last()
+                .unwrap()
+                .contains("Arguments: a local Markdown change")
+        );
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: effort=medium] /implement plans/local.md keep these arguments",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                .unwrap(),
+            "work"
+        );
+        assert!(
+            planner_user_prompts(&log)
+                .last()
+                .unwrap()
+                .contains("Arguments: plans/local.md keep these arguments")
+        );
+        prompt_text(&cx, &sid, "/plan refine the same plan").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                .unwrap(),
+            "plan"
+        );
+        assert_eq!(
+            planner_user_prompts(&log)
+                .last()
+                .unwrap()
+                .matches("REPOSITORY-PLAN-SENTINEL")
+                .count(),
+            1
+        );
+        prompt_text(
+            &cx,
+            &sid,
+            "Example: `/implement plans/local.md` and quoted \"/implement\" stay examples",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        let meta: agent_client_protocol::schema::v1::Meta = serde_json::from_value(
+            serde_json::json!({"router_acp":{"planner_role":"create-plan","agent_origin":true}}),
+        )
+        .unwrap();
+        cx.send_request(
+            PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from("/implement internal guidance")],
+            )
+            .meta(meta),
+        )
+        .block_task()
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.commands.len(), 3);
+        assert!(
+            run.inputs
+                .values()
+                .filter(|i| i.origin == "human")
+                .all(|i| i.delivered_to.contains(&sid))
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn coordinator_implement_command_changes_workflow_without_changing_planner_role() {
+    let yaml = coordinator_yaml("explicit-coordinator-workflow", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = new_coordinator_session(&cx).await?;
+        coordinator_prompt(&cx, &sid, "/plan local scope").await?;
+        coordinator_prompt(&cx, &sid, "/implement the admitted scope").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.to_string())
+                .unwrap(),
+            "plan/sol"
+        );
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert!(run.coordinator);
+        assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+        coordinator_prompt(&cx, &sid, "/plan refine").await?;
+        assert_eq!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .phase,
+            router_acp::config::PlannerPhase::Planning
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn missing_explicit_planner_mapping_fails_before_downstream_execution() {
+    let state = temp_state_file("missing-planner-skill");
+    let log = temp_log("missing-planner-skill");
+    let repo = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\nrouters:\n  planner:\n    finish-work: {{ skill: unavailable-skill }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[("MOCK_LOG", log.to_str().unwrap())])
+    );
+    run_test(yaml, async |cx, _| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        let error = prompt_text(&cx, &sid, "/plan change").await.unwrap_err();
+        assert!(format!("{error}").contains("explicit planner mapping finish-work.skill"));
+        assert!(planner_user_prompts(&log).is_empty());
+        Ok(())
+    })
+    .await;
+}
+
+fn session_state_path(state: &std::path::Path, sid: &str) -> PathBuf {
+    use router_acp::state_layout::{SessionHome, StateLayout, home_of};
+    match home_of(sid) {
+        SessionHome::Legacy => state.to_path_buf(),
+        SessionHome::Shard(tag) => StateLayout::new(state).shard_path(&tag),
+    }
+}
+
+fn planner_wire_repository() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.email", "protocol-test@example.invalid"][..],
+        &["config", "user.name", "Protocol Test"][..],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(repo.join("README.md"), "planner wire test\n").unwrap();
+    for args in [
+        &["add", "README.md"][..],
+        &["commit", "--quiet", "-m", "initial"][..],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    tmp
+}
+
+fn planner_wire_yaml(state: &std::path::Path, log: &std::path::Path) -> String {
+    format!(
+        r#"state_file: {}
+router: planner
+delegation: {{ enabled: true, max_concurrent: 1 }}
+routers:
+  planner:
+    planning_candidates: ["planner/sol"]
+    implementation_candidates: ["planner/sol"]
+agents:
+{}"#,
+        state.display(),
+        agent_yaml(
+            "planner",
+            &[("sol", 3), ("haiku", 1)],
+            &[
+                ("MOCK_LOG", log.to_str().unwrap()),
+                ("MOCK_CAPS_IMAGE", "1"),
+            ],
+        )
+    )
+}
+
+async fn wait_for_mock_prompt(log: &PathBuf, marker: &str) -> Vec<serde_json::Value> {
+    for _ in 0..40 {
+        let events = read_log(log);
+        if events.iter().any(|event| {
+            event["event"] == "prompt"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(marker))
+        }) {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("mock agent did not receive prompt containing {marker:?}");
+}
+
+fn planner_admit_wire_prompt() -> &'static str {
+    r#"MCP_CALL:router-delegate planner_workflow {"action":"admit","key":"admit-wire","work":{"work_id":"work-1","plan_id":"plan-1","scope":"implement the admitted wire test","dependencies":[],"required_checks":[],"required_integration_evidence":[],"external_id":"external-work"}}
+"#
+}
+
+#[tokio::test]
+async fn planner_streaming_write_failure_preserves_pending_receipt_without_poisoning_next_turn() {
+    let state = temp_state_file("planner-streaming-failure");
+    let log = temp_log("planner-streaming-failure");
+    let repo = planner_wire_repository();
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let db = rusqlite::Connection::open(session_state_path(&state, &sid)).unwrap();
+        db.execute_batch("CREATE TRIGGER synthetic_write_failure BEFORE INSERT ON session_log WHEN NEW.kind = 'session_update' BEGIN SELECT RAISE(FAIL, 'synthetic transcript write failure'); END;").unwrap();
+        let request = |id: &str| PromptRequest::new(sid.clone(), vec![ContentBlock::from("TEXT:answer remains available")])
+            .meta(serde_json::from_value(serde_json::json!({"router_acp": {"input_id": id}})).ok());
+        let result = cx.send_request(request("failed-stream-input")).block_task().await?;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let run = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        assert!(!run.inputs["failed-stream-input"].delivered_to.contains(&sid));
+        db.execute_batch("DROP TRIGGER synthetic_write_failure;").unwrap();
+        let result = cx.send_request(request("next-stream-input")).block_task().await?;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let run = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        assert!(!run.inputs["failed-stream-input"].delivered_to.contains(&sid));
+        assert!(run.inputs["next-stream-input"].delivered_to.contains(&sid));
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn planner_child_streaming_failure_fences_initial_and_followup_receipts() {
+    let state = temp_state_file("planner-child-streaming-failure");
+    let log = temp_log("planner-child-streaming-failure");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        let implementation = PromptRequest::new(sid.clone(), vec![ContentBlock::from("/implement carry original input")])
+            .meta(serde_json::from_value(serde_json::json!({"router_acp": {"input_id": "child-input"}})).ok());
+        cx.send_request(implementation).block_task().await?;
+        prompt_text(&cx, &sid, planner_admit_wire_prompt()).await?;
+        let db = rusqlite::Connection::open(session_state_path(&state, &sid)).unwrap();
+        db.execute_batch("CREATE TRIGGER synthetic_child_write_failure BEFORE INSERT ON session_log WHEN NEW.kind = 'session_update' AND NEW.router_session_id LIKE '%::delegate-%' BEGIN SELECT RAISE(FAIL, 'synthetic child transcript write failure'); END;").unwrap();
+        let task = format!("MCP_CALL:router-delegate delegate_task {}", serde_json::json!({
+            "work_id": "work-1", "task": "TEXT:initial-child-answer", "input_ids": ["child-input"]
+        }));
+        prompt_text(&cx, &sid, &task).await?;
+        wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+        let run = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        assert!(!run.inputs["child-input"].delivered_to.contains("work-1"), "initial child receipt must remain pending");
+        let delegate_id = shared.live_delegates.lock().unwrap().keys().next().cloned().unwrap();
+        for (label, healthy) in [("failed-followup", false), ("healthy-followup", true)] {
+            if healthy { db.execute_batch("DROP TRIGGER synthetic_child_write_failure;").unwrap(); }
+            let followup = format!("MCP_CALL:router-delegate delegate_followup {}", serde_json::json!({
+                "delegate_id": delegate_id, "message": format!("TEXT:{label}"), "input_ids": ["child-input"]
+            }));
+            prompt_text(&cx, &sid, &followup).await?;
+            let run = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+            assert_eq!(run.inputs["child-input"].delivered_to.contains("work-1"), healthy, "{label}");
+        }
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn planner_durable_child_uses_account_qualified_runtime_and_generation() {
+    let state = temp_state_file("planner-account-child");
+    let log = temp_log("planner-account-child");
+    let repo = planner_wire_repository();
+    let planning = claude_credential_fixture(None);
+    let implementation = claude_credential_fixture(None);
+    let file = implementation.path().join(".credentials.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    value["claudeAiOauth"]["accessToken"] = serde_json::json!("synthetic-worker-access");
+    std::fs::write(file, value.to_string()).unwrap();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\nauto_upgrade: {{enabled: false}}\ndelegation: {{enabled: true, candidate_hints: exact}}\nrouters:\n  planner:\n    planning_candidates: ['claude@planning/sol']\n    implementation_candidates: ['claude@implementation/sol']\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "claude@planning",
+            &[("sol", 3)],
+            &[
+                ("CLAUDE_CONFIG_DIR", planning.path().to_str().unwrap()),
+                ("MOCK_LOG", log.to_str().unwrap())
+            ],
+        ),
+        agent_yaml(
+            "claude@implementation",
+            &[("sol", 3)],
+            &[
+                ("CLAUDE_CONFIG_DIR", implementation.path().to_str().unwrap()),
+                ("MOCK_LOG", log.to_str().unwrap())
+            ],
+        ),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=claude@planning/sol] /implement prepare the assignment").await?;
+        let parent_candidate = CandidateId::parse("claude@planning/sol").unwrap();
+        let child_candidate = CandidateId::parse("claude@implementation/sol").unwrap();
+        assert_eq!(shared.with_session(&sid, |session| session.pin.as_ref().unwrap().candidate.clone()), Some(parent_candidate.clone()));
+        let parent_generation = router_acp::auth::request_access_generation(&shared, &parent_candidate).unwrap();
+        let child_generation = router_acp::auth::request_access_generation(&shared, &child_candidate).unwrap();
+        assert_ne!(parent_generation, child_generation);
+        let task = format!(
+            "{}MCP_CALL:router-delegate delegate_task {{\"work_id\":\"work-1\",\"task\":\"account-child-wire MCP_CALL:router-worker worker_whoami {{}}\",\"hints\":{{\"candidate\":\"claude@implementation/sol\"}}}}",
+            planner_admit_wire_prompt(),
+        );
+        prompt_text(&cx, &sid, &task).await?;
+        let events = wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+        let event = events.iter().find(|event| event["event"] == "prompt"
+            && event["text"].as_str().is_some_and(|text| text.contains("[Assignment briefing]"))).unwrap();
+        assert_eq!(event["agent"], "claude@implementation");
+        assert_eq!(event["model"], "sol");
+        let route = shared.planner_child_routes.lock().unwrap().values().next().cloned().unwrap();
+        assert_eq!(route.work_id, "work-1");
+        assert_eq!(route.candidate, "claude@implementation/sol");
+        let persisted = shared.state.lock().unwrap().get(&route.state_sid).unwrap();
+        assert_eq!(persisted.agent, "claude@implementation");
+        assert_eq!(persisted.model, "sol");
+        assert_eq!(persisted.parent_session_id.as_deref(), Some(sid.as_str()));
+        let key = shared.planner_child_targets.lock().unwrap().iter().next().cloned().unwrap();
+        let targets = shared.targets.lock().unwrap();
+        let target = &targets[&key];
+        assert_eq!(target.spec.agent_name, "claude@implementation");
+        assert_eq!(target.credential_generation.as_deref(), Some(child_generation.as_str()));
+        assert_ne!(target.credential_generation.as_deref(), Some(parent_generation.as_str()));
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn planner_worker_wire_delivers_attachment_and_fences_parent_actions() {
+    let state = temp_state_file("planner-worker-wire");
+    let log = temp_log("planner-worker-wire");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_wire_yaml(&state, &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+
+        let mut implementation = PromptRequest::new(
+            sid.clone(),
+            vec![
+                ContentBlock::from("/implement carry the attached scope"),
+                ContentBlock::Image(ImageContent::new("aGk=", "image/png")),
+            ],
+        );
+        implementation.meta = serde_json::from_value(serde_json::json!({
+            "router_acp": {"input_id": "impl-input"}
+        }))
+        .ok();
+        cx.send_request(implementation).block_task().await?;
+
+        let child_task = concat!(
+            "MCP_LIST:router-worker|",
+            "MCP_CALL:router-worker worker_whoami {}|",
+            "MCP_CALL:router-worker planner_workflow {\"action\":\"review\",\"key\":\"worker-review\",\"work_id\":\"work-1\",\"revision\":\"ignored\",\"accepted\":true,\"evidence\":[],\"corrections\":null}|",
+            "MCP_CALL:router-worker planner_workflow {\"action\":\"integrate\",\"key\":\"worker-integrate\",\"work_id\":\"work-1\",\"receipt\":{\"revision\":\"ignored\",\"evidence\":{\"merge\":\"verified\"}}}|",
+            "MCP_CALL:router-worker planner_workflow {\"action\":\"complete\",\"key\":\"worker-complete\",\"queue_evidence\":\"verified\"}"
+        );
+        let parent_prompt = format!(
+            "{}DELEGATE_WORK:work-1:{}",
+            planner_admit_wire_prompt(),
+            child_task
+        );
+        prompt_text(&cx, &sid, &parent_prompt).await?;
+
+        let events = wait_for_mock_prompt(&log, "[Router-owned child wake]").await;
+        let child = events
+            .iter()
+            .find(|event| {
+                event["event"] == "prompt"
+                    && event["model"] == "sol"
+                    && event["blocks"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block["type"] == "image" && block["data"] == "aGk="
+                        })
+                    })
+            })
+            .expect("the admitted worker receives the original image block");
+        assert_eq!(child["agent"], "planner");
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("mcp-list:router-worker:")
+                && text.contains("worker_whoami")
+                && text.matches("implementation children cannot coordinate").count() >= 3,
+            "worker MCP bind, identity and parent-action fencing reached the wire: {text}"
+        );
+
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        let wake_id = run.wakes.keys().next().cloned().expect("child stop wake");
+        assert_eq!(run.wakes[&wake_id].deliveries, 1);
+        assert!(!run.wakes[&wake_id].acknowledged);
+
+        for _ in 0..30 {
+            if !shared
+                .with_session(&sid, |session| session.planner_wake_active)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let acknowledge = format!(
+            "MCP_CALL:router-delegate planner_workflow {{\"action\":\"acknowledge-input\",\"key\":\"ack-input-wire\",\"input_id\":\"impl-input\",\"owner\":\"work-1\"}}\n\
+             MCP_CALL:router-delegate planner_workflow {{\"action\":\"acknowledge-wake\",\"key\":\"ack-wake-wire\",\"wake_id\":\"{wake_id}\"}}"
+        );
+        prompt_text(&cx, &sid, &acknowledge).await?;
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert!(run.inputs["impl-input"].acknowledged);
+        assert!(run.wakes[&wake_id].acknowledged);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
+    let state = temp_state_file("planner-native-resume");
+    let log = temp_log("planner-native-resume");
+    let repo = planner_wire_repository();
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")).meta(coordinator_meta()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement resume the durable planner run").await?;
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert!(run.coordinator);
+        assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+
+        // The run, rather than either persisted router snapshot, owns these
+        // workflow facts. This also makes the native resume path distinct from
+        // an in-memory planner session surviving a close.
+        let mut persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        for snapshot in [&mut persisted.routing, &mut persisted.session_config] {
+            let snapshot = snapshot.as_mut().expect("planner session checkpoint");
+            snapshot["planner_phase"] = serde_json::Value::Null;
+            snapshot["coordinator"] = serde_json::Value::Bool(false);
+        }
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(sid.clone(), persisted)
+            .unwrap();
+
+        let resume = cx
+            .send_request(
+                agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                    sid.clone(),
+                    repo.path().join("repo"),
+                ),
+            )
+            .block_task()
+            .await?;
+        let meta = serde_json::to_value(resume.meta).unwrap();
+        assert_eq!(meta["router_acp"]["planner_phase"], "implementation");
+        assert_eq!(meta["router_acp"]["coordinator"], true);
+        let restored = shared
+            .with_session(&sid, |session| {
+                (
+                    session.planner_phase,
+                    session.coordinator,
+                    session.pin.is_none(),
+                    session.resolved_effort.is_none(),
+                )
+            })
+            .expect("native resume restores the exact router session id");
+        assert_eq!(
+            restored.0,
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert!(restored.1, "planner run restores the coordinator role");
+        assert!(
+            restored.2,
+            "resume does not open an adapter before a prompt"
+        );
+        assert!(
+            restored.3,
+            "resume does not claim confirmed effective effort before pinning"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_lifecycle_delete_refuses_admitted_work_and_close_keeps_assignment() {
+    let state = temp_state_file("planner-lifecycle-admitted-work");
+    let log = temp_log("planner-lifecycle-admitted-work");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement admit this assignment").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            &format!(
+                "{}DELEGATE_WORK:work-1:leave this assignment unfinished",
+                planner_admit_wire_prompt()
+            ),
+        )
+        .await?;
+        let assigned = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap()
+            .works["work-1"]
+            .child_id
+            .clone();
+
+        let error = cx
+            .send_request(agent_client_protocol::schema::v1::DeleteSessionRequest::new(sid.clone()))
+            .block_task()
+            .await
+            .expect_err("admitted planner work prevents lifecycle deletion");
+        assert!(
+            format!("{error}").contains("reconcile unfinished planner work"),
+            "delete explains the durable-work fence: {error}"
+        );
+
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+        assert!(shared.with_session(&sid, |_| ()).is_none());
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .expect("close preserves durable planner work");
+        assert_eq!(run.works["work-1"].child_id, assigned);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn direct_human_roadmap_request_authorizes_durable_work() {
+    let state = temp_state_file("planner-human-roadmap");
+    let log = temp_log("planner-human-roadmap");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        let original = format!("Implement ROADMAP.md\n{}", planner_admit_wire_prompt());
+        prompt_text(&cx, &sid, &original).await?;
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+        assert_eq!(run.execution_request.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            run.works["work-1"].status,
+            router_acp::planner_workflow::WorkStatus::Admitted
+        );
+        let events = read_log(&log);
+        assert!(events.iter().any(|event| {
+            event["event"] == "prompt"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("[router-acp planner role: select-plan]"))
+        }));
+        for text in [
+            "`implement ROADMAP.md`",
+            "Example: implement ROADMAP.md",
+            "Do not implement ROADMAP.md",
+        ] {
+            let request = PromptRequest::new(sid.clone(), vec![ContentBlock::from(text)]);
+            assert_eq!(router_acp::planner_workflow::command(&request), None);
+        }
+        let mut internal =
+            PromptRequest::new(sid, vec![ContentBlock::from("implement ROADMAP.md")]);
+        internal.meta =
+            serde_json::from_value(serde_json::json!({"router_acp":{"agent_origin":true}})).ok();
+        assert_eq!(router_acp::planner_workflow::command(&internal), None);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_parent_cancel_releases_idle_children_but_keeps_assignment() {
+    let state = temp_state_file("planner-cancel-idle");
+    let log = temp_log("planner-cancel-idle");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement the cancellation test").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            &format!(
+                "{}DELEGATE_WORK:work-1:finish this bounded turn",
+                planner_admit_wire_prompt()
+            ),
+        )
+        .await?;
+        assert!(!shared.live_delegates.lock().unwrap().is_empty());
+        assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
+        cx.send_notification(CancelNotification::new(sid.clone()))?;
+        for _ in 0..40 {
+            if shared.planner_child_targets.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(shared.live_delegates.lock().unwrap().is_empty());
+        assert!(shared.planner_child_routes.lock().unwrap().is_empty());
+        assert!(shared.planner_child_targets.lock().unwrap().is_empty());
+        assert!(
+            shared
+                .delegate_tokens
+                .lock()
+                .unwrap()
+                .values()
+                .all(|binding| binding.worker.is_none())
+        );
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, router_acp::planner_workflow::RunStatus::Paused);
+        assert!(run.works["work-1"].workspace.is_some());
+        assert!(run.works["work-1"].attempt.as_ref().unwrap().ended);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn queued_planner_turn_collects_managed_background_without_client_cancellation() {
+    let state = temp_state_file("planner-queued-background");
+    let log = temp_log("planner-queued-background");
+    let repo = planner_wire_repository();
+    // SAFETY: every helper-enabled test uses the same executable.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_wire_yaml(&state, &log),
+        async |cx, observed, shared| {
+            init_with_terminals(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement authorized test").await?;
+            let active = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::from("SLEEP:1000 original-active-turn")],
+                ))
+                .block_task();
+            wait_for_mock_prompt(&log, "original-active-turn").await;
+            cx.send_request(
+                PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::from("BACKGROUND_START:echo managed")],
+                )
+                .meta(
+                    serde_json::from_value(
+                        serde_json::json!({"router_acp":{"input_id":"queued-background"}}),
+                    )
+                    .ok(),
+                ),
+            )
+            .block_task()
+            .await?;
+            active.await?;
+            wait_for_mock_prompt(&log, "router-acp managed background completed").await;
+            let text = agent_text(&observed, &sid);
+            assert!(text.contains("watch-fired"), "{text}");
+            assert_eq!(observed.lock().unwrap().terminal_creates.len(), 1);
+            assert!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .parent_queue
+                    .is_empty()
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queued_planner_commands_keep_fifo_controls_and_original_images() {
+    let state = temp_state_file("planner-fifo-controls");
+    let log = temp_log("planner-fifo-controls");
+    let repo = planner_wire_repository();
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\nrouters:\n  planner:\n    planning_candidates: ['plan/sol']\n    implementation_candidates: ['work/sol']\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 2)],
+            &[
+                ("MOCK_LOG", log.to_str().unwrap()),
+                ("MOCK_CAPS_IMAGE", "1")
+            ]
+        ),
+        agent_yaml(
+            "work",
+            &[("sol", 2)],
+            &[
+                ("MOCK_LOG", log.to_str().unwrap()),
+                ("MOCK_CAPS_IMAGE", "1")
+            ]
+        )
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement initial admitted scope").await?;
+        let active = cx
+            .send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from(
+                    "[router: effort=low] SLEEP:1000 original-active-turn",
+                )],
+            ))
+            .block_task();
+        wait_for_mock_prompt(&log, "original-active-turn").await;
+        for (id, text) in [
+            (
+                "queued-one",
+                "[router: switch=plan/sol, effort=medium] /plan fifo-plan",
+            ),
+            (
+                "queued-two",
+                "[router: switch=work/sol, effort=high] /implement fifo-implement",
+            ),
+        ] {
+            let mut request = PromptRequest::new(
+                sid.clone(),
+                vec![
+                    ContentBlock::from(text),
+                    ContentBlock::Image(ImageContent::new(id, "image/png")),
+                ],
+            );
+            request.meta =
+                serde_json::from_value(serde_json::json!({"router_acp":{"input_id":id}})).ok();
+            cx.send_request(request).block_task().await?;
+        }
+        let malformed = cx
+            .send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from("[router: effort=bogus] /plan invalid")],
+            ))
+            .block_task()
+            .await;
+        assert!(
+            malformed.is_err(),
+            "malformed queued controls fail through ACP"
+        );
+        assert_eq!(
+            shared.with_session(&sid, |s| s.effort_request).flatten(),
+            Some(router_acp::candidate::EffortLevel::Low)
+        );
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.parent_queue
+                .iter()
+                .map(|input| input.input_id.as_str())
+                .collect::<Vec<_>>(),
+            ["queued-one", "queued-two"]
+        );
+        assert!(
+            run.inputs["queued-one"]
+                .text
+                .starts_with("[router: switch=plan/sol")
+        );
+        active.await?;
+        let events = wait_for_mock_prompt(&log, "fifo-implement").await;
+        let first = events
+            .iter()
+            .position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Arguments: fifo-plan"))
+            })
+            .expect("planning command delivered");
+        let second = events
+            .iter()
+            .position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Arguments: fifo-implement"))
+            })
+            .expect("implementation command delivered");
+        assert!(first < second);
+        for (index, agent, image) in [
+            (first, "plan", "queued-one"),
+            (second, "work", "queued-two"),
+        ] {
+            assert_eq!(events[index]["agent"], agent);
+            assert!(
+                events[index]["blocks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|block| block["type"] == "image" && block["data"] == image)
+            );
+        }
+        assert_eq!(
+            shared.with_session(&sid, |s| s.effort_request).flatten(),
+            Some(router_acp::candidate::EffortLevel::High)
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn queued_planner_role_honors_repository_skill_routing() {
+    let state = temp_state_file("planner-queued-skill");
+    let log = temp_log("planner-queued-skill");
+    let repo = planner_wire_repository();
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\nrouters:\n  planner:\n    planning_candidates: ['plan/sol', 'review/opus']\n    implementation_candidates: ['work/sol']\nskill_routing:\n  - pattern: create-plan\n    candidates: ['review/opus']\nagents:\n{}{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("sol", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "review",
+            &[("opus", 3)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=work/sol] /implement initial scope",
+        )
+        .await?;
+        let active = cx
+            .send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from("SLEEP:1000 queued-skill-active")],
+            ))
+            .block_task();
+        wait_for_mock_prompt(&log, "queued-skill-active").await;
+        prompt_text(&cx, &sid, "/plan use-repository-model-policy").await?;
+        active.await?;
+        let events = wait_for_mock_prompt(&log, "Arguments: use-repository-model-policy").await;
+        let delivered = events
+            .iter()
+            .find(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Arguments: use-repository-model-policy"))
+            })
+            .expect("queued role guidance delivered");
+        assert_eq!(delivered["agent"], "review");
+        assert_eq!(delivered["model"], "opus");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.elevation_skill.clone())
+                .flatten()
+                .as_deref(),
+            Some("create-plan")
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_wake_loop_suppresses_active_paused_and_approval_parent() {
+    let state = temp_state_file("planner-wake-fences");
+    let log = temp_log("planner-wake-fences");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_wire_yaml(&state, &log),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare a bounded assignment").await?;
+            prompt_text(&cx, &sid, planner_admit_wire_prompt()).await?;
+
+            let identity = router_acp::planner_workflow::begin_work(&shared, &sid, "work-1")
+                .await
+                .map_err(|error| AcpError::internal_error().data(error))?
+                .0;
+            router_acp::planner_workflow::attempt_ended(
+                &shared,
+                &sid,
+                &identity,
+                None,
+                "child stopped during the wire fence test".into(),
+                true,
+            )
+            .map_err(|error| AcpError::internal_error().data(error))?;
+
+            shared.with_session(&sid, |session| session.prompt_activity = 1);
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .wakes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .deliveries,
+                0,
+                "active parent suppresses automatic wake"
+            );
+
+            shared.with_session(&sid, |session| session.prompt_activity = 0);
+            router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                run.status = router_acp::planner_workflow::RunStatus::Paused;
+                Ok(())
+            })
+            .map_err(|error| AcpError::internal_error().data(error))?;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .wakes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .deliveries,
+                0,
+                "paused parent suppresses automatic wake"
+            );
+
+            router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                run.status = router_acp::planner_workflow::RunStatus::Running;
+                run.approval_waits.insert("approval-1".into());
+                Ok(())
+            })
+            .map_err(|error| AcpError::internal_error().data(error))?;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .wakes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .deliveries,
+                0,
+                "approval wait suppresses automatic wake"
+            );
+
+            router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                run.approval_waits.remove("approval-1");
+                Ok(())
+            })
+            .map_err(|error| AcpError::internal_error().data(error))?;
+            wait_for_mock_prompt(&log, "[Router-owned child wake]").await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                run.wakes.values().next().unwrap().deliveries,
+                1,
+                "retry fencing prevents duplicate delivery inside the retry window"
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn planner_child_status_restores_only_the_current_router_attempt() {
+    let state = temp_state_file("planner-child-status");
+    let log = temp_log("planner-child-status");
+    let repo = planner_wire_repository();
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        cx.send_request(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                serde_json::from_value(serde_json::json!({
+                    "_meta": {"router_acp": {"planner_children": true}}
+                }))
+                .unwrap(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        let mut run = router_acp::planner_workflow::ensure(&shared, &sid).unwrap();
+        run.phase = router_acp::config::PlannerPhase::Implementation;
+        run.execution_request = Some("authorized test execution".into());
+        router_acp::planner_workflow::save(&shared, &sid, &mut run).unwrap();
+        router_acp::planner_workflow::operate(
+            &shared,
+            &sid,
+            None,
+            router_acp::planner_workflow::Operation::Admit {
+                key: "admit-status-wire".into(),
+                work: router_acp::planner_workflow::WorkSpec {
+                    work_id: "work-1".into(),
+                    plan_id: "plan-1".into(),
+                    scope: "restore the child presentation".into(),
+                    dependencies: Vec::new(),
+                    required_checks: Vec::new(),
+                    required_integration_evidence: Vec::new(),
+                    external_id: Some("external-work".into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        let child = run.works["work-1"].child_id.clone();
+        let request = || {
+            agent_client_protocol::UntypedMessage::new(
+                "router-acp/planner-child",
+                serde_json::json!({
+                    "sessionId": sid, "child_id": child, "action": "status"
+                }),
+            )
+            .unwrap()
+        };
+        let idle = cx.send_request(request()).block_task().await?;
+        assert_eq!(idle["active"], false);
+        assert_eq!(idle["effort_confirmed"], false);
+        let (actor, _, _, _) = router_acp::planner_workflow::begin_work(&shared, &sid, "work-1")
+            .await
+            .unwrap();
+        let state_sid = format!("{sid}::attempt-state");
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(
+                state_sid.clone(),
+                router_acp::state::PersistedSession {
+                    routing: Some(
+                        serde_json::json!({"effort": {"resolved": "high", "confirmed": false}}),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        shared.planner_child_routes.lock().unwrap().insert(
+            (
+                router_acp::downstream::ProcessKey("test".into()),
+                "downstream".into(),
+            ),
+            router_acp::planner_client::ChildRoute {
+                parent_sid: sid.clone(),
+                work_id: "work-1".into(),
+                child_id: child.clone(),
+                attempt_id: actor.attempt_id.clone(),
+                candidate: "test/model".into(),
+                state_sid: state_sid.clone(),
+            },
+        );
+        let active = cx.send_request(request()).block_task().await?;
+        assert_eq!(active["active"], true);
+        assert_eq!(active["attempt_id"], actor.attempt_id);
+        assert_eq!(active["child_id"], child);
+        assert_eq!(active["work_id"], "work-1");
+        assert_eq!(active["effort_confirmed"], false);
+        assert!(active["effort"].is_null());
+        assert_eq!(
+            active["revision"],
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .revision
+        );
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .patch_session_routing(
+                &state_sid,
+                &serde_json::json!({
+                    "effort": {"resolved": "high", "confirmed": true}
+                }),
+            )
+            .unwrap();
+        let confirmed = cx.send_request(request()).block_task().await?;
+        assert_eq!(confirmed["effort_confirmed"], true);
+        assert_eq!(confirmed["effort"], "high");
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.works
+                .get_mut("work-1")
+                .unwrap()
+                .attempt
+                .as_mut()
+                .unwrap()
+                .ended = true;
+            Ok(())
+        })
+        .unwrap();
+        let ended = cx.send_request(request()).block_task().await?;
+        assert_eq!(ended["active"], false);
+        assert_eq!(ended["effort_confirmed"], false);
+        assert!(ended["effort"].is_null());
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            let attempt = run
+                .works
+                .get_mut("work-1")
+                .unwrap()
+                .attempt
+                .as_mut()
+                .unwrap();
+            attempt.ended = false;
+            attempt.router_pid = 0;
+            Ok(())
+        })
+        .unwrap();
+        let stale = cx.send_request(request()).block_task().await?;
+        assert_eq!(
+            stale["active"], false,
+            "a different router generation cannot claim the saved attempt"
+        );
+        assert_eq!(stale["effort_confirmed"], false);
+        let wrong_child = agent_client_protocol::UntypedMessage::new(
+            "router-acp/planner-child",
+            serde_json::json!({
+                "sessionId": sid, "child_id": "another-child", "action": "status"
+            }),
+        )
+        .unwrap();
+        assert!(cx.send_request(wrong_child).block_task().await.is_err());
+        Ok(())
+    })
+    .await;
 }

@@ -182,6 +182,7 @@ async fn invoke(hook: &DelegateLifecycleHook, payload: &[u8]) -> Result<HookOutp
     if let Some(mut stdin) = child.stdin.take() {
         // A hook that ignores stdin may close it early; that is not a failure.
         let _ = stdin.write_all(payload).await;
+        let _ = stdin.write_all(b"\n").await;
         let _ = stdin.shutdown().await;
     }
     let output = tokio::time::timeout(

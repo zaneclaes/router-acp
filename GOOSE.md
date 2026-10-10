@@ -492,6 +492,23 @@ With `ticket_context` configured (your config loads `HAI-…` tickets via the
 linear CLI), **"Fix HAI-1234" pulls the ticket into the prompt first**, so
 classification runs on the ticket's real content.
 
+Send an authentic leading `/plan <context>` to select planning, or
+`/implement <plan or scope>` to select implementation. `/plan` also works
+after implementation starts. The default uses local Markdown plans and has no
+ticket-service dependency. Repository roles and explicit skill mappings retain
+their own approval and release policy.
+
+The parent admits work through `planner_workflow`. A `delegate_task` with
+`work_id` creates an isolated durable child; plain delegation remains ephemeral.
+Review binds to an exact revision. Corrections return to that child. Resume
+targets the exact saved router session, and retained work uses replacement
+attempts. Completion requires input, review, finishing, and integration receipts.
+
+Goose does not need to negotiate separate child presentation. A client that
+does negotiate `planner_children` must route child callbacks and controls by
+exact identity. Real Goose idle-parent wake, restart, and consumer parity remain
+release checks. Protocol fixtures do not establish those runtime results.
+
 ## Notes and caveats
 
 - **Cosmetics:** goose labels the borrowed slot "Pi" in provider lists and

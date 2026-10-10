@@ -22,7 +22,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::candidate::{CandidateId, TaskClass};
+use crate::candidate::{CandidateId, EffortLevel, TaskClass};
 use crate::config::{AgentLlmProxyConfig, LlmWireProtocol};
 use crate::downstream::{ProcessKey, ProcessTargetSpec};
 use crate::session::Shared;
@@ -591,6 +591,14 @@ async fn proxy_request(
     } else {
         parts.headers.clone()
     };
+    let mut wire_effort = decision.as_ref().map(|d| {
+        confirmed_wire_effort(
+            &state.shared,
+            &CandidateId::new(&target.agent, &d.selected_model),
+            &outbound_body,
+            target.config.protocol,
+        )
+    });
 
     let upstream_url = match upstream_url(&target, &rest, &parts.uri) {
         Ok(url) => url,
@@ -801,6 +809,12 @@ async fn proxy_request(
             match retry {
                 Ok(response) => {
                     if let Some(active) = attributed.as_ref() {
+                        wire_effort = Some(confirmed_wire_effort(
+                            &state.shared,
+                            &active.candidate,
+                            &body,
+                            target.config.protocol,
+                        ));
                         let estimated_input = decision
                             .as_ref()
                             .map(|decision| decision.estimated_input)
@@ -871,6 +885,11 @@ async fn proxy_request(
         started,
     );
     let status = upstream.status();
+    if status.is_success()
+        && let (Some(active), Some(effort)) = (attributed.as_ref(), wire_effort.as_ref())
+    {
+        publish_effective_effort(&state.shared, active, effort);
+    }
     let headers = upstream.headers().clone();
     let max_capture = state.shared.cfg.llm_proxy.max_capture_bytes;
     let shared = state.shared.clone();
@@ -1637,6 +1656,83 @@ enum EffortShape {
     Set(String),
 }
 
+/// Report the value on the accepted wire, including provider clamps and an
+/// unchanged fallback body. An omitted field cannot establish provider effort.
+fn confirmed_wire_effort(
+    shared: &Shared,
+    candidate: &CandidateId,
+    body: &[u8],
+    protocol: LlmWireProtocol,
+) -> Value {
+    let body = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    let value = match protocol {
+        LlmWireProtocol::Anthropic => body.pointer("/output_config/effort"),
+        LlmWireProtocol::Openai => body
+            .pointer("/reasoning/effort")
+            .or_else(|| body.get("reasoning_effort")),
+    }
+    .and_then(Value::as_str);
+    let scores = shared.scores.lookup_exact(candidate);
+    let resolved = value.and_then(|value| {
+        EffortLevel::parse(value)
+            .filter(|level| *level != EffortLevel::Auto)
+            .or_else(|| {
+                scores
+                    .effort_mapping
+                    .iter()
+                    .find_map(|(level, mapped)| (mapped == value).then_some(*level))
+            })
+    });
+    json!({"resolved":resolved.map(EffortLevel::as_str),"provider_value":value,"source":"provider-request","confirmed":true})
+}
+
+fn publish_effective_effort(shared: &Shared, active: &ActiveTurn, confirmed: &Value) {
+    let effort = {
+        let state = shared.state.lock().unwrap();
+        let mut effort = state
+            .get(&active.state_sid)
+            .and_then(|s| s.routing)
+            .and_then(|r| r.get("effort").cloned())
+            .unwrap_or_else(|| json!({}));
+        if !effort.is_object() {
+            effort = json!({});
+        }
+        effort
+            .as_object_mut()
+            .unwrap()
+            .extend(confirmed.as_object().unwrap().clone());
+        if let Err(error) =
+            state.patch_session_routing(&active.state_sid, &json!({"effort":effort}))
+        {
+            tracing::warn!(session = active.state_sid, %error, "cannot persist confirmed effort");
+        }
+        effort
+    };
+    shared.with_session(&active.state_sid, |s| {
+        let pending = s.pending_meta_disclosure.get_or_insert_with(|| json!({}));
+        pending["effort"] = effort.clone();
+    });
+    let child = shared
+        .planner_child_routes
+        .lock()
+        .unwrap()
+        .values()
+        .find(|r| r.state_sid == active.state_sid)
+        .cloned();
+    if active.state_sid != active.parent_router_sid && child.is_none() {
+        return;
+    }
+    if let Some(upstream) = shared.upstream() {
+        let params = json!({"sessionId":child.as_ref().map(|r| r.child_id.as_str()).unwrap_or(&active.state_sid),
+            "attempt_id":child.as_ref().map(|r| &r.attempt_id),"effort":effort});
+        if let Ok(msg) =
+            agent_client_protocol::UntypedMessage::new("router-acp/effort-update", params)
+        {
+            let _ = upstream.send_notification(msg);
+        }
+    }
+}
+
 fn request_effort(
     shared: &Shared,
     parent_router_sid: &str,
@@ -1661,13 +1757,24 @@ fn request_effort(
             })
             .flatten()
     });
+    let explicit = delegate.is_none()
+        && shared
+            .with_session(parent_router_sid, |s| s.effort_request.is_some())
+            .unwrap_or(false);
     match requested {
         None => EffortShape::Preserve,
-        Some(level) => turn_scores(shared, version, candidate)
-            .resolve_effort(level)
-            .provider_value
-            .map(EffortShape::Set)
-            .unwrap_or(EffortShape::Omit),
+        Some(level) => {
+            let scores = turn_scores(shared, version, candidate);
+            let resolution = if explicit {
+                scores.resolve_effort(level)
+            } else {
+                scores.resolve_automatic_effort(level)
+            };
+            resolution
+                .provider_value
+                .map(EffortShape::Set)
+                .unwrap_or(EffortShape::Omit)
+        }
     }
 }
 
@@ -3509,6 +3616,47 @@ agents:
         summarized["thinking"] = json!({"type": "adaptive", "display": "summarized"});
         select_request_model(&shared, &turn, &summarized);
         assert!(!shared.llm_proxy.thinking_text_is_narration("r1"));
+    }
+
+    #[test]
+    fn confirmed_effort_uses_the_shaped_or_unchanged_provider_wire() {
+        let (_dir, shared) = kory_code_shared();
+        let candidate = CandidateId::new("claude", "sonnet");
+        let capped = shape_provider_request(
+            &json!({"thinking":{"type":"disabled"}}),
+            None,
+            &EffortShape::Set("max".into()),
+            LlmWireProtocol::Anthropic,
+            false,
+        )
+        .unwrap();
+        let confirmed =
+            confirmed_wire_effort(&shared, &candidate, &capped, LlmWireProtocol::Anthropic);
+        assert_eq!(confirmed["resolved"], "high");
+        assert_eq!(confirmed["provider_value"], "high");
+        let omitted = shape_provider_request(
+            &json!({"output_config":{"effort":"max"}}),
+            None,
+            &EffortShape::Omit,
+            LlmWireProtocol::Anthropic,
+            false,
+        )
+        .unwrap();
+        assert!(confirmed_wire_effort(&shared, &candidate, &omitted, LlmWireProtocol::Anthropic)["resolved"].is_null());
+        let unchanged = serde_json::to_vec(&json!({"reasoning":{"effort":"medium"}})).unwrap();
+        assert_eq!(
+            confirmed_wire_effort(&shared, &candidate, &unchanged, LlmWireProtocol::Openai)["resolved"],
+            "medium"
+        );
+        assert!(
+            confirmed_wire_effort(
+                &shared,
+                &candidate,
+                br#"{"reasoning":{"effort":"auto"}}"#,
+                LlmWireProtocol::Openai
+            )["resolved"]
+                .is_null()
+        );
     }
 
     #[test]

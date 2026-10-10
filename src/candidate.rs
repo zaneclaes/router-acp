@@ -61,6 +61,8 @@ pub struct EffortResolution {
     pub requested: EffortLevel,
     pub resolved: Option<EffortLevel>,
     pub provider_value: Option<String>,
+    /// True only after the adapter acknowledges its native effort option.
+    pub confirmed: bool,
 }
 
 impl CandidateId {
@@ -322,6 +324,30 @@ impl ResolvedScores {
             requested,
             resolved,
             provider_value,
+            confirmed: false,
+        }
+    }
+
+    /// Resolve an automatic recommendation without increasing it when this
+    /// provider lacks the requested level. Explicit requests keep using
+    /// [`Self::resolve_effort`], which preserves its closest-level behavior.
+    pub fn resolve_automatic_effort(&self, requested: EffortLevel) -> EffortResolution {
+        let resolved = self
+            .effort_levels
+            .iter()
+            .copied()
+            .filter(|level| {
+                *level != EffortLevel::Auto
+                    && *level <= requested
+                    && self.effort_mapping.contains_key(level)
+            })
+            .max();
+        let provider_value = resolved.and_then(|level| self.effort_mapping.get(&level).cloned());
+        EffortResolution {
+            requested,
+            resolved,
+            provider_value,
+            confirmed: false,
         }
     }
 }
@@ -468,8 +494,18 @@ impl ScoreTable {
     /// `lookup` without the `pinned_versions` mapping: `id` is matched as is.
     pub fn lookup_exact(&self, id: &CandidateId) -> ResolvedScores {
         let key = id.to_string();
+        // Account seats run the same model capabilities as their base agent.
+        // Ordered account-specific entries can still override the base entry.
+        let base_key = id
+            .agent
+            .split_once('@')
+            .map(|(agent, _)| CandidateId::new(agent, &id.model).to_string());
         for (pattern, entry) in &self.entries {
-            if glob_match(pattern, &key) {
+            if glob_match(pattern, &key)
+                || base_key
+                    .as_ref()
+                    .is_some_and(|key| glob_match(pattern, key))
+            {
                 return entry.clone();
             }
         }
@@ -571,6 +607,36 @@ mod tests {
                 .resolved,
             None
         );
+    }
+
+    #[test]
+    fn automatic_effort_resolution_never_rounds_up_but_explicit_stays_compatible() {
+        let scores = ScoreTable::from_yaml(
+            "candidates:\n  - pattern: '*model*'\n    effort_levels: [medium, high, max]\n    effort_mapping: { medium: balanced, high: intensive, max: maximum }\n",
+        )
+        .unwrap()
+        .lookup(&CandidateId::new("test", "model"));
+
+        let automatic_low = scores.resolve_automatic_effort(EffortLevel::Low);
+        assert_eq!(automatic_low.resolved, None);
+        assert_eq!(automatic_low.provider_value, None);
+
+        let automatic_high = scores.resolve_automatic_effort(EffortLevel::High);
+        assert_eq!(automatic_high.resolved, Some(EffortLevel::High));
+        assert_eq!(automatic_high.provider_value.as_deref(), Some("intensive"));
+
+        let explicit_low = scores.resolve_effort(EffortLevel::Low);
+        assert_eq!(explicit_low.resolved, Some(EffortLevel::Medium));
+        assert_eq!(explicit_low.provider_value.as_deref(), Some("balanced"));
+
+        let missing_mapping = ScoreTable::from_yaml(
+            "candidates:\n  - pattern: '*unmapped*'\n    effort_levels: [medium, high]\n    effort_mapping: { medium: balanced }\n",
+        )
+        .unwrap()
+        .lookup(&CandidateId::new("test", "unmapped"));
+        let automatic_high = missing_mapping.resolve_automatic_effort(EffortLevel::High);
+        assert_eq!(automatic_high.resolved, Some(EffortLevel::Medium));
+        assert_eq!(automatic_high.provider_value.as_deref(), Some("balanced"));
     }
 }
 

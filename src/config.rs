@@ -1292,6 +1292,32 @@ fn default_hard_planning_candidates() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlannerRouterConfig {
+    /// `markdown` uses the bundled repository-neutral workflow. Any other
+    /// value is a repository-relative Markdown policy file, never an inferred
+    /// organization or an implicitly selected ticket service.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Optional repository-relative roadmap path. No path means selection
+    /// must resolve the repository's convention before admitting work.
+    #[serde(default)]
+    pub roadmap: Option<PathBuf>,
+    #[serde(default, rename = "create-plan")]
+    pub create_plan: PlannerSkillConfig,
+    #[serde(default, rename = "select-plan")]
+    pub select_plan: PlannerSkillConfig,
+    #[serde(default, rename = "implement-work")]
+    pub implement_work: PlannerSkillConfig,
+    #[serde(default, rename = "review-work")]
+    pub review_work: PlannerSkillConfig,
+    #[serde(default, rename = "finish-work")]
+    pub finish_work: PlannerSkillConfig,
+    #[serde(default, rename = "integrate-plan")]
+    pub integrate_plan: PlannerSkillConfig,
+    /// Repository-owned allocator. It receives a JSON assignment on stdin
+    /// and returns {"path": "/isolated/workspace", "lease": "opaque-id"}.
+    /// Omitted allocation uses isolated local clones, never shared writes.
+    #[serde(default)]
+    pub workspace: Option<PlannerWorkspaceConfig>,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1331,6 +1357,15 @@ pub struct PlannerRouterConfig {
 impl Default for PlannerRouterConfig {
     fn default() -> Self {
         Self {
+            profile: None,
+            roadmap: None,
+            create_plan: PlannerSkillConfig::default(),
+            select_plan: PlannerSkillConfig::default(),
+            implement_work: PlannerSkillConfig::default(),
+            review_work: PlannerSkillConfig::default(),
+            finish_work: PlannerSkillConfig::default(),
+            integrate_plan: PlannerSkillConfig::default(),
+            workspace: None,
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -1342,6 +1377,22 @@ impl Default for PlannerRouterConfig {
             planning_instructions: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerSkillConfig {
+    pub skill: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerWorkspaceConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2108,6 +2159,44 @@ impl Config {
                 default.as_str(),
                 cap.as_str()
             )));
+        }
+        for (role, mapping) in [
+            ("create-plan", &self.routers.planner.create_plan),
+            ("select-plan", &self.routers.planner.select_plan),
+            ("implement-work", &self.routers.planner.implement_work),
+            ("review-work", &self.routers.planner.review_work),
+            ("finish-work", &self.routers.planner.finish_work),
+            ("integrate-plan", &self.routers.planner.integrate_plan),
+        ] {
+            if let Some(skill) = &mapping.skill
+                && !crate::planner_skills::valid_skill_name(skill)
+            {
+                return Err(ConfigError(format!(
+                    "routers.planner.{role}.skill must name a repository skill"
+                )));
+            }
+        }
+        if self
+            .routers
+            .planner
+            .profile
+            .as_deref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(ConfigError(
+                "routers.planner.profile must be markdown or a readable policy path".into(),
+            ));
+        }
+        if self
+            .routers
+            .planner
+            .workspace
+            .as_ref()
+            .is_some_and(|w| w.command.trim().is_empty() || w.timeout_ms == 0)
+        {
+            return Err(ConfigError(
+                "planner workspace requires a command and positive timeout_ms".into(),
+            ));
         }
         if self.pre_classifier.enabled {
             if self.pre_classifier.evaluator.is_empty() {

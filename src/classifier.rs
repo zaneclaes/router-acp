@@ -41,21 +41,47 @@ impl Default for TaskProfile {
 }
 
 /// Conservative automatic effort recommendation from the classified task.
+///
+/// Complexity and task labels help route a task, but they are not evidence
+/// that a routine implementation needs more reasoning. Higher automatic
+/// effort therefore needs a separate, concrete difficulty signal.
 pub fn automatic_effort(class: TaskClass, complexity: f64) -> EffortLevel {
     let complexity = complexity.clamp(0.0, 1.0);
-    if complexity >= 0.85 {
-        EffortLevel::Max
-    } else if complexity >= 0.65
-        || matches!(
-            class,
-            TaskClass::Algorithms | TaskClass::Architecture | TaskClass::Research
-        )
-    {
-        EffortLevel::Xhigh
-    } else if complexity >= 0.35 {
-        EffortLevel::High
+    if complexity <= 0.15 && matches!(class, TaskClass::UiTweak | TaskClass::Writing) {
+        EffortLevel::Low
     } else {
         EffortLevel::Medium
+    }
+}
+
+/// Return whether a report contains an observed failure or similarly concrete
+/// debugging evidence. This deliberately does not inspect labels or complexity.
+pub fn has_concrete_difficulty_evidence(evidence: &str) -> bool {
+    let evidence = evidence.to_lowercase();
+    [
+        "still broken",
+        "still failing",
+        "didn't work",
+        "did not work",
+        "failed after",
+        "multiple attempts",
+        "reproduce the failure",
+    ]
+    .iter()
+    .any(|signal| evidence.contains(signal))
+}
+
+/// Raise automatic effort only when the task supplies concrete difficulty
+/// evidence. Automatic selection never emits XHigh or Max.
+pub fn automatic_effort_with_evidence(
+    class: TaskClass,
+    complexity: f64,
+    evidence: &str,
+) -> EffortLevel {
+    if has_concrete_difficulty_evidence(evidence) {
+        EffortLevel::High
+    } else {
+        automatic_effort(class, complexity)
     }
 }
 
@@ -320,6 +346,9 @@ pub fn classify_heuristic(rules: &ClassifierRules, input: &ClassifyInput) -> Tas
         class,
         complexity,
         languages: languages.into_iter().collect(),
+        // The heuristic receives expanded tickets and skills as one string,
+        // so it cannot safely attribute an apparent failure to the user's
+        // task. Its fallback remains at the baseline.
         effort: Some(automatic_effort(class, complexity)),
     }
 }
@@ -525,6 +554,43 @@ mod tests {
     }
 
     #[test]
+    fn automatic_effort_keeps_long_labeled_work_at_medium() {
+        let long_architecture_prompt = format!(
+            "Design the architecture for this change. {}",
+            "Detailed skill context and implementation notes. ".repeat(2_000)
+        );
+        let profile = classify_text(&long_architecture_prompt);
+        assert_eq!(profile.class, TaskClass::Architecture);
+        assert!(
+            profile.complexity >= 0.85,
+            "complexity {}",
+            profile.complexity
+        );
+        assert_eq!(profile.effort, Some(EffortLevel::Medium));
+
+        for class in [TaskClass::Algorithms, TaskClass::Research] {
+            assert_eq!(automatic_effort(class, 1.0), EffortLevel::Medium);
+        }
+    }
+
+    #[test]
+    fn automatic_effort_uses_high_only_for_concrete_failure_evidence() {
+        assert_eq!(
+            automatic_effort_with_evidence(
+                TaskClass::BugFix,
+                0.2,
+                "The regression is still failing after multiple attempts; attached stack trace.",
+            ),
+            EffortLevel::High
+        );
+        assert_eq!(
+            automatic_effort(TaskClass::UiTweak, 0.1),
+            EffortLevel::Low,
+            "bounded trivial work may use low effort"
+        );
+    }
+
+    #[test]
     fn classifies_ui_tweak() {
         let p = classify_text("Change the button padding and font color on the login page CSS");
         assert_eq!(p.class, TaskClass::UiTweak);
@@ -608,6 +674,15 @@ mod tests {
             "a failed-fix follow-up must select the high-complexity path: {}",
             p.complexity
         );
+        assert_eq!(p.effort, Some(EffortLevel::Medium));
+    }
+
+    #[test]
+    fn heuristic_fallback_keeps_failure_text_at_medium_without_attribution() {
+        let p = classify_text(
+            "The login regression is still failing after multiple attempts; reproduce it from the attached stack trace.",
+        );
+        assert_eq!(p.effort, Some(EffortLevel::Medium));
     }
 
     #[test]

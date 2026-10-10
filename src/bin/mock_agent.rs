@@ -53,9 +53,13 @@
 //! - `MCP_CALL:<server> <tool> <json args>` — call any tool on the named MCP
 //!   server from `session/new` (in order, before other directives) and echo
 //!   `mcp:<tool>:<text>`; works for `router-delegate` and `router-worker`.
+//! - `MCP_LIST:<server>` — call `tools/list` on the named MCP server and echo
+//!   the advertised tool names.
 //! - `DELEGATE:<task>` — call the `delegate_task` tool on the MCP server
 //!   named `router-delegate` passed in session/new (may repeat; all
 //!   delegations run concurrently)
+//! - `DELEGATE_WORK:<work_id>:<task>` — call the planner-assigned
+//!   `delegate_task` path with the durable work identity.
 //! - `DELEGATE_BG:<task>` — call `delegate_task` with `background: true`
 //!   (returns the immediate `b-…` ack; may repeat)
 //! - `AWAIT_DELEGATES` — call `delegate_await` (all pending jobs); an
@@ -114,6 +118,7 @@ struct Mock {
     auth_required: bool,
     fail_new_after: Option<u32>,
     ignore_set_config: bool,
+    native_efforts: bool,
     exit_after_init: bool,
     exit_on_prompt: bool,
     /// When set, prompts fail with this error message (data field).
@@ -153,6 +158,7 @@ impl Mock {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             ignore_set_config: std::env::var("MOCK_IGNORE_SET_CONFIG").is_ok(),
+            native_efforts: std::env::var("MOCK_NATIVE_EFFORTS").is_ok(),
             exit_after_init: std::env::var("MOCK_EXIT_AFTER_INIT").is_ok(),
             exit_on_prompt: std::env::var("MOCK_EXIT_ON_PROMPT").is_ok(),
             fail_prompt_msg: std::env::var("MOCK_FAIL_PROMPT_MSG").ok(),
@@ -201,6 +207,22 @@ impl Mock {
                 .collect::<Vec<_>>(),
         )
         .category(SessionConfigOptionCategory::Model)
+    }
+
+    fn config_options(&self, model: &str, effort: &str) -> Vec<SessionConfigOption> {
+        let mut options = vec![self.model_option(model)];
+        if self.native_efforts {
+            options.push(SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning effort",
+                effort.to_string(),
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(|v| SessionConfigSelectOption::new(v, v))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        options
     }
 }
 
@@ -363,11 +385,13 @@ async fn run_prompt(
         .as_millis() as u64;
     mock.log(json!({
         "event": "prompt",
+        "agent": mock.name,
         "sessionId": session_id,
         "text": text,
         "content": req.prompt,
         "model": model,
         "startedAtMs": started_at_ms,
+        "blocks": serde_json::to_value(&req.prompt).unwrap_or_default(),
     }));
 
     if mock.exit_on_prompt {
@@ -669,6 +693,40 @@ async fn run_prompt(
     }
 
     // MCP_CALL:<server> <tool> <json args> — one call each, in order.
+    for server_name in text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("MCP_LIST:"))
+    {
+        let Some(server) = mcp_servers
+            .iter()
+            .find(|server| matches!(server, McpServer::Stdio(stdio) if stdio.name == server_name))
+        else {
+            reply.push(format!("mcp-list-error:no {server_name} MCP server"));
+            continue;
+        };
+        let result = match McpClient::spawn(server).await {
+            Ok(mut client) => {
+                let result = client.request("tools/list", json!({})).await;
+                client.shutdown().await;
+                result
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(value) => {
+                let names = value["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .collect::<Vec<_>>();
+                reply.push(format!("mcp-list:{server_name}:{}", names.join(",")));
+            }
+            Err(error) => reply.push(format!("mcp-list-error:{server_name}:{error}")),
+        }
+    }
+
+    // MCP_CALL:<server> <tool> <json args> — one call each, in order.
     for spec in text
         .lines()
         .filter_map(|l| l.trim().strip_prefix("MCP_CALL:"))
@@ -711,6 +769,58 @@ async fn run_prompt(
                 ));
             }
             Err(err) => reply.push(format!("mcp-error:{tool}:{err}")),
+        }
+    }
+
+    let planner_tasks: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("DELEGATE_WORK:"))
+        .filter_map(|spec| {
+            let (work_id, task) = spec.split_once(':')?;
+            Some((work_id.to_string(), task.replace('|', "\n")))
+        })
+        .collect();
+    if !planner_tasks.is_empty() {
+        let delegate_server = mcp_servers.iter().find(
+            |server| matches!(server, McpServer::Stdio(stdio) if stdio.name == "router-delegate"),
+        );
+        match delegate_server {
+            Some(server) => {
+                for (work_id, task) in planner_tasks {
+                    let result = match McpClient::spawn(server).await {
+                        Ok(mut client) => {
+                            let result = client
+                                .request(
+                                    "tools/call",
+                                    json!({
+                                        "name": "delegate_task",
+                                        "arguments": {
+                                            "task": task,
+                                            "work_id": work_id,
+                                            "input_ids": [],
+                                        },
+                                    }),
+                                )
+                                .await;
+                            client.shutdown().await;
+                            result
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(value) => {
+                            let text = value["content"][0]["text"].as_str().unwrap_or("");
+                            let is_error = value["isError"].as_bool().unwrap_or(false);
+                            reply.push(format!(
+                                "delegate-work{}:{text}",
+                                if is_error { "-error" } else { "" }
+                            ));
+                        }
+                        Err(error) => reply.push(format!("delegate-work-error:{error}")),
+                    }
+                }
+            }
+            None => reply.push("delegate-work-error:no router-delegate MCP server".to_string()),
         }
     }
 
@@ -1110,9 +1220,8 @@ async fn main() {
                                     })),
                                 }
                             }
-                            let option = mock.model_option(&mock.models[0]);
-                            let mut resp =
-                                NewSessionResponse::new(sid).config_options(vec![option]);
+                            let mut resp = NewSessionResponse::new(sid)
+                                .config_options(mock.config_options(&mock.models[0], "medium"));
                             if !mock.session_modes.is_empty() {
                                 use agent_client_protocol::schema::v1::{
                                     SessionMode, SessionModeState,
@@ -1149,10 +1258,28 @@ async fn main() {
                     };
                     mock.log(json!({
                         "event": "set_config_option",
+                        "agent": mock.name,
                         "sessionId": sid,
                         "configId": req.config_id.0.to_string(),
                         "value": value,
                     }));
+                    if req.config_id.0.as_ref() == "reasoning_effort" && mock.native_efforts {
+                        if !["low", "medium", "high", "xhigh", "max"].contains(&value.as_str()) {
+                            return responder.respond_with_error(
+                                AcpError::invalid_params().data("unknown effort"),
+                            );
+                        }
+                        return responder.respond(SetSessionConfigOptionResponse::new(
+                            mock.config_options(
+                                &mock.models[0],
+                                if mock.ignore_set_config {
+                                    "medium"
+                                } else {
+                                    &value
+                                },
+                            ),
+                        ));
+                    }
                     if req.config_id.0.as_ref() != "model" {
                         return responder.respond_with_error(
                             AcpError::invalid_params().data("unknown config id"),
@@ -1174,8 +1301,9 @@ async fn main() {
                         }
                         session.model.clone()
                     };
-                    let option = mock.model_option(&current);
-                    responder.respond(SetSessionConfigOptionResponse::new(vec![option]))
+                    responder.respond(SetSessionConfigOptionResponse::new(
+                        mock.config_options(&current, "medium"),
+                    ))
                 }
             },
             on_receive_request!(),
@@ -1219,7 +1347,7 @@ async fn main() {
                     let _ = cx.send_notification(chunk(&sid, format!("replayed:{sid}")));
                     responder.respond(
                         agent_client_protocol::schema::v1::LoadSessionResponse::new()
-                            .config_options(vec![mock.model_option(&mock.models[0])]),
+                            .config_options(mock.config_options(&mock.models[0], "medium")),
                     )
                 }
             },
