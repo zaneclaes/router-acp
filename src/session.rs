@@ -14,14 +14,14 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
     ConfigOptionUpdate, ContentBlock, ContentChunk, DeleteSessionRequest, Error as AcpError,
-    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, McpCapabilities, McpServer, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
-    SessionCapabilities, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelectGroup, SessionConfigSelectOption,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalOutputRequest,
-    WaitForTerminalExitRequest,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpCapabilities, McpServer,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ReleaseTerminalRequest, ResumeSessionRequest, SessionCapabilities, SessionConfigId,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    StopReason, TerminalOutputRequest, WaitForTerminalExitRequest,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Client as ClientPeer, ConnectTo, ConnectionTo, Dispatch, Handled,
@@ -562,6 +562,11 @@ pub struct Shared {
     /// Managed terminals whose exit resumes the agent within the current
     /// upstream prompt, keyed by router session id.
     pub managed_backgrounds: Mutex<HashMap<String, Vec<String>>>,
+    /// The interrupt for a turn currently waiting on its managed terminals,
+    /// keyed by router session id. A user steer or `session/cancel` fires it
+    /// so a human can always reach a parked turn.
+    pub background_interrupts:
+        Mutex<HashMap<String, tokio::sync::oneshot::Sender<BackgroundInterrupt>>>,
     /// Per-delegate effort from `delegate_task` `hints.effort`, keyed by the
     /// delegate's state-session id. The LLM proxy reads it in place of the
     /// parent session's effort while that delegate runs.
@@ -693,6 +698,7 @@ impl Shared {
             background_delegates: Mutex::new(HashMap::new()),
             background_notify: tokio::sync::Notify::new(),
             managed_backgrounds: Mutex::new(HashMap::new()),
+            background_interrupts: Mutex::new(HashMap::new()),
             delegate_effort: Mutex::new(HashMap::new()),
             agent_delegate_slots,
             worker_handoffs: Mutex::new(HashMap::new()),
@@ -4854,11 +4860,28 @@ async fn send_primary_prompt(
     }
 }
 
+/// Why a turn parked on its managed terminals stops waiting early.
+pub enum BackgroundInterrupt {
+    Cancel,
+    Steer(Vec<ContentBlock>),
+}
+
+/// How a turn's wait on its managed terminals ended.
+enum BackgroundWait {
+    /// Every terminal exited; resume the agent with this report.
+    Completed(String),
+    /// A user message arrived first. The terminals were stopped; resume the
+    /// agent with this prompt.
+    Steered(Vec<ContentBlock>),
+    /// The client cancelled the turn. The terminals were stopped.
+    Cancelled,
+}
+
 async fn wait_for_managed_backgrounds(
     shared: &Arc<Shared>,
     router_sid: &str,
     cancellation: RequestCancellation,
-) -> Result<Option<String>, AcpError> {
+) -> Result<Option<BackgroundWait>, AcpError> {
     let terminal_ids = shared
         .managed_backgrounds
         .lock()
@@ -4869,45 +4892,125 @@ async fn wait_for_managed_backgrounds(
         return Ok(None);
     }
     let upstream = shared.upstream().ok_or_else(AcpError::internal_error)?;
-    let mut completions = Vec::with_capacity(terminal_ids.len());
-    for terminal_id in terminal_ids {
-        let exited = upstream
-            .send_request(WaitForTerminalExitRequest::new(
-                router_sid.to_string(),
-                terminal_id.clone(),
-            ))
-            .forward_cancellation_from(cancellation.clone())
-            .block_task()
-            .await?;
-        let output = upstream
-            .send_request(TerminalOutputRequest::new(
-                router_sid.to_string(),
-                terminal_id.clone(),
-            ))
-            .block_task()
-            .await?;
-        let status = exited
-            .exit_status
-            .exit_code
-            .map(|code| format!("exit code {code}"))
-            .or_else(|| {
-                exited
-                    .exit_status
-                    .signal
-                    .map(|signal| format!("signal {signal}"))
-            })
-            .unwrap_or_else(|| "unknown status".to_string());
-        let retained = output.output.trim();
-        completions.push(if retained.is_empty() {
-            format!("Terminal {terminal_id} exited with {status}. No output was captured.")
-        } else {
-            format!("Terminal {terminal_id} exited with {status}.\nOutput:\n{retained}")
-        });
+    let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+    shared
+        .background_interrupts
+        .lock()
+        .unwrap()
+        .insert(router_sid.to_string(), interrupt_tx);
+    // A cancel that landed after the downstream turn ended but before the
+    // interrupt was registered still stops the wait.
+    let cancelled_early = shared
+        .with_session(router_sid, |s| s.cancelled)
+        .unwrap_or(false);
+    let waited = async {
+        let mut completions = Vec::with_capacity(terminal_ids.len());
+        for terminal_id in &terminal_ids {
+            let exited = upstream
+                .send_request(WaitForTerminalExitRequest::new(
+                    router_sid.to_string(),
+                    terminal_id.clone(),
+                ))
+                .forward_cancellation_from(cancellation.clone())
+                .block_task()
+                .await?;
+            let output = upstream
+                .send_request(TerminalOutputRequest::new(
+                    router_sid.to_string(),
+                    terminal_id.clone(),
+                ))
+                .block_task()
+                .await?;
+            let status = exited
+                .exit_status
+                .exit_code
+                .map(|code| format!("exit code {code}"))
+                .or_else(|| {
+                    exited
+                        .exit_status
+                        .signal
+                        .map(|signal| format!("signal {signal}"))
+                })
+                .unwrap_or_else(|| "unknown status".to_string());
+            let retained = output.output.trim();
+            completions.push(if retained.is_empty() {
+                format!("Terminal {terminal_id} exited with {status}. No output was captured.")
+            } else {
+                format!("Terminal {terminal_id} exited with {status}.\nOutput:\n{retained}")
+            });
+        }
+        Ok::<_, AcpError>(BackgroundWait::Completed(format!(
+            "[router-acp managed background completed]\n{}\nContinue the original task now.",
+            completions.join("\n\n")
+        )))
+    };
+    let outcome = if cancelled_early {
+        Ok(BackgroundWait::Cancelled)
+    } else {
+        tokio::select! {
+            result = waited => result,
+            interrupt = interrupt_rx => Ok(match interrupt {
+                Ok(BackgroundInterrupt::Steer(prompt)) => BackgroundWait::Steered(prompt),
+                Ok(BackgroundInterrupt::Cancel) | Err(_) => BackgroundWait::Cancelled,
+            }),
+            () = cancellation.cancelled() => Ok(BackgroundWait::Cancelled),
+        }
+    };
+    shared
+        .background_interrupts
+        .lock()
+        .unwrap()
+        .remove(router_sid);
+    if let Ok(BackgroundWait::Steered(_) | BackgroundWait::Cancelled) = &outcome {
+        // An interrupted wait owns its terminals: nothing would collect them,
+        // and a watcher left running would keep polling for hours.
+        for terminal_id in &terminal_ids {
+            stop_managed_background(&upstream, router_sid, terminal_id).await;
+        }
     }
-    Ok(Some(format!(
-        "[router-acp managed background completed]\n{}\nContinue the original task now.",
-        completions.join("\n\n")
-    )))
+    let outcome = outcome?;
+    Ok(Some(match outcome {
+        BackgroundWait::Steered(prompt) => {
+            let mut blocks = vec![ContentBlock::from(format!(
+                "[router-acp managed background interrupted]\nThe user sent a message while this \
+                 turn waited on background terminal(s) {}. router-acp stopped them. Answer the \
+                 user; start a new watcher only if it is still needed.\nUser message:",
+                terminal_ids.join(", ")
+            ))];
+            blocks.extend(prompt);
+            BackgroundWait::Steered(blocks)
+        }
+        other => other,
+    }))
+}
+
+/// Kill and release one managed terminal. Best effort: the client may
+/// already have reaped it.
+async fn stop_managed_background(
+    upstream: &ConnectionTo<ClientPeer>,
+    router_sid: &str,
+    terminal_id: &str,
+) {
+    if let Err(err) = upstream
+        .send_request(KillTerminalRequest::new(
+            router_sid.to_string(),
+            terminal_id.to_string(),
+        ))
+        .block_task()
+        .await
+    {
+        tracing::warn!(session = %router_sid, terminal = %terminal_id, "terminal/kill failed: {err}");
+    }
+    if let Err(err) = upstream
+        .send_request(ReleaseTerminalRequest::new(
+            router_sid.to_string(),
+            terminal_id.to_string(),
+        ))
+        .block_task()
+        .await
+    {
+        tracing::warn!(session = %router_sid, terminal = %terminal_id, "terminal/release failed: {err}");
+    }
 }
 
 async fn send_prompt_with_failover(
@@ -4970,7 +5073,7 @@ async fn send_prompt_with_failover(
     let max_iters = max_attempts.max(shared.cfg.routers.escalation.max_escalations + 1) + 1;
     let mut continuing = false;
     let mut repaired_once = false;
-    let mut background_completion: Option<String> = None;
+    let mut background_completion: Option<Vec<ContentBlock>> = None;
     let mut attempt = 0;
     // Managed watcher completions are continuations of the same provider
     // attempt. Give them their own bounded budget so repeated CI waits do not
@@ -5079,7 +5182,7 @@ async fn send_prompt_with_failover(
             }
             blocks.extend(history.clone());
             if let Some(completion) = background_completion.take() {
-                blocks.push(ContentBlock::from(completion));
+                blocks.extend(completion);
             } else {
                 blocks.extend(req.prompt.clone());
             }
@@ -5287,11 +5390,20 @@ async fn send_prompt_with_failover(
                 match wait_for_managed_backgrounds(&shared, &router_sid, responder.cancellation())
                     .await
                 {
-                    Ok(Some(completion)) => {
-                        background_completion = Some(completion);
+                    Ok(Some(BackgroundWait::Completed(completion))) => {
+                        background_completion = Some(vec![ContentBlock::from(completion)]);
                         continuing = false;
                         attempt -= 1;
                         continue;
+                    }
+                    Ok(Some(BackgroundWait::Steered(prompt))) => {
+                        background_completion = Some(prompt);
+                        continuing = false;
+                        attempt -= 1;
+                        continue;
+                    }
+                    Ok(Some(BackgroundWait::Cancelled)) => {
+                        return responder.respond(PromptResponse::new(StopReason::Cancelled));
                     }
                     Ok(None) => {}
                     Err(_err) if responder.cancellation().is_cancelled() => {
@@ -8733,6 +8845,15 @@ fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpEr
             (s.pin.clone(), s.delegates.clone())
         })
         .unwrap_or((None, Vec::new()));
+    // A turn parked on managed terminals has no downstream turn to cancel.
+    if let Some(interrupt) = shared
+        .background_interrupts
+        .lock()
+        .unwrap()
+        .remove(&router_sid)
+    {
+        let _ = interrupt.send(BackgroundInterrupt::Cancel);
+    }
     if let Some(pin) = pin
         && let Some(conn) = shared.target_conn(&pin.process_key)
     {
@@ -8774,6 +8895,30 @@ fn on_session_list(
         })
         .collect();
     responder.respond(ListSessionsResponse::new(sessions))
+}
+
+/// Persist a user message steered into a running turn. On failure, record
+/// the persistence error on the session and return it.
+fn log_user_steer(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    prompt: &[ContentBlock],
+) -> Result<(), String> {
+    let saved = shared.state.lock().unwrap().log_checked(
+        router_sid,
+        &crate::state::LogEntry {
+            kind: "user_steer".into(),
+            role: "user".into(),
+            summary: prompt_display_text(prompt),
+            detail: Some(json!({"prompt": prompt})),
+            ..Default::default()
+        },
+    );
+    saved.map_err(|err| {
+        let message = format!("cannot save injected user message: {err}");
+        shared.with_session(router_sid, |s| s.persistence_error = Some(message.clone()));
+        message
+    })
 }
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
@@ -8839,6 +8984,30 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
                             .map(|_| Handled::Yes);
                     }
                 };
+                // A turn parked on managed terminals has an idle downstream
+                // that would decline the steer, leaving the user queued until
+                // a watcher exits. Hand the message to the parked turn instead.
+                let parked = shared
+                    .background_interrupts
+                    .lock()
+                    .unwrap()
+                    .remove(&router_sid);
+                if let Some(interrupt) = parked {
+                    if let Err(message) = log_user_steer(&shared, &router_sid, &prompt) {
+                        let _ = interrupt.send(BackgroundInterrupt::Cancel);
+                        return responder
+                            .respond_with_error(AcpError::internal_error().data(message))
+                            .map(|_| Handled::Yes);
+                    }
+                    if interrupt.send(BackgroundInterrupt::Steer(prompt)).is_ok() {
+                        return responder
+                            .respond(json!({"outcome": "injected"}))
+                            .map(|_| Handled::Yes);
+                    }
+                    return responder
+                        .respond(json!({"outcome": "declined"}))
+                        .map(|_| Handled::Yes);
+                }
                 let task_shared = shared.clone();
                 shared
                     .upstream()
@@ -8855,26 +9024,11 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
                             .and_then(|v| v.get("outcome"))
                             .and_then(Value::as_str)
                             == Some("injected")
+                            && let Err(message) = log_user_steer(&task_shared, &router_sid, &prompt)
                         {
-                            let saved = task_shared.state.lock().unwrap().log_checked(
-                                &router_sid,
-                                &crate::state::LogEntry {
-                                    kind: "user_steer".into(),
-                                    role: "user".into(),
-                                    summary: prompt_display_text(&prompt),
-                                    detail: Some(json!({"prompt": prompt})),
-                                    ..Default::default()
-                                },
-                            );
-                            if let Err(err) = saved {
-                                let message = format!("cannot save injected user message: {err}");
-                                task_shared.with_session(&router_sid, |s| {
-                                    s.persistence_error = Some(message.clone())
-                                });
-                                let _ = responder
-                                    .respond_with_error(AcpError::internal_error().data(message));
-                                return Ok(());
-                            }
+                            let _ = responder
+                                .respond_with_error(AcpError::internal_error().data(message));
+                            return Ok(());
                         }
                         let _ = responder.respond_with_result(result);
                         Ok(())

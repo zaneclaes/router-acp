@@ -13,8 +13,9 @@ use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, Error as AcpError, ImageContent, InitializeRequest,
-    InitializeResponse, McpServer, McpServerStdio, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    InitializeResponse, KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionValue,
     SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
@@ -226,6 +227,11 @@ struct Observed {
     xai_ask_session_ids: Vec<String>,
     terminal_creates: Vec<(String, String, Vec<String>, Option<PathBuf>)>,
     terminal_create_meta: Vec<Option<serde_json::Map<String, serde_json::Value>>>,
+    /// Hold `terminal/wait_for_exit` open until the terminal is killed, like
+    /// a long-running watcher.
+    hang_terminal_waits: bool,
+    terminal_kills: Vec<String>,
+    terminal_releases: Vec<String>,
 }
 
 type ObservedHandle = Arc<Mutex<Observed>>;
@@ -278,6 +284,9 @@ where
     let o_elicit = observed.clone();
     let o_xai = observed.clone();
     let o_terminal = observed.clone();
+    let o_wait = observed.clone();
+    let o_kill = observed.clone();
+    let o_release = observed.clone();
 
     let client_result = tokio::time::timeout(
         Duration::from_secs(120),
@@ -385,10 +394,53 @@ where
             .on_receive_request(
                 move |_req: WaitForTerminalExitRequest,
                       responder: Responder<WaitForTerminalExitResponse>,
-                      _cx| async move {
-                    responder.respond(WaitForTerminalExitResponse::new(
-                        TerminalExitStatus::new().exit_code(0),
-                    ))
+                      cx: ConnectionTo<AgentPeer>| {
+                    let observed = o_wait.clone();
+                    async move {
+                        if !observed.lock().unwrap().hang_terminal_waits {
+                            return responder.respond(WaitForTerminalExitResponse::new(
+                                TerminalExitStatus::new().exit_code(0),
+                            ));
+                        }
+                        cx.spawn(async move {
+                            while observed.lock().unwrap().terminal_kills.is_empty() {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            responder.respond(WaitForTerminalExitResponse::new(
+                                TerminalExitStatus::new().signal("SIGTERM"),
+                            ))
+                        })
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                move |req: KillTerminalRequest, responder: Responder<KillTerminalResponse>, _cx| {
+                    let observed = o_kill.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .terminal_kills
+                            .push(req.terminal_id.0.to_string());
+                        responder.respond(KillTerminalResponse::new())
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                move |req: ReleaseTerminalRequest,
+                      responder: Responder<ReleaseTerminalResponse>,
+                      _cx| {
+                    let observed = o_release.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .terminal_releases
+                            .push(req.terminal_id.0.to_string());
+                        responder.respond(ReleaseTerminalResponse::new())
+                    }
                 },
                 on_receive_request!(),
             )
@@ -828,6 +880,114 @@ async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
                 .and_then(|router| router.get("managed_background"))
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Start a turn that parks on a never-exiting managed terminal and return
+/// its pending prompt once the terminal exists.
+async fn park_on_managed_background(
+    cx: &ConnectionTo<AgentPeer>,
+    observed: &ObservedHandle,
+    sid: &str,
+) -> Result<tokio::task::JoinHandle<Result<PromptResponse, AcpError>>, AcpError> {
+    observed.lock().unwrap().hang_terminal_waits = true;
+    let sent = cx.send_request(PromptRequest::new(
+        sid.to_string(),
+        vec![ContentBlock::from(
+            "BACKGROUND_START:sleep 14400".to_string(),
+        )],
+    ));
+    let pending = tokio::spawn(sent.block_task());
+    for _ in 0..200 {
+        if !observed.lock().unwrap().terminal_creates.is_empty() {
+            // Let the downstream turn end so the router is parked on the wait.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return Ok(pending);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("managed terminal was never created");
+}
+
+#[tokio::test]
+async fn user_steer_interrupts_turn_parked_on_managed_background() {
+    let state = temp_state_file("managed-background-steer");
+    // SAFETY: test-scoped env mutation; identical value in every test.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let pending = park_on_managed_background(&cx, &observed, &sid).await?;
+
+        let steer = agent_client_protocol::UntypedMessage::new(
+            "_session/steering",
+            serde_json::json!({
+                "sessionId": sid,
+                "prompt": [{"type": "text", "text": "human: stop waiting"}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            }),
+        )?;
+        let ack = cx.send_request(steer).block_task().await?;
+        assert_eq!(
+            ack.get("outcome").and_then(|v| v.as_str()),
+            Some("injected")
+        );
+
+        let resp = pending.await.expect("prompt task")?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("managed background interrupted") && text.contains("human: stop waiting"),
+            "the parked turn must resume with the user's message, got: {text}"
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.terminal_kills,
+            vec!["managed-terminal-1".to_string()]
+        );
+        assert_eq!(
+            observed.terminal_releases,
+            vec!["managed-terminal-1".to_string()]
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancel_ends_turn_parked_on_managed_background() {
+    let state = temp_state_file("managed-background-cancel");
+    // SAFETY: test-scoped env mutation; identical value in every test.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let pending = park_on_managed_background(&cx, &observed, &sid).await?;
+
+        cx.send_notification(CancelNotification::new(sid.clone()))?;
+        let resp = pending.await.expect("prompt task")?;
+        assert_eq!(resp.stop_reason, StopReason::Cancelled);
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.terminal_kills,
+            vec!["managed-terminal-1".to_string()]
+        );
+        assert_eq!(
+            observed.terminal_releases,
+            vec!["managed-terminal-1".to_string()]
         );
         Ok(())
     })
