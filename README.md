@@ -63,6 +63,26 @@ router-acp check-config --config router.yaml
 router-acp serve --config router.yaml
 ```
 
+### Hickory dev workstation release
+
+Hickory dev workstations install a pinned binary from GitHub Releases. They do
+not clone or compile router-acp during an upgrade.
+
+After testing a pushed commit, publish its Linux x86-64 binary from a clean
+checkout:
+
+```sh
+scripts/release-dev-workstation.sh
+```
+
+The script builds the current commit, then creates the prerelease tag
+`dev-workstation-<full-git-sha>` in `zaneclaes/router-acp`. It uploads
+`router-acp-x86_64-unknown-linux-gnu.tar.gz` and its SHA-256 file. Re-running
+the script succeeds only when the existing release has the same checksum.
+
+Copy the printed revision and checksum into Hickory's router pin files before
+updating Kory Code. Keep source builds for development and testing.
+
 1. Copy [`examples/router-preferred.yaml`](examples/router-preferred.yaml) to `~/.config/router-acp/router.yaml` as a starting point, and fill in the adapters you actually have installed (see the [integration matrix](#integration-matrix)).
 2. Point your ACP client at `router-acp serve --config ~/.config/router-acp/router.yaml`:
    - **goose** has no generic "point at any ACP command" slot — see [`GOOSE.md`](GOOSE.md) for the exact (small) shim-based hookup, still current for goose ≥ 1.41.
