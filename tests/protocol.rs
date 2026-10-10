@@ -593,11 +593,14 @@ fn routing_meta_for(observed: &ObservedHandle, session_id: &str) -> Option<serde
         .find_map(|n| n.meta.as_ref()?.get("router_acp").cloned())
 }
 
+/// Each test gets its own directory: shards live beside the state file.
 fn temp_state_file(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "router-acp-test-{tag}-{}.db",
-        uuid::Uuid::new_v4().simple()
-    ))
+    std::env::temp_dir()
+        .join(format!(
+            "router-acp-test-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .join("state.db")
 }
 
 /// Open the state DB the router wrote (read-only view via the lib API).
@@ -10188,7 +10191,7 @@ async fn sharded_delegates_live_with_their_parent_and_stay_queryable() {
     let checkout = dir.path().join("checkout");
     std::fs::create_dir(&checkout).unwrap();
     let log = temp_log("sharded-delegate");
-    let yaml = delegation_yaml(&state, &log, 3).replacen("\n", "\nstate_sharding: cwd\n", 1);
+    let yaml = delegation_yaml(&state, &log, 3);
     let config = dir.path().join("router.yaml");
     std::fs::write(&config, &yaml).unwrap();
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };

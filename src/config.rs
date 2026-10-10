@@ -1374,11 +1374,6 @@ pub struct Config {
     /// `3600s`, or a bare number of days. Default `30d`.
     #[serde(default = "default_history")]
     pub history: String,
-    /// How NEW session ids pick their database. `off` keeps every session in
-    /// `state_file`; `cwd` puts each checkout's sessions in its own shard
-    /// beside it. Existing ids always resolve by their shape, in both modes.
-    #[serde(default)]
-    pub state_sharding: crate::state_layout::ShardingMode,
     /// Optional path to a score-table YAML overriding the built-in table.
     #[serde(default)]
     pub score_table: Option<PathBuf>,

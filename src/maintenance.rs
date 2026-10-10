@@ -663,7 +663,7 @@ pub fn compact(db: &Path) -> rusqlite::Result<(u64, u64)> {
 mod tests {
     use super::*;
     use crate::state::{PersistedSession, StateStore};
-    use crate::state_layout::{ShardingMode, canonical_cwd, tag_for_cwd};
+    use crate::state_layout::{canonical_cwd, tag_for_cwd};
     use serde_json::json;
 
     const DAY: u64 = 24 * 60 * 60;
@@ -1003,8 +1003,7 @@ mod tests {
     /// A cwd shard holding one session seeded like `seed`. Returns the
     /// session id and the shard's path.
     fn seed_shard(legacy: &Path, cwd: &Path, rows: usize, updated_at: i64) -> (String, PathBuf) {
-        let store =
-            StateStore::try_load_with(legacy, Retention::default(), ShardingMode::Cwd).unwrap();
+        let store = StateStore::load(legacy, Retention::default());
         let sid = store.new_session_id(cwd).unwrap();
         drop(store);
         let shard = StateLayout::new(legacy).shard_path(&tag_for_cwd(cwd));
@@ -1125,16 +1124,14 @@ mod tests {
             seed(&legacy, "legacy-fresh", 3, fresh);
             let active_dir = dir.path().join("active");
             let (active_old, active) = seed_shard(&legacy, &active_dir, 3, expired);
-            let active_fresh =
-                StateStore::try_load_with(&legacy, retention, ShardingMode::Cwd).unwrap();
+            let active_fresh = StateStore::load(&legacy, retention);
             let active_fresh_id = active_fresh.new_session_id(&active_dir).unwrap();
             fill(&legacy, &active, &active_fresh_id, 3, fresh);
             // `active_fresh` keeps the shard open like a live router does.
             assert!(active_fresh.get(&active_fresh_id).is_some());
             let (inactive_old, inactive) =
                 seed_shard(&legacy, &dir.path().join("inactive"), 3, expired);
-            let inactive_fresh =
-                StateStore::try_load_with(&legacy, retention, ShardingMode::Cwd).unwrap();
+            let inactive_fresh = StateStore::load(&legacy, retention);
             let inactive_fresh_id = inactive_fresh
                 .new_session_id(&dir.path().join("inactive"))
                 .unwrap();

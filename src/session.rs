@@ -609,13 +609,12 @@ impl Shared {
             .map(|a| (a.name.clone(), a.budget_prompts_5h))
             .collect();
         let headroom = HeadroomTracker::new(&cfg.headroom, budgets);
-        let state = StateStore::try_load_with(&cfg.state_file, cfg.retention(), cfg.state_sharding)
-            .map_err(|e| {
-                AcpError::internal_error().data(format!(
-                    "cannot open durable router state at {}: {e}",
-                    cfg.state_file.display()
-                ))
-            })?;
+        let state = StateStore::try_load(&cfg.state_file, cfg.retention()).map_err(|e| {
+            AcpError::internal_error().data(format!(
+                "cannot open durable router state at {}: {e}",
+                cfg.state_file.display()
+            ))
+        })?;
 
         let specs = build_targets(&cfg);
         let llm_proxy = crate::llm_proxy::LlmProxyRuntime::new(&cfg, &specs)
@@ -7732,7 +7731,7 @@ fn on_session_new(
         crate::auth::refresh_before_selection(&shared).await;
         // Management commands must remain accessible when every login is
         // expired. Normal prompts still enforce eligibility at pin time.
-        // With `state_sharding: cwd` the id names this checkout's shard.
+        // The id names this checkout's shard.
         let minted = shared.state.lock().unwrap().new_session_id(&req.cwd);
         let router_sid = match minted {
             Ok(sid) => sid,

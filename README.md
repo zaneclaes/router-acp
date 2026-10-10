@@ -368,12 +368,12 @@ table-wide row counts, so status refreshes remain cheap as retained history grow
 The query command opens the configured state file and every shard read-only.
 It does not create shards or schemas, migrate, import legacy JSON, flush
 buffered rows, prune retained history, vacuum, or checkpoint the WAL. The v1
-JSON shapes are identical with sharding on or off.
+JSON shapes are identical for legacy and sharded sessions.
 
 ### Cwd-sharded state
 
-With `state_sharding: cwd`, each checkout's sessions get their own SQLite file,
-so routers working in different checkouts stop queueing on one write lock:
+Each checkout's sessions get their own SQLite file, so routers working in
+different checkouts stop queueing on one write lock:
 
 ```text
 ~/.local/state/router-acp/
@@ -386,10 +386,9 @@ so routers working in different checkouts stop queueing on one write lock:
 `<tag>` is the first 16 bytes of SHA-256 over the canonical cwd (symlinks
 resolved), as 32 hex characters. A new session id carries it:
 `rtr-<tag>-<uuid>`. A delegate (`<parent>::delegate-…`) lives with its parent.
-The router finds a session's file from its id alone, in either mode, so:
+The router finds a session's file from its id alone, so:
 
-- turning sharding on keeps every legacy `rtr-<uuid>` session resumable in `sessions.db`;
-- turning it off keeps every tagged session resumable in its shard;
+- every session created before sharding (`rtr-<uuid>`) stays in `sessions.db` and stays resumable;
 - a session resumed from another checkout stays in its original shard, while
   `continue_from` in another checkout starts a new id in that checkout's shard.
 
@@ -399,10 +398,11 @@ for it. New shards start with `auto_vacuum = INCREMENTAL`, so they never need
 `state-compact`. Box-wide reads (`sessions`, analytics, spend windows, health,
 delegation reports) cover the legacy file and every shard.
 
-`router-acp state-bench --state <scratch>/sessions.db --mode legacy|sharded
---processes 32 --seconds 20` spawns router-shaped writer processes with the
-live write mix and prints throughput, latency, and lost-write counts. It writes
-only beside `--state`; never point it at a live state file.
+`router-acp state-bench --state <scratch>/sessions.db --processes 32
+--checkouts 8 --seconds 20` spawns router-shaped writer processes with the live
+write mix, spread over that many checkouts (one shard each; `--checkouts 1`
+puts them all on one file), and prints throughput, latency, and lost-write
+counts. It writes only beside `--state`; never point it at a live state file.
 
 ### State DB maintenance
 
@@ -498,7 +498,6 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | --- | --- | --- |
 | `router` | `auto` | Default strategy: `auto`, `pareto-code`, `escalation`, `static`. |
 | `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` records pins, lineage, token/context totals, and per-request aggregate cost/count. `session_log` records ACP and proxy events. `llm_requests` records each attributed provider request's model, policy event, latency, exact/cache tokens, and cost. `tool_calls` plus `active_tool_calls` expose tool/model lifecycle. A legacy `sessions.json` beside it is imported once. |
-| `state_sharding` | `off` | `cwd` gives each checkout's new sessions their own shard beside `state_file` (see [Cwd-sharded state](#cwd-sharded-state)). Existing sessions resolve by id in either mode. |
 | `history` | `30d` | How long to keep sessions before auto-pruning (with their rows in every table). Duration string: `30d`, `12h`, `90m`, `3600s`, or a bare number of days. Pruned by the background maintenance worker (see [State DB maintenance](#state-db-maintenance)). |
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |

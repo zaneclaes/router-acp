@@ -28,8 +28,7 @@ use rusqlite::{
 };
 
 use crate::state_layout::{
-    SessionHome, ShardTag, ShardingMode, StateLayout, canonical_cwd, home_of, legacy_session_id,
-    tag_for_cwd, tagged_session_id,
+    SessionHome, ShardTag, StateLayout, canonical_cwd, home_of, tag_for_cwd, tagged_session_id,
 };
 
 /// How long a write waits for another router process to release the
@@ -210,7 +209,6 @@ pub const STATE_QUERY_VERSION: u32 = 1;
 /// so neither callers nor hosts see the layout.
 pub struct StateStore {
     layout: StateLayout,
-    mode: ShardingMode,
     retention: Retention,
     readonly: bool,
     legacy: StateFile,
@@ -222,35 +220,23 @@ impl std::fmt::Debug for StateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateStore")
             .field("layout", &self.layout)
-            .field("mode", &self.mode)
             .field("retention", &self.retention)
             .finish_non_exhaustive()
     }
 }
 
 impl StateStore {
-    /// Open durable state for router reads and writes, minting legacy ids.
-    /// Tagged ids written by a sharded router still resolve to their shards.
+    /// Open durable state for router reads and writes. Every id resolves by
+    /// its shape: legacy `rtr-<uuid>` ids in `path`, tagged ids in shards.
     pub fn load(path: &Path, retention: Retention) -> Self {
         Self::try_load(path, retention)
             .unwrap_or_else(|err| panic!("cannot open state DB at {}: {err}", path.display()))
     }
 
     pub fn try_load(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
-        Self::try_load_with(path, retention, ShardingMode::Off)
-    }
-
-    /// `mode` only decides how `new_session_id` mints ids. Every existing id
-    /// resolves by its shape in either mode.
-    pub fn try_load_with(
-        path: &Path,
-        retention: Retention,
-        mode: ShardingMode,
-    ) -> rusqlite::Result<Self> {
         Ok(Self::with_legacy(
             path,
             retention,
-            mode,
             false,
             StateFile::try_load(path, retention)?,
         ))
@@ -264,22 +250,14 @@ impl StateStore {
         Ok(Self::with_legacy(
             path,
             retention,
-            ShardingMode::Off,
             true,
             StateFile::from_connection(conn, retention),
         ))
     }
 
-    fn with_legacy(
-        path: &Path,
-        retention: Retention,
-        mode: ShardingMode,
-        readonly: bool,
-        legacy: StateFile,
-    ) -> Self {
+    fn with_legacy(path: &Path, retention: Retention, readonly: bool, legacy: StateFile) -> Self {
         Self {
             layout: StateLayout::new(path),
-            mode,
             retention,
             readonly,
             legacy,
@@ -300,13 +278,10 @@ impl StateStore {
         StateFile::open_conn(path)
     }
 
-    /// Mint the id for a new session started in `cwd`. In `cwd` mode this
-    /// creates the checkout's shard, or verifies that the existing one was
-    /// created for the same directory.
+    /// Mint the id for a new session started in `cwd`, creating the
+    /// checkout's shard or verifying that the existing one was created for
+    /// the same directory.
     pub fn new_session_id(&self, cwd: &Path) -> rusqlite::Result<String> {
-        if self.mode == ShardingMode::Off {
-            return Ok(legacy_session_id());
-        }
         let tag = tag_for_cwd(cwd);
         let cwd = canonical_cwd(cwd);
         let mut shards = self.shards.borrow_mut();
@@ -1200,29 +1175,15 @@ impl StateFile {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        if incremental_vacuum {
-            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        }
         // Concurrent router startups can contend while enabling WAL. Install
         // the wait first so a transient lock cannot select the memory fallback.
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        // SQLite can refuse a journal-mode lock upgrade without invoking its
-        // busy handler. Retry the statement after concurrent startup releases it.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match conn.pragma_update(None, "journal_mode", "WAL") {
-                Ok(()) => break,
-                Err(rusqlite::Error::SqliteFailure(error, _))
-                    if matches!(
-                        error.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(error) => return Err(error),
-            }
+        // SQLite can refuse these pragmas' locks without invoking its busy
+        // handler. Retry after a concurrent opener or writer releases it.
+        if incremental_vacuum {
+            retry_busy(|| conn.pragma_update(None, "auto_vacuum", "INCREMENTAL"))?;
         }
+        retry_busy(|| conn.pragma_update(None, "journal_mode", "WAL"))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
     }
@@ -2500,6 +2461,19 @@ impl StateFile {
     }
 }
 
+/// Retry `op` for up to 5 s while SQLite reports busy without waiting.
+fn retry_busy(op: impl Fn() -> rusqlite::Result<()>) -> rusqlite::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match op() {
+            Err(err) if is_busy(&err) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// True at most once per `WARN_EVERY` for the warning tracked by `last`.
 fn throttle(last: &Cell<Option<Instant>>) -> bool {
     if last.get().is_some_and(|at| at.elapsed() < WARN_EVERY) {
@@ -3349,12 +3323,7 @@ mod tests {
     }
 
     fn sharded(dir: &Path) -> StateStore {
-        StateStore::try_load_with(
-            &dir.join("state.db"),
-            Retention::default(),
-            ShardingMode::Cwd,
-        )
-        .unwrap()
+        StateStore::load(&dir.join("state.db"), Retention::default())
     }
 
     fn sessions_in(path: &Path) -> Vec<String> {
@@ -3412,29 +3381,29 @@ mod tests {
     }
 
     #[test]
-    fn sharding_off_still_reads_and_writes_tagged_sessions() {
+    fn a_session_from_before_sharding_stays_in_the_legacy_file() {
         let dir = tempfile::tempdir().unwrap();
-        let sid = {
-            let s = sharded(dir.path());
-            let sid = s.new_session_id(dir.path()).unwrap();
-            s.upsert(sid.clone(), session("claude"));
-            sid
-        };
+        let s = sharded(dir.path());
+        let legacy = format!("rtr-{}", uuid::Uuid::new_v4());
+        s.upsert(legacy.clone(), session("claude"));
+        s.set_title(&legacy, "kept");
+        s.log(&legacy, &chunk("old"));
 
-        let off = StateStore::load(&dir.path().join("state.db"), Retention::default());
         assert_eq!(
-            home_of(&off.new_session_id(dir.path()).unwrap()),
-            SessionHome::Legacy
+            sessions_in(&dir.path().join("state.db")),
+            std::slice::from_ref(&legacy)
         );
-        assert_eq!(off.get(&sid).unwrap().agent, "claude");
-        off.set_title(&sid, "kept");
-        assert_eq!(off.get(&sid).unwrap().title.as_deref(), Some("kept"));
+        assert_eq!(s.get(&legacy).unwrap().title.as_deref(), Some("kept"));
+        assert_eq!(texts(&s.log_for_all(&legacy).unwrap()), ["old"]);
+        // New sessions always get a shard.
+        let new = s.new_session_id(dir.path()).unwrap();
+        assert_eq!(home_of(&new), SessionHome::Shard(tag_for_cwd(dir.path())));
         // An id naming a shard that was never created reads as absent, and
         // writing to it creates nothing.
         let ghost = tagged_session_id(&tag_for_cwd(Path::new("/nowhere")));
-        assert!(off.get(&ghost).is_none());
-        assert!(off.upsert_checked(ghost, session("x")).is_err());
-        assert_eq!(off.layout.list_shards().len(), 1);
+        assert!(s.get(&ghost).is_none());
+        assert!(s.upsert_checked(ghost, session("x")).is_err());
+        assert_eq!(s.layout.list_shards().len(), 1);
     }
 
     #[test]
@@ -3615,5 +3584,25 @@ mod tests {
             .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, 2);
+    }
+
+    #[test]
+    fn a_process_opening_a_busy_shard_waits_for_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let cwd = dir.path().join("a");
+        let first = StateStore::load(&path, Retention::default());
+        first.new_session_id(&cwd).unwrap();
+        let writer = Connection::open(first.layout.shard_path(&tag_for_cwd(&cwd))).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            writer.execute_batch("COMMIT").unwrap();
+        });
+
+        // Another router starting a session in the same checkout.
+        let second = StateStore::load(&path, Retention::default());
+        second.new_session_id(&cwd).unwrap();
+        release.join().unwrap();
     }
 }

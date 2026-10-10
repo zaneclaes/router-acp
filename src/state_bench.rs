@@ -1,5 +1,6 @@
 //! `router-acp state-bench`: many router-shaped processes writing state at
-//! once, to compare the legacy single file with cwd shards.
+//! once. Processes in one checkout share one shard file, so `--checkouts 1`
+//! measures single-file contention and larger values measure sharding.
 //!
 //! Each worker process drives one session through the public `StateStore`
 //! API with the live write mix (2026-10 sample of `session_log`): 65%
@@ -11,10 +12,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+
 use crate::state::{
     LlmRequestStart, LlmRequestUsage, LogEntry, PersistedSession, Retention, StateStore,
 };
-use crate::state_layout::ShardingMode;
 
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 
@@ -38,7 +40,6 @@ pub struct WorkerReport {
 /// The whole run, aggregated over every worker.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BenchReport {
-    pub mode: &'static str,
     pub processes: usize,
     pub checkouts: usize,
     pub seconds: u64,
@@ -87,13 +88,12 @@ fn entry(kind: &str, detail: &serde_json::Value) -> LogEntry {
 pub fn worker(
     state: &Path,
     cwd: &Path,
-    mode: ShardingMode,
     seconds: u64,
     rate: u64,
     seed: u64,
 ) -> anyhow::Result<WorkerReport> {
-    let store = StateStore::try_load_with(state, Retention::default(), mode)?;
-    let sid = store.new_session_id(cwd)?;
+    let store = StateStore::try_load(state, Retention::default()).context("open state")?;
+    let sid = store.new_session_id(cwd).context("start a session")?;
     let session = PersistedSession {
         agent: "bench".into(),
         model: "m".into(),
@@ -202,11 +202,10 @@ pub fn worker(
 }
 
 /// Spawn `processes` workers of this binary against `state` and aggregate
-/// their reports. Sharded workers are spread over `checkouts` directories
-/// beside `state`; legacy workers write the one legacy file.
+/// their reports. Workers are spread round-robin over `checkouts`
+/// directories beside `state`, one shard each.
 pub fn run(
     state: &Path,
-    mode: ShardingMode,
     processes: usize,
     seconds: u64,
     checkouts: usize,
@@ -223,10 +222,6 @@ pub fn run(
         std::fs::create_dir_all(dir)?;
     }
     let exe = std::env::current_exe()?;
-    let mode_arg = match mode {
-        ShardingMode::Off => "off",
-        ShardingMode::Cwd => "cwd",
-    };
     let started = Instant::now();
     let children = (0..processes)
         .map(|n| {
@@ -236,7 +231,6 @@ pub fn run(
                 .arg(state)
                 .arg("--cwd")
                 .arg(&dirs[n % checkouts])
-                .args(["--mode", mode_arg])
                 .args(["--seconds", &seconds.to_string()])
                 .args(["--rate", &rate.to_string()])
                 .args(["--seed", &(n as u64 + 1).to_string()])
@@ -260,11 +254,6 @@ pub fn run(
     let sum = |field: fn(&WorkerReport) -> u64| reports.iter().map(field).sum::<u64>();
     let total_ops = sum(|r| r.ops);
     Ok(BenchReport {
-        mode: if mode == ShardingMode::Cwd {
-            "sharded"
-        } else {
-            "legacy"
-        },
         processes,
         checkouts,
         seconds,

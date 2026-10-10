@@ -156,21 +156,18 @@ enum Command {
         #[command(subcommand)]
         query: StateQueryCommand,
     },
-    /// Benchmark concurrent state writers: `legacy` (one file) or `sharded`
-    /// (cwd shards). Prints one JSON report. Writes only beside `--state`;
-    /// never point it at a live state file.
+    /// Benchmark concurrent state writers. Prints one JSON report. Writes
+    /// only beside `--state`; never point it at a live state file.
     #[command(hide = true)]
     StateBench {
         #[arg(long)]
         state: PathBuf,
-        /// `legacy` or `sharded`.
-        #[arg(long)]
-        mode: String,
         #[arg(long, default_value_t = 32)]
         processes: usize,
         #[arg(long, default_value_t = 10)]
         seconds: u64,
-        /// Checkout directories the sharded workers are spread over.
+        /// Checkout directories (one shard each) the workers are spread
+        /// over. `1` makes every process share one file.
         #[arg(long, default_value_t = 8)]
         checkouts: usize,
         /// Write operations per second per process.
@@ -184,9 +181,6 @@ enum Command {
         state: PathBuf,
         #[arg(long)]
         cwd: PathBuf,
-        /// `off` or `cwd`.
-        #[arg(long)]
-        mode: String,
         #[arg(long)]
         seconds: u64,
         #[arg(long)]
@@ -419,13 +413,6 @@ async fn main() -> anyhow::Result<()> {
         Command::CheckConfig { config } => {
             let cfg = Config::from_file(&config)?;
             println!("configuration OK: {} agent(s)", cfg.agents.len());
-            println!(
-                "  state: {} (sharding: {})",
-                cfg.state_file.display(),
-                serde_json::to_value(cfg.state_sharding)?
-                    .as_str()
-                    .unwrap_or_default()
-            );
             for id in cfg.declared_candidates() {
                 let manual = if cfg.auto_eligible(&id) {
                     ""
@@ -692,7 +679,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::StateBench {
             state,
-            mode,
             processes,
             seconds,
             checkouts,
@@ -700,7 +686,6 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let report = router_acp::state_bench::run(
                 &router_acp::config::expand_tilde(&state),
-                sharding_mode(&mode)?,
                 processes,
                 seconds,
                 checkouts,
@@ -712,31 +697,14 @@ async fn main() -> anyhow::Result<()> {
         Command::StateBenchWorker {
             state,
             cwd,
-            mode,
             seconds,
             rate,
             seed,
         } => {
-            let report = router_acp::state_bench::worker(
-                &state,
-                &cwd,
-                sharding_mode(&mode)?,
-                seconds,
-                rate,
-                seed,
-            )?;
+            let report = router_acp::state_bench::worker(&state, &cwd, seconds, rate, seed)?;
             println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
-    }
-}
-
-fn sharding_mode(name: &str) -> anyhow::Result<router_acp::state_layout::ShardingMode> {
-    use router_acp::state_layout::ShardingMode;
-    match name {
-        "legacy" | "off" => Ok(ShardingMode::Off),
-        "sharded" | "cwd" => Ok(ShardingMode::Cwd),
-        other => anyhow::bail!("unknown mode `{other}` (use legacy or sharded)"),
     }
 }
 

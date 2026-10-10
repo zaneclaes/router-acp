@@ -1009,21 +1009,9 @@ fn log_kinds_in(db: &Path, session_id: &str) -> Vec<String> {
         .expect("log kinds")
 }
 
-fn set_sharding(fixture: &Fixture, on: bool) {
-    let config = std::fs::read_to_string(&fixture.config).expect("read config");
-    let config = config.replace("state_sharding: cwd\n", "");
-    let config = if on {
-        config.replacen("\n", "\nstate_sharding: cwd\n", 1)
-    } else {
-        config
-    };
-    std::fs::write(&fixture.config, config).expect("write config");
-}
-
 #[tokio::test]
 async fn sharded_sessions_resume_and_continue_from_another_checkout() {
     let fixture = fixture("sharded");
-    set_sharding(&fixture, true);
     let layout = StateLayout::new(&fixture.state);
     let checkout_a = fixture.home.join("checkout-a");
     let checkout_b = fixture.home.join("checkout-b");
@@ -1093,33 +1081,14 @@ async fn sharded_sessions_resume_and_continue_from_another_checkout() {
 }
 
 #[tokio::test]
-async fn sessions_resume_after_sharding_is_turned_on_and_off() {
-    let fixture = fixture("sharding-toggle");
+async fn a_session_saved_before_sharding_still_resumes() {
+    let fixture = fixture("legacy-session");
     let mut client = spawn(&fixture);
     client.initialize().await;
-    let legacy = session_id(&client.new_session(&fixture.home, None).await);
-    assert_success(
-        &client.prompt(&legacy, "before sharding", None).await,
-        "legacy prompt",
-    );
-    client.close().await;
-    assert_eq!(home_of(&legacy), SessionHome::Legacy);
-
-    set_sharding(&fixture, true);
-    let mut client = spawn(&fixture);
-    client.initialize().await;
-    assert_success(
-        &client.resume(&legacy, &fixture.home).await,
-        "resume legacy",
-    );
-    assert_success(
-        &client.prompt(&legacy, "legacy after sharding", None).await,
-        "legacy prompt under sharding",
-    );
     let tagged = session_id(&client.new_session(&fixture.home, None).await);
     assert_success(
-        &client.prompt(&tagged, "tagged before rollback", None).await,
-        "tagged prompt",
+        &client.prompt(&tagged, "before the upgrade", None).await,
+        "first prompt",
     );
     client.close().await;
     assert_eq!(
@@ -1127,36 +1096,38 @@ async fn sessions_resume_after_sharding_is_turned_on_and_off() {
         SessionHome::Shard(tag_for_cwd(&fixture.home))
     );
 
-    set_sharding(&fixture, false);
+    // Rewrite it as a pre-sharding session: legacy id, legacy file.
+    let legacy = format!("rtr-{}", uuid::Uuid::new_v4());
+    {
+        let store = state(&fixture);
+        let row = store.get(&tagged).expect("tagged row");
+        store.upsert_checked(legacy.clone(), row).unwrap();
+        for entry in store.log_for_all(&tagged).unwrap() {
+            store.log_checked(&legacy, &entry).unwrap();
+        }
+        store.remove(&tagged);
+    }
+    assert_eq!(home_of(&legacy), SessionHome::Legacy);
+    assert_eq!(sessions_in(&fixture.state), std::slice::from_ref(&legacy));
+
     let mut client = spawn(&fixture);
     client.initialize().await;
     assert_success(
-        &client.resume(&tagged, &fixture.home).await,
-        "resume tagged",
+        &client.resume(&legacy, &fixture.home).await,
+        "resume legacy",
     );
     assert_success(
-        &client.prompt(&tagged, "tagged after rollback", None).await,
-        "tagged prompt after rollback",
+        &client.prompt(&legacy, "after the upgrade", None).await,
+        "legacy prompt",
     );
-    let fresh = session_id(&client.new_session(&fixture.home, None).await);
     client.close().await;
-    assert_eq!(home_of(&fresh), SessionHome::Legacy);
 
-    let store = state(&fixture);
-    let prompts = |sid: &str| -> Vec<String> {
-        store
-            .log_for(sid, 100)
-            .into_iter()
-            .filter(|entry| entry.kind == "user_prompt")
-            .map(|entry| entry.summary)
-            .collect()
-    };
-    assert_eq!(
-        prompts(&legacy),
-        ["before sharding", "legacy after sharding"]
-    );
-    assert_eq!(
-        prompts(&tagged),
-        ["tagged before rollback", "tagged after rollback"]
-    );
+    let prompts: Vec<String> = state(&fixture)
+        .log_for(&legacy, 100)
+        .into_iter()
+        .filter(|entry| entry.kind == "user_prompt")
+        .map(|entry| entry.summary)
+        .collect();
+    assert_eq!(prompts, ["before the upgrade", "after the upgrade"]);
+    assert_eq!(sessions_in(&fixture.state), [legacy]);
 }

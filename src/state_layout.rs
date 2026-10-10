@@ -1,10 +1,9 @@
 //! Where a router session's state lives.
 //!
-//! `state_file` is the legacy database. With `state_sharding: cwd`, each new
-//! session id carries a tag derived from its canonical cwd, and that
-//! session's rows live in `<state_file parent>/shards/sessions-<tag>.db`.
-//! Routing is always by id shape, never by mode, so turning sharding on or
-//! off keeps every existing session resumable.
+//! Every new session id carries a tag derived from its canonical cwd, and
+//! that session's rows live in `<state_file parent>/shards/sessions-<tag>.db`.
+//! `state_file` itself is the legacy database: it keeps box-wide tables and
+//! every session created before sharding, which still resolve by id shape.
 //!
 //! Id shapes:
 //! * legacy: `rtr-<uuid>` (a `-` follows the first 8 hex chars)
@@ -19,17 +18,6 @@ const ID_PREFIX: &str = "rtr-";
 const TAG_LEN: usize = 32;
 const SHARD_PREFIX: &str = "sessions-";
 const SHARD_SUFFIX: &str = ".db";
-
-/// How NEW session ids pick their database.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ShardingMode {
-    /// Every new session goes to the legacy `state_file`.
-    #[default]
-    Off,
-    /// Every new session goes to the shard for its canonical cwd.
-    Cwd,
-}
 
 /// 32 lowercase hex chars: the first 16 bytes of SHA-256 over a canonical cwd.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -97,10 +85,6 @@ pub fn tag_for_cwd(cwd: &Path) -> ShardTag {
             .map(|b| format!("{b:02x}"))
             .collect(),
     )
-}
-
-pub fn legacy_session_id() -> String {
-    format!("{ID_PREFIX}{}", uuid::Uuid::new_v4())
 }
 
 pub fn tagged_session_id(tag: &ShardTag) -> String {
@@ -179,7 +163,7 @@ mod tests {
 
     #[test]
     fn legacy_and_tagged_ids_resolve_by_shape() {
-        let legacy = legacy_session_id();
+        let legacy = format!("rtr-{}", uuid::Uuid::new_v4());
         assert_eq!(home_of(&legacy), SessionHome::Legacy);
         assert_eq!(home_of("rtr-1"), SessionHome::Legacy);
         assert_eq!(home_of("not-a-router-id"), SessionHome::Legacy);
@@ -204,7 +188,7 @@ mod tests {
             home_of(&format!("{parent}::delegate-abc")),
             SessionHome::Shard(tag)
         );
-        let legacy = legacy_session_id();
+        let legacy = format!("rtr-{}", uuid::Uuid::new_v4());
         assert_eq!(
             home_of(&format!("{legacy}::delegate-abc")),
             SessionHome::Legacy

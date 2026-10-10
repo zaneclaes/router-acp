@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use router_acp::state::{LogEntry, PersistedSession, Retention, StateStore};
-use router_acp::state_layout::{ShardingMode, StateLayout, tag_for_cwd};
+use router_acp::state_layout::{StateLayout, tag_for_cwd};
 use serde_json::{Value, json};
 
 const DAY_START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
@@ -367,7 +367,7 @@ fn populate(store: &StateStore, parent: &str) {
 }
 
 #[test]
-fn v1_shapes_are_unchanged_when_sessions_live_in_shards() {
+fn v1_shapes_match_for_legacy_and_sharded_sessions() {
     let week = Retention {
         max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
     };
@@ -383,7 +383,7 @@ fn v1_shapes_are_unchanged_when_sessions_live_in_shards() {
     let sharded_state = sharded.path().join("state.db");
     let sharded_config = sharded.path().join("router.yaml");
     write_config(&sharded_config, &sharded_state);
-    let store = StateStore::try_load_with(&sharded_state, week, ShardingMode::Cwd).unwrap();
+    let store = StateStore::load(&sharded_state, week);
     let parent = store
         .new_session_id(&sharded.path().join("checkout"))
         .unwrap();
