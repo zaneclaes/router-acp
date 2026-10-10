@@ -140,6 +140,11 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
     let credential = match configured.as_ref() {
         Some(agent) => {
             acp_agent.scrub_auth_env = crate::accounts::provider(agent).is_some();
+            if crate::accounts::provider(agent) == Some("codex")
+                && let Some(home) = crate::credentials::directory(agent)
+            {
+                crate::codex_logs::rotate_if_oversized(&home);
+            }
             crate::credentials::runtime(agent, &mut acp_agent.env)
                 .await
                 .map_err(|message| AcpError::internal_error().data(message))?

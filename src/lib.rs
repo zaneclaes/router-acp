@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod auth;
 pub mod candidate;
 pub mod classifier;
+pub mod codex_logs;
 pub mod config;
 pub mod credentials;
 pub mod delegate_hook;
