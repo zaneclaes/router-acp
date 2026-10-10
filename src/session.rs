@@ -5452,7 +5452,9 @@ async fn send_prompt_with_failover(
                                 &candidate,
                                 "Credential repaired",
                                 HandoffStyle::Full,
-                                false,
+                                shared
+                                    .with_session(&router_sid, |s| s.pin_user_pick)
+                                    .unwrap_or(false),
                             )
                             .await
                             .is_ok()
@@ -5600,6 +5602,32 @@ async fn send_prompt_with_failover(
                 if let Some(key) = old_key {
                     close_downstream_session(&shared, &key, &down_sid);
                 }
+                // An outage on a human pick first re-pins that pick, which
+                // respawns its adapter. Only when it cannot route does the
+                // ordinary failover below choose a replacement.
+                if matches!(class, FailureClass::Outage)
+                    && shared
+                        .with_session(&router_sid, |s| human_pick(s, &candidate))
+                        .unwrap_or(false)
+                {
+                    match pin_session(
+                        &shared,
+                        &router_sid,
+                        &req.prompt,
+                        &responder.cancellation(),
+                        None,
+                        true,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(PinOutcome::Pinned) => continue,
+                        Ok(PinOutcome::Cancelled) => {
+                            return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                        }
+                        Err(_) => {}
+                    }
+                }
                 match pin_session(
                     &shared,
                     &router_sid,
@@ -5633,6 +5661,18 @@ async fn send_prompt_with_failover(
     )
 }
 
+/// True when a human chose `candidate` for this session.
+fn human_pick(s: &RouterSession, candidate: &CandidateId) -> bool {
+    // A resumed session keeps only the pin's `user_pick` flag.
+    match &s.candidate_override {
+        Some(pick) => {
+            pick == candidate
+                && matches!(s.candidate_override_source, Some(OverrideSource::UserPick))
+        }
+        None => s.pin_user_pick,
+    }
+}
+
 /// A human picked `failed`, and the provider says that model is at capacity.
 /// Move the pick to the eligible model nearest its quality, as the human would,
 /// so the session stays on that model after this turn instead of reverting to
@@ -5641,15 +5681,7 @@ async fn send_prompt_with_failover(
 fn adopt_capacity_substitute(shared: &Arc<Shared>, router_sid: &str, failed: &CandidateId) {
     let Some((class, excluded, coordinator)) = shared
         .with_session(router_sid, |s| {
-            // A resumed session keeps only the pin's `user_pick` flag.
-            let human_pick = match &s.candidate_override {
-                Some(pick) => {
-                    pick == failed
-                        && matches!(s.candidate_override_source, Some(OverrideSource::UserPick))
-                }
-                None => s.pin_user_pick,
-            };
-            human_pick.then(|| {
+            human_pick(s, failed).then(|| {
                 let mut excluded = s.excluded.clone();
                 excluded.push(failed.to_string());
                 (
@@ -6997,7 +7029,15 @@ async fn switch_pin(
         }
     }
 
-    shared.with_session(router_sid, |s| s.pin_user_pick = user_pick);
+    shared.with_session(router_sid, |s| {
+        s.pin_user_pick = user_pick;
+        // Outage recovery reads the human pick from the override, so a human
+        // switch must land there too.
+        if user_pick {
+            s.candidate_override = Some(target.clone());
+            s.candidate_override_source = Some(OverrideSource::UserPick);
+        }
+    });
 
     // 5. Persist + close the old session.
     shared.state.lock().unwrap().upsert(

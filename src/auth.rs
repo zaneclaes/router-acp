@@ -320,6 +320,7 @@ pub fn response_is_auth_error(text: &str) -> bool {
     matches!(
         text.trim_end_matches('.'),
         "Failed to authenticate: OAuth session expired and could not be refreshed"
+            | "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator"
             | "Authentication required"
             | "Not logged in. Please run /login"
     )
@@ -527,6 +528,22 @@ mod tests {
         )));
         assert!(!response_is_auth_error(
             "Here is how to repair Authentication required errors."
+        ));
+    }
+
+    #[test]
+    fn complete_revoked_token_reply_triggers_repair() {
+        let error = "Failed to authenticate: OAuth token revoked. \
+                     Please log in again or contact your administrator.";
+        assert!(response_is_auth_error(error));
+        assert!(response_is_auth_error(&format!("\n{error}  ")));
+        assert!(!response_is_auth_error(&format!(
+            "The previous error was: {error}"
+        )));
+        assert!(!response_is_auth_error(&format!("\"{error}\"")));
+        assert!(!response_is_auth_error(&format!("> {error}")));
+        assert!(!response_is_auth_error(
+            "Failed to authenticate: OAuth token revoked."
         ));
     }
 

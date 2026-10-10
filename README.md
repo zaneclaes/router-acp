@@ -607,6 +607,16 @@ per-credential OS locking. The lock covers only login, automatic repair, and
 removal. It never covers a session or model turn. Adapter runtime stores are
 private and access-only.
 
+For managed Claude accounts with the LLM proxy enabled, every proxied request
+reads the current canonical access token. Expiring tokens refresh through the
+same credential lock. A token that is still unexpired is sent when that refresh
+is temporarily unknown. An HTTP 401 reuses a sibling's completed refresh or
+requests repair, then retries that HTTP request once before streaming a reply.
+It does not restart the adapter or replay completed tools. A second 401 does
+not prove logout or model unavailability. Missing credentials never fall back
+to the adapter's launch token. Without the proxy, adapter authentication errors
+continue to use the session repair path.
+
 Grok uses `GROK_HOME` when set, with `HOME/.grok` as its legacy fallback.
 Symlinked stores retain their canonical identity for locking and shared-account
 removal protection. Native login writes that store without changing the

@@ -478,6 +478,77 @@ pub fn request_generation(agent: &AgentConfig) -> Option<String> {
     Some(marker(&credential, record(&directory(agent)?).as_ref()))
 }
 
+// Keep the token and its repair marker from the same read. Do not derive
+// Debug: access tokens must never appear in diagnostics.
+pub(crate) struct ClaudeAccess {
+    pub token: String,
+    pub generation: String,
+}
+
+/// Long-lived adapters retain their launch token. The HTTP boundary reads the
+/// canonical store for every request instead, without locking model traffic.
+pub(crate) async fn claude_access(agent: &AgentConfig) -> Result<ClaudeAccess, RepairOutcome> {
+    claude_access_with(agent, |generation| async move {
+        repair(agent, Some(&generation)).await
+    })
+    .await
+}
+
+async fn claude_access_with<F, Fut>(
+    agent: &AgentConfig,
+    repair_expiring: F,
+) -> Result<ClaudeAccess, RepairOutcome>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = RepairOutcome>,
+{
+    let mut credential = read(agent).ok_or(RepairOutcome::Unknown)?;
+    let dir = directory(agent).ok_or(RepairOutcome::Unknown)?;
+    let previous = record(&dir).filter(|r| r.generation == credential.generation);
+    if previous
+        .as_ref()
+        .is_some_and(|r| r.outcome == RepairOutcome::Rejected)
+    {
+        return Err(RepairOutcome::Rejected);
+    }
+    let expires = credential
+        .value
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(Value::as_i64)
+        .and_then(chrono::DateTime::from_timestamp_millis);
+    // Refresh during the last minute, but a transient failure must not discard
+    // an access token the provider has not expired yet. A rejection or an
+    // already-expired token cannot authorize the request.
+    if let Some(expires_at) = expires
+        && expires_at <= chrono::Utc::now() + chrono::Duration::minutes(1)
+    {
+        let outcome = repair_expiring(marker(&credential, previous.as_ref())).await;
+        if outcome == RepairOutcome::Repaired {
+            credential = read(agent).ok_or(RepairOutcome::Unknown)?;
+        } else if outcome == RepairOutcome::Rejected || expires_at <= chrono::Utc::now() {
+            return Err(outcome);
+        }
+    }
+    let previous = record(&dir).filter(|r| r.generation == credential.generation);
+    if previous
+        .as_ref()
+        .is_some_and(|r| r.outcome == RepairOutcome::Rejected)
+    {
+        return Err(RepairOutcome::Rejected);
+    }
+    let token = credential
+        .value
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(RepairOutcome::Unknown)?
+        .to_owned();
+    Ok(ClaudeAccess {
+        token,
+        generation: marker(&credential, previous.as_ref()),
+    })
+}
+
 pub(crate) fn access_generation(agent: &AgentConfig) -> Option<String> {
     let credential = read(agent)?;
     let token = match crate::accounts::provider(agent)? {
@@ -1232,6 +1303,121 @@ pub async fn repair_for_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn claude_requests_share_expiry_repair_and_read_the_new_token() {
+        let (_root, agent) = fixture("claude");
+        let mut original = read(&agent).unwrap();
+        original.value["claudeAiOauth"]["expiresAt"] = 0.into();
+        write_private(&original.path, &original.value).unwrap();
+        let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = (0..12).map(|_| {
+            let agent = agent.clone();
+            let refreshes = refreshes.clone();
+            async move {
+                let repair_agent = &agent;
+                claude_access_with(&agent, |observed| async move {
+                    durable_repair(
+                        repair_agent,
+                        Some(&observed),
+                        move |mut value, _| async move {
+                            refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            value["claudeAiOauth"]["accessToken"] = "synthetic-rotated".into();
+                            value["claudeAiOauth"]["expiresAt"] = 4070908800000u64.into();
+                            Refresh {
+                                outcome: RepairOutcome::Repaired,
+                                value: Some(value),
+                            }
+                        },
+                    )
+                    .await
+                })
+                .await
+                .unwrap()
+            }
+        });
+        for access in futures::future::join_all(requests).await {
+            assert_eq!(access.token, "synthetic-rotated");
+            assert_eq!(Some(access.generation), request_generation(&agent));
+        }
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            claude_access(&agent).await.unwrap().token,
+            "synthetic-rotated"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_request_does_not_use_missing_or_rejected_credentials() {
+        let (_root, agent) = fixture("claude");
+        let generation = request_generation(&agent).unwrap();
+        let outcome = durable_repair(&agent, Some(&generation), |_, _| async {
+            Refresh {
+                outcome: RepairOutcome::Rejected,
+                value: None,
+            }
+        })
+        .await;
+        assert_eq!(outcome, RepairOutcome::Rejected);
+        assert!(matches!(
+            claude_access(&agent).await,
+            Err(RepairOutcome::Rejected)
+        ));
+        std::fs::remove_file(read(&agent).unwrap().path).unwrap();
+        assert!(matches!(
+            claude_access(&agent).await,
+            Err(RepairOutcome::Unknown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn claude_request_keeps_unexpired_token_when_refresh_is_unknown() {
+        let (_root, agent) = fixture("claude");
+        let mut credential = read(&agent).unwrap();
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis();
+        credential.value["claudeAiOauth"]["accessToken"] = "synthetic-current".into();
+        credential.value["claudeAiOauth"]["expiresAt"] = soon.into();
+        write_private(&credential.path, &credential.value).unwrap();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let refresh = |agent: AgentConfig, attempts: std::sync::Arc<AtomicUsize>| {
+            move |observed: String| {
+                let attempts = attempts.clone();
+                async move {
+                    durable_repair(&agent, Some(&observed), move |_, _| {
+                        let attempts = attempts.clone();
+                        async move {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            Refresh {
+                                outcome: RepairOutcome::Unknown,
+                                value: None,
+                            }
+                        }
+                    })
+                    .await
+                }
+            }
+        };
+        let access = claude_access_with(&agent, refresh(agent.clone(), attempts.clone()))
+            .await
+            .unwrap();
+        assert_eq!(access.token, "synthetic-current");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        // The unknown result is fresh, so the next request reuses it and the token.
+        let access = claude_access_with(&agent, refresh(agent.clone(), attempts.clone()))
+            .await
+            .unwrap();
+        assert_eq!(access.token, "synthetic-current");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let mut credential = read(&agent).unwrap();
+        credential.value["claudeAiOauth"]["expiresAt"] = 0.into();
+        write_private(&credential.path, &credential.value).unwrap();
+        assert!(matches!(
+            claude_access_with(&agent, refresh(agent.clone(), attempts)).await,
+            Err(RepairOutcome::Unknown)
+        ));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn fixture(provider: &str) -> (tempfile::TempDir, AgentConfig) {

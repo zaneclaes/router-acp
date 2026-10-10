@@ -3937,6 +3937,14 @@ async fn downstream_death_between_turns_fails_over_with_prior_context() {
             .candidate_runtime(&CandidateId::new("a", "opus"))
             .unwrap()
             .process_key;
+        // Inside its respawn cooldown, the pick cannot come back.
+        shared
+            .targets
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .last_respawn = Some(std::time::Instant::now());
         shared.mark_target_dead(&key, "adapter exited while idle");
 
         let response = prompt_text(&cx, &sid, "second task").await?;
@@ -3961,6 +3969,58 @@ async fn downstream_death_between_turns_fails_over_with_prior_context() {
         Ok(())
     })
     .await;
+}
+
+#[tokio::test]
+async fn outage_after_a_human_switch_respawns_the_pick_before_failing_over() {
+    // The live failure: a human switched to Codex, its adapter died, and the
+    // next attempt failed over to a model nobody chose instead of respawning.
+    // A pick that cannot respawn still takes the ordinary failover.
+    for (cooldown, revives) in [(0, true), (3600, false)] {
+        let state = temp_state_file(&format!("switch-outage-{cooldown}"));
+        let yaml = format!(
+            "state_file: {}\ndelegation: {{ enabled: false }}\n\
+             auto_upgrade: {{ enabled: false }}\n\
+             failover: {{ respawn_cooldown_secs: {cooldown} }}\nagents:\n{}{}",
+            state.display(),
+            agent_yaml("a", &[("m1", 1)], &[]),
+            agent_yaml("b", &[("m2", 2)], &[]),
+        );
+        run_test_shared(yaml, async |cx, observed, shared| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
+            prompt_text(&cx, &sid, "[router: switch=b/m2]\ncontinue").await?;
+            let b = CandidateId::parse("b/m2").unwrap();
+            let key = shared.candidate_runtime(&b).unwrap().process_key;
+            if !revives {
+                shared
+                    .targets
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .last_respawn = Some(std::time::Instant::now());
+            }
+            shared.mark_target_dead(&key, "adapter exited while idle");
+            let before = agent_text(&observed, &sid).len();
+
+            let result = prompt_text(&cx, &sid, "next task").await;
+            let text = agent_text(&observed, &sid)[before..].to_string();
+            assert_eq!(result?.stop_reason, StopReason::EndTurn);
+            if revives {
+                assert!(text.contains("echo:m2:"), "respawned b/m2: {text}");
+                assert!(!text.contains("echo:m1:"), "never routed to a/m1: {text}");
+            } else {
+                assert!(
+                    text.contains("failover:"),
+                    "ordinary failover disclosed: {text}"
+                );
+            }
+            Ok(())
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
