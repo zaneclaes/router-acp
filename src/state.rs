@@ -242,9 +242,6 @@ impl StateStore {
         ))
     }
 
-    /// Open existing state for query-only inspection. This deliberately
-    /// skips schema setup, legacy import, log flushing, and maintenance, and
-    /// never creates a shard.
     /// True only when no router has created state at `path` yet: the legacy
     /// file and the shards directory are both definitively missing (or the
     /// directory holds no shard). Any other I/O answer, such as a permission
@@ -261,6 +258,9 @@ impl StateStore {
         }
     }
 
+    /// Open existing state for query-only inspection. This deliberately
+    /// skips schema setup, legacy import, log flushing, and maintenance, and
+    /// never creates a shard.
     pub fn open_readonly(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
         let conn = StateFile::open_readonly_conn(path)?;
         Ok(Self::with_legacy(
