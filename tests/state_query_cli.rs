@@ -445,3 +445,63 @@ fn v1_shapes_match_for_legacy_and_sharded_sessions() {
         sharded_state.display().to_string()
     );
 }
+
+#[test]
+fn v1_session_resolves_a_provider_session_id_in_any_state_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.db");
+    let config = dir.path().join("router.yaml");
+    write_config(&config, &state);
+    let store = StateStore::load(
+        &state,
+        Retention {
+            max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        },
+    );
+    store.upsert(
+        "rtr-legacy".into(),
+        PersistedSession {
+            downstream_session_id: "legacy-down".into(),
+            ..session(None, "primary", "Legacy", DAY_START)
+        },
+    );
+    let parent = store.new_session_id(&dir.path().join("checkout")).unwrap();
+    let child = format!("{parent}::delegate-down");
+    store.upsert(
+        parent.clone(),
+        PersistedSession {
+            downstream_session_id: "shard-parent-down".into(),
+            ..session(None, "primary", "Parent", DAY_START)
+        },
+    );
+    store.upsert(
+        child.clone(),
+        PersistedSession {
+            downstream_session_id: "shard-child-down".into(),
+            ..session(Some(&parent), "delegate", "Child", DAY_START + 60)
+        },
+    );
+    drop(store);
+
+    let lookup = |args: &[&str]| {
+        let mut full = vec!["session"];
+        full.extend_from_slice(args);
+        let value = query(&config, &full);
+        assert_envelope(&value, "session");
+        value["data"]["session"].clone()
+    };
+    let legacy = lookup(&["--downstream", "legacy-down"]);
+    assert_eq!(legacy["router_session_id"], "rtr-legacy");
+    assert_eq!(legacy["kind"], "primary");
+    let primary = lookup(&["--downstream", "shard-parent-down"]);
+    assert_eq!(primary["router_session_id"], parent.as_str());
+    assert_eq!(primary["kind"], "primary");
+    let delegate = lookup(&["--downstream", "shard-child-down", "--agent", "mock"]);
+    assert_eq!(delegate["router_session_id"], child.as_str());
+    assert_eq!(delegate["kind"], "delegate");
+    assert_eq!(
+        lookup(&["--downstream", "shard-child-down", "--agent", "other"]),
+        Value::Null
+    );
+    assert_eq!(lookup(&["--downstream", "unknown"]), Value::Null);
+}
