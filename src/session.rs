@@ -6535,7 +6535,7 @@ pub(crate) async fn run_primary_turn(
                             if !wait_for_retry(
                                 &shared,
                                 &router_sid,
-                                responder.cancellation(),
+                                cancellation.clone(),
                                 mark,
                                 notice_reason,
                                 &candidate,
@@ -6543,14 +6543,13 @@ pub(crate) async fn run_primary_turn(
                             )
                             .await
                             {
-                                return responder
-                                    .respond(PromptResponse::new(StopReason::Cancelled));
+                                return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
                             match pin_session(
                                 &shared,
                                 &router_sid,
                                 &req.prompt,
-                                &responder.cancellation(),
+                                cancellation.as_ref(),
                                 None,
                                 true,
                                 None,
@@ -6559,8 +6558,7 @@ pub(crate) async fn run_primary_turn(
                             {
                                 Ok(PinOutcome::Pinned) => continue,
                                 Ok(PinOutcome::Cancelled) => {
-                                    return responder
-                                        .respond(PromptResponse::new(StopReason::Cancelled));
+                                    return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
                                 Err(retry_err) => {
                                     notify_user(
@@ -6569,7 +6567,7 @@ pub(crate) async fn run_primary_turn(
                                         format!("router-acp · retry failed — {retry_err}"),
                                     );
                                     flush_pending_disclosure(&shared, &router_sid);
-                                    return responder.respond_with_error(retry_err);
+                                    return Err(retry_err);
                                 }
                             }
                         }
@@ -6661,7 +6659,7 @@ fn retry_wait_until(
 async fn wait_for_retry(
     shared: &Arc<Shared>,
     router_sid: &str,
-    cancellation: RequestCancellation,
+    cancellation: Option<RequestCancellation>,
     mark: usize,
     reason: crate::notice::Reason,
     candidate: &CandidateId,
@@ -6706,7 +6704,7 @@ async fn wait_for_retry(
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
             _ = tick.tick() => {
-                if cancellation.is_cancelled()
+                if cancellation.as_ref().is_some_and(RequestCancellation::is_cancelled)
                     || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true)
                 {
                     return false;

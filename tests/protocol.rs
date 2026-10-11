@@ -11694,6 +11694,90 @@ async fn queued_planner_turn_collects_managed_background_without_client_cancella
 }
 
 #[tokio::test]
+async fn queued_planner_turn_waits_out_outage_without_client_cancellation() {
+    let state = temp_state_file("planner-queued-outage");
+    let log = temp_log("planner-queued-outage");
+    let repo = planner_wire_repository();
+    let yaml = format!(
+        r#"state_file: {}
+router: planner
+delegation: {{ enabled: false }}
+auto_upgrade: {{ enabled: false }}
+failover: {{ outage_cordon_secs: 1 }}
+routers:
+  planner:
+    planning_candidates: ['planner/sol']
+    implementation_candidates: ['planner/sol']
+agents:
+{}"#,
+        state.display(),
+        agent_yaml(
+            "planner",
+            &[("sol", 3)],
+            &[
+                ("MOCK_LOG", log.to_str().unwrap()),
+                ("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable"),
+                ("MOCK_FAIL_PROMPT_AFTER", "2"),
+                ("MOCK_FAIL_PROMPT_TIMES", "1"),
+            ],
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement authorized test").await?;
+        let active = cx
+            .send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from("SLEEP:1000 original-active-turn")],
+            ))
+            .block_task();
+        wait_for_mock_prompt(&log, "original-active-turn").await;
+        cx.send_request(
+            PromptRequest::new(sid.clone(), vec![ContentBlock::from("queued-outage-turn")]).meta(
+                serde_json::from_value(
+                    serde_json::json!({"router_acp":{"input_id":"queued-outage"}}),
+                )
+                .ok(),
+            ),
+        )
+        .block_task()
+        .await?;
+        active.await?;
+        for _ in 0..40 {
+            let queue_empty = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .parent_queue
+                .is_empty();
+            if queue_empty && agent_text(&observed, &sid).contains("queued-outage-turn") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("no other model can serve"), "{text}");
+        assert!(text.contains("retrying sol now"), "{text}");
+        assert!(text.contains("queued-outage-turn"), "{text}");
+        assert!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .parent_queue
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn queued_planner_commands_keep_fifo_controls_and_original_images() {
     let state = temp_state_file("planner-fifo-controls");
     let log = temp_log("planner-fifo-controls");
