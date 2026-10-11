@@ -1281,7 +1281,7 @@ fn default_planning_candidates() -> Vec<String> {
 
 fn default_implementation_candidates() -> Vec<String> {
     vec![
-        "*terra*".to_string(),
+        "*sol*".to_string(),
         "*opus*".to_string(),
         "*grok*".to_string(),
     ]

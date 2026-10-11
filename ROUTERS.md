@@ -500,7 +500,7 @@ routers:
     # roadmap: ROADMAP.md
     # finish-work: { skill: ship-pr }  # only if this repository has that skill
     planning_candidates: ["*opus*", "*sol*", "*astra*", "*fable*"]
-    implementation_candidates: ["*terra*", "*opus*", "*grok*"]
+    implementation_candidates: ["*sol*", "*opus*", "*grok*"]
     easy_planning_candidates: ["*opus*", "*sol*"]
     hard_planning_candidates: ["*astra*", "*fable*"]
     model_boosts:
