@@ -73,29 +73,14 @@ failover:
 # Per-LLM-request routing. When enabled, router-acp binds one loopback HTTP
 # listener and injects each configured adapter's base-URL override. It keeps
 # auth and request/response bodies intact except for the top-level `model`,
-# streams responses, starts from the ACP-pinned model, demotes after a routine
-# streak, and immediately escalates on failures/stagnation/token ceilings.
+# streams responses, and keeps every request on the ACP-pinned model unless that
+# model is out of plan budget, when it fails over to the strongest same-agent
+# model with budget left. It never switches models to save cost.
 # Keep disabled until `api_model` values and upstream OAuth/API endpoints have
 # been verified for your installed adapters.
 llm_proxy:
   enabled: true
   listen: 127.0.0.1:0
-  routine_streak: 3            # consecutive routine tool-result turns before demoting
-  # Anthropic prompt caching is per-model, so a mid-session demotion re-primes
-  # the whole prefix on the cheaper model at its cache-WRITE rate (a one-time
-  # cost). The router won't demote until the routine streak also clears the
-  # per-pair break-even (⌈(target_write−pinned_read)/(pinned_read−target_read)⌉;
-  # below it you'll see `cache-hold` rows). On the fable DEFAULT (Fable 5, read
-  # $1.00) that is Fable→Sonnet = 2 turns and Fable→Opus = 11. Pin a session to
-  # Fable 5.1 and the arithmetic changes sharply: its read is $0.25/Mtok
-  # (0.025x input, against 0.1x everywhere else), so Fable→Sonnet stretches to
-  # 46 turns and Fable→Opus saves nothing on reads at all ($0.50 > $0.25) —
-  # the gate reports break-even 0 there, so cache economics stop holding that
-  # pair and `minimum_dwell_requests` is the only damper left. Keep
-  # minimum_dwell_requests at/above the break-even you actually want enforced.
-  minimum_dwell_requests: 12
-  verdict_ttl_requests: 6
-  verdict_ttl_secs: 900
   context_window_fraction: 0.9
 
 # Proactive usage-cap cordoning. On top of the reactive (error-driven) cordons

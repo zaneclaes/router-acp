@@ -5972,7 +5972,6 @@ pub(crate) async fn run_primary_turn(
             down_sid.clone(),
             candidate.clone(),
             class,
-            req.meta.as_ref(),
         );
         let request_generation = crate::auth::request_access_generation(&shared, &candidate);
         // Compute-time = the model's actual turn (excludes user idle between
@@ -8002,7 +8001,6 @@ async fn switch_pin(
             old_down_sid.clone(),
             old_candidate.clone(),
             class,
-            None,
         );
         let result = conn.send_request(summary_prompt).block_task().await;
         shared.with_session(router_sid, |s| s.capturing_summary = None);
@@ -8283,7 +8281,6 @@ async fn handle_meta_prompt(
                     opened.downstream_sid.clone(),
                     view.id.clone(),
                     TaskClass::Writing,
-                    req.meta.as_ref(),
                 );
                 let result = opened.conn.send_request(fwd).block_task().await;
                 close_downstream_session(&shared, &opened.process_key, &opened.downstream_sid);

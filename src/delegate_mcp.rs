@@ -1952,7 +1952,6 @@ async fn run_delegate_task_inner(
                     opened.downstream_sid.clone(),
                     candidate.clone(),
                     profile.class,
-                    None,
                 );
                 let prompt_generation = crate::auth::request_access_generation(shared, &candidate);
                 let result = opened.conn.send_request(prompt).block_task().await;
@@ -2569,7 +2568,6 @@ async fn run_delegate_followup_inner(
         downstream_sid.clone(),
         candidate.clone(),
         TaskClass::CodingGeneral,
-        None,
     );
     let request_generation = crate::auth::request_access_generation(shared, &candidate);
     let result = conn.send_request(prompt).block_task().await;

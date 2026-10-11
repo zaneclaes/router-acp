@@ -234,24 +234,14 @@ Per-class quality scores, coding tiers/percentiles, and context windows live in 
 
 ACP routing normally sees one `session/prompt`; a coding agent may make hundreds of provider calls while executing it. The optional `llm_proxy` interposes those calls. router-acp binds a loopback-only HTTP listener before spawning adapters, replaces each configured adapter's inference base URL, and forwards the original method, path, application headers (including authorization), body, and streamed response. It requests an identity-encoded upstream response so usage can be accounted while streaming; only an inference request's top-level `model` field may change.
 
-The request policy is deliberately stateful:
+Requests stay on the ACP session's pinned candidate. The proxy moves a request to another model in one case: the pin is out of plan budget (cordoned, quarantined, or seat-exhausted). Then the request goes to the strongest compatible same-agent model that still has budget. If no such model exists, the pin stands. The proxy never switches models to save cost. The per-request cost policy (routine demotion, difficulty escalation, verdict expiry, dwell) was removed: measured on live traffic, it rarely saved money and sometimes moved requests sideways onto pricier models. `routine_streak`, `minimum_dwell_requests`, `verdict_ttl_requests` and `verdict_ttl_secs` are still accepted so old configs load, and a warning names any that are set; they have no effect.
 
-- begin on the ACP session's pinned candidate;
-- demote to the cheapest routeable model from the same agent after a sustained streak of successful routine tool results (reads, searches, mechanical edits, status/CI checks) — on the Anthropic wire this is also gated by cache economics: prompt caching is per-model, so a demotion pays the target's cache-*write* rate to re-prime the conversation, and only fires once the streak is long enough that the saved turns beat that one-time cost (`cache_reprime_break_even`, derived from each model's configured cache rates); below that, the router holds the warm pin instead of thrashing;
-- escalate immediately to that agent's highest-quality compatible model at or below the session pin's cost rank after a tool failure, repeated unchanged test output, refusal, HTTP failure, or token/context ceiling; per-request routing never spends above the pin;
-- expire difficulty verdicts by request count and wall time; and
-- enforce a minimum dwell before ordinary switches to bound cold-cache churn. Difficulty and explicit automation hints bypass dwell.
-
-Request signals are extracted structurally and deterministically from the live tool payload; per-request routing does not call an LLM to classify requests. Demotion is rejected when the estimated request plus requested output exceeds `context_window_fraction` of the target's context window. An alternate whose window is unknown is never selected. Cordons and quarantines also apply. `api_model` maps an ACP selector alias such as `opus[1m]` to the exact provider API model id used for rewrites.
+A failover target must fit the estimated request plus requested output within `context_window_fraction` of its context window. An alternate whose window is unknown is never selected. `api_model` maps an ACP selector alias such as `opus[1m]` to the exact provider API model id used for rewrites.
 
 ```yaml
 llm_proxy:
   enabled: true
   listen: 127.0.0.1:0
-  routine_streak: 3
-  minimum_dwell_requests: 12
-  verdict_ttl_requests: 6
-  verdict_ttl_secs: 900
   context_window_fraction: 0.9
 
 agents:
@@ -281,14 +271,6 @@ The explicit upstream must match the adapter's authentication mode:
 This routes among models accepted by the same adapter/upstream/auth seat; it does not translate wire formats or credentials across providers. Future agents only need a base-URL environment variable, an explicit upstream, and either the `anthropic` or `openai` wire setting.
 
 Attribution is exact for `spawn-config` processes and for a process with one active ACP prompt. If a shared `config-option` process serves concurrent prompts, an adapter session marker (`prompt_cache_key`, `session_id`, or equivalent) resolves the owner; otherwise the request passes through unchanged rather than risking a cross-session rewrite. Invalid JSON, non-inference endpoints, ambiguous traffic, or listener bind failure likewise degrade to transparent ACP-turn routing.
-
-Relay-generated automation can bypass the routine streak by attaching this to the ACP prompt:
-
-```json
-{"_meta":{"router_acp":{"request_hint":"ci-poll"}}}
-```
-
-Accepted hints are `ci-poll`, `ship-nudge`, and `automation`.
 
 A host can mark a coordinator with `{"_meta":{"router_acp":{"session_role":"coordinator"}}}` on `session/new` or any `session/prompt`. Workflow phase remains reversible while the coordinator retains planner models. Proxy alternates remain limited to `routers.planner.planning_candidates`; explicit human picks are preserved. See ROUTERS.md § "Coordinator sessions" for failover and human-pick behavior.
 
@@ -607,9 +589,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | --- | --- | --- |
 | `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
 | `llm_proxy.listen` | `127.0.0.1:0` | Loopback listener; port `0` selects a free port. Non-loopback addresses are rejected because provider credentials pass through it. |
-| `llm_proxy.routine_streak` | `3` | Consecutive successful routine tool-result requests required before demotion (also gated by the cache-reprime break-even on the Anthropic wire — see [Per-request LLM routing](#per-request-llm-routing)). |
-| `llm_proxy.minimum_dwell_requests` | `12` | Requests a selected model serves before an ordinary switch; difficulty and automation bypass it. |
-| `llm_proxy.verdict_ttl_requests` / `verdict_ttl_secs` | `6` / `900` | Request-count and wall-clock expiry for a difficulty escalation verdict; `0` disables that expiry dimension. |
+| `llm_proxy.routine_streak` / `minimum_dwell_requests` / `verdict_ttl_requests` / `verdict_ttl_secs` | — | Deprecated and ignored; the per-request cost policy was removed. Accepted so old configs load, with a load-time warning. |
 | `llm_proxy.context_window_fraction` | `0.9` | Maximum fraction of an alternate model's known context window that an estimated request may occupy. |
 | `llm_proxy.max_request_bytes` / `max_capture_bytes` | `32 MiB` / `4 MiB` | Request buffering limit and head/tail response capture limit. Responses still stream in full. |
 | `agents[].llm_proxy` | – | Adapter interposition: `protocol` (`anthropic` or `openai`), `base_url_env`, and the real `upstream_base_url`. |
