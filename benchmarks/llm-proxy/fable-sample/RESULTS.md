@@ -1,5 +1,11 @@
 # Fable expensive-use benchmark
 
+> **Historical.** The per-request cost policy this benchmark measured was
+> removed. On 30 days of live Kory Code traffic it saved +$9.85 and lost
+> $68.60 at list price (net -1.0%), mostly from difficulty escalations that
+> moved GPT-6.1 Sol requests sideways onto pricier GPT-5.6 Sol. The proxy now
+> keeps requests on the session pin and reroutes only an out-of-budget pin.
+
 **Run date:** 2026-07-23, updated 2026-07-24 (America/New_York)
 **Source:** dev workstation SQLite history plus a live Claude/Anthropic replay
 **Status:** history complete; Claude available and the per-request routing now

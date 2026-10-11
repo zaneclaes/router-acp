@@ -17,19 +17,6 @@ effort:
 llm_proxy:
   enabled: true
   listen: 127.0.0.1:0
-  routine_streak: 3
-  # Small on purpose. This is a FIXED request count, so on real traffic it never
-  # prevents a bad switch — it just delays every good one: measured over the
-  # recorded history, 0 of 7 sessions ran shorter than 12 requests (median 124),
-  # so a dwell of 12 taxed 12% of all traffic onto the pinned model and blocked
-  # nothing. It also delays DE-escalation, since returning to the pin after a
-  # difficulty verdict expires is not an emergency switch and so has to wait it
-  # out on the more expensive model. Real hysteresis comes from the cache
-  # re-prime break-even (see the per-model cache rates below), which is
-  # economically exact; this only damps single-request flapping.
-  minimum_dwell_requests: 2
-  verdict_ttl_requests: 6
-  verdict_ttl_secs: 900
   context_window_fraction: 0.9
 
 delegation:
@@ -93,19 +80,11 @@ agents:
     # the per-request proxy: rewriting the request body's `model` to a CLI alias
     # gets a 404 from api.anthropic.com. Values below verified against the ids
     # claude-agent-acp actually puts on the wire for each alias.
-    # Cache rates are load-bearing, not decoration: without them
-    # `cache_reprime_break_even` returns 0 and the cache-aware demotion gate is
-    # inert, leaving `minimum_dwell_requests` as the only (blunt) thrash guard.
-    # Anthropic's rates are usually a fixed ratio of the input rate — read 0.1x,
-    # write 1.25x — so a mid-session switch forfeits the warm cache and re-primes
-    # at the target's write rate. At a 200k context that is ~$0.50 on Sonnet vs
-    # ~$0.04 for a warm read, i.e. one switch costs ~12 warm turns. Those numbers
-    # are what make the break-even the correct hysteresis.
-    # Two Claude models break the read ratio, so state every rate explicitly
+    # Cache rates price each request's cache reads and writes. Anthropic's rates
+    # are usually a fixed ratio of the input rate — read 0.1x, write 1.25x — but
+    # two Claude models break the read ratio, so state every rate explicitly
     # rather than deriving one: Fable 5.1 is 0.025x ($0.25/Mtok), and Opus 5.5
-    # is 0.05x ($0.20/Mtok). On a Fable 5.1 pin the warm read is only $0.05/Mtok
-    # above Sonnet's, pushing the Fable→Sonnet break-even from 2 warm turns
-    # (on Fable 5's $1.00 read) out to 46.
+    # is 0.05x ($0.20/Mtok).
     models:
       - { id: haiku, display_name: Claude Haiku, cost_rank: 1,
           api_model: claude-haiku-4-5,

@@ -41,7 +41,7 @@ SDK traps below, which were all discovered the hard way.
 | `src/limits.rs` | failure classification (RateLimited/Outage/ModelAtCapacity/ContextOverflow/Other) + reset-time parsing (regex, every format unit-tested) + `humanize` |
 | `src/headroom.rs` | sliding-window seat budgets, candidate quarantine, per-agent **cordons** (reactive, error-driven, monotonic `Instant`), per-candidate **usage cordons** (`UsageCordon`/`usage_cordons`, proactive, absolute wall-clock `resets_at`, reconciled per account with a usable reading via `reconcile_usage_cordons`) AND per-candidate **seat availability** (`SeatAvailability`: `plan_headroom` + `on_overage`, poll snapshot via `set_polled_availability` + per-agent TTL'd client hints via `set_hinted_availability`; fresh hint outranks poll in `availability()`) |
 | `src/usage.rs` | proactive usage-cap poller: `anthropic-oauth` uses router-managed credentials to call `GET /api/oauth/usage`; `codex-rollout` uses one `codex app-server` `account/rateLimits/read` round-trip and falls back to its snapshot cache. Both fail open, never hardcode a model list, and feed cordons and seat availability. `spawn_usage_poller` installs those results. |
-| `src/llm_proxy.rs` | optional loopback provider proxy: process base-URL injection, Anthropic Messages + OpenAI Responses/Chat forwarding, auth/SSE pass-through, per-active-prompt attribution, same-agent request policy (routine demotion, difficulty/stagnation escalation, verdict expiry, dwell, context guards), request disclosure, usage/cache/cost capture |
+| `src/llm_proxy.rs` | optional loopback provider proxy: process base-URL injection, Anthropic Messages + OpenAI Responses/Chat forwarding, auth/SSE pass-through, per-active-prompt attribution, out-of-budget pin failover to the strongest same-agent model (context-guarded), request disclosure, usage/cache/cost capture |
 | `src/state.rs` | **StateStore** owns SQLite state (rusqlite, bundled) and is the only boundary for router callers. New sessions always go to their cwd shard; pre-sharding `rtr-<uuid>` ids stay in the legacy file. Routing is by id shape; only `new_session_id(cwd)` creates a shard. Box-wide reads fan out over every file; `hook_outbox` and the maintenance tables stay in the legacy file. `StateFile` is the private one-file implementation with its own streaming queue. `sessions` stores pins, lineage, titles, token counters and observability metrics. `session_log` records ACP interactions and buffers streaming rows. `state-query --config … v1` is the stable read-only JSON boundary for hosts: metadata/title, batched delegate panels, timestamped selected logs, Kory-compatible analytics and savings rows, health, delegation report, and transcript. Delegates use two SQL queries total and retain detail only for `delegate_task`, `delegate_followup`, and `agent_response`. Analytics range-scans `idx_log_ts`, then applies a small attribution map. Health reports file and maintenance metadata without table-wide row counts. It opens read-only and never creates shards, initializes, imports, flushes, prunes, vacuums, or checkpoints. v1 shapes match for legacy and sharded sessions (health sums bytes across files); per-shard detail is only in `state-stats`. |
 | `src/state_layout.rs` / `src/state_bench.rs` | shard ids and paths (`rtr-<sha256 cwd tag>-<uuid>`, `shards/sessions-<tag>.db`); hidden `state-bench` multi-process writer benchmark |
 | `src/maintenance.rs` | elected state-DB upkeep: every serve process ticks every 5 min, only the holder of a nonblocking flock on `maintenance.lock` works; `maintenance_lease` only reports. Legacy file, then shards oldest-swept first (`shard_maintenance`), ≤250 ms each. Own connection (never the state mutex), 200 ms lock wait, 2 s budget, a busy file is deferred and the tick moves on. Batched `history`-window prune across every per-session table (children before the `sessions` row, each batch re-checking the session is still expired), finished `tool_calls.detail` backfill, `incremental_vacuum` (only once `state-compact` switched `auto_vacuum`), PASSIVE/quiet-TRUNCATE WAL checkpoint. `stats`/`compact` back the `state-stats`/`state-compact` subcommands. Writes never prune inline |
@@ -343,70 +343,34 @@ SDK traps below, which were all discovered the hard way.
   A 401 must never cordon a pinned model or trigger alternate-model retries.
   normalize upstream `Accept-Encoding` to `identity` so usage can be accounted;
   only rewrite the inference body's top-level `model`. `models[].
-  api_model` maps ACP aliases to provider ids. Request routing stays within the
-  same agent/auth/wire: routine streak → cheapest compatible candidate.
+  api_model` maps ACP aliases to provider ids. Requests stay on the session
+  pin; the only reroute is an out-of-budget pin → strongest compatible
+  candidate in the same agent/auth/wire.
   Codex ChatGPT OAuth normally prefers WebSocket and bypasses
   `OPENAI_BASE_URL`; `codex_chatgpt_provider: true` installs a custom HTTP
   Responses provider so those requests are actually intercepted. A repin
   resets request attribution immediately, before the first intercepted
   inference, so tool history can never combine a new agent with a stale model;
-  failure/stagnation/refusal/token ceiling → strongest compatible candidate at
-  or below the session pin's cost rank (per-request routing never spends above
-  the pin); request signals are extracted structurally and deterministically,
-  with no LLM classification call;
-  verdict expiry + minimum dwell bound frontier/cache residence; known context
-  windows, cordons, and quarantines constrain alternates. Register EVERY
+  known context windows, cordons, and quarantines constrain the failover
+  target. Register EVERY
   downstream `session/prompt` path with `LlmProxyRuntime::begin_turn`.
   Process-scoped base URLs make attribution ambiguous when one config-option
   process serves concurrent prompts: use adapter session hints when present,
   otherwise pass through unchanged. Listener bind failure leaves environments
   untouched. Provider calls live in `llm_requests`; in-flight tools and their
   selected model live in the `active_tool_calls` SQLite view.
-  **LESSON (cross-provider, shipped bug):** routine/difficulty detection in
-  `inspect_request` originally scanned only the **last 24 KB of the serialized
-  request**. That worked for Codex's Responses shape but silently defeated the
-  policy for **Claude/Anthropic**: an Anthropic `/v1/messages` request carries a
-  large `system` + `tools` prelude and the *entire* conversation history in
-  `messages`, so the current turn's `tool_result` routinely falls outside any
-  fixed tail — `has_tool_result`/`routine_tool` read false and NOTHING ever
-  demoted (every request logged `routing_event=steady`; confirmed live — a
-  Fable-pinned goose session produced 8 real `/v1/messages` rows, all steady,
-  never demoting despite routine reads). Fix: `latest_tool_context` walks the
-  body structurally (like `test_fingerprint`) for the most-recent tool-result
-  content + the invoking tool name, and difficulty is scoped to that latest
-  block (a stale historical `is_error` no longer pins escalation forever now
-  that the whole history is resent each turn). Regressions:
-  `routine_detection_survives_large_anthropic_tools_prelude` (asserts the
-  tool_result is NOT in the 24 KB tail yet still reads routine),
-  `routine_detection_uses_tool_name_when_output_has_no_marker`,
-  `stale_history_failure_does_not_pin_difficulty_on_the_current_turn`. The
-  mock-driven end-to-end test (`proxy_streams_rewrites_preserves_auth_and_accounts_requests`,
-  `protocol: anthropic`) proves demotion+rewrite+accounting+fallback on the
-  Anthropic wire; the demotion-target `api_model` ids (`claude-sonnet-5`,
-  `claude-opus-5`) are valid on the subscription OAuth `/v1/messages` endpoint.
-  **Anthropic cache caveat + the cache-reprime gate:** prompt caching is
-  per-model, so a mid-session demotion forfeits the incumbent's warm cache and
-  the switch turn pays the cheaper model's cache-*write* rate to re-prime the
-  whole prefix (instead of the incumbent's cache-*read* rate); only later warm
-  turns bank the read-rate difference. Break-even is *turn-count-driven, not
-  prefix-size-driven* (both the switch penalty and the per-turn saving scale
-  with the prefix): `cache_reprime_break_even` = ⌈(target_write − pinned_read) /
-  (pinned_read − target_read)⌉ — for Fable→Sonnet ≈ 4 turns, Fable→Opus ≈ 11.
-  So the routine-demotion branch now **gates** on
-  `routine_streak ≥ max(cfg.routine_streak, break_even)`: below it, it emits a
-  `cache-hold` (stays on the warm pinned model, no per-turn disclosure) rather
-  than demoting a short routine blip that would escalate right back and waste
-  the write (thrash pays the write twice). The gate no-ops when cache pricing is
-  absent (the OpenAI/Responses wire has no separate write cost), so
-  Codex/Grok/Kimi are unchanged. There is no way to make a single cache-write
-  cheaper (Anthropic fixes it at 1.25×/2× base input); the only lever is not
-  wasting writes — hence the gate, plus config guidance to set
-  `minimum_dwell_requests ≥ break_even` so a demotion, once taken, stays warm
-  long enough to amortize. Report savings **session-wide** (whole-session cost
-  delta), never as the ratio on the demoted tool-use turns alone, which ignores
-  the non-demotable turns AND the re-prime cost and massively overstates. Tests:
-  `cache_reprime_break_even_matches_configured_rates`,
-  `demotion_waits_for_cache_reprime_break_even_then_demotes`.
+  **LESSON (removed feature):** the proxy used to run a per-request cost
+  policy — routine-streak demotion to the cheapest model, difficulty/stagnation
+  escalation, verdict expiry, dwell, and a cache re-prime break-even gate. It
+  was removed: on 30 days of live Kory Code traffic it saved +$9.85 and lost
+  $68.60 at list price (net −1.0%). Escalation ranked by score-table quality,
+  then `cost_rank`, then id, so equal-quality, equal-rank Sol versions tied
+  and the alphabetical tie-break moved 6.1 Sol requests onto 2.5× pricier
+  5.6 Sol. Anthropic prompt caching is per-model, so every switch also
+  re-primed the prefix at the target's cache-write rate. Do not reintroduce
+  automatic per-request model switching for cost without a measured,
+  session-wide net saving. The four config keys are accepted and ignored
+  (`LlmProxyConfig::deprecated_keys`) so old configs still load.
 - Don't advertise ACP capabilities (list/load/resume/close/delete) unless at
   least one downstream supports them and the router implements the full
   remap path.

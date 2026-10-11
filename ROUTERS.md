@@ -40,24 +40,12 @@ to see every account. Lower account priorities drain first before the
 strategy ranks models. See [Multiple accounts](README.md#multiple-accounts).
 
 With the optional **per-request LLM proxy**, the candidate remains the
-session's default and failover owner, but it is no longer necessarily the model
-for every provider call inside a turn. The loopback proxy observes the live
-tool-result trace and may:
-
-- demote to the cheapest same-agent model after `llm_proxy.routine_streak`
-  routine requests;
-- escalate immediately to the highest-quality compatible same-agent model at or
-  below the session pin's cost rank on failures, unchanged test output, refusal,
-  or token/context ceilings; per-request routing never spends above the pin;
-- return from an escalation when its request/time verdict expires; and
-- hold a model for `minimum_dwell_requests` to avoid repeatedly paying cold
-  cache costs.
-
-Context-window guards, cordons, and quarantines constrain this pool. Request
-signals are extracted structurally and deterministically from the live tool
-payload; per-request routing does not call an LLM to classify requests. An
-automation hint (`_meta.router_acp.request_hint = "ci-poll"`, `"ship-nudge"`,
-or `"automation"`) goes directly to the cheap compatible model. Every
+session's default and the model for every provider call inside a turn. The
+loopback proxy moves a request off the pin only when the pin is out of plan
+budget: then it uses the strongest compatible same-agent model with budget
+left. It never switches to save cost; the routine-demotion and
+difficulty-escalation policy was removed. Context-window guards, cordons, and
+quarantines constrain the failover pool. Every
 attributed decision is disclosed as `router-acp · request …`, stored in
 `session_log`, and recorded with exact model/token/cache/cost fields in
 `llm_requests`. The proxy is orthogonal to the four ACP routers below: they

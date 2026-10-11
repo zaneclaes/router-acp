@@ -1545,21 +1545,21 @@ pub struct LlmProxyConfig {
     /// Must resolve to a loopback socket. Port 0 asks the OS for a free port.
     #[serde(default = "default_llm_proxy_listen")]
     pub listen: String,
-    /// Consecutive routine tool-result requests before demotion is considered.
-    #[serde(default = "default_llm_routine_streak")]
-    pub routine_streak: u32,
-    /// Requests a selected model must serve before a non-emergency switch.
-    #[serde(default = "default_llm_minimum_dwell_requests")]
-    pub minimum_dwell_requests: u32,
-    /// Number of subsequent requests for which a difficulty verdict remains
-    /// elevated. Zero disables request-count expiry.
-    #[serde(default = "default_llm_verdict_ttl_requests")]
-    pub verdict_ttl_requests: u32,
-    /// Wall-clock expiry for a difficulty verdict. Zero disables time expiry.
-    #[serde(default = "default_llm_verdict_ttl_secs")]
-    pub verdict_ttl_secs: u64,
+    /// DEPRECATED and ignored. The per-request cost policy (routine demotion,
+    /// difficulty escalation, verdict expiry, dwell) was removed; requests stay
+    /// on the session pin unless it is out of plan budget. Accepted, unused, so
+    /// existing configs still load; `deprecated_keys` reports them.
+    #[serde(default, skip_serializing)]
+    pub routine_streak: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing)]
+    pub minimum_dwell_requests: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing)]
+    pub verdict_ttl_requests: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing)]
+    pub verdict_ttl_secs: Option<serde_yaml::Value>,
     /// Fraction of a target model's configured context window that a request
-    /// may occupy. Demotion is refused when the target window is unknown.
+    /// may occupy. An out-of-budget pin's failover target must fit it, and a
+    /// target with an unknown window is refused.
     #[serde(default = "default_llm_context_window_fraction")]
     pub context_window_fraction: f64,
     /// Maximum buffered JSON request size. Responses remain streamed.
@@ -1575,22 +1575,6 @@ fn default_llm_proxy_listen() -> String {
     "127.0.0.1:0".to_string()
 }
 
-fn default_llm_routine_streak() -> u32 {
-    3
-}
-
-fn default_llm_minimum_dwell_requests() -> u32 {
-    12
-}
-
-fn default_llm_verdict_ttl_requests() -> u32 {
-    6
-}
-
-fn default_llm_verdict_ttl_secs() -> u64 {
-    15 * 60
-}
-
 fn default_llm_context_window_fraction() -> f64 {
     0.9
 }
@@ -1603,15 +1587,40 @@ fn default_llm_max_capture_bytes() -> usize {
     4 * 1024 * 1024
 }
 
+impl LlmProxyConfig {
+    /// Removed per-request policy keys still present in the config, for a
+    /// load-time warning.
+    pub fn deprecated_keys(&self) -> Vec<&'static str> {
+        [
+            ("llm_proxy.routine_streak", self.routine_streak.is_some()),
+            (
+                "llm_proxy.minimum_dwell_requests",
+                self.minimum_dwell_requests.is_some(),
+            ),
+            (
+                "llm_proxy.verdict_ttl_requests",
+                self.verdict_ttl_requests.is_some(),
+            ),
+            (
+                "llm_proxy.verdict_ttl_secs",
+                self.verdict_ttl_secs.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect()
+    }
+}
+
 impl Default for LlmProxyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             listen: default_llm_proxy_listen(),
-            routine_streak: default_llm_routine_streak(),
-            minimum_dwell_requests: default_llm_minimum_dwell_requests(),
-            verdict_ttl_requests: default_llm_verdict_ttl_requests(),
-            verdict_ttl_secs: default_llm_verdict_ttl_secs(),
+            routine_streak: None,
+            minimum_dwell_requests: None,
+            verdict_ttl_requests: None,
+            verdict_ttl_secs: None,
             context_window_fraction: default_llm_context_window_fraction(),
             max_request_bytes: default_llm_max_request_bytes(),
             max_capture_bytes: default_llm_max_capture_bytes(),
@@ -1736,6 +1745,12 @@ impl Config {
         let interpolated = interpolate_env(yaml);
         let mut cfg: Config = serde_yaml::from_str(&interpolated)
             .map_err(|e| ConfigError(format!("invalid YAML: {e}")))?;
+        for key in cfg.llm_proxy.deprecated_keys() {
+            tracing::warn!(
+                key,
+                "ignored config key: the per-request cost policy was removed"
+            );
+        }
         cfg.state_file = expand_tilde(&cfg.state_file);
         if let Some(p) = &cfg.delegation.socket_path {
             cfg.delegation.socket_path = Some(expand_tilde(p));
@@ -1997,11 +2012,6 @@ impl Config {
                     "llm_proxy.listen must use a loopback address; provider credentials pass \
                      through this listener"
                         .into(),
-                ));
-            }
-            if self.llm_proxy.routine_streak == 0 {
-                return Err(ConfigError(
-                    "llm_proxy.routine_streak must be at least 1".into(),
                 ));
             }
             if !(0.1..=1.0).contains(&self.llm_proxy.context_window_fraction) {
@@ -2424,7 +2434,26 @@ agents:
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
         assert!(cfg.effort.default.is_none() && cfg.effort.max_automatic.is_none());
         assert!(!cfg.llm_proxy.enabled);
-        assert_eq!(cfg.llm_proxy.minimum_dwell_requests, 12);
+        assert!(cfg.llm_proxy.deprecated_keys().is_empty());
+    }
+
+    #[test]
+    fn accepts_removed_llm_proxy_policy_keys_as_deprecated() {
+        let yaml = format!(
+            "llm_proxy:\n  routine_streak: 3\n  minimum_dwell_requests: 4\n  \
+             verdict_ttl_requests: 6\n  verdict_ttl_secs: 900\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            cfg.llm_proxy.deprecated_keys(),
+            vec![
+                "llm_proxy.routine_streak",
+                "llm_proxy.minimum_dwell_requests",
+                "llm_proxy.verdict_ttl_requests",
+                "llm_proxy.verdict_ttl_secs",
+            ]
+        );
     }
 
     #[test]
