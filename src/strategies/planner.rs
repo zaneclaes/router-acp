@@ -167,8 +167,7 @@ fn phase_label(phase: PlannerPhase) -> &'static str {
 /// High-precision keyword phrases that strongly signal the user wants
 /// execution, not further planning. Matched case-insensitively against the
 /// full prompt text. Only phrases that almost never appear in a planning
-/// discussion are included — false positives pin the session to
-/// implementation irreversibly.
+/// discussion are included. Explicit workflow commands can reverse the phase.
 const IMPLEMENTATION_PHRASES: &[&str] = &[
     "implement it",
     "implement this",
@@ -213,56 +212,7 @@ pub const PLAN_PROTOCOL_HEADER: &str = "[router-acp planner protocol]";
 /// Planning. Host `planning_instructions` are appended separately.
 pub fn planner_plan_protocol() -> String {
     format!(
-        "{PLAN_PROTOCOL_HEADER}\n\
-         You are in the PLANNING phase. Investigate the request and present a \
-         concrete, reviewable plan before asking for implementation approval.\n\
-         \n\
-         Required order:\n\
-         1. Investigate (read the code, tickets, and docs) until you can name \
-         the files, steps, and risks.\n\
-         2. Present that plan in this turn as a reviewable artifact: goal, \
-         approach, files/systems to change, sequenced steps, open questions, \
-         and what done looks like.\n\
-         3. Capture the plan on a Linear ticket BEFORE asking for approval. \
-         If this session is not already ticket-bound, create the ticket now \
-         (linear CLI) with the plan as its body. Tickets are how the work is \
-         captured; the planner writes that ticket, never the implementation \
-         agent. Do not ask the handoff question until the session is \
-         ticket-bound.\n\
-         4. Only AFTER the plan is in the conversation AND the session is \
-         ticket-bound, ask one structured question. Offer exactly one of \
-         these pairs — never both \"{HANDOFF_PROCEED}\" and \
-         \"{HANDOFF_CREATE_EPIC}\" in the same question:\n\
-         - Default — the work fits in ONE PR to this session's \
-         repository, even when it also needs PRs in other repositories: \"{HANDOFF_PROCEED}\" and \
-         \"{HANDOFF_REFINE}\". This session does the work.\n\
-         - Only when the plan needs two or more PRs to this session's \
-         repository: \
-         \"{HANDOFF_CREATE_EPIC}\" and \"{HANDOFF_REFINE}\". This session \
-         becomes the epic parent and the work runs in separate ticket-bound \
-         child sessions. Each child ticket is exactly one PR to that repository. Put \
-         the child breakdown in the \"{HANDOFF_CREATE_EPIC}\" option's \
-         preview as a numbered list, one line per child, each ending \
-         \"— 1 PR\".\n\
-         One PR is one ticket, never an epic. The choice defaults \
-         to \"{HANDOFF_PROCEED}\". Any complexity or confidence estimate \
-         from the router is advisory, not a gate.\n\
-         5. Do not ask for implementation approval against a plan you have \
-         not presented, or against a session with no Linear ticket.\n\
-         \n\
-         Forbidden in this planning turn:\n\
-         - Editing, creating, or deleting implementation files\n\
-         - Asking for implementation approval before the plan is presented\n\
-         - Asking for implementation approval before this session is \
-         ticket-bound\n\
-         - Starting implementation after a \"{HANDOFF_PROCEED}\" answer. End \
-         the turn without editing; a follow-up user prompt performs the \
-         router switch onto the implementation model.\n\
-         - Leaving the PLANNING phase after a \"{HANDOFF_CREATE_EPIC}\" \
-         answer. End the turn without editing and without a phase switch; \
-         a follow-up user prompt carries the epic coordination brief.\n\
-         \n\
-         Do not paraphrase the choice labels."
+        "{PLAN_PROTOCOL_HEADER}\nYou are in the PLANNING phase. Investigate and present a concrete, reviewable plan. Use the resolved repository policy and create-plan skill. Preserve existing authorization and work state. Do not implement unapproved scope. Mode commands do not cancel assigned children or authorize merge, deployment, or publication."
     )
 }
 
@@ -285,6 +235,7 @@ mod tests {
             easy_planning_candidates: vec!["*opus*".into(), "*sol*".into()],
             hard_planning_candidates: vec!["*astra*".into(), "*fable*".into()],
             planning_instructions: String::new(),
+            ..Default::default()
         }
     }
 
@@ -600,27 +551,18 @@ mod tests {
     }
 
     #[test]
-    fn plan_protocol_names_stable_handoff_choices() {
+    fn plan_protocol_is_repository_neutral() {
         let protocol = planner_plan_protocol();
         assert!(protocol.starts_with(PLAN_PROTOCOL_HEADER));
-        assert!(protocol.contains(HANDOFF_PROCEED));
-        assert!(protocol.contains(HANDOFF_REFINE));
-        assert!(protocol.contains(HANDOFF_CREATE_EPIC));
+        assert!(protocol.contains("resolved repository policy"));
+        assert!(!protocol.contains("Linear"));
+        assert!(!protocol.contains(HANDOFF_CREATE_EPIC));
         assert!(
             !protocol.contains(HANDOFF_COORDINATE),
             "legacy coordinate label must not be offered: {protocol}"
         );
-        assert!(protocol.contains("defaults to \"Proceed with implementation\""));
-        assert!(protocol.contains("ONE PR to this session's"));
-        assert!(protocol.contains("two or more PRs"));
-        assert!(protocol.contains("exactly one PR to that repository"));
-        assert!(protocol.contains("One PR is one ticket, never an epic"));
-        assert!(protocol.contains("advisory, not a gate"));
-        assert!(protocol.contains("separate ticket-bound child sessions"));
-        assert!(protocol.contains("without a phase switch"));
-        assert!(protocol.contains("ticket-bound"));
-        assert!(protocol.contains("never the implementation agent"));
-        assert!(protocol.contains("before asking for implementation approval"));
+        assert!(protocol.contains("review"));
+        assert!(!protocol.contains("ticket-bound"));
         assert!(
             !protocol.contains("with the current plan"),
             "must not revive the premature current-plan question: {protocol}"

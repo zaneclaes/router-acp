@@ -180,8 +180,28 @@ pub struct McpToolsCallResult {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DelegateTaskArgs {
     pub task: String,
+    /// Optional durable planner assignment. Omitted keeps legacy lightweight
+    /// delegation semantics and its shared read-only context.
+    #[serde(default)]
+    pub work_id: Option<String>,
+    #[serde(skip)]
+    pub planner_identity: Option<crate::planner_workflow::WorkerIdentity>,
+    #[serde(skip)]
+    pub planner_role: Option<crate::planner_skills::PlannerRole>,
+    #[serde(skip)]
+    pub planner_workspace: Option<PathBuf>,
+    #[serde(skip)]
+    pub planner_environment: std::collections::BTreeMap<String, String>,
+    #[serde(skip)]
+    pub classification_text: Option<String>,
     #[serde(default)]
     pub context_files: Vec<String>,
+    #[serde(default)]
+    pub input_ids: Vec<String>,
+    #[serde(skip)]
+    pub planner_input_blocks: Vec<ContentBlock>,
+    #[serde(skip)]
+    pub planner_receipt_ids: Vec<String>,
     #[serde(default)]
     pub hints: DelegateHints,
     /// Opaque capabilities required by this bounded subtask. The router maps
@@ -226,6 +246,16 @@ pub struct DelegateAwaitArgs {
 pub struct DelegateFollowupArgs {
     pub delegate_id: String,
     pub message: String,
+    #[serde(default)]
+    pub input_ids: Vec<String>,
+    #[serde(skip)]
+    pub planner_input_blocks: Vec<ContentBlock>,
+    #[serde(skip)]
+    pub planner_receipt_ids: Vec<String>,
+    #[serde(skip)]
+    pub planner_identity: Option<crate::planner_workflow::WorkerIdentity>,
+    #[serde(skip)]
+    pub planner_role: Option<crate::planner_skills::PlannerRole>,
     /// Return a `b-…` id immediately and run the follow-up turn concurrently;
     /// collect it with `delegate_await`.
     #[serde(default)]
@@ -296,6 +326,8 @@ fn tool_definition() -> Value {
                     "type": "string",
                     "description": "Complete, self-contained instructions for the subtask."
                 },
+                "work_id": { "type": "string", "description": "Admitted durable planner work identity. Allocates an isolated workspace and preserves the child identity across attempts. Omit for lightweight delegation." },
+                "input_ids": {"type":"array","items":{"type":"string"},"description":"Original durable planner input receipts to deliver, including attachments."},
                 "context_files": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -374,6 +406,7 @@ fn followup_tool_definition() -> Value {
                     "type": "string",
                     "description": "The delegate_id returned by delegate_task."
                 },
+                "input_ids": {"type":"array","items":{"type":"string"},"description":"Original durable planner input receipts for this work owner."},
                 "message": {
                     "type": "string",
                     "description": "The follow-up instruction for the sub-agent."
@@ -474,6 +507,7 @@ fn listed_tools(delegation_enabled: bool, terminal_enabled: bool) -> Vec<Value> 
             close_tool_definition(),
             result_tool_definition(),
         ]);
+        tools.push(crate::planner_workflow::tool_definition());
     }
     if terminal_enabled {
         tools.push(background_start_tool_definition());
@@ -563,16 +597,28 @@ pub fn delegate_server_entry(
     router_sid: &str,
     candidate: &CandidateId,
 ) -> Option<McpServer> {
-    if !delegation_available(shared, candidate) && !shared.upstream_client_capabilities().terminal {
+    let planner_session = shared
+        .with_session(router_sid, |s| s.strategy == StrategyKind::Planner)
+        .unwrap_or(false);
+    if !delegation_available(shared, candidate)
+        && !planner_session
+        && !shared.upstream_client_capabilities().terminal
+    {
         return None;
     }
     let socket = shared.delegate_socket.get()?.clone();
+    let exe = std::env::var("ROUTER_ACP_HELPER_EXE")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::current_exe())
+        .ok()?;
 
     let token = uuid::Uuid::new_v4().to_string();
     // Freeze the decision against the candidate being pinned, not against
     // `session.pin` — that pin is committed only *after* `session/new`
     // returns, and tools/list runs inside that call.
-    let delegation_enabled = delegation_available(shared, candidate);
+    let delegation_enabled = delegation_available(shared, candidate)
+        || (planner_session && shared.cfg.delegation.enabled);
+    drop_parent_tokens(shared, router_sid);
     shared.delegate_tokens.lock().unwrap().insert(
         token.clone(),
         DelegateBinding {
@@ -583,10 +629,6 @@ pub fn delegate_server_entry(
     );
     shared.with_session(router_sid, |s| s.delegate_token = Some(token.clone()));
 
-    let exe = std::env::var("ROUTER_ACP_HELPER_EXE")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::current_exe())
-        .ok()?;
     let stdio = McpServerStdio::new(DELEGATE_SERVER_NAME, exe).args(vec![
         "mcp-delegate".to_string(),
         "--socket".to_string(),
@@ -694,6 +736,7 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
     let call_shared = shared.clone();
     let call_sid = router_sid.clone();
     let call_worker = worker.clone();
+    let planner_worker = worker.as_ref().is_some_and(|w| w.planner.is_some());
     let terminal_enabled = shared.upstream_client_capabilities().terminal;
     UntypedRole
         .builder()
@@ -727,7 +770,9 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                   _cx| async move {
                 responder.respond(McpToolsListResult {
                     tools: if worker_connection {
-                        worker_tools()
+                        let mut tools = worker_tools();
+                        if planner_worker { tools.push(crate::planner_workflow::tool_definition()); }
+                        tools
                     } else {
                         listed_tools(delegation_enabled, terminal_enabled)
                     },
@@ -743,6 +788,21 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                 let router_sid = call_sid.clone();
                 let worker = call_worker.clone();
                 async move {
+                    if req.name == crate::planner_workflow::TOOL_NAME {
+                        if worker.as_ref().is_some_and(|w| w.planner.is_none()) {
+                            return responder.respond(text_result("lightweight worker has no planner assignment".into(), true));
+                        }
+                        let operation = match serde_json::from_value::<crate::planner_workflow::Operation>(req.arguments) {
+                            Ok(operation) => operation,
+                            Err(err) => return responder.respond(text_result(format!("invalid planner_workflow arguments: {err}"), true)),
+                        };
+                        let actor = worker.as_ref().and_then(|w| w.planner.clone());
+                        return cx.spawn(async move {
+                            let result = crate::planner_workflow::operate(&shared, &router_sid, actor.as_ref(), operation).await;
+                            let _ = responder.respond(match result { Ok(text) => text_result(text, false), Err(err) => text_result(err, true) });
+                            Ok(())
+                        });
+                    }
                     // A worker's connection serves only its own tools.
                     if let Some(worker) = &worker {
                         return responder.respond(match req.name.as_str() {
@@ -1171,7 +1231,7 @@ fn exact_hint_pool(
     Ok(pool)
 }
 
-/// Parse `hints.effort`; `auto` (or no hint) inherits the parent's effort.
+/// Parse delegate hints. Omitted effort uses the bounded assignment baseline.
 fn parse_effort_hint(raw: Option<&str>) -> Result<Option<EffortLevel>, String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
@@ -1245,6 +1305,66 @@ fn synth_delegate_cost(
 pub async fn run_delegate_task(
     shared: &Arc<Shared>,
     router_sid: &str,
+    mut args: DelegateTaskArgs,
+) -> Result<String, String> {
+    if let Some(work_id) = args.work_id.clone() {
+        args.planner_role = Some(
+            if crate::planner_workflow::load(shared, router_sid)?
+                .and_then(|run| run.works.get(&work_id).map(|w| w.status))
+                == Some(crate::planner_workflow::WorkStatus::Accepted)
+            {
+                crate::planner_skills::PlannerRole::FinishWork
+            } else {
+                crate::planner_skills::PlannerRole::ImplementWork
+            },
+        );
+        let (identity, workspace, child_id, instructions) =
+            crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
+        args.classification_text = Some(args.task.clone());
+        args.task = format!("{instructions}\n[Assignment briefing]\n{}", args.task);
+        args.planner_identity = Some(identity.clone());
+        args.planner_workspace = Some(workspace.path);
+        args.planner_environment = workspace.environment;
+        args.worker_id = Some(child_id);
+        args.keep_open = true;
+        let original_inputs =
+            crate::planner_workflow::input_blocks(shared, router_sid, &identity, &args.input_ids);
+        let result = match original_inputs {
+            Ok((blocks, ids)) => {
+                args.planner_input_blocks = blocks;
+                args.planner_receipt_ids = ids;
+                run_delegate_task_inner(shared, router_sid, args).await
+            }
+            Err(error) => Err(error),
+        };
+        let delegate_id = shared
+            .live_delegates
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, live)| {
+                live.planner.as_ref().is_some_and(|p| {
+                    p.work_id == identity.work_id && p.attempt_id == identity.attempt_id
+                })
+            })
+            .map(|(id, _)| id.clone());
+        crate::planner_workflow::attempt_ended(
+            shared,
+            router_sid,
+            &identity,
+            delegate_id,
+            result.clone().unwrap_or_else(|e| e),
+            result.is_err(),
+        )?;
+        crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+        return result;
+    }
+    run_delegate_task_inner(shared, router_sid, args).await
+}
+
+async fn run_delegate_task_inner(
+    shared: &Arc<Shared>,
+    router_sid: &str,
     args: DelegateTaskArgs,
 ) -> Result<String, String> {
     // Bounded concurrency across all delegated sessions.
@@ -1255,7 +1375,7 @@ pub async fn run_delegate_task(
         .map_err(|_| "router shutting down".to_string())?;
     crate::auth::refresh_before_selection(shared).await;
 
-    let (pin, cwd, dirs, client_mcp, delegate_mcp_catalogs, strategy) = shared
+    let (pin, mut cwd, mut dirs, client_mcp, delegate_mcp_catalogs, strategy) = shared
         .with_session(router_sid, |s| {
             (
                 s.pin.clone(),
@@ -1268,6 +1388,10 @@ pub async fn run_delegate_task(
         })
         .ok_or("parent session no longer exists")?;
     let pin = pin.ok_or("parent session is not pinned")?;
+    if let Some(workspace) = &args.planner_workspace {
+        cwd = workspace.clone();
+        dirs.clear();
+    }
     if !args.required_capabilities.is_empty() && shared.cfg.delegation.mcp_catalogs.is_empty() {
         return Err("delegate MCP catalogs are disabled by router configuration".to_string());
     }
@@ -1285,7 +1409,10 @@ pub async fn run_delegate_task(
 
     // Classify the subtask (heuristic only; hints are filters).
     let input = ClassifyInput {
-        text: args.task.clone(),
+        text: args
+            .classification_text
+            .clone()
+            .unwrap_or_else(|| args.task.clone()),
         mentioned_paths: args.context_files.clone(),
         resource_count: args.context_files.len(),
         ..Default::default()
@@ -1309,7 +1436,19 @@ pub async fn run_delegate_task(
     // hint naming the stable default id matches nothing in the pool and is
     // silently dropped.
     let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
-    let effort = parse_effort_hint(args.hints.effort.as_deref())?;
+    let hinted_effort = parse_effort_hint(args.hints.effort.as_deref())?;
+    // A model-generated hint is an automatic recommendation, never a human
+    // override. Resolve each bounded assignment from its own scope.
+    let baseline_effort = profile.effort.unwrap_or(EffortLevel::Medium);
+    let effort = crate::session::session_effort(
+        &shared.cfg,
+        None,
+        Some(
+            hinted_effort
+                .map(|hint| hint.min(baseline_effort))
+                .unwrap_or(baseline_effort),
+        ),
+    );
     let exact = shared.cfg.delegation.candidate_hints == CandidateHintMode::Exact;
     let mut pool = match (&args.hints.candidate, &hinted) {
         // `exact`: the named model or an error — never a substitute, whatever
@@ -1319,12 +1458,34 @@ pub async fn run_delegate_task(
             raw,
             hinted.as_ref(),
         )?,
+        _ if args.planner_identity.is_some() => {
+            shared.eligible_views(&RequiredCaps::default(), profile.class)
+        }
         _ => scope_delegate_pool(
             shared.eligible_views(&RequiredCaps::default(), profile.class),
             parent_cost,
             &pin.candidate.agent,
         ),
     };
+    if args.planner_identity.is_some() {
+        let run =
+            crate::planner_workflow::load(shared, router_sid)?.ok_or("planner state missing")?;
+        let role = args
+            .planner_role
+            .unwrap_or(crate::planner_skills::PlannerRole::ImplementWork);
+        let skill = &run.policy.roles[&role];
+        if let Some(route) = crate::session::detect_skill_route(
+            &shared.cfg,
+            &[ContentBlock::from(format!("/{}", skill.name))],
+        ) {
+            pool.retain(|candidate| {
+                route
+                    .candidates
+                    .iter()
+                    .any(|pattern| crate::session::candidate_matches(pattern, &candidate.id))
+            });
+        }
+    }
     if let Some(min_quality) = args.hints.min_quality {
         pool.retain(|v| v.quality >= min_quality);
     }
@@ -1358,7 +1519,10 @@ pub async fn run_delegate_task(
         required_caps: RequiredCaps::default(),
         explicit_candidate: None,
         explicit_source: None,
-        planner_phase: None,
+        planner_phase: args
+            .work_id
+            .as_ref()
+            .map(|_| crate::config::PlannerPhase::Implementation),
         planner_difficulty: None,
     };
     let ranked = make_strategy(strategy_kind, &shared.cfg)
@@ -1396,6 +1560,15 @@ pub async fn run_delegate_task(
     let mut last_err = None;
     let ranked_len = ranked.len();
     for (index, rc) in ranked.into_iter().enumerate() {
+        if let Some(identity) = &args.planner_identity {
+            let run = crate::planner_workflow::load(shared, router_sid)?
+                .ok_or("planner state missing")?;
+            if run.status != crate::planner_workflow::RunStatus::Running
+                || run.works[&identity.work_id].paused
+            {
+                return Err("planner assignment is suspended; refusing automatic dispatch".into());
+            }
+        }
         let candidate = rc.candidate.clone();
         // `agents[].max_delegates`: skip a full agent while another ranked
         // candidate remains, otherwise wait for its next free slot. The permit
@@ -1421,7 +1594,7 @@ pub async fn run_delegate_task(
         // Host-directed workers get the router's worker tools (identity and
         // structured handoffs), bound to this worker id.
         let mut session_mcp = sub_mcp.clone();
-        if lifecycle_hook.is_some()
+        if (lifecycle_hook.is_some() || args.planner_identity.is_some())
             && let Some(entry) = worker_server_entry(
                 shared,
                 router_sid,
@@ -1429,25 +1602,64 @@ pub async fn run_delegate_task(
                     worker_id: worker_id.clone(),
                     candidate: candidate.to_string(),
                     parent_downstream_sid: pin.downstream_sid.clone(),
+                    planner: args.planner_identity.clone(),
                 },
             )
         {
             session_mcp.push(entry);
         }
-        match open_downstream_session(
-            shared,
-            &candidate,
-            cwd.clone(),
-            dirs.clone(),
-            session_mcp,
-            DownstreamRoute::Delegate {
-                parent_router_sid: router_sid.to_string(),
-                capture: capture.clone(),
-            },
-        )
-        .await
-        {
+        let opening = if let Some(identity) = &args.planner_identity {
+            crate::planner_client::open_child(
+                shared,
+                router_sid,
+                identity,
+                &candidate,
+                cwd.clone(),
+                dirs.clone(),
+                session_mcp,
+                capture.clone(),
+            )
+            .await
+        } else {
+            open_downstream_session(
+                shared,
+                &candidate,
+                cwd.clone(),
+                dirs.clone(),
+                session_mcp,
+                DownstreamRoute::Delegate {
+                    parent_router_sid: router_sid.to_string(),
+                    capture: capture.clone(),
+                },
+            )
+            .await
+        };
+        match opening {
             Ok(opened) => {
+                let mut resolution = effort.map(|level| {
+                    shared
+                        .scores
+                        .lookup_exact(&candidate)
+                        .resolve_automatic_effort(level)
+                });
+                if let Some(resolution) = &mut resolution
+                    && let Err(error) = crate::session::apply_native_effort(
+                        shared,
+                        &candidate,
+                        &opened.conn,
+                        &opened.downstream_sid,
+                        &opened.config_options,
+                        resolution,
+                        false,
+                    )
+                    .await
+                {
+                    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                    drop_worker_tokens(shared, &worker_id);
+                    last_err = Some(error.to_string());
+                    continue;
+                }
+                let effective_effort = resolution.as_ref().and_then(|r| r.resolved);
                 // Delegates have no upstream client to send the set_mode that
                 // primary sessions receive. Apply the same configured `auto`
                 // mapping explicitly so Claude/Codex delegates inherit the
@@ -1497,6 +1709,7 @@ pub async fn run_delegate_task(
                                     &opened.process_key,
                                     &opened.downstream_sid,
                                 );
+                                drop_worker_tokens(shared, &worker_id);
                                 continue;
                             } else {
                                 tracing::info!(
@@ -1522,6 +1735,7 @@ pub async fn run_delegate_task(
                                 &opened.process_key,
                                 &opened.downstream_sid,
                             );
+                            drop_worker_tokens(shared, &worker_id);
                             continue;
                         }
                     }
@@ -1550,7 +1764,7 @@ pub async fn run_delegate_task(
                     downstream_session_id: opened.downstream_sid.clone(),
                     state_session_id: sub_sid.clone(),
                     cwd: cwd.display().to_string(),
-                    effort: effort.map(|level| level.as_str().to_string()),
+                    effort: effective_effort.map(|level| level.as_str().to_string()),
                     background: args.background,
                     keep_open: args.keep_open,
                     task_summary: task_summary.clone(),
@@ -1585,7 +1799,7 @@ pub async fn run_delegate_task(
                         event.worker_id
                     ));
                 }
-                if let Some(level) = effort {
+                if let Some(level) = effective_effort {
                     shared
                         .delegate_effort
                         .lock()
@@ -1638,6 +1852,7 @@ pub async fn run_delegate_task(
                             "parent": router_sid,
                             "worker_id": worker_id,
                             "background_id": args.worker_id,
+                            "effort": resolution.as_ref().map(|r| json!({"requested":r.requested.as_str(),"resolved":r.resolved.map(EffortLevel::as_str),"provider_value":r.provider_value,"confirmed":r.confirmed})),
                         })),
                         parent_session_id: Some(router_sid.to_string()),
                         kind: "delegate".to_string(),
@@ -1655,6 +1870,9 @@ pub async fn run_delegate_task(
                             "task": args.task,
                             "context_files": args.context_files,
                             "required_capabilities": args.required_capabilities,
+                            "work_id": args.work_id,
+                            "attempt_id": args.planner_identity.as_ref().map(|p| &p.attempt_id),
+                            "effort": {"requested": hinted_effort.map(EffortLevel::as_str), "effective": effort.map(EffortLevel::as_str), "source":"assigned-scope", "reason":"bounded task baseline; model hint cannot exceed automatic policy"},
                         })),
                         tokens_input: crate::state::estimate_tokens(&args.task),
                         tokens_estimated: true,
@@ -1666,11 +1884,27 @@ pub async fn run_delegate_task(
                 // immediately instead of running the subtask.
                 if shared
                     .with_session(router_sid, |s| s.cancelled)
-                    .unwrap_or(false)
+                    .unwrap_or(true)
+                    || args.planner_identity.as_ref().is_some_and(|identity| {
+                        crate::planner_workflow::load(shared, router_sid)
+                            .ok()
+                            .flatten()
+                            .is_none_or(|run| {
+                                run.status != crate::planner_workflow::RunStatus::Running
+                                    || run.works[&identity.work_id].paused
+                            })
+                    })
                 {
                     let _ = opened
                         .conn
                         .send_notification(CancelNotification::new(opened.downstream_sid.clone()));
+                    close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
+                    shared.delegate_effort.lock().unwrap().remove(&sub_sid);
+                    drop_worker_tokens(shared, &worker_id);
+                    if let Some(event) = &lifecycle {
+                        crate::delegate_hook::deliver(shared, &event.stopped("cancelled", None));
+                    }
+                    return Err("planner parent or child stopped during session opening".into());
                 }
 
                 let mut content: Vec<ContentBlock> = Vec::new();
@@ -1681,6 +1915,7 @@ pub async fn run_delegate_task(
                     )));
                 }
                 content.push(ContentBlock::from(args.task.clone()));
+                content.extend(args.planner_input_blocks.clone());
                 for file in &args.context_files {
                     let uri = if file.contains("://") {
                         file.clone()
@@ -1690,13 +1925,26 @@ pub async fn run_delegate_task(
                     let name = file.rsplit('/').next().unwrap_or(file).to_string();
                     content.push(ContentBlock::ResourceLink(ResourceLink::new(name, uri)));
                 }
-                let prompt = PromptRequest::new(opened.downstream_sid.clone(), content);
+                let mut prompt = PromptRequest::new(opened.downstream_sid.clone(), content);
+                if let Some(identity) = &args.planner_identity {
+                    prompt = prompt.meta(serde_json::from_value(serde_json::json!({"router_acp":{"planner_role":args.planner_role,"work_id":identity.work_id,"attempt_id":identity.attempt_id,"agent_origin":true}})).ok());
+                }
                 {
                     let mut headroom = shared.headroom.lock().unwrap();
                     headroom.record_session(&candidate.agent);
                     headroom.record_prompt(&candidate.agent);
                 }
                 let turn_start = std::time::Instant::now();
+                if let Some(identity) = &args.planner_identity {
+                    crate::planner_client::turn_state(shared, router_sid, identity, "started")?;
+                    crate::planner_workflow::queue_delivery(
+                        shared,
+                        &sub_sid,
+                        router_sid,
+                        &identity.work_id,
+                        args.planner_receipt_ids.clone(),
+                    );
+                }
                 let _llm_turn = shared.llm_proxy.begin_turn(
                     opened.process_key.clone(),
                     router_sid.to_string(),
@@ -1708,6 +1956,10 @@ pub async fn run_delegate_task(
                 );
                 let prompt_generation = crate::auth::request_access_generation(shared, &candidate);
                 let result = opened.conn.send_request(prompt).block_task().await;
+                if result.is_ok() {
+                    crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
+                }
+                shared.planner_deliveries.lock().unwrap().remove(&sub_sid);
                 // The host may send the worker back to finish before the turn
                 // returns to the parent (`delegate_turn_end`).
                 let mut turns = 1;
@@ -1829,6 +2081,7 @@ pub async fn run_delegate_task(
                                             sub_sid: sub_sid.clone(),
                                             lifecycle: lifecycle.clone(),
                                             worker_id: worker_id.clone(),
+                                            planner: args.planner_identity.clone(),
                                             turns,
                                         },
                                     );
@@ -1863,6 +2116,7 @@ pub async fn run_delegate_task(
                 };
             }
             Err(err) => {
+                drop_worker_tokens(shared, &worker_id);
                 tracing::warn!(candidate = %candidate, error = %err, "delegate candidate failed");
                 if crate::downstream::is_auth_required(&err) {
                     crate::auth::note_auth_failure_for_request(
@@ -1979,6 +2233,7 @@ pub struct WorkerBinding {
     pub worker_id: String,
     pub candidate: String,
     pub parent_downstream_sid: String,
+    pub planner: Option<crate::planner_workflow::WorkerIdentity>,
 }
 
 /// The `router-worker` MCP server for one host-directed delegate: its
@@ -2020,6 +2275,16 @@ pub fn drop_worker_tokens(shared: &Shared, worker_id: &str) {
         .lock()
         .unwrap()
         .retain(|_, b| b.worker.as_ref().is_none_or(|w| w.worker_id != worker_id));
+}
+
+/// Revoke the parent's credentials when its MCP binding is replaced or closed.
+pub fn drop_parent_tokens(shared: &Shared, router_sid: &str) {
+    shared
+        .delegate_tokens
+        .lock()
+        .unwrap()
+        .retain(|_, b| b.router_sid != router_sid || b.worker.is_some());
+    shared.with_session(router_sid, |s| s.delegate_token = None);
 }
 
 fn run_worker_handoff(
@@ -2121,6 +2386,88 @@ pub async fn run_delegate_followup(
     router_sid: &str,
     args: DelegateFollowupArgs,
 ) -> Result<String, String> {
+    let planner = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .get(&args.delegate_id)
+        .filter(|d| d.parent_sid == router_sid)
+        .and_then(|d| d.planner.clone());
+    if let Some(identity) = planner {
+        let candidate = shared
+            .live_delegates
+            .lock()
+            .unwrap()
+            .get(&args.delegate_id)
+            .map(|d| d.candidate.clone())
+            .ok_or("child disappeared")?;
+        let run =
+            crate::planner_workflow::load(shared, router_sid)?.ok_or("planner state missing")?;
+        let role = if run.works[&identity.work_id].status
+            == crate::planner_workflow::WorkStatus::Accepted
+        {
+            crate::planner_skills::PlannerRole::FinishWork
+        } else {
+            crate::planner_skills::PlannerRole::ImplementWork
+        };
+        let skill = &run.policy.roles[&role];
+        if let Some(route) = crate::session::detect_skill_route(
+            &shared.cfg,
+            &[ContentBlock::from(format!("/{}", skill.name))],
+        ) && !route
+            .candidates
+            .iter()
+            .chain(&route.also_acceptable)
+            .any(|pattern| crate::session::candidate_matches(pattern, &candidate))
+        {
+            return Err("mapped child role requires another model; close this delegate and dispatch the same work_id to preserve durable child, workspace and evidence".into());
+        }
+        let context = crate::planner_workflow::begin_followup(shared, router_sid, &identity)?;
+        let mut scoped = args.clone();
+        scoped.planner_identity = Some(identity.clone());
+        scoped.planner_role = Some(role);
+        let delivery =
+            crate::planner_workflow::input_blocks(shared, router_sid, &identity, &args.input_ids);
+        let (blocks, ids) = match delivery {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                crate::planner_workflow::attempt_ended(
+                    shared,
+                    router_sid,
+                    &identity,
+                    Some(args.delegate_id),
+                    error.clone(),
+                    true,
+                )?;
+                return Err(error);
+            }
+        };
+        scoped.planner_input_blocks = blocks;
+        scoped.planner_receipt_ids = ids;
+        scoped.message = format!(
+            "{context}\n[Parent correction or finish instruction]\n{}",
+            args.message
+        );
+        let result = run_delegate_followup_inner(shared, router_sid, scoped).await;
+        crate::planner_workflow::attempt_ended(
+            shared,
+            router_sid,
+            &identity,
+            Some(args.delegate_id),
+            result.clone().unwrap_or_else(|e| e),
+            result.is_err(),
+        )?;
+        crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+        return result;
+    }
+    run_delegate_followup_inner(shared, router_sid, args).await
+}
+
+async fn run_delegate_followup_inner(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: DelegateFollowupArgs,
+) -> Result<String, String> {
     let _permit = shared
         .delegate_semaphore
         .acquire()
@@ -2197,11 +2544,24 @@ pub async fn run_delegate_followup(
         .unwrap()
         .record_prompt(&candidate.agent);
 
-    let prompt = PromptRequest::new(
-        downstream_sid.clone(),
-        vec![ContentBlock::from(args.message.clone())],
-    );
+    let mut content = vec![ContentBlock::from(args.message.clone())];
+    content.extend(args.planner_input_blocks.clone());
+    let mut prompt = PromptRequest::new(downstream_sid.clone(), content);
+    if let Some(identity) = &args.planner_identity {
+        let role = args.planner_role;
+        prompt = prompt.meta(serde_json::from_value(json!({"router_acp":{"planner_role":role,"work_id":identity.work_id,"attempt_id":identity.attempt_id,"agent_origin":true}})).ok());
+    }
     let turn_start = std::time::Instant::now();
+    if let Some(identity) = &args.planner_identity {
+        crate::planner_client::turn_state(shared, router_sid, identity, "started")?;
+        crate::planner_workflow::queue_delivery(
+            shared,
+            &sub_sid,
+            router_sid,
+            &identity.work_id,
+            args.planner_receipt_ids.clone(),
+        );
+    }
     let _llm_turn = shared.llm_proxy.begin_turn(
         process_key.clone(),
         router_sid.to_string(),
@@ -2213,6 +2573,10 @@ pub async fn run_delegate_followup(
     );
     let request_generation = crate::auth::request_access_generation(shared, &candidate);
     let result = conn.send_request(prompt).block_task().await;
+    if result.is_ok() {
+        crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
+    }
+    shared.planner_deliveries.lock().unwrap().remove(&sub_sid);
     let mut turns = turns + 1;
     let result = match result {
         Ok(resp) => {
@@ -2449,7 +2813,8 @@ mod tests {
                 DELEGATE_AWAIT_TOOL_NAME,
                 DELEGATE_FOLLOWUP_TOOL_NAME,
                 DELEGATE_CLOSE_TOOL_NAME,
-                DELEGATE_RESULT_TOOL_NAME
+                DELEGATE_RESULT_TOOL_NAME,
+                crate::planner_workflow::TOOL_NAME
             ]
         );
         assert_eq!(

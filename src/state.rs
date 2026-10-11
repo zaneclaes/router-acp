@@ -234,12 +234,14 @@ impl StateStore {
     }
 
     pub fn try_load(path: &Path, retention: Retention) -> rusqlite::Result<Self> {
-        Ok(Self::with_legacy(
+        let store = Self::with_legacy(
             path,
             retention,
             false,
             StateFile::try_load(path, retention)?,
-        ))
+        );
+        store.reconcile_planner_wakes();
+        Ok(store)
     }
 
     /// True only when no router has created state at `path` yet: the legacy
@@ -641,6 +643,133 @@ impl StateStore {
             .flatten()
     }
 
+    /// Planner runs stay with their parent session. Workspace claims and wake
+    /// delivery live in the legacy control database because they are box-wide.
+    pub fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.with_file(sid, |file| file.planner_run(sid))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Optimistically save one planner document in its parent session shard.
+    pub fn save_planner_run(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        self.with_file(sid, |file| file.save_planner_run(sid, expected, document))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Save a planner revision and durably stage its hook wakes. The legacy
+    /// journal prevents a process crash between the shard commit and hook
+    /// outbox delivery from losing a wake. Outbox polling reconciles any
+    /// staged wake with an atomic shard-side save receipt.
+    pub fn save_planner_run_with_wakes(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+        events: &[String],
+    ) -> Result<u64, String> {
+        let revision = expected + 1;
+        let save_id = uuid::Uuid::new_v4().to_string();
+        self.legacy
+            .prepare_planner_wakes(sid, revision, &save_id, events)?;
+        let saved = self
+            .with_file(sid, |file| {
+                file.save_planner_run_with_receipt(
+                    sid,
+                    expected,
+                    document,
+                    if events.is_empty() { "" } else { &save_id },
+                )
+            })
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()));
+        let revision = match saved {
+            Ok(revision) => revision,
+            Err(error) => {
+                let _ = self.legacy.discard_planner_wakes(sid, &save_id);
+                return Err(error);
+            }
+        };
+        self.pending_planner_wakes(sid)?;
+        Ok(revision)
+    }
+
+    /// Materialize staged wake events only after the shard contains the
+    /// matching save receipt. This is also called by outbox polling
+    /// to recover a router process interrupted after the shard commit.
+    pub fn pending_planner_wakes(&self, sid: &str) -> Result<(), String> {
+        let (revision, receipts) = self
+            .with_file(sid, |file| file.planner_wake_receipts(sid))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))?;
+        self.legacy
+            .materialize_planner_wakes(sid, revision, &receipts)?;
+        self.with_file(sid, |file| {
+            file.remove_planner_wake_receipts(sid, &receipts)
+        })
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    fn reconcile_planner_wakes(&self) {
+        for sid in self.legacy.pending_planner_wake_sessions() {
+            if let Err(error) = self.pending_planner_wakes(&sid) {
+                tracing::warn!(%error, session = sid, "planner wake reconciliation deferred");
+            }
+        }
+        for sid in self.legacy.pending_planner_cleanup_sessions() {
+            let absent = self.with_file(&sid, |file| {
+                file.planner_run(&sid)
+                    .map(|run| run.is_none() && file.get(&sid).is_none())
+            });
+            if matches!(absent, Ok(Some(Ok(true))))
+                && let Err(error) = self.legacy.finish_planner_cleanup(&sid)
+            {
+                tracing::warn!(%error, session = sid, "planner cleanup deferred");
+            }
+        }
+    }
+
+    /// A workspace may be used by only one durable assignment across every
+    /// checkout shard, so claims always go through the legacy control DB.
+    pub fn claim_planner_workspace(
+        &self,
+        path: &Path,
+        sid: &str,
+        work_id: &str,
+        lease: &str,
+    ) -> Result<(), String> {
+        self.reconcile_planner_wakes();
+        self.legacy
+            .claim_planner_workspace(path, sid, work_id, lease)
+    }
+
+    /// Merge routing state in the session's parent shard.
+    pub fn patch_session_routing(
+        &self,
+        sid: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.with_file(sid, |file| file.patch_session_routing(sid, patch))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Remove terminal planner state from the session's own state shard.
+    pub fn remove_planner_session(&self, sid: &str, revision: u64) -> Result<(), String> {
+        self.legacy.prepare_planner_cleanup(sid)?;
+        self.with_file(sid, |file| file.remove_planner_session(sid, revision))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))?;
+        self.legacy.finish_planner_cleanup(sid)
+    }
+
     pub fn log(&self, router_session_id: &str, entry: &LogEntry) {
         if let Err(err) = self.log_checked(router_session_id, entry) {
             tracing::debug!(%err, session = router_session_id, "session_log insert skipped");
@@ -835,6 +964,7 @@ impl StateStore {
     }
 
     pub fn outbox_pending(&self, limit: usize) -> Vec<(i64, String)> {
+        self.reconcile_planner_wakes();
         self.legacy.outbox_pending(limit)
     }
 
@@ -1322,13 +1452,23 @@ impl StateFile {
                    started_at, updated_at, detail
             FROM tool_calls
             WHERE completed_at IS NULL;
+        CREATE TABLE IF NOT EXISTS planner_runs (
+            session_id TEXT PRIMARY KEY,
+            revision   INTEGER NOT NULL,
+            document   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS planner_wake_commits (
+            session_id TEXT NOT NULL,
+            save_id    TEXT NOT NULL,
+            PRIMARY KEY (session_id, save_id)
+        );
         "#;
         let file_sql = match kind {
             FileKind::Legacy => LEGACY_SCHEMA,
             FileKind::Shard => SHARD_SCHEMA,
         };
         self.conn.execute_batch(&format!("{sql}{file_sql}"))?;
-        self.migrate()
+        self.migrate(kind)
     }
 }
 
@@ -1359,6 +1499,29 @@ const LEGACY_SCHEMA: &str = "
             last_tick_at INTEGER NOT NULL,
             last_result  TEXT
         );
+        -- Workspace paths are box-wide. A claim must conflict even when the
+        -- owning and requesting sessions live in different checkout shards.
+        CREATE TABLE IF NOT EXISTS planner_workspaces (
+            path       TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            work_id    TEXT NOT NULL,
+            lease      TEXT NOT NULL
+        );
+        -- A short journal bridges a planner shard commit and the legacy hook
+        -- outbox. The outbox poller emits entries only after the matching
+        -- planner document proves the wake is durable.
+        CREATE TABLE IF NOT EXISTS planner_wake_journal (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            revision   INTEGER NOT NULL,
+            save_id    TEXT NOT NULL,
+            payload    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_planner_wake_journal_session
+            ON planner_wake_journal(session_id, revision);
+        CREATE TABLE IF NOT EXISTS planner_cleanup_journal (
+            session_id TEXT PRIMARY KEY
+        );
 ";
 
 /// The checkout a shard belongs to, checked on every open.
@@ -1373,7 +1536,7 @@ const SHARD_SCHEMA: &str = "
 ";
 
 impl StateFile {
-    fn migrate(&self) -> rusqlite::Result<()> {
+    fn migrate(&self, kind: FileKind) -> rusqlite::Result<()> {
         // Migrations for DBs created by older versions: add columns that the
         // `CREATE TABLE IF NOT EXISTS` above skips on an existing table. A
         // duplicate-column error just means the migration already ran.
@@ -1402,7 +1565,339 @@ impl StateFile {
                 return Err(err);
             }
         }
+        if kind == FileKind::Legacy {
+            match self.conn.execute(
+                "ALTER TABLE planner_wake_journal ADD COLUMN save_id TEXT NOT NULL DEFAULT ''",
+                [],
+            ) {
+                Ok(_) => {
+                    let retained: i64 = self.conn.query_row(
+                        "SELECT COUNT(*) FROM planner_wake_journal WHERE save_id = ''",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if retained > 0 {
+                        tracing::warn!(
+                            retained,
+                            "older planner wakes lack commit receipts; retained without delivery"
+                        );
+                    }
+                }
+                Err(error) if error.to_string().contains("duplicate column") => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
+    }
+
+    fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.conn
+            .query_row(
+                "SELECT revision, document FROM planner_runs WHERE session_id = ?1",
+                [sid],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|(revision, document)| {
+                serde_json::from_str(&document)
+                    .map(|document| (revision, document))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    /// Optimistic concurrency protects planner receipts, assignments, and
+    /// acknowledgements from independent router processes.
+    fn save_planner_run(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        self.save_planner_run_with_receipt(sid, expected, document, "")
+    }
+
+    fn save_planner_run_with_receipt(
+        &self,
+        sid: &str,
+        expected: u64,
+        document: &serde_json::Value,
+        save_id: &str,
+    ) -> Result<u64, String> {
+        let document = serde_json::to_string(document).map_err(|error| error.to_string())?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let changed = if expected == 0 {
+            transaction.execute(
+                "INSERT OR IGNORE INTO planner_runs (session_id, revision, document) VALUES (?1, 1, ?2)",
+                params![sid, document],
+            )
+        } else {
+            transaction.execute(
+                "UPDATE planner_runs SET revision = revision + 1, document = ?1 \
+                 WHERE session_id = ?2 AND revision = ?3",
+                params![document, sid, expected as i64],
+            )
+        }.map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("planner state changed concurrently; reload before retrying".into());
+        }
+        if !save_id.is_empty() {
+            transaction
+                .execute(
+                    "INSERT INTO planner_wake_commits (session_id, save_id) VALUES (?1, ?2)",
+                    params![sid, save_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(expected + 1)
+    }
+
+    fn planner_wake_receipts(
+        &self,
+        sid: &str,
+    ) -> Result<(u64, std::collections::HashSet<String>), String> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let revision = transaction
+            .query_row(
+                "SELECT revision FROM planner_runs WHERE session_id = ?1",
+                [sid],
+                |row| row.get::<_, i64>(0).map(|revision| revision as u64),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        let receipts = transaction
+            .prepare("SELECT save_id FROM planner_wake_commits WHERE session_id = ?1")
+            .map_err(|error| error.to_string())?
+            .query_map([sid], |row| row.get(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok((revision, receipts))
+    }
+
+    fn remove_planner_wake_receipts(
+        &self,
+        sid: &str,
+        receipts: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for save_id in receipts {
+            transaction
+                .execute(
+                    "DELETE FROM planner_wake_commits WHERE session_id = ?1 AND save_id = ?2",
+                    params![sid, save_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn prepare_planner_wakes(
+        &self,
+        sid: &str,
+        revision: u64,
+        save_id: &str,
+        events: &[String],
+    ) -> Result<(), String> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for payload in events {
+            transaction
+                .execute(
+                    "INSERT INTO planner_wake_journal \
+                     (session_id, revision, save_id, payload) VALUES (?1, ?2, ?3, ?4)",
+                    params![sid, revision as i64, save_id, payload],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn pending_planner_wake_sessions(&self) -> Vec<String> {
+        let Ok(mut statement) = self
+            .conn
+            .prepare("SELECT DISTINCT session_id FROM planner_wake_journal ORDER BY session_id")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    fn discard_planner_wakes(&self, sid: &str, save_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM planner_wake_journal WHERE session_id = ?1 AND save_id = ?2",
+                params![sid, save_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn materialize_planner_wakes(
+        &self,
+        sid: &str,
+        revision: u64,
+        receipts: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        // Select and consume under the same write transaction. A sibling
+        // process cannot observe and emit a journal row we have already consumed.
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<(i64, u64, String, String)> = transaction
+            .prepare(
+                "SELECT id, revision, save_id, payload FROM planner_wake_journal \
+                 WHERE session_id = ?1 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?
+            .query_map([sid], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| error.to_string())?;
+        for (id, event_revision, save_id, payload) in rows {
+            // Older journal rows cannot prove which competing save committed.
+            // Preserve them for inspection instead of inventing a receipt.
+            if save_id.is_empty() {
+                continue;
+            }
+            if receipts.contains(&save_id) {
+                transaction
+                    .execute(
+                        "INSERT INTO hook_outbox (payload, created_at) VALUES (?1, ?2)",
+                        params![payload, now_epoch() as i64],
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else if event_revision > revision {
+                // A prepared write may still commit. A matching shard-side
+                // receipt is the only authority to deliver it.
+                continue;
+            }
+            transaction
+                .execute("DELETE FROM planner_wake_journal WHERE id = ?1", [id])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn prepare_planner_cleanup(&self, sid: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO planner_cleanup_journal (session_id) VALUES (?1)",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn claim_planner_workspace(
+        &self,
+        path: &Path,
+        sid: &str,
+        work_id: &str,
+        lease: &str,
+    ) -> Result<(), String> {
+        let canonical = path.display().to_string();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO planner_workspaces (path, session_id, work_id, lease) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![canonical, sid, work_id, lease],
+            )
+            .map_err(|error| error.to_string())?;
+        let owned: bool = self
+            .conn
+            .query_row(
+                "SELECT session_id = ?2 AND work_id = ?3 AND lease = ?4 \
+                 FROM planner_workspaces WHERE path = ?1",
+                params![canonical, sid, work_id, lease],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if owned {
+            Ok(())
+        } else {
+            Err(format!(
+                "workspace {canonical} is held by another durable assignment"
+            ))
+        }
+    }
+
+    fn pending_planner_cleanup_sessions(&self) -> Vec<String> {
+        let Ok(mut statement) = self
+            .conn
+            .prepare("SELECT session_id FROM planner_cleanup_journal ORDER BY session_id")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    fn finish_planner_cleanup(&self, sid: &str) -> Result<(), String> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM planner_workspaces WHERE session_id = ?1",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM planner_wake_journal WHERE session_id = ?1",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM planner_cleanup_journal WHERE session_id = ?1",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn patch_session_routing(&self, sid: &str, patch: &serde_json::Value) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE sessions SET routing = json_patch(COALESCE(routing, '{}'), ?1) \
+                 WHERE router_session_id = ?2",
+                params![patch.to_string(), sid],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("planner session no longer exists".into())
+        }
     }
 
     fn import_legacy_json(&self, db_path: &Path) {
@@ -1693,6 +2188,37 @@ impl StateFile {
             );
         }
         existing
+    }
+
+    /// Remove terminal planner state under the checked revision. Box-wide
+    /// workspace claims are released by `StateStore` after this shard commit.
+    pub fn remove_planner_session(&self, sid: &str, revision: u64) -> Result<(), String> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM planner_runs WHERE session_id = ?1 AND revision = ?2",
+                params![sid, revision as i64],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("planner state changed concurrently; reconcile before deleting".into());
+        }
+        transaction
+            .execute(
+                "DELETE FROM planner_wake_commits WHERE session_id = ?1",
+                [sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE router_session_id = ?1",
+                params![sid],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     /// Append a row now, after any queued streaming rows so the log keeps
@@ -3568,6 +4094,298 @@ mod tests {
         let report = s.delegation_report(10);
         assert_eq!(report.prompted_sessions, 1);
         assert_eq!(report.sessions_that_delegated, 1);
+    }
+
+    #[test]
+    fn planner_state_is_sharded_cas_fenced_and_workspace_claims_are_box_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let first = StateStore::load(&path, Retention::default());
+        let parent_a = first.new_session_id(&dir.path().join("a")).unwrap();
+        let parent_b = first.new_session_id(&dir.path().join("b")).unwrap();
+        first.upsert(parent_a.clone(), session("claude"));
+        first.upsert(parent_b.clone(), session("codex"));
+
+        let initial = serde_json::json!({"wakes": {}});
+        assert_eq!(first.save_planner_run(&parent_a, 0, &initial), Ok(1));
+        first
+            .patch_session_routing(&parent_a, &serde_json::json!({"planner_phase": "planning"}))
+            .unwrap();
+        assert_eq!(
+            first
+                .get(&parent_a)
+                .unwrap()
+                .routing
+                .unwrap()
+                .get("planner_phase")
+                .and_then(serde_json::Value::as_str),
+            Some("planning")
+        );
+
+        let second = StateStore::load(&path, Retention::default());
+        let (_, stale) = second.planner_run(&parent_a).unwrap().unwrap();
+        assert_eq!(
+            first.save_planner_run(&parent_a, 1, &serde_json::json!({"wakes": {}})),
+            Ok(2)
+        );
+        let error = second.save_planner_run(&parent_a, 1, &stale).unwrap_err();
+        assert!(error.contains("changed concurrently"), "{error}");
+
+        let workspace_a = dir.path().join("workspace-a");
+        let workspace_b = dir.path().join("workspace-b");
+        first
+            .claim_planner_workspace(&workspace_a, &parent_a, "work-a", "lease-a")
+            .unwrap();
+        let error = first
+            .claim_planner_workspace(&workspace_a, &parent_b, "work-b", "lease-b")
+            .unwrap_err();
+        assert!(error.contains("held by another"), "{error}");
+        first
+            .claim_planner_workspace(&workspace_b, &parent_b, "work-b", "lease-b")
+            .unwrap();
+
+        let wake_document = serde_json::json!({"wakes": {"wake-1": {"acknowledged": false}}});
+        let wake = serde_json::json!({"wake_id": "wake-1", "revision": 3}).to_string();
+        assert_eq!(
+            first.save_planner_run_with_wakes(&parent_a, 2, &wake_document, &[wake]),
+            Ok(3)
+        );
+        assert_eq!(first.outbox_pending(10).len(), 1);
+
+        let error = first.remove_planner_session(&parent_a, 2).unwrap_err();
+        assert!(error.contains("changed concurrently"), "{error}");
+        first.remove_planner_session(&parent_a, 3).unwrap();
+        assert_eq!(first.planner_run(&parent_a).unwrap(), None);
+        assert!(first.get(&parent_a).is_none());
+        first
+            .claim_planner_workspace(&workspace_a, &parent_b, "work-b", "lease-new")
+            .unwrap();
+        let error = first
+            .claim_planner_workspace(&workspace_b, "third-session", "work-c", "lease-c")
+            .unwrap_err();
+        assert!(error.contains("held by another"), "{error}");
+    }
+
+    #[test]
+    fn older_planner_wake_journal_migrates_without_guessing_commit_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE planner_wake_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            INSERT INTO planner_wake_journal (session_id, revision, payload)
+                VALUES ('legacy', 1, 'unverified-old-event');",
+        )
+        .unwrap();
+        drop(conn);
+
+        for _ in 0..2 {
+            let store = StateStore::try_load(&path, Retention::default()).unwrap();
+            store.upsert("legacy".into(), session("claude"));
+            let expected = store
+                .planner_run("legacy")
+                .unwrap()
+                .map_or(0, |(revision, _)| revision);
+            store
+                .save_planner_run_with_wakes(
+                    "legacy",
+                    expected,
+                    &serde_json::json!({}),
+                    &["verified-new-event".into()],
+                )
+                .unwrap();
+            let pending = store.outbox_pending(10);
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].1, "verified-new-event");
+            store.outbox_done(pending[0].0);
+            let retained: String = store
+                .legacy
+                .conn
+                .query_row(
+                    "SELECT payload FROM planner_wake_journal WHERE save_id = ''",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, "unverified-old-event");
+        }
+    }
+
+    #[test]
+    fn failed_planner_save_cannot_deliver_a_winners_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = sharded(dir.path());
+        let sid = store.new_session_id(&dir.path().join("repo")).unwrap();
+        store.upsert(sid.clone(), session("claude"));
+        store
+            .save_planner_run(&sid, 0, &serde_json::json!({}))
+            .unwrap();
+        let document = serde_json::json!({"wakes": {"wake-1": {}}});
+        let winner = serde_json::json!({"wake_id":"wake-1", "reason":"winner"}).to_string();
+        let loser = serde_json::json!({"wake_id":"wake-1", "reason":"loser"}).to_string();
+        // A process can die after preparing, before its revision check.
+        store
+            .legacy
+            .prepare_planner_wakes(&sid, 2, "crashed-loser", std::slice::from_ref(&loser))
+            .unwrap();
+        store
+            .save_planner_run_with_wakes(&sid, 1, &document, std::slice::from_ref(&winner))
+            .unwrap();
+        assert!(
+            store
+                .save_planner_run_with_wakes(&sid, 1, &document, &[loser])
+                .is_err()
+        );
+        let pending = store.outbox_pending(10);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, winner);
+    }
+
+    #[test]
+    fn planner_wake_recovers_after_a_later_revision_and_process_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = StateStore::load(&path, Retention::default());
+        let sid = store.new_session_id(&dir.path().join("repo")).unwrap();
+        store.upsert(sid.clone(), session("claude"));
+        store
+            .save_planner_run(&sid, 0, &serde_json::json!({}))
+            .unwrap();
+        let event = serde_json::json!({"wake_id":"wake-1"}).to_string();
+        store
+            .legacy
+            .prepare_planner_wakes(&sid, 2, "interrupted-save", std::slice::from_ref(&event))
+            .unwrap();
+        store
+            .with_file(&sid, |file| {
+                file.save_planner_run_with_receipt(
+                    &sid,
+                    1,
+                    &serde_json::json!({"wakes":{"wake-1":{}}}),
+                    "interrupted-save",
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Another process advances state before the interrupted hook is emitted.
+        store
+            .save_planner_run(
+                &sid,
+                2,
+                &serde_json::json!({"wakes":{"wake-1":{"acknowledged":true}}}),
+            )
+            .unwrap();
+        drop(store);
+        let restored = StateStore::load(&path, Retention::default());
+        assert_eq!(restored.outbox_pending(10)[0].1, event);
+        assert_eq!(restored.outbox_pending(10).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_planner_wake_materializers_emit_one_outbox_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = sharded(dir.path());
+        let sid = store.new_session_id(&dir.path().join("repo")).unwrap();
+        store.upsert(sid.clone(), session("claude"));
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let go = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let path = store.path().to_path_buf();
+                let sid = sid.clone();
+                let ready = ready.clone();
+                let go = go.clone();
+                std::thread::spawn(move || {
+                    let sibling = StateStore::load(&path, Retention::default());
+                    ready.wait();
+                    go.wait();
+                    let receipts = std::collections::HashSet::from(["concurrent-save".to_string()]);
+                    sibling
+                        .legacy
+                        .materialize_planner_wakes(&sid, 1, &receipts)
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        ready.wait();
+        store
+            .legacy
+            .prepare_planner_wakes(&sid, 1, "concurrent-save", &["event".into()])
+            .unwrap();
+        store
+            .with_file(&sid, |file| {
+                file.save_planner_run_with_receipt(
+                    &sid,
+                    0,
+                    &serde_json::json!({}),
+                    "concurrent-save",
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        go.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.legacy.outbox_pending(10).len(), 1);
+    }
+
+    #[test]
+    fn interrupted_terminal_cleanup_releases_only_its_claims_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = StateStore::load(&path, Retention::default());
+        let sid = store.new_session_id(&dir.path().join("repo")).unwrap();
+        store.upsert(sid.clone(), session("claude"));
+        store
+            .save_planner_run(&sid, 0, &serde_json::json!({}))
+            .unwrap();
+        let workspace = dir.path().join("workspace");
+        let other = dir.path().join("other");
+        store
+            .claim_planner_workspace(&workspace, &sid, "work", "lease")
+            .unwrap();
+        store
+            .claim_planner_workspace(&other, "other-parent", "other-work", "lease")
+            .unwrap();
+        store.legacy.conn.execute_batch(
+            "CREATE TRIGGER reject_cleanup BEFORE DELETE ON planner_workspaces BEGIN SELECT RAISE(FAIL, 'synthetic cleanup failure'); END;",
+        ).unwrap();
+        assert!(
+            store
+                .remove_planner_session(&sid, 1)
+                .unwrap_err()
+                .contains("synthetic cleanup failure")
+        );
+        assert!(store.get(&sid).is_none());
+        store
+            .legacy
+            .conn
+            .execute_batch("DROP TRIGGER reject_cleanup;")
+            .unwrap();
+        drop(store);
+        let restored = StateStore::load(&path, Retention::default());
+        restored
+            .claim_planner_workspace(&workspace, "new-parent", "new-work", "new-lease")
+            .unwrap();
+        assert!(
+            restored
+                .claim_planner_workspace(&other, "new-parent", "new-work", "new-lease")
+                .is_err()
+        );
+        assert!(
+            restored
+                .legacy
+                .pending_planner_cleanup_sessions()
+                .is_empty()
+        );
     }
 
     #[test]

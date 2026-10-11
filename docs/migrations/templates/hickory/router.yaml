@@ -1,0 +1,22 @@
+# Hickory fleet configuration template.
+# Enable only after the compatible router SHA is merged and pinned.
+
+routers:
+  planner:
+    profile: kory-code/profiles/hickory.md
+    create-plan:
+      skill: create-plan
+    select-plan:
+      skill: select-plan
+    implement-work:
+      skill: implement-work
+    review-work:
+      skill: review-work
+    finish-work:
+      skill: ship-pr
+    integrate-plan:
+      skill: integrate-plan
+    workspace:
+      command: node
+      args: [kory-code/relay/planner-allocator.mjs]
+      timeout_ms: 120000
