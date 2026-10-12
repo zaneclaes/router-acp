@@ -296,13 +296,13 @@ routers:
   # Two-phase routing (used when `router: planner`). Everyday planning is
   # Opus 5.5 / Sol; Fable and Astra stay in the pool so auto's
   # apex_complexity (pure quality) can reach them for exceptionally hard
-  # plans. Implementation workers stay Opus / Terra / Grok.
+  # plans. Implementation workers stay Opus / Sol / Grok.
   planner:
     profile: markdown
     # roadmap: ROADMAP.md
     # finish-work: { skill: ship-pr }  # requires this repository skill
     planning_candidates: ["*opus*", "*sol*", "*astra*", "*fable*"]
-    implementation_candidates: ["*terra*", "*opus*", "*grok*"]
+    implementation_candidates: ["*sol*", "*opus*", "*grok*"]
     # Per-prompt prefixes (stripped, never reach the model):
     #   easy:  → opus/sol     hard: → astra/fable
     # No prefix keeps auto ranking (astra/fable only at apex_complexity).

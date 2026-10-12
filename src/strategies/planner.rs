@@ -466,9 +466,10 @@ mod tests {
             "opus is an everyday planner: {:?}",
             cfg.planning_candidates
         );
-        assert!(
-            cfg.implementation_candidates.iter().any(|p| p == "*opus*"),
-            "opus remains a workhorse: {:?}",
+        assert_eq!(
+            cfg.implementation_candidates,
+            vec!["*sol*".to_string(), "*opus*".to_string(), "*grok*".to_string()],
+            "implementation default is sol, opus, grok: {:?}",
             cfg.implementation_candidates
         );
         let s = PlannerStrategy::new(cfg, auto_cfg(), 0.1);
