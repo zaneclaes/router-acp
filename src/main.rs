@@ -37,8 +37,9 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Sign the router in to one `mcp_servers` entry (OAuth + PKCE in the
-    /// browser). Every agent family's sessions then share that sign-in.
+    /// Sign the router in to one remote server from the project's `.mcp.json`
+    /// (OAuth + PKCE in the browser). Every agent family's sessions then share
+    /// that sign-in.
     McpLogin {
         /// The server's name in the project's `.mcp.json`.
         server: Option<String>,
