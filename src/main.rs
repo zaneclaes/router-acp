@@ -76,6 +76,32 @@ enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Call one tool on a project MCP server with the router's own sign-in and
+    /// print the tool's result object as JSON on stdout.
+    ///
+    /// Exit status: 0 success; 1 usage or other error; 2 not signed in or
+    /// reconnect needed (stderr names the state, never a token); 3 transient
+    /// failure (network, token endpoint, 5xx, timeout); 4 the tool returned
+    /// `isError: true` (its result is still printed).
+    McpCall {
+        /// The server's name in the project's `.mcp.json` (or any name with --url).
+        server: String,
+        /// The tool to call.
+        tool: String,
+        /// The tool arguments as one JSON object.
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Project directory whose `.mcp.json` names the server (default: the
+        /// current directory; the nearest file up to the git root is used).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Call this MCP URL directly instead of a project entry.
+        #[arg(long)]
+        url: Option<String>,
+        /// Bound on the whole call, in milliseconds.
+        #[arg(long, default_value_t = 20_000)]
+        timeout_ms: u64,
+    },
     /// Print the router configuration as JSON: `{revision, config}`.
     ConfigShow {
         #[arg(long)]
@@ -507,6 +533,42 @@ async fn main() -> anyhow::Result<()> {
                 router_acp::mcp_oauth::project_status_json(&project, &root)
             );
             Ok(())
+        }
+        Command::McpCall {
+            server,
+            tool,
+            args,
+            project,
+            url,
+            timeout_ms,
+        } => {
+            let arguments: serde_json::Value = serde_json::from_str(&args)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .ok_or_else(|| anyhow::anyhow!("--args must be one JSON object"))?;
+            let target = mcp_target(project, Some(server), url)?;
+            let root = router_acp::mcp_oauth::store_root();
+            let outcome = router_acp::mcp_broker::call_tool(
+                &root,
+                &target,
+                &tool,
+                &arguments,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await;
+            match outcome {
+                Ok(call) => {
+                    println!("{}", call.result);
+                    if call.is_error {
+                        std::process::exit(4);
+                    }
+                    Ok(())
+                }
+                Err(failure) => {
+                    eprintln!("router-acp mcp-call: {}", failure.message());
+                    std::process::exit(failure.exit_code());
+                }
+            }
         }
         Command::ConfigShow { config } => admin_output(router_acp::config_admin::show(&config)),
         Command::ConfigApply {

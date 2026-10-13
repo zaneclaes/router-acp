@@ -611,6 +611,19 @@ to any server): `{key, name, resource, state, label}` per server, with `state`
 minutes). `mcp-status [--project <dir>]` lists the project's servers with
 their handling and state.
 
+**Calling a tool.** `router-acp mcp-call <server> <tool> [--args <json object>]
+[--project <dir>] [--url <url>] [--timeout-ms 20000]` makes one tool call on a
+project server with the router's own sign-in. It sends `initialize`,
+`notifications/initialized` and `tools/call` over streamable HTTP, reads JSON or
+SSE replies, and carries the `Mcp-Session-Id`. A refused bearer gets one forced
+refresh and one retry. It prints the tool's `result` object as JSON on stdout.
+Exit status: `0` success; `1` usage or other error; `2` not signed in or
+reconnect needed (stderr names the state); `3` transient failure (network, token
+endpoint, 5xx, timeout); `4` the tool returned `isError: true` (its result is
+still printed). A host that must not hold a token calls the tool this way
+instead of reading the credential store. Errors name HTTP statuses and OAuth
+codes only.
+
 **Hosts that own the redirect** (a remote box whose browser is elsewhere) use
 the two-step form: `mcp-login <name> --redirect-uri <public callback>` prints
 `{url, expiresAt}` and keeps the pending flow (0600, ten minutes), and

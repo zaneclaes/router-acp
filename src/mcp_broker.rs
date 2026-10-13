@@ -138,6 +138,68 @@ impl Broker {
             .clone()
     }
 
+    fn entry_for(&self, server: &RemoteServer) -> Entry {
+        Entry {
+            name: server.name.clone(),
+            upstream: server.url.clone(),
+            source: self.source_for(server),
+        }
+    }
+
+    /// `tools/call` with the router's sign-in. A refused bearer gets one
+    /// forced refresh and one retry; a refreshed bearer the upstream also
+    /// refuses marks the server reconnect-needed, as the proxy does.
+    async fn call(
+        &self,
+        entry: &Entry,
+        tool: &str,
+        arguments: &Value,
+        timeout: Duration,
+    ) -> Result<ToolCall, CallFailure> {
+        let source = &entry.source;
+        let mut token = source
+            .access_token(false, None)
+            .await
+            .map_err(|e| access_failure_cli(entry, e))?;
+        match call_once(
+            &self.http,
+            &entry.upstream,
+            &token,
+            tool,
+            arguments,
+            timeout,
+        )
+        .await
+        {
+            Err(RpcError::Refused) => {}
+            outcome => return outcome.map_err(rpc_failure),
+        }
+        let rejected = std::mem::take(&mut token);
+        token = source
+            .access_token(true, Some(&rejected))
+            .await
+            .map_err(|e| access_failure_cli(entry, e))?;
+        match call_once(
+            &self.http,
+            &entry.upstream,
+            &token,
+            tool,
+            arguments,
+            timeout,
+        )
+        .await
+        {
+            Err(RpcError::Refused) => {
+                source.mark_access_rejected(&token).await;
+                Err(CallFailure::SignedOut(format!(
+                    "{} MCP reconnect needed: sign in with `router-acp mcp-login {}`",
+                    entry.name, entry.name
+                )))
+            }
+            outcome => outcome.map_err(rpc_failure),
+        }
+    }
+
     /// The broker entries for a session in `cwd`: each brokered project server
     /// the router is signed in to. A server that needs a human sign-in is left
     /// to the adapters as before (Kory likewise omits a hard disconnect and
@@ -572,32 +634,67 @@ fn parse_rpc(content_type: &str, body: &str) -> Option<Value> {
     serde_json::from_str(body).ok()
 }
 
-/// `initialize` → `notifications/initialized` → `tools/list` against the
-/// upstream; the number of tools, or why it failed (no response bodies).
-pub async fn probe_tools(http: &reqwest::Client, url: &str, token: &str) -> Result<usize, String> {
-    let mut session: Option<String> = None;
-    let mut call = async |payload: Value| -> Result<Option<Value>, String> {
-        let mut request = http
-            .post(url)
-            .bearer_auth(token)
+fn initialize_request() -> Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": PROBE_PROTOCOL, "capabilities": {},
+        "clientInfo": {"name": crate::mcp_oauth::CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}}})
+}
+
+/// One streamable-HTTP MCP session: every POST carries the bearer and the
+/// `Mcp-Session-Id` the upstream issued.
+struct Rpc<'a> {
+    http: &'a reqwest::Client,
+    url: &'a str,
+    token: &'a str,
+    session: Option<String>,
+}
+
+/// Why one POST failed. Only `Refused` is an authorization failure.
+enum RpcError {
+    Refused,
+    /// Unreachable, timed out, 408, 429 or 5xx: worth trying again later.
+    Transient(String),
+    Other(String),
+}
+
+impl RpcError {
+    fn message(self) -> String {
+        match self {
+            Self::Refused => "the MCP server refused the token".into(),
+            Self::Transient(why) | Self::Other(why) => why,
+        }
+    }
+}
+
+impl Rpc<'_> {
+    /// POST one JSON-RPC message; the reply's message when it has one.
+    async fn post(
+        &mut self,
+        payload: &Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>, RpcError> {
+        let mut request = self
+            .http
+            .post(self.url)
+            .bearer_auth(self.token)
             .header(header::ACCEPT, "application/json, text/event-stream")
             .header("MCP-Protocol-Version", PROBE_PROTOCOL)
-            .json(&payload)
-            .timeout(Duration::from_secs(15));
-        if let Some(id) = &session {
+            .json(payload)
+            .timeout(timeout);
+        if let Some(id) = &self.session {
             request = request.header("Mcp-Session-Id", id);
         }
         let response = request
             .send()
             .await
-            .map_err(|_| "MCP server unreachable".to_string())?;
+            .map_err(|_| RpcError::Transient("MCP server unreachable".into()))?;
         let status = response.status();
         if let Some(id) = response
             .headers()
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
         {
-            session = Some(id.to_string());
+            self.session = Some(id.to_string());
         }
         let content_type = response
             .headers()
@@ -609,28 +706,187 @@ pub async fn probe_tools(http: &reqwest::Client, url: &str, token: &str) -> Resu
         let message = parse_rpc(&content_type, &text);
         let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         if response_rejects_auth(code, Some(text.as_bytes())) {
-            return Err("the MCP server refused the token".into());
+            return Err(RpcError::Refused);
         }
         if !status.is_success() {
-            return Err(format!("MCP server answered HTTP {}", status.as_u16()));
+            let code = status.as_u16();
+            let message = format!("MCP server answered HTTP {code}");
+            return Err(if code == 408 || code == 429 || status.is_server_error() {
+                RpcError::Transient(message)
+            } else {
+                RpcError::Other(message)
+            });
         }
         Ok(message)
+    }
+}
+
+/// `initialize` → `notifications/initialized` → `tools/list` against the
+/// upstream; the number of tools, or why it failed (no response bodies).
+pub async fn probe_tools(http: &reqwest::Client, url: &str, token: &str) -> Result<usize, String> {
+    let mut rpc = Rpc {
+        http,
+        url,
+        token,
+        session: None,
     };
-    let init = call(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": PROBE_PROTOCOL, "capabilities": {},
-        "clientInfo": {"name": crate::mcp_oauth::CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}}}))
-    .await?;
+    let timeout = Duration::from_secs(15);
+    let init = rpc
+        .post(&initialize_request(), timeout)
+        .await
+        .map_err(RpcError::message)?;
     if init.as_ref().and_then(|m| m.get("result")).is_none() {
         return Err("MCP initialize returned no result".into());
     }
-    call(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await?;
-    let list =
-        call(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).await?;
+    rpc.post(
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        timeout,
+    )
+    .await
+    .map_err(RpcError::message)?;
+    let list = rpc
+        .post(
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            timeout,
+        )
+        .await
+        .map_err(RpcError::message)?;
     list.as_ref()
         .and_then(|m| m.pointer("/result/tools"))
         .and_then(Value::as_array)
         .map(Vec::len)
         .ok_or_else(|| "MCP tools/list returned no tools".to_string())
+}
+
+// ----------------------------------------------------------------------
+// CLI: mcp-call
+// ----------------------------------------------------------------------
+
+/// The result of one `tools/call` the upstream answered.
+#[derive(Debug)]
+pub struct ToolCall {
+    /// The JSON-RPC `result` object.
+    pub result: Value,
+    /// The tool reported `isError: true`.
+    pub is_error: bool,
+}
+
+/// Why `mcp-call` returned no tool result. Each variant has one exit status.
+#[derive(Debug)]
+pub enum CallFailure {
+    /// Not signed in, or the sign-in needs repair (exit 2).
+    SignedOut(String),
+    /// Network, token endpoint, 5xx or timeout (exit 3).
+    Transient(String),
+    /// Anything else (exit 1).
+    Other(String),
+}
+
+impl CallFailure {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::SignedOut(_) => 2,
+            Self::Transient(_) => 3,
+            Self::Other(_) => 1,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::SignedOut(why) | Self::Transient(why) | Self::Other(why) => why,
+        }
+    }
+}
+
+fn rpc_failure(error: RpcError) -> CallFailure {
+    match error {
+        RpcError::Refused => CallFailure::SignedOut("the MCP server refused the token".into()),
+        RpcError::Transient(why) => CallFailure::Transient(why),
+        RpcError::Other(why) => CallFailure::Other(why),
+    }
+}
+
+fn access_failure_cli(entry: &Entry, error: AccessError) -> CallFailure {
+    match error {
+        AccessError::SignedOut(label) => CallFailure::SignedOut(format!(
+            "{} MCP {label}: sign in with `router-acp mcp-login {}`",
+            entry.name, entry.name
+        )),
+        AccessError::Unavailable(why) => CallFailure::Transient(why),
+    }
+}
+
+/// One MCP session in which the upstream runs `tools/call`.
+async fn call_once(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    tool: &str,
+    arguments: &Value,
+    timeout: Duration,
+) -> Result<ToolCall, RpcError> {
+    let mut rpc = Rpc {
+        http,
+        url,
+        token,
+        session: None,
+    };
+    let init = rpc.post(&initialize_request(), timeout).await?;
+    if init.as_ref().and_then(|m| m.get("result")).is_none() {
+        return Err(RpcError::Other("MCP initialize returned no result".into()));
+    }
+    rpc.post(
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        timeout,
+    )
+    .await?;
+    let reply = rpc
+        .post(
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}}),
+            timeout,
+        )
+        .await?;
+    let message =
+        reply.ok_or_else(|| RpcError::Other("MCP tools/call returned no result".into()))?;
+    if let Some(error) = message.get("error") {
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        return Err(RpcError::Other(format!(
+            "MCP tools/call failed (JSON-RPC error {code})"
+        )));
+    }
+    let result = message
+        .get("result")
+        .cloned()
+        .ok_or_else(|| RpcError::Other("MCP tools/call returned no result".into()))?;
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(ToolCall { result, is_error })
+}
+
+/// `router-acp mcp-call`: one `tools/call` on a project server, through the
+/// router's own sign-in. The whole call is bounded by `timeout`.
+pub async fn call_tool(
+    root: &FsPath,
+    server: &RemoteServer,
+    tool: &str,
+    arguments: &Value,
+    timeout: Duration,
+) -> Result<ToolCall, CallFailure> {
+    let broker = Broker::new(root.to_path_buf());
+    let entry = broker.entry_for(server);
+    match tokio::time::timeout(timeout, broker.call(&entry, tool, arguments, timeout)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(CallFailure::Transient(format!(
+            "timed out after {} ms",
+            timeout.as_millis()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -684,13 +940,26 @@ mod tests {
                                 "result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake"}}}),
                             Some("tools/list") => json!({"jsonrpc":"2.0","id":message["id"],
                                 "result":{"tools":[{"name":"search"},{"name":"get"}]}}),
+                            // `sse` answers as an event stream, `broken` as a tool error.
+                            Some("tools/call") if message["params"]["name"] == "broken" => {
+                                json!({"jsonrpc":"2.0","id":message["id"],"result":{
+                                    "content":[{"type":"text","text":"no such monitor"}],"isError":true}})
+                            }
+                            Some("tools/call") => json!({"jsonrpc":"2.0","id":message["id"],"result":{
+                                "content":[{"type":"text","text":"2 hits"}],"isError":false}}),
                             _ => json!({"jsonrpc":"2.0","id":message["id"],"result":{}}),
+                        };
+                        let (content_type, text) = if message["params"]["name"] == "sse" {
+                            ("text/event-stream", format!(
+                                "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{}}}}\n\ndata: {reply}\n\n"))
+                        } else {
+                            ("application/json", reply.to_string())
                         };
                         Response::builder()
                             .status(200)
-                            .header("content-type", "application/json")
+                            .header("content-type", content_type)
                             .header("mcp-session-id", "upstream-session")
-                            .body(Body::from(reply.to_string()))
+                            .body(Body::from(text))
                             .unwrap()
                     },
                 ),
@@ -971,5 +1240,170 @@ mod tests {
             urls,
             vec!["https://other.test/mcp", "http://127.0.0.1:9/mcp/datadog"]
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_call_returns_the_tool_result_from_json_and_sse_upstreams() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        signed_in(
+            root.path(),
+            &server("fake", &upstream_url),
+            "http://127.0.0.1:1/token",
+            &tokens("live", 3_600_000),
+        );
+        for tool in ["search", "sse"] {
+            let call = call_tool(
+                root.path(),
+                &server("fake", &upstream_url),
+                tool,
+                &json!({"q": "x"}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert!(!call.is_error);
+            assert_eq!(call.result["content"][0]["text"], "2 hits");
+        }
+        let seen = upstream.seen.lock().unwrap().clone();
+        let calls: Vec<_> = seen.iter().filter(|s| s.0.contains("tools/call")).collect();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[0].0.contains(r#""arguments":{"q":"x"}"#),
+            "{}",
+            calls[0].0
+        );
+        assert_eq!(calls[0].1.as_deref(), Some("Bearer live"));
+        assert_eq!(calls[0].2.as_deref(), Some("upstream-session"));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_refreshes_and_retries_once_on_a_refused_bearer() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        upstream.refuse.lock().unwrap().push("old".into());
+        let (token_url, calls) =
+            token_endpoint((200, json!({"access_token": "new", "expires_in": 3600}))).await;
+        let root = tempfile::tempdir().unwrap();
+        signed_in(
+            root.path(),
+            &server("fake", &upstream_url),
+            &token_url,
+            &tokens("old", 3_600_000),
+        );
+        let call = call_tool(
+            root.path(),
+            &server("fake", &upstream_url),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.result["content"][0]["text"], "2 hits");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let auths: Vec<_> = upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.1.clone().unwrap())
+            .collect();
+        assert_eq!(auths.first().map(String::as_str), Some("Bearer old"));
+        assert_eq!(auths.last().map(String::as_str), Some("Bearer new"));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_marks_reconnect_needed_when_the_refreshed_bearer_is_refused() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        upstream
+            .refuse
+            .lock()
+            .unwrap()
+            .extend(["old".into(), "new".into()]);
+        let (token_url, _) =
+            token_endpoint((200, json!({"access_token": "new", "expires_in": 3600}))).await;
+        let root = tempfile::tempdir().unwrap();
+        let store = signed_in(
+            root.path(),
+            &server("fake", &upstream_url),
+            &token_url,
+            &tokens("old", 3_600_000),
+        );
+        let failure = call_tool(
+            root.path(),
+            &server("fake", &upstream_url),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.exit_code(), 2);
+        assert!(failure.message().contains("router-acp mcp-login fake"));
+        assert!(!failure.message().contains("new"));
+        assert_eq!(
+            crate::mcp_oauth::status(&store).state,
+            StatusState::SignedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_call_without_a_sign_in_or_a_reachable_server_has_its_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let unsigned = call_tool(
+            root.path(),
+            &server("fake", "http://127.0.0.1:1/mcp"),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unsigned.exit_code(), 2);
+        assert!(
+            unsigned.message().contains("not signed in"),
+            "{}",
+            unsigned.message()
+        );
+
+        signed_in(
+            root.path(),
+            &server("fake", "http://127.0.0.1:1/mcp"),
+            "http://127.0.0.1:1/token",
+            &tokens("live", 3_600_000),
+        );
+        let unreachable = call_tool(
+            root.path(),
+            &server("fake", "http://127.0.0.1:1/mcp"),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unreachable.exit_code(), 3);
+    }
+
+    #[tokio::test]
+    async fn mcp_call_returns_a_tool_error_as_a_result_for_exit_status_four() {
+        let (upstream_url, _) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        signed_in(
+            root.path(),
+            &server("fake", &upstream_url),
+            "http://127.0.0.1:1/token",
+            &tokens("live", 3_600_000),
+        );
+        let call = call_tool(
+            root.path(),
+            &server("fake", &upstream_url),
+            "broken",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(call.is_error);
+        assert_eq!(call.result["content"][0]["text"], "no such monitor");
     }
 }
