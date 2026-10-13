@@ -1641,3 +1641,50 @@ fn a_goose_expansion_becomes_the_role_invocation_with_its_typed_arguments() {
         invocation.text
     );
 }
+
+#[tokio::test]
+async fn an_attempt_that_handed_off_reads_as_that_handoff() {
+    let fixture = fixture(|_| {});
+    admit(&fixture.shared, work("work-1"));
+    let (actor, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::record_handoff(
+        &fixture.shared,
+        SID,
+        &actor,
+        router_acp::delegate_hook::Handoff {
+            kind: "waiting".into(),
+            message: "WAITING build 3729 is still running\nmore detail".into(),
+        },
+    )
+    .unwrap();
+    planner_workflow::attempt_ended(&fixture.shared, SID, &actor, None, "done".into(), false)
+        .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    let work = &run.works["work-1"];
+    assert_eq!(work.status, planner_workflow::WorkStatus::Interrupted);
+    assert_eq!(
+        work.reason.as_deref(),
+        Some("handed off `waiting`: WAITING build 3729 is still running")
+    );
+
+    // A new attempt forgets the old handoff; ending it without one reads as before.
+    let (next, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(&fixture.shared, SID, &next, None, "gone".into(), false)
+        .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert!(
+        run.works["work-1"]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("attempt stopped without a valid artifact")
+    );
+}

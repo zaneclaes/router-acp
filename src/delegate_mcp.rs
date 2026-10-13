@@ -809,8 +809,21 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                             WORKER_WHOAMI_TOOL_NAME => text_result(worker_whoami(worker), false),
                             WORKER_HANDOFF_TOOL_NAME => {
                                 match serde_json::from_value::<WorkerHandoffArgs>(req.arguments) {
-                                    Ok(args) => match run_worker_handoff(&shared, worker, args) {
-                                        Ok(text) => text_result(text, false),
+                                    Ok(args) => match run_worker_handoff(&shared, worker, args.clone()) {
+                                        Ok(text) => {
+                                            if let Some(identity) = &worker.planner {
+                                                let _ = crate::planner_workflow::record_handoff(
+                                                    &shared,
+                                                    &router_sid,
+                                                    identity,
+                                                    crate::delegate_hook::Handoff {
+                                                        kind: args.kind,
+                                                        message: args.message,
+                                                    },
+                                                );
+                                            }
+                                            text_result(text, false)
+                                        }
                                         Err(msg) => text_result(msg, true),
                                     },
                                     Err(err) => text_result(

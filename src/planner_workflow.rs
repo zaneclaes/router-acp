@@ -96,6 +96,10 @@ pub struct Work {
     pub last_output: Option<String>,
     #[serde(default)]
     pub paused: bool,
+    /// The structured handoff the current attempt recorded (`worker_handoff`),
+    /// so its end reads as that handoff rather than as a lost attempt.
+    #[serde(default)]
+    pub handoff: Option<crate::delegate_hook::Handoff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1084,6 +1088,7 @@ async fn operate_once(
                         reason: None,
                         last_output: None,
                         paused: false,
+                        handoff: None,
                     },
                 );
             }
@@ -1489,6 +1494,7 @@ async fn begin_work_once(
     work.status = WorkStatus::Allocating;
     // A new attempt starts clean; the previous failure stays in `last_output`.
     work.reason = None;
+    work.handoff = None;
     save(shared, sid, &mut run)?;
     let allocation = async {
         let workspace = match snapshot.workspace.clone() {
@@ -1676,6 +1682,30 @@ async fn allocate_workspace(
     })
 }
 
+/// Keep the handoff a planner worker just recorded on its own attempt, so the
+/// attempt's end names it. A stale attempt's handoff is ignored.
+pub fn record_handoff(
+    shared: &Arc<Shared>,
+    sid: &str,
+    actor: &WorkerIdentity,
+    handoff: crate::delegate_hook::Handoff,
+) -> Result<(), String> {
+    mutate(shared, sid, |run| {
+        let Some(work) = run.works.get_mut(&actor.work_id) else {
+            return Ok(());
+        };
+        if work
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.id == actor.attempt_id && !attempt.ended)
+        {
+            work.handoff = Some(handoff.clone());
+        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 pub fn attempt_ended(
     shared: &Arc<Shared>,
     sid: &str,
@@ -1699,10 +1729,22 @@ pub fn attempt_ended(
         work.last_output = Some(output.clone());
         if work.status == WorkStatus::Running || work.status == WorkStatus::Allocating {
             work.status = WorkStatus::Interrupted;
-            work.reason = Some(
-            "attempt stopped without a valid artifact/finishing receipt; reconcile before resuming"
-                .into(),
-        );
+            work.reason = Some(match &work.handoff {
+                // The worker handed back on purpose (waiting, a question, a
+                // lease); say so rather than reporting a lost attempt.
+                Some(handoff) => {
+                    let first = handoff
+                        .message
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim();
+                    let first: String = first.chars().take(300).collect();
+                    format!("handed off `{}`: {first}", handoff.kind)
+                }
+                None => "attempt stopped without a valid artifact/finishing receipt; reconcile before resuming"
+                    .into(),
+            });
         }
         if failed {
             // Keep the cause (a host refusal, a provider error) in the reason the
