@@ -88,15 +88,24 @@ impl Client {
     }
     async fn close(mut self) {
         self.input.take();
-        tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+        // A bound on a hung shutdown, not a speed check: stopping adapters and
+        // flushing state took over 5 s under the parallel suite.
+        tokio::time::timeout(Duration::from_secs(30), self.child.wait())
             .await
             .unwrap()
             .unwrap();
     }
 }
 
+/// A temp dir whose path is already canonical. The router canonicalizes
+/// account directories, and macOS's temp dir is a symlink (`/var` →
+/// `/private/var`), so a raw `tempdir()` path never matched what it recorded.
+fn canonical_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let config = dir.path().join("router.yaml");
     // A rejected probe must not make account-management ACP unreachable.
     std::fs::write(
@@ -290,14 +299,27 @@ async fn wait_for_process_exit(pid_path: &Path) {
     .expect("login process did not exit after cancellation");
 }
 
-async fn wait_for_empty_dir(path: &Path) {
+/// The accounts directory holds only the seats that remain: the base seat's
+/// own directory (created at the router's start), never a cancelled add's.
+fn remaining_seats(path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+async fn wait_for_only_base_seat(path: &Path, base: &str) {
     let path = path.to_path_buf();
+    let base = base.to_string();
     tokio::time::timeout(Duration::from_secs(3), async move {
         loop {
-            let empty = std::fs::read_dir(&path)
-                .map(|entries| entries.count() == 0)
-                .unwrap_or(true);
-            if empty {
+            if remaining_seats(&path) == [base.clone()] {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -308,7 +330,7 @@ async fn wait_for_empty_dir(path: &Path) {
 }
 
 fn login_fixture(provider: &str, existing: Option<&str>) -> LoginFixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let home = dir.path().join("home");
     let account_root = home.join(".config/router-acp/accounts");
     let login_state = dir.path().join("login-state");
@@ -533,7 +555,7 @@ fn cache_usage_fixture() -> (
     PathBuf,
     PathBuf,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let home = dir.path().join("home");
     let work = home.join("work-claude");
     let personal = home.join("personal-claude");
@@ -614,8 +636,6 @@ agents:
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let snapshot_dir = home.join(".local/state/router-acp/usage");
-    std::fs::create_dir_all(&snapshot_dir).unwrap();
     for (agent, (credential_name, percent)) in
         cfg.agents.iter().zip([("work", 12), ("personal", 34)])
     {
@@ -634,10 +654,10 @@ agents:
             last_error: None,
             payload: Some(json!({"limits":[{"kind":"weekly","percent":percent}]})),
         };
-        let path = snapshot_dir.join(format!(
-            "anthropic-oauth-{}.json",
-            router_acp::usage_cache::fingerprint(&config_dir.to_string_lossy())
-        ));
+        // Each account's usage lives in its own directory.
+        let path = config_dir
+            .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+            .join("anthropic-oauth.json");
         router_acp::usage_cache::write_snapshot(&path, &snapshot).unwrap();
     }
     (dir, config, home, bin, provider_marker, curl_marker)
@@ -673,10 +693,9 @@ fn account_status_reports_router_owned_capacity_outcomes() {
             "resets_at":chrono::DateTime::from_timestamp((now + 3600) as i64, 0).unwrap().to_rfc3339()
         }]})),
     };
-    let snapshot_path = home.join(".local/state/router-acp/usage").join(format!(
-        "anthropic-oauth-{}.json",
-        router_acp::usage_cache::fingerprint(&config_dir.to_string_lossy())
-    ));
+    let snapshot_path = config_dir
+        .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+        .join("anthropic-oauth.json");
     router_acp::usage_cache::write_snapshot(&snapshot_path, &snapshot).unwrap();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
@@ -709,7 +728,7 @@ fn account_status_reports_router_owned_capacity_outcomes() {
 
 #[tokio::test]
 async fn standalone_grok_delete_preserves_a_shared_symlinked_store() {
-    let root = tempfile::tempdir().unwrap();
+    let root = canonical_tempdir();
     let home = root.path().join("home");
     let durable = root.path().join("durable-grok");
     std::fs::create_dir(&home).unwrap();
@@ -820,6 +839,13 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
             json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}}),
         )
         .await;
+    // The router's start already made the original seat an account.
+    let original: Vec<String> = router_acp::config::Config::from_file(&fixture.config)
+        .unwrap()
+        .agents
+        .iter()
+        .map(|a| a.name.clone())
+        .collect();
     let created = client
         .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
         .await;
@@ -845,18 +871,11 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
     assert_eq!(prompt_count(&fixture.added_log), 0);
 
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
-    let added = cfg
-        .agents
-        .iter()
-        .find(|agent| agent.name.starts_with("codex@"))
-        .unwrap();
-    assert_eq!(
-        cfg.agents
-            .iter()
-            .filter(|a| a.name.starts_with("codex@"))
-            .count(),
-        1
-    );
+    let is_added = |a: &&router_acp::config::AgentConfig| {
+        a.name.starts_with("codex@") && !original.contains(&a.name)
+    };
+    let added = cfg.agents.iter().find(is_added).unwrap();
+    assert_eq!(cfg.agents.iter().filter(is_added).count(), 1);
     // 1-based: the original account is saved as 1, the added one as 2.
     assert_eq!(added.account_priority, Some(2));
     let added_dir = added.env_var("CODEX_HOME").unwrap();
@@ -1397,6 +1416,18 @@ async fn standalone_session_cancel_removes_pending_add_but_keeps_existing_member
             json!({"protocolVersion":1,"clientCapabilities":{}}),
         )
         .await;
+    // The router's start already made the original seat an account.
+    let original: Vec<String> = router_acp::config::Config::from_file(&fixture.config)
+        .unwrap()
+        .agents
+        .iter()
+        .map(|a| a.name.clone())
+        .collect();
+    let base = original
+        .iter()
+        .find(|name| name.starts_with("claude@"))
+        .expect("the base seat is an account")
+        .clone();
     let created = client
         .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
         .await;
@@ -1410,23 +1441,16 @@ async fn standalone_session_cancel_removes_pending_add_but_keeps_existing_member
         .await;
     wait_for_process_exit(&fixture.login_state.join("pid")).await;
     client.prompt(&sid, "/login").await;
-    wait_for_empty_dir(&fixture.account_root).await;
+    wait_for_only_base_seat(&fixture.account_root, &base).await;
 
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
-    assert_eq!(
-        cfg.agents
-            .iter()
-            .filter(|a| a.name.starts_with("claude@"))
-            .count(),
-        0
-    );
+    let names: Vec<String> = cfg.agents.iter().map(|a| a.name.clone()).collect();
+    assert_eq!(names, original, "the cancelled add left no membership");
     assert_eq!(
         std::fs::read(fixture.home.join(".claude/.credentials.json")).unwrap(),
         home_credentials
     );
-    if fixture.account_root.exists() {
-        assert_eq!(std::fs::read_dir(&fixture.account_root).unwrap().count(), 0);
-    }
+    assert_eq!(remaining_seats(&fixture.account_root), [base]);
     assert!(
         !std::fs::read_to_string(fixture.login_state.join("events"))
             .unwrap()

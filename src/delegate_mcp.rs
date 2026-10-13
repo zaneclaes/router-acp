@@ -1435,7 +1435,13 @@ async fn run_delegate_task_inner(
     // id it knows), so resolve it through the version-pin map — otherwise a
     // hint naming the stable default id matches nothing in the pool and is
     // silently dropped.
-    let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
+    // `codex/gpt-6.1-sol` names that agent's account seats for the model.
+    let hinted = args
+        .hints
+        .candidate
+        .as_deref()
+        .and_then(CandidateId::parse)
+        .map(|id| shared.seat_for(&id));
     let hinted_effort = parse_effort_hint(args.hints.effort.as_deref())?;
     // A model-generated hint is an automatic recommendation, never a human
     // override. Resolve each bounded assignment from its own scope.
@@ -1524,6 +1530,7 @@ async fn run_delegate_task_inner(
             .as_ref()
             .map(|_| crate::config::PlannerPhase::Implementation),
         planner_difficulty: None,
+        planner_explicit: false,
     };
     let ranked = make_strategy(strategy_kind, &shared.cfg)
         .rank(&ctx, &pool)

@@ -293,6 +293,11 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .with_writer(std::io::stderr)
                 .init();
+            // Each seat owns its directory before anything reads its login.
+            match router_acp::accounts::adopt_seat_directories(&config) {
+                Ok(report) => report.iter().for_each(|line| tracing::info!("{line}")),
+                Err(err) => tracing::warn!("{err}"),
+            }
             let cfg = Config::from_file(&config)?;
             export_router_env(&config);
             // Downstream agents run with workspace write access; they must die
@@ -390,6 +395,11 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .with_writer(std::io::stderr)
                 .init();
+            // Each seat owns its directory before anything reads its login.
+            match router_acp::accounts::adopt_seat_directories(&config) {
+                Ok(report) => report.iter().for_each(|line| tracing::info!("{line}")),
+                Err(err) => tracing::warn!("{err}"),
+            }
             let cfg = Config::from_file(&config)?;
             export_router_env(&config);
             let cwd = match cwd {

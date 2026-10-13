@@ -411,18 +411,82 @@ pub fn human_prompt(req: &PromptRequest) -> bool {
 }
 
 pub fn command(req: &PromptRequest) -> Option<PlannerPhase> {
+    leading_command(req).map(|c| c.phase)
+}
+
+/// A slash `/plan` or `/implement` (or a client's expansion of one) opts a
+/// session on any strategy into the planner workflow. The bare word
+/// `implement` selects implementation only in a session already on `planner`,
+/// so ordinary prose such as "implement the login fix" never starts a run.
+pub fn explicit_command(req: &PromptRequest) -> bool {
+    leading_command(req).is_some_and(|c| c.explicit)
+}
+
+/// The operator's leading mode command, the text block that carries it, and
+/// its arguments.
+struct LeadingCommand {
+    phase: PlannerPhase,
+    block: usize,
+    args: String,
+    explicit: bool,
+}
+
+/// goose adds a `<turn-context>` span (its own block or inside the typed one),
+/// and when a typed `/plan` or `/implement` names a repository skill it sends
+/// that skill's expansion in its place: `# Loaded Skill: implement (skill)`,
+/// the skill text, then `ARGUMENTS: <typed arguments>`. Both are the same
+/// authentic leading command.
+fn leading_command(req: &PromptRequest) -> Option<LeadingCommand> {
     if !human_prompt(req) {
         return None;
     }
-    let ContentBlock::Text(first) = req.prompt.first()? else {
-        return None;
-    };
-    match first.text.split_whitespace().next()? {
-        "/plan" => Some(PlannerPhase::Planning),
-        "/implement" => Some(PlannerPhase::Implementation),
-        verb if verb.eq_ignore_ascii_case("implement") => Some(PlannerPhase::Implementation),
-        _ => None,
+    let (block, text) = req.prompt.iter().enumerate().find_map(|(i, b)| match b {
+        ContentBlock::Text(t) => {
+            let typed = crate::accounts::without_turn_context(&t.text);
+            (!typed.trim().is_empty()).then_some(Some((i, typed)))
+        }
+        _ => Some(None),
+    })??;
+    let typed = text.trim_start();
+    if let Some(loaded) = typed.strip_prefix("# Loaded Skill: ") {
+        let name = loaded.split_whitespace().next()?;
+        if !loaded[name.len()..].trim_start().starts_with("(skill)") {
+            return None;
+        }
+        let phase = match name {
+            "plan" => PlannerPhase::Planning,
+            "implement" => PlannerPhase::Implementation,
+            _ => return None,
+        };
+        let content = typed
+            .rsplit_once("\n## Supporting Files")
+            .map_or(typed, |(c, _)| c);
+        let args = content
+            .rsplit_once("\nARGUMENTS:")
+            .map(|(_, a)| a.lines().next().unwrap_or("").trim().to_string())
+            .unwrap_or_default();
+        return Some(LeadingCommand {
+            phase,
+            block,
+            args,
+            explicit: true,
+        });
     }
+    let (verb, args) = typed
+        .split_once(char::is_whitespace)
+        .map_or((typed, ""), |(v, a)| (v, a.trim_start()));
+    let (phase, explicit) = match verb {
+        "/plan" => (PlannerPhase::Planning, true),
+        "/implement" => (PlannerPhase::Implementation, true),
+        verb if verb.eq_ignore_ascii_case("implement") => (PlannerPhase::Implementation, false),
+        _ => return None,
+    };
+    Some(LeadingCommand {
+        phase,
+        block,
+        args: args.trim_end().to_string(),
+        explicit,
+    })
 }
 
 /// Run before ticket/skill expansion. The original text and attachments stay
@@ -474,7 +538,13 @@ fn user_command_once(
     req: &mut PromptRequest,
     queued: bool,
 ) -> Result<Option<PlannerPhase>, String> {
-    let Some(phase) = command(req) else {
+    let Some(LeadingCommand {
+        phase,
+        block,
+        args,
+        explicit,
+    }) = leading_command(req)
+    else {
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
@@ -535,13 +605,9 @@ fn user_command_once(
     if let Some(roadmap) = &run.policy.roadmap {
         instructions.push_str(&format!("\nConfigured roadmap: {}", roadmap.display()));
     }
-    if let Some(ContentBlock::Text(first)) = req.prompt.first_mut() {
-        let args = first
-            .text
-            .trim_start()
-            .split_once(char::is_whitespace)
-            .map(|(_, s)| s.trim_start())
-            .unwrap_or("");
+    // The command's own block becomes the role invocation, so a client's
+    // expanded skill text is not sent to the provider a second time.
+    if let Some(ContentBlock::Text(first)) = req.prompt.get_mut(block) {
         first.text = format!(
             "{instructions}\n[Original user command: {entrypoint_name}, input: {input_id}]\nArguments: {args}"
         );
@@ -551,6 +617,13 @@ fn user_command_once(
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
     save(shared, sid, &mut run)?;
+    if explicit {
+        let typed = format!("{entrypoint_name} {args}");
+        shared.with_session(sid, |s| {
+            s.planner_command_text = Some(typed.trim_end().to_string());
+            s.planner_explicit_phase = Some(phase);
+        });
+    }
     Ok(Some(phase))
 }
 

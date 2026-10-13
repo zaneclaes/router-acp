@@ -42,6 +42,9 @@
 //!   extension request and echo the raw reply
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
+//! - `WAIT_FILE:<path>` — on its own line: wait until `<path>` exists (at
+//!   most 60 s), honoring `session/cancel`; a test releases the turn by
+//!   creating the file
 //! - `TEXT:<message>` — stream text before the remaining directives
 //! - `EXIT_NOW:<model>` — crash on this prompt if it reached `<model>` (a
 //!   respawned process is healthy; a failover replay to another model is not
@@ -644,6 +647,27 @@ async fn run_prompt(
                 )),
                 Err(err) => reply.push(format!("xai-ask-error:{err}")),
             }
+        } else if let Some(tool) = line.strip_prefix("ASK_PERMISSION:") {
+            // An agent with no session modes asks before each tool (Grok does).
+            let request = UntypedMessage::new(
+                "session/request_permission",
+                json!({
+                    "sessionId": session_id,
+                    "toolCall": {"toolCallId": "perm-1", "title": tool, "kind": "execute"},
+                    "options": [
+                        {"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
+                        {"optionId": "no", "name": "Reject", "kind": "reject_once"}
+                    ]
+                }),
+            )?;
+            match cx.send_request(request).block_task().await {
+                Ok(resp) => reply.push(format!(
+                    "permission:{}",
+                    serde_json::to_string(&resp).unwrap_or_else(|_| "null".to_string())
+                )),
+                Err(err) => reply.push(format!("permission-error:{err}")),
+            }
         } else if let Some(script) = line.strip_prefix("TERMINAL_GROK:") {
             // Grok's wire format: one string in `command`, no `args`.
             let request =
@@ -689,6 +713,28 @@ async fn run_prompt(
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             reply.push(format!("slept:{ms}"));
+        } else if let Some(path) = line.strip_prefix("WAIT_FILE:") {
+            // Hold the turn open until the test releases it, so a test can
+            // observe "still active" without racing a fixed sleep.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if mock
+                    .state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.cancelled)
+                    .unwrap_or(false)
+                {
+                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                }
+                if std::path::Path::new(path).exists() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            reply.push(format!("released:{path}"));
         }
     }
 

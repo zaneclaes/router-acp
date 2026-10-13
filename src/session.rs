@@ -317,6 +317,14 @@ pub struct RouterSession {
     /// Successful LLM pre-classification supersedes the static classifier for
     /// the initial model-selection profile.
     pub preclass_profile: Option<crate::classifier::TaskProfile>,
+    /// The operator's own text of a `/plan` or `/implement` command. Routing
+    /// classifies this, not the role invocation it became: the repository's
+    /// role skill inlined into the prompt would otherwise score every command
+    /// at maximum complexity and pull the planning pool into implementation.
+    pub planner_command_text: Option<String>,
+    /// The phase an explicit `/plan` or `/implement` command chose. While the
+    /// session stays in it, routing uses that phase's pool without crossover.
+    pub planner_explicit_phase: Option<crate::config::PlannerPhase>,
     /// Whether the native-subagent-usage warning has fired this turn (a session
     /// that received the delegation directive using the adapter's built-in
     /// `Task` tool instead of `delegate_task`). Reset each turn so it warns at
@@ -493,6 +501,8 @@ impl RouterSession {
                     requested_effort
                 },
             }),
+            planner_command_text: None,
+            planner_explicit_phase: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             pending_ticket_enrichment_chars: None,
@@ -573,6 +583,8 @@ impl RouterSession {
             delegation_directive_active: false,
             preclass_done: false,
             preclass_profile: None,
+            planner_command_text: None,
+            planner_explicit_phase: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             pending_ticket_enrichment_chars: None,
@@ -1172,6 +1184,35 @@ impl Shared {
     /// what makes "never picked by accident" hold for mechanisms added later.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
         self.eligible_views_inner(required, class, None, false, &[])
+    }
+
+    /// The seat a candidate reference names. Every seat is an account
+    /// (`claude@<id>`), and a reference written without one (`claude/opus[1m]`,
+    /// as people and skills write it) names that agent's account seats for that
+    /// model: it resolves to the first one routing may use now, so account
+    /// priority still decides. An exact id, or a reference nothing matches, is
+    /// returned unchanged.
+    pub fn seat_for(&self, reference: &CandidateId) -> CandidateId {
+        if reference.agent.contains('@')
+            || self
+                .candidate_view_revivable(
+                    reference,
+                    &RequiredCaps::default(),
+                    TaskClass::CodingGeneral,
+                )
+                .is_some()
+        {
+            return reference.clone();
+        }
+        self.eligible_views_revivable(&RequiredCaps::default(), TaskClass::CodingGeneral)
+            .into_iter()
+            .filter(|v| {
+                v.id.agent.split('@').next() == Some(reference.agent.as_str())
+                    && v.id.model == reference.model
+            })
+            .min_by_key(|v| v.config_index)
+            .map(|v| v.id)
+            .unwrap_or_else(|| reference.clone())
     }
 
     /// `eligible_views` for resolving an EXPLICIT user pick: also keeps
@@ -2468,6 +2509,27 @@ fn client_has_form_elicitation(shared: &Shared) -> bool {
         .is_some_and(|caps| caps.form.is_some())
 }
 
+/// The `session/request_permission` answer `auto` mode gives: the agent's own
+/// "allow always" option, else its "allow once". An agent that offers neither
+/// is told the request was cancelled rather than having a choice guessed.
+pub(crate) fn auto_permission_answer(params: &Value) -> Value {
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pick = |kind: &str| {
+        options
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
+            .and_then(|o| o.get("optionId").cloned())
+    };
+    match pick("allow_always").or_else(|| pick("allow_once")) {
+        Some(option) => json!({"outcome": {"outcome": "selected", "optionId": option}}),
+        None => json!({"outcome": {"outcome": "cancelled"}}),
+    }
+}
+
 fn track_approval(
     shared: &Arc<Shared>,
     sid: &str,
@@ -2934,6 +2996,27 @@ pub fn handle_downstream_dispatch(
                 // Permission/fs/terminal callbacks go live to the client
                 // under the parent router session id.
                 let method = msg.method().to_string();
+                // A delegate always runs in `auto`. An agent with no mode for it
+                // (Grok advertises none) still asks before each tool, and no
+                // client can answer a background worker: the parent's turn has
+                // usually ended. Answer as `auto` does, with the agent's own
+                // allow option.
+                if method == "session/request_permission" {
+                    let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
+                    let answer = auto_permission_answer(msg.params());
+                    shared.state.lock().unwrap().log(
+                        &sub_sid,
+                        &crate::state::LogEntry {
+                            kind: "auto_permission".to_string(),
+                            role: "router".to_string(),
+                            summary: format!("auto mode answered a permission request: {answer}"),
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                    );
+                    responder.respond(answer)?;
+                    return Ok(Handled::Yes);
+                }
                 let responder =
                     track_approval(shared, &parent_router_sid, &down_sid, &method, responder)?;
                 let client_sid = if crate::planner_client::supported(shared) {
@@ -4357,7 +4440,11 @@ async fn pin_session(
 
     // 1. Build the route context from the first prompt.
     let cwd_langs = cwd_language_fingerprint(&shared.rules, &cwd);
-    let input = ClassifyInput::from_prompt(prompt, cwd_langs);
+    let typed = shared
+        .with_session(router_sid, |s| s.planner_command_text.take())
+        .flatten()
+        .map(|text| vec![ContentBlock::from(text)]);
+    let input = ClassifyInput::from_prompt(typed.as_deref().unwrap_or(prompt), cwd_langs);
     let profile = match shared.with_session(router_sid, |s| s.preclass_profile.clone()) {
         Some(Some(profile)) => profile,
         _ => classify(&shared.cfg.classifier, &shared.rules, &input).await,
@@ -4434,6 +4521,12 @@ async fn pin_session(
             planner_phase
         },
         planner_difficulty,
+        planner_explicit: !coordinator
+            && planner_phase.is_some()
+            && shared
+                .with_session(router_sid, |s| s.planner_explicit_phase)
+                .flatten()
+                == planner_phase,
     };
 
     // Cordons active right now (shown to the user so exclusions are visible).
@@ -7029,7 +7122,7 @@ fn resolve_candidate_ref(
     // selection, so it may name a pinned legacy version. The fuzzy matching
     // below stays on the automatic pool: `opus:` must not land on a legacy
     // version just because it scores a hair higher.
-    if let Some(id) = CandidateId::parse(reference)
+    if let Some(id) = CandidateId::parse(reference).map(|id| shared.seat_for(&id))
         && !is_excluded(&id, excluded)
         && shared
             .candidate_view_revivable(&id, &RequiredCaps::default(), class)
@@ -7407,6 +7500,7 @@ fn select_planner_target(
         explicit_source: None,
         planner_phase: Some(phase),
         planner_difficulty,
+        planner_explicit: false,
     };
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     if !excluded.is_empty() {
@@ -9329,6 +9423,16 @@ fn prepare_parent_prompt_inner(
     let already_pinned = shared
         .with_session(&router_sid, |s| s.pin.is_some())
         .unwrap_or(false);
+    // An explicit `/plan` or `/implement` opts this session into the planner
+    // workflow whatever the configured router, so `router: auto` sessions keep
+    // ordinary routing until the operator asks for a plan or a run.
+    let mut undirected = req.clone();
+    if let Ok(Some((_, stripped))) = parse_prompt_directives(&req.prompt) {
+        undirected.prompt = stripped;
+    }
+    if crate::planner_workflow::explicit_command(&undirected) {
+        shared.with_session(&router_sid, |s| s.strategy = StrategyKind::Planner);
+    }
     if shared
         .with_session(&router_sid, |s| s.strategy == StrategyKind::Planner)
         .unwrap_or(false)
@@ -9539,7 +9643,10 @@ fn prepare_parent_prompt_inner(
                 }
             }
         }
-        Ok(Some((directives, stripped))) => {
+        Ok(Some((mut directives, stripped))) => {
+            // `candidate=claude/opus[1m]` names that agent's account seats.
+            directives.candidate = directives.candidate.map(|id| shared.seat_for(&id));
+            directives.switch = directives.switch.map(|id| shared.seat_for(&id));
             explicit_routing = true;
             req = PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
             let pinned_now = shared

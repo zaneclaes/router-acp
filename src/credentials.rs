@@ -53,6 +53,39 @@ pub(crate) fn directory(agent: &AgentConfig) -> Option<PathBuf> {
     Some(dir.canonicalize().unwrap_or(dir))
 }
 
+/// Where an adapter reads everything but its login: the provider CLI's
+/// computer-wide directory (`~/.claude`, `~/.codex`, `~/.grok`, `~/.kimi`)
+/// under the seat's `HOME`. A router account directory
+/// (`~/.config/router-acp/accounts/<seat>`) holds only that account's login
+/// and usage, so switching accounts never changes skills, plugins or
+/// settings. A seat configured with any other directory (a mounted volume, a
+/// dedicated config) keeps using that directory for everything.
+pub(crate) fn configuration_directory(agent: &AgentConfig, dir: &Path) -> PathBuf {
+    let Some(home) = agent.env_var("HOME").map(PathBuf::from) else {
+        return dir.to_path_buf();
+    };
+    let accounts = home.join(".config/router-acp/accounts");
+    let accounts = accounts.canonicalize().unwrap_or(accounts);
+    if !dir.starts_with(&accounts) {
+        return dir.to_path_buf();
+    }
+    let shared = match crate::accounts::provider(agent) {
+        Some("claude") => home.join(".claude"),
+        Some("codex") => home.join(".codex"),
+        Some("grok") => home.join(".grok"),
+        Some("kimi") => {
+            let (legacy, current) = (home.join(".kimi"), home.join(".kimi-code"));
+            if !legacy.exists() && current.exists() {
+                current
+            } else {
+                legacy
+            }
+        }
+        _ => return dir.to_path_buf(),
+    };
+    shared.canonicalize().unwrap_or(shared)
+}
+
 struct Credential {
     path: PathBuf,
     value: Value,
@@ -107,6 +140,15 @@ pub(crate) async fn runtime(
         return Err("Kimi credential isolation requires its default config location. Use KIMI_SHARE_DIR or KIMI_CODE_HOME for account configuration.".into());
     }
     env.retain(|(k, _)| !crate::accounts::AUTH_ENV.contains(&k.as_str()));
+    if provider == "claude" {
+        let base = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone());
+        let path = claude_file_store_path(agent, base.as_deref())?;
+        env.retain(|(k, _)| k != "PATH");
+        env.push(("PATH".into(), path));
+    }
     if matches!(
         availability(agent),
         AuthAvailability::Unauthenticated { .. }
@@ -170,11 +212,23 @@ pub(crate) async fn runtime(
             .map(|c| marker(c, record(&dir).as_ref()))
             .unwrap_or_else(|| "missing".into()),
     };
-    for entry in std::fs::read_dir(&dir).map_err(|_| "Could not read adapter configuration")? {
-        let entry = entry.map_err(|_| "Could not read adapter configuration")?;
+    // The account directory supplies the login; everything else (skills,
+    // plugins, settings, config.toml) is the computer-wide configuration.
+    let config = configuration_directory(agent, &dir);
+    let entries = match std::fs::read_dir(&config) {
+        Ok(listing) => listing
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "Could not read adapter configuration")?,
+        // A CLI that was never run here has no configuration yet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return Err("Could not read adapter configuration".into()),
+    };
+    for entry in entries {
         let name = entry.file_name();
         if name == ".credentials.json"
             || name == "auth.json"
+            // An account's Claude identity is its own; written privately below.
+            || (provider == "claude" && config != dir && name == ".claude.json")
             || ((provider == "kimi"
                 && (name == "credentials" || name == "config.toml" || name == "config.json"))
                 || (matches!(provider, "codex" | "grok") && name == "config.toml"))
@@ -197,7 +251,10 @@ pub(crate) async fn runtime(
             .map_err(|_| "Could not preserve adapter configuration")?;
     }
     if matches!(provider, "codex" | "grok") {
-        write_runtime_config(provider, &dir, &runtime.root)?;
+        write_runtime_config(provider, &config, &runtime.root)?;
+    }
+    if provider == "claude" && config != dir {
+        write_claude_state(&config, &dir, &runtime.root)?;
     }
     let mut value = credential.map(|c| c.value).unwrap_or_else(|| json!({}));
     if provider == "claude" {
@@ -217,7 +274,7 @@ pub(crate) async fn runtime(
         value["tokens"]["refresh_token"] = "".into();
     }
     if provider == "kimi" {
-        let source = dir.join("config.toml");
+        let source = config.join("config.toml");
         let mut config: Value = if source.exists() {
             toml::from_str(
                 &std::fs::read_to_string(&source).map_err(|_| "Kimi configuration unavailable")?,
@@ -616,11 +673,93 @@ pub(crate) fn record_success(agent: &AgentConfig) {
 
 /// Native login already holds the credential lock while its CLI publishes.
 /// A successful login starts a new epoch even if the provider reuses tokens.
+/// Claude CLI keeps its sign-in in `<CLAUDE_CONFIG_DIR>/.credentials.json`
+/// wherever it has no OS keychain. On macOS it reaches the Keychain only by
+/// running `security` from `PATH`, and falls back to that same file when a
+/// write fails. The manager owns that one file on every platform, so Claude
+/// runs with a `security` that holds no items (exit 44, errSecItemNotFound)
+/// and refuses writes (exit 1, not the transient "locked" 36). Where
+/// `security` does not exist (Linux, containers) the shim changes nothing.
+const CLAUDE_SECURITY_SHIM: &str = "#!/bin/sh\n# router-acp: Claude credentials live in the router-owned .credentials.json.\ncase \"$1\" in find-generic-password) exit 44 ;; esac\n[ \"$1\" = -i ] && cat >/dev/null\nexit 1\n";
+
+/// The `PATH` a Claude login or adapter runs with: the manager's `security`
+/// shim first, then `base` (the configured `PATH`, else the router's own).
+/// The shim lives with the router's state (`~/.local/state/router-acp/bin`),
+/// not in an account directory, which holds only that account's login.
+pub(crate) fn claude_file_store_path(
+    agent: &AgentConfig,
+    base: Option<&str>,
+) -> Result<String, String> {
+    let dir = PathBuf::from(agent.env_var("HOME").ok_or("HOME is unavailable")?)
+        .join(".local/state/router-acp/bin");
+    let shim = dir.join("security");
+    if std::fs::read(&shim).ok().as_deref() != Some(CLAUDE_SECURITY_SHIM.as_bytes()) {
+        std::fs::create_dir_all(&dir)
+            .map_err(|_| "Could not prepare the Claude credential store")?;
+        write_private_bytes(&shim, CLAUDE_SECURITY_SHIM.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| "Could not prepare the Claude credential store")?;
+        }
+    }
+    let base = base
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let joined = std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&base)))
+        .map_err(|_| "Could not prepare the Claude credential store")?;
+    Ok(joined.to_string_lossy().into_owned())
+}
+
+/// Claude keeps the signed-in account (`oauthAccount`) in `.claude.json`
+/// beside a great deal of other client state. An account directory keeps only
+/// the identity; everything else is the computer-wide client's.
+pub(crate) fn claude_identity(state: &Path) -> Option<Value> {
+    let value: Value = serde_json::from_slice(&std::fs::read(state).ok()?).ok()?;
+    value.get("oauthAccount").cloned()
+}
+
+/// Write `identity` as the whole of an account's `.claude.json`.
+pub(crate) fn write_claude_identity(path: &Path, identity: Value) -> Result<(), String> {
+    write_private(path, &json!({ "oauthAccount": identity }))
+}
+
+/// The adapter's `.claude.json`: the computer-wide client state, signed in as
+/// the account. A private copy, so the account's identity never leaks into
+/// another account's sessions or the native CLI.
+fn write_claude_state(config: &Path, dir: &Path, root: &Path) -> Result<(), String> {
+    let identity = claude_identity(&dir.join(".claude.json"));
+    let mut state: Value = std::fs::read(config.join(".claude.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    match identity {
+        Some(identity) => state["oauthAccount"] = identity,
+        None => {
+            state.as_object_mut().map(|o| o.remove("oauthAccount"));
+        }
+    }
+    if state.as_object().is_some_and(|o| o.is_empty()) {
+        return Ok(());
+    }
+    write_private(&root.join(".claude.json"), &state)
+}
+
 pub(crate) fn login_succeeded(agent: &AgentConfig) -> Result<(), String> {
     let Some(credential) = read(agent) else {
         return Ok(());
     };
     let dir = directory(agent).ok_or("Credential directory unavailable")?;
+    // A login run in an account directory leaves Claude's whole client state
+    // there; the account keeps only who signed in.
+    if crate::accounts::provider(agent) == Some("claude")
+        && configuration_directory(agent, &dir) != dir
+        && let Some(identity) = claude_identity(&dir.join(".claude.json"))
+    {
+        write_claude_identity(&dir.join(".claude.json"), identity)?;
+    }
     write_private(
         &dir.join(".router-acp-auth.json"),
         &Record {
@@ -1304,6 +1443,148 @@ pub async fn repair_for_helper(
 mod tests {
     use super::*;
 
+    /// An account directory holds only its login; switching accounts must not
+    /// change the computer-wide skills, plugins or settings an adapter sees.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_account_adapter_gets_its_login_and_the_computer_wide_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let shared = home.join(".claude");
+        std::fs::create_dir_all(shared.join("skills/review")).unwrap();
+        std::fs::write(shared.join("settings.json"), "{}").unwrap();
+        std::fs::write(
+            shared.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"cli@example.test"},"machineID":"m"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            shared.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"cli-access","refreshToken":"cli-refresh"}}"#,
+        )
+        .unwrap();
+        let account = home.join(".config/router-acp/accounts/claude@1");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(account.join(".credentials.json"), r#"{"claudeAiOauth":{"accessToken":"account-access","refreshToken":"account-refresh","expiresAt":4070908800000}}"#).unwrap();
+        std::fs::write(
+            account.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"account@example.test"}}"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            "agents:\n  - name: claude@1\n    command: {{type: stdio, command: mock-agent, env: [{{name: HOME, value: {}}}, {{name: CLAUDE_CONFIG_DIR, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: model, cost_rank: 1}}]\n",
+            home.display(),
+            account.display()
+        );
+        let agent = crate::config::Config::from_yaml(&yaml)
+            .unwrap()
+            .agents
+            .remove(0);
+        let mut env = vec![];
+        let view = runtime(&agent, &mut env).await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_link(view.root.join("skills")).unwrap(),
+            shared.join("skills")
+        );
+        assert_eq!(
+            std::fs::read_link(view.root.join("settings.json")).unwrap(),
+            shared.join("settings.json")
+        );
+        let login = std::fs::read_to_string(view.root.join(".credentials.json")).unwrap();
+        assert!(
+            login.contains("account-access") && !login.contains("cli-access"),
+            "the account's login, not the CLI's"
+        );
+        assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), "account-access".into())));
+        // Computer-wide client state, signed in as the account, in a private copy.
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(view.root.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["machineID"], "m");
+        assert_eq!(
+            state["oauthAccount"]["emailAddress"],
+            "account@example.test"
+        );
+        assert!(
+            !std::fs::symlink_metadata(view.root.join(".claude.json"))
+                .unwrap()
+                .is_symlink()
+        );
+        let mut kept: Vec<_> = std::fs::read_dir(&account)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".router-acp-runtime")
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [".claude.json", ".credentials.json"],
+            "nothing is linked into the account directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_runs_with_a_keychain_shim_so_it_writes_the_managed_file() {
+        let (root, mut agent) = fixture("claude");
+        // The shim belongs to this HOME's router state, never the real one.
+        agent.command.env.push(crate::config::EnvVarConfig {
+            name: "HOME".into(),
+            value: root.path().to_string_lossy().into_owned(),
+        });
+        let path = claude_file_store_path(&agent, Some("/usr/bin:/bin")).unwrap();
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        let shim_dir = root.path().join(".local/state/router-acp/bin");
+        assert!(
+            !directory(&agent).unwrap().join(".router-acp-bin").exists(),
+            "an account directory holds only its login and usage"
+        );
+        assert_eq!(dirs[0], shim_dir, "the shim shadows /usr/bin/security");
+        assert_eq!(
+            &dirs[1..],
+            [PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+        );
+        let run = |args: &[&str]| {
+            std::process::Command::new(shim_dir.join("security"))
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .code()
+        };
+        // Claude reads "not found" as absent; a non-transient write failure
+        // sends it to its `.credentials.json` fallback.
+        assert_eq!(
+            run(&["find-generic-password", "-a", "u", "-w", "-s", "s"]),
+            Some(44)
+        );
+        assert_eq!(
+            run(&[
+                "add-generic-password",
+                "-U",
+                "-a",
+                "u",
+                "-s",
+                "s",
+                "-X",
+                "00"
+            ]),
+            Some(1)
+        );
+        assert_eq!(run(&["-i"]), Some(1));
+        assert_eq!(run(&["show-keychain-info"]), Some(1));
+        // A runtime launch carries the shim; the adapter's directory skips it.
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let _runtime = runtime(&agent, &mut env).await.unwrap();
+        let launched = env.iter().find(|(k, _)| k == "PATH").unwrap();
+        assert!(
+            launched.1.starts_with(&shim_dir.display().to_string()),
+            "{launched:?}"
+        );
+        assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+    }
+
     #[tokio::test]
     async fn claude_requests_share_expiry_repair_and_read_the_new_token() {
         let (_root, agent) = fixture("claude");
@@ -1435,8 +1716,15 @@ mod tests {
         } else {
             &dir
         };
+        // Every fixture runs under its own HOME, so router state such as the
+        // Claude keychain shim never lands in the real one.
+        let home = if variable == "HOME" {
+            String::new()
+        } else {
+            format!(", {{name: HOME, value: {}}}", root.path().display())
+        };
         let yaml = format!(
-            "agents:\n  - name: {provider}\n    command: {{type: stdio, command: mock-agent, env: [{{name: {variable}, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: model, cost_rank: 1}}]\n",
+            "agents:\n  - name: {provider}\n    command: {{type: stdio, command: mock-agent, env: [{{name: {variable}, value: {}}}{home}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: model, cost_rank: 1}}]\n",
             env_dir.display()
         );
         let config = crate::config::Config::from_yaml(&yaml).unwrap();
@@ -1521,15 +1809,9 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
         let helper = helper_agent("grok", &durable).unwrap();
         assert_eq!(directory(&agent), directory(&helper));
         let held = lock(&agent).await.unwrap();
-        assert!(
-            !std::process::Command::new("flock")
-                .args(["--nonblock"])
-                .arg(directory(&helper).unwrap().join(".router-acp-auth.lock"))
-                .arg("true")
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(!lockable_elsewhere(
+            &directory(&helper).unwrap().join(".router-acp-auth.lock")
+        ));
         drop(held);
     }
 
@@ -1992,18 +2274,27 @@ flag = 7
         let (_root, agent) = fixture("claude");
         let held = lock(&agent).await.unwrap();
         let path = directory(&agent).unwrap().join(".router-acp-auth.lock");
-        let try_other = || {
-            std::process::Command::new("flock")
-                .arg("--nonblock")
-                .arg(&path)
-                .arg("true")
-                .status()
-                .unwrap()
-                .success()
-        };
-        assert!(!try_other());
+        assert!(!lockable_elsewhere(&path));
         drop(held);
-        assert!(try_other());
+        assert!(lockable_elsewhere(&path));
+    }
+
+    /// Whether an independent opener (another router process, or this one
+    /// through a separate open file description) can take the credential lock
+    /// now. `File::try_lock` is `flock(2)` on Unix, which locks per open file
+    /// description, so this is the contention another process sees, without
+    /// depending on util-linux's `flock`, which macOS does not ship.
+    fn lockable_elsewhere(path: &Path) -> bool {
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        match other.try_lock() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(e) => panic!("lock probe failed: {e:?}"),
+        }
     }
 
     #[tokio::test]

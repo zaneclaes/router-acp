@@ -1417,3 +1417,107 @@ fn identical_human_messages_without_client_ids_remain_distinct_inputs() {
             .all(|input| input.text == "repeat this exact human message")
     );
 }
+
+/// goose sends a typed `/implement` that names a repository skill as that
+/// skill's expansion, with its `<turn-context>` span in a separate block.
+fn goose_skill_expansion(skill: &str, args: &str) -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::from(
+            "<turn-context>\n<t>2026-10-12</t>\nCurrent tasks and notes: (none)\n</turn-context>"
+                .to_string(),
+        ),
+        ContentBlock::from(format!(
+            "# Loaded Skill: {skill} (skill)\nThe skill description.\n\n## Content\n\n# {skill}\n\nARGUMENTS: inside the skill text\n\nBody.\n\nARGUMENTS: {args}\n\n## Supporting Files\n\nSkill directory: /repo/.agents/skills/{skill}\n"
+        )),
+    ]
+}
+
+#[test]
+fn goose_skill_expansions_are_the_authentic_mode_commands() {
+    let request = |prompt: Vec<ContentBlock>| PromptRequest::new("downstream", prompt);
+    let implement = request(goose_skill_expansion("implement", "Docs/Plans/X.md extra"));
+    assert_eq!(
+        planner_workflow::command(&implement),
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    assert!(planner_workflow::explicit_command(&implement));
+    assert_eq!(
+        planner_workflow::command(&request(goose_skill_expansion("plan", ""))),
+        Some(router_acp::config::PlannerPhase::Planning)
+    );
+    // Another skill's expansion, or prose that only mentions one, is no command.
+    assert_eq!(
+        planner_workflow::command(&request(goose_skill_expansion("review", ""))),
+        None
+    );
+    assert_eq!(
+        planner_workflow::command(&request(vec![ContentBlock::from(
+            "please # Loaded Skill: implement (skill)".to_string()
+        )])),
+        None
+    );
+    // Slash commands behind a turn-context block are explicit; the bare verb is
+    // a command only for a session already on the planner strategy.
+    let behind_context = request(vec![
+        ContentBlock::from("<turn-context>x</turn-context>".to_string()),
+        ContentBlock::from("/implement".to_string()),
+    ]);
+    assert!(planner_workflow::explicit_command(&behind_context));
+    let bare = request(vec![ContentBlock::from(
+        "implement the login fix".to_string(),
+    )]);
+    assert_eq!(
+        planner_workflow::command(&bare),
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    assert!(!planner_workflow::explicit_command(&bare));
+    // An internal role invocation never re-selects a mode.
+    let mut internal = request(goose_skill_expansion("implement", ""));
+    internal.meta =
+        serde_json::from_value(json!({"router_acp": {"planner_role": "select-plan"}})).ok();
+    assert_eq!(planner_workflow::command(&internal), None);
+}
+
+#[test]
+fn a_goose_expansion_becomes_the_role_invocation_with_its_typed_arguments() {
+    let fixture = fixture(|_| {});
+    let mut request = PromptRequest::new(
+        "downstream",
+        goose_skill_expansion("implement", "Docs/Plans/X.md extra"),
+    );
+    let phase = planner_workflow::user_command(&fixture.shared, SID, &mut request).unwrap();
+    assert_eq!(
+        phase,
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    let ContentBlock::Text(context) = &request.prompt[0] else {
+        panic!("turn context block changed type")
+    };
+    assert!(
+        context.text.starts_with("<turn-context>"),
+        "{}",
+        context.text
+    );
+    let ContentBlock::Text(invocation) = &request.prompt[1] else {
+        panic!("command block changed type")
+    };
+    assert!(
+        invocation
+            .text
+            .contains("[router-acp planner role: select-plan]"),
+        "{}",
+        invocation.text
+    );
+    assert!(
+        invocation
+            .text
+            .ends_with("Arguments: Docs/Plans/X.md extra"),
+        "{}",
+        invocation.text
+    );
+    assert!(
+        !invocation.text.contains("# Loaded Skill"),
+        "{}",
+        invocation.text
+    );
+}

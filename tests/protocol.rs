@@ -2714,6 +2714,39 @@ fn delegation_yaml(
     )
 }
 
+/// A delegate runs in `auto`, but an agent with no session modes (Grok) still
+/// asks before each tool, and a background worker has no client to answer.
+/// The router answers as `auto` does, with the agent's "allow always" option.
+#[tokio::test]
+async fn a_delegate_permission_request_is_answered_as_auto_mode() {
+    let state = temp_state_file("delegate-permission");
+    let log = temp_log("delegate-permission");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test(delegation_yaml(&state, &log, 3), async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "hard integration work\nDELEGATE:ASK_PERMISSION:run the tests",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        let answer = text
+            .lines()
+            .find_map(|line| line.strip_prefix("permission:"))
+            .unwrap_or_else(|| panic!("the worker's request was answered: {text}"));
+        let answer: serde_json::Value = serde_json::from_str(answer).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+            "the router allowed it with the agent's own allow-always option"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn delegate_task_routes_to_lower_cost_candidate() {
     let state = temp_state_file("delegate");
@@ -3544,6 +3577,76 @@ async fn rate_limit_with_reset_time_cordons_agent_and_fails_over() {
         assert!(
             text2.contains("fancy is cordoned: token/usage limit"),
             "cordon disclosed on later sessions: {text2}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Every seat is an account (`fancy@one`). A reference written without the
+/// account (`fancy/opus`), as people and skills write it, names that seat.
+#[tokio::test]
+async fn a_reference_without_an_account_names_the_agents_account_seat() {
+    let state = temp_state_file("seat-reference");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml("fancy@one", &[("opus", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=fancy/opus] which seat").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("echo:opus:which seat"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// Grok reports an exhausted seat as `402 Payment Required … usage balance
+/// exhausted`. That classified as an ordinary error, so every turn routed back
+/// to the exhausted seat and failed instead of failing over.
+#[tokio::test]
+async fn an_exhausted_grok_balance_cordons_the_seat_and_fails_over() {
+    let state = temp_state_file("grok-balance");
+    let log = temp_log("grok-balance");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "cheap",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "fancy",
+            &[("opus", 3)],
+            &[(
+                "MOCK_FAIL_PROMPT_MSG",
+                "API error (status 402 Payment Required): Grok Build usage balance exhausted"
+            )]
+        )
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "first question").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("failing over"), "failover announced: {text}");
+        assert!(
+            text.contains("echo:haiku:first question"),
+            "the turn was answered: {text}"
+        );
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid2, "second question").await?;
+        let text2 = agent_text(&observed, &sid2);
+        assert!(
+            text2.contains("fancy is cordoned: token/usage limit"),
+            "the exhausted seat stays out of routing: {text2}"
         );
         Ok(())
     })
@@ -10865,6 +10968,125 @@ async fn sharded_delegates_live_with_their_parent_and_stay_queryable() {
     assert_eq!(delegates["data"]["children"][0]["id"], ids[1].as_str());
 }
 
+/// `router: auto` keeps ordinary routing until the operator explicitly asks for
+/// the planner workflow; goose sends a typed `/implement` that names a
+/// repository skill as that skill's expansion.
+#[tokio::test]
+async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path().join(".agents/skills/implement");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "REPOSITORY-WORK-SENTINEL").unwrap();
+    let log = temp_log("auto-opt-in");
+    let state = temp_state_file("auto-opt-in");
+    let yaml = format!(
+        "state_file: {}\nrouter: auto\ndelegation: {{ enabled: false }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*']\n    implementation_candidates: ['work/*']\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "implement the login fix").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.strategy).unwrap(),
+            router_acp::config::StrategyKind::Auto,
+            "prose that starts with the verb stays an ordinary auto prompt"
+        );
+        assert!(
+            planner_user_prompts(&log)
+                .iter()
+                .all(|p| !p.contains("[router-acp planner role")),
+            "no planner role reached the provider"
+        );
+        prompt_text(
+            &cx,
+            &sid,
+            "<turn-context>\nnow\n</turn-context>\n# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\nREPOSITORY-WORK-SENTINEL\n\nARGUMENTS: Docs/Plans/X.md\n\n## Supporting Files\n\nSkill directory: x\n",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.strategy).unwrap(),
+            router_acp::config::StrategyKind::Planner
+        );
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        let delivered = planner_user_prompts(&log);
+        let last = delivered.last().expect("the role invocation reached the provider");
+        assert!(last.contains("[router-acp planner role: select-plan]"), "{last}");
+        assert!(last.contains("Arguments: Docs/Plans/X.md"), "{last}");
+        assert!(!last.contains("# Loaded Skill"), "{last}");
+        Ok(())
+    })
+    .await;
+}
+
+/// An explicit `/implement` routes its parent from `implementation_candidates`
+/// alone: the inlined role skill must not raise complexity into the apex
+/// crossover that admits the planning pool.
+#[tokio::test]
+async fn an_explicit_implement_command_pins_from_the_implementation_pool() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path().join(".agents/skills/implement");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "REPOSITORY-WORK-SENTINEL").unwrap();
+    let log = temp_log("explicit-implement-pool");
+    let state = temp_state_file("explicit-implement-pool");
+    let yaml = format!(
+        "state_file: {}\nrouter: auto\ndelegation: {{ enabled: false }}\nrouters:\n  planner:\n    apex_complexity: 0.0\n    planning_candidates: ['plan/*']\n    implementation_candidates: ['work/*']\n    model_boosts:\n    - {{ pattern: 'plan/*', planning: 9.0, implementation: 9.0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("fable", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\nREPOSITORY-WORK-SENTINEL\n\nARGUMENTS:\n\n## Supporting Files\n\nSkill directory: x\n",
+        )
+        .await?;
+        let pinned = shared
+            .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+            .unwrap();
+        assert_eq!(pinned, "work");
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn planner_commands_reverse_phase_and_preserve_repository_guidance_once() {
     let repo = tempfile::tempdir().unwrap();
@@ -11139,7 +11361,10 @@ agents:
 }
 
 async fn wait_for_mock_prompt(log: &PathBuf, marker: &str) -> Vec<serde_json::Value> {
-    for _ in 0..40 {
+    // Up to 15 s: a router-delivered follow-up (a background completion, a
+    // wake) can take several seconds under a parallel suite. Success returns
+    // at once, so the bound costs nothing when the test passes.
+    for _ in 0..150 {
         let events = read_log(log);
         if events.iter().any(|event| {
             event["event"] == "prompt"
@@ -11217,8 +11442,22 @@ async fn planner_child_streaming_failure_fences_initial_and_followup_receipts() 
                 "delegate_id": delegate_id, "message": format!("TEXT:{label}"), "input_ids": ["child-input"]
             }));
             prompt_text(&cx, &sid, &followup).await?;
-            let run = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
-            assert_eq!(run.inputs["child-input"].delivered_to.contains("work-1"), healthy, "{label}");
+            let delivered = || {
+                router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap().inputs["child-input"]
+                    .delivered_to
+                    .contains("work-1")
+            };
+            if healthy {
+                // The child's receipt lands once its transcript write is
+                // confirmed, which can follow the parent's tool result.
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    while !delivered() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+            }
+            assert_eq!(delivered(), healthy, "{label}");
         }
         Ok(())
     }).await;
@@ -11654,39 +11893,80 @@ async fn queued_planner_turn_collects_managed_background_without_client_cancella
                 .0
                 .to_string();
             prompt_text(&cx, &sid, "/implement authorized test").await?;
+            // Held open until the background request is queued behind it.
+            let release = log.with_extension("release");
+            let _ = std::fs::remove_file(&release);
             let active = cx
                 .send_request(PromptRequest::new(
                     sid.clone(),
-                    vec![ContentBlock::from("SLEEP:1000 original-active-turn")],
+                    vec![ContentBlock::from(format!(
+                        "original-active-turn\nWAIT_FILE:{}",
+                        release.display()
+                    ))],
                 ))
                 .block_task();
             wait_for_mock_prompt(&log, "original-active-turn").await;
-            cx.send_request(
-                PromptRequest::new(
-                    sid.clone(),
-                    vec![ContentBlock::from("BACKGROUND_START:echo managed")],
-                )
-                .meta(
-                    serde_json::from_value(
-                        serde_json::json!({"router_acp":{"input_id":"queued-background"}}),
+            // Its response arrives only once its own turn has run, so it is
+            // awaited after the active turn is released.
+            let queued = cx
+                .send_request(
+                    PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::from("BACKGROUND_START:echo managed")],
                     )
-                    .ok(),
-                ),
-            )
-            .block_task()
-            .await?;
+                    .meta(
+                        serde_json::from_value(
+                            serde_json::json!({"router_acp":{"input_id":"queued-background"}}),
+                        )
+                        .ok(),
+                    ),
+                )
+                .block_task();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .parent_queue
+                    .iter()
+                    .any(|input| input.input_id == "queued-background")
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the background request queued behind the active turn");
+            std::fs::write(&release, "").unwrap();
             active.await?;
+            queued.await?;
             wait_for_mock_prompt(&log, "router-acp managed background completed").await;
-            let text = agent_text(&observed, &sid);
+            // The completion turn's reply streams after its prompt is logged.
+            let text = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let text = agent_text(&observed, &sid);
+                    if text.contains("watch-fired") {
+                        return text;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| agent_text(&observed, &sid));
             assert!(text.contains("watch-fired"), "{text}");
             assert_eq!(observed.lock().unwrap().terminal_creates.len(), 1);
-            assert!(
-                router_acp::planner_workflow::load(&shared, &sid)
+            // The queue entry is retired when that turn finishes, a moment
+            // after the provider receives its prompt.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !router_acp::planner_workflow::load(&shared, &sid)
                     .unwrap()
                     .unwrap()
                     .parent_queue
                     .is_empty()
-            );
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the queued background turn retired its queue entry");
             Ok(())
         },
     )
@@ -11812,12 +12092,17 @@ async fn queued_planner_commands_keep_fifo_controls_and_original_images() {
             .0
             .to_string();
         prompt_text(&cx, &sid, "/implement initial admitted scope").await?;
+        // The active turn stays open until the assertions below have run;
+        // a fixed sleep let it finish first on a loaded machine.
+        let release = log.with_extension("release");
+        let _ = std::fs::remove_file(&release);
         let active = cx
             .send_request(PromptRequest::new(
                 sid.clone(),
-                vec![ContentBlock::from(
-                    "[router: effort=low] SLEEP:1000 original-active-turn",
-                )],
+                vec![ContentBlock::from(format!(
+                    "[router: effort=low] original-active-turn\nWAIT_FILE:{}",
+                    release.display()
+                ))],
             ))
             .block_task();
         wait_for_mock_prompt(&log, "original-active-turn").await;
@@ -11872,6 +12157,7 @@ async fn queued_planner_commands_keep_fifo_controls_and_original_images() {
                 .text
                 .starts_with("[router: switch=plan/sol")
         );
+        std::fs::write(&release, "").unwrap();
         active.await?;
         let events = wait_for_mock_prompt(&log, "fifo-implement").await;
         let first = events

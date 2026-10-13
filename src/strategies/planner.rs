@@ -59,11 +59,17 @@ impl RouterStrategy for PlannerStrategy {
                 Some(PlannerDifficulty::Hard) => {
                     (&cfg.hard_planning_candidates, false, " · hard: prefix")
                 }
+                None if ctx.planner_explicit => {
+                    (&cfg.planning_candidates, false, " · explicit command")
+                }
                 None => {
                     let cross = complexity <= cfg.floor_complexity;
                     (&cfg.planning_candidates, cross, "")
                 }
             },
+            PlannerPhase::Implementation if ctx.planner_explicit => {
+                (&cfg.implementation_candidates, false, " · explicit command")
+            }
             PlannerPhase::Implementation => {
                 let cross = complexity >= cfg.apex_complexity;
                 (&cfg.implementation_candidates, cross, "")
@@ -263,6 +269,7 @@ mod tests {
             explicit_source: None,
             planner_phase: Some(phase),
             planner_difficulty: None,
+            planner_explicit: false,
         }
     }
 
@@ -315,6 +322,21 @@ mod tests {
         let ctx = ctx_with_phase(PlannerPhase::Implementation, 0.90);
         let ranked = s.rank(&ctx, &pool()).unwrap();
         assert_eq!(ranked.len(), 4, "all candidates should be in the pool");
+    }
+
+    #[test]
+    fn explicit_implement_command_never_crosses_into_planning_pool() {
+        let mut acfg = auto_cfg();
+        acfg.complexity_floor = 2.0;
+        let s = PlannerStrategy::new(planner_cfg(), acfg, 0.1);
+        let mut ctx = ctx_with_phase(PlannerPhase::Implementation, 1.0);
+        ctx.planner_explicit = true;
+        let ranked = s.rank(&ctx, &pool()).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked.iter().all(|r| {
+            let id = r.candidate.to_string();
+            (id.contains("opus") || id.contains("grok")) && r.reason.contains("explicit command")
+        }));
     }
 
     #[test]
@@ -514,6 +536,7 @@ mod tests {
             explicit_source: None,
             planner_phase: None,
             planner_difficulty: None,
+            planner_explicit: false,
         };
         let ranked = s.rank(&ctx, &pool()).unwrap();
         assert!(ranked.iter().all(|r| {

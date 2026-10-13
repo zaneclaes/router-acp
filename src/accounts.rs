@@ -388,7 +388,7 @@ fn text(prompt: &[ContentBlock]) -> Option<String> {
     Some(typed.trim().to_string())
 }
 
-fn without_turn_context(text: &str) -> String {
+pub(crate) fn without_turn_context(text: &str) -> String {
     const OPEN: &str = "<turn-context>";
     const CLOSE: &str = "</turn-context>";
     let mut out = String::new();
@@ -888,13 +888,7 @@ fn new_account(shared: &Arc<Shared>, p: &str) -> Result<(AgentConfig, String), A
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
     }
-    let variable = match p {
-        "claude" => "CLAUDE_CONFIG_DIR",
-        "codex" => "CODEX_HOME",
-        "grok" => "GROK_HOME",
-        "kimi" => "KIMI_SHARE_DIR",
-        _ => "HOME",
-    };
+    let variable = directory_variable(p);
     agent.command.env.retain(|e| {
         e.name != variable
             && !(p == "kimi" && e.name == "KIMI_CODE_HOME")
@@ -1129,6 +1123,19 @@ async fn run_login(
         match p {
             "claude" => {
                 cmd.env("CLAUDE_CONFIG_DIR", dir);
+                // The login writes the manager's `.credentials.json` on every
+                // platform, never a macOS Keychain item the manager cannot see.
+                let base = agent
+                    .login_command
+                    .iter()
+                    .flat_map(|c| c.env.iter())
+                    .chain(agent.command.env.iter())
+                    .find(|v| v.name == "PATH")
+                    .map(|v| v.value.as_str());
+                cmd.env(
+                    "PATH",
+                    crate::credentials::claude_file_store_path(agent, base)?,
+                );
             }
             "codex" => {
                 cmd.env("CODEX_HOME", dir);
@@ -1203,7 +1210,11 @@ async fn run_login(
 }
 
 fn browser_message(output: &str, p: &str) -> Option<String> {
-    let clean = regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    // Claude prints its sign-in link as an OSC 8 hyperlink,
+    // `ESC]8;;<url> BEL <url> ESC]8;; BEL`. Strip OSC sequences as well as CSI
+    // styling, or the match runs through the BEL into the repeated URL and the
+    // page echoes that corrupted `state` back inside the authorization code.
+    let clean = regex::Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
         .ok()?
         .replace_all(output, "");
     // Do not publish a URL while its final bytes are still arriving.
@@ -1307,9 +1318,16 @@ async fn write_config(
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut document: Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
     edit(&mut document)?;
-    let yaml = serde_yaml::to_string(&document).map_err(|e| e.to_string())?;
+    save_document(path, &document)
+}
+
+/// Validate `document` as a router configuration and replace the file at
+/// `path` with it atomically (private temp file, fsync, rename). The caller
+/// holds the accounts lock.
+fn save_document(path: &Path, document: &Value) -> Result<Config, String> {
+    let yaml = serde_yaml::to_string(document).map_err(|e| e.to_string())?;
     let mut cfg = Config::from_yaml(&yaml).map_err(|e| e.to_string())?;
-    cfg.source_path = Some(path.clone());
+    cfg.source_path = Some(path.to_path_buf());
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
@@ -1358,6 +1376,233 @@ impl Drop for ConfigLock {
     }
 }
 
+/// The environment variable that names a provider's config directory.
+pub(crate) fn directory_variable(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "CLAUDE_CONFIG_DIR",
+        "codex" => "CODEX_HOME",
+        "grok" => "GROK_HOME",
+        "kimi" => "KIMI_SHARE_DIR",
+        _ => "HOME",
+    }
+}
+
+/// The entries of a provider's config directory that are the login itself,
+/// with the router's repair record for it. Everything else is configuration.
+fn credential_entries(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &[".credentials.json", ".router-acp-auth.json"],
+        "codex" | "grok" => &["auth.json", ".router-acp-auth.json"],
+        "kimi" => &["credentials", ".router-acp-auth.json"],
+        _ => &[],
+    }
+}
+
+/// Every seat is an account: `<agent>@<id>`, owning
+/// `~/.config/router-acp/accounts/<agent>@<id>`, which holds only its login
+/// and its usage cache (`.router-acp-usage/`). Skills, plugins and settings
+/// stay the computer-wide CLI configuration its adapters read
+/// (`credentials::configuration_directory`). A seat still on its CLI's default
+/// directory (`~/.claude`, `~/.codex`, `~/.grok`, `~/.kimi`) becomes one once:
+///
+/// - it is renamed `<agent>@<id>`, as an added account is named; a plain
+///   `<agent>/<model>` reference still resolves to it;
+/// - its login is copied (private, `0600`); the CLI keeps its own and stays
+///   signed in. From then on each side refreshes its own copy, so a provider
+///   that rotates refresh tokens may later ask one of them to sign in again;
+/// - the configuration is saved under the accounts lock, and a failed save
+///   removes the new directory.
+///
+/// A seat with its own directory (an added account, a configured volume) is
+/// left alone. Another router holding the lock defers this to a later start.
+/// Returns one line per seat that became an account or could not.
+pub fn adopt_seat_directories(config_path: &Path) -> Result<Vec<String>, String> {
+    let Ok(_lock) = ConfigLock::acquire(config_path.with_extension("accounts.lock")) else {
+        return Ok(vec![
+            "seat directories: configuration busy; retried at the next start".into(),
+        ]);
+    };
+    let raw = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
+    let cfg = Config::from_yaml(&raw).map_err(|e| e.to_string())?;
+    let mut document: Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut report = Vec::new();
+    // Directories this call created, removed again if the configuration is not saved.
+    let mut created: Vec<PathBuf> = Vec::new();
+    // (old seat name, new seat name), applied to the references below.
+    let mut renamed: Vec<(String, String)> = Vec::new();
+    let Some(entries) = document.get_mut("agents").and_then(Value::as_array_mut) else {
+        return Ok(report);
+    };
+    for entry in entries.iter_mut() {
+        // The expanded multi-account form names each account's directory itself.
+        if entry.get("accounts").is_some() {
+            continue;
+        }
+        let Some(name) = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(agent) = cfg.agents.iter().find(|a| a.name == name) else {
+            continue;
+        };
+        let Some(p) = provider(agent) else { continue };
+        let variable = directory_variable(p);
+        let configured = |v: &str| agent.env_var(v).is_some_and(|value| !value.is_empty());
+        if configured(variable) || (p == "kimi" && configured("KIMI_CODE_HOME")) {
+            continue;
+        }
+        let Some(shared_dir) = crate::credentials::directory(agent) else {
+            continue;
+        };
+        // Under the HOME the seat itself runs with, as an added account's is,
+        // so a seat and the directory it leaves always belong to one user.
+        let Some(home) = agent.env_var("HOME") else {
+            continue;
+        };
+        let account = format!("{name}@{}", uuid::Uuid::new_v4().simple());
+        let seat = PathBuf::from(home)
+            .join(".config/router-acp/accounts")
+            .join(&account);
+        match adopt_seat(p, &shared_dir, &seat) {
+            Ok(()) => {
+                created.push(seat.clone());
+                let object = entry.as_object_mut().ok_or("Invalid agent entry")?;
+                object.insert("name".into(), Value::String(account.clone()));
+                object
+                    .entry("lineage")
+                    .or_insert_with(|| Value::String(name.clone()));
+                let env = object
+                    .get_mut("command")
+                    .and_then(Value::as_object_mut)
+                    .ok_or("Missing command")?
+                    .entry("env")
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .ok_or("Invalid command environment")?;
+                env.push(serde_json::json!({"name": variable, "value": seat.to_string_lossy()}));
+                report.push(format!(
+                    "{name}: now account {account} in {}",
+                    seat.display()
+                ));
+                renamed.push((name, account));
+            }
+            Err(why) => report.push(format!("{name}: kept {} ({why})", shared_dir.display())),
+        }
+    }
+    if renamed.is_empty() {
+        return Ok(report);
+    }
+    rename_candidate_references(&mut document, &renamed);
+    if let Err(e) = save_document(config_path, &document) {
+        created.iter().for_each(|dir| remove_entry(dir));
+        return Err(format!(
+            "seat accounts were not saved; seats keep their shared directories: {e}"
+        ));
+    }
+    Ok(report)
+}
+
+/// Point the configuration's exact candidate references (`<seat>/<model>`) at
+/// the renamed seats: version pins and the static router's candidate. Globs
+/// and other references match the new names already.
+fn rename_candidate_references(document: &mut Value, renamed: &[(String, String)]) {
+    let rename = |id: &str| -> Option<String> {
+        let (agent, model) = id.split_once('/')?;
+        renamed
+            .iter()
+            .find(|(old, _)| old == agent)
+            .map(|(_, new)| format!("{new}/{model}"))
+    };
+    if let Some(pins) = document
+        .get_mut("pinned_versions")
+        .and_then(Value::as_object_mut)
+    {
+        let entries: Vec<(String, Value)> = std::mem::take(pins).into_iter().collect();
+        for (key, value) in entries {
+            pins.insert(rename(&key).unwrap_or(key), value);
+        }
+    }
+    if let Some(candidate) = document.pointer_mut("/routers/static/candidate")
+        && let Some(new) = candidate.as_str().and_then(rename)
+    {
+        *candidate = Value::String(new);
+    }
+}
+
+/// Create the account directory `seat` and copy only the login into it.
+/// On failure the directory is removed again.
+fn adopt_seat(provider: &str, shared: &Path, seat: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(seat).map_err(|e| format!("cannot create the seat directory: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(seat, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot protect the seat directory: {e}"))?;
+    }
+    for name in credential_entries(provider) {
+        let from = shared.join(name);
+        if std::fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        if let Err(e) = copy_private(&from, &seat.join(name)) {
+            remove_entry(seat);
+            return Err(format!("cannot copy {name}: {e}"));
+        }
+    }
+    // Claude names the signed-in account in its client state (`.claude.json`
+    // in the config directory, or `~/.claude.json` for the default one). The
+    // account keeps that identity and nothing else of that state.
+    if provider == "claude" {
+        let identity =
+            crate::credentials::claude_identity(&shared.join(".claude.json")).or_else(|| {
+                (shared.file_name()? == ".claude")
+                    .then(|| {
+                        crate::credentials::claude_identity(&shared.parent()?.join(".claude.json"))
+                    })
+                    .flatten()
+            });
+        if let Some(identity) = identity
+            && let Err(e) =
+                crate::credentials::write_claude_identity(&seat.join(".claude.json"), identity)
+        {
+            remove_entry(seat);
+            return Err(format!("cannot copy the account identity: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Copy a login file, or a directory of them, readable only by the owner.
+fn copy_private(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(from)?.is_dir() {
+        std::fs::create_dir(to)?;
+        for item in std::fs::read_dir(from)? {
+            let item = item?;
+            copy_private(&item.path(), &to.join(item.file_name()))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700))?;
+        }
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn remove_entry(path: &Path) {
+    let _ = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
+}
+
 async fn publish_added(
     shared: &Arc<Shared>,
     agent: &AgentConfig,
@@ -1401,13 +1646,7 @@ async fn publish_added(
         added["account_priority"] = serde_json::json!(agent.account_priority);
         added["lineage"] = serde_json::json!(agent.lineage);
         added["reserve_capacity"] = serde_json::json!(agent.reserve_capacity);
-        let variable = match provider(agent) {
-            Some("claude") => "CLAUDE_CONFIG_DIR",
-            Some("codex") => "CODEX_HOME",
-            Some("grok") => "GROK_HOME",
-            Some("kimi") => "KIMI_SHARE_DIR",
-            _ => "HOME",
-        };
+        let variable = directory_variable(provider(agent).unwrap_or(""));
         let env = added["command"]
             .as_object_mut()
             .ok_or("Missing command")?
@@ -1793,6 +2032,181 @@ fn remove_json_field(path: &Path, field: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A router config whose `claude` seat uses `<home>/.claude` (shared with
+    /// the CLI) and whose `claude@work` seat already has its own directory.
+    fn seat_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let shared = home.join(".claude");
+        std::fs::create_dir_all(shared.join("plugins")).unwrap();
+        std::fs::write(
+            shared.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#,
+        )
+        .unwrap();
+        std::fs::write(shared.join("settings.json"), "{}").unwrap();
+        std::fs::write(
+            shared.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"base@example.test"},"projects":{"/repo":{}},"machineID":"m"}"#,
+        )
+        .unwrap();
+        let work = home.join("work-claude");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join(".credentials.json"), "{}").unwrap();
+        let config = home.join("router.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "routers:\n  static: {{candidate: claude/sonnet}}\npinned_versions:\n  claude/sonnet: default\nagents:\n  - name: claude\n    command: {{type: stdio, command: mock-agent, env: [{{name: HOME, value: {h}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: sonnet, cost_rank: 1}}]\n  - name: claude@work\n    command: {{type: stdio, command: mock-agent, env: [{{name: HOME, value: {h}}}, {{name: CLAUDE_CONFIG_DIR, value: {w}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: sonnet, cost_rank: 1}}]\n",
+                h = home.display(),
+                w = work.display()
+            ),
+        )
+        .unwrap();
+        // The seat's own HOME decides where its directory goes, never the
+        // HOME of the process running the router.
+        let accounts = home.join(".config/router-acp/accounts");
+        (root, config, shared, accounts)
+    }
+
+    #[test]
+    fn a_shared_default_seat_becomes_an_account_holding_only_its_login() {
+        let (_root, config, shared, accounts) = seat_fixture();
+        let original = std::fs::read(shared.join(".credentials.json")).unwrap();
+        let report = adopt_seat_directories(&config).unwrap();
+        let cfg = Config::from_file(&config).unwrap();
+        let claude = cfg
+            .agents
+            .iter()
+            .find(|a| a.name.starts_with("claude@") && a.name != "claude@work")
+            .expect("the base seat is now an account");
+        let id = claude.name.strip_prefix("claude@").unwrap();
+        assert!(
+            id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{}",
+            claude.name
+        );
+        let seat = accounts.join(&claude.name);
+        assert_eq!(
+            report,
+            [format!(
+                "claude: now account {} in {}",
+                claude.name,
+                seat.display()
+            )]
+        );
+        assert!(cfg.agents.iter().all(|a| a.name != "claude"));
+        assert_eq!(claude.lineage.as_deref(), Some("claude"));
+        // Exact references follow the rename.
+        let pins = std::fs::read_to_string(&config).unwrap();
+        assert!(pins.contains(&format!("{}/sonnet", claude.name)), "{pins}");
+        assert!(!pins.contains("claude/sonnet"), "{pins}");
+        // The folder holds the login and nothing else.
+        let mut entries: Vec<_> = std::fs::read_dir(&seat)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, [".claude.json", ".credentials.json"]);
+        // Of Claude's client state, the account keeps only who signed in.
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(seat.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            state,
+            serde_json::json!({"oauthAccount": {"emailAddress": "base@example.test"}})
+        );
+        assert_eq!(identity(claude).0, "base@example.test");
+        // Copied: the native CLI keeps its own login and stays signed in.
+        assert_eq!(
+            std::fs::read(shared.join(".credentials.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(seat.join(".credentials.json")).unwrap(),
+            original
+        );
+        assert!(
+            std::fs::symlink_metadata(seat.join(".credentials.json"))
+                .unwrap()
+                .is_file()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(seat.join(".credentials.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            claude.env_var("CLAUDE_CONFIG_DIR").as_deref(),
+            Some(seat.to_str().unwrap())
+        );
+        assert_eq!(crate::credentials::directory(claude), Some(seat.clone()));
+        // Its adapters still read the computer-wide configuration.
+        assert_eq!(
+            crate::credentials::configuration_directory(claude, &seat),
+            shared
+        );
+        // A seat that already had its own directory is untouched.
+        let work = cfg.agents.iter().find(|a| a.name == "claude@work").unwrap();
+        assert!(
+            work.env_var("CLAUDE_CONFIG_DIR")
+                .unwrap()
+                .ends_with("work-claude")
+        );
+        assert!(!accounts.join("claude@work").exists());
+        // Idempotent: the next start finds nothing to move.
+        let before = std::fs::read_to_string(&config).unwrap();
+        assert!(adopt_seat_directories(&config).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsaved_configuration_removes_the_copied_login() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, original, shared, accounts) = seat_fixture();
+        // The atomic save writes a temp file beside the config; forbid only
+        // that. The lock file already exists, as after any earlier save.
+        let dir = original.parent().unwrap().join("conf");
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join("router.yaml");
+        std::fs::rename(&original, &config).unwrap();
+        std::fs::write(config.with_extension("accounts.lock"), "").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = adopt_seat_directories(&config);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            shared.join(".credentials.json").is_file(),
+            "the CLI's own login is untouched"
+        );
+        assert!(
+            no_accounts(&accounts),
+            "the new account directory was removed"
+        );
+    }
+
+    fn no_accounts(accounts: &Path) -> bool {
+        std::fs::read_dir(accounts).map_or(true, |mut entries| entries.next().is_none())
+    }
+
+    #[test]
+    fn a_busy_configuration_defers_the_move() {
+        let (_root, config, shared, accounts) = seat_fixture();
+        let _held = ConfigLock::acquire(config.with_extension("accounts.lock")).unwrap();
+        let report = adopt_seat_directories(&config).unwrap();
+        assert!(report[0].contains("busy"), "{report:?}");
+        assert!(shared.join(".credentials.json").is_file());
+        assert!(
+            no_accounts(&accounts),
+            "nothing changes while another router holds the lock"
+        );
+    }
+
     #[test]
     fn commands_ignore_goose_turn_context_in_any_block() {
         let ctx = "<turn-context>\n<t>2026</t>\n</turn-context>";
@@ -1835,6 +2249,25 @@ mod tests {
             )
             .as_deref(),
             Some("Open https://auth.openai.com/codex/device\nDevice code: LWD3-2FXYY")
+        );
+        // Claude 2.1 prints the manual sign-in link as an OSC 8 hyperlink.
+        let url = "https://claude.com/cai/oauth/authorize?code=true&client_id=c&state=s1";
+        assert_eq!(
+            browser_message(
+                &format!("Opening browser to sign in\nIf the browser didn't open, visit: \x1b]8;;{url}\x07{url}\x1b]8;;\x07\nPaste code here if prompted >"),
+                "claude",
+            )
+            .as_deref(),
+            Some(format!("Open {url}").as_str())
+        );
+        assert_eq!(
+            browser_message(
+                &format!("visit: \x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\\n"),
+                "claude"
+            )
+            .as_deref(),
+            Some(format!("Open {url}").as_str()),
+            "the ST terminator form strips too"
         );
         assert_eq!(
             plan_label("claude", "default_claude_max_20x"),

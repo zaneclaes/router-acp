@@ -9,8 +9,9 @@
 //! measurement per window kind is cached: a plan's window size is stable
 //! across resets, so it stays valid until the account itself changes.
 //!
-//! Published contract, read by `account-status` (and through it the Kory
-//! Code relay): `~/.local/state/router-acp/usage/capacity/<agent>.json`
+//! Kept in the account's own directory, beside its usage snapshot:
+//! `<account dir>/.router-acp-usage/capacity.json`. Hosts (the Kory Code
+//! relay) read it only through `account-status`.
 //!
 //! ```json
 //! { "account": "<snapshot account fingerprint>",
@@ -152,17 +153,25 @@ pub fn measure(
     out
 }
 
-fn path(agent: &str) -> Option<PathBuf> {
+/// `<account dir>/.router-acp-usage/capacity.json`, beside the account's usage
+/// snapshot; the shared state directory only for an account without one.
+fn path(agent: &AgentConfig) -> Option<PathBuf> {
+    if let Some(dir) = crate::credentials::directory(agent) {
+        return Some(
+            dir.join(crate::usage_cache::ACCOUNT_USAGE_DIR)
+                .join("capacity.json"),
+        );
+    }
     let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
             .join(".local/state/router-acp/usage/capacity")
-            .join(format!("{agent}.json")),
+            .join(format!("{}.json", agent.name)),
     )
 }
 
 /// The cached capacity for `agent`, if it was measured on `account`.
-pub fn read(agent: &str, account: &str) -> Option<Capacity> {
+pub fn read(agent: &AgentConfig, account: &str) -> Option<Capacity> {
     let text = std::fs::read_to_string(path(agent)?).ok()?;
     serde_json::from_str::<Capacity>(&text)
         .ok()
@@ -187,18 +196,18 @@ pub fn record(agent: &AgentConfig, spend: &SpendLookup, now: SystemTime) {
         .iter()
         .map(|w| (w.weekly, w.percent, w.start))
         .collect();
-    let previous = read(&agent.name, &snapshot.account);
+    let previous = read(agent, &snapshot.account);
     let next = measure(previous.clone(), &snapshot.account, &windows, spend, now);
     if previous.as_ref() == Some(&next) || (next.session.is_none() && next.weekly.is_none()) {
         return;
     }
-    let Some(target) = path(&agent.name) else {
+    let Some(target) = path(agent) else {
         return;
     };
     let write = || -> std::io::Result<()> {
         let dir = target.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".{}.tmp.{}", agent.name, std::process::id()));
+        let tmp = dir.join(format!(".capacity.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&next)?)?;
         std::fs::rename(&tmp, &target)
     };
