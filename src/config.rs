@@ -1524,6 +1524,17 @@ pub struct McpCredentialCommand {
     /// A helper still running after this long has declined.
     #[serde(default = "default_mcp_credential_timeout_ms")]
     pub timeout_ms: u64,
+    /// The `.mcp.json` server names the helper serves; empty serves every
+    /// brokered server. A covered server always reaches sessions, so name
+    /// only the ones the helper can actually supply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<String>,
+}
+
+impl McpCredentialCommand {
+    pub fn covers(&self, server: &str) -> bool {
+        self.servers.is_empty() || self.servers.iter().any(|s| s == server)
+    }
 }
 
 fn default_mcp_credential_timeout_ms() -> u64 {

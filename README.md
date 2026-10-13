@@ -645,6 +645,7 @@ mcp_credential_command:
   command: /path/to/helper
   args: []
   timeout_ms: 5000   # default
+  servers: [kory]    # default: every brokered server
 ```
 
 When the router has no usable sign-in for a project server, it runs the helper
@@ -654,9 +655,11 @@ or exits non-zero to decline. A timeout or crash counts as a decline. The
 router keeps a supplied token in memory only, until a minute before
 `expiresAt` (five minutes without one), and asks again after a decline a
 minute later. A token the upstream refuses is dropped and the helper is asked
-once more. The router's own sign-in always wins. With a helper configured,
-every brokered project server reaches sessions: a server the helper declines
-answers its calls with the sign-in message. `mcp-status --config <router.yaml>`
+once more. The router's own sign-in always wins. Every server the helper
+covers (`servers`, or all brokered servers when omitted) reaches sessions even
+without a sign-in: a call the helper declines is answered with the sign-in
+message. So list only the servers the helper can supply; the others reach
+sessions only once the router is signed in. `mcp-status --config <router.yaml>`
 reports a helper-served server as `signed-in` with the label
 `provided credential`.
 

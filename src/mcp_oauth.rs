@@ -814,7 +814,7 @@ pub async fn project_status_json(
             "url": server.url, "handling": server.handling()});
         if let Some(remote) = server.remote() {
             let source = TokenSource::new(remote.store(root), reqwest::Client::new())
-                .with_supplier(helper.map(|h| Supplier::new(h.clone(), &remote)));
+                .with_supplier(Supplier::for_server(helper, &remote));
             let status = source.effective_status().await;
             row["state"] = json!(status.state);
             row["label"] = status.label.into();
@@ -1052,6 +1052,16 @@ const SUPPLIED_TTL_MS: i64 = 5 * 60_000;
 const DECLINE_TTL_MS: i64 = 60_000;
 
 impl Supplier {
+    /// The helper for `server`, or None when its `servers` list leaves it out.
+    pub fn for_server(
+        helper: Option<&crate::config::McpCredentialCommand>,
+        server: &RemoteServer,
+    ) -> Option<Self> {
+        helper
+            .filter(|h| h.covers(&server.name))
+            .map(|h| Self::new(h.clone(), server))
+    }
+
     pub fn new(helper: crate::config::McpCredentialCommand, server: &RemoteServer) -> Self {
         Self {
             helper,

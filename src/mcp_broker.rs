@@ -135,9 +135,7 @@ impl Broker {
             .or_insert_with(|| {
                 Arc::new(
                     TokenSource::new(server.store(&self.root), self.http.clone()).with_supplier(
-                        self.helper
-                            .clone()
-                            .map(|h| crate::mcp_oauth::Supplier::new(h, server)),
+                        crate::mcp_oauth::Supplier::for_server(self.helper.as_ref(), server),
                     ),
                 )
             })
@@ -1437,6 +1435,7 @@ mod tests {
             command: path.display().to_string(),
             args: Vec::new(),
             timeout_ms: 2_000,
+            servers: Vec::new(),
         }
     }
 
@@ -1568,6 +1567,47 @@ mod tests {
             .last()
             .and_then(|s| s.1.clone());
         assert_eq!(last.as_deref(), Some("Bearer fresh"));
+    }
+
+    #[tokio::test]
+    async fn a_helper_serves_only_the_servers_it_names() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"kory":{"type":"http","url":"https://kory.example/mcp"},
+                "datadog":{"type":"http","url":"https://mcp.datadog.example/v1/mcp"}}}"#,
+        )
+        .unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let mut supplied = helper(scripts.path(), r#"echo '{"token":"box-jwt"}'"#);
+        supplied.servers = vec!["kory".into()];
+        let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
+        broker.bind().await.unwrap();
+        let names: Vec<String> = broker
+            .session_servers(project.path())
+            .iter()
+            .map(|s| match s {
+                McpServer::Http(h) => h.name.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        // A server nobody signed in to stays off sessions unless the helper names it.
+        assert_eq!(names, vec!["kory"]);
+        let status =
+            crate::mcp_oauth::project_status_json(project.path(), root.path(), Some(&supplied))
+                .await;
+        let state = |name: &str| {
+            status["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == name)
+                .unwrap()["state"]
+                .clone()
+        };
+        assert_eq!(state("kory"), "signed-in");
+        assert_eq!(state("datadog"), "signed-out");
     }
 
     #[tokio::test]
