@@ -73,6 +73,8 @@ struct ClaudeRuntime {
 
 pub struct Broker {
     root: PathBuf,
+    /// The host's fallback credential helper (`mcp_credential_command`).
+    helper: Option<crate::config::McpCredentialCommand>,
     secret: String,
     addr: OnceLock<SocketAddr>,
     http: reqwest::Client,
@@ -84,9 +86,10 @@ pub struct Broker {
 }
 
 impl Broker {
-    pub fn new(root: PathBuf) -> Arc<Self> {
+    pub fn new(root: PathBuf, helper: Option<crate::config::McpCredentialCommand>) -> Arc<Self> {
         Arc::new(Self {
             root,
+            helper,
             secret: crate::mcp_oauth::random_token(32),
             addr: OnceLock::new(),
             http: reqwest::Client::new(),
@@ -130,10 +133,13 @@ impl Broker {
             .unwrap()
             .entry(server.store_key())
             .or_insert_with(|| {
-                Arc::new(TokenSource::new(
-                    server.store(&self.root),
-                    self.http.clone(),
-                ))
+                Arc::new(
+                    TokenSource::new(server.store(&self.root), self.http.clone()).with_supplier(
+                        self.helper
+                            .clone()
+                            .map(|h| crate::mcp_oauth::Supplier::new(h, server)),
+                    ),
+                )
             })
             .clone()
     }
@@ -873,12 +879,13 @@ async fn call_once(
 /// router's own sign-in. The whole call is bounded by `timeout`.
 pub async fn call_tool(
     root: &FsPath,
+    helper: Option<crate::config::McpCredentialCommand>,
     server: &RemoteServer,
     tool: &str,
     arguments: &Value,
     timeout: Duration,
 ) -> Result<ToolCall, CallFailure> {
-    let broker = Broker::new(root.to_path_buf());
+    let broker = Broker::new(root.to_path_buf(), helper);
     let entry = broker.entry_for(server);
     match tokio::time::timeout(timeout, broker.call(&entry, tool, arguments, timeout)).await {
         Ok(outcome) => outcome,
@@ -990,7 +997,7 @@ mod tests {
         stored: crate::mcp_oauth::Tokens,
     ) -> (Arc<Broker>, tempfile::TempDir) {
         signed_in(root, &server("fake", upstream_url), token_url, &stored);
-        let broker = Broker::new(root.to_path_buf());
+        let broker = Broker::new(root.to_path_buf(), None);
         broker.bind().await.unwrap();
         (broker, project(upstream_url))
     }
@@ -1019,7 +1026,7 @@ mod tests {
     async fn sessions_get_only_signed_in_project_servers() {
         let (upstream_url, _) = fake_upstream().await;
         let root = tempfile::tempdir().unwrap();
-        let broker = Broker::new(root.path().to_path_buf());
+        let broker = Broker::new(root.path().to_path_buf(), None);
         let dir = project(&upstream_url);
         assert!(
             broker.session_servers(dir.path()).is_empty(),
@@ -1255,6 +1262,7 @@ mod tests {
         for tool in ["search", "sse"] {
             let call = call_tool(
                 root.path(),
+                None,
                 &server("fake", &upstream_url),
                 tool,
                 &json!({"q": "x"}),
@@ -1292,6 +1300,7 @@ mod tests {
         );
         let call = call_tool(
             root.path(),
+            None,
             &server("fake", &upstream_url),
             "search",
             &json!({}),
@@ -1331,6 +1340,7 @@ mod tests {
         );
         let failure = call_tool(
             root.path(),
+            None,
             &server("fake", &upstream_url),
             "search",
             &json!({}),
@@ -1352,6 +1362,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let unsigned = call_tool(
             root.path(),
+            None,
             &server("fake", "http://127.0.0.1:1/mcp"),
             "search",
             &json!({}),
@@ -1374,6 +1385,7 @@ mod tests {
         );
         let unreachable = call_tool(
             root.path(),
+            None,
             &server("fake", "http://127.0.0.1:1/mcp"),
             "search",
             &json!({}),
@@ -1396,6 +1408,7 @@ mod tests {
         );
         let call = call_tool(
             root.path(),
+            None,
             &server("fake", &upstream_url),
             "broken",
             &json!({}),
@@ -1405,5 +1418,178 @@ mod tests {
         .unwrap();
         assert!(call.is_error);
         assert_eq!(call.result["content"][0]["text"], "no such monitor");
+    }
+
+    /// A credential helper script: prints `answer` (or sleeps, or declines).
+    fn helper(dir: &FsPath, body: &str) -> crate::config::McpCredentialCommand {
+        let path = dir.join("helper.sh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat > {}/request.json\n{body}\n", dir.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::config::McpCredentialCommand {
+            command: path.display().to_string(),
+            args: Vec::new(),
+            timeout_ms: 2_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_helper_token_serves_a_server_the_router_never_signed_in_to() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let supplied = helper(scripts.path(), r#"echo '{"token":"box-jwt"}'"#);
+        let call = call_tool(
+            root.path(),
+            Some(supplied),
+            &server("fake", &upstream_url),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.result["content"][0]["text"], "2 hits");
+        let calls: Vec<_> = upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.1.clone())
+            .collect();
+        assert!(
+            calls.iter().all(|a| a.as_deref() == Some("Bearer box-jwt")),
+            "{calls:?}"
+        );
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(scripts.path().join("request.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request["name"], "fake");
+        assert_eq!(request["url"], upstream_url);
+    }
+
+    #[tokio::test]
+    async fn a_declining_or_silent_helper_leaves_the_server_signed_out() {
+        let root = tempfile::tempdir().unwrap();
+        for body in ["exit 1", "sleep 5"] {
+            let scripts = tempfile::tempdir().unwrap();
+            let mut supplied = helper(scripts.path(), body);
+            supplied.timeout_ms = 300;
+            let failure = call_tool(
+                root.path(),
+                Some(supplied),
+                &server("fake", "http://127.0.0.1:1/mcp"),
+                "search",
+                &json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.exit_code(), 2, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_routers_own_sign_in_wins_over_the_helper() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        signed_in(
+            root.path(),
+            &server("fake", &upstream_url),
+            "http://127.0.0.1:1/token",
+            &tokens("live", 3_600_000),
+        );
+        let scripts = tempfile::tempdir().unwrap();
+        let supplied = helper(scripts.path(), r#"echo '{"token":"box-jwt"}'"#);
+        call_tool(
+            root.path(),
+            Some(supplied),
+            &server("fake", &upstream_url),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let calls: Vec<_> = upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.1.clone())
+            .collect();
+        assert!(
+            calls.iter().all(|a| a.as_deref() == Some("Bearer live")),
+            "{calls:?}"
+        );
+        assert!(
+            !scripts.path().join("request.json").exists(),
+            "the helper is never asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_helper_token_is_asked_for_again_once() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        upstream.refuse.lock().unwrap().push("stale".into());
+        let root = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let count = scripts.path().join("count");
+        let supplied = helper(
+            scripts.path(),
+            &format!(
+                r#"if [ -f {c} ]; then echo '{{"token":"fresh"}}'; else touch {c}; echo '{{"token":"stale"}}'; fi"#,
+                c = count.display()
+            ),
+        );
+        let call = call_tool(
+            root.path(),
+            Some(supplied),
+            &server("fake", &upstream_url),
+            "search",
+            &json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.result["content"][0]["text"], "2 hits");
+        let last = upstream
+            .seen
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|s| s.1.clone());
+        assert_eq!(last.as_deref(), Some("Bearer fresh"));
+    }
+
+    #[tokio::test]
+    async fn sessions_get_a_helper_served_server_and_status_says_provided() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"kory":{"type":"http","url":"https://kory.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let supplied = helper(scripts.path(), r#"echo '{"token":"box-jwt"}'"#);
+        let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
+        broker.bind().await.unwrap();
+        assert_eq!(broker.session_servers(project.path()).len(), 1);
+        let status =
+            crate::mcp_oauth::project_status_json(project.path(), root.path(), Some(&supplied))
+                .await;
+        assert_eq!(status["servers"][0]["state"], "signed-in");
+        assert_eq!(status["servers"][0]["label"], "provided credential");
+        let own = crate::mcp_oauth::project_status_json(project.path(), root.path(), None).await;
+        assert_eq!(own["servers"][0]["state"], "signed-out");
     }
 }

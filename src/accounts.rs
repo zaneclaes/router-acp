@@ -30,6 +30,7 @@ pub fn advertise(shared: &Arc<Shared>, sid: &str) {
         let commands = vec![
             AvailableCommand::new("login", "Manage provider accounts"),
             AvailableCommand::new("usage", "Show cached usage for every account"),
+            AvailableCommand::new("mcp", "Manage the router's MCP server sign-ins"),
         ];
         let _ = cx.send_notification(SessionNotification::new(
             sid.to_string(),
@@ -58,12 +59,13 @@ pub(crate) fn merge_commands(
         commands.retain(|c| {
             !matches!(
                 c.get("name").and_then(Value::as_str),
-                Some("login" | "usage")
+                Some("login" | "usage" | "mcp")
             )
         });
         commands.extend([
             serde_json::json!({"name":"login", "description":"Manage provider accounts"}),
             serde_json::json!({"name":"usage", "description":"Show cached usage for every account"}),
+            serde_json::json!({"name":"mcp", "description":"Manage the router's MCP server sign-ins"}),
         ]);
     }
     agent_client_protocol::UntypedMessage::new(message.method(), params)
@@ -409,6 +411,11 @@ pub fn intercepts(shared: &Arc<Shared>, sid: &str, prompt: &[ContentBlock]) -> b
         return false;
     };
     if text == "/usage" || text == "/login" || text.starts_with("/login ") {
+        shared.mcp_menus.lock().unwrap().remove(sid);
+        return true;
+    }
+    if crate::mcp_menu::intercepts(shared, sid, &text) {
+        shared.account_menus.lock().unwrap().remove(sid);
         return true;
     }
     let mut menus = shared.account_menus.lock().unwrap();
@@ -422,6 +429,7 @@ pub fn intercepts(shared: &Arc<Shared>, sid: &str, prompt: &[ContentBlock]) -> b
 }
 
 pub fn cancel_login(shared: &Arc<Shared>, sid: &str) {
+    crate::mcp_menu::cancel(shared, sid);
     if let Some(cancel) = shared.account_cancellations.lock().unwrap().get(sid) {
         cancel.cancel();
     }
@@ -445,9 +453,13 @@ pub fn cancel_all(shared: &Arc<Shared>) {
         flow.cancel.cancel();
     }
     shared.account_menus.lock().unwrap().clear();
+    shared.mcp_menus.lock().unwrap().clear();
+    for (_, pending) in shared.mcp_logins.lock().unwrap().drain() {
+        pending.cancel();
+    }
 }
 
-fn emit(shared: &Arc<Shared>, sid: &str, message: &str) {
+pub(crate) fn emit(shared: &Arc<Shared>, sid: &str, message: &str) {
     if let Some(cx) = shared.upstream() {
         let _ = cx.send_notification(SessionNotification::new(
             sid.to_string(),
@@ -578,7 +590,7 @@ fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
     }
 }
 
-async fn ask(
+pub(crate) async fn ask(
     shared: &Arc<Shared>,
     sid: &str,
     title: &str,
@@ -654,6 +666,18 @@ pub async fn handle_prompt(
 }
 
 async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), AcpError> {
+    // `/mcp`, or a reply to an open `/mcp` menu (intercepts routed it here).
+    if command == "/mcp"
+        || command.starts_with("/mcp ")
+        || shared.mcp_menus.lock().unwrap().contains_key(sid)
+    {
+        let structured = shared
+            .upstream_client_capabilities()
+            .elicitation
+            .as_ref()
+            .is_some_and(|c| c.form.is_some());
+        return crate::mcp_menu::handle(shared, sid, command, structured).await;
+    }
     if command == "/usage" {
         emit(shared, sid, &crate::account_usage::summarize(shared));
         return Ok(());
@@ -2323,7 +2347,7 @@ mod tests {
 
     #[test]
     fn native_commands_survive_downstream_command_updates() {
-        let frame = agent_client_protocol::UntypedMessage::new("session/update", serde_json::json!({"sessionId":"s", "update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"help","description":"Provider help"},{"name":"login","description":"Provider login"}]}})).unwrap();
+        let frame = agent_client_protocol::UntypedMessage::new("session/update", serde_json::json!({"sessionId":"s", "update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"help","description":"Provider help"},{"name":"login","description":"Provider login"},{"name":"mcp","description":"Provider MCP"}]}})).unwrap();
         let merged = merge_commands(frame).unwrap();
         let commands = merged
             .params()
@@ -2336,9 +2360,13 @@ mod tests {
                 .iter()
                 .map(|c| c["name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["help", "login", "usage"]
+            ["help", "login", "usage", "mcp"]
         );
         assert_eq!(commands[1]["description"], "Manage provider accounts");
+        assert_eq!(
+            commands[3]["description"],
+            "Manage the router's MCP server sign-ins"
+        );
     }
 
     #[tokio::test]

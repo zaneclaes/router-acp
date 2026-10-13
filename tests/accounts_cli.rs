@@ -1665,3 +1665,120 @@ async fn standalone_login_retains_expired_membership_and_deletes_persistently() 
     assert!(client.text().contains("claude (0 accounts)"));
     client.close().await;
 }
+
+/// A project naming one brokered server and one stdio server, and a router
+/// whose MCP store is private to the test.
+fn mcp_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+    let (dir, config) = fixture();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"kory":{"type":"http","url":"https://kory.example/mcp"},
+            "local":{"command":"local-mcp"}}}"#,
+    )
+    .unwrap();
+    let store = dir.path().join("mcp-store").display().to_string();
+    (dir, config, project, store)
+}
+
+#[tokio::test]
+async fn slash_mcp_lists_project_servers_with_their_sign_in_state() {
+    let (_dir, config, project, store) = mcp_fixture();
+    let mut client = spawn_with_env(&config, &[("ROUTER_ACP_MCP_DIR", &store)]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":project,"mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    // kory → Back → local → Back → Close.
+    client
+        .answers
+        .extend(["1", "2", "2", "1", "3"].map(String::from));
+    let response = client.prompt(&sid, "/mcp").await;
+    assert!(response["result"].is_object(), "{response}");
+    let forms: Vec<(String, Vec<String>)> = client
+        .events
+        .iter()
+        .filter(|f| f["method"] == "elicitation/create")
+        .map(|f| {
+            let choice = &f["params"]["requestedSchema"]["properties"]["choice"];
+            let options = choice["oneOf"]
+                .as_array()
+                .map(|o| {
+                    o.iter()
+                        .map(|v| v["title"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (
+                choice["title"].as_str().unwrap_or_default().to_string(),
+                options,
+            )
+        })
+        .collect();
+    assert_eq!(forms.len(), 5, "{forms:?}");
+    assert!(forms[0].0.starts_with("MCP servers in "), "{forms:?}");
+    assert_eq!(
+        forms[0].1,
+        vec![
+            "kory: not signed in",
+            "local: pass-through (stdio)",
+            "Close"
+        ]
+    );
+    assert!(
+        forms[1].0.contains("URL: https://kory.example/mcp"),
+        "{forms:?}"
+    );
+    assert_eq!(forms[1].1, vec!["Sign in", "Back"]);
+    assert!(
+        forms[3].0.contains("does not sign in to this entry"),
+        "{forms:?}"
+    );
+    assert_eq!(forms[3].1, vec!["Back"]);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn slash_mcp_works_as_a_numbered_menu_without_forms() {
+    let (_dir, config, project, store) = mcp_fixture();
+    let mut client = spawn_with_env(&config, &[("ROUTER_ACP_MCP_DIR", &store)]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":project,"mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    client.prompt(&sid, "/mcp").await;
+    let text = client.text();
+    assert!(text.contains("1. kory: not signed in"), "{text}");
+    assert!(text.contains("2. local: pass-through (stdio)"), "{text}");
+    client.prompt(&sid, "1").await;
+    assert!(
+        client.text().contains("1. Sign in\n2. Back"),
+        "{}",
+        client.text()
+    );
+    client.prompt(&sid, "/cancel").await;
+    assert!(client.text().contains("MCP management closed."));
+    let response = client
+        .prompt(&sid, "/mcp callback http://localhost:1/callback?code=x")
+        .await;
+    assert!(response["result"].is_object(), "{response}");
+    assert!(
+        client.text().contains("No MCP sign-in is waiting"),
+        "{}",
+        client.text()
+    );
+    client.close().await;
+}

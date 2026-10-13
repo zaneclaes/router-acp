@@ -611,6 +611,17 @@ to any server): `{key, name, resource, state, label}` per server, with `state`
 minutes). `mcp-status [--project <dir>]` lists the project's servers with
 their handling and state.
 
+**From any ACP client: `/mcp`.** Like `/login`, `/mcp` is answered by the
+router itself, in any session. It lists every server in the session's
+`.mcp.json` with its state (`signed in`, `not signed in`, `reconnect needed`,
+`provided credential`, or the pass-through reason), and a server's menu offers
+Sign in (or Sign in again), Sign out, and Back. Clients with form elicitation
+get forms; others get a numbered list answered by number, and `/cancel`
+closes it. Sign in shows the authorization URL and listens on a loopback
+redirect, so a browser on the same machine finishes on its own. A browser on
+another machine lands on a page that cannot load: send its full address with
+`/mcp callback <address>`. `/mcp cancel` stops a started sign-in.
+
 **Calling a tool.** `router-acp mcp-call <server> <tool> [--args <json object>]
 [--project <dir>] [--url <url>] [--timeout-ms 20000]` makes one tool call on a
 project server with the router's own sign-in. It sends `initialize`,
@@ -622,7 +633,32 @@ reconnect needed (stderr names the state); `3` transient failure (network, token
 endpoint, 5xx, timeout); `4` the tool returned `isError: true` (its result is
 still printed). A host that must not hold a token calls the tool this way
 instead of reading the credential store. Errors name HTTP statuses and OAuth
-codes only.
+codes only. `--config <router.yaml>` lets the call use the configuration's
+credential helper (below).
+
+**A host-supplied credential.** A host that holds its own credential for a
+server, such as a machine token for an unattended box, names a helper in
+router.yaml:
+
+```yaml
+mcp_credential_command:
+  command: /path/to/helper
+  args: []
+  timeout_ms: 5000   # default
+```
+
+When the router has no usable sign-in for a project server, it runs the helper
+with `{"name", "url", "resource"}` on stdin. The helper prints
+`{"token": "<bearer>", "expiresAt": <epoch ms, optional>}` to supply a bearer,
+or exits non-zero to decline. A timeout or crash counts as a decline. The
+router keeps a supplied token in memory only, until a minute before
+`expiresAt` (five minutes without one), and asks again after a decline a
+minute later. A token the upstream refuses is dropped and the helper is asked
+once more. The router's own sign-in always wins. With a helper configured,
+every brokered project server reaches sessions: a server the helper declines
+answers its calls with the sign-in message. `mcp-status --config <router.yaml>`
+reports a helper-served server as `signed-in` with the label
+`provided credential`.
 
 **Hosts that own the redirect** (a remote box whose browser is elsewhere) use
 the two-step form: `mcp-login <name> --redirect-uri <public callback>` prints
@@ -654,6 +690,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
 | `probe_timeout_ms` | `120000` | Timeout for downstream initialize/probe/session-open calls. |
+| `mcp_credential_command` | unset | Host helper that supplies a bearer for a project MCP server the router has no sign-in for (see Project MCP servers). |
 | `effort.default` | unset | Reasoning effort (`low` … `max`) used for primary sessions instead of the automatic class/complexity recommendation when nobody asked explicitly (the `router.effort` option or `[router: effort=…]`). See [Reasoning effort](#task-classification). |
 | `effort.max_automatic` | unset | Ceiling on any effort the router picks by itself (automatic or `effort.default`). Explicit requests are never capped. `effort.default` above `effort.max_automatic` is a config error. |
 | `classifier.backend` | `heuristic` | `heuristic` or `local-model`. |

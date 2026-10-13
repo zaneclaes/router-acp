@@ -618,6 +618,9 @@ pub struct Shared {
     pub account_flows: Mutex<HashMap<String, crate::accounts::LoginFlow>>,
     pub account_cancellations: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     pub account_write: tokio::sync::Mutex<()>,
+    /// `/mcp` menus and started sign-ins, per session.
+    pub mcp_menus: crate::mcp_menu::McpMenus,
+    pub mcp_logins: crate::mcp_menu::McpLogins,
     pub scores: ScoreTable,
     pub rules: ClassifierRules,
     pub state: Mutex<StateStore>,
@@ -760,7 +763,10 @@ impl Shared {
                     .map(|n| (a.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
             })
             .collect();
-        let mcp_broker = crate::mcp_broker::Broker::new(crate::mcp_oauth::store_root());
+        let mcp_broker = crate::mcp_broker::Broker::new(
+            crate::mcp_oauth::store_root(),
+            cfg.mcp_credential_command.clone(),
+        );
         Ok(Arc::new(Self {
             mcp_broker,
             account_config: Mutex::new(cfg.clone()),
@@ -769,6 +775,8 @@ impl Shared {
             account_flows: Mutex::default(),
             account_cancellations: Mutex::default(),
             account_write: Default::default(),
+            mcp_menus: Default::default(),
+            mcp_logins: Default::default(),
             cfg,
             scores,
             rules,

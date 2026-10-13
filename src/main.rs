@@ -75,6 +75,10 @@ enum Command {
     McpStatus {
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Router configuration whose `mcp_credential_command` may serve a
+        /// server the router has no sign-in for.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Call one tool on a project MCP server with the router's own sign-in and
     /// print the tool's result object as JSON on stdout.
@@ -101,6 +105,10 @@ enum Command {
         /// Bound on the whole call, in milliseconds.
         #[arg(long, default_value_t = 20_000)]
         timeout_ms: u64,
+        /// Router configuration whose `mcp_credential_command` supplies a
+        /// bearer when the router has no sign-in.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Print the router configuration as JSON: `{revision, config}`.
     ConfigShow {
@@ -525,12 +533,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{message}");
             Ok(())
         }
-        Command::McpStatus { project } => {
+        Command::McpStatus { project, config } => {
             let project = project.unwrap_or(std::env::current_dir()?);
             let root = router_acp::mcp_oauth::store_root();
+            let helper = mcp_credential_command(config.as_deref())?;
             println!(
                 "{}",
-                router_acp::mcp_oauth::project_status_json(&project, &root)
+                router_acp::mcp_oauth::project_status_json(&project, &root, helper.as_ref()).await
             );
             Ok(())
         }
@@ -541,7 +550,9 @@ async fn main() -> anyhow::Result<()> {
             project,
             url,
             timeout_ms,
+            config,
         } => {
+            let helper = mcp_credential_command(config.as_deref())?;
             let arguments: serde_json::Value = serde_json::from_str(&args)
                 .ok()
                 .filter(serde_json::Value::is_object)
@@ -550,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
             let root = router_acp::mcp_oauth::store_root();
             let outcome = router_acp::mcp_broker::call_tool(
                 &root,
+                helper,
                 &target,
                 &tool,
                 &arguments,
@@ -1057,4 +1069,16 @@ fn admin_output(
         }
         Err(err) => Err(anyhow::anyhow!("{err}")),
     }
+}
+
+/// The `mcp_credential_command` of `--config`, when one is given.
+fn mcp_credential_command(
+    config: Option<&std::path::Path>,
+) -> anyhow::Result<Option<router_acp::config::McpCredentialCommand>> {
+    let Some(path) = config else {
+        return Ok(None);
+    };
+    let cfg = router_acp::config::Config::from_file(path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    Ok(cfg.mcp_credential_command)
 }

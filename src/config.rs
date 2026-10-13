@@ -1506,6 +1506,28 @@ pub struct Config {
     /// Timeout for downstream initialize/probe calls, in milliseconds.
     #[serde(default = "default_probe_timeout_ms")]
     pub probe_timeout_ms: u64,
+    /// Fallback credential for project MCP servers the router has no sign-in
+    /// for: a host helper that supplies a bearer (`mcp_broker::supply`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_credential_command: Option<McpCredentialCommand>,
+}
+
+/// A helper process that supplies a bearer for one MCP server. It reads
+/// `{name, url, resource}` on stdin and prints `{token, expiresAt?}`, or exits
+/// non-zero / prints nothing to decline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCredentialCommand {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// A helper still running after this long has declined.
+    #[serde(default = "default_mcp_credential_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_mcp_credential_timeout_ms() -> u64 {
+    5_000
 }
 
 /// HTTP wire shape used by an interposed adapter. Both OpenAI Responses and
@@ -1796,6 +1818,9 @@ impl Config {
             );
         }
         cfg.state_file = expand_tilde(&cfg.state_file);
+        if let Some(helper) = &mut cfg.mcp_credential_command {
+            helper.command = expand_tilde_str(&helper.command);
+        }
         if let Some(p) = &cfg.delegation.socket_path {
             cfg.delegation.socket_path = Some(expand_tilde(p));
         }
@@ -2250,6 +2275,18 @@ impl Config {
                 )));
             }
         }
+        if let Some(helper) = &self.mcp_credential_command {
+            if helper.command.trim().is_empty() {
+                return Err(ConfigError(
+                    "mcp_credential_command: command must not be empty".into(),
+                ));
+            }
+            if helper.timeout_ms == 0 {
+                return Err(ConfigError(
+                    "mcp_credential_command: timeout_ms must be positive".into(),
+                ));
+            }
+        }
         if self.orchestration.is_some() {
             return Err(ConfigError(
                 "`orchestration` was removed: auto-orchestration is superseded by the `planner` \
@@ -2546,6 +2583,29 @@ agents:
             serde_yaml::to_value(Config::from_yaml(&small).unwrap()).unwrap(),
             serde_yaml::to_value(Config::from_yaml(text).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn parses_and_validates_the_mcp_credential_command() {
+        let yaml = format!(
+            "mcp_credential_command:\n  command: ~/bin/kory-mcp-credential\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        let helper = cfg.mcp_credential_command.as_ref().unwrap();
+        assert!(!helper.command.starts_with('~'), "tilde expands");
+        assert_eq!(helper.timeout_ms, 5_000);
+        assert!(
+            Config::from_yaml(minimal_yaml())
+                .unwrap()
+                .mcp_credential_command
+                .is_none()
+        );
+        let empty = format!(
+            "mcp_credential_command:\n  command: \"\"\n{}",
+            minimal_yaml()
+        );
+        assert!(Config::from_yaml(&empty).is_err());
     }
 
     #[test]

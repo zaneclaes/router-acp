@@ -800,21 +800,27 @@ pub fn status_json(root: &Path) -> Vec<Value> {
 
 /// `mcp-status`: every server in the project's `.mcp.json`, how the broker
 /// handles it, and the router's sign-in state for the brokered ones.
-pub fn project_status_json(project: &Path, root: &Path) -> Value {
+/// With `helper`, a server only the host's credential helper serves reports
+/// `signed-in` / "provided credential".
+pub async fn project_status_json(
+    project: &Path,
+    root: &Path,
+    helper: Option<&crate::config::McpCredentialCommand>,
+) -> Value {
     let file = project_file(project);
-    let servers: Vec<Value> = project_servers(project)
-        .iter()
-        .map(|server| {
-            let mut row = json!({"name": server.name, "transport": server.transport,
-                "url": server.url, "handling": server.handling()});
-            if let Some(remote) = server.remote() {
-                let status = status(&remote.store(root));
-                row["state"] = json!(status.state);
-                row["label"] = status.label.into();
-            }
-            row
-        })
-        .collect();
+    let mut servers = Vec::new();
+    for server in project_servers(project) {
+        let mut row = json!({"name": server.name, "transport": server.transport,
+            "url": server.url, "handling": server.handling()});
+        if let Some(remote) = server.remote() {
+            let source = TokenSource::new(remote.store(root), reqwest::Client::new())
+                .with_supplier(helper.map(|h| Supplier::new(h.clone(), &remote)));
+            let status = source.effective_status().await;
+            row["state"] = json!(status.state);
+            row["label"] = status.label.into();
+        }
+        servers.push(row);
+    }
     json!({"project": file.map(|f| f.display().to_string()), "servers": servers})
 }
 
@@ -1029,6 +1035,98 @@ enum Refresh {
     Transient(String),
 }
 
+/// The host's `mcp_credential_command` for one server: a bearer when the
+/// router has no sign-in of its own. Held in memory only, never on disk.
+pub struct Supplier {
+    helper: crate::config::McpCredentialCommand,
+    request: Value,
+    /// The last answer and when it lapses: `Some(token)` or a decline.
+    cached: tokio::sync::Mutex<Option<(Option<String>, i64)>>,
+}
+
+/// A supplied token is reused until this long before its `expiresAt`.
+const SUPPLIED_HEADROOM_MS: i64 = 60_000;
+/// Reuse for a supplied token without `expiresAt`.
+const SUPPLIED_TTL_MS: i64 = 5 * 60_000;
+/// A decline (or a failed helper) is asked again after this long.
+const DECLINE_TTL_MS: i64 = 60_000;
+
+impl Supplier {
+    pub fn new(helper: crate::config::McpCredentialCommand, server: &RemoteServer) -> Self {
+        Self {
+            helper,
+            request: json!({"name": server.name, "url": server.url,
+                "resource": resource_indicator(&server.url)}),
+            cached: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The helper's bearer, or None when it declines. `rejected` is a token
+    /// the upstream just refused: it is dropped and the helper asked once more.
+    pub async fn token(&self, rejected: Option<&str>) -> Option<String> {
+        let mut cached = self.cached.lock().await;
+        if let Some((answer, until)) = cached.as_ref() {
+            let refused = rejected.is_some() && answer.as_deref() == rejected;
+            if !refused && *until > now_ms() {
+                return answer.clone();
+            }
+        }
+        let answer = self.run().await;
+        let until = match &answer {
+            Some((_, Some(expires_at))) => expires_at - SUPPLIED_HEADROOM_MS,
+            Some((_, None)) => now_ms() + SUPPLIED_TTL_MS,
+            None => now_ms() + DECLINE_TTL_MS,
+        };
+        let token = answer.map(|(token, _)| token);
+        *cached = Some((token.clone(), until));
+        token
+    }
+
+    async fn run(&self) -> Option<(String, Option<i64>)> {
+        use tokio::io::AsyncWriteExt;
+        let name = self.request["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let mut child = tokio::process::Command::new(&self.helper.command)
+            .args(&self.helper.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| tracing::warn!(server = name, "MCP credential helper did not start: {e}"))
+            .ok()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(self.request.to_string().as_bytes()).await;
+        }
+        let timeout = Duration::from_millis(self.helper.timeout_ms);
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                tracing::warn!(server = name, "MCP credential helper failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(server = name, "MCP credential helper timed out");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            return None;
+        }
+        let answer: Value = serde_json::from_slice(&output.stdout).ok()?;
+        let token = answer.get("token")?.as_str()?.trim();
+        if token.is_empty() {
+            return None;
+        }
+        Some((
+            token.to_string(),
+            answer.get("expiresAt").and_then(Value::as_i64),
+        ))
+    }
+}
+
 /// The broker's one reader and refresher of a server's credentials.
 pub struct TokenSource {
     /// The store key, for logs.
@@ -1037,6 +1135,8 @@ pub struct TokenSource {
     http: reqwest::Client,
     refreshing: tokio::sync::Mutex<()>,
     last_health: std::sync::Mutex<Option<(StatusState, String)>>,
+    /// Consulted only when the router has no usable sign-in of its own.
+    supplier: Option<Supplier>,
 }
 
 impl TokenSource {
@@ -1051,12 +1151,37 @@ impl TokenSource {
             http,
             refreshing: tokio::sync::Mutex::new(()),
             last_health: std::sync::Mutex::new(None),
+            supplier: None,
         }
     }
 
-    /// Sessions receive this server unless it needs a human sign-in.
+    pub fn with_supplier(mut self, supplier: Option<Supplier>) -> Self {
+        self.supplier = supplier;
+        self
+    }
+
+    /// Sessions receive this server unless it needs a human sign-in. With a
+    /// host credential helper they always do: the helper answers at request
+    /// time, and a decline reaches the agent as the sign-in message.
     pub fn injectable(&self) -> bool {
-        usable_tokens(&self.store).is_ok()
+        usable_tokens(&self.store).is_ok() || self.supplier.is_some()
+    }
+
+    async fn supplied(&self, rejected: Option<&str>) -> Option<String> {
+        match &self.supplier {
+            Some(supplier) => supplier.token(rejected).await,
+            None => None,
+        }
+    }
+
+    /// The router's own state, or `signed-in` / "provided credential" when only
+    /// the host's helper supplies a bearer. The router's sign-in always wins.
+    pub async fn effective_status(&self) -> ServerStatus {
+        let own = self.status();
+        if own.state == StatusState::SignedOut && self.supplied(None).await.is_some() {
+            return ServerStatus::new(StatusState::SignedIn, "provided credential");
+        }
+        own
     }
 
     pub fn status(&self) -> ServerStatus {
@@ -1072,7 +1197,15 @@ impl TokenSource {
         force: bool,
         rejected: Option<&str>,
     ) -> Result<String, AccessError> {
-        let tokens = usable_tokens(&self.store).map_err(AccessError::SignedOut)?;
+        let tokens = match usable_tokens(&self.store) {
+            Ok(tokens) => tokens,
+            Err(why) => {
+                return self
+                    .supplied(rejected)
+                    .await
+                    .ok_or(AccessError::SignedOut(why));
+            }
+        };
         if rejected.is_some_and(|r| r != tokens.access_token) {
             return Ok(tokens.access_token);
         }
@@ -1092,7 +1225,10 @@ impl TokenSource {
             Refresh::Renewed(token) => Ok(token),
             Refresh::Rejected => {
                 self.mark_failed(&current);
-                Err(AccessError::SignedOut("reconnect needed".into()))
+                match self.supplied(None).await {
+                    Some(token) => Ok(token),
+                    None => Err(AccessError::SignedOut("reconnect needed".into())),
+                }
             }
             // Headroom never costs a working credential: a token that is
             // short but still live is better than none. A bearer the server
@@ -1332,6 +1468,60 @@ pub async fn login_interactive(server: &RemoteServer, browser: bool) -> Result<S
     Ok(verify(&http, server, &store).await)
 }
 
+/// A loopback listener for one sign-in redirect: the redirect URI and the
+/// full URL the browser lands on. It stops after one callback, or when the
+/// flow expires.
+pub async fn loopback_redirect(
+    port: Option<u16>,
+) -> Result<(String, tokio::sync::oneshot::Receiver<String>), String> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
+        .await
+        .map_err(|e| format!("cannot listen for the sign-in redirect: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read the redirect address: {e}"))?
+        .port();
+    let redirect = format!("http://localhost:{port}/callback");
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let base = redirect.clone();
+    let done = stop.clone();
+    let app = axum::Router::new().route(
+        "/callback",
+        axum::routing::get(
+            move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                let (tx, base, done) = (tx.clone(), base.clone(), done.clone());
+                async move {
+                    let query = query.unwrap_or_default();
+                    if !query.contains("code=") && !query.contains("error=") {
+                        return axum::response::Html(
+                            CALLBACK_PAGE.replace("MESSAGE", "Waiting for sign-in."),
+                        );
+                    }
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(format!("{base}?{query}"));
+                    }
+                    done.cancel();
+                    axum::response::Html(CALLBACK_PAGE.replace(
+                        "MESSAGE",
+                        "Sign-in received. You can close this tab and return to your session.",
+                    ))
+                }
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        let expiry = tokio::time::sleep(Duration::from_millis(FLOW_TTL_MS as u64));
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                tokio::select! { () = stop.cancelled() => {}, () = expiry => {} }
+            })
+            .await;
+    });
+    Ok((redirect, rx))
+}
+
 /// Host-delegated sign-in, step one: the host owns the redirect (a public
 /// callback URL). Persists the pending flow (0600) and returns `{url, expiresAt}`.
 pub async fn login_start(server: &RemoteServer, redirect_uri: &str) -> Result<Value, String> {
@@ -1389,6 +1579,25 @@ pub(crate) mod tests {
     use super::*;
     use axum::{Router, extract::State, routing::get, routing::post};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn the_loopback_redirect_hands_back_the_full_landing_url_once() {
+        let (redirect, received) = loopback_redirect(None).await.unwrap();
+        assert!(redirect.starts_with("http://localhost:") && redirect.ends_with("/callback"));
+        let port = redirect
+            .trim_start_matches("http://localhost:")
+            .trim_end_matches("/callback");
+        let base = format!("http://127.0.0.1:{port}/callback");
+        // A bare visit (a prefetch) is not the redirect.
+        reqwest::get(&base).await.unwrap();
+        reqwest::get(format!("{base}?code=abc&state=xyz"))
+            .await
+            .unwrap();
+        assert_eq!(
+            received.await.unwrap(),
+            format!("{redirect}?code=abc&state=xyz")
+        );
+    }
 
     pub(crate) fn server(name: &str, url: &str) -> RemoteServer {
         RemoteServer::new(name, url)
