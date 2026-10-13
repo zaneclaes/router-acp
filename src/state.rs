@@ -746,8 +746,55 @@ impl StateStore {
         lease: &str,
     ) -> Result<(), String> {
         self.reconcile_planner_wakes();
+        let error = match self
+            .legacy
+            .claim_planner_workspace(path, sid, work_id, lease)
+        {
+            Err(error) if error.contains("held by another") => error,
+            result => return result,
+        };
+        // A new coordinator inherits a worktree whose holder can no longer use
+        // it: the holder's attempt has no live owner, or ended in a run that is
+        // no longer running.
+        let Some((holder, holder_work)) = self.legacy.planner_workspace_holder(path)? else {
+            return Err(error);
+        };
+        if holder == sid || !self.planner_claim_stale(&holder, &holder_work) {
+            return Err(error);
+        }
+        self.legacy
+            .release_planner_workspace(path, &holder, &holder_work)?;
+        tracing::info!(
+            path = %path.display(),
+            from = %holder,
+            to = %sid,
+            work_id,
+            "planner workspace claim taken over from a stale session"
+        );
         self.legacy
             .claim_planner_workspace(path, sid, work_id, lease)
+    }
+
+    fn planner_claim_stale(&self, holder: &str, work_id: &str) -> bool {
+        let document = match self.planner_run(holder) {
+            Ok(Some((_, document))) => document,
+            // Removing a run releases its claims; one without a run is unknown.
+            Ok(None) | Err(_) => return false,
+        };
+        let running = document.get("status").and_then(serde_json::Value::as_str) == Some("running");
+        let attempt = document
+            .pointer(&format!(
+                "/works/{}/attempt",
+                work_id.replace('~', "~0").replace('/', "~1")
+            ))
+            .cloned()
+            .and_then(|a| serde_json::from_value::<crate::planner_workflow::Attempt>(a).ok());
+        match attempt {
+            None => false,
+            Some(attempt) => {
+                !crate::planner_workflow::owner_alive(&attempt) || (attempt.ended && !running)
+            }
+        }
     }
 
     /// Merge routing state in the session's parent shard.
@@ -1845,6 +1892,32 @@ impl StateFile {
                 "workspace {canonical} is held by another durable assignment"
             ))
         }
+    }
+
+    fn planner_workspace_holder(&self, path: &Path) -> Result<Option<(String, String)>, String> {
+        self.conn
+            .query_row(
+                "SELECT session_id, work_id FROM planner_workspaces WHERE path = ?1",
+                [path.display().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_planner_workspace(
+        &self,
+        path: &Path,
+        sid: &str,
+        work_id: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM planner_workspaces WHERE path = ?1 AND session_id = ?2 AND work_id = ?3",
+                params![path.display().to_string(), sid, work_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn pending_planner_cleanup_sessions(&self) -> Vec<String> {
@@ -4162,6 +4235,51 @@ mod tests {
             .unwrap();
         let error = first
             .claim_planner_workspace(&workspace_b, "third-session", "work-c", "lease-c")
+            .unwrap_err();
+        assert!(error.contains("held by another"), "{error}");
+    }
+
+    #[test]
+    fn a_stale_holders_workspace_claim_passes_to_the_next_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::load(&dir.path().join("state.db"), Retention::default());
+        let old = store.new_session_id(&dir.path().join("repo")).unwrap();
+        let live = store.new_session_id(&dir.path().join("repo")).unwrap();
+        let next = store.new_session_id(&dir.path().join("repo")).unwrap();
+        for sid in [&old, &live, &next] {
+            store.upsert(sid.clone(), session("claude"));
+        }
+        let attempt = |pid: u32, started: u64, ended: bool| {
+            serde_json::json!({"id": "a", "router_pid": pid, "router_started_at_ms": started,
+                "delegate_id": null, "ended": ended})
+        };
+        // The previous router died: its paused run's attempt has no owner.
+        let stale = serde_json::json!({"status": "paused",
+            "works": {"plan-a": {"attempt": attempt(1, 1, true)}}});
+        assert_eq!(store.save_planner_run(&old, 0, &stale), Ok(1));
+        let (pid, started) = crate::planner_workflow::process_identity();
+        let running = serde_json::json!({"status": "running",
+            "works": {"plan-b": {"attempt": attempt(pid, started, false)}}});
+        assert_eq!(store.save_planner_run(&live, 0, &running), Ok(1));
+
+        let a = dir.path().join("workspace-a");
+        let b = dir.path().join("workspace-b");
+        store
+            .claim_planner_workspace(&a, &old, "plan-a", "lease-old")
+            .unwrap();
+        store
+            .claim_planner_workspace(&b, &live, "plan-b", "lease-live")
+            .unwrap();
+
+        store
+            .claim_planner_workspace(&a, &next, "plan-a", "lease-new")
+            .expect("a dead holder's claim is inherited");
+        let error = store
+            .claim_planner_workspace(&b, &next, "plan-b", "lease-new")
+            .unwrap_err();
+        assert!(error.contains("held by another"), "{error}");
+        let error = store
+            .claim_planner_workspace(&a, &old, "plan-a", "lease-old")
             .unwrap_err();
         assert!(error.contains("held by another"), "{error}");
     }

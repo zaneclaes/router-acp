@@ -490,7 +490,11 @@ mod tests {
         );
         assert_eq!(
             cfg.implementation_candidates,
-            vec!["*sol*".to_string(), "*opus*".to_string(), "*grok*".to_string()],
+            vec![
+                "*sol*".to_string(),
+                "*opus*".to_string(),
+                "*grok*".to_string()
+            ],
             "implementation default is sol, opus, grok: {:?}",
             cfg.implementation_candidates
         );
