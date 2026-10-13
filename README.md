@@ -663,6 +663,20 @@ sessions only once the router is signed in. `mcp-status --config <router.yaml>`
 reports a helper-served server as `signed-in` with the label
 `provided credential`.
 
+A helper may also answer `"denyTools": ["mail_*", "compose_brief"]` (exact
+names, or a prefix ending in `*`): tools its credential may not call, such as
+tools that act as a specific person. The router answers such a call itself
+with a tool error naming the sign-in, and never sends it upstream. The
+router's own sign-in is never restricted.
+
+**Tool results in the session.** Some adapters report a finished MCP tool call
+to the client with no output. Each session gets its own broker address, so the
+router knows which session a result belongs to; it keeps each result briefly
+(two minutes, twenty per session) and writes it into a completed tool-call
+update that arrives empty. It matches the update's title (`tool`,
+`server__tool`, or `mcp__server__tool`) and never replaces output the agent
+reported. Delegate workers' results are not filled.
+
 **Hosts that own the redirect** (a remote box whose browser is elsewhere) use
 the two-step form: `mcp-login <name> --redirect-uri <public callback>` prints
 `{url, expiresAt}` and keeps the pending flow (0600, ten minutes), and

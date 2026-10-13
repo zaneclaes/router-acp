@@ -2897,6 +2897,16 @@ pub fn handle_downstream_dispatch(
                             fwd = relay::with_router_notices(&fwd, notices)?;
                         }
                     }
+                    // Some adapters drop MCP output from the completed update;
+                    // the broker saw the result and fills it back in.
+                    if relay::is_tool_call_update(&fwd) {
+                        let mut params = fwd.params().clone();
+                        if let Some(update) = params.get_mut("update")
+                            && shared.mcp_broker.fill_tool_result(&router_sid, update)
+                        {
+                            fwd = agent_client_protocol::UntypedMessage::new(fwd.method(), params)?;
+                        }
+                    }
                     // Attribute each tool call to the model that produced it, as
                     // structured metadata on the frame the client already renders
                     // as a card. This is where per-request routing belongs — it
@@ -5321,7 +5331,10 @@ pub(crate) fn mcp_servers_for_pin(
         }
     }
     // The project's signed-in remote servers, through the router's broker.
-    crate::mcp_broker::merge_authoritative(&mut servers, shared.mcp_broker.session_servers(&cwd));
+    crate::mcp_broker::merge_authoritative(
+        &mut servers,
+        shared.mcp_broker.session_servers(&cwd, Some(router_sid)),
+    );
     let delegate_attached = crate::delegate_mcp::delegation_available(shared, candidate);
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);

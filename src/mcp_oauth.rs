@@ -1040,8 +1040,23 @@ enum Refresh {
 pub struct Supplier {
     helper: crate::config::McpCredentialCommand,
     request: Value,
-    /// The last answer and when it lapses: `Some(token)` or a decline.
-    cached: tokio::sync::Mutex<Option<(Option<String>, i64)>>,
+    /// The last answer and when it lapses: a supplied token or a decline.
+    cached: tokio::sync::Mutex<Option<(Option<Supplied>, i64)>>,
+}
+
+/// A helper's bearer and the tools it may not be used for.
+#[derive(Clone)]
+struct Supplied {
+    token: String,
+    /// `denyTools`: exact names, or a prefix ending in `*`.
+    deny: Vec<String>,
+}
+
+fn tool_matches(pattern: &str, tool: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => tool.starts_with(prefix),
+        None => pattern == tool,
+    }
 }
 
 /// A supplied token is reused until this long before its `expiresAt`.
@@ -1076,9 +1091,10 @@ impl Supplier {
     pub async fn token(&self, rejected: Option<&str>) -> Option<String> {
         let mut cached = self.cached.lock().await;
         if let Some((answer, until)) = cached.as_ref() {
-            let refused = rejected.is_some() && answer.as_deref() == rejected;
+            let token = answer.as_ref().map(|s| s.token.as_str());
+            let refused = rejected.is_some() && token == rejected;
             if !refused && *until > now_ms() {
-                return answer.clone();
+                return token.map(String::from);
             }
         }
         let answer = self.run().await;
@@ -1087,12 +1103,26 @@ impl Supplier {
             Some((_, None)) => now_ms() + SUPPLIED_TTL_MS,
             None => now_ms() + DECLINE_TTL_MS,
         };
-        let token = answer.map(|(token, _)| token);
-        *cached = Some((token.clone(), until));
+        let supplied = answer.map(|(supplied, _)| supplied);
+        let token = supplied.as_ref().map(|s| s.token.clone());
+        *cached = Some((supplied, until));
         token
     }
 
-    async fn run(&self) -> Option<(String, Option<i64>)> {
+    /// The helper supplied `token` and named `tool` in its `denyTools`.
+    pub async fn denies(&self, token: &str, tool: &str) -> bool {
+        self.cached
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(answer, _)| {
+                answer.as_ref().is_some_and(|s| {
+                    s.token == token && s.deny.iter().any(|p| tool_matches(p, tool))
+                })
+            })
+    }
+
+    async fn run(&self) -> Option<(Supplied, Option<i64>)> {
         use tokio::io::AsyncWriteExt;
         let name = self.request["name"]
             .as_str()
@@ -1130,8 +1160,22 @@ impl Supplier {
         if token.is_empty() {
             return None;
         }
+        let deny = answer
+            .get("denyTools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         Some((
-            token.to_string(),
+            Supplied {
+                token: token.to_string(),
+                deny,
+            },
             answer.get("expiresAt").and_then(Value::as_i64),
         ))
     }
@@ -1175,6 +1219,14 @@ impl TokenSource {
     /// time, and a decline reaches the agent as the sign-in message.
     pub fn injectable(&self) -> bool {
         usable_tokens(&self.store).is_ok() || self.supplier.is_some()
+    }
+
+    /// `token` came from the host's helper, which may not be used for `tool`.
+    pub async fn denies(&self, token: &str, tool: &str) -> bool {
+        match &self.supplier {
+            Some(supplier) => supplier.denies(token, tool).await,
+            None => false,
+        }
     }
 
     async fn supplied(&self, rejected: Option<&str>) -> Option<String> {

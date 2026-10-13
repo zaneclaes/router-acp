@@ -62,6 +62,32 @@ struct Entry {
     name: String,
     upstream: String,
     source: Arc<TokenSource>,
+    /// The router session the entry was issued to (none for `mcp-call` and
+    /// delegate workers): its tool results may fill that session's updates.
+    session: Option<String>,
+}
+
+/// A tool result the broker carried for a session, kept briefly so a
+/// completed tool update the agent reported empty can show it.
+struct Capture {
+    server: String,
+    tool: String,
+    text: String,
+    at: std::time::Instant,
+}
+
+/// Results older than this no longer fill an update.
+const CAPTURE_TTL: Duration = Duration::from_secs(120);
+/// Results kept per session.
+const CAPTURE_MAX: usize = 20;
+/// Characters of one result written into an update.
+const CAPTURE_TEXT_MAX: usize = 80_000;
+
+#[derive(Default)]
+struct Captures {
+    results: HashMap<String, std::collections::VecDeque<Capture>>,
+    /// Tool-call titles by (session, toolCallId): updates may omit the title.
+    titles: HashMap<(String, String), String>,
 }
 
 /// A Claude runtime the broker may write private settings into.
@@ -82,6 +108,7 @@ pub struct Broker {
     /// single-flight refresh.
     sources: Mutex<HashMap<String, Arc<TokenSource>>>,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
+    captures: Mutex<Captures>,
     runtimes: Mutex<HashMap<ProcessKey, ClaudeRuntime>>,
 }
 
@@ -95,6 +122,7 @@ impl Broker {
             http: reqwest::Client::new(),
             sources: Mutex::default(),
             entries: Mutex::default(),
+            captures: Mutex::default(),
             runtimes: Mutex::default(),
         })
     }
@@ -147,6 +175,7 @@ impl Broker {
             name: server.name.clone(),
             upstream: server.url.clone(),
             source: self.source_for(server),
+            session: None,
         }
     }
 
@@ -165,6 +194,9 @@ impl Broker {
             .access_token(false, None)
             .await
             .map_err(|e| access_failure_cli(entry, e))?;
+        if source.denies(&token, tool).await {
+            return Err(CallFailure::SignedOut(denied_message(&entry.name, tool)));
+        }
         match call_once(
             &self.http,
             &entry.upstream,
@@ -208,7 +240,7 @@ impl Broker {
     /// the router is signed in to. A server that needs a human sign-in is left
     /// to the adapters as before (Kory likewise omits a hard disconnect and
     /// still starts the session).
-    pub fn session_servers(&self, cwd: &FsPath) -> Vec<McpServer> {
+    pub fn session_servers(&self, cwd: &FsPath, session: Option<&str>) -> Vec<McpServer> {
         let Some(addr) = self.addr.get() else {
             return Vec::new();
         };
@@ -221,8 +253,15 @@ impl Broker {
             if !source.injectable() {
                 continue;
             }
-            let id: String = Sha256::digest(format!("{}\n{}", remote.name, remote.url).as_bytes())
-                [..8]
+            let id: String = Sha256::digest(
+                format!(
+                    "{}\n{}\n{}",
+                    remote.name,
+                    remote.url,
+                    session.unwrap_or_default()
+                )
+                .as_bytes(),
+            )[..8]
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect();
@@ -232,6 +271,7 @@ impl Broker {
                     name: remote.name.clone(),
                     upstream: remote.url.clone(),
                     source,
+                    session: session.map(String::from),
                 }),
             );
             out.push(McpServer::Http(
@@ -240,6 +280,90 @@ impl Broker {
             ));
         }
         out
+    }
+
+    fn capture(&self, entry: &Entry, tool: &str, result: &Value) {
+        let Some(session) = &entry.session else {
+            return;
+        };
+        let text = result_text(result);
+        if text.is_empty() {
+            return;
+        }
+        let mut captures = self.captures.lock().unwrap();
+        let list = captures.results.entry(session.clone()).or_default();
+        list.retain(|c| c.at.elapsed() < CAPTURE_TTL);
+        if list.len() >= CAPTURE_MAX {
+            list.pop_front();
+        }
+        list.push_back(Capture {
+            server: entry.name.clone(),
+            tool: tool.to_string(),
+            text: text.chars().take(CAPTURE_TEXT_MAX).collect(),
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// Fill a completed tool update the agent reported without output, from
+    /// the result this broker carried for that session's matching tool call.
+    /// Some adapters drop MCP output from the update they send the client.
+    /// Remembers `tool_call` titles for later updates that omit them. True
+    /// when `update` changed.
+    pub fn fill_tool_result(&self, session: &str, update: &mut Value) -> bool {
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let id = update
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let title = update
+            .get("title")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let mut captures = self.captures.lock().unwrap();
+        let key = (session.to_string(), id);
+        if kind == "tool_call" {
+            if let Some(title) = title {
+                captures.titles.insert(key, title);
+            }
+            return false;
+        }
+        if kind != "tool_call_update"
+            || update.get("status").and_then(Value::as_str) != Some("completed")
+        {
+            return false;
+        }
+        let Some(title) = title.or_else(|| captures.titles.get(&key).cloned()) else {
+            return false;
+        };
+        captures.titles.remove(&key);
+        let Some(list) = captures.results.get_mut(session) else {
+            return false;
+        };
+        list.retain(|c| c.at.elapsed() < CAPTURE_TTL);
+        let Some(found) = list
+            .iter()
+            .position(|c| title_names(&title, &c.server, &c.tool))
+        else {
+            return false;
+        };
+        // A reported result is the source of truth; still consume the capture
+        // so a later empty update cannot pick up this call's leftover.
+        let capture = list.remove(found).unwrap();
+        let empty = |field: &str| {
+            update
+                .get(field)
+                .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+        };
+        if !empty("content") || !empty("rawOutput") {
+            return false;
+        }
+        update["content"] =
+            json!([{"type": "content", "content": {"type": "text", "text": capture.text}}]);
+        true
     }
 
     /// True for an entry this broker produced.
@@ -398,6 +522,16 @@ async fn proxy(
         Ok(token) => token,
         Err(error) => return access_failure(entry, error),
     };
+    let call = tool_call(&body);
+    if let Some((id, tool)) = &call
+        && source.denies(&token, tool).await
+    {
+        return json_response(
+            StatusCode::OK,
+            json!({"jsonrpc": "2.0", "id": id, "result": {"isError": true,
+                "content": [{"type": "text", "text": denied_message(&entry.name, tool)}]}}),
+        );
+    }
     // Grok and goose open with `server/discover`, which these upstreams
     // answer 404; reply locally so the client negotiates the legacy protocol.
     if let Some(reply) = legacy_discover_response(&body, &entry.name) {
@@ -434,8 +568,59 @@ async fn proxy(
     }
     if upstream.status.is_success() && !upstream.rejects_auth() {
         source.note(StatusState::SignedIn, "signed in");
+        if let (Some((_, tool)), UpstreamBody::Buffered(bytes)) = (&call, &upstream.body) {
+            let content_type = upstream
+                .headers
+                .iter()
+                .find(|(name, _)| *name == "content-type")
+                .and_then(|(_, v)| v.to_str().ok())
+                .unwrap_or("");
+            if let Some(result) = parse_rpc(content_type, &String::from_utf8_lossy(bytes))
+                .and_then(|m| m.get("result").cloned())
+            {
+                broker.capture(entry, tool, &result);
+            }
+        }
     }
     upstream.into_response()
+}
+
+/// The JSON-RPC id and tool name of a `tools/call` request body.
+fn tool_call(body: &[u8]) -> Option<(Value, String)> {
+    let message: Value = serde_json::from_slice(body).ok()?;
+    if message.get("method")?.as_str()? != "tools/call" {
+        return None;
+    }
+    let tool = message.pointer("/params/name")?.as_str()?.to_string();
+    Some((message.get("id").cloned().unwrap_or(Value::Null), tool))
+}
+
+/// A tool the host's credential may not call (the helper's `denyTools`).
+fn denied_message(server: &str, tool: &str) -> String {
+    format!(
+        "{server} MCP: `{tool}` needs your own sign-in; the host credential may not call it. \
+         Sign in with /mcp or `router-acp mcp-login {server}`."
+    )
+}
+
+/// A tool result's text, as the agent would have shown it.
+fn result_text(result: &Value) -> String {
+    match result.get("content").and_then(Value::as_array) {
+        Some(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    }
+}
+
+/// Whether an adapter's tool-call title names `tool` on `server`: the bare
+/// name, `server__tool` (goose), or `mcp__server__tool` (Claude, Grok).
+fn title_names(title: &str, server: &str, tool: &str) -> bool {
+    title == tool
+        || title == format!("{server}__{tool}")
+        || title == format!("mcp__{server}__{tool}")
 }
 
 enum UpstreamBody {
@@ -1001,7 +1186,7 @@ mod tests {
     }
 
     fn entry(broker: &Broker, project: &tempfile::TempDir) -> (String, String) {
-        let servers = broker.session_servers(project.path());
+        let servers = broker.session_servers(project.path(), None);
         let [McpServer::Http(http)] = servers.as_slice() else {
             panic!("one http entry: {servers:?}");
         };
@@ -1027,12 +1212,12 @@ mod tests {
         let broker = Broker::new(root.path().to_path_buf(), None);
         let dir = project(&upstream_url);
         assert!(
-            broker.session_servers(dir.path()).is_empty(),
+            broker.session_servers(dir.path(), None).is_empty(),
             "unbound: nothing"
         );
         broker.bind().await.unwrap();
         assert!(
-            broker.session_servers(dir.path()).is_empty(),
+            broker.session_servers(dir.path(), None).is_empty(),
             "not signed in: left to adapters"
         );
         signed_in(
@@ -1041,11 +1226,11 @@ mod tests {
             "http://127.0.0.1:1/token",
             &tokens("t", 3_600_000),
         );
-        assert_eq!(broker.session_servers(dir.path()).len(), 1);
+        assert_eq!(broker.session_servers(dir.path(), None).len(), 1);
         let elsewhere = tempfile::tempdir().unwrap();
         std::fs::create_dir(elsewhere.path().join(".git")).unwrap();
         assert!(
-            broker.session_servers(elsewhere.path()).is_empty(),
+            broker.session_servers(elsewhere.path(), None).is_empty(),
             "no project file: nothing"
         );
     }
@@ -1106,6 +1291,155 @@ mod tests {
         );
     }
 
+    /// One `tools/call` through the broker's entry for `session`.
+    async fn call_through(
+        broker: &Broker,
+        dir: &tempfile::TempDir,
+        session: &str,
+        tool: &str,
+    ) -> Value {
+        let servers = broker.session_servers(dir.path(), Some(session));
+        let [McpServer::Http(http)] = servers.as_slice() else {
+            panic!("one http entry: {servers:?}");
+        };
+        reqwest::Client::new()
+            .post(&http.url)
+            .header("authorization", &http.headers[0].value)
+            .json(&json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":tool,"arguments":{}}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    fn completed(id: &str, title: Option<&str>, content: Value) -> Value {
+        let mut update = json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+            "status":"completed","content":content});
+        if let Some(title) = title {
+            update["title"] = json!(title);
+        }
+        update
+    }
+
+    #[tokio::test]
+    async fn an_empty_completed_tool_update_shows_the_result_the_broker_carried() {
+        let (upstream_url, _) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let (broker, dir) = broker_for(
+            &upstream_url,
+            "http://127.0.0.1:1/token",
+            root.path(),
+            tokens("t", 3_600_000),
+        )
+        .await;
+        // The title arrives on the announcement; the update omits it.
+        let mut announce = json!({"sessionUpdate":"tool_call","toolCallId":"c1",
+            "title":"mcp__fake__search","status":"pending"});
+        assert!(!broker.fill_tool_result("s1", &mut announce));
+        call_through(&broker, &dir, "s1", "search").await;
+        // Another session's update never takes this session's result.
+        let mut other = completed("c1", Some("mcp__fake__search"), json!([]));
+        assert!(!broker.fill_tool_result("s2", &mut other));
+        let mut update = completed("c1", None, json!([]));
+        assert!(broker.fill_tool_result("s1", &mut update));
+        assert_eq!(update["content"][0]["content"]["text"], "2 hits");
+        // Used once: a second empty update for the same tool stays empty.
+        let mut again = completed("c2", Some("fake__search"), json!([]));
+        assert!(!broker.fill_tool_result("s1", &mut again));
+    }
+
+    #[tokio::test]
+    async fn a_reported_tool_result_is_never_replaced() {
+        let (upstream_url, _) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let (broker, dir) = broker_for(
+            &upstream_url,
+            "http://127.0.0.1:1/token",
+            root.path(),
+            tokens("t", 3_600_000),
+        )
+        .await;
+        call_through(&broker, &dir, "s1", "search").await;
+        let own = json!([{"type":"content","content":{"type":"text","text":"agent's own"}}]);
+        let mut update = completed("c1", Some("search"), own.clone());
+        assert!(!broker.fill_tool_result("s1", &mut update));
+        assert_eq!(update["content"], own);
+        // ...and it consumed the capture, so a later empty one stays empty.
+        let mut later = completed("c2", Some("search"), Value::Null);
+        assert!(!broker.fill_tool_result("s1", &mut later));
+    }
+
+    #[tokio::test]
+    async fn a_helper_token_is_refused_for_the_tools_it_denies() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let scripts = tempfile::tempdir().unwrap();
+        let supplied = helper(
+            scripts.path(),
+            r#"echo '{"token":"box-jwt","denyTools":["mail_*","compose_brief"]}'"#,
+        );
+        let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
+        broker.bind().await.unwrap();
+        let dir = project(&upstream_url);
+        let refused = call_through(&broker, &dir, "s1", "mail_send").await;
+        assert_eq!(refused["id"], 7);
+        assert_eq!(refused["result"]["isError"], true);
+        assert!(
+            refused["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("needs your own sign-in"),
+            "{refused}"
+        );
+        assert!(
+            !upstream
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.0.contains("mail_send")),
+            "a denied tool never reaches the upstream"
+        );
+        let allowed = call_through(&broker, &dir, "s1", "search").await;
+        assert_eq!(allowed["result"]["content"][0]["text"], "2 hits");
+        for (tool, ok) in [("compose_brief", false), ("search", true)] {
+            let outcome = call_tool(
+                root.path(),
+                Some(supplied.clone()),
+                &server("fake", &upstream_url),
+                tool,
+                &json!({}),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(outcome.is_ok(), ok, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_routers_own_sign_in_ignores_a_helpers_deny_list() {
+        let (upstream_url, _) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        signed_in(
+            root.path(),
+            &server("fake", &upstream_url),
+            "http://127.0.0.1:1/token",
+            &tokens("mine", 3_600_000),
+        );
+        let scripts = tempfile::tempdir().unwrap();
+        let supplied = helper(
+            scripts.path(),
+            r#"echo '{"token":"box-jwt","denyTools":["*"]}'"#,
+        );
+        let broker = Broker::new(root.path().to_path_buf(), Some(supplied));
+        broker.bind().await.unwrap();
+        let dir = project(&upstream_url);
+        let answer = call_through(&broker, &dir, "s1", "mail_send").await;
+        assert_eq!(answer["result"]["content"][0]["text"], "2 hits");
+    }
+
     #[tokio::test]
     async fn a_rejected_bearer_is_refreshed_and_retried_once() {
         let (upstream_url, upstream) = fake_upstream().await;
@@ -1159,7 +1493,7 @@ mod tests {
             .unwrap();
         assert_eq!(refused.status(), 401);
         assert_eq!(source.status().state, StatusState::SignedOut);
-        assert!(broker.session_servers(dir.path()).is_empty());
+        assert!(broker.session_servers(dir.path(), None).is_empty());
         let after = http
             .post(&url)
             .header("authorization", &bearer)
@@ -1585,7 +1919,7 @@ mod tests {
         let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
         broker.bind().await.unwrap();
         let names: Vec<String> = broker
-            .session_servers(project.path())
+            .session_servers(project.path(), None)
             .iter()
             .map(|s| match s {
                 McpServer::Http(h) => h.name.clone(),
@@ -1623,7 +1957,7 @@ mod tests {
         let supplied = helper(scripts.path(), r#"echo '{"token":"box-jwt"}'"#);
         let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
         broker.bind().await.unwrap();
-        assert_eq!(broker.session_servers(project.path()).len(), 1);
+        assert_eq!(broker.session_servers(project.path(), None).len(), 1);
         let status =
             crate::mcp_oauth::project_status_json(project.path(), root.path(), Some(&supplied))
                 .await;
