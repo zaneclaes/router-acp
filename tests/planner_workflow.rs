@@ -1431,7 +1431,7 @@ async fn human_phase_directive_reopens_a_complete_run_for_implementation() {
 }
 
 #[tokio::test]
-async fn post_completion_input_is_rejected_without_new_unresolved_input() {
+async fn post_completion_agent_input_is_rejected_without_new_unresolved_input() {
     let fixture = fixture(|_| {});
     authorize(&fixture.shared);
     planner_workflow::operate(
@@ -1446,18 +1446,60 @@ async fn post_completion_input_is_rejected_without_new_unresolved_input() {
     .await
     .unwrap();
 
-    let error = planner_workflow::observe_input(
-        &fixture.shared,
-        SID,
-        &input_request(Some("late-input"), "arrived after completion", false),
-    )
-    .unwrap_err();
+    let mut late = input_request(Some("late-input"), "arrived after completion", false);
+    late.meta = serde_json::from_value(json!({
+        "router_acp": {"input_id": "late-input", "agent_origin": true}
+    }))
+    .ok();
+    let error = planner_workflow::observe_input(&fixture.shared, SID, &late).unwrap_err();
     assert!(error.to_ascii_lowercase().contains("complete"), "{error}");
     let run = planner_workflow::load(&fixture.shared, SID)
         .unwrap()
         .unwrap();
     assert_eq!(run.status, RunStatus::Complete);
     assert!(!run.inputs.contains_key("late-input"));
+}
+
+/// A person's plain follow-up to a finished run (e.g. "edit the plan") is the
+/// next turn of the conversation, not an error; it reopens the run in its last
+/// phase and stays unresolved until the planner reconciles it.
+#[tokio::test]
+async fn post_completion_human_follow_up_reopens_the_run_in_its_phase() {
+    let fixture = fixture(|_| {});
+    authorize(&fixture.shared);
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Complete {
+            key: "complete-planning".into(),
+            queue_evidence: "queue verified".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    run.phase = router_acp::config::PlannerPhase::Planning;
+    planner_workflow::save(&fixture.shared, SID, &mut run).unwrap();
+
+    planner_workflow::observe_input(
+        &fixture.shared,
+        SID,
+        &input_request(
+            Some("follow-up"),
+            "Boundaries are approved; edit the plan.",
+            false,
+        ),
+    )
+    .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.phase, router_acp::config::PlannerPhase::Planning);
+    assert!(!run.inputs["follow-up"].acknowledged);
 }
 
 #[test]

@@ -704,27 +704,30 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         return Ok(());
     }
     let directed = directed_phase(req);
+    let human = human_prompt(req);
     mutate(shared, sid, |run| {
-        if run.status == RunStatus::Complete && directed.is_none() {
+        if run.status == RunStatus::Complete && !human {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
+        }
+        // A person's follow-up continues a finished run in its last phase.
+        if run.status == RunStatus::Complete {
+            run.status = RunStatus::Running;
         }
         let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
             Some(record_input(run, req)?)
         } else {
             prompt_input_id(req).map(str::to_string)
         };
-        // Mirrors an explicit command: the run follows the human's phase, an
-        // implementation choice is the authentic request work admission
-        // needs, and a finished or stopped run reopens.
+        // Mirrors an explicit command: the run follows the human's phase, and
+        // an implementation choice resumes a stopped run with the authentic
+        // request work admission needs.
         if let Some(phase) = directed {
             run.phase = phase;
-            if phase == PlannerPhase::Implementation || run.status == RunStatus::Complete {
+            if phase == PlannerPhase::Implementation {
                 if matches!(run.status, RunStatus::Paused | RunStatus::Cancelled) {
                     run.approval_waits.clear();
                 }
                 run.status = RunStatus::Running;
-            }
-            if phase == PlannerPhase::Implementation {
                 run.execution_request = Some(display_text(req));
                 run.execution_input_id = input_id;
             }
@@ -752,7 +755,7 @@ pub(crate) fn enqueue_parent_input(
     ensure(shared, sid)?;
     mutate(shared, sid, |run| {
         if run.status == RunStatus::Complete {
-            if phase.is_none() {
+            if phase.is_none() && !human_prompt(req) {
                 return Err(
                     "planner run is complete; use /plan or /implement for new scope".into(),
                 );
