@@ -1404,6 +1404,14 @@ async fn human_phase_directive_reopens_a_complete_run_for_implementation() {
         error.contains("complete"),
         "an agent cannot reopen the run: {error}"
     );
+    assert_eq!(
+        fixture
+            .shared
+            .with_session(SID, |s| s.planner_explicit_phase)
+            .flatten(),
+        None,
+        "an agent's directive does not choose the routing pool"
+    );
 
     planner_workflow::observe_input(
         &fixture.shared,
@@ -1417,6 +1425,14 @@ async fn human_phase_directive_reopens_a_complete_run_for_implementation() {
     assert_eq!(run.status, RunStatus::Running);
     assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
     assert_eq!(run.execution_input_id.as_deref(), Some("human-handoff"));
+    assert_eq!(
+        fixture
+            .shared
+            .with_session(SID, |s| s.planner_explicit_phase)
+            .flatten(),
+        Some(router_acp::config::PlannerPhase::Implementation),
+        "a human phase directive routes from that phase's pool, as the command does"
+    );
     planner_workflow::operate(
         &fixture.shared,
         SID,

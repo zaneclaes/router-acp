@@ -705,6 +705,10 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
     }
     let directed = directed_phase(req);
     let human = human_prompt(req);
+    // An explicit phase routes from that phase's pool only, as the command does.
+    if let Some(phase) = directed {
+        shared.with_session(sid, |s| s.planner_explicit_phase = Some(phase));
+    }
     mutate(shared, sid, |run| {
         if run.status == RunStatus::Complete && !human {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
