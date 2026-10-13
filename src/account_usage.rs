@@ -37,17 +37,34 @@ pub fn status(config: &crate::config::Config) -> Value {
             config.cordon.enabled,
             SystemTime::now(),
         );
-        serde_json::json!({"id":agent.name,"provider":crate::accounts::provider(agent),
+        let provider = crate::accounts::provider(agent);
+        let capacity = crate::window_capacity::status_json(snapshot.as_ref()
+            .and_then(|s| crate::window_capacity::read(agent, &s.account)).as_ref());
+        // Still on the provider CLI's own directory, shared with that CLI.
+        let shared_directory = match (crate::credentials::directory(agent), agent.env_var("HOME"), provider) {
+            (Some(dir), Some(home), Some(p)) => dir == std::path::Path::new(&home).join(format!(".{p}")),
+            _ => false,
+        };
+        serde_json::json!({"id":agent.name,"provider":provider,
             "label":safe_text(&label),"plan":plan.map(|p| safe_text(&p)),"authState":auth,
             "credentialPresent":crate::credentials::present(agent),
+            "priority":agent.account_priority,
+            "reserveCapacity":{"weekly":agent.reserve_capacity.weekly,"session":agent.reserve_capacity.session},
+            "sharedDirectory":shared_directory,
             "routing":routing,
-            "windowCapacity":crate::window_capacity::status_json(snapshot.as_ref()
-                .and_then(|s| crate::window_capacity::read(agent, &s.account)).as_ref()),
+            "usage":crate::usage_view::view(agent.usage_source.as_ref(), snapshot.as_ref(), &capacity),
+            "windowCapacity":capacity,
             "snapshot":snapshot.map(|s| serde_json::json!({"account":s.account,"access_generation":s.access_generation,
                 "updatedAt":chrono::DateTime::from_timestamp(s.fetched_at as i64, 0).map(|t| t.to_rfc3339()),
                 "fetched_at":s.fetched_at,"known":s.payload.is_some()}))})
     }).collect::<Vec<_>>();
-    serde_json::json!({"accounts":accounts})
+    // The configuration revision this membership was read from.
+    let revision = config
+        .source_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|raw| crate::config_admin::revision(&raw));
+    serde_json::json!({"revision":revision,"accounts":accounts})
 }
 
 fn routing_status(

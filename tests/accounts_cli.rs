@@ -724,6 +724,133 @@ fn account_status_reports_router_owned_capacity_outcomes() {
     assert!(work["routing"]["resetsAt"].is_string());
     assert_eq!(personal["routing"]["available"], true);
     assert!(personal["routing"]["reason"].is_null());
+    // Hosts read normalized usage here, never the snapshot files.
+    assert_eq!(work["usage"]["windows"][0]["percent"], 100);
+    assert_eq!(work["usage"]["windows"][0]["active"], true);
+    assert_eq!(personal["usage"]["windows"][0]["percent"], 34);
+    assert!(personal["usage"]["updatedAt"].is_string());
+    assert!(personal["usage"]["error"].is_null());
+    assert_eq!(personal["sharedDirectory"], false);
+    assert_eq!(personal["priority"], 2);
+    assert_eq!(
+        status["revision"],
+        router_acp::config_admin::revision(&std::fs::read(&config).unwrap())
+    );
+}
+
+fn router(args: &[&str], config: &Path, stdin: Option<&Value>) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    if let Some(value) = stdin {
+        input.write_all(value.to_string().as_bytes()).unwrap();
+    }
+    drop(input);
+    child.wait_with_output().unwrap()
+}
+
+fn json_of(output: &std::process::Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// A host edits settings and account order only through router commands. A
+/// settings save keeps the router's accounts, and a stale write is refused.
+#[test]
+fn config_commands_keep_router_accounts_and_refuse_stale_writes() {
+    let (_dir, config, _home, _bin, _provider_marker, _curl_marker) = cache_usage_fixture();
+    let shown = json_of(&router(&["config-show"], &config, None));
+    let revision = shown["revision"].as_str().unwrap().to_string();
+    let mut proposed = shown["config"].clone();
+    proposed["agents"][0]["models"] =
+        json!([{"id": "sonnet", "cost_rank": 2}, {"id": "opus", "cost_rank": 3}]);
+    proposed["agents"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("accounts");
+
+    let applied = json_of(&router(
+        &["config-apply", "--expect-revision", &revision],
+        &config,
+        Some(&proposed),
+    ));
+    let claude = &applied["config"]["agents"][0];
+    assert_eq!(claude["models"].as_array().unwrap().len(), 2);
+    assert_eq!(claude["accounts"].as_array().unwrap().len(), 2);
+
+    let stale = router(
+        &["config-apply", "--expect-revision", &revision],
+        &config,
+        Some(&proposed),
+    );
+    assert_eq!(stale.status.code(), Some(3));
+
+    json_of(&router(
+        &[
+            "account-reserve",
+            "--account",
+            "claude@work",
+            "--weekly",
+            "15",
+            "--session",
+            "25",
+        ],
+        &config,
+        None,
+    ));
+    json_of(&router(
+        &[
+            "account-order",
+            "--provider",
+            "claude",
+            "--account",
+            "claude@personal",
+            "--account",
+            "claude@work",
+        ],
+        &config,
+        None,
+    ));
+    let missing = router(
+        &[
+            "account-order",
+            "--provider",
+            "claude",
+            "--account",
+            "claude@work",
+        ],
+        &config,
+        None,
+    );
+    assert_eq!(missing.status.code(), Some(3));
+    let status = json_of(&router(&["account-status"], &config, None));
+    let account = |id: &str| {
+        status["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        account("claude@work")["reserveCapacity"],
+        json!({"weekly": 15.0, "session": 25.0})
+    );
+    assert_eq!(account("claude@personal")["priority"], 1);
+    assert_eq!(account("claude@work")["priority"], 2);
 }
 
 #[tokio::test]

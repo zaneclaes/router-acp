@@ -1324,7 +1324,7 @@ async fn write_config(
 /// Validate `document` as a router configuration and replace the file at
 /// `path` with it atomically (private temp file, fsync, rename). The caller
 /// holds the accounts lock.
-fn save_document(path: &Path, document: &Value) -> Result<Config, String> {
+pub(crate) fn save_document(path: &Path, document: &Value) -> Result<Config, String> {
     let yaml = serde_yaml::to_string(document).map_err(|e| e.to_string())?;
     let mut cfg = Config::from_yaml(&yaml).map_err(|e| e.to_string())?;
     cfg.source_path = Some(path.to_path_buf());
@@ -1350,9 +1350,9 @@ fn save_document(path: &Path, document: &Value) -> Result<Config, String> {
     Ok(cfg)
 }
 
-struct ConfigLock(std::fs::File);
+pub(crate) struct ConfigLock(std::fs::File);
 impl ConfigLock {
-    fn acquire(path: PathBuf) -> Result<Self, String> {
+    pub(crate) fn acquire(path: PathBuf) -> Result<Self, String> {
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)]
@@ -1766,7 +1766,7 @@ pub(crate) fn account_group(shared: &Arc<Shared>, name: &str) -> Vec<String> {
 /// Set fields on an account wherever the document declares it: a standalone
 /// `agents[]` entry (what `/login` → Add Account writes) and/or an entry in
 /// its base agent's `accounts:` list.
-fn set_account_fields(
+pub(crate) fn set_account_fields(
     doc: &mut Value,
     name: &str,
     standalone: &[(&str, Value)],

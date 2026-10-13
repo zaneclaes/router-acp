@@ -3605,6 +3605,63 @@ async fn a_reference_without_an_account_names_the_agents_account_seat() {
     .await;
 }
 
+/// A session saved while its seat was still `fancy` resumes after that seat
+/// became the account `fancy@one`, onto that account, not an unknown agent.
+#[tokio::test]
+async fn a_resumed_session_follows_its_seat_into_an_account() {
+    let state = temp_state_file("seat-restore");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml("fancy@one", &[("opus", 3)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=fancy@one/opus] first").await?;
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+
+        // The checkpoint as a router before the account rename wrote it.
+        let mut persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        let snapshot = persisted.session_config.as_mut().expect("checkpoint");
+        snapshot["candidate"] = serde_json::json!("fancy/opus");
+        snapshot["preferred_candidate"] = serde_json::json!("fancy/opus");
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(sid.clone(), persisted)
+            .unwrap();
+
+        cx.send_request(
+            agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(),
+                std::env::temp_dir(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let restored = shared
+            .with_session(&sid, |s| {
+                (
+                    s.candidate_override.as_ref().map(ToString::to_string),
+                    s.preferred_candidate.as_ref().map(ToString::to_string),
+                )
+            })
+            .unwrap();
+        assert_eq!(restored.0.as_deref(), Some("fancy@one/opus"));
+        assert_eq!(restored.1.as_deref(), Some("fancy@one/opus"));
+        prompt_text(&cx, &sid, "second").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(text.matches("static → fancy@one/opus").count(), 2, "{text}");
+        Ok(())
+    })
+    .await;
+}
+
 /// Grok reports an exhausted seat as `402 Payment Required … usage balance
 /// exhausted`. That classified as an ordinary error, so every turn routed back
 /// to the exhausted seat and failed instead of failing over.

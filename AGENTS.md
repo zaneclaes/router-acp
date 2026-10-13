@@ -54,6 +54,8 @@ SDK traps below, which were all discovered the hard way.
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment (`with_router_notices` adds `notices[]`) |
 | `src/notice.rs` | typed router notices: reason → label (`GPT-6.1 Sol outage`, `Reserve reached`), hard/soft cordon, the `_meta.router_acp.notices[]` JSON shape |
 | `src/xai_questions.rs` | Grok `_x.ai/ask_user_question` ↔ ACP `elicitation/create` translation (pure; `session.rs` intercepts) |
+| `src/config_admin.rs` | host configuration commands (`config-show`, `config-apply`, `account-reserve`, `account-order`): JSON in and out, the accounts lock, revision checks, and `keep_router_accounts` (live account entries keep their router-owned fields; a proposal under a seat's former name supplies its settings; unknown proposed accounts are dropped). A non-dry-run apply then runs `adopt_seat_directories`. Exit status 3 = conflict |
+| `src/usage_view.rs` | normalized per-account usage for `account-status` (`usage`): Claude limits/legacy windows/extra usage and Codex pools/member limits as host-ready windows with `reserveKind` and measured `capacityDollars` |
 | `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
 | `src/bin/mock_agent.rs` | scripted downstream for tests (below) |
 | `data/*.yaml` | score table + classifier rules, embedded via `include_str!`, overridable by config path |
@@ -215,8 +217,9 @@ SDK traps below, which were all discovered the hard way.
   Hosts that also run provider adapters directly supervise
   `router-acp usage-monitor --config …`. That router-owned process reloads the
   config before each poll and keeps the same account-isolated shared caches
-  current without an active ACP router conversation. The host remains a cache
-  reader and process supervisor; it never performs provider usage requests.
+  current without an active ACP router conversation. The host is a process
+  supervisor and reads usage only through `account-status` (`usage_view.rs`);
+  it never opens the caches or performs provider usage requests.
   Tests: `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).

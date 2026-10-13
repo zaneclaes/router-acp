@@ -1215,6 +1215,33 @@ impl Shared {
             .unwrap_or_else(|| reference.clone())
     }
 
+    /// The seat a persisted candidate names now. A session saved before its
+    /// seat became an account (`grok/x` before `grok` was renamed
+    /// `grok@<id>`) would otherwise resume onto an agent that no longer
+    /// exists. Like `seat_for`, but an account with that model is still
+    /// chosen, by account priority, when none is routable at this moment, so
+    /// the next pin reports that seat's state instead of an unknown agent.
+    pub fn restored_seat(&self, reference: &CandidateId) -> CandidateId {
+        let agents = self.agent_configs();
+        if agents.iter().any(|agent| agent.name == reference.agent) {
+            return reference.clone();
+        }
+        let seat = self.seat_for(reference);
+        if seat != *reference {
+            return seat;
+        }
+        agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| {
+                agent.name.split_once('@').map(|(base, _)| base) == Some(reference.agent.as_str())
+                    && agent.models.iter().any(|model| model.id == reference.model)
+            })
+            .min_by_key(|(index, agent)| (agent.account_priority.unwrap_or(u32::MAX), *index))
+            .map(|(_, agent)| CandidateId::new(&agent.name, &reference.model))
+            .unwrap_or_else(|| reference.clone())
+    }
+
     /// `eligible_views` for resolving an EXPLICIT user pick: also keeps
     /// candidates whose downstream process died (the switch revives it) and
     /// ignores outage quarantine (a penalty on automatic routing, not a veto
@@ -8994,6 +9021,7 @@ fn on_session_new(
                     AcpError::invalid_params().data(format!("unknown router session id `{source}`"))
                 })?;
                 crate::restoration::restore_continued_config(&mut session, &saved)?;
+                crate::restoration::migrate_seats(&shared, &mut session);
                 session.coordinator |= meta_marks_coordinator(req.meta.as_ref());
                 inherited_context = Some(crate::restoration::snapshot(&shared, source)?);
                 session.pending_history = crate::restoration::lookup_context(&shared, &router_sid);

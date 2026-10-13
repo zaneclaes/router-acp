@@ -37,6 +37,45 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Print the router configuration as JSON: `{revision, config}`.
+    ConfigShow {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Replace the router configuration with the JSON document on stdin.
+    /// Account entries stay as the router wrote them. Prints `{revision,
+    /// config}`. Exit status 3 means it changed or is locked: re-read, retry.
+    ConfigApply {
+        #[arg(long)]
+        config: PathBuf,
+        /// Refuse the write unless the file is still at this revision.
+        #[arg(long)]
+        expect_revision: Option<String>,
+        /// Validate and print the result without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Set one account's reserve percentages. Exit status 3: re-read, retry.
+    AccountReserve {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        weekly: f64,
+        #[arg(long)]
+        session: f64,
+    },
+    /// Order one provider's accounts, first drained first. Name every
+    /// connected account once. Exit status 3: re-read, retry.
+    AccountOrder {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "account", required = true)]
+        accounts: Vec<String>,
+    },
     /// Internal: access-only credential hook for a router-owned Grok adapter.
     CredentialToken {
         #[arg(long)]
@@ -330,6 +369,37 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", router_acp::account_usage::status(&config));
             Ok(())
         }
+        Command::ConfigShow { config } => admin_output(router_acp::config_admin::show(&config)),
+        Command::ConfigApply {
+            config,
+            expect_revision,
+            dry_run,
+        } => {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+            let proposed: serde_json::Value = serde_json::from_str(&input)?;
+            admin_output(router_acp::config_admin::apply(
+                &config,
+                proposed,
+                expect_revision.as_deref(),
+                dry_run,
+            ))
+        }
+        Command::AccountReserve {
+            config,
+            account,
+            weekly,
+            session,
+        } => admin_output(router_acp::config_admin::set_reserve(
+            &config, &account, weekly, session,
+        )),
+        Command::AccountOrder {
+            config,
+            provider,
+            accounts,
+        } => admin_output(router_acp::config_admin::set_order(
+            &config, &provider, &accounts,
+        )),
         Command::CredentialToken {
             provider,
             directory,
@@ -763,4 +833,22 @@ fn export_router_env(config: &std::path::Path) {
         env.push(("ROUTER_ACP_BIN".to_string(), exe.display().to_string()));
     }
     router_acp::transport::set_router_env(env);
+}
+
+/// Print a configuration command's JSON result. A conflict exits 3 so a host
+/// can tell "re-read and retry" from a rejected configuration.
+fn admin_output(
+    result: Result<serde_json::Value, router_acp::config_admin::AdminError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(value) => {
+            println!("{value}");
+            Ok(())
+        }
+        Err(router_acp::config_admin::AdminError::Conflict(message)) => {
+            eprintln!("{message}");
+            std::process::exit(3);
+        }
+        Err(err) => Err(anyhow::anyhow!("{err}")),
+    }
 }
