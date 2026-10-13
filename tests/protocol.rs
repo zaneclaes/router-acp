@@ -636,6 +636,32 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
         "        - {{ name: MOCK_NAME, value: {name} }}\n        - {{ name: MOCK_MODELS, value: \"{}\" }}\n",
         model_ids.join(",")
     ));
+    // Startup leaves a provider account with no credential down until
+    // `/login`. Mock provider agents stand in for signed-in accounts unless
+    // the test supplies its own credential location.
+    let key_var = match name.split('@').next() {
+        Some("claude") => Some("ANTHROPIC_API_KEY"),
+        Some("codex") => Some("OPENAI_API_KEY"),
+        Some("grok") => Some("XAI_API_KEY"),
+        Some("kimi") => Some("KIMI_API_KEY"),
+        _ => None,
+    };
+    let own_credential = env.iter().any(|(k, _)| {
+        k.ends_with("_API_KEY")
+            || matches!(
+                *k,
+                "CLAUDE_CONFIG_DIR"
+                    | "CODEX_HOME"
+                    | "GROK_HOME"
+                    | "KIMI_SHARE_DIR"
+                    | "KIMI_CODE_HOME"
+            )
+    });
+    if let Some(var) = key_var.filter(|_| !own_credential) {
+        out.push_str(&format!(
+            "        - {{ name: {var}, value: synthetic-key }}\n"
+        ));
+    }
     for (k, v) in env {
         // Escape for a double-quoted YAML scalar (JSON env values need this).
         let escaped = v
@@ -4648,8 +4674,9 @@ async fn manager_rejection_is_not_spawned_and_auto_routes_live_peer() {
 // Observed: with no Grok credential, the startup probe's managed
 // `authenticate` became an interactive sign-in that never answered, and
 // router initialize hung for every provider (Claude `/login` included).
+// An account never signed in is now not started at all until `/login`.
 #[tokio::test]
-async fn unsigned_in_grok_does_not_block_initialize() {
+async fn never_signed_in_grok_is_not_started() {
     let state = temp_state_file("grok-unsigned");
     let grok_log = temp_log("grok-unsigned");
     let grok_home = tempfile::tempdir().unwrap();
@@ -4673,14 +4700,13 @@ async fn unsigned_in_grok_does_not_block_initialize() {
             .await
             .expect("initialize completes without a Grok credential")?;
         assert!(
-            !read_log(&grok_log)
-                .iter()
-                .any(|e| e["event"] == "authenticate"),
-            "no automatic Grok sign-in without saved credential material"
+            read_log(&grok_log).is_empty(),
+            "a never-signed-in Grok account is not started before /login"
         );
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "hello").await?;
         assert!(agent_text(&observed, &sid).contains("echo:m1:hello"));
+        assert!(read_log(&grok_log).is_empty(), "routing leaves it down too");
         Ok(())
     })
     .await;

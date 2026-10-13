@@ -1041,6 +1041,19 @@ impl Shared {
 
     /// Managed credentials use shared, generation-bound evidence on every
     /// decision. A process-local probe or stale success cannot lift rejection.
+    /// A provider account with no saved credential and no API key in its
+    /// environment: nothing could authenticate it except `/login`.
+    pub fn never_signed_in(&self, name: &str) -> bool {
+        self.agent_configs().into_iter().any(|agent| {
+            agent.name == name
+                && crate::accounts::provider(&agent).is_some()
+                && !crate::credentials::present(&agent)
+                && !crate::accounts::AUTH_ENV
+                    .iter()
+                    .any(|var| agent.env_var(var).is_some_and(|v| !v.is_empty()))
+        })
+    }
+
     pub fn auth_rejection(&self, name: &str) -> Option<String> {
         let agent = self.agent_configs().into_iter().find(|a| a.name == name)?;
         let state = if crate::accounts::provider(&agent).is_some() {
@@ -8930,6 +8943,15 @@ fn on_initialize(
                 .and_then(|spec| task_shared.auth_rejection(&spec.agent_name))
                 .is_some()
             {
+                continue;
+            }
+            // An account never signed in has nothing to start with. It stays
+            // down until `/login`, which starts and probes it on success.
+            if task_shared
+                .target_spec(key)
+                .is_some_and(|spec| task_shared.never_signed_in(&spec.agent_name))
+            {
+                task_shared.set_target_auth_pending(key);
                 continue;
             }
             if let Err(err) = start_downstream(&task_shared, key).await {
