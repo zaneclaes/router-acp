@@ -1540,7 +1540,7 @@ pub struct AgentLlmProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmProxyConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Must resolve to a loopback socket. Port 0 asks the OS for a free port.
     #[serde(default = "default_llm_proxy_listen")]
@@ -1615,7 +1615,7 @@ impl LlmProxyConfig {
 impl Default for LlmProxyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             listen: default_llm_proxy_listen(),
             routine_streak: None,
             minimum_dwell_requests: None,
@@ -1728,6 +1728,47 @@ pub fn expand_tilde_str(s: &str) -> String {
     s.to_string()
 }
 
+/// A serialized agent with only its required keys set: every other value is
+/// the field's default.
+pub fn agent_defaults() -> serde_yaml::Value {
+    let agent: AgentConfig = serde_yaml::from_str(
+        "{ name: x, command: { type: stdio, command: x }, model_selection: { type: config-option }, models: [] }",
+    )
+    .expect("the minimal agent is valid");
+    serde_yaml::to_value(agent).expect("an agent serializes")
+}
+
+/// The first paths (up to ten) where two resolved configurations differ.
+fn differences(a: &serde_yaml::Value, b: &serde_yaml::Value, at: String, out: &mut Vec<String>) {
+    use serde_yaml::Value;
+    if out.len() >= 10 || a == b {
+        return;
+    }
+    match (a, b) {
+        (Value::Mapping(x), Value::Mapping(y)) => {
+            for key in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
+                let name = key
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{key:?}"));
+                let null = Value::Null;
+                differences(
+                    x.get(key).unwrap_or(&null),
+                    y.get(key).unwrap_or(&null),
+                    format!("{at}.{name}"),
+                    out,
+                );
+            }
+        }
+        (Value::Sequence(x), Value::Sequence(y)) if x.len() == y.len() => {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                differences(p, q, format!("{at}[{i}]"), out);
+            }
+        }
+        _ => out.push(if at.is_empty() { ".".into() } else { at }),
+    }
+}
+
 /// A configuration error with an actionable message.
 #[derive(Debug)]
 pub struct ConfigError(pub String);
@@ -1743,7 +1784,10 @@ impl std::error::Error for ConfigError {}
 impl Config {
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {
         let interpolated = interpolate_env(yaml);
-        let mut cfg: Config = serde_yaml::from_str(&interpolated)
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&interpolated)
+            .map_err(|e| ConfigError(format!("invalid YAML: {e}")))?;
+        crate::presets::apply(&mut document);
+        let mut cfg: Config = serde_yaml::from_value(document)
             .map_err(|e| ConfigError(format!("invalid YAML: {e}")))?;
         for key in cfg.llm_proxy.deprecated_keys() {
             tracing::warn!(
@@ -1829,6 +1873,41 @@ impl Config {
         }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// `yaml` reduced to the values that differ from router-acp's defaults:
+    /// the provider presets, implied seat directories and section defaults.
+    /// The input is the raw file, so `${VAR}` references stay unexpanded. The
+    /// result is refused unless it resolves to the same configuration.
+    pub fn minimize_yaml(yaml: &str) -> Result<String, ConfigError> {
+        let invalid = |e: serde_yaml::Error| ConfigError(format!("invalid YAML: {e}"));
+        let document: serde_yaml::Value = serde_yaml::from_str(yaml).map_err(invalid)?;
+        let mut defaults =
+            serde_yaml::to_value(serde_yaml::from_str::<Config>("agents: []").map_err(invalid)?)
+                .map_err(invalid)?;
+        if let Some(map) = defaults.as_mapping_mut() {
+            map.remove("agents");
+        }
+        let agent_defaults = agent_defaults();
+        let small = serde_yaml::to_string(&crate::presets::minimize(
+            &document,
+            &defaults,
+            &agent_defaults,
+        ))
+        .map_err(invalid)?;
+        let resolved = |text: &str| -> Result<serde_yaml::Value, ConfigError> {
+            serde_yaml::to_value(Self::from_yaml(text)?).map_err(invalid)
+        };
+        let (full, reduced) = (resolved(yaml)?, resolved(&small)?);
+        if full != reduced {
+            let mut paths = Vec::new();
+            differences(&full, &reduced, String::new(), &mut paths);
+            return Err(ConfigError(format!(
+                "the reduced configuration would resolve differently at {}; it was not produced",
+                paths.join(", ")
+            )));
+        }
+        Ok(small)
     }
 
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
@@ -2025,12 +2104,8 @@ impl Config {
                         .into(),
                 ));
             }
-            if !self.agents.iter().any(|a| a.llm_proxy.is_some()) {
-                return Err(ConfigError(
-                    "llm_proxy.enabled is true but no agent has agents[].llm_proxy configured"
-                        .into(),
-                ));
-            }
+            // Enabled is the default; with no proxied agent the proxy simply
+            // does not start (`llm_proxy::LlmProxy` needs a target).
         }
         for agent in &self.agents {
             if let Some(proxy) = &agent.llm_proxy {
@@ -2422,6 +2497,58 @@ agents:
     }
 
     #[test]
+    fn a_seat_named_for_its_provider_needs_no_other_keys() {
+        let cfg = Config::from_yaml("agents:\n- name: codex@one\n- name: grok@two\n").unwrap();
+        let codex = &cfg.agents[0];
+        assert!(codex.command.command.ends_with("codex-acp"));
+        assert!(codex.models.iter().any(|m| m.id == "gpt-6.1-sol"));
+        assert!(matches!(
+            codex.usage_source,
+            Some(UsageSourceConfig::CodexRollout)
+        ));
+        assert!(
+            codex
+                .command
+                .env
+                .iter()
+                .any(|e| e.name == "CODEX_HOME" && e.value.ends_with("/accounts/codex@one"))
+        );
+        assert_eq!(cfg.agents[1].lineage.as_deref(), Some("xai"));
+    }
+
+    #[test]
+    fn minimize_reduces_a_full_configuration_to_its_overrides() {
+        let home = std::env::var("HOME").unwrap();
+        let mut full: serde_yaml::Value =
+            serde_yaml::from_str("agents:\n- name: claude@one\n  preference: 0.1\n").unwrap();
+        crate::presets::apply(&mut full);
+        full["cordon"] = serde_yaml::from_str("{ enabled: true, poll_secs: 120 }").unwrap();
+        full["llm_proxy"] = serde_yaml::from_str("{ enabled: true, routine_streak: 3 }").unwrap();
+        let small = Config::minimize_yaml(&serde_yaml::to_string(&full).unwrap()).unwrap();
+        let small: serde_yaml::Value = serde_yaml::from_str(&small).unwrap();
+        let expect: serde_yaml::Value = serde_yaml::from_str(
+            "agents:\n- name: claude@one\n  preference: 0.1\ncordon:\n  poll_secs: 120\n",
+        )
+        .unwrap();
+        assert_eq!(
+            small, expect,
+            "seat dir under {home} and preset values drop"
+        );
+    }
+
+    #[test]
+    fn minimize_refuses_a_reduction_that_would_resolve_differently() {
+        // A custom entry runs its own program; reducing it must not let the
+        // preset change what it resolves to, and the check proves it.
+        let text = "agents:\n- name: claude\n  command: { type: stdio, command: /opt/mock-agent }\n  model_selection: { type: config-option }\n  models: [{ id: m1, cost_rank: 1 }]\n";
+        let small = Config::minimize_yaml(text).unwrap();
+        assert_eq!(
+            serde_yaml::to_value(Config::from_yaml(&small).unwrap()).unwrap(),
+            serde_yaml::to_value(Config::from_yaml(text).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
     fn parses_minimal_config_with_defaults() {
         let cfg = Config::from_yaml(minimal_yaml()).unwrap();
         assert_eq!(cfg.router, StrategyKind::Auto);
@@ -2433,7 +2560,10 @@ agents:
         assert_eq!(cfg.agents[0].budget_prompts_5h, 400);
         assert_eq!(cfg.routers.auto.cost_quality_tradeoff, 7.0);
         assert!(cfg.effort.default.is_none() && cfg.effort.max_automatic.is_none());
-        assert!(!cfg.llm_proxy.enabled);
+        assert!(
+            cfg.llm_proxy.enabled,
+            "on by default; idle without a proxied agent"
+        );
         assert!(cfg.llm_proxy.deprecated_keys().is_empty());
     }
 

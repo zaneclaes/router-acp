@@ -1475,14 +1475,22 @@ pub fn adopt_seat_directories(config_path: &Path) -> Result<Vec<String>, String>
                     .entry("lineage")
                     .or_insert_with(|| Value::String(name.clone()));
                 let env = object
-                    .get_mut("command")
-                    .and_then(Value::as_object_mut)
+                    .entry("command")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
                     .ok_or("Missing command")?
                     .entry("env")
                     .or_insert_with(|| serde_json::json!([]))
                     .as_array_mut()
                     .ok_or("Invalid command environment")?;
                 env.push(serde_json::json!({"name": variable, "value": seat.to_string_lossy()}));
+                // The renamed seat keeps only what its preset does not imply.
+                if let Ok(serde_yaml::Value::Mapping(mut small)) = serde_yaml::to_value(&*entry) {
+                    crate::presets::minimize_agent(&mut small, &crate::config::agent_defaults());
+                    if let Ok(small) = serde_json::to_value(small) {
+                        *entry = small;
+                    }
+                }
                 report.push(format!(
                     "{name}: now account {account} in {}",
                     seat.display()
@@ -1647,6 +1655,11 @@ async fn publish_added(
         added["lineage"] = serde_json::json!(agent.lineage);
         added["reserve_capacity"] = serde_json::json!(agent.reserve_capacity);
         let variable = directory_variable(provider(agent).unwrap_or(""));
+        // A template that inherits its command from the provider preset has
+        // no `command` mapping of its own.
+        if added.get("command").is_none() {
+            added["command"] = serde_json::json!({});
+        }
         let env = added["command"]
             .as_object_mut()
             .ok_or("Missing command")?
@@ -1676,6 +1689,13 @@ async fn publish_added(
         }) {
             if a.get("account_priority").is_none() {
                 a["account_priority"] = serde_json::json!(1);
+            }
+        }
+        // Write only what the new seat changes; presets supply the rest.
+        if let Ok(serde_yaml::Value::Mapping(mut entry)) = serde_yaml::to_value(&added) {
+            crate::presets::minimize_agent(&mut entry, &crate::config::agent_defaults());
+            if let Ok(small) = serde_json::to_value(entry) {
+                added = small;
             }
         }
         agents.push(added);

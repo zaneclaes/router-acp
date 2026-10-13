@@ -131,6 +131,13 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Print a configuration reduced to what differs from router-acp's
+    /// defaults (provider presets, implied account directories, section
+    /// defaults). Refuses unless the result resolves identically.
+    ConfigMinimize {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Inspect the session state database (routing decisions + token usage).
     Sessions {
         #[arg(long)]
@@ -499,6 +506,11 @@ async fn main() -> anyhow::Result<()> {
             router_acp::delegate_mcp::run_helper(&socket, &token)
                 .await
                 .map_err(|e| anyhow::anyhow!("mcp-delegate bridge failed: {e}"))
+        }
+        Command::ConfigMinimize { config } => {
+            let raw = std::fs::read_to_string(&config)?;
+            print!("{}", Config::minimize_yaml(&raw)?);
+            Ok(())
         }
         Command::CheckConfig { config } => {
             let cfg = Config::from_file(&config)?;

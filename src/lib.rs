@@ -25,6 +25,7 @@ pub mod planner_skills;
 pub mod planner_wake;
 pub mod planner_workflow;
 pub mod pre_classifier;
+pub mod presets;
 pub mod relay;
 pub mod restoration;
 pub mod session;

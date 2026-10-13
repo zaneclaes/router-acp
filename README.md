@@ -600,7 +600,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
+| `llm_proxy.enabled` | `true` | Interpose configured adapters (every preset agent has its `agents[].llm_proxy`) and route each attributed provider inference request. With no proxied agent the proxy does not start. Bind/config failures leave ACP-turn routing active. |
 | `llm_proxy.listen` | `127.0.0.1:0` | Loopback listener; port `0` selects a free port. Non-loopback addresses are rejected because provider credentials pass through it. |
 | `llm_proxy.routine_streak` / `minimum_dwell_requests` / `verdict_ttl_requests` / `verdict_ttl_secs` | — | Deprecated and ignored; the per-request cost policy was removed. Accepted so old configs load, with a load-time warning. |
 | `llm_proxy.context_window_fraction` | `0.9` | Maximum fraction of an alternate model's known context window that an estimated request may occupy. |
@@ -633,6 +633,30 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `routers.escalation.max_escalations` | `3` | Hard cap on escalations per session. |
 
 ### Agents & models
+
+**Provider presets.** router-acp ships defaults for `claude` (claude-agent-acp), `codex` (codex-acp) and
+`grok` (the Grok CLI): command, model selection, usage source, LLM-proxy upstream, mode map, auth probe,
+lineage, budget, and the model list with pricing and versions (`src/presets/*.yaml`). An entry inherits
+its preset when it names `provider:` or runs no program of its own. The provider comes from `provider:`,
+from the name (`claude`, `claude@<id>`), or from the usage source. Keys the entry sets win: mappings
+merge, while lists (such as `models`) and scalars replace the preset's. Bare program names resolve
+through `PATH`. An account seat `<provider>@<id>` also implies its directory,
+`~/.config/router-acp/accounts/<name>`, through the provider's directory variable (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, `GROK_HOME`). An entry that sets its own `command` without `provider:` stays exactly as
+written. So a complete seat can be just:
+
+```yaml
+agents:
+- name: claude@07460b494a7f4c0b9474e2957345695f
+  account_priority: 1
+- name: codex@d16ac4a2639a4d9aa6ed0038ffd9c271
+```
+
+Presets apply when the file loads and are never written back. Logins and seat adoption add only what a
+new seat changes. `router-acp config-minimize --config <file>` prints any configuration reduced to
+what differs from the presets and section defaults. It works on the raw file, so `${VAR}` references
+stay unexpanded. It refuses unless the result resolves identically, and names the differing paths when
+it would not.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
