@@ -2747,6 +2747,47 @@ async fn a_delegate_permission_request_is_answered_as_auto_mode() {
     .await;
 }
 
+/// A planner wake is a router-owned turn: no client prompt is in flight, so
+/// the client cannot answer the parent's permission request (goose fails it,
+/// which pauses the run). The router answers it as a delegate's is answered.
+#[tokio::test]
+async fn a_planner_wake_permission_request_is_answered_by_the_router() {
+    let state = temp_state_file("wake-permission");
+    let log = temp_log("wake-permission");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[("MOCK_LOG", log.to_str().unwrap())])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "pin the session").await?;
+        // The wake flag is set mid-turn, as a router-owned wake holds it, and
+        // the agent asks only after that.
+        let gate = log.with_extension("gate");
+        let text = format!("WAIT_FILE:{}\nASK_PERMISSION:run the tests", gate.display());
+        let (turn, _) = tokio::join!(prompt_text(&cx, &sid, &text), async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            shared.with_session(&sid, |s| s.planner_wake_active = true);
+            std::fs::write(&gate, "go").unwrap();
+        });
+        turn?;
+        let text = agent_text(&observed, &sid);
+        let answer = text
+            .lines()
+            .find_map(|line| line.strip_prefix("permission:"))
+            .unwrap_or_else(|| panic!("the parent's request was answered: {text}"));
+        let answer: serde_json::Value = serde_json::from_str(answer).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}})
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn delegate_task_routes_to_lower_cost_candidate() {
     let state = temp_state_file("delegate");

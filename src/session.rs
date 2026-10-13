@@ -2922,6 +2922,31 @@ pub fn handle_downstream_dispatch(
             Dispatch::Request(msg, responder) => {
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
+                // A planner wake is a router-owned turn: the client has no
+                // prompt in flight, so it cannot show the request (goose
+                // answers it with an internal error, which pauses the run).
+                // Answer as a delegate's turn is answered.
+                if method == "session/request_permission"
+                    && shared
+                        .with_session(&router_sid, |s| s.planner_wake_active)
+                        .unwrap_or(false)
+                {
+                    let answer = auto_permission_answer(msg.params());
+                    shared.state.lock().unwrap().log(
+                        &router_sid,
+                        &crate::state::LogEntry {
+                            kind: "auto_permission".to_string(),
+                            role: "router".to_string(),
+                            summary: format!(
+                                "planner wake answered a permission request: {answer}"
+                            ),
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                    );
+                    responder.respond(answer)?;
+                    return Ok(Handled::Yes);
+                }
                 let responder = track_approval(shared, &router_sid, &down_sid, &method, responder)?;
                 // Escalation router: a file read is investigation; a write or
                 // a terminal command is a side effect that locks out mid-turn

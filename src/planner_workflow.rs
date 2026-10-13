@@ -1462,6 +1462,8 @@ async fn begin_work_once(
         ended: false,
     });
     work.status = WorkStatus::Allocating;
+    // A new attempt starts clean; the previous failure stays in `last_output`.
+    work.reason = None;
     save(shared, sid, &mut run)?;
     let allocation = async {
         let workspace = match snapshot.workspace.clone() {
@@ -1678,9 +1680,21 @@ pub fn attempt_ended(
         );
         }
         if failed {
-            work.reason = Some(
-                "child turn failed; preserve recorded evidence and reconcile before retry".into(),
-            );
+            // Keep the cause (a host refusal, a provider error) in the reason the
+            // parent reads; the full text stays in `last_output`.
+            let cause = output
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            let cause: String = cause.chars().take(300).collect();
+            work.reason = Some(if cause.is_empty() {
+                "child turn failed; preserve recorded evidence and reconcile before retry".into()
+            } else {
+                format!(
+                    "child turn failed: {cause}; preserve recorded evidence and reconcile before retry"
+                )
+            });
         }
         let wake_id = format!("{}:{}", actor.work_id, actor.attempt_id);
         let wake = run.wakes.entry(wake_id.clone()).or_insert(Wake {
