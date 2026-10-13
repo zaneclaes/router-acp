@@ -4645,6 +4645,130 @@ async fn manager_rejection_is_not_spawned_and_auto_routes_live_peer() {
     .await;
 }
 
+// Observed: with no Grok credential, the startup probe's managed
+// `authenticate` became an interactive sign-in that never answered, and
+// router initialize hung for every provider (Claude `/login` included).
+#[tokio::test]
+async fn unsigned_in_grok_does_not_block_initialize() {
+    let state = temp_state_file("grok-unsigned");
+    let grok_log = temp_log("grok-unsigned");
+    let grok_home = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "state_file: {}\nprobe_timeout_ms: 2000\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[]),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[
+                ("MOCK_LOG", &grok_log.display().to_string()),
+                ("MOCK_AUTH_REQUIRED", "1"),
+                ("MOCK_AUTH_HANG", "1"),
+                ("GROK_HOME", &grok_home.path().display().to_string()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        tokio::time::timeout(std::time::Duration::from_secs(10), init(&cx))
+            .await
+            .expect("initialize completes without a Grok credential")?;
+        assert!(
+            !read_log(&grok_log)
+                .iter()
+                .any(|e| e["event"] == "authenticate"),
+            "no automatic Grok sign-in without saved credential material"
+        );
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hello").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:m1:hello"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn saved_grok_credential_still_authenticates_at_startup() {
+    let state = temp_state_file("grok-saved");
+    let grok_log = temp_log("grok-saved");
+    let grok_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        grok_home.path().join("auth.json"),
+        serde_json::json!({"https://auth.x.ai::fixture": {"key": "synthetic-key",
+            "create_time": "2026-10-01T00:00:00Z"}})
+        .to_string(),
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[
+                ("MOCK_LOG", &grok_log.display().to_string()),
+                ("MOCK_AUTH_REQUIRED", "1"),
+                ("GROK_HOME", &grok_home.path().display().to_string()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        assert!(
+            read_log(&grok_log)
+                .iter()
+                .any(|e| e["event"] == "authenticate"),
+            "saved Grok credential authenticates automatically"
+        );
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hello").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:grok-4.5:hello"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn silent_grok_authenticate_is_bounded() {
+    let state = temp_state_file("grok-silent");
+    let grok_log = temp_log("grok-silent");
+    let grok_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        grok_home.path().join("auth.json"),
+        serde_json::json!({"https://auth.x.ai::fixture": {"key": "synthetic-key",
+            "create_time": "2026-10-01T00:00:00Z"}})
+        .to_string(),
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nprobe_timeout_ms: 2000\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[]),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[
+                ("MOCK_LOG", &grok_log.display().to_string()),
+                ("MOCK_AUTH_REQUIRED", "1"),
+                ("MOCK_AUTH_HANG", "1"),
+                ("GROK_HOME", &grok_home.path().display().to_string()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        tokio::time::timeout(std::time::Duration::from_secs(10), init(&cx))
+            .await
+            .expect("a silent managed authenticate cannot block initialize")?;
+        assert!(
+            read_log(&grok_log)
+                .iter()
+                .any(|e| e["event"] == "authenticate"),
+            "the saved credential was offered"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn static_pin_to_unauthenticated_agent_reports_auth_required_with_live_peer() {
     let state = temp_state_file("auth-static-pin");

@@ -7,6 +7,8 @@
 //!   select config option (default `m1,m2`); the first is current
 //! - `MOCK_AUTH_REQUIRED=1`: `session/new` returns `auth_required` until
 //!   `authenticate` is called (any method id; advertised as `mock-login`)
+//! - `MOCK_AUTH_HANG=1`: `authenticate` is logged and never answered, like
+//!   an adapter waiting on an interactive sign-in
 //! - `MOCK_FAIL_NEW_AFTER=<n>`: `session/new` fails after the first n
 //!   successes (probe succeeds, pin-time creation fails)
 //! - `MOCK_IGNORE_SET_CONFIG=1`: `set_config_option` silently keeps the old
@@ -121,6 +123,7 @@ struct Mock {
     session_modes: Vec<String>,
     models: Vec<String>,
     auth_required: bool,
+    auth_hang: bool,
     fail_new_after: Option<u32>,
     ignore_set_config: bool,
     native_efforts: bool,
@@ -159,6 +162,7 @@ impl Mock {
                 .unwrap_or_default(),
             models,
             auth_required: std::env::var("MOCK_AUTH_REQUIRED").is_ok(),
+            auth_hang: std::env::var("MOCK_AUTH_HANG").is_ok(),
             fail_new_after: std::env::var("MOCK_FAIL_NEW_AFTER")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -1208,6 +1212,9 @@ async fn main() {
                 let mock = m_auth.clone();
                 async move {
                     mock.log(json!({"event": "authenticate"}));
+                    if mock.auth_hang {
+                        return std::future::pending().await;
+                    }
                     mock.state.lock().unwrap().authed = true;
                     responder.respond(AuthenticateResponse::new())
                 }
