@@ -19,6 +19,8 @@ pub mod lifecycle;
 pub mod limits;
 pub mod llm_proxy;
 pub mod maintenance;
+pub mod mcp_broker;
+pub mod mcp_oauth;
 pub mod notice;
 pub mod planner_client;
 pub mod planner_skills;

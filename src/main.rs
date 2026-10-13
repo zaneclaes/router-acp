@@ -37,6 +37,44 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Sign the router in to one `mcp_servers` entry (OAuth + PKCE in the
+    /// browser). Every agent family's sessions then share that sign-in.
+    McpLogin {
+        /// The server's name in the project's `.mcp.json`.
+        server: Option<String>,
+        /// Project directory whose `.mcp.json` names the server (default: the
+        /// current directory; the nearest file up to the git root is used).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Sign in to this MCP URL directly instead of a project entry.
+        #[arg(long)]
+        url: Option<String>,
+        /// Print the sign-in URL without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Host-delegated sign-in, step one: use this redirect URI instead of
+        /// a loopback listener and print `{url, expiresAt}` as JSON.
+        #[arg(long, conflicts_with = "callback_url")]
+        redirect_uri: Option<String>,
+        /// Host-delegated sign-in, step two: the full URL the browser was
+        /// redirected to. Prints the server's status as JSON.
+        #[arg(long)]
+        callback_url: Option<String>,
+    },
+    /// Forget the router's sign-in for one project MCP server (or `--url`).
+    McpLogout {
+        server: Option<String>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Print the project's `.mcp.json` servers as JSON: how the router's
+    /// broker handles each one and its sign-in state.
+    McpStatus {
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
     /// Print the router configuration as JSON: `{revision, config}`.
     ConfigShow {
         #[arg(long)]
@@ -326,6 +364,16 @@ async fn termination_signal() {
     tokio::select! { _ = wait_term => {}, _ = wait_intr => {} }
 }
 
+fn mcp_target(
+    project: Option<PathBuf>,
+    server: Option<String>,
+    url: Option<String>,
+) -> anyhow::Result<router_acp::mcp_oauth::RemoteServer> {
+    let project = project.unwrap_or(std::env::current_dir()?);
+    router_acp::mcp_oauth::resolve_target(&project, server.as_deref(), url.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -374,6 +422,47 @@ async fn main() -> anyhow::Result<()> {
         Command::AccountStatus { config } => {
             let config = Config::from_file(&config)?;
             println!("{}", router_acp::account_usage::status(&config));
+            Ok(())
+        }
+        Command::McpLogin {
+            server,
+            project,
+            url,
+            no_browser,
+            redirect_uri,
+            callback_url,
+        } => {
+            use router_acp::mcp_oauth;
+            let target = mcp_target(project, server, url)?;
+            let result = match (redirect_uri, callback_url) {
+                (Some(uri), _) => mcp_oauth::login_start(&target, &uri)
+                    .await
+                    .map(|v| v.to_string()),
+                (_, Some(url)) => mcp_oauth::login_finish(&target, &url)
+                    .await
+                    .map(|v| v.to_string()),
+                _ => mcp_oauth::login_interactive(&target, !no_browser).await,
+            };
+            println!("{}", result.map_err(|e| anyhow::anyhow!(e))?);
+            Ok(())
+        }
+        Command::McpLogout {
+            server,
+            project,
+            url,
+        } => {
+            let target = mcp_target(project, server, url)?;
+            let message = router_acp::mcp_oauth::logout(&target).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{message}");
+            Ok(())
+        }
+        Command::McpStatus { project } => {
+            let project = project.unwrap_or(std::env::current_dir()?);
+            let root = router_acp::mcp_oauth::store_root();
+            println!(
+                "{}",
+                router_acp::mcp_oauth::project_status_json(&project, &root)
+            );
             Ok(())
         }
         Command::ConfigShow { config } => admin_output(router_acp::config_admin::show(&config)),

@@ -622,6 +622,8 @@ pub struct Shared {
     pub rules: ClassifierRules,
     pub state: Mutex<StateStore>,
     pub llm_proxy: Arc<crate::llm_proxy::LlmProxyRuntime>,
+    /// Router-owned OAuth broker for `mcp_servers` (inert when none).
+    pub mcp_broker: Arc<crate::mcp_broker::Broker>,
     pub headroom: Mutex<HeadroomTracker>,
     pub auth: Mutex<crate::auth::AuthTracker>,
     pub sessions: Mutex<HashMap<String, RouterSession>>,
@@ -758,7 +760,9 @@ impl Shared {
                     .map(|n| (a.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
             })
             .collect();
+        let mcp_broker = crate::mcp_broker::Broker::new(crate::mcp_oauth::store_root());
         Ok(Arc::new(Self {
+            mcp_broker,
             account_config: Mutex::new(cfg.clone()),
             account_menus: Mutex::default(),
             account_login: Mutex::default(),
@@ -3323,6 +3327,25 @@ pub(crate) async fn open_downstream_session_at(
             .ok_or_else(|| AcpError::internal_error().data("target vanished"))?;
         (t.spec.selection.clone(), t.model_config_id.clone())
     };
+    // Broker entries are streamable HTTP: an adapter that does not advertise
+    // HTTP MCP support never receives one.
+    let http_mcp = shared
+        .targets
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|t| t.init.as_ref())
+        .is_some_and(|init| init.agent_capabilities.mcp_capabilities.http);
+    let mut mcp_servers = mcp_servers;
+    if !http_mcp
+        && mcp_servers
+            .iter()
+            .any(|s| shared.mcp_broker.is_broker_entry(s))
+    {
+        tracing::info!(%candidate, "adapter lacks HTTP MCP support; broker servers omitted");
+        mcp_servers.retain(|s| !shared.mcp_broker.is_broker_entry(s));
+    }
+    shared.mcp_broker.suppress_duplicates(&key, &mcp_servers);
 
     let new_req = NewSessionRequest::new(cwd)
         .additional_directories(additional_directories)
@@ -5260,11 +5283,12 @@ pub(crate) fn mcp_servers_for_pin(
     client_mcp: &[McpServer],
 ) -> Result<(Vec<McpServer>, bool), AcpError> {
     let mut servers = client_mcp.to_vec();
-    let (required_capabilities, catalogs) = shared
+    let (required_capabilities, catalogs, cwd) = shared
         .with_session(router_sid, |s| {
             (
                 s.required_mcp_capabilities.clone(),
                 s.delegate_mcp_catalogs.clone(),
+                s.cwd.clone(),
             )
         })
         .unwrap_or_default();
@@ -5275,6 +5299,8 @@ pub(crate) fn mcp_servers_for_pin(
             merge_catalog_entries(&mut servers, entries);
         }
     }
+    // The project's signed-in remote servers, through the router's broker.
+    crate::mcp_broker::merge_authoritative(&mut servers, shared.mcp_broker.session_servers(&cwd));
     let delegate_attached = crate::delegate_mcp::delegation_available(shared, candidate);
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
@@ -8581,6 +8607,15 @@ pub async fn serve_shared(
     } else {
         None
     };
+    // The MCP OAuth broker's loopback listener. It serves only the project
+    // servers the router is signed in to; with none, sessions are unchanged.
+    let mcp_broker_task = match shared.mcp_broker.bind().await {
+        Ok(task) => Some(task),
+        Err(err) => {
+            tracing::warn!(%err, "MCP broker disabled; sessions receive client MCP servers only");
+            None
+        }
+    };
 
     // Router-owned MCP listener (Unix socket) runs independently of the ACP
     // connection; it serves delegation when configured and managed-background
@@ -8626,6 +8661,9 @@ pub async fn serve_shared(
     }
     planner_wake_task.abort();
     if let Some(task) = llm_proxy_task {
+        task.abort();
+    }
+    if let Some(task) = mcp_broker_task {
         task.abort();
     }
     log_task.abort();

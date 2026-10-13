@@ -12649,3 +12649,313 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
     })
     .await;
 }
+
+// ----------------------------------------------------------------------
+// MCP OAuth broker: project `.mcp.json` servers, one router sign-in
+// ----------------------------------------------------------------------
+
+/// One store root for every broker test in this process (the env var is
+/// read when `Shared` is built); each test's fake upstream has its own port,
+/// so its store key is its own.
+fn mcp_store_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| tempfile::tempdir().unwrap()).path();
+    // SAFETY: test-scoped env mutation; the value is identical everywhere.
+    unsafe { std::env::set_var(router_acp::mcp_oauth::STORE_ENV, root) };
+    root
+}
+
+/// A fake streamable-HTTP MCP upstream that records each Authorization header.
+async fn fake_mcp_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+    use axum::routing::post;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route(
+            "/mcp",
+            post(
+                |axum::extract::State(seen): axum::extract::State<Arc<Mutex<Vec<String>>>>,
+                 headers: axum::http::HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    seen.lock().unwrap().push(auth);
+                    axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}}))
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/mcp"), seen)
+}
+
+/// A git project whose `.mcp.json` names `fake` (remote, brokerable) and
+/// `local` (stdio, untouched), with the router already signed in to `fake`.
+fn signed_in_project(upstream: &str) -> tempfile::TempDir {
+    use router_acp::mcp_oauth::{ClientRecord, Endpoints, RemoteServer, Tokens};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"fake": {"type": "http", "url": upstream},
+            "local": {"command": "true"}}})
+        .to_string(),
+    )
+    .unwrap();
+    let store = RemoteServer::new("fake", upstream).store(mcp_store_root());
+    store
+        .write_client(&ClientRecord {
+            name: "fake".into(),
+            client_id: "client".into(),
+            redirect_uri: "http://localhost:1/callback".into(),
+            resource: router_acp::mcp_oauth::resource_indicator(upstream),
+            endpoints: Endpoints {
+                authorize: "http://127.0.0.1:1/authorize".into(),
+                token: "http://127.0.0.1:1/token".into(),
+                register: None,
+            },
+        })
+        .unwrap();
+    store
+        .write_tokens(&Tokens {
+            access_token: "stored-upstream-token".into(),
+            refresh_token: Some("stored-refresh".into()),
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+            refresh_failed_at: None,
+        })
+        .unwrap();
+    dir
+}
+
+fn broker_entries(event: &serde_json::Value) -> Vec<serde_json::Value> {
+    event["mcpHttp"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn broker_serves_project_servers_to_parent_and_delegate_sessions() {
+    use agent_client_protocol::schema::v1::McpServerHttp;
+    let (upstream, seen) = fake_mcp_upstream().await;
+    let project = signed_in_project(&upstream);
+    let state = temp_state_file("mcp-broker");
+    let log = temp_log("mcp-broker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let log_s = log.display().to_string();
+    let cheap = agent_yaml(
+        "cheap",
+        &[("haiku", 1)],
+        &[("MOCK_LOG", &log_s), ("MOCK_MCP_HTTP", "1")],
+    );
+    let fancy = agent_yaml(
+        "fancy",
+        &[("opus", 3)],
+        &[("MOCK_LOG", &log_s), ("MOCK_MCP_HTTP", "1")],
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 2 }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{cheap}{fancy}",
+        state.display()
+    );
+    let cwd = project.path().to_path_buf();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        // The client sends its own (unauthenticated) `fake` and an unrelated server.
+        let client_servers = vec![
+            McpServer::Http(McpServerHttp::new("fake", upstream.clone())),
+            McpServer::Http(McpServerHttp::new("other", "https://other.test/mcp")),
+        ];
+        let session = cx
+            .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(client_servers))
+            .block_task()
+            .await?;
+        let sid = session.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=fancy/opus] hard integration work\nDELEGATE:fix button color",
+        )
+        .await?;
+        let events = read_log(&log);
+        let news: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "session_new")
+            .collect();
+        // Model probes and title sessions carry no MCP servers; the pinned
+        // parent and the delegate do.
+        let parent = news
+            .iter()
+            .find(|e| {
+                e["sessionId"].as_str().unwrap().starts_with("fancy-")
+                    && !broker_entries(e).is_empty()
+            })
+            .unwrap_or_else(|| panic!("the parent session on fancy with the broker: {events:?}"));
+        let delegate = news
+            .iter()
+            .find(|e| {
+                e["sessionId"].as_str().unwrap().starts_with("cheap-")
+                    && !broker_entries(e).is_empty()
+            })
+            .unwrap_or_else(|| panic!("a delegate session on cheap with the broker: {events:?}"));
+        for event in [parent, delegate] {
+            let http = broker_entries(event);
+            let fakes: Vec<_> = http.iter().filter(|h| h["name"] == "fake").collect();
+            assert_eq!(
+                fakes.len(),
+                1,
+                "one `fake`, the client's replaced: {http:?}"
+            );
+            let url = fakes[0]["url"].as_str().unwrap();
+            assert!(
+                url.starts_with("http://127.0.0.1:") && url != upstream,
+                "{url}"
+            );
+            let header = &fakes[0]["headers"][0];
+            assert_eq!(header[0], "Authorization");
+            assert!(
+                !header[1]
+                    .as_str()
+                    .unwrap()
+                    .contains("stored-upstream-token")
+            );
+            assert!(
+                http.iter().any(|h| h["name"] == "other"),
+                "unrelated server kept: {http:?}"
+            );
+        }
+        // The injected entry works: the upstream sees the stored token.
+        let entry = &broker_entries(parent)
+            .into_iter()
+            .find(|h| h["name"] == "fake")
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(entry["url"].as_str().unwrap())
+            .header("authorization", entry["headers"][0][1].as_str().unwrap())
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["Bearer stored-upstream-token"]
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn broker_entries_skip_adapters_without_http_mcp_and_unsigned_projects() {
+    let (upstream, _) = fake_mcp_upstream().await;
+    let project = signed_in_project(&upstream);
+    let unsigned = tempfile::tempdir().unwrap();
+    std::fs::create_dir(unsigned.path().join(".git")).unwrap();
+    std::fs::write(
+        unsigned.path().join(".mcp.json"),
+        r#"{"mcpServers":{"never":{"type":"http","url":"https://never-signed-in.test/mcp"}}}"#,
+    )
+    .unwrap();
+    let state = temp_state_file("mcp-broker-caps");
+    let log = temp_log("mcp-broker-caps");
+    let log_s = log.display().to_string();
+    let plain = agent_yaml("plain", &[("m1", 1)], &[("MOCK_LOG", &log_s)]);
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{plain}",
+        state.display()
+    );
+    let (cwd, other) = (project.path().to_path_buf(), unsigned.path().to_path_buf());
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        for dir in [cwd.clone(), other.clone()] {
+            let sid = cx
+                .send_request(NewSessionRequest::new(dir))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "pin").await?;
+        }
+        let events = read_log(&log);
+        let news: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "session_new")
+            .collect();
+        assert!(news.len() >= 2, "{events:?}");
+        for event in news {
+            assert!(broker_entries(event).is_empty(), "{event}");
+        }
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn claude_runtimes_disable_the_project_copy_of_a_brokered_server() {
+    let (upstream, _) = fake_mcp_upstream().await;
+    let project = signed_in_project(&upstream);
+    let credential = claude_credential_fixture(None);
+    let user_settings = r#"{"disabledMcpjsonServers":["mine"],"enabledMcpjsonServers":["fake","x"],"theme":"dark"}"#;
+    std::fs::write(credential.path().join("settings.json"), user_settings).unwrap();
+    let state = temp_state_file("mcp-broker-claude");
+    let log = temp_log("mcp-broker-claude");
+    let log_s = log.display().to_string();
+    let claude_dir = credential.path().display().to_string();
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "claude",
+            &[("m1", 1)],
+            &[
+                ("CLAUDE_CONFIG_DIR", &claude_dir),
+                ("MOCK_LOG", &log_s),
+                ("MOCK_MCP_HTTP", "1"),
+            ],
+        ),
+    );
+    let cwd = project.path().to_path_buf();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(cwd.clone()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "[router: candidate=claude/m1]\nstart").await?;
+        let events = read_log(&log);
+        let new = events
+            .iter()
+            .find(|e| e["event"] == "session_new" && !broker_entries(e).is_empty())
+            .unwrap_or_else(|| panic!("a claude session with the broker: {events:?}"));
+        let runtime = std::path::PathBuf::from(new["configDir"].as_str().unwrap());
+        assert_ne!(runtime, credential.path(), "a private runtime directory");
+        let settings = runtime.join("settings.json");
+        assert!(
+            !settings
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(
+            value["disabledMcpjsonServers"],
+            serde_json::json!(["mine", "fake"])
+        );
+        assert_eq!(value["enabledMcpjsonServers"], serde_json::json!(["x"]));
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(
+            std::fs::read_to_string(credential.path().join("settings.json")).unwrap(),
+            user_settings,
+            "the user's own settings are never written"
+        );
+        Ok(())
+    })
+    .await;
+}

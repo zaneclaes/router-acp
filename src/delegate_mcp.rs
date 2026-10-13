@@ -1554,6 +1554,9 @@ async fn run_delegate_task_inner(
         };
         sub_mcp.extend(servers.iter().cloned());
     }
+    // Workers get their own project's signed-in servers through the same
+    // broker as the parent (one sign-in, every agent family).
+    crate::mcp_broker::merge_authoritative(&mut sub_mcp, shared.mcp_broker.session_servers(&cwd));
     let capture = Arc::new(Mutex::new(String::new()));
     // One worker id per delegation, whichever candidate ends up running it:
     // the background job id when there is one, so the parent and the host

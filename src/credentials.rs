@@ -95,6 +95,16 @@ struct Credential {
 pub(crate) struct RuntimeCredential {
     root: PathBuf,
     pub generation: String,
+    /// For Claude: the configuration directory the runtime mirrors.
+    claude_config: Option<PathBuf>,
+}
+
+impl RuntimeCredential {
+    /// `(runtime root, mirrored configuration directory)` for a Claude
+    /// runtime, where the MCP broker writes its private settings.
+    pub(crate) fn claude_settings(&self) -> Option<(PathBuf, PathBuf)> {
+        Some((self.root.clone(), self.claude_config.clone()?))
+    }
 }
 
 impl Drop for RuntimeCredential {
@@ -205,12 +215,13 @@ pub(crate) async fn runtime(
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .map_err(|_| "Could not protect adapter credentials")?;
     }
-    let runtime = RuntimeCredential {
+    let mut runtime = RuntimeCredential {
         root,
         generation: credential
             .as_ref()
             .map(|c| marker(c, record(&dir).as_ref()))
             .unwrap_or_else(|| "missing".into()),
+        claude_config: None,
     };
     // The account directory supplies the login; everything else (skills,
     // plugins, settings, config.toml) is the computer-wide configuration.
@@ -255,6 +266,9 @@ pub(crate) async fn runtime(
     }
     if provider == "claude" && config != dir {
         write_claude_state(&config, &dir, &runtime.root)?;
+    }
+    if provider == "claude" {
+        runtime.claude_config = Some(config.clone());
     }
     let mut value = credential.map(|c| c.value).unwrap_or_else(|| json!({}));
     if provider == "claude" {
@@ -724,6 +738,60 @@ pub(crate) fn claude_identity(state: &Path) -> Option<Value> {
 /// Write `identity` as the whole of an account's `.claude.json`.
 pub(crate) fn write_claude_identity(path: &Path, identity: Value) -> Result<(), String> {
     write_private(path, &json!({ "oauthAccount": identity }))
+}
+
+/// Replace a Claude runtime's `settings.json` symlink with a private copy
+/// whose `disabledMcpjsonServers` also names the MCP broker's servers (Claude
+/// Code rejects a listed project `.mcp.json` server before approving it), so a
+/// session never starts the unauthenticated project copy beside the broker's.
+/// Each Claude session is its own CLI process that reads settings at start,
+/// so a rewrite before `session/new` applies to that session. The user's own
+/// settings file is never written. A malformed settings file stays linked as
+/// it was: Claude reports it, and suppression fails open.
+pub(crate) fn write_claude_mcp_suppression(
+    config: &Path,
+    root: &Path,
+    names: &[String],
+) -> Result<(), String> {
+    let mut settings = match std::fs::read(config.join("settings.json")) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value @ Value::Object(_)) => value,
+            _ => {
+                tracing::warn!(
+                    "Claude settings.json is not a JSON object; MCP duplicates not suppressed"
+                );
+                return Ok(());
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => return Err("Could not read Claude settings".into()),
+    };
+    let object = settings.as_object_mut().expect("checked object");
+    let mut disabled: Vec<Value> = object
+        .get("disabledMcpjsonServers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for name in names {
+        let name = Value::from(name.as_str());
+        if !disabled.contains(&name) {
+            disabled.push(name);
+        }
+    }
+    object.insert("disabledMcpjsonServers".into(), Value::Array(disabled));
+    if let Some(enabled) = object
+        .get_mut("enabledMcpjsonServers")
+        .and_then(Value::as_array_mut)
+    {
+        enabled.retain(|v| !v.as_str().is_some_and(|n| names.iter().any(|b| b == n)));
+    }
+    let target = root.join("settings.json");
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("Could not isolate Claude settings".into()),
+    }
+    write_private(&target, &settings)
 }
 
 /// The adapter's `.claude.json`: the computer-wide client state, signed in as

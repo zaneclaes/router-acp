@@ -151,6 +151,12 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
         }
         None => None,
     };
+    shared.mcp_broker.register_runtime(
+        key,
+        credential
+            .as_ref()
+            .and_then(crate::credentials::RuntimeCredential::claude_settings),
+    );
 
     let relay_shared = shared.clone();
     let relay_key = key.clone();

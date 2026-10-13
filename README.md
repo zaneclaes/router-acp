@@ -29,6 +29,7 @@ This repo:
 - [Prompt routing directives](#prompt-routing-directives)
 - [Switching models mid-session](#switching-models-mid-session)
 - [In-session delegation](#in-session-delegation)
+- [Project MCP servers: one sign-in for every agent](#project-mcp-servers-one-sign-in-for-every-agent)
 - [Configuration reference](#configuration-reference)
 - [Session modes](#session-modes)
 - [First-run authentication](#first-run-authentication)
@@ -505,6 +506,124 @@ and retained-output limit through ACP `terminal/create` and returns immediately.
 The router also instructs downstream models to use it instead of an adapter's
 private `run_in_background` mode, so the host client can persist the process,
 show its output and status, and cancel it independently of foreground turns.
+
+## Project MCP servers: one sign-in for every agent
+
+Remote MCP servers that sign in with OAuth (Datadog, Buildkite, a private
+company gateway) are project settings. router-acp defines none and has no
+router.yaml key for them: it reads each session's own project `.mcp.json`,
+the file Claude Code and the Claude ACP adapter already use (the nearest one
+from the session's cwd up to the git root). For example, this project file:
+
+```json
+{
+  "mcpServers": {
+    "datadog":   { "type": "http", "url": "https://mcp.datadoghq.com/v1/mcp?toolsets=core,dbm,error-tracking,rum" },
+    "buildkite": { "type": "http", "url": "https://mcp.buildkite.com/mcp/readonly" }
+  }
+}
+```
+
+needs one sign-in per server, run once from inside the project:
+
+```sh
+router-acp mcp-login datadog      # opens the browser; prints "signed in to `datadog` (N tools)"
+router-acp mcp-login buildkite
+router-acp mcp-status             # every server in this project's .mcp.json, and its state
+```
+
+After that, every session the router opens, for every agent family (Claude,
+Codex, Grok, Kimi), in parent sessions, model switches, delegates and planner
+workers, receives each signed-in server in ACP `session/new` `mcpServers`.
+Codex and Grok never read `.mcp.json` on their own, so this is the only way
+they get these servers. Claude seats used to load the project entry and then
+fail to authenticate, because a router seat runs in a private configuration
+directory that keeps no MCP sign-in.
+
+How each `.mcp.json` entry is handled:
+
+| entry | handling |
+| --- | --- |
+| `type: http` (or a bare `url`), no `headers` / `headersHelper`, router signed in | **brokered**: replaced in every session by the router's loopback entry |
+| the same, not signed in | left as it is today (Claude reads it itself; the others never see it) |
+| `headers` or `headersHelper` (static credential) | left as it is today |
+| `type: sse` (legacy HTTP+SSE transport) | left as it is today |
+| stdio (`command`) | left as it is today |
+
+`${VAR}` and `${VAR:-default}` in a URL are expanded as Claude Code does. An
+entry's `oauth.clientId` (a pre-registered public client) and
+`oauth.callbackPort` (a fixed redirect port) are honored.
+
+**Sign-in** (`mcp-login <name>`, `--project <dir>` for another project,
+`--url <url>` for a server no project names yet) is OAuth 2.1 authorization
+code + PKCE (S256) as a public client. Endpoints come from RFC 9728
+protected-resource metadata on the MCP URL and the authorization server's
+RFC 8414 or OpenID metadata; Datadog's site endpoints are derived from the
+`mcp.<site>` host when discovery fails. The router registers itself
+dynamically (`client_name: router-acp`, `token_endpoint_auth_method: none`)
+with a loopback redirect `http://localhost:<port>/callback`, and binds every
+grant to the server with an RFC 8707 `resource` (the URL without its query).
+`--no-browser` only prints the sign-in URL. `mcp-logout <name>` forgets the
+sign-in locally.
+
+**Storage.** Sign-ins are keyed by the server's URL (scheme, host and path;
+the query is ignored, so `?toolsets=…` variants share one sign-in), in
+`~/.config/router-acp/mcp/<host>-<hash>/` (`ROUTER_ACP_MCP_DIR` moves the
+root). The directory is 0700, every file 0600 and written atomically.
+`client.json` names the client that issued the current refresh token and is
+written only after a successful exchange; `tokens.json` holds the tokens;
+`configured` marks that a sign-in once succeeded, so a lost token file reads
+"reconnect needed" rather than "not signed in". One sign-in serves every
+project that names the same server. Only the router reads or refreshes these
+files, and it never touches Claude's own MCP sign-ins in the macOS Keychain.
+
+**The broker.** `serve` binds a loopback listener on `127.0.0.1` (random
+port). A brokered entry reaches the adapter as
+`{type: http, name, url: http://127.0.0.1:<port>/mcp/<entry>, headers:
+[Authorization: Bearer <per-process secret>]}`, replacing any same-named
+server the client sent. The proxy rejects any request without that secret,
+forwards streamable HTTP (`POST`/`DELETE` buffered, the `GET` event stream
+streamed) to the upstream URL the router itself read from the project file,
+and attaches the current access token on every request. It refreshes the
+token within two minutes of expiry, one refresh at a time across every router
+process (a file lock; waiters reuse the result). When the upstream refuses a
+bearer (401/403, or a JSON-RPC or tool error saying the token expired or was
+refused, in plain JSON or SSE frames), it forces one refresh and retries; only
+a refreshed bearer the upstream also refuses marks the server "reconnect
+needed". A transient token-endpoint failure keeps a still-live token and marks
+nothing. `server/discover` is answered locally with the legacy protocol
+versions, so Grok and goose fall back to `initialize`. An adapter that does not
+advertise HTTP MCP support never receives a broker entry.
+
+**Claude duplicates.** Each Claude seat runs in a private runtime directory.
+Before a Claude session starts with broker entries, the router replaces that
+runtime's `settings.json` symlink with a private copy whose
+`disabledMcpjsonServers` also lists those names, so Claude never starts the
+unauthenticated project copy beside the broker's. The user's own
+`~/.claude/settings.json` is never written. A Claude agent configured outside
+router-managed seats (no private runtime) receives the broker entries without
+this suppression.
+
+**Status.** `account-status` adds `mcpServers` (once the router has signed in
+to any server): `{key, name, resource, state, label}` per server, with `state`
+`signed-in`, `signed-out` (`not signed in` / `reconnect needed`) or
+`degraded` (the proxy's last live outcome was a transient failure, for 15
+minutes). `mcp-status [--project <dir>]` lists the project's servers with
+their handling and state.
+
+**Hosts that own the redirect** (a remote box whose browser is elsewhere) use
+the two-step form: `mcp-login <name> --redirect-uri <public callback>` prints
+`{url, expiresAt}` and keeps the pending flow (0600, ten minutes), and
+`mcp-login <name> --callback-url <the URL the browser landed on>` completes it
+and prints the server's status as JSON.
+
+**Security model.** Sessions never receive an upstream token: a copied access
+token dies with its lifetime while the session keeps sending it, and an agent
+that can read its own environment could carry it elsewhere. The process secret
+is good only against the loopback proxy of one router process, which sends the
+token only to URLs read from project files. Tokens and response bodies are
+never logged, printed or put in an error message; errors name HTTP statuses and
+OAuth error codes only.
 
 ## Configuration reference
 

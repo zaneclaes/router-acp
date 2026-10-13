@@ -18,6 +18,8 @@
 //! - `MOCK_CAPS_IMAGE=1`: advertise the image prompt capability
 //! - `MOCK_LOG`: append JSONL events (initialize/authenticate/new/
 //!   set_config/prompt/cancel) for test assertions
+//! - `MOCK_MCP_HTTP=1`: advertise HTTP MCP support; `session_new` events log
+//!   every HTTP server (`mcpHttp`) and the process's `CLAUDE_CONFIG_DIR`
 //! - `MOCK_LIST_DELEGATE_TOOLS=1`: during `session/new`, call `tools/list` on
 //!   the `router-delegate` MCP server and log the names. This is the Codex
 //!   adapter's timing: list happens before the router commits `session.pin`.
@@ -1169,7 +1171,11 @@ async fn main() {
                     } else {
                         Default::default()
                     };
+                    // `MOCK_MCP_HTTP=1`: advertise streamable-HTTP MCP support.
+                    let mut mcp = agent_client_protocol::schema::v1::McpCapabilities::new();
+                    mcp.http = std::env::var("MOCK_MCP_HTTP").is_ok();
                     let caps = AgentCapabilities::new()
+                        .mcp_capabilities(mcp)
                         .load_session(mock.supports_lifecycle)
                         .prompt_capabilities(
                             PromptCapabilities::new()
@@ -1251,6 +1257,13 @@ async fn main() {
                                     McpServer::Stdio(st) => st.name.clone(),
                                     _ => "other".to_string(),
                                 }).collect::<Vec<_>>(),
+                                // HTTP servers in full, for broker tests.
+                                "mcpHttp": req.mcp_servers.iter().filter_map(|s| match s {
+                                    McpServer::Http(h) => Some(json!({"name": h.name, "url": h.url,
+                                        "headers": h.headers.iter().map(|x| json!([x.name, x.value])).collect::<Vec<_>>()})),
+                                    _ => None,
+                                }).collect::<Vec<_>>(),
+                                "configDir": std::env::var("CLAUDE_CONFIG_DIR").ok(),
                             }));
                             if mock.list_delegate_tools {
                                 match list_router_delegate_tools(&req.mcp_servers).await {

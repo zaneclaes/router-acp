@@ -64,7 +64,13 @@ pub fn status(config: &crate::config::Config) -> Value {
         .as_ref()
         .and_then(|path| std::fs::read(path).ok())
         .map(|raw| crate::config_admin::revision(&raw));
-    serde_json::json!({"revision":revision,"accounts":accounts})
+    let mut status = serde_json::json!({"revision":revision,"accounts":accounts});
+    // MCP servers the router has signed in to (absent until the first one).
+    let mcp = crate::mcp_oauth::status_json(&crate::mcp_oauth::store_root());
+    if !mcp.is_empty() {
+        status["mcpServers"] = mcp.into();
+    }
+    status
 }
 
 fn routing_status(
