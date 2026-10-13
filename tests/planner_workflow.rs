@@ -1368,6 +1368,68 @@ async fn unacknowledged_wake_redelivers_after_resume() {
     }));
 }
 
+/// Kory Code's accepted-plan handoff is a human `[router: phase=…]`
+/// directive, not a slash command. On a finished planning run it must reopen
+/// the run in implementation, as `/implement` does, so its work can be admitted.
+#[tokio::test]
+async fn human_phase_directive_reopens_a_complete_run_for_implementation() {
+    let fixture = fixture(|_| {});
+    authorize(&fixture.shared);
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Complete {
+            key: "complete-planning".into(),
+            queue_evidence: "queue verified".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    run.phase = router_acp::config::PlannerPhase::Planning;
+    run.execution_request = None;
+    planner_workflow::save(&fixture.shared, SID, &mut run).unwrap();
+
+    let handoff = "[router: phase=implementation]\n[planner-handoff] The user accepted the plan.";
+    let mut agent = input_request(Some("agent-handoff"), handoff, false);
+    agent.meta = serde_json::from_value(json!({
+        "router_acp": {"input_id": "agent-handoff", "agent_origin": true}
+    }))
+    .ok();
+    let error = planner_workflow::observe_input(&fixture.shared, SID, &agent).unwrap_err();
+    assert!(
+        error.contains("complete"),
+        "an agent cannot reopen the run: {error}"
+    );
+
+    planner_workflow::observe_input(
+        &fixture.shared,
+        SID,
+        &input_request(Some("human-handoff"), handoff, false),
+    )
+    .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+    assert_eq!(run.execution_input_id.as_deref(), Some("human-handoff"));
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "admit-after-handoff".into(),
+            work: work("work-1"),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn post_completion_input_is_rejected_without_new_unresolved_input() {
     let fixture = fixture(|_| {});

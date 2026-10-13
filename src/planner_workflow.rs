@@ -687,16 +687,47 @@ impl PlannerRun {
     }
 }
 
+/// A human `[router: phase=…]` directive is the same explicit phase choice as
+/// `/plan` or `/implement`. Kory Code's accepted-plan handoff sends one.
+fn directed_phase(req: &PromptRequest) -> Option<PlannerPhase> {
+    if !human_prompt(req) {
+        return None;
+    }
+    crate::session::parse_prompt_directives(&req.prompt)
+        .ok()
+        .flatten()
+        .and_then(|(directives, _)| directives.phase)
+}
+
 pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Result<(), String> {
     if load(shared, sid)?.is_none() {
         return Ok(());
     }
+    let directed = directed_phase(req);
     mutate(shared, sid, |run| {
-        if run.status == RunStatus::Complete {
+        if run.status == RunStatus::Complete && directed.is_none() {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
         }
-        if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
-            record_input(run, req)?;
+        let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
+            Some(record_input(run, req)?)
+        } else {
+            prompt_input_id(req).map(str::to_string)
+        };
+        // Mirrors an explicit command: the run follows the human's phase, an
+        // implementation choice is the authentic request work admission
+        // needs, and a finished or stopped run reopens.
+        if let Some(phase) = directed {
+            run.phase = phase;
+            if phase == PlannerPhase::Implementation || run.status == RunStatus::Complete {
+                if matches!(run.status, RunStatus::Paused | RunStatus::Cancelled) {
+                    run.approval_waits.clear();
+                }
+                run.status = RunStatus::Running;
+            }
+            if phase == PlannerPhase::Implementation {
+                run.execution_request = Some(display_text(req));
+                run.execution_input_id = input_id;
+            }
         }
         if let Some(wake) = req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_wake_ack")).and_then(Value::as_str) {
             run.wakes.get_mut(wake).ok_or("unknown planner wake acknowledgement")?.acknowledged = true;
