@@ -375,8 +375,50 @@ fn mcp_target(
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Raise the soft open-file limit to the hard one. A router holds three pipes
+/// per adapter process plus its sockets and state files, and macOS launchd
+/// starts GUI shells at 256: past that every adapter spawn fails with EMFILE.
+/// macOS refuses an unlimited soft value, so cap it at `kern.maxfilesperproc`.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed in.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let mut target = limit.rlim_max;
+        #[cfg(target_os = "macos")]
+        {
+            let mut per_process: libc::c_int = 0;
+            let mut size = std::mem::size_of::<libc::c_int>();
+            let name = c"kern.maxfilesperproc";
+            if libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut per_process as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+                && per_process > 0
+            {
+                target = target.min(per_process as libc::rlim_t);
+            }
+        }
+        if target > limit.rlim_cur {
+            limit.rlim_cur = target;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    raise_open_file_limit();
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => {

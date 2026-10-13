@@ -1360,17 +1360,39 @@ fn linux_process_start_identity(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
+/// Whether a process with `pid` exists, by signal 0 rather than a spawned
+/// `kill`, so file-descriptor or process exhaustion cannot read as a death.
+/// Only "no such process" is absence; a permission refusal is a live process.
+fn pid_exists(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs only the existence and permission check.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 pub(crate) fn owner_alive(attempt: &Attempt) -> bool {
     if attempt.router_pid == 0 {
         return false;
     }
-    let pid_alive = std::process::Command::new("kill")
-        .args(["-0", &attempt.router_pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !pid_alive {
+    // This router's own attempts need no probe. A probe that fails for any
+    // reason but a missing process must not declare a live owner dead: the
+    // wake loop ends every attempt it judges orphaned.
+    if attempt.router_pid == std::process::id() {
+        return (attempt.router_pid, attempt.router_started_at_ms) == process_identity();
+    }
+    if !pid_exists(attempt.router_pid) {
         return false;
     }
 
@@ -1381,8 +1403,7 @@ pub(crate) fn owner_alive(attempt: &Attempt) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        attempt.router_pid != std::process::id()
-            || (attempt.router_pid, attempt.router_started_at_ms) == process_identity()
+        true
     }
 }
 
@@ -1792,4 +1813,35 @@ pub fn begin_followup(
         Ok(())
     })?;
     Ok(context)
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn this_routers_attempts_are_alive_without_a_probe() {
+        let (router_pid, router_started_at_ms) = process_identity();
+        let attempt = |pid, started| Attempt {
+            id: "a".into(),
+            router_pid: pid,
+            router_started_at_ms: started,
+            delegate_id: None,
+            ended: false,
+        };
+        assert!(owner_alive(&attempt(router_pid, router_started_at_ms)));
+        assert!(
+            !owner_alive(&attempt(router_pid, router_started_at_ms + 1)),
+            "a reused pid is not this router"
+        );
+        assert!(!owner_alive(&attempt(0, 0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_process_is_absent_and_an_unsignalable_one_is_present() {
+        assert!(pid_exists(std::process::id()));
+        assert!(pid_exists(1), "launchd/init refuses signals but exists");
+        assert!(!pid_exists(i32::MAX as u32), "no such process");
+    }
 }
