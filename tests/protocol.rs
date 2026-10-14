@@ -13049,6 +13049,13 @@ async fn claude_runtimes_disable_the_project_copy_of_a_brokered_server() {
     let credential = claude_credential_fixture(None);
     let user_settings = r#"{"disabledMcpjsonServers":["mine"],"enabledMcpjsonServers":["fake","x"],"theme":"dark"}"#;
     std::fs::write(credential.path().join("settings.json"), user_settings).unwrap();
+    // A name-keyed "needs auth" entry would make Claude skip the broker's server.
+    let user_cache = r#"{"fake":{"timestamp":1},"other":{"timestamp":2}}"#;
+    std::fs::write(
+        credential.path().join("mcp-needs-auth-cache.json"),
+        user_cache,
+    )
+    .unwrap();
     let state = temp_state_file("mcp-broker-claude");
     let log = temp_log("mcp-broker-claude");
     let log_s = log.display().to_string();
@@ -13104,6 +13111,16 @@ async fn claude_runtimes_disable_the_project_copy_of_a_brokered_server() {
             std::fs::read_to_string(credential.path().join("settings.json")).unwrap(),
             user_settings,
             "the user's own settings are never written"
+        );
+        let cache = runtime.join("mcp-needs-auth-cache.json");
+        assert!(!cache.symlink_metadata().unwrap().file_type().is_symlink());
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"other": {"timestamp": 2}}));
+        assert_eq!(
+            std::fs::read_to_string(credential.path().join("mcp-needs-auth-cache.json")).unwrap(),
+            user_cache,
+            "the user's own needs-auth cache is never written"
         );
         Ok(())
     })

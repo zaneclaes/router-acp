@@ -417,6 +417,13 @@ impl Broker {
         let Some(runtime) = runtimes.get_mut(key) else {
             return;
         };
+        // Claude keeps a runtime-wide, name-keyed "needs auth" cache. A Claude
+        // the adapter started before this suppression existed tried the
+        // project copies, failed, and cached these names; every later session
+        // would then skip the working broker entry as needing auth.
+        if let Err(err) = crate::credentials::forget_claude_mcp_needs_auth(&runtime.root, &names) {
+            tracing::warn!(%key, "could not clear Claude's MCP needs-auth cache: {err}");
+        }
         if names.is_subset(&runtime.suppressed) {
             return;
         }

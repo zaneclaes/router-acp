@@ -794,6 +794,34 @@ pub(crate) fn write_claude_mcp_suppression(
     write_private(&target, &settings)
 }
 
+/// Drop `names` from the runtime's `mcp-needs-auth-cache.json`. Only the
+/// runtime's own file is edited: a link into the computer-wide configuration
+/// is replaced by a private copy, so the native CLI's cache never changes.
+pub(crate) fn forget_claude_mcp_needs_auth(
+    root: &Path,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let target = root.join("mcp-needs-auth-cache.json");
+    let mut cache = match std::fs::read(&target) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(cache)) => cache,
+            _ => serde_json::Map::new(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("Could not read Claude's MCP needs-auth cache".into()),
+    };
+    if !names.iter().any(|name| cache.contains_key(name)) {
+        return Ok(());
+    }
+    cache.retain(|name, _| !names.contains(name));
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("Could not isolate Claude's MCP needs-auth cache".into()),
+    }
+    write_private(&target, &Value::Object(cache))
+}
+
 /// The adapter's `.claude.json`: the computer-wide client state, signed in as
 /// the account. A private copy, so the account's identity never leaks into
 /// another account's sessions or the native CLI.
