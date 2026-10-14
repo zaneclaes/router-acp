@@ -12067,7 +12067,7 @@ async fn direct_human_roadmap_request_authorizes_durable_work() {
 }
 
 #[tokio::test]
-async fn planner_parent_cancel_releases_idle_children_but_keeps_assignment() {
+async fn planner_parent_cancel_stops_only_the_parent_turn() {
     let state = temp_state_file("planner-cancel-idle");
     let log = temp_log("planner-cancel-idle");
     let repo = planner_wire_repository();
@@ -12093,30 +12093,40 @@ async fn planner_parent_cancel_releases_idle_children_but_keeps_assignment() {
         .await?;
         assert!(!shared.live_delegates.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
+        let attempt = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap()
+            .works["work-1"]
+            .attempt
+            .clone();
+        // Interrupting the parent to ask something must not stop the run.
         cx.send_notification(CancelNotification::new(sid.clone()))?;
-        for _ in 0..40 {
-            if shared.planner_child_targets.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(shared.live_delegates.lock().unwrap().is_empty());
-        assert!(shared.planner_child_routes.lock().unwrap().is_empty());
-        assert!(shared.planner_child_targets.lock().unwrap().is_empty());
-        assert!(
-            shared
-                .delegate_tokens
-                .lock()
-                .unwrap()
-                .values()
-                .all(|binding| binding.worker.is_none())
-        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!shared.live_delegates.lock().unwrap().is_empty());
+        assert!(!shared.planner_child_routes.lock().unwrap().is_empty());
+        assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
         let run = router_acp::planner_workflow::load(&shared, &sid)
             .unwrap()
             .unwrap();
-        assert_eq!(run.status, router_acp::planner_workflow::RunStatus::Paused);
+        assert_eq!(run.status, router_acp::planner_workflow::RunStatus::Running);
         assert!(run.works["work-1"].workspace.is_some());
-        assert!(run.works["work-1"].attempt.as_ref().unwrap().ended);
+        let after = run.works["work-1"].attempt.as_ref().unwrap();
+        let before = attempt.as_ref().unwrap();
+        assert_eq!((&after.id, after.ended), (&before.id, before.ended));
+        // A run an older router paused, with a stale permission wait, resumes
+        // on the person's next message, even a plain question.
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.status = router_acp::planner_workflow::RunStatus::Paused;
+            run.approval_waits.insert("stale:1".into());
+            Ok(())
+        })
+        .unwrap();
+        prompt_text(&cx, &sid, "what is the worker doing?").await?;
+        let run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, router_acp::planner_workflow::RunStatus::Running);
+        assert!(run.approval_waits.is_empty());
         Ok(())
     })
     .await;

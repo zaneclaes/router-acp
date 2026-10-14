@@ -26,12 +26,13 @@ impl PromptActivity {
         }
     }
 
-    fn idle(shared: &Arc<Shared>, sid: &str, queued_input: bool) -> Option<Self> {
+    fn idle(shared: &Arc<Shared>, sid: &str) -> Option<Self> {
         shared
             .with_session(sid, |s| {
+                // A cancel ends the turn it interrupted, not the run: once that
+                // turn is over, wakes resume with a fresh turn.
                 if s.prompt_activity != 0
                     || s.pinning
-                    || (s.cancelled && !queued_input)
                     || s.pin.is_none()
                     || s.capturing_summary.is_some()
                 {
@@ -39,9 +40,7 @@ impl PromptActivity {
                 }
                 s.prompt_activity += 1;
                 s.planner_wake_active = true;
-                if queued_input {
-                    s.cancelled = false;
-                }
+                s.cancelled = false;
                 true
             })
             .filter(|idle| *idle)
@@ -142,7 +141,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 {
                     continue;
                 }
-                let Some(activity) = PromptActivity::idle(&shared, &sid, queued_input) else {
+                let Some(activity) = PromptActivity::idle(&shared, &sid) else {
                     continue;
                 };
                 let shared = shared.clone();

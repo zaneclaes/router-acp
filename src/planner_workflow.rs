@@ -721,8 +721,10 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         if run.status == RunStatus::Complete && !human {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
         }
-        // A person's follow-up continues a finished run in its last phase.
-        if run.status == RunStatus::Complete {
+        // A person's follow-up continues a finished or paused run in its last
+        // phase: a question or an interrupted turn never ends the run.
+        if human && matches!(run.status, RunStatus::Complete | RunStatus::Paused) {
+            run.approval_waits.clear();
             run.status = RunStatus::Running;
         }
         let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {

@@ -2600,21 +2600,12 @@ fn track_approval(
         .map_err(|e| AcpError::internal_error().data(e))?;
     let shared = shared.clone();
     let sid = sid.to_string();
+    // A client that fails the request has still answered it: the agent sees the
+    // error as a refusal and its turn goes on. Only a callback that never
+    // returns stays a wait; one tool's permission never stops the planner run.
     Ok(responder.wrap_params(move |_, result| {
-        if result.is_ok() {
-            crate::planner_wake::approval_answered(&shared, &sid, &id)
-                .map_err(|e| AcpError::internal_error().data(e))?;
-        } else if crate::planner_workflow::load(&shared, &sid)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            crate::planner_workflow::mutate(&shared, &sid, |run| {
-                run.status = crate::planner_workflow::RunStatus::Paused;
-                Ok(())
-            })
+        crate::planner_wake::approval_answered(&shared, &sid, &id)
             .map_err(|e| AcpError::internal_error().data(e))?;
-        }
         result
     }))
 }
@@ -10445,15 +10436,11 @@ fn apply_skill_route(shared: &Arc<Shared>, router_sid: &str, route: &SkillRoute)
 fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpError> {
     let router_sid = sid_str(&notif.session_id);
     crate::accounts::cancel_login(&shared, &router_sid);
+    // Cancelling a planner parent's turn stops that turn only. The run, its
+    // workers and their wakes go on; closing the session is what stops them.
     let planner = crate::planner_workflow::load(&shared, &router_sid)
-        .map_err(|e| AcpError::internal_error().data(e))?;
-    if planner.is_some() {
-        crate::planner_workflow::mutate(&shared, &router_sid, |run| {
-            run.status = crate::planner_workflow::RunStatus::Paused;
-            Ok(())
-        })
-        .map_err(|e| AcpError::internal_error().data(e))?;
-    }
+        .map_err(|e| AcpError::internal_error().data(e))?
+        .is_some();
     let (pin, delegates) = shared
         .with_session(&router_sid, |s| {
             s.cancelled = true;
@@ -10476,15 +10463,13 @@ fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpEr
             CancelNotification::new(pin.downstream_sid.clone()).meta(notif.meta.clone()),
         );
     }
-    // Parent cancel propagates to all active delegated sub-sessions.
+    if planner {
+        return Ok(());
+    }
+    // An ordinary parent's cancel propagates to its delegated sub-sessions.
     for d in delegates {
         if let Some(conn) = shared.target_conn(&d.process_key) {
             let _ = conn.send_notification(CancelNotification::new(d.downstream_sid.clone()));
-        }
-    }
-    if let Some(run) = planner {
-        for work in run.works.values() {
-            crate::planner_client::stop_child(&shared, &router_sid, &work.child_id);
         }
     }
     Ok(())
