@@ -1688,3 +1688,75 @@ async fn an_attempt_that_handed_off_reads_as_that_handoff() {
             .starts_with("attempt stopped without a valid artifact")
     );
 }
+
+/// A parent that ended its turn blocked on something outside the run has no
+/// child left to wake it. With no worker running it gets a heartbeat wake,
+/// backed off one step per heartbeat until a worker runs again.
+#[tokio::test]
+async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    let heartbeats = || {
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes
+            .into_iter()
+            .filter(|(id, _)| id.starts_with("heartbeat:"))
+            .collect::<Vec<_>>()
+    };
+    let beat = |now: i64| {
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        router_acp::planner_wake::heartbeat(shared, SID, &run, now);
+    };
+    let acknowledge_all = || {
+        planner_workflow::mutate(shared, SID, |run| {
+            run.wakes.values_mut().for_each(|w| w.acknowledged = true);
+            Ok(())
+        })
+        .unwrap();
+    };
+    shared.state.lock().unwrap().log(
+        SID,
+        &router_acp::state::LogEntry {
+            kind: "agent_response".into(),
+            role: "agent".into(),
+            summary: "blocked".into(),
+            ..Default::default()
+        },
+    );
+    let (last, _) = shared.state.lock().unwrap().last_activity(SID).unwrap();
+
+    // A running worker will wake the parent itself.
+    beat(last + 3 * 3600);
+    assert!(heartbeats().is_empty());
+
+    planner_workflow::attempt_ended(shared, SID, &identity, None, "stopped".into(), true).unwrap();
+    // The worker's own wake is still unacknowledged.
+    beat(last + 3 * 3600);
+    assert!(heartbeats().is_empty());
+    acknowledge_all();
+
+    beat(last + 29 * 60);
+    assert!(heartbeats().is_empty());
+    beat(last + 31 * 60);
+    assert_eq!(heartbeats().len(), 1);
+    assert!(heartbeats()[0].1.reason.starts_with("heartbeat:"));
+    acknowledge_all();
+    // The second waits two steps.
+    beat(last + 59 * 60);
+    assert_eq!(heartbeats().len(), 1);
+    beat(last + 61 * 60);
+    assert_eq!(heartbeats().len(), 2);
+    assert_eq!(
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .idle_heartbeats,
+        2
+    );
+}

@@ -37,6 +37,9 @@ pub struct PlannerRun {
     #[serde(default)]
     pub approval_waits: BTreeSet<String>,
     pub receipts: BTreeMap<String, String>,
+    /// Heartbeat wakes sent since a worker last ran; spaces the next one out.
+    #[serde(default)]
+    pub idle_heartbeats: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +394,7 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         wakes: BTreeMap::new(),
         approval_waits: BTreeSet::new(),
         receipts: BTreeMap::new(),
+        idle_heartbeats: 0,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
