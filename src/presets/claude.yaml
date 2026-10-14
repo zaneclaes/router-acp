@@ -1,0 +1,70 @@
+# Built-in defaults for a `claude` agent (claude-agent-acp). An agent entry
+# inherits every key it does not set; mappings merge, lists and scalars replace.
+command:
+  type: stdio
+  command: claude-agent-acp
+model_selection:
+  type: config-option
+budget_prompts_5h: 400
+usage_source:
+  type: anthropic-oauth
+llm_proxy:
+  protocol: anthropic
+  base_url_env: ANTHROPIC_BASE_URL
+  upstream_base_url: https://api.anthropic.com
+mode_map:
+  auto: bypassPermissions
+  approve: default
+  chat: plan
+  preclass: plan
+lineage: claude
+models:
+- id: haiku
+  display_name: Claude Haiku
+  cost_rank: 1
+  api_model: claude-haiku-4-5
+  pricing:
+    input_per_mtok: 1.0
+    output_per_mtok: 5.0
+    cache_read_per_mtok: 0.1
+    cache_write_per_mtok: 1.25
+- id: sonnet
+  display_name: Claude Sonnet
+  cost_rank: 2
+  api_model: claude-sonnet-5
+  pricing:
+    input_per_mtok: 2.0
+    output_per_mtok: 10.0
+    cache_read_per_mtok: 0.2
+    cache_write_per_mtok: 2.5
+- id: opus[1m]
+  display_name: Claude Opus 5.5 1M
+  cost_rank: 4
+  api_model: claude-opus-5-5
+  pricing:
+    input_per_mtok: 4.0
+    output_per_mtok: 20.0
+    cache_read_per_mtok: 0.2
+    cache_write_per_mtok: 5.0
+  versions:
+  - api_model: claude-opus-5
+    pricing:
+      input_per_mtok: 5.0
+      output_per_mtok: 25.0
+      cache_read_per_mtok: 0.5
+      cache_write_per_mtok: 6.25
+  - api_model: claude-opus-4-6
+    pricing:
+      input_per_mtok: 5.0
+      output_per_mtok: 25.0
+      cache_read_per_mtok: 0.5
+      cache_write_per_mtok: 6.25
+- id: claude-fable-5-1[1m]
+  display_name: Claude Fable 5.1 1M
+  cost_rank: 5
+  api_model: claude-fable-5-1
+  pricing:
+    input_per_mtok: 10.0
+    output_per_mtok: 50.0
+    cache_read_per_mtok: 0.25
+    cache_write_per_mtok: 12.5

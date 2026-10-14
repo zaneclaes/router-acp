@@ -809,8 +809,21 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                             WORKER_WHOAMI_TOOL_NAME => text_result(worker_whoami(worker), false),
                             WORKER_HANDOFF_TOOL_NAME => {
                                 match serde_json::from_value::<WorkerHandoffArgs>(req.arguments) {
-                                    Ok(args) => match run_worker_handoff(&shared, worker, args) {
-                                        Ok(text) => text_result(text, false),
+                                    Ok(args) => match run_worker_handoff(&shared, worker, args.clone()) {
+                                        Ok(text) => {
+                                            if let Some(identity) = &worker.planner {
+                                                let _ = crate::planner_workflow::record_handoff(
+                                                    &shared,
+                                                    &router_sid,
+                                                    identity,
+                                                    crate::delegate_hook::Handoff {
+                                                        kind: args.kind,
+                                                        message: args.message,
+                                                    },
+                                                );
+                                            }
+                                            text_result(text, false)
+                                        }
                                         Err(msg) => text_result(msg, true),
                                     },
                                     Err(err) => text_result(
@@ -1435,7 +1448,13 @@ async fn run_delegate_task_inner(
     // id it knows), so resolve it through the version-pin map — otherwise a
     // hint naming the stable default id matches nothing in the pool and is
     // silently dropped.
-    let hinted = args.hints.candidate.as_deref().and_then(CandidateId::parse);
+    // `codex/gpt-6.1-sol` names that agent's account seats for the model.
+    let hinted = args
+        .hints
+        .candidate
+        .as_deref()
+        .and_then(CandidateId::parse)
+        .map(|id| shared.seat_for(&id));
     let hinted_effort = parse_effort_hint(args.hints.effort.as_deref())?;
     // A model-generated hint is an automatic recommendation, never a human
     // override. Resolve each bounded assignment from its own scope.
@@ -1524,6 +1543,7 @@ async fn run_delegate_task_inner(
             .as_ref()
             .map(|_| crate::config::PlannerPhase::Implementation),
         planner_difficulty: None,
+        planner_explicit: false,
     };
     let ranked = make_strategy(strategy_kind, &shared.cfg)
         .rank(&ctx, &pool)
@@ -1547,6 +1567,12 @@ async fn run_delegate_task_inner(
         };
         sub_mcp.extend(servers.iter().cloned());
     }
+    // Workers get their own project's signed-in servers through the same
+    // broker as the parent (one sign-in, every agent family).
+    crate::mcp_broker::merge_authoritative(
+        &mut sub_mcp,
+        shared.mcp_broker.session_servers(&cwd, None),
+    );
     let capture = Arc::new(Mutex::new(String::new()));
     // One worker id per delegation, whichever candidate ends up running it:
     // the background job id when there is one, so the parent and the host
@@ -1954,7 +1980,7 @@ async fn run_delegate_task_inner(
                     profile.class,
                 );
                 let prompt_generation = crate::auth::request_access_generation(shared, &candidate);
-                let result = opened.conn.send_request(prompt).block_task().await;
+                let result = prompt_unless_stalled(shared, &opened.conn, &sub_sid, prompt).await;
                 if result.is_ok() {
                     crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
                 }
@@ -2222,7 +2248,79 @@ async fn gate_turns(
             gate.downstream_sid.to_string(),
             vec![ContentBlock::from(message)],
         );
-        resp = gate.conn.send_request(prompt).block_task().await?;
+        resp = prompt_unless_stalled(shared, gate.conn, gate.sub_sid, prompt).await?;
+    }
+}
+
+/// A delegate turn with no reply, log row or tool update for this long has
+/// been dropped by its adapter: nothing will ever answer it.
+const STALL_QUIET_SECS: i64 = 30 * 60;
+/// The same while a tool call is still open, so a long build wait survives
+/// but a tool that never reports completion does not hold the turn forever.
+const STALL_OPEN_TOOL_SECS: i64 = 3 * 60 * 60;
+
+/// Send one delegate prompt and wait for its reply, unless the sub-session
+/// goes silent past the stall limits. Then the turn is cancelled and fails
+/// with the reason, so its planner attempt ends and wakes the parent instead
+/// of reading as running indefinitely.
+async fn prompt_unless_stalled(
+    shared: &Arc<Shared>,
+    conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    sub_sid: &str,
+    prompt: PromptRequest,
+) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
+    let downstream_sid = prompt.session_id.clone();
+    let reply = conn.send_request(prompt).block_task();
+    tokio::pin!(reply);
+    let started = chrono::Utc::now().timestamp();
+    let mut check = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tokio::select! {
+            result = &mut reply => return result,
+            _ = check.tick() => {}
+        }
+        let (last, open) = shared
+            .state
+            .lock()
+            .unwrap()
+            .last_activity(sub_sid)
+            .unwrap_or((started, false));
+        let quiet = chrono::Utc::now().timestamp() - last.max(started);
+        if quiet
+            < if open {
+                STALL_OPEN_TOOL_SECS
+            } else {
+                STALL_QUIET_SECS
+            }
+        {
+            continue;
+        }
+        let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), &mut reply).await
+            && resp.stop_reason != StopReason::Cancelled
+        {
+            return Ok(resp);
+        }
+        let reason = format!(
+            "delegate stalled: no reply, log row or tool update for {} min{}; the router cancelled the turn",
+            quiet / 60,
+            if open {
+                " while a tool call stayed open"
+            } else {
+                ""
+            }
+        );
+        shared.state.lock().unwrap().log(
+            sub_sid,
+            &crate::state::LogEntry {
+                kind: "router_notice".to_string(),
+                role: "router".to_string(),
+                summary: reason.clone(),
+                ..Default::default()
+            },
+        );
+        return Err(AcpError::internal_error().data(reason));
     }
 }
 
@@ -2570,7 +2668,7 @@ async fn run_delegate_followup_inner(
         TaskClass::CodingGeneral,
     );
     let request_generation = crate::auth::request_access_generation(shared, &candidate);
-    let result = conn.send_request(prompt).block_task().await;
+    let result = prompt_unless_stalled(shared, &conn, &sub_sid, prompt).await;
     if result.is_ok() {
         crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
     }

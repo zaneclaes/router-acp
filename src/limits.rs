@@ -142,6 +142,11 @@ pub fn is_rate_limit_text(lower: &str) -> bool {
         || lower.contains("limit reached")
         || lower.contains("out of credits")
         || lower.contains("credits_exhausted")
+        // Grok: `API error (status 402 Payment Required): Grok Build usage
+        // balance exhausted`. The balance is the whole seat's, so it cordons
+        // the agent rather than one model.
+        || lower.contains("payment required")
+        || lower.contains("balance exhausted")
         || lower.contains("usagelimitexceeded")
         || is_spend_limit_text(lower)
 }
@@ -539,6 +544,22 @@ mod tests {
         assert!(!is_spend_limit_text(
             "claude ai usage limit reached|1752530400"
         ));
+    }
+
+    #[test]
+    fn an_exhausted_grok_balance_cordons_the_seat() {
+        // The live error. It classified as `Other`, so the router kept
+        // routing to the exhausted seat and never failed over.
+        let err = AcpError::internal_error().data(
+            "{\n  \"message\": \"API error (status 402 Payment Required): Grok Build usage balance exhausted\",\n  \"http_status\": 402\n}",
+        );
+        assert_eq!(
+            classify_failure(&err),
+            FailureClass::RateLimited {
+                retry_after: None,
+                spend_scoped: false
+            }
+        );
     }
 
     #[test]

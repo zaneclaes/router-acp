@@ -32,6 +32,7 @@ fn restore(
     let persisted = lookup_persisted(shared, sid)?;
     let mut session = RouterSession::rehydrated(&shared.cfg, &persisted, mcp_servers.clone());
     crate::restoration::restore_config(&mut session, &persisted)?;
+    crate::restoration::migrate_seats(shared, &mut session);
     if let Some(run) = crate::planner_workflow::load(shared, sid)
         .map_err(|e| AcpError::internal_error().data(e))?
     {

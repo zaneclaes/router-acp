@@ -37,7 +37,9 @@ const SESSIONS_PER_BATCH: i64 = 20;
 const LOG_ROWS_PER_BATCH: i64 = 5_000;
 const CHILD_ROWS_PER_BATCH: i64 = 2_000;
 const TRIM_ROWS_PER_BATCH: i64 = 2_000;
-/// Vacuum starts once this many pages (10 MB at 4 KB) are free...
+/// Vacuum starts once this many pages (10 MB at 4 KB) are free, or once free
+/// pages are most of the file, so a small or emptied shard is never left
+/// holding pages that only a later, larger prune would return...
 const VACUUM_FREE_PAGES: i64 = 2_560;
 /// ...and returns them to the filesystem this many (8 MB) per transaction.
 const VACUUM_STEP_PAGES: i64 = 2_048;
@@ -502,7 +504,10 @@ fn incremental_vacuum(
         conn.pragma_query_value(None, "freelist_count", |row| row.get(0))
     };
     let mut free = freelist(conn)?;
-    if free <= VACUUM_FREE_PAGES {
+    let pages: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    // A prune that spans several ticks frees its last batch below the
+    // threshold; without the ratio those pages stayed in an emptied shard.
+    if free == 0 || (free <= VACUUM_FREE_PAGES && free * 2 <= pages) {
         return Ok(0);
     }
     let start = free;

@@ -29,6 +29,7 @@ This repo:
 - [Prompt routing directives](#prompt-routing-directives)
 - [Switching models mid-session](#switching-models-mid-session)
 - [In-session delegation](#in-session-delegation)
+- [Project MCP servers: one sign-in for every agent](#project-mcp-servers-one-sign-in-for-every-agent)
 - [Configuration reference](#configuration-reference)
 - [Session modes](#session-modes)
 - [First-run authentication](#first-run-authentication)
@@ -145,24 +146,37 @@ Manage logins
 4. kimi (0 accounts)
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Its `credentialPresent` field distinguishes a saved but unprobed credential from a configured account with no credential. Its `routing` object reports the router's read-only availability outcome: `available`, a machine-readable `reason` (`authentication` or `capacity`), and the capacity reset when known. Hosts display this outcome and never infer authentication, capacity, cordons, or route eligibility from provider usage. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Its `credentialPresent` field distinguishes a saved but unprobed credential from a configured account with no credential. Its `routing` object reports the router's read-only availability outcome: `available`, a machine-readable `reason` (`authentication` or `capacity`), and the capacity reset when known. Each account also carries its `priority`, `reserveCapacity`, `sharedDirectory` (still on the provider CLI's own directory), and `usage`: the normalized meters `/usage` shows, as `{plan, windows, credits, updatedAt, error}`. A window is `{id, label, percent, resetsAt, severity, active, scope, windowMinutes, reserveKind}`, plus `capacityDollars` when the router has measured the seat's window. `active` means the limit is reached. The top-level `revision` identifies the configuration that membership came from. Hosts display this outcome and never infer authentication, capacity, cordons, or route eligibility from provider usage. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
 The provider's ACP adapter must be configured. The router validates and atomically saves membership in the configuration passed to `serve --config`. It makes a new login available in the current router too. Deleting removes membership and the router-owned credential. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
 
-When a host generates this configuration, it must preserve the router's membership changes. Kory Code keeps its Connected Tools controls and delegates them to the router. Standalone clients use the router's file directly.
+A host that generates this configuration never opens the file. It uses router commands, which print JSON:
+
+- `router-acp config-show --config <path>` returns `{revision, config}`.
+- `router-acp config-apply --config <path> [--expect-revision <revision>] [--dry-run]` replaces the configuration with the JSON document on stdin. Account entries stay as the router wrote them: their directories, membership, priority, reserves and login settings. A proposed entry under a seat's former name (`claude` for `claude@<id>`) supplies that account's models and other settings. A proposed account the router does not have is dropped, because accounts are added through `/login`. The write then runs the seat migration below, so account ids settle before any session or login starts.
+- `router-acp account-reserve --config <path> --account <id> --weekly <percent> --session <percent>` sets one account's reserves.
+- `router-acp account-order --config <path> --provider <provider> --account <id>…` orders every connected account of a provider, first drained first.
+
+Exit status 3 means the configuration changed or another write holds its lock. Read it again and retry. Kory Code keeps its Connected Tools controls and delegates them to the router. Standalone clients use the router's file directly.
 
 Type `/usage` for a deterministic account report with ASCII bars, percentages, reset times, reserve ceilings, credits, cache timestamps and errors. It reads router snapshots and never sends your command to a model or starts an upstream usage request. Grok reports its access gate because it has no numeric plan meter.
 
 Hosts supervise `router-acp usage-monitor --config ~/.config/router-acp/router.yaml`
 when account snapshots must stay current without a router conversation. Provider
 requests, credential isolation, cache locking, and refresh cadence remain inside
-router-acp. The host only reads the published snapshots.
+router-acp. The host reads usage only through `account-status`.
 
 Accounts use lower `priority` numbers first. For example, `priority: 0`, `priority: 1`, and `priority: 2` drain in that order. A configured `agents[].accounts` list defaults to its list order. The expanded standalone form uses `agents[].account_priority`. This is an eligibility gate before model ranking. A later account becomes eligible when earlier accounts are cordoned, exhausted or unavailable. Remaining included plans take precedence over paid overage. Explicit account picks can override order, but cannot bypass reserves or cordons.
 
-`reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves. See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.
+`reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves.
+
+Every seat is an account named `<agent>@<id>`, with a directory `~/.config/router-acp/accounts/<agent>@<id>`. That directory holds only what lets the router switch accounts: the login, and the usage cache (the session and weekly snapshot and the measured window size) in `.router-acp-usage/`. Hosts read the cache only through `account-status`. Skills, plugins and settings stay computer-wide. Every account's adapters read them from the CLI's own directory (`~/.claude`, `~/.codex`, `~/.grok` or `~/.kimi`), so switching accounts never changes them. A reference written without the account, such as `claude/opus[1m]` in a routing directive or a delegate hint, names that agent's account seats, and account priority decides among them.
+
+A seat configured with no directory of its own still shares its CLI's directory. The router's next start makes it an account once. It copies the login into the new directory (readable only by you), so the native CLI stays signed in, and renames the seat's exact references in the configuration. From then on each side refreshes its own copy. A provider that rotates refresh tokens may later ask one of them to sign in again. A seat that already names a directory, such as an added account or a mounted volume, stays where it is. A seat configured with a directory outside the accounts folder keeps using that directory for its configuration too.
+
+See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.
 
 A saved account pin also yields when its included plan is exhausted and paid usage is unavailable or denied. The router announces the replacement and applies the session's normal strategy. An unavailable prompt pin cannot block an eligible sibling, even when static fallback is disabled. A configured static strategy retains its own fallback policy.
 
@@ -493,6 +507,190 @@ The router also instructs downstream models to use it instead of an adapter's
 private `run_in_background` mode, so the host client can persist the process,
 show its output and status, and cancel it independently of foreground turns.
 
+## Project MCP servers: one sign-in for every agent
+
+Remote MCP servers that sign in with OAuth (Datadog, Buildkite, a private
+company gateway) are project settings. router-acp defines none and has no
+router.yaml key for them: it reads each session's own project `.mcp.json`,
+the file Claude Code and the Claude ACP adapter already use (the nearest one
+from the session's cwd up to the git root). For example, this project file:
+
+```json
+{
+  "mcpServers": {
+    "datadog":   { "type": "http", "url": "https://mcp.datadoghq.com/v1/mcp?toolsets=core,dbm,error-tracking,rum" },
+    "buildkite": { "type": "http", "url": "https://mcp.buildkite.com/mcp/readonly" }
+  }
+}
+```
+
+needs one sign-in per server, run once from inside the project:
+
+```sh
+router-acp mcp-login datadog      # opens the browser; prints "signed in to `datadog` (N tools)"
+router-acp mcp-login buildkite
+router-acp mcp-status             # every server in this project's .mcp.json, and its state
+```
+
+After that, every session the router opens, for every agent family (Claude,
+Codex, Grok, Kimi), in parent sessions, model switches, delegates and planner
+workers, receives each signed-in server in ACP `session/new` `mcpServers`.
+Codex and Grok never read `.mcp.json` on their own, so this is the only way
+they get these servers. Claude seats used to load the project entry and then
+fail to authenticate, because a router seat runs in a private configuration
+directory that keeps no MCP sign-in.
+
+How each `.mcp.json` entry is handled:
+
+| entry | handling |
+| --- | --- |
+| `type: http` (or a bare `url`), no `headers` / `headersHelper`, router signed in | **brokered**: replaced in every session by the router's loopback entry |
+| the same, not signed in | left as it is today (Claude reads it itself; the others never see it) |
+| `headers` or `headersHelper` (static credential) | left as it is today |
+| `type: sse` (legacy HTTP+SSE transport) | left as it is today |
+| stdio (`command`) | left as it is today |
+
+`${VAR}` and `${VAR:-default}` in a URL are expanded as Claude Code does. An
+entry's `oauth.clientId` (a pre-registered public client) and
+`oauth.callbackPort` (a fixed redirect port) are honored.
+
+**Sign-in** (`mcp-login <name>`, `--project <dir>` for another project,
+`--url <url>` for a server no project names yet) is OAuth 2.1 authorization
+code + PKCE (S256) as a public client. Endpoints come from RFC 9728
+protected-resource metadata on the MCP URL and the authorization server's
+RFC 8414 or OpenID metadata; Datadog's site endpoints are derived from the
+`mcp.<site>` host when discovery fails. The router registers itself
+dynamically (`client_name: router-acp`, `token_endpoint_auth_method: none`)
+with a loopback redirect `http://localhost:<port>/callback`, and binds every
+grant to the server with an RFC 8707 `resource` (the URL without its query).
+`--no-browser` only prints the sign-in URL. `mcp-logout <name>` forgets the
+sign-in locally.
+
+**Storage.** Sign-ins are keyed by the server's URL (scheme, host and path;
+the query is ignored, so `?toolsets=…` variants share one sign-in), in
+`~/.config/router-acp/mcp/<host>-<hash>/` (`ROUTER_ACP_MCP_DIR` moves the
+root). The directory is 0700, every file 0600 and written atomically.
+`client.json` names the client that issued the current refresh token and is
+written only after a successful exchange; `tokens.json` holds the tokens;
+`configured` marks that a sign-in once succeeded, so a lost token file reads
+"reconnect needed" rather than "not signed in". One sign-in serves every
+project that names the same server. Only the router reads or refreshes these
+files, and it never touches Claude's own MCP sign-ins in the macOS Keychain.
+
+**The broker.** `serve` binds a loopback listener on `127.0.0.1` (random
+port). A brokered entry reaches the adapter as
+`{type: http, name, url: http://127.0.0.1:<port>/mcp/<entry>, headers:
+[Authorization: Bearer <per-process secret>]}`, replacing any same-named
+server the client sent. The proxy rejects any request without that secret,
+forwards streamable HTTP (`POST`/`DELETE` buffered, the `GET` event stream
+streamed) to the upstream URL the router itself read from the project file,
+and attaches the current access token on every request. It refreshes the
+token within two minutes of expiry, one refresh at a time across every router
+process (a file lock; waiters reuse the result). When the upstream refuses a
+bearer (401/403, or a JSON-RPC or tool error saying the token expired or was
+refused, in plain JSON or SSE frames), it forces one refresh and retries; only
+a refreshed bearer the upstream also refuses marks the server "reconnect
+needed". A transient token-endpoint failure keeps a still-live token and marks
+nothing. `server/discover` is answered locally with the legacy protocol
+versions, so Grok and goose fall back to `initialize`. An adapter that does not
+advertise HTTP MCP support never receives a broker entry.
+
+**Claude duplicates.** Each Claude seat runs in a private runtime directory.
+Before a Claude session starts with broker entries, the router replaces that
+runtime's `settings.json` symlink with a private copy whose
+`disabledMcpjsonServers` also lists those names, so Claude never starts the
+unauthenticated project copy beside the broker's. The user's own
+`~/.claude/settings.json` is never written. A Claude agent configured outside
+router-managed seats (no private runtime) receives the broker entries without
+this suppression.
+
+**Status.** `account-status` adds `mcpServers` (once the router has signed in
+to any server): `{key, name, resource, state, label}` per server, with `state`
+`signed-in`, `signed-out` (`not signed in` / `reconnect needed`) or
+`degraded` (the proxy's last live outcome was a transient failure, for 15
+minutes). `mcp-status [--project <dir>]` lists the project's servers with
+their handling and state.
+
+**From any ACP client: `/mcp`.** Like `/login`, `/mcp` is answered by the
+router itself, in any session. It lists every server in the session's
+`.mcp.json` with its state (`signed in`, `not signed in`, `reconnect needed`,
+`provided credential`, or the pass-through reason), and a server's menu offers
+Sign in (or Sign in again), Sign out, and Back. Clients with form elicitation
+get forms; others get a numbered list answered by number, and `/cancel`
+closes it. Sign in shows the authorization URL and listens on a loopback
+redirect, so a browser on the same machine finishes on its own. A browser on
+another machine lands on a page that cannot load: send its full address with
+`/mcp callback <address>`. `/mcp cancel` stops a started sign-in.
+
+**Calling a tool.** `router-acp mcp-call <server> <tool> [--args <json object>]
+[--project <dir>] [--url <url>] [--timeout-ms 20000]` makes one tool call on a
+project server with the router's own sign-in. It sends `initialize`,
+`notifications/initialized` and `tools/call` over streamable HTTP, reads JSON or
+SSE replies, and carries the `Mcp-Session-Id`. A refused bearer gets one forced
+refresh and one retry. It prints the tool's `result` object as JSON on stdout.
+Exit status: `0` success; `1` usage or other error; `2` not signed in or
+reconnect needed (stderr names the state); `3` transient failure (network, token
+endpoint, 5xx, timeout); `4` the tool returned `isError: true` (its result is
+still printed). A host that must not hold a token calls the tool this way
+instead of reading the credential store. Errors name HTTP statuses and OAuth
+codes only. `--config <router.yaml>` lets the call use the configuration's
+credential helper (below).
+
+**A host-supplied credential.** A host that holds its own credential for a
+server, such as a machine token for an unattended box, names a helper in
+router.yaml:
+
+```yaml
+mcp_credential_command:
+  command: /path/to/helper
+  args: []
+  timeout_ms: 5000   # default
+  servers: [kory]    # default: every brokered server
+```
+
+When the router has no usable sign-in for a project server, it runs the helper
+with `{"name", "url", "resource"}` on stdin. The helper prints
+`{"token": "<bearer>", "expiresAt": <epoch ms, optional>}` to supply a bearer,
+or exits non-zero to decline. A timeout or crash counts as a decline. The
+router keeps a supplied token in memory only, until a minute before
+`expiresAt` (five minutes without one), and asks again after a decline a
+minute later. A token the upstream refuses is dropped and the helper is asked
+once more. The router's own sign-in always wins. Every server the helper
+covers (`servers`, or all brokered servers when omitted) reaches sessions even
+without a sign-in: a call the helper declines is answered with the sign-in
+message. So list only the servers the helper can supply; the others reach
+sessions only once the router is signed in. `mcp-status --config <router.yaml>`
+reports a helper-served server as `signed-in` with the label
+`provided credential`.
+
+A helper may also answer `"denyTools": ["mail_*", "compose_brief"]` (exact
+names, or a prefix ending in `*`): tools its credential may not call, such as
+tools that act as a specific person. The router answers such a call itself
+with a tool error naming the sign-in, and never sends it upstream. The
+router's own sign-in is never restricted.
+
+**Tool results in the session.** Some adapters report a finished MCP tool call
+to the client with no output. Each session gets its own broker address, so the
+router knows which session a result belongs to; it keeps each result briefly
+(two minutes, twenty per session) and writes it into a completed tool-call
+update that arrives empty. It matches the update's title (`tool`,
+`server__tool`, or `mcp__server__tool`) and never replaces output the agent
+reported. Delegate workers' results are not filled.
+
+**Hosts that own the redirect** (a remote box whose browser is elsewhere) use
+the two-step form: `mcp-login <name> --redirect-uri <public callback>` prints
+`{url, expiresAt}` and keeps the pending flow (0600, ten minutes), and
+`mcp-login <name> --callback-url <the URL the browser landed on>` completes it
+and prints the server's status as JSON.
+
+**Security model.** Sessions never receive an upstream token: a copied access
+token dies with its lifetime while the session keeps sending it, and an agent
+that can read its own environment could carry it elsewhere. The process secret
+is good only against the loopback proxy of one router process, which sends the
+token only to URLs read from project files. Tokens and response bodies are
+never logged, printed or put in an error message; errors name HTTP statuses and
+OAuth error codes only.
+
 ## Configuration reference
 
 See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete annotated example, or [`examples/router-preferred.yaml`](examples/router-preferred.yaml) for a real four-agent (Claude/Codex/Grok/Kimi) starting config.
@@ -509,6 +707,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
 | `probe_timeout_ms` | `120000` | Timeout for downstream initialize/probe/session-open calls. |
+| `mcp_credential_command` | unset | Host helper that supplies a bearer for a project MCP server the router has no sign-in for (see Project MCP servers). |
 | `effort.default` | unset | Reasoning effort (`low` … `max`) used for primary sessions instead of the automatic class/complexity recommendation when nobody asked explicitly (the `router.effort` option or `[router: effort=…]`). See [Reasoning effort](#task-classification). |
 | `effort.max_automatic` | unset | Ceiling on any effort the router picks by itself (automatic or `effort.default`). Explicit requests are never capped. `effort.default` above `effort.max_automatic` is a config error. |
 | `classifier.backend` | `heuristic` | `heuristic` or `local-model`. |
@@ -587,7 +786,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `llm_proxy.enabled` | `false` | Interpose configured adapters and route each attributed provider inference request. Bind/config failures leave ACP-turn routing active. |
+| `llm_proxy.enabled` | `true` | Interpose configured adapters (every preset agent has its `agents[].llm_proxy`) and route each attributed provider inference request. With no proxied agent the proxy does not start. Bind/config failures leave ACP-turn routing active. |
 | `llm_proxy.listen` | `127.0.0.1:0` | Loopback listener; port `0` selects a free port. Non-loopback addresses are rejected because provider credentials pass through it. |
 | `llm_proxy.routine_streak` / `minimum_dwell_requests` / `verdict_ttl_requests` / `verdict_ttl_secs` | — | Deprecated and ignored; the per-request cost policy was removed. Accepted so old configs load, with a load-time warning. |
 | `llm_proxy.context_window_fraction` | `0.9` | Maximum fraction of an alternate model's known context window that an estimated request may occupy. |
@@ -620,6 +819,30 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `routers.escalation.max_escalations` | `3` | Hard cap on escalations per session. |
 
 ### Agents & models
+
+**Provider presets.** router-acp ships defaults for `claude` (claude-agent-acp), `codex` (codex-acp) and
+`grok` (the Grok CLI): command, model selection, usage source, LLM-proxy upstream, mode map, auth probe,
+lineage, budget, and the model list with pricing and versions (`src/presets/*.yaml`). An entry inherits
+its preset when it names `provider:` or runs no program of its own. The provider comes from `provider:`,
+from the name (`claude`, `claude@<id>`), or from the usage source. Keys the entry sets win: mappings
+merge, while lists (such as `models`) and scalars replace the preset's. Bare program names resolve
+through `PATH`. An account seat `<provider>@<id>` also implies its directory,
+`~/.config/router-acp/accounts/<name>`, through the provider's directory variable (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, `GROK_HOME`). An entry that sets its own `command` without `provider:` stays exactly as
+written. So a complete seat can be just:
+
+```yaml
+agents:
+- name: claude@07460b494a7f4c0b9474e2957345695f
+  account_priority: 1
+- name: codex@d16ac4a2639a4d9aa6ed0038ffd9c271
+```
+
+Presets apply when the file loads and are never written back. Logins and seat adoption add only what a
+new seat changes. `router-acp config-minimize --config <file>` prints any configuration reduced to
+what differs from the presets and section defaults. It works on the raw file, so `${VAR}` references
+stay unexpanded. It refuses unless the result resolves identically, and names the differing paths when
+it would not.
 
 | Key | Default | Meaning |
 | --- | --- | --- |

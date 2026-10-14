@@ -1,0 +1,41 @@
+# Built-in defaults for a `grok` agent (the Grok CLI's ACP mode). An agent entry
+# inherits every key it does not set; mappings merge, lists and scalars replace.
+command:
+  type: stdio
+  command: ~/.grok/bin/grok
+  args:
+  - agent
+model_selection:
+  type: spawn-config
+  process_template:
+    args:
+    - --model
+    - ${model_id}
+    - stdio
+budget_prompts_5h: 400
+auth_probe:
+  command: ~/.grok/bin/grok
+  args:
+  - models
+  unauthenticated_patterns:
+  - not authenticated
+llm_proxy:
+  protocol: openai
+  base_url_env: GROK_CLI_CHAT_PROXY_BASE_URL
+  upstream_base_url: https://cli-chat-proxy.grok.com/v1
+lineage: xai
+models:
+- id: grok-4.7
+  display_name: Grok 4.7
+  cost_rank: 5
+  pricing:
+    input_per_mtok: 2.0
+    output_per_mtok: 6.0
+    cache_read_per_mtok: 0.5
+- id: grok-4.6
+  display_name: Grok 4.6
+  cost_rank: 4
+  pricing:
+    input_per_mtok: 2.0
+    output_per_mtok: 6.0
+    cache_read_per_mtok: 0.5

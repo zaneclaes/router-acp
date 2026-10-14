@@ -89,6 +89,7 @@ fn route(prompt: &str) -> Outcome {
         explicit_source: None,
         planner_phase: None,
         planner_difficulty: None,
+        planner_explicit: false,
     };
     let ranked = AutoStrategy::new(auto_cfg())
         .rank(&ctx, &views)

@@ -120,6 +120,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                                 "Owning router exited. Reconcile preserved workspace/evidence before replacement.".into(), true);
                     }
                 }
+                heartbeat(&shared, &sid, &run, chrono::Utc::now().timestamp());
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
@@ -154,6 +155,82 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// A parent idle this long with no worker running gets a heartbeat wake. Each
+/// further heartbeat before a worker runs again waits one more step, up to
+/// `HEARTBEAT_MAX_STEPS` steps.
+const HEARTBEAT_SECS: i64 = 30 * 60;
+const HEARTBEAT_MAX_STEPS: u32 = 4;
+
+/// A parent that ended its turn blocked on something outside the run (a
+/// sign-in, host memory, a person) has no child left to wake it when that
+/// clears. Wake it on a backed-off timer so it re-checks its own blockers.
+pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun, now: i64) {
+    if run.status != RunStatus::Running
+        || !run.approval_waits.is_empty()
+        || !run.parent_queue.is_empty()
+        || run
+            .wakes
+            .values()
+            .any(|w| !w.acknowledged && w.deliveries < 3)
+    {
+        return;
+    }
+    if run
+        .works
+        .values()
+        .any(|w| w.attempt.as_ref().is_some_and(|a| !a.ended))
+    {
+        if run.idle_heartbeats != 0 {
+            let _ = planner_workflow::mutate(shared, sid, |run| {
+                run.idle_heartbeats = 0;
+                Ok(())
+            });
+        }
+        return;
+    }
+    // An unloaded (unpinned) parent keeps the heartbeat pending until it is
+    // loaded; delivery itself waits for that.
+    if shared
+        .with_session(sid, |s| s.prompt_activity != 0)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let Some((last, _)) = shared.state.lock().unwrap().last_activity(sid) else {
+        return;
+    };
+    let idle = now - last;
+    let steps = i64::from(run.idle_heartbeats.min(HEARTBEAT_MAX_STEPS - 1) + 1);
+    if idle < HEARTBEAT_SECS * steps {
+        return;
+    }
+    let reason = format!(
+        "heartbeat: no worker has run and the parent has been idle for {} min. Re-check each \
+         blocker your last turn reported (sign-ins, host state, a person's action). Resume or \
+         admit the work that no longer waits on it; otherwise end the turn with the same \
+         waiting reason.",
+        idle / 60
+    );
+    let _ = planner_workflow::mutate(shared, sid, |run| {
+        if run
+            .wakes
+            .values()
+            .any(|w| !w.acknowledged && w.deliveries < 3)
+        {
+            return Ok(());
+        }
+        run.idle_heartbeats += 1;
+        run.wakes.insert(
+            format!("heartbeat:{}", uuid::Uuid::new_v4()),
+            planner_workflow::Wake {
+                reason: reason.clone(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    });
 }
 
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {

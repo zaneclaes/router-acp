@@ -151,6 +151,12 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
         }
         None => None,
     };
+    shared.mcp_broker.register_runtime(
+        key,
+        credential
+            .as_ref()
+            .and_then(crate::credentials::RuntimeCredential::claude_settings),
+    );
 
     let relay_shared = shared.clone();
     let relay_key = key.clone();
@@ -261,8 +267,11 @@ pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcom
     }
     // Grok's external credential provider is an ACP authentication method.
     // A valid managed credential therefore still needs one `authenticate`
-    // request before the adapter will accept `session/new`.
+    // request before the adapter will accept `session/new`. Without saved
+    // material Grok treats that request as an interactive sign-in and never
+    // answers, so only `/login` may start one.
     if crate::accounts::provider(&agent) == Some("grok")
+        && crate::credentials::present(&agent)
         && authenticate_from_manager(shared, key).await.is_ok()
     {
         let retried = probe_target_once(shared, key).await;
@@ -298,6 +307,8 @@ pub async fn probe_target(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutcom
     }
 }
 
+const MANAGED_AUTHENTICATE_TIMEOUT_MS: u64 = 15_000;
+
 async fn authenticate_from_manager(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), AcpError> {
     let conn = shared
         .target_conn(key)
@@ -313,9 +324,25 @@ async fn authenticate_from_manager(shared: &Arc<Shared>, key: &ProcessKey) -> Re
             _ => None,
         })
         .ok_or_else(AcpError::internal_error)?;
-    conn.send_request(AuthenticateRequest::new(method))
-        .block_task()
-        .await?;
+    // Bounded: router initialize waits on every probe, so a silent adapter
+    // here would block the handshake for every provider.
+    let timeout = Duration::from_millis(
+        shared
+            .cfg
+            .probe_timeout_ms
+            .min(MANAGED_AUTHENTICATE_TIMEOUT_MS),
+    );
+    tokio::time::timeout(
+        timeout,
+        conn.send_request(AuthenticateRequest::new(method))
+            .block_task(),
+    )
+    .await
+    .map_err(|_| {
+        AcpError::internal_error().data(format!(
+            "target {key} did not answer managed authentication"
+        ))
+    })??;
     Ok(())
 }
 

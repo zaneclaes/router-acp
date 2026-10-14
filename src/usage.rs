@@ -400,8 +400,8 @@ pub(crate) struct OauthCredentials {
     pub refresh_token: Option<String>,
 }
 
-/// Read the Claude CLI OAuth credentials: first `~/.claude/.credentials.json`
-/// (Linux), else the macOS Keychain (`Claude Code-credentials`).
+/// A provider's config directory: the agent's configured one, else the
+/// process's environment variable, else the CLI default under `HOME`.
 pub(crate) fn provider_config_dir(
     agent: Option<&crate::config::AgentConfig>,
     variable: &str,
@@ -419,48 +419,16 @@ pub(crate) fn provider_config_dir(
         })
 }
 
+/// The account's router-managed Claude credentials,
+/// `<CLAUDE_CONFIG_DIR>/.credentials.json`, on every platform. The router
+/// runs Claude so it writes that file (`credentials::claude_file_store_path`);
+/// another login, such as a native Claude Code's Keychain item, is never read
+/// as this account's.
 pub(crate) fn anthropic_oauth_credentials(
     agent: Option<&crate::config::AgentConfig>,
 ) -> Option<OauthCredentials> {
-    if let Some(dir) = provider_config_dir(agent, "CLAUDE_CONFIG_DIR", ".claude") {
-        let path = dir.join(".credentials.json");
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(creds) = credentials_from_json(&text)
-        {
-            return Some(creds);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let service = anthropic_keychain_service(agent);
-        if let Ok(out) = std::process::Command::new("security")
-            .args(["find-generic-password", "-s", &service, "-w"])
-            .output()
-            && out.status.success()
-            && let Some(creds) = credentials_from_json(&String::from_utf8_lossy(&out.stdout))
-        {
-            return Some(creds);
-        }
-    }
-    None
-}
-
-/// Claude CLI scopes its macOS Keychain service to the first eight hex digits
-/// of SHA-256(CLAUDE_CONFIG_DIR). Match the literal environment value, not a
-/// canonicalized path. Verified against @anthropic-ai/claude-code 2.0.76.
-#[cfg(any(target_os = "macos", test))]
-fn anthropic_keychain_service(agent: Option<&crate::config::AgentConfig>) -> String {
-    let dir = agent.map_or_else(
-        || std::env::var("CLAUDE_CONFIG_DIR").ok(),
-        |a| a.env_var("CLAUDE_CONFIG_DIR"),
-    );
-    match dir.filter(|dir| !dir.is_empty()) {
-        Some(dir) => format!(
-            "Claude Code-credentials-{}",
-            &crate::usage_cache::fingerprint(&dir)[..8]
-        ),
-        None => "Claude Code-credentials".into(),
-    }
+    let dir = provider_config_dir(agent, "CLAUDE_CONFIG_DIR", ".claude")?;
+    credentials_from_json(&std::fs::read_to_string(dir.join(".credentials.json")).ok()?)
 }
 
 #[cfg(test)]
@@ -1791,21 +1759,6 @@ agents:
             "the next cycle re-reads the file"
         );
     }
-    #[test]
-    fn claude_keychain_service_matches_cli_account_isolation() {
-        let cfg = crate::config::Config::from_yaml(
-            "agents:\n  - name: claude\n    command: {type: stdio, command: mock-agent}\n    model_selection: {type: config-option}\n    models: [{id: sonnet, cost_rank: 1}]\n    accounts:\n      - name: default\n        env: [{name: CLAUDE_CONFIG_DIR, value: ''}]\n      - name: personal\n        env: [{name: CLAUDE_CONFIG_DIR, value: /tmp/router-acp-claude-personal}]\n",
-        ).unwrap();
-        assert_eq!(
-            anthropic_keychain_service(Some(&cfg.agents[0])),
-            "Claude Code-credentials"
-        );
-        assert_eq!(
-            anthropic_keychain_service(Some(&cfg.agents[1])),
-            "Claude Code-credentials-704cd5a3"
-        );
-    }
-
     #[test]
     fn expired_anthropic_windows_do_not_renew_cordons_or_exhaust_the_seat() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);

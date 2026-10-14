@@ -1368,8 +1368,86 @@ async fn unacknowledged_wake_redelivers_after_resume() {
     }));
 }
 
+/// Kory Code's accepted-plan handoff is a human `[router: phase=…]`
+/// directive, not a slash command. On a finished planning run it must reopen
+/// the run in implementation, as `/implement` does, so its work can be admitted.
 #[tokio::test]
-async fn post_completion_input_is_rejected_without_new_unresolved_input() {
+async fn human_phase_directive_reopens_a_complete_run_for_implementation() {
+    let fixture = fixture(|_| {});
+    authorize(&fixture.shared);
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Complete {
+            key: "complete-planning".into(),
+            queue_evidence: "queue verified".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    run.phase = router_acp::config::PlannerPhase::Planning;
+    run.execution_request = None;
+    planner_workflow::save(&fixture.shared, SID, &mut run).unwrap();
+
+    let handoff = "[router: phase=implementation]\n[planner-handoff] The user accepted the plan.";
+    let mut agent = input_request(Some("agent-handoff"), handoff, false);
+    agent.meta = serde_json::from_value(json!({
+        "router_acp": {"input_id": "agent-handoff", "agent_origin": true}
+    }))
+    .ok();
+    let error = planner_workflow::observe_input(&fixture.shared, SID, &agent).unwrap_err();
+    assert!(
+        error.contains("complete"),
+        "an agent cannot reopen the run: {error}"
+    );
+    assert_eq!(
+        fixture
+            .shared
+            .with_session(SID, |s| s.planner_explicit_phase)
+            .flatten(),
+        None,
+        "an agent's directive does not choose the routing pool"
+    );
+
+    planner_workflow::observe_input(
+        &fixture.shared,
+        SID,
+        &input_request(Some("human-handoff"), handoff, false),
+    )
+    .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+    assert_eq!(run.execution_input_id.as_deref(), Some("human-handoff"));
+    assert_eq!(
+        fixture
+            .shared
+            .with_session(SID, |s| s.planner_explicit_phase)
+            .flatten(),
+        Some(router_acp::config::PlannerPhase::Implementation),
+        "a human phase directive routes from that phase's pool, as the command does"
+    );
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "admit-after-handoff".into(),
+            work: work("work-1"),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn post_completion_agent_input_is_rejected_without_new_unresolved_input() {
     let fixture = fixture(|_| {});
     authorize(&fixture.shared);
     planner_workflow::operate(
@@ -1384,18 +1462,60 @@ async fn post_completion_input_is_rejected_without_new_unresolved_input() {
     .await
     .unwrap();
 
-    let error = planner_workflow::observe_input(
-        &fixture.shared,
-        SID,
-        &input_request(Some("late-input"), "arrived after completion", false),
-    )
-    .unwrap_err();
+    let mut late = input_request(Some("late-input"), "arrived after completion", false);
+    late.meta = serde_json::from_value(json!({
+        "router_acp": {"input_id": "late-input", "agent_origin": true}
+    }))
+    .ok();
+    let error = planner_workflow::observe_input(&fixture.shared, SID, &late).unwrap_err();
     assert!(error.to_ascii_lowercase().contains("complete"), "{error}");
     let run = planner_workflow::load(&fixture.shared, SID)
         .unwrap()
         .unwrap();
     assert_eq!(run.status, RunStatus::Complete);
     assert!(!run.inputs.contains_key("late-input"));
+}
+
+/// A person's plain follow-up to a finished run (e.g. "edit the plan") is the
+/// next turn of the conversation, not an error; it reopens the run in its last
+/// phase and stays unresolved until the planner reconciles it.
+#[tokio::test]
+async fn post_completion_human_follow_up_reopens_the_run_in_its_phase() {
+    let fixture = fixture(|_| {});
+    authorize(&fixture.shared);
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Complete {
+            key: "complete-planning".into(),
+            queue_evidence: "queue verified".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    run.phase = router_acp::config::PlannerPhase::Planning;
+    planner_workflow::save(&fixture.shared, SID, &mut run).unwrap();
+
+    planner_workflow::observe_input(
+        &fixture.shared,
+        SID,
+        &input_request(
+            Some("follow-up"),
+            "Boundaries are approved; edit the plan.",
+            false,
+        ),
+    )
+    .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.phase, router_acp::config::PlannerPhase::Planning);
+    assert!(!run.inputs["follow-up"].acknowledged);
 }
 
 #[test]
@@ -1415,5 +1535,228 @@ fn identical_human_messages_without_client_ids_remain_distinct_inputs() {
         run.inputs
             .values()
             .all(|input| input.text == "repeat this exact human message")
+    );
+}
+
+/// goose sends a typed `/implement` that names a repository skill as that
+/// skill's expansion, with its `<turn-context>` span in a separate block.
+fn goose_skill_expansion(skill: &str, args: &str) -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::from(
+            "<turn-context>\n<t>2026-10-12</t>\nCurrent tasks and notes: (none)\n</turn-context>"
+                .to_string(),
+        ),
+        ContentBlock::from(format!(
+            "# Loaded Skill: {skill} (skill)\nThe skill description.\n\n## Content\n\n# {skill}\n\nARGUMENTS: inside the skill text\n\nBody.\n\nARGUMENTS: {args}\n\n## Supporting Files\n\nSkill directory: /repo/.agents/skills/{skill}\n"
+        )),
+    ]
+}
+
+#[test]
+fn goose_skill_expansions_are_the_authentic_mode_commands() {
+    let request = |prompt: Vec<ContentBlock>| PromptRequest::new("downstream", prompt);
+    let implement = request(goose_skill_expansion("implement", "Docs/Plans/X.md extra"));
+    assert_eq!(
+        planner_workflow::command(&implement),
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    assert!(planner_workflow::explicit_command(&implement));
+    assert_eq!(
+        planner_workflow::command(&request(goose_skill_expansion("plan", ""))),
+        Some(router_acp::config::PlannerPhase::Planning)
+    );
+    // Another skill's expansion, or prose that only mentions one, is no command.
+    assert_eq!(
+        planner_workflow::command(&request(goose_skill_expansion("review", ""))),
+        None
+    );
+    assert_eq!(
+        planner_workflow::command(&request(vec![ContentBlock::from(
+            "please # Loaded Skill: implement (skill)".to_string()
+        )])),
+        None
+    );
+    // Slash commands behind a turn-context block are explicit; the bare verb is
+    // a command only for a session already on the planner strategy.
+    let behind_context = request(vec![
+        ContentBlock::from("<turn-context>x</turn-context>".to_string()),
+        ContentBlock::from("/implement".to_string()),
+    ]);
+    assert!(planner_workflow::explicit_command(&behind_context));
+    let bare = request(vec![ContentBlock::from(
+        "implement the login fix".to_string(),
+    )]);
+    assert_eq!(
+        planner_workflow::command(&bare),
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    assert!(!planner_workflow::explicit_command(&bare));
+    // An internal role invocation never re-selects a mode.
+    let mut internal = request(goose_skill_expansion("implement", ""));
+    internal.meta =
+        serde_json::from_value(json!({"router_acp": {"planner_role": "select-plan"}})).ok();
+    assert_eq!(planner_workflow::command(&internal), None);
+}
+
+#[test]
+fn a_goose_expansion_becomes_the_role_invocation_with_its_typed_arguments() {
+    let fixture = fixture(|_| {});
+    let mut request = PromptRequest::new(
+        "downstream",
+        goose_skill_expansion("implement", "Docs/Plans/X.md extra"),
+    );
+    let phase = planner_workflow::user_command(&fixture.shared, SID, &mut request).unwrap();
+    assert_eq!(
+        phase,
+        Some(router_acp::config::PlannerPhase::Implementation)
+    );
+    let ContentBlock::Text(context) = &request.prompt[0] else {
+        panic!("turn context block changed type")
+    };
+    assert!(
+        context.text.starts_with("<turn-context>"),
+        "{}",
+        context.text
+    );
+    let ContentBlock::Text(invocation) = &request.prompt[1] else {
+        panic!("command block changed type")
+    };
+    assert!(
+        invocation
+            .text
+            .contains("[router-acp planner role: select-plan]"),
+        "{}",
+        invocation.text
+    );
+    assert!(
+        invocation
+            .text
+            .ends_with("Arguments: Docs/Plans/X.md extra"),
+        "{}",
+        invocation.text
+    );
+    assert!(
+        !invocation.text.contains("# Loaded Skill"),
+        "{}",
+        invocation.text
+    );
+}
+
+#[tokio::test]
+async fn an_attempt_that_handed_off_reads_as_that_handoff() {
+    let fixture = fixture(|_| {});
+    admit(&fixture.shared, work("work-1"));
+    let (actor, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::record_handoff(
+        &fixture.shared,
+        SID,
+        &actor,
+        router_acp::delegate_hook::Handoff {
+            kind: "waiting".into(),
+            message: "WAITING build 3729 is still running\nmore detail".into(),
+        },
+    )
+    .unwrap();
+    planner_workflow::attempt_ended(&fixture.shared, SID, &actor, None, "done".into(), false)
+        .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    let work = &run.works["work-1"];
+    assert_eq!(work.status, planner_workflow::WorkStatus::Interrupted);
+    assert_eq!(
+        work.reason.as_deref(),
+        Some("handed off `waiting`: WAITING build 3729 is still running")
+    );
+
+    // A new attempt forgets the old handoff; ending it without one reads as before.
+    let (next, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(&fixture.shared, SID, &next, None, "gone".into(), false)
+        .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert!(
+        run.works["work-1"]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("attempt stopped without a valid artifact")
+    );
+}
+
+/// A parent that ended its turn blocked on something outside the run has no
+/// child left to wake it. With no worker running it gets a heartbeat wake,
+/// backed off one step per heartbeat until a worker runs again.
+#[tokio::test]
+async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    let heartbeats = || {
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes
+            .into_iter()
+            .filter(|(id, _)| id.starts_with("heartbeat:"))
+            .collect::<Vec<_>>()
+    };
+    let beat = |now: i64| {
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        router_acp::planner_wake::heartbeat(shared, SID, &run, now);
+    };
+    let acknowledge_all = || {
+        planner_workflow::mutate(shared, SID, |run| {
+            run.wakes.values_mut().for_each(|w| w.acknowledged = true);
+            Ok(())
+        })
+        .unwrap();
+    };
+    shared.state.lock().unwrap().log(
+        SID,
+        &router_acp::state::LogEntry {
+            kind: "agent_response".into(),
+            role: "agent".into(),
+            summary: "blocked".into(),
+            ..Default::default()
+        },
+    );
+    let (last, _) = shared.state.lock().unwrap().last_activity(SID).unwrap();
+
+    // A running worker will wake the parent itself.
+    beat(last + 3 * 3600);
+    assert!(heartbeats().is_empty());
+
+    planner_workflow::attempt_ended(shared, SID, &identity, None, "stopped".into(), true).unwrap();
+    // The worker's own wake is still unacknowledged.
+    beat(last + 3 * 3600);
+    assert!(heartbeats().is_empty());
+    acknowledge_all();
+
+    beat(last + 29 * 60);
+    assert!(heartbeats().is_empty());
+    beat(last + 31 * 60);
+    assert_eq!(heartbeats().len(), 1);
+    assert!(heartbeats()[0].1.reason.starts_with("heartbeat:"));
+    acknowledge_all();
+    // The second waits two steps.
+    beat(last + 59 * 60);
+    assert_eq!(heartbeats().len(), 1);
+    beat(last + 61 * 60);
+    assert_eq!(heartbeats().len(), 2);
+    assert_eq!(
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .idle_heartbeats,
+        2
     );
 }

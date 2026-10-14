@@ -7,6 +7,8 @@
 //!   select config option (default `m1,m2`); the first is current
 //! - `MOCK_AUTH_REQUIRED=1`: `session/new` returns `auth_required` until
 //!   `authenticate` is called (any method id; advertised as `mock-login`)
+//! - `MOCK_AUTH_HANG=1`: `authenticate` is logged and never answered, like
+//!   an adapter waiting on an interactive sign-in
 //! - `MOCK_FAIL_NEW_AFTER=<n>`: `session/new` fails after the first n
 //!   successes (probe succeeds, pin-time creation fails)
 //! - `MOCK_IGNORE_SET_CONFIG=1`: `set_config_option` silently keeps the old
@@ -18,6 +20,8 @@
 //! - `MOCK_CAPS_IMAGE=1`: advertise the image prompt capability
 //! - `MOCK_LOG`: append JSONL events (initialize/authenticate/new/
 //!   set_config/prompt/cancel) for test assertions
+//! - `MOCK_MCP_HTTP=1`: advertise HTTP MCP support; `session_new` events log
+//!   every HTTP server (`mcpHttp`) and the process's `CLAUDE_CONFIG_DIR`
 //! - `MOCK_LIST_DELEGATE_TOOLS=1`: during `session/new`, call `tools/list` on
 //!   the `router-delegate` MCP server and log the names. This is the Codex
 //!   adapter's timing: list happens before the router commits `session.pin`.
@@ -42,6 +46,9 @@
 //!   extension request and echo the raw reply
 //! - `READFILE:<path>` — fs/read_text_file via the client, echo contents
 //! - `SLEEP:<ms>` — wait, honoring `session/cancel`
+//! - `WAIT_FILE:<path>` — on its own line: wait until `<path>` exists (at
+//!   most 60 s), honoring `session/cancel`; a test releases the turn by
+//!   creating the file
 //! - `TEXT:<message>` — stream text before the remaining directives
 //! - `EXIT_NOW:<model>` — crash on this prompt if it reached `<model>` (a
 //!   respawned process is healthy; a failover replay to another model is not
@@ -116,6 +123,7 @@ struct Mock {
     session_modes: Vec<String>,
     models: Vec<String>,
     auth_required: bool,
+    auth_hang: bool,
     fail_new_after: Option<u32>,
     ignore_set_config: bool,
     native_efforts: bool,
@@ -154,6 +162,7 @@ impl Mock {
                 .unwrap_or_default(),
             models,
             auth_required: std::env::var("MOCK_AUTH_REQUIRED").is_ok(),
+            auth_hang: std::env::var("MOCK_AUTH_HANG").is_ok(),
             fail_new_after: std::env::var("MOCK_FAIL_NEW_AFTER")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -644,6 +653,27 @@ async fn run_prompt(
                 )),
                 Err(err) => reply.push(format!("xai-ask-error:{err}")),
             }
+        } else if let Some(tool) = line.strip_prefix("ASK_PERMISSION:") {
+            // An agent with no session modes asks before each tool (Grok does).
+            let request = UntypedMessage::new(
+                "session/request_permission",
+                json!({
+                    "sessionId": session_id,
+                    "toolCall": {"toolCallId": "perm-1", "title": tool, "kind": "execute"},
+                    "options": [
+                        {"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
+                        {"optionId": "no", "name": "Reject", "kind": "reject_once"}
+                    ]
+                }),
+            )?;
+            match cx.send_request(request).block_task().await {
+                Ok(resp) => reply.push(format!(
+                    "permission:{}",
+                    serde_json::to_string(&resp).unwrap_or_else(|_| "null".to_string())
+                )),
+                Err(err) => reply.push(format!("permission-error:{err}")),
+            }
         } else if let Some(script) = line.strip_prefix("TERMINAL_GROK:") {
             // Grok's wire format: one string in `command`, no `args`.
             let request =
@@ -689,6 +719,28 @@ async fn run_prompt(
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             reply.push(format!("slept:{ms}"));
+        } else if let Some(path) = line.strip_prefix("WAIT_FILE:") {
+            // Hold the turn open until the test releases it, so a test can
+            // observe "still active" without racing a fixed sleep.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if mock
+                    .state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.cancelled)
+                    .unwrap_or(false)
+                {
+                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                }
+                if std::path::Path::new(path).exists() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            reply.push(format!("released:{path}"));
         }
     }
 
@@ -1123,7 +1175,11 @@ async fn main() {
                     } else {
                         Default::default()
                     };
+                    // `MOCK_MCP_HTTP=1`: advertise streamable-HTTP MCP support.
+                    let mut mcp = agent_client_protocol::schema::v1::McpCapabilities::new();
+                    mcp.http = std::env::var("MOCK_MCP_HTTP").is_ok();
                     let caps = AgentCapabilities::new()
+                        .mcp_capabilities(mcp)
                         .load_session(mock.supports_lifecycle)
                         .prompt_capabilities(
                             PromptCapabilities::new()
@@ -1156,6 +1212,9 @@ async fn main() {
                 let mock = m_auth.clone();
                 async move {
                     mock.log(json!({"event": "authenticate"}));
+                    if mock.auth_hang {
+                        return std::future::pending().await;
+                    }
                     mock.state.lock().unwrap().authed = true;
                     responder.respond(AuthenticateResponse::new())
                 }
@@ -1205,6 +1264,13 @@ async fn main() {
                                     McpServer::Stdio(st) => st.name.clone(),
                                     _ => "other".to_string(),
                                 }).collect::<Vec<_>>(),
+                                // HTTP servers in full, for broker tests.
+                                "mcpHttp": req.mcp_servers.iter().filter_map(|s| match s {
+                                    McpServer::Http(h) => Some(json!({"name": h.name, "url": h.url,
+                                        "headers": h.headers.iter().map(|x| json!([x.name, x.value])).collect::<Vec<_>>()})),
+                                    _ => None,
+                                }).collect::<Vec<_>>(),
+                                "configDir": std::env::var("CLAUDE_CONFIG_DIR").ok(),
                             }));
                             if mock.list_delegate_tools {
                                 match list_router_delegate_tools(&req.mcp_servers).await {

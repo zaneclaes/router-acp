@@ -37,6 +37,9 @@ pub struct PlannerRun {
     #[serde(default)]
     pub approval_waits: BTreeSet<String>,
     pub receipts: BTreeMap<String, String>,
+    /// Heartbeat wakes sent since a worker last ran; spaces the next one out.
+    #[serde(default)]
+    pub idle_heartbeats: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +99,10 @@ pub struct Work {
     pub last_output: Option<String>,
     #[serde(default)]
     pub paused: bool,
+    /// The structured handoff the current attempt recorded (`worker_handoff`),
+    /// so its end reads as that handoff rather than as a lost attempt.
+    #[serde(default)]
+    pub handoff: Option<crate::delegate_hook::Handoff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +394,7 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         wakes: BTreeMap::new(),
         approval_waits: BTreeSet::new(),
         receipts: BTreeMap::new(),
+        idle_heartbeats: 0,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -411,18 +419,82 @@ pub fn human_prompt(req: &PromptRequest) -> bool {
 }
 
 pub fn command(req: &PromptRequest) -> Option<PlannerPhase> {
+    leading_command(req).map(|c| c.phase)
+}
+
+/// A slash `/plan` or `/implement` (or a client's expansion of one) opts a
+/// session on any strategy into the planner workflow. The bare word
+/// `implement` selects implementation only in a session already on `planner`,
+/// so ordinary prose such as "implement the login fix" never starts a run.
+pub fn explicit_command(req: &PromptRequest) -> bool {
+    leading_command(req).is_some_and(|c| c.explicit)
+}
+
+/// The operator's leading mode command, the text block that carries it, and
+/// its arguments.
+struct LeadingCommand {
+    phase: PlannerPhase,
+    block: usize,
+    args: String,
+    explicit: bool,
+}
+
+/// goose adds a `<turn-context>` span (its own block or inside the typed one),
+/// and when a typed `/plan` or `/implement` names a repository skill it sends
+/// that skill's expansion in its place: `# Loaded Skill: implement (skill)`,
+/// the skill text, then `ARGUMENTS: <typed arguments>`. Both are the same
+/// authentic leading command.
+fn leading_command(req: &PromptRequest) -> Option<LeadingCommand> {
     if !human_prompt(req) {
         return None;
     }
-    let ContentBlock::Text(first) = req.prompt.first()? else {
-        return None;
-    };
-    match first.text.split_whitespace().next()? {
-        "/plan" => Some(PlannerPhase::Planning),
-        "/implement" => Some(PlannerPhase::Implementation),
-        verb if verb.eq_ignore_ascii_case("implement") => Some(PlannerPhase::Implementation),
-        _ => None,
+    let (block, text) = req.prompt.iter().enumerate().find_map(|(i, b)| match b {
+        ContentBlock::Text(t) => {
+            let typed = crate::accounts::without_turn_context(&t.text);
+            (!typed.trim().is_empty()).then_some(Some((i, typed)))
+        }
+        _ => Some(None),
+    })??;
+    let typed = text.trim_start();
+    if let Some(loaded) = typed.strip_prefix("# Loaded Skill: ") {
+        let name = loaded.split_whitespace().next()?;
+        if !loaded[name.len()..].trim_start().starts_with("(skill)") {
+            return None;
+        }
+        let phase = match name {
+            "plan" => PlannerPhase::Planning,
+            "implement" => PlannerPhase::Implementation,
+            _ => return None,
+        };
+        let content = typed
+            .rsplit_once("\n## Supporting Files")
+            .map_or(typed, |(c, _)| c);
+        let args = content
+            .rsplit_once("\nARGUMENTS:")
+            .map(|(_, a)| a.lines().next().unwrap_or("").trim().to_string())
+            .unwrap_or_default();
+        return Some(LeadingCommand {
+            phase,
+            block,
+            args,
+            explicit: true,
+        });
     }
+    let (verb, args) = typed
+        .split_once(char::is_whitespace)
+        .map_or((typed, ""), |(v, a)| (v, a.trim_start()));
+    let (phase, explicit) = match verb {
+        "/plan" => (PlannerPhase::Planning, true),
+        "/implement" => (PlannerPhase::Implementation, true),
+        verb if verb.eq_ignore_ascii_case("implement") => (PlannerPhase::Implementation, false),
+        _ => return None,
+    };
+    Some(LeadingCommand {
+        phase,
+        block,
+        args: args.trim_end().to_string(),
+        explicit,
+    })
 }
 
 /// Run before ticket/skill expansion. The original text and attachments stay
@@ -474,7 +546,13 @@ fn user_command_once(
     req: &mut PromptRequest,
     queued: bool,
 ) -> Result<Option<PlannerPhase>, String> {
-    let Some(phase) = command(req) else {
+    let Some(LeadingCommand {
+        phase,
+        block,
+        args,
+        explicit,
+    }) = leading_command(req)
+    else {
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
@@ -535,13 +613,9 @@ fn user_command_once(
     if let Some(roadmap) = &run.policy.roadmap {
         instructions.push_str(&format!("\nConfigured roadmap: {}", roadmap.display()));
     }
-    if let Some(ContentBlock::Text(first)) = req.prompt.first_mut() {
-        let args = first
-            .text
-            .trim_start()
-            .split_once(char::is_whitespace)
-            .map(|(_, s)| s.trim_start())
-            .unwrap_or("");
+    // The command's own block becomes the role invocation, so a client's
+    // expanded skill text is not sent to the provider a second time.
+    if let Some(ContentBlock::Text(first)) = req.prompt.get_mut(block) {
         first.text = format!(
             "{instructions}\n[Original user command: {entrypoint_name}, input: {input_id}]\nArguments: {args}"
         );
@@ -551,6 +625,13 @@ fn user_command_once(
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
     save(shared, sid, &mut run)?;
+    if explicit {
+        let typed = format!("{entrypoint_name} {args}");
+        shared.with_session(sid, |s| {
+            s.planner_command_text = Some(typed.trim_end().to_string());
+            s.planner_explicit_phase = Some(phase);
+        });
+    }
     Ok(Some(phase))
 }
 
@@ -614,16 +695,54 @@ impl PlannerRun {
     }
 }
 
+/// A human `[router: phase=…]` directive is the same explicit phase choice as
+/// `/plan` or `/implement`. Kory Code's accepted-plan handoff sends one.
+fn directed_phase(req: &PromptRequest) -> Option<PlannerPhase> {
+    if !human_prompt(req) {
+        return None;
+    }
+    crate::session::parse_prompt_directives(&req.prompt)
+        .ok()
+        .flatten()
+        .and_then(|(directives, _)| directives.phase)
+}
+
 pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Result<(), String> {
     if load(shared, sid)?.is_none() {
         return Ok(());
     }
+    let directed = directed_phase(req);
+    let human = human_prompt(req);
+    // An explicit phase routes from that phase's pool only, as the command does.
+    if let Some(phase) = directed {
+        shared.with_session(sid, |s| s.planner_explicit_phase = Some(phase));
+    }
     mutate(shared, sid, |run| {
-        if run.status == RunStatus::Complete {
+        if run.status == RunStatus::Complete && !human {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
         }
-        if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
-            record_input(run, req)?;
+        // A person's follow-up continues a finished run in its last phase.
+        if run.status == RunStatus::Complete {
+            run.status = RunStatus::Running;
+        }
+        let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
+            Some(record_input(run, req)?)
+        } else {
+            prompt_input_id(req).map(str::to_string)
+        };
+        // Mirrors an explicit command: the run follows the human's phase, and
+        // an implementation choice resumes a stopped run with the authentic
+        // request work admission needs.
+        if let Some(phase) = directed {
+            run.phase = phase;
+            if phase == PlannerPhase::Implementation {
+                if matches!(run.status, RunStatus::Paused | RunStatus::Cancelled) {
+                    run.approval_waits.clear();
+                }
+                run.status = RunStatus::Running;
+                run.execution_request = Some(display_text(req));
+                run.execution_input_id = input_id;
+            }
         }
         if let Some(wake) = req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_wake_ack")).and_then(Value::as_str) {
             run.wakes.get_mut(wake).ok_or("unknown planner wake acknowledgement")?.acknowledged = true;
@@ -648,7 +767,7 @@ pub(crate) fn enqueue_parent_input(
     ensure(shared, sid)?;
     mutate(shared, sid, |run| {
         if run.status == RunStatus::Complete {
-            if phase.is_none() {
+            if phase.is_none() && !human_prompt(req) {
                 return Err(
                     "planner run is complete; use /plan or /implement for new scope".into(),
                 );
@@ -973,6 +1092,7 @@ async fn operate_once(
                         reason: None,
                         last_output: None,
                         paused: false,
+                        handoff: None,
                     },
                 );
             }
@@ -1249,17 +1369,39 @@ fn linux_process_start_identity(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
+/// Whether a process with `pid` exists, by signal 0 rather than a spawned
+/// `kill`, so file-descriptor or process exhaustion cannot read as a death.
+/// Only "no such process" is absence; a permission refusal is a live process.
+fn pid_exists(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs only the existence and permission check.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 pub(crate) fn owner_alive(attempt: &Attempt) -> bool {
     if attempt.router_pid == 0 {
         return false;
     }
-    let pid_alive = std::process::Command::new("kill")
-        .args(["-0", &attempt.router_pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !pid_alive {
+    // This router's own attempts need no probe. A probe that fails for any
+    // reason but a missing process must not declare a live owner dead: the
+    // wake loop ends every attempt it judges orphaned.
+    if attempt.router_pid == std::process::id() {
+        return (attempt.router_pid, attempt.router_started_at_ms) == process_identity();
+    }
+    if !pid_exists(attempt.router_pid) {
         return false;
     }
 
@@ -1270,8 +1412,7 @@ pub(crate) fn owner_alive(attempt: &Attempt) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        attempt.router_pid != std::process::id()
-            || (attempt.router_pid, attempt.router_started_at_ms) == process_identity()
+        true
     }
 }
 
@@ -1355,6 +1496,9 @@ async fn begin_work_once(
         ended: false,
     });
     work.status = WorkStatus::Allocating;
+    // A new attempt starts clean; the previous failure stays in `last_output`.
+    work.reason = None;
+    work.handoff = None;
     save(shared, sid, &mut run)?;
     let allocation = async {
         let workspace = match snapshot.workspace.clone() {
@@ -1542,6 +1686,30 @@ async fn allocate_workspace(
     })
 }
 
+/// Keep the handoff a planner worker just recorded on its own attempt, so the
+/// attempt's end names it. A stale attempt's handoff is ignored.
+pub fn record_handoff(
+    shared: &Arc<Shared>,
+    sid: &str,
+    actor: &WorkerIdentity,
+    handoff: crate::delegate_hook::Handoff,
+) -> Result<(), String> {
+    mutate(shared, sid, |run| {
+        let Some(work) = run.works.get_mut(&actor.work_id) else {
+            return Ok(());
+        };
+        if work
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.id == actor.attempt_id && !attempt.ended)
+        {
+            work.handoff = Some(handoff.clone());
+        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 pub fn attempt_ended(
     shared: &Arc<Shared>,
     sid: &str,
@@ -1565,15 +1733,39 @@ pub fn attempt_ended(
         work.last_output = Some(output.clone());
         if work.status == WorkStatus::Running || work.status == WorkStatus::Allocating {
             work.status = WorkStatus::Interrupted;
-            work.reason = Some(
-            "attempt stopped without a valid artifact/finishing receipt; reconcile before resuming"
-                .into(),
-        );
+            work.reason = Some(match &work.handoff {
+                // The worker handed back on purpose (waiting, a question, a
+                // lease); say so rather than reporting a lost attempt.
+                Some(handoff) => {
+                    let first = handoff
+                        .message
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim();
+                    let first: String = first.chars().take(300).collect();
+                    format!("handed off `{}`: {first}", handoff.kind)
+                }
+                None => "attempt stopped without a valid artifact/finishing receipt; reconcile before resuming"
+                    .into(),
+            });
         }
         if failed {
-            work.reason = Some(
-                "child turn failed; preserve recorded evidence and reconcile before retry".into(),
-            );
+            // Keep the cause (a host refusal, a provider error) in the reason the
+            // parent reads; the full text stays in `last_output`.
+            let cause = output
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            let cause: String = cause.chars().take(300).collect();
+            work.reason = Some(if cause.is_empty() {
+                "child turn failed; preserve recorded evidence and reconcile before retry".into()
+            } else {
+                format!(
+                    "child turn failed: {cause}; preserve recorded evidence and reconcile before retry"
+                )
+            });
         }
         let wake_id = format!("{}:{}", actor.work_id, actor.attempt_id);
         let wake = run.wakes.entry(wake_id.clone()).or_insert(Wake {
@@ -1667,4 +1859,35 @@ pub fn begin_followup(
         Ok(())
     })?;
     Ok(context)
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn this_routers_attempts_are_alive_without_a_probe() {
+        let (router_pid, router_started_at_ms) = process_identity();
+        let attempt = |pid, started| Attempt {
+            id: "a".into(),
+            router_pid: pid,
+            router_started_at_ms: started,
+            delegate_id: None,
+            ended: false,
+        };
+        assert!(owner_alive(&attempt(router_pid, router_started_at_ms)));
+        assert!(
+            !owner_alive(&attempt(router_pid, router_started_at_ms + 1)),
+            "a reused pid is not this router"
+        );
+        assert!(!owner_alive(&attempt(0, 0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_process_is_absent_and_an_unsignalable_one_is_present() {
+        assert!(pid_exists(std::process::id()));
+        assert!(pid_exists(1), "launchd/init refuses signals but exists");
+        assert!(!pid_exists(i32::MAX as u32), "no such process");
+    }
 }

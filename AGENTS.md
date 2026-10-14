@@ -48,12 +48,16 @@ SDK traps below, which were all discovered the hard way.
 | `src/lifecycle.rs` | router-owned session/list,load,resume,delete,close from SQLite; provider lifecycle support and provider session files are optional |
 | `src/restoration.rs` | durable router configuration, SQLite history lookup references, and Continue snapshots |
 | `src/delegate_mcp.rs` | delegate tools: unix-socket listener, token→binding map (`DelegateBinding.worker` marks a `router-worker` connection: `worker_whoami`/`worker_handoff` only), minimal MCP server on the SDK's JSON-RPC layer, `run_delegate_task` (cheaper-only pool, same agent first — except with `delegation.candidate_hints: exact`, where `hints.candidate` names any eligible model or fails without substituting; `agents[].max_delegates` slots in `Shared.agent_delegate_slots` beside the global semaphore; `hints.effort` → `Shared.delegate_effort`, read by `llm_proxy::request_effort` by state-session id; `gate_turns` runs `delegate_turn_end` and re-prompts on exit 2), multi-turn `delegate_task keep_open` → `run_delegate_followup` (optionally a background job)/`run_delegate_close` over a `Shared.live_delegates` registry, `delegate_result` (re-reads the state DB by `worker_id`/`background_id` in the delegate row's routing JSON), `mcp-delegate` helper bridge |
+| `src/mcp_oauth.rs` | project `.mcp.json` discovery (nearest file up to the git root; which entries are brokered), OAuth 2.1 + PKCE sign-in for remote MCP servers (RFC 9728/8414 discovery, DCR as `router-acp`, RFC 8707 resource), the URL-keyed 0700/0600 atomic token store, `TokenSource` (single-flight, locked refresh; a refused refresh or replacement marks "reconnect needed"), `mcp-login`/`mcp-logout`/`mcp-status`/`mcp-call` and the `account-status` `mcpServers` rows. Never logs token material |
+| `src/mcp_broker.rs` | the loopback MCP broker `serve` binds: per-session broker entries (`session_servers(cwd)`, merged authoritatively in `mcp_servers_for_pin` and the delegate path), the bearer-checked streamable-HTTP proxy with refresh-and-retry on auth rejection, local `server/discover`, the HTTP-capability gate and Claude `disabledMcpjsonServers` suppression in `open_downstream_session_at` |
 | `src/delegate_hook.rs` | `delegation.lifecycle_hook`: `delegate_start` (awaited after the delegate session opens, before its prompt; a failure refuses the delegate and queues an `aborted` stop), `delegate_turn_end` (`TurnVerdict`: only exit 2 + stderr continues), and durable `delegate_stop`/`parent_repinned` (`deliver`/`deliver_now` through the state DB `hook_outbox`, flushed every 30 s by `spawn_outbox_flusher`); `process_identity` (pid + start ms on every event); the delegate identity line. `parent_repinned` is emitted by `session::report_repin` from both pin sites (`pin_session` and `switch_pin`) |
 | `src/headless.rs` | `router-acp prompt`: in-process client that resumes/loads a session (by router id or pinned provider id) or opens one, applies a mode, sends one message and streams text to stdout; first-allow permissions, no fs/terminal capability. `serve`/`prompt` export `ROUTER_ACP_CONFIG`/`ROUTER_ACP_BIN` to every adapter (`transport::set_router_env`) |
 | `src/tickets.rs` | ticket-context loading: `find_ticket_refs` (configured `prefix` at word start + digits), `fetch_ticket` (rule's argv with `$TICKET` substituted, no shell, 20s timeout, output capped), `enrich_prompt` (prepends framed ticket content BEFORE classification; per-session dedup via `injected_tickets`, 5-min global `ticket_cache`, fail-open, disclosed). Pluggable across ticketing systems (linear/jira/gh CLIs) |
 | `src/relay.rs` | raw `UntypedMessage` sessionId rewriting + `_meta.router_acp` attachment (`with_router_notices` adds `notices[]`) |
 | `src/notice.rs` | typed router notices: reason → label (`GPT-6.1 Sol outage`, `Reserve reached`), hard/soft cordon, the `_meta.router_acp.notices[]` JSON shape |
 | `src/xai_questions.rs` | Grok `_x.ai/ask_user_question` ↔ ACP `elicitation/create` translation (pure; `session.rs` intercepts) |
+| `src/config_admin.rs` | host configuration commands (`config-show`, `config-apply`, `account-reserve`, `account-order`): JSON in and out, the accounts lock, revision checks, and `keep_router_accounts` (live account entries keep their router-owned fields; a proposal under a seat's former name supplies its settings; unknown proposed accounts are dropped). A non-dry-run apply then runs `adopt_seat_directories`. Exit status 3 = conflict |
+| `src/usage_view.rs` | normalized per-account usage for `account-status` (`usage`): Claude limits/legacy windows/extra usage and Codex pools/member limits as host-ready windows with `reserveKind` and measured `capacityDollars` |
 | `src/config.rs` | YAML config, env interpolation (`${VAR}`; unknown names left intact for later `${model_id}` substitution), validation |
 | `src/bin/mock_agent.rs` | scripted downstream for tests (below) |
 | `data/*.yaml` | score table + classifier rules, embedded via `include_str!`, overridable by config path |
@@ -215,8 +219,9 @@ SDK traps below, which were all discovered the hard way.
   Hosts that also run provider adapters directly supervise
   `router-acp usage-monitor --config …`. That router-owned process reloads the
   config before each poll and keeps the same account-isolated shared caches
-  current without an active ACP router conversation. The host remains a cache
-  reader and process supervisor; it never performs provider usage requests.
+  current without an active ACP router conversation. The host is a process
+  supervisor and reads usage only through `account-status` (`usage_view.rs`);
+  it never opens the caches or performs provider usage requests.
   Tests: `usage::tests` (pure, both providers) +
   `usage_cordon_excludes_advertises_and_redirects` (enforcement, via
   `run_test_shared`).
@@ -551,6 +556,7 @@ serves fs reads, collects `session/update`s). Mock behavior is env-driven:
 - `MOCK_FAIL_PROMPT_MSG` (+ `MOCK_FAIL_PROMPT_TIMES`, `MOCK_FAIL_PROMPT_AFTER=<n successes first>`)
 - `MOCK_CAPS_IMAGE`, `MOCK_SUPPORTS_LIFECYCLE`, `MOCK_SESSION_MODES`
 - `MOCK_LOG=<path>` — JSONL event log tests assert against
+- `MOCK_MCP_HTTP` — advertise HTTP MCP; `session_new` logs `mcpHttp` and `configDir`
 
 Prompt-text directives the mock obeys: `PERM`, `READFILE:<path>`,
 `SLEEP:<ms>` (cancel-aware), `TITLE:<t>` (emits session_info_update),

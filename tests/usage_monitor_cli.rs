@@ -68,15 +68,19 @@ done
     };
     let mut child = spawn_monitor();
 
-    let usage = home.join(".local/state/router-acp/usage");
+    // Each account publishes into its own directory.
+    let usage: Vec<_> = ["first", "second"]
+        .iter()
+        .map(|name| {
+            home.join(name)
+                .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+        })
+        .collect();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let snapshots: Vec<Value> = std::fs::read_dir(&usage)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-                .filter_map(|entry| std::fs::read(entry.path()).ok())
+            let snapshots: Vec<Value> = usage
+                .iter()
+                .filter_map(|dir| std::fs::read(dir.join("codex.json")).ok())
                 .filter_map(|raw| serde_json::from_slice(&raw).ok())
                 .collect();
             if snapshots.len() == 2 {
@@ -111,7 +115,9 @@ done
 
     // Interrupt a native poll with a live Codex reader. The reader must die,
     // rather than becoming another orphaned credential writer after restart.
-    std::fs::remove_dir_all(&usage).unwrap();
+    for dir in &usage {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     std::fs::write(
         &cli,
         r#"#!/bin/sh

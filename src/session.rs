@@ -317,6 +317,14 @@ pub struct RouterSession {
     /// Successful LLM pre-classification supersedes the static classifier for
     /// the initial model-selection profile.
     pub preclass_profile: Option<crate::classifier::TaskProfile>,
+    /// The operator's own text of a `/plan` or `/implement` command. Routing
+    /// classifies this, not the role invocation it became: the repository's
+    /// role skill inlined into the prompt would otherwise score every command
+    /// at maximum complexity and pull the planning pool into implementation.
+    pub planner_command_text: Option<String>,
+    /// The phase an explicit `/plan` or `/implement` command chose. While the
+    /// session stays in it, routing uses that phase's pool without crossover.
+    pub planner_explicit_phase: Option<crate::config::PlannerPhase>,
     /// Whether the native-subagent-usage warning has fired this turn (a session
     /// that received the delegation directive using the adapter's built-in
     /// `Task` tool instead of `delegate_task`). Reset each turn so it warns at
@@ -493,6 +501,8 @@ impl RouterSession {
                     requested_effort
                 },
             }),
+            planner_command_text: None,
+            planner_explicit_phase: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             pending_ticket_enrichment_chars: None,
@@ -573,6 +583,8 @@ impl RouterSession {
             delegation_directive_active: false,
             preclass_done: false,
             preclass_profile: None,
+            planner_command_text: None,
+            planner_explicit_phase: None,
             turn_native_subagent_warned: false,
             injected_tickets: HashSet::new(),
             pending_ticket_enrichment_chars: None,
@@ -606,10 +618,15 @@ pub struct Shared {
     pub account_flows: Mutex<HashMap<String, crate::accounts::LoginFlow>>,
     pub account_cancellations: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     pub account_write: tokio::sync::Mutex<()>,
+    /// `/mcp` menus and started sign-ins, per session.
+    pub mcp_menus: crate::mcp_menu::McpMenus,
+    pub mcp_logins: crate::mcp_menu::McpLogins,
     pub scores: ScoreTable,
     pub rules: ClassifierRules,
     pub state: Mutex<StateStore>,
     pub llm_proxy: Arc<crate::llm_proxy::LlmProxyRuntime>,
+    /// Router-owned OAuth broker for `mcp_servers` (inert when none).
+    pub mcp_broker: Arc<crate::mcp_broker::Broker>,
     pub headroom: Mutex<HeadroomTracker>,
     pub auth: Mutex<crate::auth::AuthTracker>,
     pub sessions: Mutex<HashMap<String, RouterSession>>,
@@ -746,13 +763,20 @@ impl Shared {
                     .map(|n| (a.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
             })
             .collect();
+        let mcp_broker = crate::mcp_broker::Broker::new(
+            crate::mcp_oauth::store_root(),
+            cfg.mcp_credential_command.clone(),
+        );
         Ok(Arc::new(Self {
+            mcp_broker,
             account_config: Mutex::new(cfg.clone()),
             account_menus: Mutex::default(),
             account_login: Mutex::default(),
             account_flows: Mutex::default(),
             account_cancellations: Mutex::default(),
             account_write: Default::default(),
+            mcp_menus: Default::default(),
+            mcp_logins: Default::default(),
             cfg,
             scores,
             rules,
@@ -1025,6 +1049,19 @@ impl Shared {
 
     /// Managed credentials use shared, generation-bound evidence on every
     /// decision. A process-local probe or stale success cannot lift rejection.
+    /// A provider account with no saved credential and no API key in its
+    /// environment: nothing could authenticate it except `/login`.
+    pub fn never_signed_in(&self, name: &str) -> bool {
+        self.agent_configs().into_iter().any(|agent| {
+            agent.name == name
+                && crate::accounts::provider(&agent).is_some()
+                && !crate::credentials::present(&agent)
+                && !crate::accounts::AUTH_ENV
+                    .iter()
+                    .any(|var| agent.env_var(var).is_some_and(|v| !v.is_empty()))
+        })
+    }
+
     pub fn auth_rejection(&self, name: &str) -> Option<String> {
         let agent = self.agent_configs().into_iter().find(|a| a.name == name)?;
         let state = if crate::accounts::provider(&agent).is_some() {
@@ -1172,6 +1209,62 @@ impl Shared {
     /// what makes "never picked by accident" hold for mechanisms added later.
     pub fn eligible_views(&self, required: &RequiredCaps, class: TaskClass) -> Vec<CandidateView> {
         self.eligible_views_inner(required, class, None, false, &[])
+    }
+
+    /// The seat a candidate reference names. Every seat is an account
+    /// (`claude@<id>`), and a reference written without one (`claude/opus[1m]`,
+    /// as people and skills write it) names that agent's account seats for that
+    /// model: it resolves to the first one routing may use now, so account
+    /// priority still decides. An exact id, or a reference nothing matches, is
+    /// returned unchanged.
+    pub fn seat_for(&self, reference: &CandidateId) -> CandidateId {
+        if reference.agent.contains('@')
+            || self
+                .candidate_view_revivable(
+                    reference,
+                    &RequiredCaps::default(),
+                    TaskClass::CodingGeneral,
+                )
+                .is_some()
+        {
+            return reference.clone();
+        }
+        self.eligible_views_revivable(&RequiredCaps::default(), TaskClass::CodingGeneral)
+            .into_iter()
+            .filter(|v| {
+                v.id.agent.split('@').next() == Some(reference.agent.as_str())
+                    && v.id.model == reference.model
+            })
+            .min_by_key(|v| v.config_index)
+            .map(|v| v.id)
+            .unwrap_or_else(|| reference.clone())
+    }
+
+    /// The seat a persisted candidate names now. A session saved before its
+    /// seat became an account (`grok/x` before `grok` was renamed
+    /// `grok@<id>`) would otherwise resume onto an agent that no longer
+    /// exists. Like `seat_for`, but an account with that model is still
+    /// chosen, by account priority, when none is routable at this moment, so
+    /// the next pin reports that seat's state instead of an unknown agent.
+    pub fn restored_seat(&self, reference: &CandidateId) -> CandidateId {
+        let agents = self.agent_configs();
+        if agents.iter().any(|agent| agent.name == reference.agent) {
+            return reference.clone();
+        }
+        let seat = self.seat_for(reference);
+        if seat != *reference {
+            return seat;
+        }
+        agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| {
+                agent.name.split_once('@').map(|(base, _)| base) == Some(reference.agent.as_str())
+                    && agent.models.iter().any(|model| model.id == reference.model)
+            })
+            .min_by_key(|(index, agent)| (agent.account_priority.unwrap_or(u32::MAX), *index))
+            .map(|(_, agent)| CandidateId::new(&agent.name, &reference.model))
+            .unwrap_or_else(|| reference.clone())
     }
 
     /// `eligible_views` for resolving an EXPLICIT user pick: also keeps
@@ -2468,6 +2561,27 @@ fn client_has_form_elicitation(shared: &Shared) -> bool {
         .is_some_and(|caps| caps.form.is_some())
 }
 
+/// The `session/request_permission` answer `auto` mode gives: the agent's own
+/// "allow always" option, else its "allow once". An agent that offers neither
+/// is told the request was cancelled rather than having a choice guessed.
+pub(crate) fn auto_permission_answer(params: &Value) -> Value {
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pick = |kind: &str| {
+        options
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
+            .and_then(|o| o.get("optionId").cloned())
+    };
+    match pick("allow_always").or_else(|| pick("allow_once")) {
+        Some(option) => json!({"outcome": {"outcome": "selected", "optionId": option}}),
+        None => json!({"outcome": {"outcome": "cancelled"}}),
+    }
+}
+
 fn track_approval(
     shared: &Arc<Shared>,
     sid: &str,
@@ -2783,6 +2897,16 @@ pub fn handle_downstream_dispatch(
                             fwd = relay::with_router_notices(&fwd, notices)?;
                         }
                     }
+                    // Some adapters drop MCP output from the completed update;
+                    // the broker saw the result and fills it back in.
+                    if relay::is_tool_call_update(&fwd) {
+                        let mut params = fwd.params().clone();
+                        if let Some(update) = params.get_mut("update")
+                            && shared.mcp_broker.fill_tool_result(&router_sid, update)
+                        {
+                            fwd = agent_client_protocol::UntypedMessage::new(fwd.method(), params)?;
+                        }
+                    }
                     // Attribute each tool call to the model that produced it, as
                     // structured metadata on the frame the client already renders
                     // as a card. This is where per-request routing belongs — it
@@ -2833,6 +2957,31 @@ pub fn handle_downstream_dispatch(
             Dispatch::Request(msg, responder) => {
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
+                // A planner wake is a router-owned turn: the client has no
+                // prompt in flight, so it cannot show the request (goose
+                // answers it with an internal error, which pauses the run).
+                // Answer as a delegate's turn is answered.
+                if method == "session/request_permission"
+                    && shared
+                        .with_session(&router_sid, |s| s.planner_wake_active)
+                        .unwrap_or(false)
+                {
+                    let answer = auto_permission_answer(msg.params());
+                    shared.state.lock().unwrap().log(
+                        &router_sid,
+                        &crate::state::LogEntry {
+                            kind: "auto_permission".to_string(),
+                            role: "router".to_string(),
+                            summary: format!(
+                                "planner wake answered a permission request: {answer}"
+                            ),
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                    );
+                    responder.respond(answer)?;
+                    return Ok(Handled::Yes);
+                }
                 let responder = track_approval(shared, &router_sid, &down_sid, &method, responder)?;
                 // Escalation router: a file read is investigation; a write or
                 // a terminal command is a side effect that locks out mid-turn
@@ -2934,6 +3083,27 @@ pub fn handle_downstream_dispatch(
                 // Permission/fs/terminal callbacks go live to the client
                 // under the parent router session id.
                 let method = msg.method().to_string();
+                // A delegate always runs in `auto`. An agent with no mode for it
+                // (Grok advertises none) still asks before each tool, and no
+                // client can answer a background worker: the parent's turn has
+                // usually ended. Answer as `auto` does, with the agent's own
+                // allow option.
+                if method == "session/request_permission" {
+                    let sub_sid = format!("{parent_router_sid}::delegate-{down_sid}");
+                    let answer = auto_permission_answer(msg.params());
+                    shared.state.lock().unwrap().log(
+                        &sub_sid,
+                        &crate::state::LogEntry {
+                            kind: "auto_permission".to_string(),
+                            role: "router".to_string(),
+                            summary: format!("auto mode answered a permission request: {answer}"),
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                    );
+                    responder.respond(answer)?;
+                    return Ok(Handled::Yes);
+                }
                 let responder =
                     track_approval(shared, &parent_router_sid, &down_sid, &method, responder)?;
                 let client_sid = if crate::planner_client::supported(shared) {
@@ -3188,6 +3358,25 @@ pub(crate) async fn open_downstream_session_at(
             .ok_or_else(|| AcpError::internal_error().data("target vanished"))?;
         (t.spec.selection.clone(), t.model_config_id.clone())
     };
+    // Broker entries are streamable HTTP: an adapter that does not advertise
+    // HTTP MCP support never receives one.
+    let http_mcp = shared
+        .targets
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|t| t.init.as_ref())
+        .is_some_and(|init| init.agent_capabilities.mcp_capabilities.http);
+    let mut mcp_servers = mcp_servers;
+    if !http_mcp
+        && mcp_servers
+            .iter()
+            .any(|s| shared.mcp_broker.is_broker_entry(s))
+    {
+        tracing::info!(%candidate, "adapter lacks HTTP MCP support; broker servers omitted");
+        mcp_servers.retain(|s| !shared.mcp_broker.is_broker_entry(s));
+    }
+    shared.mcp_broker.suppress_duplicates(&key, &mcp_servers);
 
     let new_req = NewSessionRequest::new(cwd)
         .additional_directories(additional_directories)
@@ -4357,7 +4546,11 @@ async fn pin_session(
 
     // 1. Build the route context from the first prompt.
     let cwd_langs = cwd_language_fingerprint(&shared.rules, &cwd);
-    let input = ClassifyInput::from_prompt(prompt, cwd_langs);
+    let typed = shared
+        .with_session(router_sid, |s| s.planner_command_text.take())
+        .flatten()
+        .map(|text| vec![ContentBlock::from(text)]);
+    let input = ClassifyInput::from_prompt(typed.as_deref().unwrap_or(prompt), cwd_langs);
     let profile = match shared.with_session(router_sid, |s| s.preclass_profile.clone()) {
         Some(Some(profile)) => profile,
         _ => classify(&shared.cfg.classifier, &shared.rules, &input).await,
@@ -4434,6 +4627,12 @@ async fn pin_session(
             planner_phase
         },
         planner_difficulty,
+        planner_explicit: !coordinator
+            && planner_phase.is_some()
+            && shared
+                .with_session(router_sid, |s| s.planner_explicit_phase)
+                .flatten()
+                == planner_phase,
     };
 
     // Cordons active right now (shown to the user so exclusions are visible).
@@ -5115,11 +5314,12 @@ pub(crate) fn mcp_servers_for_pin(
     client_mcp: &[McpServer],
 ) -> Result<(Vec<McpServer>, bool), AcpError> {
     let mut servers = client_mcp.to_vec();
-    let (required_capabilities, catalogs) = shared
+    let (required_capabilities, catalogs, cwd) = shared
         .with_session(router_sid, |s| {
             (
                 s.required_mcp_capabilities.clone(),
                 s.delegate_mcp_catalogs.clone(),
+                s.cwd.clone(),
             )
         })
         .unwrap_or_default();
@@ -5130,6 +5330,11 @@ pub(crate) fn mcp_servers_for_pin(
             merge_catalog_entries(&mut servers, entries);
         }
     }
+    // The project's signed-in remote servers, through the router's broker.
+    crate::mcp_broker::merge_authoritative(
+        &mut servers,
+        shared.mcp_broker.session_servers(&cwd, Some(router_sid)),
+    );
     let delegate_attached = crate::delegate_mcp::delegation_available(shared, candidate);
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {
         servers.push(entry);
@@ -7029,7 +7234,7 @@ fn resolve_candidate_ref(
     // selection, so it may name a pinned legacy version. The fuzzy matching
     // below stays on the automatic pool: `opus:` must not land on a legacy
     // version just because it scores a hair higher.
-    if let Some(id) = CandidateId::parse(reference)
+    if let Some(id) = CandidateId::parse(reference).map(|id| shared.seat_for(&id))
         && !is_excluded(&id, excluded)
         && shared
             .candidate_view_revivable(&id, &RequiredCaps::default(), class)
@@ -7407,6 +7612,7 @@ fn select_planner_target(
         explicit_source: None,
         planner_phase: Some(phase),
         planner_difficulty,
+        planner_explicit: false,
     };
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     if !excluded.is_empty() {
@@ -8435,6 +8641,15 @@ pub async fn serve_shared(
     } else {
         None
     };
+    // The MCP OAuth broker's loopback listener. It serves only the project
+    // servers the router is signed in to; with none, sessions are unchanged.
+    let mcp_broker_task = match shared.mcp_broker.bind().await {
+        Ok(task) => Some(task),
+        Err(err) => {
+            tracing::warn!(%err, "MCP broker disabled; sessions receive client MCP servers only");
+            None
+        }
+    };
 
     // Router-owned MCP listener (Unix socket) runs independently of the ACP
     // connection; it serves delegation when configured and managed-background
@@ -8480,6 +8695,9 @@ pub async fn serve_shared(
     }
     planner_wake_task.abort();
     if let Some(task) = llm_proxy_task {
+        task.abort();
+    }
+    if let Some(task) = mcp_broker_task {
         task.abort();
     }
     log_task.abort();
@@ -8748,6 +8966,15 @@ fn on_initialize(
             {
                 continue;
             }
+            // An account never signed in has nothing to start with. It stays
+            // down until `/login`, which starts and probes it on success.
+            if task_shared
+                .target_spec(key)
+                .is_some_and(|spec| task_shared.never_signed_in(&spec.agent_name))
+            {
+                task_shared.set_target_auth_pending(key);
+                continue;
+            }
             if let Err(err) = start_downstream(&task_shared, key).await {
                 task_shared.set_target_failed(key, &format!("failed to start: {err}"));
             }
@@ -8900,6 +9127,7 @@ fn on_session_new(
                     AcpError::invalid_params().data(format!("unknown router session id `{source}`"))
                 })?;
                 crate::restoration::restore_continued_config(&mut session, &saved)?;
+                crate::restoration::migrate_seats(&shared, &mut session);
                 session.coordinator |= meta_marks_coordinator(req.meta.as_ref());
                 inherited_context = Some(crate::restoration::snapshot(&shared, source)?);
                 session.pending_history = crate::restoration::lookup_context(&shared, &router_sid);
@@ -9329,6 +9557,16 @@ fn prepare_parent_prompt_inner(
     let already_pinned = shared
         .with_session(&router_sid, |s| s.pin.is_some())
         .unwrap_or(false);
+    // An explicit `/plan` or `/implement` opts this session into the planner
+    // workflow whatever the configured router, so `router: auto` sessions keep
+    // ordinary routing until the operator asks for a plan or a run.
+    let mut undirected = req.clone();
+    if let Ok(Some((_, stripped))) = parse_prompt_directives(&req.prompt) {
+        undirected.prompt = stripped;
+    }
+    if crate::planner_workflow::explicit_command(&undirected) {
+        shared.with_session(&router_sid, |s| s.strategy = StrategyKind::Planner);
+    }
     if shared
         .with_session(&router_sid, |s| s.strategy == StrategyKind::Planner)
         .unwrap_or(false)
@@ -9539,7 +9777,10 @@ fn prepare_parent_prompt_inner(
                 }
             }
         }
-        Ok(Some((directives, stripped))) => {
+        Ok(Some((mut directives, stripped))) => {
+            // `candidate=claude/opus[1m]` names that agent's account seats.
+            directives.candidate = directives.candidate.map(|id| shared.seat_for(&id));
+            directives.switch = directives.switch.map(|id| shared.seat_for(&id));
             explicit_routing = true;
             req = PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
             let pinned_now = shared

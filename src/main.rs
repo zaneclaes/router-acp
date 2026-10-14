@@ -37,6 +37,118 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Sign the router in to one remote server from the project's `.mcp.json`
+    /// (OAuth + PKCE in the browser). Every agent family's sessions then share
+    /// that sign-in.
+    McpLogin {
+        /// The server's name in the project's `.mcp.json`.
+        server: Option<String>,
+        /// Project directory whose `.mcp.json` names the server (default: the
+        /// current directory; the nearest file up to the git root is used).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Sign in to this MCP URL directly instead of a project entry.
+        #[arg(long)]
+        url: Option<String>,
+        /// Print the sign-in URL without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Host-delegated sign-in, step one: use this redirect URI instead of
+        /// a loopback listener and print `{url, expiresAt}` as JSON.
+        #[arg(long, conflicts_with = "callback_url")]
+        redirect_uri: Option<String>,
+        /// Host-delegated sign-in, step two: the full URL the browser was
+        /// redirected to. Prints the server's status as JSON.
+        #[arg(long)]
+        callback_url: Option<String>,
+    },
+    /// Forget the router's sign-in for one project MCP server (or `--url`).
+    McpLogout {
+        server: Option<String>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Print the project's `.mcp.json` servers as JSON: how the router's
+    /// broker handles each one and its sign-in state.
+    McpStatus {
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Router configuration whose `mcp_credential_command` may serve a
+        /// server the router has no sign-in for.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Call one tool on a project MCP server with the router's own sign-in and
+    /// print the tool's result object as JSON on stdout.
+    ///
+    /// Exit status: 0 success; 1 usage or other error; 2 not signed in or
+    /// reconnect needed (stderr names the state, never a token); 3 transient
+    /// failure (network, token endpoint, 5xx, timeout); 4 the tool returned
+    /// `isError: true` (its result is still printed).
+    McpCall {
+        /// The server's name in the project's `.mcp.json` (or any name with --url).
+        server: String,
+        /// The tool to call.
+        tool: String,
+        /// The tool arguments as one JSON object.
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Project directory whose `.mcp.json` names the server (default: the
+        /// current directory; the nearest file up to the git root is used).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Call this MCP URL directly instead of a project entry.
+        #[arg(long)]
+        url: Option<String>,
+        /// Bound on the whole call, in milliseconds.
+        #[arg(long, default_value_t = 20_000)]
+        timeout_ms: u64,
+        /// Router configuration whose `mcp_credential_command` supplies a
+        /// bearer when the router has no sign-in.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Print the router configuration as JSON: `{revision, config}`.
+    ConfigShow {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Replace the router configuration with the JSON document on stdin.
+    /// Account entries stay as the router wrote them. Prints `{revision,
+    /// config}`. Exit status 3 means it changed or is locked: re-read, retry.
+    ConfigApply {
+        #[arg(long)]
+        config: PathBuf,
+        /// Refuse the write unless the file is still at this revision.
+        #[arg(long)]
+        expect_revision: Option<String>,
+        /// Validate and print the result without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Set one account's reserve percentages. Exit status 3: re-read, retry.
+    AccountReserve {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        weekly: f64,
+        #[arg(long)]
+        session: f64,
+    },
+    /// Order one provider's accounts, first drained first. Name every
+    /// connected account once. Exit status 3: re-read, retry.
+    AccountOrder {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "account", required = true)]
+        accounts: Vec<String>,
+    },
     /// Internal: access-only credential hook for a router-owned Grok adapter.
     CredentialToken {
         #[arg(long)]
@@ -89,6 +201,13 @@ enum Command {
     },
     /// Validate a configuration file and print the resolved candidates.
     CheckConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print a configuration reduced to what differs from router-acp's
+    /// defaults (provider presets, implied account directories, section
+    /// defaults). Refuses unless the result resolves identically.
+    ConfigMinimize {
         #[arg(long)]
         config: PathBuf,
     },
@@ -280,8 +399,60 @@ async fn termination_signal() {
     tokio::select! { _ = wait_term => {}, _ = wait_intr => {} }
 }
 
+fn mcp_target(
+    project: Option<PathBuf>,
+    server: Option<String>,
+    url: Option<String>,
+) -> anyhow::Result<router_acp::mcp_oauth::RemoteServer> {
+    let project = project.unwrap_or(std::env::current_dir()?);
+    router_acp::mcp_oauth::resolve_target(&project, server.as_deref(), url.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Raise the soft open-file limit to the hard one. A router holds three pipes
+/// per adapter process plus its sockets and state files, and macOS launchd
+/// starts GUI shells at 256: past that every adapter spawn fails with EMFILE.
+/// macOS refuses an unlimited soft value, so cap it at `kern.maxfilesperproc`.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed in.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let mut target = limit.rlim_max;
+        #[cfg(target_os = "macos")]
+        {
+            let mut per_process: libc::c_int = 0;
+            let mut size = std::mem::size_of::<libc::c_int>();
+            let name = c"kern.maxfilesperproc";
+            if libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut per_process as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+                && per_process > 0
+            {
+                target = target.min(per_process as libc::rlim_t);
+            }
+        }
+        if target > limit.rlim_cur {
+            limit.rlim_cur = target;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    raise_open_file_limit();
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => {
@@ -293,6 +464,11 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .with_writer(std::io::stderr)
                 .init();
+            // Each seat owns its directory before anything reads its login.
+            match router_acp::accounts::adopt_seat_directories(&config) {
+                Ok(report) => report.iter().for_each(|line| tracing::info!("{line}")),
+                Err(err) => tracing::warn!("{err}"),
+            }
             let cfg = Config::from_file(&config)?;
             export_router_env(&config);
             // Downstream agents run with workspace write access; they must die
@@ -325,6 +501,118 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", router_acp::account_usage::status(&config));
             Ok(())
         }
+        Command::McpLogin {
+            server,
+            project,
+            url,
+            no_browser,
+            redirect_uri,
+            callback_url,
+        } => {
+            use router_acp::mcp_oauth;
+            let target = mcp_target(project, server, url)?;
+            let result = match (redirect_uri, callback_url) {
+                (Some(uri), _) => mcp_oauth::login_start(&target, &uri)
+                    .await
+                    .map(|v| v.to_string()),
+                (_, Some(url)) => mcp_oauth::login_finish(&target, &url)
+                    .await
+                    .map(|v| v.to_string()),
+                _ => mcp_oauth::login_interactive(&target, !no_browser).await,
+            };
+            println!("{}", result.map_err(|e| anyhow::anyhow!(e))?);
+            Ok(())
+        }
+        Command::McpLogout {
+            server,
+            project,
+            url,
+        } => {
+            let target = mcp_target(project, server, url)?;
+            let message = router_acp::mcp_oauth::logout(&target).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{message}");
+            Ok(())
+        }
+        Command::McpStatus { project, config } => {
+            let project = project.unwrap_or(std::env::current_dir()?);
+            let root = router_acp::mcp_oauth::store_root();
+            let helper = mcp_credential_command(config.as_deref())?;
+            println!(
+                "{}",
+                router_acp::mcp_oauth::project_status_json(&project, &root, helper.as_ref()).await
+            );
+            Ok(())
+        }
+        Command::McpCall {
+            server,
+            tool,
+            args,
+            project,
+            url,
+            timeout_ms,
+            config,
+        } => {
+            let helper = mcp_credential_command(config.as_deref())?;
+            let arguments: serde_json::Value = serde_json::from_str(&args)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .ok_or_else(|| anyhow::anyhow!("--args must be one JSON object"))?;
+            let target = mcp_target(project, Some(server), url)?;
+            let root = router_acp::mcp_oauth::store_root();
+            let outcome = router_acp::mcp_broker::call_tool(
+                &root,
+                helper,
+                &target,
+                &tool,
+                &arguments,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await;
+            match outcome {
+                Ok(call) => {
+                    println!("{}", call.result);
+                    if call.is_error {
+                        std::process::exit(4);
+                    }
+                    Ok(())
+                }
+                Err(failure) => {
+                    eprintln!("router-acp mcp-call: {}", failure.message());
+                    std::process::exit(failure.exit_code());
+                }
+            }
+        }
+        Command::ConfigShow { config } => admin_output(router_acp::config_admin::show(&config)),
+        Command::ConfigApply {
+            config,
+            expect_revision,
+            dry_run,
+        } => {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+            let proposed: serde_json::Value = serde_json::from_str(&input)?;
+            admin_output(router_acp::config_admin::apply(
+                &config,
+                proposed,
+                expect_revision.as_deref(),
+                dry_run,
+            ))
+        }
+        Command::AccountReserve {
+            config,
+            account,
+            weekly,
+            session,
+        } => admin_output(router_acp::config_admin::set_reserve(
+            &config, &account, weekly, session,
+        )),
+        Command::AccountOrder {
+            config,
+            provider,
+            accounts,
+        } => admin_output(router_acp::config_admin::set_order(
+            &config, &provider, &accounts,
+        )),
         Command::CredentialToken {
             provider,
             directory,
@@ -390,6 +678,11 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .with_writer(std::io::stderr)
                 .init();
+            // Each seat owns its directory before anything reads its login.
+            match router_acp::accounts::adopt_seat_directories(&config) {
+                Ok(report) => report.iter().for_each(|line| tracing::info!("{line}")),
+                Err(err) => tracing::warn!("{err}"),
+            }
             let cfg = Config::from_file(&config)?;
             export_router_env(&config);
             let cwd = match cwd {
@@ -419,6 +712,11 @@ async fn main() -> anyhow::Result<()> {
             router_acp::delegate_mcp::run_helper(&socket, &token)
                 .await
                 .map_err(|e| anyhow::anyhow!("mcp-delegate bridge failed: {e}"))
+        }
+        Command::ConfigMinimize { config } => {
+            let raw = std::fs::read_to_string(&config)?;
+            print!("{}", Config::minimize_yaml(&raw)?);
+            Ok(())
         }
         Command::CheckConfig { config } => {
             let cfg = Config::from_file(&config)?;
@@ -753,4 +1051,34 @@ fn export_router_env(config: &std::path::Path) {
         env.push(("ROUTER_ACP_BIN".to_string(), exe.display().to_string()));
     }
     router_acp::transport::set_router_env(env);
+}
+
+/// Print a configuration command's JSON result. A conflict exits 3 so a host
+/// can tell "re-read and retry" from a rejected configuration.
+fn admin_output(
+    result: Result<serde_json::Value, router_acp::config_admin::AdminError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(value) => {
+            println!("{value}");
+            Ok(())
+        }
+        Err(router_acp::config_admin::AdminError::Conflict(message)) => {
+            eprintln!("{message}");
+            std::process::exit(3);
+        }
+        Err(err) => Err(anyhow::anyhow!("{err}")),
+    }
+}
+
+/// The `mcp_credential_command` of `--config`, when one is given.
+fn mcp_credential_command(
+    config: Option<&std::path::Path>,
+) -> anyhow::Result<Option<router_acp::config::McpCredentialCommand>> {
+    let Some(path) = config else {
+        return Ok(None);
+    };
+    let cfg = router_acp::config::Config::from_file(path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    Ok(cfg.mcp_credential_command)
 }

@@ -149,6 +149,9 @@ pub struct RouteContext {
     /// Per-prompt `hard:` / `easy:` prefix. `None` keeps the full planning
     /// pool (auto + apex). Ignored by non-planner strategies.
     pub planner_difficulty: Option<crate::config::PlannerDifficulty>,
+    /// The phase came from an explicit `/plan` or `/implement` command: the
+    /// planner ranks that phase's pool only, with no complexity crossover.
+    pub planner_explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -470,6 +473,7 @@ pub(crate) mod test_util {
             explicit_source: None,
             planner_phase: None,
             planner_difficulty: None,
+            planner_explicit: false,
         }
     }
 }

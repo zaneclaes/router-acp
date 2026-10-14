@@ -269,9 +269,8 @@ pub fn fingerprint(secret: &str) -> String {
 // Snapshot file I/O
 // ----------------------------------------------------------------------
 
-/// The published snapshot location: `~/.local/state/router-acp/usage/…` —
-/// alongside `sessions.db`. Fixed (not derived from `state_file`) because the
-/// relay reads these exact paths regardless of any per-process router config.
+/// The shared snapshot location, `~/.local/state/router-acp/usage/…`, for a
+/// usage source with no account directory to hold it.
 fn snapshot_path(file_name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
@@ -279,6 +278,32 @@ fn snapshot_path(file_name: &str) -> Option<PathBuf> {
             .join(".local/state/router-acp/usage")
             .join(file_name),
     )
+}
+
+/// The directory inside an account's own config directory that holds its
+/// published usage. The account owns its cache next to the credential it
+/// measures, so every router process on the box shares it, and deleting the
+/// account removes it. Adapters never see it (`.router-acp-*` stays out of
+/// their runtime stores). Hosts read it through `account-status`.
+pub const ACCOUNT_USAGE_DIR: &str = ".router-acp-usage";
+
+/// One account's snapshot file: `<account dir>/.router-acp-usage/<file>`, or
+/// the shared location when no account directory resolves.
+fn account_snapshot_path(
+    file: &str,
+    agent: Option<&crate::config::AgentConfig>,
+    variable: &str,
+    default: &str,
+) -> Option<PathBuf> {
+    match crate::usage::provider_config_dir(agent, variable, default) {
+        Some(dir) => Some(
+            dir.canonicalize()
+                .unwrap_or(dir)
+                .join(ACCOUNT_USAGE_DIR)
+                .join(file),
+        ),
+        None => snapshot_path(file),
+    }
 }
 
 pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
@@ -290,16 +315,16 @@ pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
 /// must never turn into this account's usage report.
 pub fn read_agent_snapshot(agent: &crate::config::AgentConfig) -> Option<Snapshot> {
     use crate::config::UsageSourceConfig;
-    let (file, account, generation) = match agent.usage_source.as_ref()? {
+    let (path, account, generation) = match agent.usage_source.as_ref()? {
         UsageSourceConfig::AnthropicOauth => {
             let creds = crate::usage::anthropic_oauth_credentials(Some(agent))?;
             (
-                account_cache_name(
+                account_snapshot_path(
                     "anthropic-oauth.json",
                     Some(agent),
                     "CLAUDE_CONFIG_DIR",
                     ".claude",
-                ),
+                )?,
                 fingerprint(
                     creds
                         .refresh_token
@@ -310,12 +335,12 @@ pub fn read_agent_snapshot(agent: &crate::config::AgentConfig) -> Option<Snapsho
             )
         }
         UsageSourceConfig::CodexRollout => (
-            account_cache_name("codex.json", Some(agent), "CODEX_HOME", ".codex"),
+            account_snapshot_path("codex.json", Some(agent), "CODEX_HOME", ".codex")?,
             crate::usage::codex_account_fingerprint(Some(agent))?,
             crate::credentials::access_generation(agent),
         ),
     };
-    let snapshot = read_snapshot(&snapshot_path(&file)?)?;
+    let snapshot = read_snapshot(&path)?;
     if snapshot.account != account
         || snapshot.fetched_at > unix_now()
         || (generation.is_some()
@@ -456,15 +481,17 @@ pub(crate) async fn cached_anthropic_usage_for_agent(
         return CachedUsage::Unknown(None);
     };
     let observed = agent.and_then(crate::credentials::request_generation);
-    let file_name = account_cache_name(
+    let Some(path) = account_snapshot_path(
         "anthropic-oauth.json",
         agent,
         "CLAUDE_CONFIG_DIR",
         ".claude",
-    );
-    cached_usage(
+    ) else {
+        return CachedUsage::Unknown(None);
+    };
+    cached_usage_at(
+        path,
         ANTHROPIC_SOURCE,
-        &file_name,
         initial,
         min_refresh_secs,
         true,
@@ -507,10 +534,12 @@ pub(crate) async fn cached_codex_usage_for_agent(
         return CachedUsage::Unknown(None);
     };
     let observed = agent.and_then(crate::credentials::request_generation);
-    let file_name = account_cache_name("codex.json", agent, "CODEX_HOME", ".codex");
-    cached_usage(
+    let Some(path) = account_snapshot_path("codex.json", agent, "CODEX_HOME", ".codex") else {
+        return CachedUsage::Unknown(None);
+    };
+    cached_usage_at(
+        path,
         CODEX_SOURCE,
-        &file_name,
         initial,
         min_refresh_secs,
         true,
@@ -550,30 +579,6 @@ fn codex_cache_request(agent: Option<&crate::config::AgentConfig>) -> Option<Cac
     })
 }
 
-fn account_cache_name(
-    file: &str,
-    agent: Option<&crate::config::AgentConfig>,
-    variable: &str,
-    default: &str,
-) -> String {
-    let Some(dir) = crate::usage::provider_config_dir(agent, variable, default) else {
-        return file.to_string();
-    };
-    let dir = dir.canonicalize().unwrap_or(dir);
-    let default_dir = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(default))
-        .map(|dir| dir.canonicalize().unwrap_or(dir));
-    if default_dir.as_ref() == Some(&dir) {
-        file.to_string()
-    } else {
-        format!(
-            "{}-{}.json",
-            file.trim_end_matches(".json"),
-            fingerprint(&dir.to_string_lossy())
-        )
-    }
-}
-
 fn anthropic_cache_request(agent: Option<&crate::config::AgentConfig>) -> Option<CacheRequest> {
     let creds = crate::usage::anthropic_oauth_credentials(agent)?;
     let account = fingerprint(
@@ -592,35 +597,6 @@ fn anthropic_cache_request(agent: Option<&crate::config::AgentConfig>) -> Option
 
 /// Shared cache-mediated fetch. `fetch` runs only under the cross-process
 /// lock, after the under-lock credential re-read still says a refresh is due.
-async fn cached_usage<R, F, Fut>(
-    source: &'static str,
-    file_name: &str,
-    initial: CacheRequest,
-    min_refresh_secs: u64,
-    generation_aware: bool,
-    reread: R,
-    fetch: F,
-) -> CachedUsage
-where
-    R: Fn() -> Option<CacheRequest>,
-    F: Fn(Option<String>) -> Fut,
-    Fut: std::future::Future<Output = Result<Value, String>>,
-{
-    let Some(path) = snapshot_path(file_name) else {
-        return CachedUsage::Unknown(None);
-    };
-    cached_usage_at(
-        path,
-        source,
-        initial,
-        min_refresh_secs,
-        generation_aware,
-        reread,
-        fetch,
-    )
-    .await
-}
-
 async fn cached_usage_at<R, F, Fut>(
     path: PathBuf,
     source: &'static str,
@@ -759,22 +735,38 @@ mod tests {
     #[test]
     fn account_snapshots_have_independent_paths_and_locks() {
         let cfg = crate::config::Config::from_yaml("agents:\n  - name: claude\n    command: {type: stdio, command: mock-agent}\n    model_selection: {type: config-option}\n    models: [{id: sonnet, cost_rank: 1}]\n    accounts:\n      - name: work\n        env: [{name: CLAUDE_CONFIG_DIR, value: /tmp/work}]\n      - name: personal\n        env: [{name: CLAUDE_CONFIG_DIR, value: /tmp/personal}]\n").unwrap();
-        let a = account_cache_name(
-            "anthropic-oauth.json",
-            Some(&cfg.agents[0]),
-            "CLAUDE_CONFIG_DIR",
-            ".claude",
-        );
-        let b = account_cache_name(
-            "anthropic-oauth.json",
-            Some(&cfg.agents[1]),
-            "CLAUDE_CONFIG_DIR",
-            ".claude",
-        );
-        assert_ne!(a, b);
+        let path = |agent| {
+            account_snapshot_path(
+                "anthropic-oauth.json",
+                Some(agent),
+                "CLAUDE_CONFIG_DIR",
+                ".claude",
+            )
+            .unwrap()
+        };
+        let (a, b) = (path(&cfg.agents[0]), path(&cfg.agents[1]));
+        // Each account's usage lives inside that account's own directory.
+        for (snapshot, dir) in [(&a, "/tmp/work"), (&b, "/tmp/personal")] {
+            let dir = PathBuf::from(dir);
+            let dir = dir.canonicalize().unwrap_or(dir);
+            assert_eq!(
+                snapshot,
+                &dir.join(ACCOUNT_USAGE_DIR).join("anthropic-oauth.json")
+            );
+        }
         let root = tempfile::tempdir().unwrap();
-        let a = root.path().join(a).with_extension("json.lock");
-        let b = root.path().join(b).with_extension("json.lock");
+        let a = root
+            .path()
+            .join("a")
+            .join(a.file_name().unwrap())
+            .with_extension("json.lock");
+        let b = root
+            .path()
+            .join("b")
+            .join(b.file_name().unwrap())
+            .with_extension("json.lock");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
         let _held = acquire_lock(&a, SystemTime::now(), Duration::from_secs(60)).unwrap();
         let _independent = acquire_lock(&b, SystemTime::now(), Duration::from_secs(60))
             .expect("a busy account must not prevent another account's usage read");

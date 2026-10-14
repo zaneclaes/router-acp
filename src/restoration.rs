@@ -179,6 +179,19 @@ pub fn restore_config(
     Ok(())
 }
 
+/// Point restored candidate references at the seats that hold them now.
+/// Saved ids predate any later rename of their seat into an account.
+pub fn migrate_seats(shared: &Shared, s: &mut RouterSession) {
+    s.candidate_override = s
+        .candidate_override
+        .take()
+        .map(|id| shared.restored_seat(&id));
+    s.preferred_candidate = s
+        .preferred_candidate
+        .take()
+        .map(|id| shared.restored_seat(&id));
+}
+
 /// Continue starts new work on the source's settings. Keep what a human chose
 /// (strategy, a user-picked model, effort, exclusions, coordinator role) and
 /// drop what the source's own work derived, so the first turn routes afresh:

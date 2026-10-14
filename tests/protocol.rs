@@ -636,6 +636,32 @@ fn agent_yaml(name: &str, models: &[(&str, u32)], env: &[(&str, &str)]) -> Strin
         "        - {{ name: MOCK_NAME, value: {name} }}\n        - {{ name: MOCK_MODELS, value: \"{}\" }}\n",
         model_ids.join(",")
     ));
+    // Startup leaves a provider account with no credential down until
+    // `/login`. Mock provider agents stand in for signed-in accounts unless
+    // the test supplies its own credential location.
+    let key_var = match name.split('@').next() {
+        Some("claude") => Some("ANTHROPIC_API_KEY"),
+        Some("codex") => Some("OPENAI_API_KEY"),
+        Some("grok") => Some("XAI_API_KEY"),
+        Some("kimi") => Some("KIMI_API_KEY"),
+        _ => None,
+    };
+    let own_credential = env.iter().any(|(k, _)| {
+        k.ends_with("_API_KEY")
+            || matches!(
+                *k,
+                "CLAUDE_CONFIG_DIR"
+                    | "CODEX_HOME"
+                    | "GROK_HOME"
+                    | "KIMI_SHARE_DIR"
+                    | "KIMI_CODE_HOME"
+            )
+    });
+    if let Some(var) = key_var.filter(|_| !own_credential) {
+        out.push_str(&format!(
+            "        - {{ name: {var}, value: synthetic-key }}\n"
+        ));
+    }
     for (k, v) in env {
         // Escape for a double-quoted YAML scalar (JSON env values need this).
         let escaped = v
@@ -2714,6 +2740,80 @@ fn delegation_yaml(
     )
 }
 
+/// A delegate runs in `auto`, but an agent with no session modes (Grok) still
+/// asks before each tool, and a background worker has no client to answer.
+/// The router answers as `auto` does, with the agent's "allow always" option.
+#[tokio::test]
+async fn a_delegate_permission_request_is_answered_as_auto_mode() {
+    let state = temp_state_file("delegate-permission");
+    let log = temp_log("delegate-permission");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test(delegation_yaml(&state, &log, 3), async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "hard integration work\nDELEGATE:ASK_PERMISSION:run the tests",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        let answer = text
+            .lines()
+            .find_map(|line| line.strip_prefix("permission:"))
+            .unwrap_or_else(|| panic!("the worker's request was answered: {text}"));
+        let answer: serde_json::Value = serde_json::from_str(answer).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+            "the router allowed it with the agent's own allow-always option"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// A planner wake is a router-owned turn: no client prompt is in flight, so
+/// the client cannot answer the parent's permission request (goose fails it,
+/// which pauses the run). The router answers it as a delegate's is answered.
+#[tokio::test]
+async fn a_planner_wake_permission_request_is_answered_by_the_router() {
+    let state = temp_state_file("wake-permission");
+    let log = temp_log("wake-permission");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[("MOCK_LOG", log.to_str().unwrap())])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "pin the session").await?;
+        // The wake flag is set mid-turn, as a router-owned wake holds it, and
+        // the agent asks only after that.
+        let gate = log.with_extension("gate");
+        let text = format!("WAIT_FILE:{}\nASK_PERMISSION:run the tests", gate.display());
+        let (turn, _) = tokio::join!(prompt_text(&cx, &sid, &text), async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            shared.with_session(&sid, |s| s.planner_wake_active = true);
+            std::fs::write(&gate, "go").unwrap();
+        });
+        turn?;
+        let text = agent_text(&observed, &sid);
+        let answer = text
+            .lines()
+            .find_map(|line| line.strip_prefix("permission:"))
+            .unwrap_or_else(|| panic!("the parent's request was answered: {text}"));
+        let answer: serde_json::Value = serde_json::from_str(answer).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}})
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn delegate_task_routes_to_lower_cost_candidate() {
     let state = temp_state_file("delegate");
@@ -3544,6 +3644,133 @@ async fn rate_limit_with_reset_time_cordons_agent_and_fails_over() {
         assert!(
             text2.contains("fancy is cordoned: token/usage limit"),
             "cordon disclosed on later sessions: {text2}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// Every seat is an account (`fancy@one`). A reference written without the
+/// account (`fancy/opus`), as people and skills write it, names that seat.
+#[tokio::test]
+async fn a_reference_without_an_account_names_the_agents_account_seat() {
+    let state = temp_state_file("seat-reference");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml("fancy@one", &[("opus", 3)], &[]),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=fancy/opus] which seat").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("echo:opus:which seat"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// A session saved while its seat was still `fancy` resumes after that seat
+/// became the account `fancy@one`, onto that account, not an unknown agent.
+#[tokio::test]
+async fn a_resumed_session_follows_its_seat_into_an_account() {
+    let state = temp_state_file("seat-restore");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml("fancy@one", &[("opus", 3)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=fancy@one/opus] first").await?;
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+
+        // The checkpoint as a router before the account rename wrote it.
+        let mut persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        let snapshot = persisted.session_config.as_mut().expect("checkpoint");
+        snapshot["candidate"] = serde_json::json!("fancy/opus");
+        snapshot["preferred_candidate"] = serde_json::json!("fancy/opus");
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(sid.clone(), persisted)
+            .unwrap();
+
+        cx.send_request(
+            agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(),
+                std::env::temp_dir(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let restored = shared
+            .with_session(&sid, |s| {
+                (
+                    s.candidate_override.as_ref().map(ToString::to_string),
+                    s.preferred_candidate.as_ref().map(ToString::to_string),
+                )
+            })
+            .unwrap();
+        assert_eq!(restored.0.as_deref(), Some("fancy@one/opus"));
+        assert_eq!(restored.1.as_deref(), Some("fancy@one/opus"));
+        prompt_text(&cx, &sid, "second").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(text.matches("static → fancy@one/opus").count(), 2, "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// Grok reports an exhausted seat as `402 Payment Required … usage balance
+/// exhausted`. That classified as an ordinary error, so every turn routed back
+/// to the exhausted seat and failed instead of failing over.
+#[tokio::test]
+async fn an_exhausted_grok_balance_cordons_the_seat_and_fails_over() {
+    let state = temp_state_file("grok-balance");
+    let log = temp_log("grok-balance");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "cheap",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+        agent_yaml(
+            "fancy",
+            &[("opus", 3)],
+            &[(
+                "MOCK_FAIL_PROMPT_MSG",
+                "API error (status 402 Payment Required): Grok Build usage balance exhausted"
+            )]
+        )
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "first question").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("failing over"), "failover announced: {text}");
+        assert!(
+            text.contains("echo:haiku:first question"),
+            "the turn was answered: {text}"
+        );
+        let sid2 = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid2, "second question").await?;
+        let text2 = agent_text(&observed, &sid2);
+        assert!(
+            text2.contains("fancy is cordoned: token/usage limit"),
+            "the exhausted seat stays out of routing: {text2}"
         );
         Ok(())
     })
@@ -4438,6 +4665,130 @@ async fn manager_rejection_is_not_spawned_and_auto_routes_live_peer() {
         assert!(
             grok_events.iter().any(|e| e["event"] == "prompt"),
             "Grok handled classifier and primary prompt: {grok_events:?}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+// Observed: with no Grok credential, the startup probe's managed
+// `authenticate` became an interactive sign-in that never answered, and
+// router initialize hung for every provider (Claude `/login` included).
+// An account never signed in is now not started at all until `/login`.
+#[tokio::test]
+async fn never_signed_in_grok_is_not_started() {
+    let state = temp_state_file("grok-unsigned");
+    let grok_log = temp_log("grok-unsigned");
+    let grok_home = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "state_file: {}\nprobe_timeout_ms: 2000\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[]),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[
+                ("MOCK_LOG", &grok_log.display().to_string()),
+                ("MOCK_AUTH_REQUIRED", "1"),
+                ("MOCK_AUTH_HANG", "1"),
+                ("GROK_HOME", &grok_home.path().display().to_string()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        tokio::time::timeout(std::time::Duration::from_secs(10), init(&cx))
+            .await
+            .expect("initialize completes without a Grok credential")?;
+        assert!(
+            read_log(&grok_log).is_empty(),
+            "a never-signed-in Grok account is not started before /login"
+        );
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hello").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:m1:hello"));
+        assert!(read_log(&grok_log).is_empty(), "routing leaves it down too");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn saved_grok_credential_still_authenticates_at_startup() {
+    let state = temp_state_file("grok-saved");
+    let grok_log = temp_log("grok-saved");
+    let grok_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        grok_home.path().join("auth.json"),
+        serde_json::json!({"https://auth.x.ai::fixture": {"key": "synthetic-key",
+            "create_time": "2026-10-01T00:00:00Z"}})
+        .to_string(),
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[
+                ("MOCK_LOG", &grok_log.display().to_string()),
+                ("MOCK_AUTH_REQUIRED", "1"),
+                ("GROK_HOME", &grok_home.path().display().to_string()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        assert!(
+            read_log(&grok_log)
+                .iter()
+                .any(|e| e["event"] == "authenticate"),
+            "saved Grok credential authenticates automatically"
+        );
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hello").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:grok-4.5:hello"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn silent_grok_authenticate_is_bounded() {
+    let state = temp_state_file("grok-silent");
+    let grok_log = temp_log("grok-silent");
+    let grok_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        grok_home.path().join("auth.json"),
+        serde_json::json!({"https://auth.x.ai::fixture": {"key": "synthetic-key",
+            "create_time": "2026-10-01T00:00:00Z"}})
+        .to_string(),
+    )
+    .unwrap();
+    let yaml = format!(
+        "state_file: {}\nprobe_timeout_ms: 2000\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[]),
+        agent_yaml(
+            "grok",
+            &[("grok-4.5", 5)],
+            &[
+                ("MOCK_LOG", &grok_log.display().to_string()),
+                ("MOCK_AUTH_REQUIRED", "1"),
+                ("MOCK_AUTH_HANG", "1"),
+                ("GROK_HOME", &grok_home.path().display().to_string()),
+            ],
+        ),
+    );
+    run_test(yaml, async |cx, _observed| {
+        tokio::time::timeout(std::time::Duration::from_secs(10), init(&cx))
+            .await
+            .expect("a silent managed authenticate cannot block initialize")?;
+        assert!(
+            read_log(&grok_log)
+                .iter()
+                .any(|e| e["event"] == "authenticate"),
+            "the saved credential was offered"
         );
         Ok(())
     })
@@ -10865,6 +11216,125 @@ async fn sharded_delegates_live_with_their_parent_and_stay_queryable() {
     assert_eq!(delegates["data"]["children"][0]["id"], ids[1].as_str());
 }
 
+/// `router: auto` keeps ordinary routing until the operator explicitly asks for
+/// the planner workflow; goose sends a typed `/implement` that names a
+/// repository skill as that skill's expansion.
+#[tokio::test]
+async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path().join(".agents/skills/implement");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "REPOSITORY-WORK-SENTINEL").unwrap();
+    let log = temp_log("auto-opt-in");
+    let state = temp_state_file("auto-opt-in");
+    let yaml = format!(
+        "state_file: {}\nrouter: auto\ndelegation: {{ enabled: false }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*']\n    implementation_candidates: ['work/*']\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "implement the login fix").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.strategy).unwrap(),
+            router_acp::config::StrategyKind::Auto,
+            "prose that starts with the verb stays an ordinary auto prompt"
+        );
+        assert!(
+            planner_user_prompts(&log)
+                .iter()
+                .all(|p| !p.contains("[router-acp planner role")),
+            "no planner role reached the provider"
+        );
+        prompt_text(
+            &cx,
+            &sid,
+            "<turn-context>\nnow\n</turn-context>\n# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\nREPOSITORY-WORK-SENTINEL\n\nARGUMENTS: Docs/Plans/X.md\n\n## Supporting Files\n\nSkill directory: x\n",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.strategy).unwrap(),
+            router_acp::config::StrategyKind::Planner
+        );
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        let delivered = planner_user_prompts(&log);
+        let last = delivered.last().expect("the role invocation reached the provider");
+        assert!(last.contains("[router-acp planner role: select-plan]"), "{last}");
+        assert!(last.contains("Arguments: Docs/Plans/X.md"), "{last}");
+        assert!(!last.contains("# Loaded Skill"), "{last}");
+        Ok(())
+    })
+    .await;
+}
+
+/// An explicit `/implement` routes its parent from `implementation_candidates`
+/// alone: the inlined role skill must not raise complexity into the apex
+/// crossover that admits the planning pool.
+#[tokio::test]
+async fn an_explicit_implement_command_pins_from_the_implementation_pool() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path().join(".agents/skills/implement");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "REPOSITORY-WORK-SENTINEL").unwrap();
+    let log = temp_log("explicit-implement-pool");
+    let state = temp_state_file("explicit-implement-pool");
+    let yaml = format!(
+        "state_file: {}\nrouter: auto\ndelegation: {{ enabled: false }}\nrouters:\n  planner:\n    apex_complexity: 0.0\n    planning_candidates: ['plan/*']\n    implementation_candidates: ['work/*']\n    model_boosts:\n    - {{ pattern: 'plan/*', planning: 9.0, implementation: 9.0 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("fable", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("opus", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\nREPOSITORY-WORK-SENTINEL\n\nARGUMENTS:\n\n## Supporting Files\n\nSkill directory: x\n",
+        )
+        .await?;
+        let pinned = shared
+            .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+            .unwrap();
+        assert_eq!(pinned, "work");
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn planner_commands_reverse_phase_and_preserve_repository_guidance_once() {
     let repo = tempfile::tempdir().unwrap();
@@ -11139,7 +11609,10 @@ agents:
 }
 
 async fn wait_for_mock_prompt(log: &PathBuf, marker: &str) -> Vec<serde_json::Value> {
-    for _ in 0..40 {
+    // Up to 15 s: a router-delivered follow-up (a background completion, a
+    // wake) can take several seconds under a parallel suite. Success returns
+    // at once, so the bound costs nothing when the test passes.
+    for _ in 0..150 {
         let events = read_log(log);
         if events.iter().any(|event| {
             event["event"] == "prompt"
@@ -11217,8 +11690,22 @@ async fn planner_child_streaming_failure_fences_initial_and_followup_receipts() 
                 "delegate_id": delegate_id, "message": format!("TEXT:{label}"), "input_ids": ["child-input"]
             }));
             prompt_text(&cx, &sid, &followup).await?;
-            let run = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
-            assert_eq!(run.inputs["child-input"].delivered_to.contains("work-1"), healthy, "{label}");
+            let delivered = || {
+                router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap().inputs["child-input"]
+                    .delivered_to
+                    .contains("work-1")
+            };
+            if healthy {
+                // The child's receipt lands once its transcript write is
+                // confirmed, which can follow the parent's tool result.
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    while !delivered() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+            }
+            assert_eq!(delivered(), healthy, "{label}");
         }
         Ok(())
     }).await;
@@ -11654,39 +12141,80 @@ async fn queued_planner_turn_collects_managed_background_without_client_cancella
                 .0
                 .to_string();
             prompt_text(&cx, &sid, "/implement authorized test").await?;
+            // Held open until the background request is queued behind it.
+            let release = log.with_extension("release");
+            let _ = std::fs::remove_file(&release);
             let active = cx
                 .send_request(PromptRequest::new(
                     sid.clone(),
-                    vec![ContentBlock::from("SLEEP:1000 original-active-turn")],
+                    vec![ContentBlock::from(format!(
+                        "original-active-turn\nWAIT_FILE:{}",
+                        release.display()
+                    ))],
                 ))
                 .block_task();
             wait_for_mock_prompt(&log, "original-active-turn").await;
-            cx.send_request(
-                PromptRequest::new(
-                    sid.clone(),
-                    vec![ContentBlock::from("BACKGROUND_START:echo managed")],
-                )
-                .meta(
-                    serde_json::from_value(
-                        serde_json::json!({"router_acp":{"input_id":"queued-background"}}),
+            // Its response arrives only once its own turn has run, so it is
+            // awaited after the active turn is released.
+            let queued = cx
+                .send_request(
+                    PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::from("BACKGROUND_START:echo managed")],
                     )
-                    .ok(),
-                ),
-            )
-            .block_task()
-            .await?;
+                    .meta(
+                        serde_json::from_value(
+                            serde_json::json!({"router_acp":{"input_id":"queued-background"}}),
+                        )
+                        .ok(),
+                    ),
+                )
+                .block_task();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .parent_queue
+                    .iter()
+                    .any(|input| input.input_id == "queued-background")
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the background request queued behind the active turn");
+            std::fs::write(&release, "").unwrap();
             active.await?;
+            queued.await?;
             wait_for_mock_prompt(&log, "router-acp managed background completed").await;
-            let text = agent_text(&observed, &sid);
+            // The completion turn's reply streams after its prompt is logged.
+            let text = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let text = agent_text(&observed, &sid);
+                    if text.contains("watch-fired") {
+                        return text;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| agent_text(&observed, &sid));
             assert!(text.contains("watch-fired"), "{text}");
             assert_eq!(observed.lock().unwrap().terminal_creates.len(), 1);
-            assert!(
-                router_acp::planner_workflow::load(&shared, &sid)
+            // The queue entry is retired when that turn finishes, a moment
+            // after the provider receives its prompt.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !router_acp::planner_workflow::load(&shared, &sid)
                     .unwrap()
                     .unwrap()
                     .parent_queue
                     .is_empty()
-            );
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the queued background turn retired its queue entry");
             Ok(())
         },
     )
@@ -11812,12 +12340,17 @@ async fn queued_planner_commands_keep_fifo_controls_and_original_images() {
             .0
             .to_string();
         prompt_text(&cx, &sid, "/implement initial admitted scope").await?;
+        // The active turn stays open until the assertions below have run;
+        // a fixed sleep let it finish first on a loaded machine.
+        let release = log.with_extension("release");
+        let _ = std::fs::remove_file(&release);
         let active = cx
             .send_request(PromptRequest::new(
                 sid.clone(),
-                vec![ContentBlock::from(
-                    "[router: effort=low] SLEEP:1000 original-active-turn",
-                )],
+                vec![ContentBlock::from(format!(
+                    "[router: effort=low] original-active-turn\nWAIT_FILE:{}",
+                    release.display()
+                ))],
             ))
             .block_task();
         wait_for_mock_prompt(&log, "original-active-turn").await;
@@ -11872,6 +12405,7 @@ async fn queued_planner_commands_keep_fifo_controls_and_original_images() {
                 .text
                 .starts_with("[router: switch=plan/sol")
         );
+        std::fs::write(&release, "").unwrap();
         active.await?;
         let events = wait_for_mock_prompt(&log, "fifo-implement").await;
         let first = events
@@ -12261,6 +12795,333 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
         )
         .unwrap();
         assert!(cx.send_request(wrong_child).block_task().await.is_err());
+        Ok(())
+    })
+    .await;
+}
+
+// ----------------------------------------------------------------------
+// MCP OAuth broker: project `.mcp.json` servers, one router sign-in
+// ----------------------------------------------------------------------
+
+/// One store root for every broker test in this process (the env var is
+/// read when `Shared` is built); each test's fake upstream has its own port,
+/// so its store key is its own.
+fn mcp_store_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| tempfile::tempdir().unwrap()).path();
+    // SAFETY: test-scoped env mutation; the value is identical everywhere.
+    unsafe { std::env::set_var(router_acp::mcp_oauth::STORE_ENV, root) };
+    root
+}
+
+/// A fake streamable-HTTP MCP upstream that records each Authorization header.
+async fn fake_mcp_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+    use axum::routing::post;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route(
+            "/mcp",
+            post(
+                |axum::extract::State(seen): axum::extract::State<Arc<Mutex<Vec<String>>>>,
+                 headers: axum::http::HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    seen.lock().unwrap().push(auth);
+                    axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}}))
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/mcp"), seen)
+}
+
+/// A git project whose `.mcp.json` names `fake` (remote, brokerable) and
+/// `local` (stdio, untouched), with the router already signed in to `fake`.
+fn signed_in_project(upstream: &str) -> tempfile::TempDir {
+    use router_acp::mcp_oauth::{ClientRecord, Endpoints, RemoteServer, Tokens};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"fake": {"type": "http", "url": upstream},
+            "local": {"command": "true"}}})
+        .to_string(),
+    )
+    .unwrap();
+    let store = RemoteServer::new("fake", upstream).store(mcp_store_root());
+    store
+        .write_client(&ClientRecord {
+            name: "fake".into(),
+            client_id: "client".into(),
+            redirect_uri: "http://localhost:1/callback".into(),
+            resource: router_acp::mcp_oauth::resource_indicator(upstream),
+            endpoints: Endpoints {
+                authorize: "http://127.0.0.1:1/authorize".into(),
+                token: "http://127.0.0.1:1/token".into(),
+                register: None,
+            },
+        })
+        .unwrap();
+    store
+        .write_tokens(&Tokens {
+            access_token: "stored-upstream-token".into(),
+            refresh_token: Some("stored-refresh".into()),
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+            refresh_failed_at: None,
+        })
+        .unwrap();
+    dir
+}
+
+fn broker_entries(event: &serde_json::Value) -> Vec<serde_json::Value> {
+    event["mcpHttp"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn broker_serves_project_servers_to_parent_and_delegate_sessions() {
+    use agent_client_protocol::schema::v1::McpServerHttp;
+    let (upstream, seen) = fake_mcp_upstream().await;
+    let project = signed_in_project(&upstream);
+    let state = temp_state_file("mcp-broker");
+    let log = temp_log("mcp-broker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let log_s = log.display().to_string();
+    let cheap = agent_yaml(
+        "cheap",
+        &[("haiku", 1)],
+        &[("MOCK_LOG", &log_s), ("MOCK_MCP_HTTP", "1")],
+    );
+    let fancy = agent_yaml(
+        "fancy",
+        &[("opus", 3)],
+        &[("MOCK_LOG", &log_s), ("MOCK_MCP_HTTP", "1")],
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 2 }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{cheap}{fancy}",
+        state.display()
+    );
+    let cwd = project.path().to_path_buf();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        // The client sends its own (unauthenticated) `fake` and an unrelated server.
+        let client_servers = vec![
+            McpServer::Http(McpServerHttp::new("fake", upstream.clone())),
+            McpServer::Http(McpServerHttp::new("other", "https://other.test/mcp")),
+        ];
+        let session = cx
+            .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(client_servers))
+            .block_task()
+            .await?;
+        let sid = session.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=fancy/opus] hard integration work\nDELEGATE:fix button color",
+        )
+        .await?;
+        let events = read_log(&log);
+        let news: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "session_new")
+            .collect();
+        // Model probes and title sessions carry no MCP servers; the pinned
+        // parent and the delegate do.
+        let parent = news
+            .iter()
+            .find(|e| {
+                e["sessionId"].as_str().unwrap().starts_with("fancy-")
+                    && !broker_entries(e).is_empty()
+            })
+            .unwrap_or_else(|| panic!("the parent session on fancy with the broker: {events:?}"));
+        let delegate = news
+            .iter()
+            .find(|e| {
+                e["sessionId"].as_str().unwrap().starts_with("cheap-")
+                    && !broker_entries(e).is_empty()
+            })
+            .unwrap_or_else(|| panic!("a delegate session on cheap with the broker: {events:?}"));
+        for event in [parent, delegate] {
+            let http = broker_entries(event);
+            let fakes: Vec<_> = http.iter().filter(|h| h["name"] == "fake").collect();
+            assert_eq!(
+                fakes.len(),
+                1,
+                "one `fake`, the client's replaced: {http:?}"
+            );
+            let url = fakes[0]["url"].as_str().unwrap();
+            assert!(
+                url.starts_with("http://127.0.0.1:") && url != upstream,
+                "{url}"
+            );
+            let header = &fakes[0]["headers"][0];
+            assert_eq!(header[0], "Authorization");
+            assert!(
+                !header[1]
+                    .as_str()
+                    .unwrap()
+                    .contains("stored-upstream-token")
+            );
+            assert!(
+                http.iter().any(|h| h["name"] == "other"),
+                "unrelated server kept: {http:?}"
+            );
+        }
+        // The injected entry works: the upstream sees the stored token.
+        let entry = &broker_entries(parent)
+            .into_iter()
+            .find(|h| h["name"] == "fake")
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(entry["url"].as_str().unwrap())
+            .header("authorization", entry["headers"][0][1].as_str().unwrap())
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["Bearer stored-upstream-token"]
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn broker_entries_skip_adapters_without_http_mcp_and_unsigned_projects() {
+    let (upstream, _) = fake_mcp_upstream().await;
+    let project = signed_in_project(&upstream);
+    let unsigned = tempfile::tempdir().unwrap();
+    std::fs::create_dir(unsigned.path().join(".git")).unwrap();
+    std::fs::write(
+        unsigned.path().join(".mcp.json"),
+        r#"{"mcpServers":{"never":{"type":"http","url":"https://never-signed-in.test/mcp"}}}"#,
+    )
+    .unwrap();
+    let state = temp_state_file("mcp-broker-caps");
+    let log = temp_log("mcp-broker-caps");
+    let log_s = log.display().to_string();
+    let plain = agent_yaml("plain", &[("m1", 1)], &[("MOCK_LOG", &log_s)]);
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nagents:\n{plain}",
+        state.display()
+    );
+    let (cwd, other) = (project.path().to_path_buf(), unsigned.path().to_path_buf());
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        for dir in [cwd.clone(), other.clone()] {
+            let sid = cx
+                .send_request(NewSessionRequest::new(dir))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "pin").await?;
+        }
+        let events = read_log(&log);
+        let news: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "session_new")
+            .collect();
+        assert!(news.len() >= 2, "{events:?}");
+        for event in news {
+            assert!(broker_entries(event).is_empty(), "{event}");
+        }
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn claude_runtimes_disable_the_project_copy_of_a_brokered_server() {
+    let (upstream, _) = fake_mcp_upstream().await;
+    let project = signed_in_project(&upstream);
+    let credential = claude_credential_fixture(None);
+    let user_settings = r#"{"disabledMcpjsonServers":["mine"],"enabledMcpjsonServers":["fake","x"],"theme":"dark"}"#;
+    std::fs::write(credential.path().join("settings.json"), user_settings).unwrap();
+    // A name-keyed "needs auth" entry would make Claude skip the broker's server.
+    let user_cache = r#"{"fake":{"timestamp":1},"other":{"timestamp":2}}"#;
+    std::fs::write(
+        credential.path().join("mcp-needs-auth-cache.json"),
+        user_cache,
+    )
+    .unwrap();
+    let state = temp_state_file("mcp-broker-claude");
+    let log = temp_log("mcp-broker-claude");
+    let log_s = log.display().to_string();
+    let claude_dir = credential.path().display().to_string();
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "claude",
+            &[("m1", 1)],
+            &[
+                ("CLAUDE_CONFIG_DIR", &claude_dir),
+                ("MOCK_LOG", &log_s),
+                ("MOCK_MCP_HTTP", "1"),
+            ],
+        ),
+    );
+    let cwd = project.path().to_path_buf();
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(cwd.clone()))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "[router: candidate=claude/m1]\nstart").await?;
+        let events = read_log(&log);
+        let new = events
+            .iter()
+            .find(|e| e["event"] == "session_new" && !broker_entries(e).is_empty())
+            .unwrap_or_else(|| panic!("a claude session with the broker: {events:?}"));
+        let runtime = std::path::PathBuf::from(new["configDir"].as_str().unwrap());
+        assert_ne!(runtime, credential.path(), "a private runtime directory");
+        let settings = runtime.join("settings.json");
+        assert!(
+            !settings
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(
+            value["disabledMcpjsonServers"],
+            serde_json::json!(["mine", "fake"])
+        );
+        assert_eq!(value["enabledMcpjsonServers"], serde_json::json!(["x"]));
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(
+            std::fs::read_to_string(credential.path().join("settings.json")).unwrap(),
+            user_settings,
+            "the user's own settings are never written"
+        );
+        let cache = runtime.join("mcp-needs-auth-cache.json");
+        assert!(!cache.symlink_metadata().unwrap().file_type().is_symlink());
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"other": {"timestamp": 2}}));
+        assert_eq!(
+            std::fs::read_to_string(credential.path().join("mcp-needs-auth-cache.json")).unwrap(),
+            user_cache,
+            "the user's own needs-auth cache is never written"
+        );
         Ok(())
     })
     .await;
