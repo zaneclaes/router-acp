@@ -376,19 +376,29 @@ impl Broker {
     }
 
     /// A process's Claude runtime (root, mirrored config dir), or None for a
-    /// process without one. Called on every spawn; a respawn starts clean.
+    /// process without one. Called on every spawn, before the adapter starts;
+    /// a respawn starts clean. Every name the broker already serves is
+    /// suppressed now, not at the first `session/new`: the adapter starts
+    /// Claude on its own before any session, and that Claude would otherwise
+    /// try the project copies and cache their names as needing auth.
     pub fn register_runtime(&self, key: &ProcessKey, claude: Option<(PathBuf, PathBuf)>) {
+        let names: BTreeSet<String> = self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .map(|entry| entry.name.clone())
+            .collect();
         let mut runtimes = self.runtimes.lock().unwrap();
         match claude {
             Some((root, config)) => {
-                runtimes.insert(
-                    key.clone(),
-                    ClaudeRuntime {
-                        root,
-                        config,
-                        suppressed: BTreeSet::new(),
-                    },
-                );
+                let mut runtime = ClaudeRuntime {
+                    root,
+                    config,
+                    suppressed: BTreeSet::new(),
+                };
+                runtime.suppress(key, names);
+                runtimes.insert(key.clone(), runtime);
             }
             None => {
                 runtimes.remove(key);
@@ -410,27 +420,31 @@ impl Broker {
                 _ => None,
             })
             .collect();
+        if let Some(runtime) = self.runtimes.lock().unwrap().get_mut(key) {
+            runtime.suppress(key, names);
+        }
+    }
+}
+
+impl ClaudeRuntime {
+    fn suppress(&mut self, key: &ProcessKey, names: BTreeSet<String>) {
         if names.is_empty() {
             return;
         }
-        let mut runtimes = self.runtimes.lock().unwrap();
-        let Some(runtime) = runtimes.get_mut(key) else {
-            return;
-        };
         // Claude keeps a runtime-wide, name-keyed "needs auth" cache. A Claude
-        // the adapter started before this suppression existed tried the
-        // project copies, failed, and cached these names; every later session
-        // would then skip the working broker entry as needing auth.
-        if let Err(err) = crate::credentials::forget_claude_mcp_needs_auth(&runtime.root, &names) {
+        // that tried the project copies before they were suppressed cached
+        // these names, and every later session would skip the working broker
+        // entry as needing auth.
+        if let Err(err) = crate::credentials::forget_claude_mcp_needs_auth(&self.root, &names) {
             tracing::warn!(%key, "could not clear Claude's MCP needs-auth cache: {err}");
         }
-        if names.is_subset(&runtime.suppressed) {
+        if names.is_subset(&self.suppressed) {
             return;
         }
-        runtime.suppressed.extend(names);
-        let all: Vec<String> = runtime.suppressed.iter().cloned().collect();
+        self.suppressed.extend(names);
+        let all: Vec<String> = self.suppressed.iter().cloned().collect();
         if let Err(err) =
-            crate::credentials::write_claude_mcp_suppression(&runtime.config, &runtime.root, &all)
+            crate::credentials::write_claude_mcp_suppression(&self.config, &self.root, &all)
         {
             tracing::warn!(%key, "could not suppress project MCP duplicates: {err}");
         }
@@ -1240,6 +1254,43 @@ mod tests {
             broker.session_servers(elsewhere.path(), None).is_empty(),
             "no project file: nothing"
         );
+    }
+
+    /// The adapter starts Claude before any session: a runtime registered
+    /// after the broker served a project already disables that project's copy
+    /// and has no "needs auth" entry for it.
+    #[tokio::test]
+    async fn a_new_runtime_is_suppressed_before_its_adapter_starts() {
+        let (upstream_url, _) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let (broker, project) = broker_for(
+            &upstream_url,
+            "http://127.0.0.1:1/token",
+            root.path(),
+            tokens("t", 3_600_000),
+        )
+        .await;
+        entry(&broker, &project);
+        let config = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(
+            runtime.path().join("mcp-needs-auth-cache.json"),
+            r#"{"fake":{"timestamp":1},"other":{"timestamp":2}}"#,
+        )
+        .unwrap();
+        broker.register_runtime(
+            &ProcessKey("claude".into()),
+            Some((runtime.path().to_path_buf(), config.path().to_path_buf())),
+        );
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(runtime.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["disabledMcpjsonServers"], json!(["fake"]));
+        let cache: Value = serde_json::from_slice(
+            &std::fs::read(runtime.path().join("mcp-needs-auth-cache.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache, json!({"other": {"timestamp": 2}}));
     }
 
     #[tokio::test]
