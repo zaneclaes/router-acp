@@ -1811,3 +1811,63 @@ async fn idle_parent_below_its_worker_limit_gets_capacity_heartbeats() {
     assert_eq!(reasons.len(), 1);
     assert!(reasons[0].starts_with("heartbeat: 1 of 3 worker slots are in use"));
 }
+
+/// Each planner attempt runs in its own agent process, kept open after its
+/// turn for a follow-up. Once the attempt can take no further turn its
+/// session is closed, so finished workers stop holding memory.
+#[tokio::test]
+async fn sessions_of_attempts_that_cannot_take_another_turn_are_closed() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    for id in ["finished", "accepted", "superseded"] {
+        admit(shared, work(id));
+    }
+    let mut identities = BTreeMap::new();
+    for id in ["finished", "accepted", "superseded"] {
+        let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, id).await.unwrap();
+        identities.insert(id, identity);
+    }
+    planner_workflow::mutate(shared, SID, |run| {
+        for (id, status) in [
+            ("finished", planner_workflow::WorkStatus::Finished),
+            ("accepted", planner_workflow::WorkStatus::Accepted),
+            ("superseded", planner_workflow::WorkStatus::Running),
+        ] {
+            let work = run.works.get_mut(id).unwrap();
+            work.status = status;
+            work.attempt.as_mut().unwrap().ended = id != "superseded";
+        }
+        // A newer attempt replaced the one the open session belongs to.
+        run.works.get_mut("superseded").unwrap().attempt.as_mut().unwrap().id = "newer".into();
+        Ok(())
+    })
+    .unwrap();
+    for (id, identity) in &identities {
+        shared.live_delegates.lock().unwrap().insert(
+            format!("d-{id}"),
+            router_acp::session::LiveDelegate {
+                parent_sid: SID.into(),
+                process_key: router_acp::downstream::ProcessKey(format!("key-{id}")),
+                downstream_sid: format!("down-{id}"),
+                candidate: router_acp::candidate::CandidateId::parse("test/model").unwrap(),
+                capture: Arc::default(),
+                sub_sid: format!("sub-{id}"),
+                lifecycle: None,
+                worker_id: format!("w-{id}"),
+                planner: Some(identity.clone()),
+                turns: 1,
+            },
+        );
+    }
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_wake::close_stale_delegates(shared, SID, &run);
+    let mut open = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    open.sort();
+    assert_eq!(open, vec!["d-accepted".to_string()]);
+}
