@@ -1094,6 +1094,145 @@ async fn completion_requires_acknowledged_inputs_wakes_and_no_active_work() {
     );
 }
 
+/// Integration is the work's terminal state: the router queues exactly one
+/// `work_finished` naming the work, its child id and workspace, so a host can
+/// retire the tree. A refusing host keeps it queued and never fails the
+/// `integrate` operation; a later save does not repeat it.
+#[tokio::test]
+async fn integration_queues_one_work_finished_event_for_the_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repository(&tmp);
+    let state_path = tmp.path().join("state.db");
+    let accepting = tmp.path().join("accepting");
+    let events = tmp.path().join("events.jsonl");
+    let script = format!(
+        "[ -e '{}' ] || exit 1; cat >> '{}'",
+        accepting.display(),
+        events.display()
+    );
+    let shared = shared_for(&repo, &state_path, |cfg| {
+        cfg.delegation.lifecycle_hook = Some(DelegateLifecycleHook {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script.clone()],
+            timeout_ms: 5_000,
+            max_continuations: 3,
+        });
+    });
+    admit(&shared, work("work-1"));
+    let (identity, workspace, _, _) = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap();
+    let revision = current_revision(&workspace.path);
+    planner_workflow::operate(
+        &shared,
+        SID,
+        Some(&identity),
+        Operation::Artifact {
+            key: "artifact".into(),
+            work_id: "work-1".into(),
+            attempt_id: identity.attempt_id.clone(),
+            artifact: artifact(&revision),
+        },
+    )
+    .await
+    .unwrap();
+    planner_workflow::operate(
+        &shared,
+        SID,
+        None,
+        Operation::Review {
+            key: "review".into(),
+            work_id: "work-1".into(),
+            revision: revision.clone(),
+            accepted: true,
+            evidence: vec!["review.txt".into()],
+            corrections: None,
+        },
+    )
+    .await
+    .unwrap();
+    planner_workflow::operate(
+        &shared,
+        SID,
+        Some(&identity),
+        Operation::Finished {
+            key: "finished".into(),
+            work_id: "work-1".into(),
+            attempt_id: identity.attempt_id.clone(),
+            receipt: receipt(&revision, "handoff"),
+        },
+    )
+    .await
+    .unwrap();
+    planner_workflow::attempt_ended(&shared, SID, &identity, None, "done".into(), false).unwrap();
+    let finished_events = |shared: &Arc<Shared>| {
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .outbox_pending(100)
+            .into_iter()
+            .filter_map(|(_, payload)| serde_json::from_str::<serde_json::Value>(&payload).ok())
+            .filter(|event| event["event"] == "work_finished")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        finished_events(&shared).is_empty(),
+        "a finished but unintegrated work still needs its workspace"
+    );
+
+    planner_workflow::operate(
+        &shared,
+        SID,
+        None,
+        Operation::Integrate {
+            key: "integrate".into(),
+            work_id: "work-1".into(),
+            receipt: receipt(&revision, "merge"),
+        },
+    )
+    .await
+    .expect("a refusing host never fails integration");
+    let queued = finished_events(&shared);
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    let event = &queued[0];
+    let run = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    let integrated = &run.works["work-1"];
+    assert_eq!(integrated.status, WorkStatus::Integrated);
+    assert_eq!(event["work_id"], "work-1");
+    assert_eq!(event["plan_id"], "plan-1");
+    assert_eq!(event["external_id"], "external-1");
+    assert_eq!(event["status"], "integrated");
+    assert_eq!(event["parent_router_session_id"], SID);
+    assert_eq!(event["worker_id"], integrated.child_id.as_str());
+    assert_eq!(event["child_id"], integrated.child_id.as_str());
+    assert_eq!(event["cwd"], workspace.path.display().to_string());
+    assert_eq!(event["attempt_id"], identity.attempt_id.as_str());
+    assert_eq!(event["attempt_ended"], true);
+    assert_eq!(event["revision"], revision.as_str());
+    assert_eq!(event["router_pid"], std::process::id());
+
+    // A later save of the integrated work queues nothing more.
+    let mut run = run;
+    planner_workflow::save(&shared, SID, &mut run).unwrap();
+    assert_eq!(finished_events(&shared).len(), 1);
+
+    // Let the immediate delivery `integrate` spawned finish being refused.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    std::fs::write(&accepting, "").unwrap();
+    let hook = shared.cfg.delegation.lifecycle_hook.clone().unwrap();
+    router_acp::delegate_hook::flush(&shared, &hook).await;
+    assert!(finished_events(&shared).is_empty());
+    let delivered = std::fs::read_to_string(&events).unwrap();
+    let finished = delivered
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "work_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1, "{delivered}");
+    assert_eq!(finished[0]["work_id"], "work-1");
+}
+
 #[tokio::test]
 async fn paused_run_blocks_dependent_actions() {
     let fixture = fixture(|_| {});

@@ -210,8 +210,9 @@ pub struct EffortConfig {
 /// and before its prompt; a non-zero exit or timeout refuses the delegate.
 /// `delegate_turn_end` runs when each delegate turn ends; exit 2 sends the
 /// hook's stderr back to that delegate as its next prompt, at most
-/// `max_continuations` times per turn. `delegate_stop` and `parent_repinned`
-/// are delivered durably through the state DB's outbox.
+/// `max_continuations` times per turn. `delegate_stop`, `parent_repinned`,
+/// and a planner run's `planner_wake` and `work_finished` are delivered
+/// durably through the state DB's outbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegateLifecycleHook {

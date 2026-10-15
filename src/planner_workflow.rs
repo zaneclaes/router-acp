@@ -331,6 +331,19 @@ pub fn save(shared: &Shared, sid: &str, run: &mut PlannerRun) -> Result<(), Stri
                 events.push(wake_event(sid, run, wake_id, wake).to_string());
             }
         }
+        // A work that reached `integrated` in this save: the router no longer
+        // needs its workspace, so the host may give it back.
+        let previous_works = previous.as_ref().and_then(|(_, v)| v.get("works"));
+        for (work_id, work) in &run.works {
+            let was_integrated = previous_works
+                .and_then(|w| w.get(work_id))
+                .and_then(|w| w.get("status"))
+                .and_then(Value::as_str)
+                == Some("integrated");
+            if work.status == WorkStatus::Integrated && !was_integrated {
+                events.push(work_finished_event(sid, work_id, work).to_string());
+            }
+        }
     }
     run.revision = state.save_planner_run_with_wakes(
         sid,
@@ -346,6 +359,24 @@ fn wake_event(sid: &str, run: &PlannerRun, wake_id: &str, wake: &Wake) -> Value 
     json!({"event":"planner_wake","wake_id":wake_id,"parent_router_session_id":sid,
         "work_id":wake.work_id,"reason":wake.reason,"revision":run.revision+1,
         "attempt_id":run.works.get(&wake.work_id).and_then(|w| w.attempt.as_ref()).map(|a| &a.id),
+        "router_pid":pid,"router_started_at_ms":started})
+}
+
+/// `work_finished`: a work reached its terminal `integrated` state (only then:
+/// `integrate` still verifies the workspace HEAD, so a `finished` work keeps
+/// it). Sent once per transition, through the same outbox as `planner_wake`,
+/// so a host can retire the workspace. `worker_id` is the work's child id
+/// (what the host's allocation lease records) and `cwd` its workspace path.
+pub fn work_finished_event(sid: &str, work_id: &str, work: &Work) -> Value {
+    let (pid, started) = process_identity();
+    json!({"event":"work_finished","work_id":work_id,"plan_id":work.spec.plan_id,
+        "external_id":work.spec.external_id,"status":work.status,
+        "parent_router_session_id":sid,"worker_id":work.child_id,"child_id":work.child_id,
+        "cwd":work.workspace.as_ref().map(|w| w.path.display().to_string()),
+        "lease":work.workspace.as_ref().map(|w| &w.lease),
+        "attempt_id":work.attempt.as_ref().map(|a| &a.id),
+        "attempt_ended":work.attempt.as_ref().is_none_or(|a| a.ended),
+        "revision":work.integration.as_ref().map(|r| &r.revision),
         "router_pid":pid,"router_started_at_ms":started})
 }
 
@@ -1314,6 +1345,16 @@ async fn operate_once(
     }
     run.receipts.insert(key.to_string(), fingerprint);
     save(shared, sid, &mut run)?;
+    // Deliver the queued `work_finished` now rather than on the next flusher
+    // tick; a host that refuses it keeps it queued, never this operation.
+    if matches!(operation, Operation::Integrate { .. })
+        && let Some(hook) = shared.cfg.delegation.lifecycle_hook.clone()
+    {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            crate::delegate_hook::flush(&shared, &hook).await;
+        });
+    }
     Ok(json!({"revision":run.revision,"next_role":next_role,"instructions":next_role.map(|r| run.policy.instructions(r))}).to_string())
 }
 

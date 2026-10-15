@@ -17,6 +17,9 @@
 //!   model or account, so its provider session id changed). These go through
 //!   the state DB's outbox: a failed or interrupted delivery is retried by any
 //!   router process sharing that DB until the host accepts it.
+//! - Planner runs add `planner_wake` and `work_finished` (a work reached
+//!   `integrated`, so its workspace may be retired) through the same outbox
+//!   (`planner_workflow::save`).
 //!
 //! Every event carries the router's pid and start time so a host can treat a
 //! dead router's delegates as stopped even when no stop event ever arrives.
