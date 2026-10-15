@@ -177,6 +177,9 @@ pub struct BackgroundDelegate {
     pub summary: String,
     pub started: std::time::Instant,
     pub result: Option<Result<String, String>>,
+    /// A planner work delegate. It reports through router wakes, so
+    /// `delegate_await` never blocks the parent's turn on it.
+    pub planner: bool,
 }
 
 pub struct RouterSession {

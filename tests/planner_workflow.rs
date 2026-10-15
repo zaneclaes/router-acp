@@ -1871,3 +1871,52 @@ async fn sessions_of_attempts_that_cannot_take_another_turn_are_closed() {
     open.sort();
     assert_eq!(open, vec!["d-accepted".to_string()]);
 }
+
+/// A planner parent that awaits its background workers holds its own turn,
+/// and with it every wake and review, until the slowest worker finishes (a
+/// live run sat 25 minutes in one await). Planner work delegates report
+/// through router wakes, so the await skips them and says so.
+#[tokio::test]
+async fn awaiting_background_work_never_waits_on_planner_workers() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    let job = |planner: bool, result: Option<Result<String, String>>| {
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "job".into(),
+            started: std::time::Instant::now(),
+            result,
+            planner,
+        }
+    };
+    let await_all = || {
+        router_acp::delegate_mcp::run_delegate_await(
+            shared,
+            SID,
+            router_acp::delegate_mcp::DelegateAwaitArgs {
+                delegate_ids: vec![],
+                timeout_seconds: Some(5),
+            },
+        )
+    };
+    shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .insert("b-worker".into(), job(true, None));
+    let started = std::time::Instant::now();
+    let out = await_all().await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(out.starts_with("Planner work delegates are not awaited"));
+
+    // An ordinary background job is still collected, with the note beside it.
+    shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .insert("b-other".into(), job(false, Some(Ok("done".into()))));
+    let out = await_all().await.unwrap();
+    assert!(out.contains("=== delegate b-other — done ==="));
+    assert!(out.contains("Planner work delegates are not awaited"));
+    assert!(shared.background_delegates.lock().unwrap().contains_key("b-worker"));
+}
