@@ -148,6 +148,11 @@ pub fn is_rate_limit_text(lower: &str) -> bool {
         || lower.contains("payment required")
         || lower.contains("balance exhausted")
         || lower.contains("usagelimitexceeded")
+        // Claude: `You've hit your session limit · resets 7:40pm (UTC):
+        // {"errorKind":"rate_limit"}`. Neither half matched the phrases above,
+        // so the turn failed with no failover and no cordon.
+        || lower.contains("session limit")
+        || lower.contains("rate_limit")
         || is_spend_limit_text(lower)
 }
 
@@ -244,6 +249,7 @@ struct ResetPatterns {
     retry_after_secs: Regex,
     duration_phrase: Regex,
     iso: Regex,
+    utc_clock: Regex,
 }
 
 fn patterns() -> &'static ResetPatterns {
@@ -271,6 +277,11 @@ fn patterns() -> &'static ResetPatterns {
             r"(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(z|Z|[+-]\d{2}:?\d{2})?",
         )
         .unwrap(),
+        // Claude: "resets 7:40pm (UTC)", "resets 7pm (UTC)". The time must
+        // follow "resets" directly: "resets Oct 17, 7pm (UTC)" names a day,
+        // and the next 7pm would be the wrong reset.
+        utc_clock: Regex::new(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(utc\)")
+            .unwrap(),
     })
 }
 
@@ -326,6 +337,18 @@ pub fn parse_reset_delay_at(lower: &str, now: SystemTime) -> Option<Duration> {
         && let Some(epoch) = iso_to_epoch(&cap)
     {
         return Some(Duration::from_secs(epoch.saturating_sub(now_epoch).max(30)));
+    }
+    if let Some(cap) = p.utc_clock.captures(lower) {
+        let hour: u64 = cap[1].parse().ok()?;
+        let minute: u64 = cap.get(2).map_or(Some(0), |m| m.as_str().parse().ok())?;
+        if !(1..=12).contains(&hour) || minute > 59 {
+            return None;
+        }
+        let hour = hour % 12 + if &cap[3] == "pm" { 12 } else { 0 };
+        // The next time the UTC clock reads that time: later today, else tomorrow.
+        let target = hour * 3_600 + minute * 60;
+        let wait = (target + 86_400 - now_epoch % 86_400) % 86_400;
+        return Some(Duration::from_secs(wait.max(30)));
     }
     None
 }
@@ -455,6 +478,24 @@ mod tests {
     }
 
     #[test]
+    fn utc_clock_times() {
+        // 2026-10-15T17:06:38Z; the reset is 19:40 UTC the same day.
+        let now = 1_792_083_998;
+        let text = "You've hit your session limit · resets 7:40pm (UTC)";
+        assert_eq!(parse(text, now), Some(2 * 3_600 + 33 * 60 + 22));
+        // A clock time already past today means tomorrow.
+        assert_eq!(parse("resets 5pm (UTC)", now), Some(86_400 - 6 * 60 - 38));
+        assert_eq!(
+            parse("resets 12am (UTC)", now),
+            Some(6 * 3_600 + 53 * 60 + 22)
+        );
+        // A reset that names a day is not tomorrow's clock time.
+        assert_eq!(parse("resets Oct 17, 7pm (UTC)", now), None);
+        // Only UTC is unambiguous.
+        assert_eq!(parse("resets 7:40pm (America/Denver)", now), None);
+    }
+
+    #[test]
     fn past_reset_times_clamp_to_minimum() {
         assert_eq!(
             parse("usage limit reached|1752526800", 1_752_530_000),
@@ -483,6 +524,22 @@ mod tests {
 
         let other = AcpError::invalid_params().data("unknown config id");
         assert_eq!(classify_failure(&other), FailureClass::Other);
+    }
+
+    #[test]
+    fn claude_session_limit_is_a_rate_limit() {
+        // The exact error Claude returned when an account hit its session
+        // limit. Before this matched, the turn failed with no failover.
+        let err = AcpError::internal_error().data(
+            "You've hit your session limit · resets 7:40pm (UTC): {\"errorKind\":\"rate_limit\"}",
+        );
+        assert!(matches!(
+            classify_failure(&err),
+            FailureClass::RateLimited {
+                retry_after: Some(_),
+                spend_scoped: false
+            }
+        ));
     }
 
     #[test]
