@@ -119,6 +119,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                                 "Owning router exited. Reconcile preserved workspace/evidence before replacement.".into(), true);
                     }
                 }
+                close_stale_delegates(&shared, &sid, &run);
                 heartbeat(&shared, &sid, &run, chrono::Utc::now().timestamp());
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
@@ -154,6 +155,48 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// A planner worker's sub-session is kept open after its turn so the same
+/// attempt can take a follow-up turn with its context. Each attempt runs in its
+/// own agent process, so once the attempt can take no further turn (a newer
+/// attempt replaced it, or its work is finished, integrated, blocked or
+/// watching) the open session only holds memory: a long run left over a
+/// hundred idle agent processes and their MCP servers behind. Close those.
+pub fn close_stale_delegates(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
+    use planner_workflow::WorkStatus;
+    let stale = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, d)| d.parent_sid == sid)
+        .filter_map(|(id, d)| {
+            let identity = d.planner.as_ref()?;
+            let current = run.works.get(&identity.work_id).is_some_and(|w| {
+                w.attempt.as_ref().is_some_and(|a| {
+                    a.id == identity.attempt_id
+                        && (!a.ended
+                            || !matches!(
+                                w.status,
+                                WorkStatus::Finished
+                                    | WorkStatus::Integrated
+                                    | WorkStatus::Blocked
+                                    | WorkStatus::Watching
+                            ))
+                })
+            });
+            (!current).then(|| id.clone())
+        })
+        .collect::<Vec<_>>();
+    for delegate_id in stale {
+        // A completing turn or an explicit close may get there first.
+        let _ = crate::delegate_mcp::run_delegate_close(
+            shared,
+            sid,
+            crate::delegate_mcp::DelegateCloseArgs { delegate_id },
+        );
+    }
 }
 
 /// A parent idle this long with a free worker slot gets a heartbeat wake. Each
