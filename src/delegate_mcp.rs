@@ -1048,9 +1048,10 @@ fn start_background_delegate(
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     args.worker_id = Some(job_id.clone());
     let summary = args.task.clone();
+    let planner = args.work_id.is_some();
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, async move {
+    start_background_job(shared, router_sid, job_id, &summary, planner, async move {
         run_delegate_task(&task_shared, &task_sid, args).await
     })
 }
@@ -1064,9 +1065,15 @@ fn start_background_followup(
 ) -> Result<String, String> {
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let summary = format!("follow-up to {}: {}", args.delegate_id, args.message);
+    let planner = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .get(&args.delegate_id)
+        .is_some_and(|d| d.planner.is_some());
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, async move {
+    start_background_job(shared, router_sid, job_id, &summary, planner, async move {
         run_delegate_followup(&task_shared, &task_sid, args).await
     })
 }
@@ -1079,6 +1086,7 @@ fn start_background_job(
     router_sid: &str,
     job_id: String,
     summary: &str,
+    planner: bool,
     job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
 ) -> Result<String, String> {
     if shared.with_session(router_sid, |_| ()).is_none() {
@@ -1096,6 +1104,7 @@ fn start_background_job(
             summary: summary.clone(),
             started: std::time::Instant::now(),
             result: None,
+            planner,
         },
     );
     let task_shared = shared.clone();
@@ -1128,7 +1137,10 @@ pub async fn run_delegate_await(
     args: DelegateAwaitArgs,
 ) -> Result<String, String> {
     // Validate explicit ids up front: they must exist and belong to us.
-    {
+    // Planner work delegates are never awaited: each reports through a router
+    // wake, and an await would hold the parent's turn (and every other wake)
+    // for as long as the slowest worker runs.
+    let skipped_planner = {
         let jobs = shared.background_delegates.lock().unwrap();
         for id in &args.delegate_ids {
             match jobs.get(id) {
@@ -1143,10 +1155,19 @@ pub async fn run_delegate_await(
                 }
             }
         }
-        if args.delegate_ids.is_empty() && !jobs.values().any(|j| j.parent_sid == router_sid) {
+        let wanted = |id: &String| args.delegate_ids.is_empty() || args.delegate_ids.contains(id);
+        let mine = jobs
+            .iter()
+            .filter(|(id, j)| j.parent_sid == router_sid && wanted(id));
+        let skipped = mine.clone().filter(|(_, j)| j.planner).count();
+        if mine.filter(|(_, j)| !j.planner).count() == 0 {
+            if skipped > 0 {
+                return Ok(PLANNER_AWAIT_NOTE.to_string());
+            }
             return Err("no background delegates are pending for this session".to_string());
         }
-    }
+        skipped
+    };
     let timeout =
         std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(600).clamp(5, 1500));
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1163,6 +1184,7 @@ pub async fn run_delegate_await(
                 .iter()
                 .filter(|(id, j)| {
                     j.parent_sid == router_sid
+                        && !j.planner
                         && (args.delegate_ids.is_empty() || args.delegate_ids.contains(id))
                 })
                 .map(|(id, _)| id.clone())
@@ -1178,11 +1200,14 @@ pub async fn run_delegate_await(
                 }
             }
         }
-        if running.is_empty() {
-            return Ok(render_await(&collected, &[]));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(render_await(&collected, &running));
+        let done = running.is_empty() || tokio::time::Instant::now() >= deadline;
+        if done {
+            let mut out = render_await(&collected, &running);
+            if skipped_planner > 0 {
+                out.push_str("\n\n");
+                out.push_str(PLANNER_AWAIT_NOTE);
+            }
+            return Ok(out);
         }
         tokio::select! {
             _ = &mut notified => {}
@@ -1190,6 +1215,10 @@ pub async fn run_delegate_await(
         }
     }
 }
+
+const PLANNER_AWAIT_NOTE: &str = "Planner work delegates are not awaited: each one reports \
+    through a router wake when it hands off. End your turn; awaiting a worker would hold every \
+    other wake until it finished.";
 
 fn render_await(
     collected: &[(String, Result<String, String>)],
