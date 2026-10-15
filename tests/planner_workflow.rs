@@ -1690,10 +1690,11 @@ async fn an_attempt_that_handed_off_reads_as_that_handoff() {
 }
 
 /// A parent that ended its turn blocked on something outside the run has no
-/// child left to wake it. With no worker running it gets a heartbeat wake,
-/// backed off one step per heartbeat until a worker runs again.
+/// child left to wake it. With no worker running it gets a heartbeat wake every
+/// 20 idle minutes, with no backoff: only finished work ends a run, so a parent
+/// that stopped on a reason of its own is woken to act on it.
 #[tokio::test]
-async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
+async fn idle_parent_with_no_running_worker_gets_heartbeats_without_backoff() {
     // One slot, so the running worker below fills the run.
     let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 1);
     let shared = &fixture.shared;
@@ -1742,16 +1743,20 @@ async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
     assert!(heartbeats().is_empty());
     acknowledge_all();
 
-    beat(last + 29 * 60);
+    beat(last + 19 * 60);
     assert!(heartbeats().is_empty());
-    beat(last + 31 * 60);
+    beat(last + 21 * 60);
     assert_eq!(heartbeats().len(), 1);
-    assert!(heartbeats()[0].1.reason.starts_with("heartbeat:"));
+    let reason = heartbeats()[0].1.reason.clone();
+    assert!(reason.starts_with("heartbeat:"));
+    assert!(reason.contains("ends only when all of its work is done"));
+    assert!(!reason.contains("same waiting reason"));
+    // An unacknowledged heartbeat is not doubled.
+    beat(last + 25 * 60);
+    assert_eq!(heartbeats().len(), 1);
     acknowledge_all();
-    // The second waits two steps.
-    beat(last + 59 * 60);
-    assert_eq!(heartbeats().len(), 1);
-    beat(last + 61 * 60);
+    // The next one comes at once: no backoff.
+    beat(last + 22 * 60);
     assert_eq!(heartbeats().len(), 2);
     assert_eq!(
         planner_workflow::load(shared, SID)
@@ -1797,7 +1802,7 @@ async fn idle_parent_below_its_worker_limit_gets_capacity_heartbeats() {
     assert!(census.contains("Interrupted, awaiting retry: work-2."));
     assert!(census.contains("fill the free slots"));
 
-    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 29 * 60);
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 19 * 60);
     let beats = |run: &planner_workflow::PlannerRun| {
         run.wakes
             .iter()
@@ -1806,7 +1811,7 @@ async fn idle_parent_below_its_worker_limit_gets_capacity_heartbeats() {
             .collect::<Vec<_>>()
     };
     assert!(beats(&planner_workflow::load(shared, SID).unwrap().unwrap()).is_empty());
-    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 31 * 60);
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 21 * 60);
     let reasons = beats(&planner_workflow::load(shared, SID).unwrap().unwrap());
     assert_eq!(reasons.len(), 1);
     assert!(reasons[0].starts_with("heartbeat: 1 of 3 worker slots are in use"));
