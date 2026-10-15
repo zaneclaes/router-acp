@@ -1694,7 +1694,8 @@ async fn an_attempt_that_handed_off_reads_as_that_handoff() {
 /// backed off one step per heartbeat until a worker runs again.
 #[tokio::test]
 async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
-    let fixture = fixture(|_| {});
+    // One slot, so the running worker below fills the run.
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 1);
     let shared = &fixture.shared;
     admit(shared, work("work-1"));
     let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
@@ -1731,7 +1732,7 @@ async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
     );
     let (last, _) = shared.state.lock().unwrap().last_activity(SID).unwrap();
 
-    // A running worker will wake the parent itself.
+    // A run whose every slot holds a running worker will wake the parent itself.
     beat(last + 3 * 3600);
     assert!(heartbeats().is_empty());
 
@@ -1759,4 +1760,54 @@ async fn idle_parent_with_no_running_worker_gets_backed_off_heartbeats() {
             .idle_heartbeats,
         2
     );
+}
+
+/// A parent that left worker slots empty (host memory was short, the roadmap
+/// had nothing runnable) gets no child event when that changes while its other
+/// workers run quietly. A free slot alone earns it a heartbeat, and every wake
+/// carries the census of used and free slots.
+#[tokio::test]
+async fn idle_parent_below_its_worker_limit_gets_capacity_heartbeats() {
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 3);
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    admit(shared, work("work-2"));
+    planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("work-2").unwrap().status = planner_workflow::WorkStatus::Interrupted;
+        Ok(())
+    })
+    .unwrap();
+    shared.state.lock().unwrap().log(
+        SID,
+        &router_acp::state::LogEntry {
+            kind: "agent_response".into(),
+            role: "agent".into(),
+            summary: "waiting on host memory".into(),
+            ..Default::default()
+        },
+    );
+    let (last, _) = shared.state.lock().unwrap().last_activity(SID).unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+
+    let census = router_acp::planner_wake::capacity_line(shared, &run);
+    assert!(census.starts_with("[Capacity] 1 of 3 worker slots in use, 2 free."));
+    assert!(census.contains("Interrupted, awaiting retry: work-2."));
+    assert!(census.contains("fill the free slots"));
+
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 29 * 60);
+    let beats = |run: &planner_workflow::PlannerRun| {
+        run.wakes
+            .iter()
+            .filter(|(id, _)| id.starts_with("heartbeat:"))
+            .map(|(_, w)| w.reason.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(beats(&planner_workflow::load(shared, SID).unwrap().unwrap()).is_empty());
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 31 * 60);
+    let reasons = beats(&planner_workflow::load(shared, SID).unwrap().unwrap());
+    assert_eq!(reasons.len(), 1);
+    assert!(reasons[0].starts_with("heartbeat: 1 of 3 worker slots are in use"));
 }

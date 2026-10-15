@@ -156,15 +156,53 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// A parent idle this long with no worker running gets a heartbeat wake. Each
-/// further heartbeat before a worker runs again waits one more step, up to
+/// A parent idle this long with a free worker slot gets a heartbeat wake. Each
+/// further heartbeat before the slots fill waits one more step, up to
 /// `HEARTBEAT_MAX_STEPS` steps.
 const HEARTBEAT_SECS: i64 = 30 * 60;
 const HEARTBEAT_MAX_STEPS: u32 = 4;
 
+fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
+    run.works
+        .values()
+        .filter(|w| w.attempt.as_ref().is_some_and(|a| !a.ended))
+        .count()
+}
+
+/// The worker census every wake carries, so a parent below its limit sees the
+/// free slots and the interrupted works waiting for a retry.
+pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -> String {
+    let cap = shared.cfg.delegation.max_concurrent;
+    let live = live_workers(run);
+    let mut interrupted = run
+        .works
+        .iter()
+        .filter(|(_, w)| w.status == planner_workflow::WorkStatus::Interrupted)
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    interrupted.sort_unstable();
+    let mut line = format!(
+        "[Capacity] {live} of {cap} worker slots in use, {} free.",
+        cap.saturating_sub(live)
+    );
+    if !interrupted.is_empty() {
+        line.push_str(&format!(" Interrupted, awaiting retry: {}.", interrupted.join(", ")));
+    }
+    if live < cap {
+        line.push_str(
+            " Re-read the plan source for work that became runnable since your last turn (a \
+             changed roadmap, a cleared blocker, recovered host memory or disk), retry \
+             interrupted works, and fill the free slots; a reason recorded in an earlier turn \
+             does not hold a slot without being re-checked now.",
+        );
+    }
+    line
+}
+
 /// A parent that ended its turn blocked on something outside the run (a
-/// sign-in, host memory, a person) has no child left to wake it when that
-/// clears. Wake it on a backed-off timer so it re-checks its own blockers.
+/// sign-in, host memory, a person, a roadmap that has since changed) may have
+/// no child event coming that would wake it when that clears. While any
+/// worker slot is free, wake it on a backed-off timer so it re-checks.
 pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun, now: i64) {
     if run.status != RunStatus::Running
         || !run.approval_waits.is_empty()
@@ -176,11 +214,9 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     {
         return;
     }
-    if run
-        .works
-        .values()
-        .any(|w| w.attempt.as_ref().is_some_and(|a| !a.ended))
-    {
+    let live = live_workers(run);
+    let cap = shared.cfg.delegation.max_concurrent;
+    if live >= cap {
         if run.idle_heartbeats != 0 {
             let _ = planner_workflow::mutate(shared, sid, |run| {
                 run.idle_heartbeats = 0;
@@ -205,13 +241,24 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     if idle < HEARTBEAT_SECS * steps {
         return;
     }
-    let reason = format!(
-        "heartbeat: no worker has run and the parent has been idle for {} min. Re-check each \
-         blocker your last turn reported (sign-ins, host state, a person's action). Resume or \
-         admit the work that no longer waits on it; otherwise end the turn with the same \
-         waiting reason.",
-        idle / 60
-    );
+    let reason = if live == 0 {
+        format!(
+            "heartbeat: no worker has run and the parent has been idle for {} min. Re-check each \
+             blocker your last turn reported (sign-ins, host state, a person's action). Resume or \
+             admit the work that no longer waits on it; otherwise end the turn with the same \
+             waiting reason.",
+            idle / 60
+        )
+    } else {
+        format!(
+            "heartbeat: {live} of {cap} worker slots are in use and the parent has been idle for \
+             {} min. Re-read the plan source and re-check each reason a slot was left empty \
+             (host memory or disk, a changed roadmap, a ready head left out of a release, an \
+             interrupted work). Fill every slot that no longer waits on it; otherwise end the \
+             turn naming what keeps each free slot empty.",
+            idle / 60
+        )
+    };
     let _ = planner_workflow::mutate(shared, sid, |run| {
         if run
             .wakes
@@ -289,9 +336,10 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         PlannerRole::ReviewWork
     };
     let text = format!(
-        "{}\n[Router-owned child wake]\n{}\nReconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason.",
+        "{}\n[Router-owned child wake]\n{}\n{}\nReconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason.",
         run.policy.instructions(role),
-        serde_json::to_string(&wakes).map_err(|e| e.to_string())?
+        serde_json::to_string(&wakes).map_err(|e| e.to_string())?,
+        capacity_line(shared, &run)
     );
     let mut blocks = vec![ContentBlock::from(text)];
     blocks.extend(planner_workflow::parent_input_blocks(
