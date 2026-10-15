@@ -199,11 +199,12 @@ pub fn close_stale_delegates(shared: &Arc<Shared>, sid: &str, run: &planner_work
     }
 }
 
-/// A parent idle this long with a free worker slot gets a heartbeat wake. Each
-/// further heartbeat before the slots fill waits one more step, up to
-/// `HEARTBEAT_MAX_STEPS` steps.
-const HEARTBEAT_SECS: i64 = 30 * 60;
-const HEARTBEAT_MAX_STEPS: u32 = 4;
+/// A parent idle this long with a free worker slot gets a heartbeat wake, and
+/// another every time it stays idle that long again. There is no backoff: a
+/// run only ends when its work is done, and a parent that ended its turn on a
+/// reason of its own is woken to act on it, not left to wait (a release once
+/// sat overnight behind a "blocker" that was a defect in its own build).
+const HEARTBEAT_SECS: i64 = 20 * 60;
 
 fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
     run.works
@@ -236,7 +237,8 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
             " Re-read the plan source for work that became runnable since your last turn (a \
              changed roadmap, a cleared blocker, recovered host memory or disk), retry \
              interrupted works, and fill the free slots; a reason recorded in an earlier turn \
-             does not hold a slot without being re-checked now.",
+             does not hold a slot without being re-checked now. Stopping is correct only when \
+             all of the work is done; a claimed blocker is a defect to investigate.",
         );
     }
     line
@@ -280,28 +282,19 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     };
     let idle = now - last;
-    let steps = i64::from(run.idle_heartbeats.min(HEARTBEAT_MAX_STEPS - 1) + 1);
-    if idle < HEARTBEAT_SECS * steps {
+    if idle < HEARTBEAT_SECS {
         return;
     }
-    let reason = if live == 0 {
-        format!(
-            "heartbeat: no worker has run and the parent has been idle for {} min. Re-check each \
-             blocker your last turn reported (sign-ins, host state, a person's action). Resume or \
-             admit the work that no longer waits on it; otherwise end the turn with the same \
-             waiting reason.",
-            idle / 60
-        )
-    } else {
-        format!(
-            "heartbeat: {live} of {cap} worker slots are in use and the parent has been idle for \
-             {} min. Re-read the plan source and re-check each reason a slot was left empty \
-             (host memory or disk, a changed roadmap, a ready head left out of a release, an \
-             interrupted work). Fill every slot that no longer waits on it; otherwise end the \
-             turn naming what keeps each free slot empty.",
-            idle / 60
-        )
-    };
+    let reason = format!(
+        "heartbeat: {live} of {cap} worker slots are in use and the parent has been idle for {} \
+         min. A run ends only when all of its work is done; any other reason to stop is a \
+         hypothesis to disprove now, not a state to wait in. For each blocker your last turn \
+         reported, prove where it is: reproduce it, check whether the previous build or path \
+         worked, and probe the system yourself. Anything in our own code, build, config or \
+         environment is a defect: admit a worker to fix it now. Even a proven human-only action \
+         holds only its own item. Fill every free slot with other runnable work this turn.",
+        idle / 60
+    );
     let _ = planner_workflow::mutate(shared, sid, |run| {
         if run
             .wakes
