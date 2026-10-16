@@ -120,7 +120,9 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                     }
                 }
                 close_stale_delegates(&shared, &sid, &run);
-                heartbeat(&shared, &sid, &run, chrono::Utc::now().timestamp());
+                let now = chrono::Utc::now().timestamp();
+                heartbeat(&shared, &sid, &run, now);
+                crate::planner_capacity::spawn_tick(&shared, &sid, now);
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
@@ -206,7 +208,7 @@ pub fn close_stale_delegates(shared: &Arc<Shared>, sid: &str, run: &planner_work
 /// sat overnight behind a "blocker" that was a defect in its own build).
 const HEARTBEAT_SECS: i64 = 20 * 60;
 
-fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
+pub fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
     run.works
         .values()
         .filter(|w| w.attempt.as_ref().is_some_and(|a| !a.ended))
@@ -230,7 +232,10 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
         cap.saturating_sub(live)
     );
     if !interrupted.is_empty() {
-        line.push_str(&format!(" Interrupted, awaiting retry: {}.", interrupted.join(", ")));
+        line.push_str(&format!(
+            " Interrupted, awaiting retry: {}.",
+            interrupted.join(", ")
+        ));
     }
     if live < cap {
         line.push_str(
@@ -241,6 +246,11 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
              all of the work is done; a claimed blocker is a defect to investigate.",
         );
     }
+    line.push_str(&crate::planner_capacity::census(
+        shared,
+        run,
+        chrono::Utc::now().timestamp_millis(),
+    ));
     line
 }
 
@@ -256,6 +266,9 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             .wakes
             .values()
             .any(|w| !w.acknowledged && w.deliveries < 3)
+        // Capacity wakes own an idle parent while the host lists unheld
+        // candidates or cannot answer; the heartbeat stays for "no work".
+        || crate::planner_capacity::supersedes_heartbeat(shared, run, now * 1000)
     {
         return;
     }
@@ -407,6 +420,14 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
                 && wake.claim_started_at_ms == started
             {
                 wake.claim_pid = 0;
+                // Router-owned capacity/in-flight wakes are recreated while
+                // their condition holds; one delivery answers each.
+                if crate::planner_capacity::ROUTER_WAKE_PREFIXES
+                    .iter()
+                    .any(|prefix| id.starts_with(prefix))
+                {
+                    wake.acknowledged = true;
+                }
             }
         }
         Ok(())

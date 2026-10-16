@@ -1349,59 +1349,134 @@ pub async fn run_delegate_task(
     router_sid: &str,
     mut args: DelegateTaskArgs,
 ) -> Result<String, String> {
-    if let Some(work_id) = args.work_id.clone() {
-        args.planner_role = Some(
-            if crate::planner_workflow::load(shared, router_sid)?
-                .and_then(|run| run.works.get(&work_id).map(|w| w.status))
-                == Some(crate::planner_workflow::WorkStatus::Accepted)
-            {
-                crate::planner_skills::PlannerRole::FinishWork
-            } else {
-                crate::planner_skills::PlannerRole::ImplementWork
-            },
-        );
-        let (identity, workspace, child_id, instructions) =
-            crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
-        args.classification_text = Some(args.task.clone());
-        args.task = format!("{instructions}\n[Assignment briefing]\n{}", args.task);
-        args.planner_identity = Some(identity.clone());
-        args.planner_workspace = Some(workspace.path);
-        args.planner_environment = workspace.environment;
-        args.worker_id = Some(child_id);
-        args.keep_open = true;
-        let original_inputs =
-            crate::planner_workflow::input_blocks(shared, router_sid, &identity, &args.input_ids);
-        let result = match original_inputs {
-            Ok((blocks, ids)) => {
-                args.planner_input_blocks = blocks;
-                args.planner_receipt_ids = ids;
-                run_delegate_task_inner(shared, router_sid, args).await
-            }
-            Err(error) => Err(error),
-        };
-        let delegate_id = shared
-            .live_delegates
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, live)| {
-                live.planner.as_ref().is_some_and(|p| {
-                    p.work_id == identity.work_id && p.attempt_id == identity.attempt_id
-                })
-            })
-            .map(|(id, _)| id.clone());
-        crate::planner_workflow::attempt_ended(
-            shared,
-            router_sid,
-            &identity,
-            delegate_id,
-            result.clone().unwrap_or_else(|e| e),
-            result.is_err(),
-        )?;
-        crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
-        return result;
+    if args.work_id.is_some() {
+        let identity = begin_planner_attempt(shared, router_sid, &mut args).await?;
+        return run_planner_attempt(shared, router_sid, args, identity).await;
     }
     run_delegate_task_inner(shared, router_sid, args).await
+}
+
+/// Start a durable planner work exactly as a parent's `delegate_task
+/// {work_id, background: true}` does: the attempt and workspace are claimed
+/// before this returns (so a host refusal is the caller's error to record),
+/// then the turn runs as a background job on the normal delegate routing
+/// path. Used by the router's capacity auto-admission and worker resumption.
+pub async fn start_planner_worker(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    work_id: &str,
+    task: String,
+) -> Result<String, String> {
+    let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let mut args = DelegateTaskArgs {
+        task,
+        work_id: Some(work_id.to_string()),
+        keep_open: true,
+        background: true,
+        worker_id: Some(job_id.clone()),
+        ..Default::default()
+    };
+    let summary = format!("{work_id}: {}", args.task);
+    let identity = begin_planner_attempt(shared, router_sid, &mut args).await?;
+    let task_shared = shared.clone();
+    let task_sid = router_sid.to_string();
+    start_background_job(shared, router_sid, job_id, &summary, true, async move {
+        run_planner_attempt(&task_shared, &task_sid, args, identity).await
+    })
+}
+
+/// Resume a planner worker whose attempt ended without a receipt: a
+/// follow-up turn on its open sub-session, through the same path as the
+/// parent's `delegate_followup {background: true}`.
+pub fn resume_planner_worker(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    delegate_id: String,
+    message: String,
+) -> Result<String, String> {
+    start_background_followup(
+        shared,
+        router_sid,
+        DelegateFollowupArgs {
+            delegate_id,
+            message,
+            background: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Claim the attempt and workspace for a durable planner work and shape
+/// `args` into its assignment brief.
+async fn begin_planner_attempt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: &mut DelegateTaskArgs,
+) -> Result<crate::planner_workflow::WorkerIdentity, String> {
+    let work_id = args
+        .work_id
+        .clone()
+        .ok_or("planner attempt needs a work_id")?;
+    args.planner_role = Some(
+        if crate::planner_workflow::load(shared, router_sid)?
+            .and_then(|run| run.works.get(&work_id).map(|w| w.status))
+            == Some(crate::planner_workflow::WorkStatus::Accepted)
+        {
+            crate::planner_skills::PlannerRole::FinishWork
+        } else {
+            crate::planner_skills::PlannerRole::ImplementWork
+        },
+    );
+    let (identity, workspace, child_id, instructions) =
+        crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
+    args.classification_text = Some(args.task.clone());
+    args.task = format!("{instructions}\n[Assignment briefing]\n{}", args.task);
+    args.planner_identity = Some(identity.clone());
+    args.planner_workspace = Some(workspace.path);
+    args.planner_environment = workspace.environment;
+    args.worker_id = Some(child_id);
+    args.keep_open = true;
+    Ok(identity)
+}
+
+/// Run a claimed planner attempt's turn and record its end.
+async fn run_planner_attempt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    mut args: DelegateTaskArgs,
+    identity: crate::planner_workflow::WorkerIdentity,
+) -> Result<String, String> {
+    let original_inputs =
+        crate::planner_workflow::input_blocks(shared, router_sid, &identity, &args.input_ids);
+    let result = match original_inputs {
+        Ok((blocks, ids)) => {
+            args.planner_input_blocks = blocks;
+            args.planner_receipt_ids = ids;
+            run_delegate_task_inner(shared, router_sid, args).await
+        }
+        Err(error) => Err(error),
+    };
+    let delegate_id = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, live)| {
+            live.planner.as_ref().is_some_and(|p| {
+                p.work_id == identity.work_id && p.attempt_id == identity.attempt_id
+            })
+        })
+        .map(|(id, _)| id.clone());
+    crate::planner_workflow::attempt_ended(
+        shared,
+        router_sid,
+        &identity,
+        delegate_id,
+        result.clone().unwrap_or_else(|e| e),
+        result.is_err(),
+    )?;
+    crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+    result
 }
 
 async fn run_delegate_task_inner(

@@ -40,6 +40,10 @@ pub struct PlannerRun {
     /// Heartbeat wakes sent since a worker last ran; spaces the next one out.
     #[serde(default)]
     pub idle_heartbeats: u32,
+    /// Router-enforced worker capacity: host candidates, holds, capacity
+    /// wakes, auto-admissions and worker resumptions.
+    #[serde(default)]
+    pub capacity: crate::planner_capacity::CapacityState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +294,14 @@ pub enum Operation {
         key: String,
         wake_id: String,
     },
+    /// Keep one capacity-host candidate unadmitted for 30 minutes. The only
+    /// way a candidate may stay out of a free slot.
+    Hold {
+        key: String,
+        plan_id: String,
+        reason: String,
+        detail: String,
+    },
     Complete {
         key: String,
         queue_evidence: String,
@@ -426,6 +438,7 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         approval_waits: BTreeSet::new(),
         receipts: BTreeMap::new(),
         idle_heartbeats: 0,
+        capacity: Default::default(),
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -955,9 +968,10 @@ pub fn input_blocks(
 }
 
 pub fn tool_definition() -> Value {
-    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions: status, admit, review, integrate, disposition, acknowledge-input, acknowledge-wake, complete. Worker actions: artifact and finished for its own assignment. Use an idempotency key for every mutation. This tool never grants merge/deploy authority.",
+    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions: status, admit, review, integrate, disposition, acknowledge-input, acknowledge-wake, hold, complete. Worker actions: artifact and finished for its own assignment. Every free worker slot must be filled while admissible work exists: admit the capacity host's candidates in order, or `hold` one {plan_id, reason: source-conflict|dependency|disk-floor, detail} for 30 minutes; the router admits unheld candidates itself otherwise. Use an idempotency key for every mutation. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
-            "action": {"type":"string", "enum":["status","admit","artifact","review","finished","integrate","disposition","acknowledge-input","acknowledge-wake","complete"]},
+            "action": {"type":"string", "enum":["status","admit","artifact","review","finished","integrate","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "plan_id":{"type":"string"}, "detail":{"type":"string"},
             "key":{"type":"string"}, "work":{"type":"object"}, "work_id":{"type":"string"}, "attempt_id":{"type":"string"},
             "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"type":"array","items":{"type":"string"}},
             "corrections":{"type":["string","null"]}, "receipt":{"type":"object"}, "status":{"type":"string"}, "reason":{"type":"string"},
@@ -1050,6 +1064,7 @@ async fn operate_once(
             .collect::<BTreeMap<_, _>>();
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
+            "capacity":crate::planner_capacity::status_block(shared, &run, chrono::Utc::now().timestamp_millis()),
             "offset":offset,"next_offset":offset+32,"counts":{"works":run.works.len(),"inputs":run.inputs.len(),"wakes":run.wakes.len()}})).map_err(|e| e.to_string());
     }
     let value = serde_json::to_value(&operation).map_err(|e| e.to_string())?;
@@ -1329,17 +1344,45 @@ async fn operate_once(
                 .ok_or("unknown wake receipt")?
                 .acknowledged = true;
         }
+        Operation::Hold {
+            plan_id,
+            reason,
+            detail,
+            ..
+        } => {
+            crate::planner_capacity::record_hold(
+                &mut run,
+                &plan_id,
+                &reason,
+                &detail,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+        }
         Operation::Complete { queue_evidence, .. } => {
             if !valid_evidence(&queue_evidence) {
                 return Err("completion requires a verified queue/disposition result".into());
             }
-            if run.works.values().any(|w| {
-                w.status != WorkStatus::Integrated || w.attempt.as_ref().is_some_and(|a| !a.ended)
-            }) || run.inputs.values().any(|i| !i.acknowledged)
+            let pending = run
+                .works
+                .iter()
+                .filter(|(_, w)| {
+                    w.status != WorkStatus::Integrated
+                        || w.attempt.as_ref().is_some_and(|a| !a.ended)
+                })
+                .map(|(id, w)| format!("{id} ({:?})", w.status))
+                .collect::<Vec<_>>();
+            if !pending.is_empty()
+                || run.inputs.values().any(|i| !i.acknowledged)
                 || run.wakes.values().any(|w| !w.acknowledged)
             {
-                return Err("completion requires all admitted scope, input and wakes to be reconciled; blocked/watching scope remains explicitly pending".into());
+                return Err(format!(
+                    "completion requires all admitted scope, input and wakes to be reconciled; blocked/watching scope remains explicitly pending. Unfinished works: [{}]",
+                    pending.join(", ")
+                ));
             }
+            // The capacity host decides whether admissible work remains; an
+            // unknown answer is never "no work".
+            crate::planner_capacity::completion_allowed(shared, sid, &run).await?;
             run.status = RunStatus::Complete;
         }
     }

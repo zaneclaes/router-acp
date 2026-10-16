@@ -1347,6 +1347,12 @@ pub struct PlannerRouterConfig {
     /// Omitted allocation uses isolated local clones, never shared writes.
     #[serde(default)]
     pub workspace: Option<PlannerWorkspaceConfig>,
+    /// Repository-owned capacity host. While the parent is idle below
+    /// `delegation.max_concurrent`, the router asks it for admissible
+    /// candidates, wakes the parent to admit them and, if it does not, admits
+    /// and starts them itself. Omitted keeps only the 20-minute heartbeat.
+    #[serde(default)]
+    pub capacity: Option<PlannerCapacityConfig>,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1395,6 +1401,7 @@ impl Default for PlannerRouterConfig {
             finish_work: PlannerSkillConfig::default(),
             integrate_plan: PlannerSkillConfig::default(),
             workspace: None,
+            capacity: None,
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -1422,6 +1429,68 @@ pub struct PlannerWorkspaceConfig {
     pub args: Vec<String>,
     #[serde(default = "default_lifecycle_hook_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+/// `routers.planner.capacity`: launched like `workspace` (cwd = the session
+/// repository, JSON on stdin, JSON on stdout), plus the wake and
+/// auto-admission timing. See `crate::planner_capacity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerCapacityConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Seconds of parent idleness with a free slot and an unheld candidate
+    /// before a capacity wake, and between repeated wakes.
+    #[serde(default = "default_capacity_wake_after_secs")]
+    pub wake_after_secs: u64,
+    /// Capacity wakes for one unfilled condition after which the router
+    /// admits and starts the candidates itself.
+    #[serde(default = "default_capacity_auto_admit_after_wakes")]
+    pub auto_admit_after_wakes: u32,
+    /// Parent idleness with a free slot after which the router admits and
+    /// starts the candidates itself, whatever the wake count.
+    #[serde(default = "default_capacity_auto_admit_after_secs")]
+    pub auto_admit_after_secs: u64,
+    /// Minimum spacing of the in-flight wakes an idle parent gets while a
+    /// release or running work is mid-flight (the first comes after
+    /// `wake_after_secs` of idleness).
+    #[serde(default = "default_capacity_inflight_wake_secs")]
+    pub inflight_wake_secs: u64,
+}
+
+impl PlannerCapacityConfig {
+    /// Timing used when no capacity host is configured: worker resumption and
+    /// in-flight wakes still run on these defaults.
+    pub fn timing_defaults() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            timeout_ms: default_lifecycle_hook_timeout_ms(),
+            wake_after_secs: default_capacity_wake_after_secs(),
+            auto_admit_after_wakes: default_capacity_auto_admit_after_wakes(),
+            auto_admit_after_secs: default_capacity_auto_admit_after_secs(),
+            inflight_wake_secs: default_capacity_inflight_wake_secs(),
+        }
+    }
+}
+
+fn default_capacity_wake_after_secs() -> u64 {
+    60
+}
+
+fn default_capacity_auto_admit_after_wakes() -> u32 {
+    2
+}
+
+fn default_capacity_auto_admit_after_secs() -> u64 {
+    300
+}
+
+fn default_capacity_inflight_wake_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

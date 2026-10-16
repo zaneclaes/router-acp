@@ -23,6 +23,7 @@ pub mod mcp_broker;
 pub mod mcp_menu;
 pub mod mcp_oauth;
 pub mod notice;
+pub mod planner_capacity;
 pub mod planner_client;
 pub mod planner_skills;
 pub mod planner_wake;

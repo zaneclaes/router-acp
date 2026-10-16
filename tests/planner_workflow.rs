@@ -4,7 +4,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, ResourceLink};
-use router_acp::config::{Config, DelegateLifecycleHook, PlannerWorkspaceConfig};
+use router_acp::config::{
+    Config, DelegateLifecycleHook, PlannerCapacityConfig, PlannerWorkspaceConfig,
+};
 use router_acp::planner_workflow::{
     self, Artifact, Operation, Receipt, RunStatus, WorkSpec, WorkStatus,
 };
@@ -1982,7 +1984,13 @@ async fn sessions_of_attempts_that_cannot_take_another_turn_are_closed() {
             work.attempt.as_mut().unwrap().ended = id != "superseded";
         }
         // A newer attempt replaced the one the open session belongs to.
-        run.works.get_mut("superseded").unwrap().attempt.as_mut().unwrap().id = "newer".into();
+        run.works
+            .get_mut("superseded")
+            .unwrap()
+            .attempt
+            .as_mut()
+            .unwrap()
+            .id = "newer".into();
         Ok(())
     })
     .unwrap();
@@ -2062,5 +2070,683 @@ async fn awaiting_background_work_never_waits_on_planner_workers() {
     let out = await_all().await.unwrap();
     assert!(out.contains("=== delegate b-other — done ==="));
     assert!(out.contains("Planner work delegates are not awaited"));
-    assert!(shared.background_delegates.lock().unwrap().contains_key("b-worker"));
+    assert!(
+        shared
+            .background_delegates
+            .lock()
+            .unwrap()
+            .contains_key("b-worker")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Router-enforced capacity (`routers.planner.capacity`)
+// ---------------------------------------------------------------------------
+
+fn candidate_json(id: &str) -> serde_json::Value {
+    json!({"work":{"work_id":format!("work-{id}"),"plan_id":format!("plan-{id}"),
+        "scope":format!("implement plan-{id}"),"external_id":format!("EXT-{id}")},
+        "task":format!("Implement plan-{id} end to end.")})
+}
+
+/// A fake capacity host: copies its stdin to `stdin_copy` and answers with
+/// the given candidates, in order.
+fn host_script(ids: &[&str], stdin_copy: &Path) -> String {
+    let reply = json!({"candidates": ids.iter().map(|id| candidate_json(id)).collect::<Vec<_>>()});
+    format!("cat > '{}'; printf '%s' '{}'", stdin_copy.display(), reply)
+}
+
+fn capacity_host(
+    cfg: &mut Config,
+    script: String,
+    auto_admit_after_wakes: u32,
+    auto_admit_after_secs: u64,
+) {
+    cfg.routers.planner.capacity = Some(PlannerCapacityConfig {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), script],
+        timeout_ms: 5_000,
+        wake_after_secs: 60,
+        auto_admit_after_wakes,
+        auto_admit_after_secs,
+        inflight_wake_secs: 300,
+    });
+}
+
+/// The parent's turn ended at the returned unix second.
+fn parent_turn_ended(shared: &Arc<Shared>) -> i64 {
+    shared.state.lock().unwrap().log(
+        SID,
+        &router_acp::state::LogEntry {
+            kind: "agent_response".into(),
+            role: "agent".into(),
+            summary: "turn ended".into(),
+            ..Default::default()
+        },
+    );
+    shared.state.lock().unwrap().last_activity(SID).unwrap().0
+}
+
+fn pin_parent(shared: &Arc<Shared>) {
+    shared.with_session(SID, |s| {
+        s.pin = Some(router_acp::session::PinInfo {
+            candidate: router_acp::candidate::CandidateId::parse("test/model").unwrap(),
+            process_key: router_acp::downstream::ProcessKey("parent".into()),
+            downstream_sid: "downstream".into(),
+            available_modes: Vec::new(),
+        });
+    });
+}
+
+fn wakes_with(shared: &Arc<Shared>, prefix: &str) -> Vec<(String, planner_workflow::Wake)> {
+    planner_workflow::load(shared, SID)
+        .unwrap()
+        .unwrap()
+        .wakes
+        .into_iter()
+        .filter(|(id, _)| id.starts_with(prefix))
+        .collect()
+}
+
+/// What a delivery does to router-owned wakes.
+fn deliver_all(shared: &Arc<Shared>) {
+    planner_workflow::mutate(shared, SID, |run| {
+        run.wakes.values_mut().for_each(|w| {
+            w.deliveries += 1;
+            w.acknowledged = true;
+        });
+        Ok(())
+    })
+    .unwrap();
+}
+
+async fn tick(shared: &Arc<Shared>, now: i64) {
+    router_acp::planner_capacity::tick(shared, SID, now).await;
+}
+
+#[tokio::test]
+async fn idle_parent_below_its_limit_gets_capacity_wakes_that_never_give_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stdin_copy = tmp.path().join("host-stdin.json");
+    let script = host_script(&["a", "b"], &stdin_copy);
+    let fixture = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 3;
+        capacity_host(cfg, script, 1_000, 1_000_000);
+    });
+    let shared = &fixture.shared;
+    authorize(shared);
+    let last = parent_turn_ended(shared);
+
+    tick(shared, last + 30).await;
+    assert!(
+        wakes_with(shared, "capacity:").is_empty(),
+        "not idle long enough"
+    );
+    let asked: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stdin_copy).unwrap()).unwrap();
+    assert_eq!(asked["event"], "capacity");
+    assert_eq!(asked["free"], 3);
+    assert_eq!(asked["max"], 3);
+    assert_eq!(asked["cwd"], json!(fixture.repo));
+
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1);
+    let reason = &wakes[0].1.reason;
+    assert!(reason.contains("3 free"), "{reason}");
+    assert!(
+        reason.contains("1. work_id work-a (external_id EXT-a"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("2. work_id work-b (external_id EXT-b"),
+        "{reason}"
+    );
+    assert!(reason.contains("`hold`"), "{reason}");
+    assert!(reason.contains("Breadth is always permitted"), "{reason}");
+
+    // An undelivered capacity wake is not doubled.
+    tick(shared, last + 200).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 1);
+
+    // The heartbeat yields to capacity wakes while candidates exist.
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    deliver_all(shared);
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 21 * 60);
+    assert!(wakes_with(shared, "heartbeat:").is_empty());
+
+    // Every wake_after_secs, with no give-up after any number of deliveries.
+    let mut now = last + 200;
+    for delivered in 1..=8 {
+        now += 61;
+        tick(shared, now).await;
+        assert_eq!(wakes_with(shared, "capacity:").len(), delivered + 1);
+        deliver_all(shared);
+    }
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(run.capacity.unfilled_wakes, 9);
+    assert!(
+        run.works.is_empty(),
+        "auto-admission is configured far away"
+    );
+
+    // Status and the census carry the same block.
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(shared, SID, None, Operation::Status { offset: 0 })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let capacity = &status["capacity"];
+    assert_eq!(capacity["live"], 0);
+    assert_eq!(capacity["max"], 3);
+    assert_eq!(capacity["free"], 3);
+    assert_eq!(capacity["host"]["ok"], true);
+    assert_eq!(capacity["unheld"], json!(["work-a", "work-b"]));
+    let census = router_acp::planner_wake::capacity_line(shared, &run);
+    assert!(
+        census.contains(
+            "Capacity host candidates no hold covers, in order: work-a (EXT-a), work-b (EXT-b)."
+        ),
+        "{census}"
+    );
+}
+
+#[tokio::test]
+async fn unanswered_capacity_wakes_make_the_router_admit_and_start_exactly_the_free_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a", "b", "c"], &tmp.path().join("stdin.json"));
+    let fixture = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 2;
+        capacity_host(cfg, script, 2, 1_000_000);
+    });
+    let shared = &fixture.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let last = parent_turn_ended(shared);
+
+    tick(shared, last + 61).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 1);
+    deliver_all(shared);
+    tick(shared, last + 122).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 2);
+    assert!(
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty()
+    );
+    deliver_all(shared);
+
+    // Two capacity wakes went unanswered: the router fills the slots itself.
+    tick(shared, last + 130).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works.keys().cloned().collect::<Vec<_>>(),
+        vec!["work-a".to_string(), "work-b".to_string()],
+        "exactly the free count, in host order"
+    );
+    for id in ["work-a", "work-b"] {
+        let work = &run.works[id];
+        assert!(run.receipts.contains_key(&format!("auto-admit:{id}:1")));
+        assert!(work.attempt.is_some(), "{id} was started");
+        let workspace = work
+            .workspace
+            .as_ref()
+            .expect("allocated through the workspace path");
+        assert_ne!(
+            workspace.path,
+            std::fs::canonicalize(&fixture.repo).unwrap()
+        );
+        assert_eq!(
+            work.spec.external_id.as_deref(),
+            Some(&*format!("EXT-{}", &id[5..]))
+        );
+    }
+    let jobs = shared.background_delegates.lock().unwrap();
+    assert_eq!(jobs.values().filter(|j| j.planner).count(), 2);
+    drop(jobs);
+    let auto = run.capacity.last_auto_admission.as_ref().unwrap();
+    assert_eq!(auto.admitted, vec!["work-a", "work-b"]);
+    assert_eq!(auto.free, 2);
+    let notice = &run.wakes["auto-admit:1"].reason;
+    assert!(
+        notice.contains(
+            "router admitted work-a, work-b to fill 2 free slots; review them as normal."
+        ),
+        "{notice}"
+    );
+    assert_eq!(run.capacity.unfilled_wakes, 0);
+}
+
+#[tokio::test]
+async fn a_parent_idle_past_the_limit_is_auto_admitted_without_wakes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let fixture = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 2;
+        capacity_host(cfg, script, 1_000, 300);
+    });
+    let shared = &fixture.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 301).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(run.works.keys().collect::<Vec<_>>(), vec!["work-a"]);
+    assert!(run.wakes.contains_key("auto-admit:1"));
+}
+
+#[tokio::test]
+async fn only_three_hold_reasons_keep_a_candidate_out_and_holds_expire() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a", "b"], &tmp.path().join("stdin.json"));
+    let fixture = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 3;
+        capacity_host(cfg, script, 1_000, 1_000_000);
+    });
+    let shared = &fixture.shared;
+    authorize(shared);
+    let hold = |key: &str, plan_id: &str, reason: &str, detail: &str| {
+        planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Hold {
+                key: key.into(),
+                plan_id: plan_id.into(),
+                reason: reason.into(),
+                detail: detail.into(),
+            },
+        )
+    };
+    let error = hold("h0", "plan-a", "waiting-for-review", "later")
+        .await
+        .unwrap_err();
+    for reason in ["source-conflict", "dependency", "disk-floor", "not allowed"] {
+        assert!(error.contains(reason), "{error}");
+    }
+    let error = hold("h1", "plan-a", "source-conflict", "touches the same files")
+        .await
+        .unwrap_err();
+    assert!(error.contains("live work_id"), "{error}");
+    let error = hold("h2", "plan-a", "disk-floor", "low").await.unwrap_err();
+    assert!(error.contains("free bytes"), "{error}");
+    hold("h3", "plan-a", "disk-floor", "free 1073741824 bytes")
+        .await
+        .unwrap();
+
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1);
+    assert!(
+        !wakes[0].1.reason.contains("work-a"),
+        "held: {}",
+        wakes[0].1.reason
+    );
+    assert!(wakes[0].1.reason.contains("work-b"));
+    deliver_all(shared);
+
+    // With every candidate held the parent gets no capacity wake, and the
+    // 20-minute heartbeat re-checks the blockers instead.
+    hold("h4", "plan-b", "dependency", "waits for plan-a")
+        .await
+        .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 61).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 1);
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 21 * 60);
+    assert_eq!(wakes_with(shared, "heartbeat:").len(), 1);
+
+    // Holds expire after 30 minutes.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, now_ms).is_empty());
+    let later: Vec<_> =
+        router_acp::planner_capacity::unheld_candidates(&run, now_ms + 31 * 60 * 1000)
+            .into_iter()
+            .map(|c| c.work.work_id)
+            .collect();
+    assert_eq!(later, vec!["work-a", "work-b"]);
+}
+
+#[tokio::test]
+async fn a_failed_host_is_unknown_never_no_work() {
+    for (script, expected) in [
+        ("cat >/dev/null; echo boom >&2; exit 3", "boom"),
+        ("cat >/dev/null; printf 'not json'", "invalid JSON"),
+    ] {
+        let fixture = fixture(|cfg| {
+            cfg.delegation.max_concurrent = 2;
+            capacity_host(cfg, script.into(), 1, 1);
+        });
+        let shared = &fixture.shared;
+        authorize(shared);
+        pin_parent(shared);
+        let last = parent_turn_ended(shared);
+        let mut now = last;
+        for _ in 0..3 {
+            now += 61;
+            tick(shared, now).await;
+            deliver_all(shared);
+        }
+        let wakes = wakes_with(shared, "capacity:");
+        assert_eq!(wakes.len(), 3, "an unknown answer keeps waking the parent");
+        assert!(wakes.iter().all(|(_, w)| w.reason.contains("UNAVAILABLE")
+            && w.reason.contains(expected)
+            && w.reason.contains("not \"no work\"")));
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        assert!(
+            run.works.is_empty(),
+            "nothing is auto-admitted from an unknown answer"
+        );
+        assert!(!run.capacity.host.as_ref().unwrap().ok);
+        let error = planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Complete {
+                key: format!("complete-{expected}"),
+                queue_evidence: "queue-census.md".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("capacity host is unavailable"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn completion_is_refused_while_an_unheld_candidate_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let fixture = fixture(|cfg| capacity_host(cfg, script, 1_000, 1_000_000));
+    let shared = &fixture.shared;
+    authorize(shared);
+    let complete = |key: &'static str| {
+        planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Complete {
+                key: key.into(),
+                queue_evidence: "queue-census.md".into(),
+            },
+        )
+    };
+    let error = complete("complete-1").await.unwrap_err();
+    assert!(error.contains("work-a (EXT-a)"), "{error}");
+    planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Hold {
+            key: "hold-a".into(),
+            plan_id: "plan-a".into(),
+            reason: "dependency".into(),
+            detail: "plan-z must land first".into(),
+        },
+    )
+    .await
+    .unwrap();
+    complete("complete-2").await.unwrap();
+    assert_eq!(
+        planner_workflow::load(shared, SID).unwrap().unwrap().status,
+        RunStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn completion_lists_unfinished_works() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    let error = planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Complete {
+            key: "complete".into(),
+            queue_evidence: "queue-census.md".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("work-1 (Admitted)"), "{error}");
+}
+
+/// Wait for a background attempt to end (the test agent cannot serve it).
+async fn attempt_settled(shared: &Arc<Shared>, work_id: &str) {
+    for _ in 0..200 {
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        let work = &run.works[work_id];
+        if work.status == WorkStatus::Interrupted && work.attempt.as_ref().is_some_and(|a| a.ended)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("attempt of {work_id} never ended");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_stops_without_a_receipt_is_resumed_with_backoff_and_no_cap() {
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 2);
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    admit(shared, work("asks-parent"));
+    pin_parent(shared);
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(
+        shared,
+        SID,
+        &identity,
+        None,
+        "stopped to wait".into(),
+        false,
+    )
+    .unwrap();
+    // A handoff that asks the parent for something is the parent's to answer.
+    let (asks, _, _, _) = planner_workflow::begin_work(shared, SID, "asks-parent")
+        .await
+        .unwrap();
+    planner_workflow::record_handoff(
+        shared,
+        SID,
+        &asks,
+        router_acp::delegate_hook::Handoff {
+            kind: "lease_requested".into(),
+            message: "need the unity lease".into(),
+        },
+    )
+    .unwrap();
+    planner_workflow::attempt_ended(shared, SID, &asks, None, "handed off".into(), false).unwrap();
+
+    let resumes = |id: &str| {
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .capacity
+            .resumes
+            .get(id)
+            .cloned()
+    };
+    let mut now = chrono::Utc::now().timestamp() + 10_000;
+    let mut previous_attempt = identity.attempt_id.clone();
+    for (round, delay) in [30, 120, 300, 300, 300].into_iter().enumerate() {
+        tick(shared, now).await;
+        let state = resumes("work-1").unwrap();
+        assert_eq!(state.count, round as u32);
+        assert_eq!(state.due_at, Some(now + delay), "backoff step {round}");
+        tick(shared, now + delay - 1).await;
+        assert_eq!(
+            resumes("work-1").unwrap().count,
+            round as u32,
+            "not before its backoff"
+        );
+        tick(shared, now + delay).await;
+        assert_eq!(resumes("work-1").unwrap().count, round as u32 + 1);
+        // The resumption is a fresh attempt on the same work and workspace.
+        attempt_settled(shared, "work-1").await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        let attempt = run.works["work-1"].attempt.as_ref().unwrap().id.clone();
+        assert_ne!(attempt, previous_attempt);
+        previous_attempt = attempt;
+        now += delay + 1;
+    }
+    assert!(resumes("asks-parent").is_none());
+    assert_eq!(
+        planner_workflow::load(shared, SID).unwrap().unwrap().works["asks-parent"]
+            .attempt
+            .as_ref()
+            .unwrap()
+            .id,
+        asks.attempt_id
+    );
+}
+
+#[tokio::test]
+async fn an_idle_parent_with_a_release_in_flight_is_woken() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    let mut release = work("release-1");
+    release.plan_id = "release".into();
+    admit(shared, release);
+    planner_workflow::begin_work(shared, SID, "release-1")
+        .await
+        .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 59).await;
+    assert!(wakes_with(shared, "inflight:").is_empty());
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "inflight:");
+    assert_eq!(wakes.len(), 1);
+    assert!(
+        wakes[0].1.reason.contains("release-1"),
+        "{}",
+        wakes[0].1.reason
+    );
+    assert!(wakes[0].1.reason.contains("smokescreen"));
+    deliver_all(shared);
+    tick(shared, last + 200).await;
+    assert_eq!(
+        wakes_with(shared, "inflight:").len(),
+        1,
+        "spaced by inflight_wake_secs"
+    );
+    tick(shared, last + 361).await;
+    assert_eq!(wakes_with(shared, "inflight:").len(), 2);
+}
+
+#[tokio::test]
+async fn a_workspace_refusal_during_auto_admission_becomes_a_recorded_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let fixture = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 2;
+        capacity_host(cfg, script, 1_000, 300);
+        cfg.routers.planner.workspace = Some(PlannerWorkspaceConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; echo 'disk floor: 1048576 bytes free' >&2; exit 1".into(),
+            ],
+            timeout_ms: 5_000,
+        });
+    });
+    let shared = &fixture.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 301).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let hold = &run.capacity.holds["plan-a"];
+    assert_eq!(hold.reason, "disk-floor");
+    assert!(
+        hold.detail.contains("1048576 bytes free"),
+        "{}",
+        hold.detail
+    );
+    let notice = &run.wakes["auto-admit:1"].reason;
+    assert!(
+        notice.contains("Not started (recorded as holds): work-a (disk-floor"),
+        "{notice}"
+    );
+    // The held candidate is no longer counted as unfilled work.
+    let now_ms = (last + 302) * 1000;
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, now_ms).is_empty());
+    assert!(
+        !router_acp::planner_capacity::unheld_candidates(&run, now_ms + 31 * 60 * 1000).is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_follow_up_resumption_falls_back_to_a_fresh_attempt() {
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 2);
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    pin_parent(shared);
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    shared.live_delegates.lock().unwrap().insert(
+        "d-1".into(),
+        router_acp::session::LiveDelegate {
+            parent_sid: SID.into(),
+            process_key: router_acp::downstream::ProcessKey("key-1".into()),
+            downstream_sid: "down-1".into(),
+            candidate: router_acp::candidate::CandidateId::parse("test/model").unwrap(),
+            capture: Arc::default(),
+            sub_sid: "sub-1".into(),
+            lifecycle: None,
+            worker_id: "w-1".into(),
+            planner: Some(identity.clone()),
+            turns: 1,
+        },
+    );
+    planner_workflow::attempt_ended(
+        shared,
+        SID,
+        &identity,
+        Some("d-1".into()),
+        "stopped".into(),
+        false,
+    )
+    .unwrap();
+    let now = chrono::Utc::now().timestamp() + 10_000;
+    tick(shared, now).await;
+    tick(shared, now + 30).await;
+    let state = planner_workflow::load(shared, SID)
+        .unwrap()
+        .unwrap()
+        .capacity
+        .resumes["work-1"]
+        .clone();
+    assert_eq!(
+        state.followup,
+        Some(("d-1".to_string(), 1)),
+        "first resumption follows up"
+    );
+    attempt_settled(shared, "work-1").await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works["work-1"].attempt.as_ref().unwrap().id,
+        identity.attempt_id
+    );
+
+    // That follow-up completed no turn, so the next resumption is a fresh attempt.
+    tick(shared, now + 31).await;
+    tick(shared, now + 31 + 120).await;
+    attempt_settled(shared, "work-1").await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_ne!(
+        run.works["work-1"].attempt.as_ref().unwrap().id,
+        identity.attempt_id
+    );
+    assert_eq!(run.capacity.resumes["work-1"].count, 2);
 }
