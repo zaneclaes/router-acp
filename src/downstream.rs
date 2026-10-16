@@ -122,6 +122,25 @@ pub fn make_process_transport(shared: &Arc<Shared>, spec: &ProcessTargetSpec) ->
     }
 }
 
+/// `bypass_hook_trust` for a Codex adapter: codex-acp passes `CODEX_CONFIG` to
+/// Codex's `thread/start` as per-thread overrides, and Codex reads this key
+/// there as `--dangerously-bypass-hook-trust`. Every other key is kept.
+fn codex_hook_trust_env(env: &mut Vec<(String, String)>) {
+    let mut config = env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CODEX_CONFIG")
+        .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    config.insert("bypass_hook_trust".into(), serde_json::Value::Bool(true));
+    env.retain(|(name, _)| name != "CODEX_CONFIG");
+    env.push((
+        "CODEX_CONFIG".into(),
+        serde_json::Value::Object(config).to_string(),
+    ));
+}
+
 /// Spawn the downstream process and its client connection as a contained
 /// task on the upstream connection. Failures are recorded in shared state
 /// instead of tearing down the router.
@@ -144,6 +163,9 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
                 && let Some(home) = crate::credentials::directory(agent)
             {
                 crate::codex_logs::rotate_if_oversized(&home);
+            }
+            if crate::accounts::provider(agent) == Some("codex") && agent.bypass_hook_trust {
+                codex_hook_trust_env(&mut acp_agent.env);
             }
             crate::credentials::runtime(agent, &mut acp_agent.env)
                 .await
@@ -676,6 +698,53 @@ agents:
       - { id: gpt-5.1, cost_rank: 3 }
       - { id: gpt-5-mini, cost_rank: 1 }
 "#
+    }
+
+    #[test]
+    fn hook_trust_bypass_joins_the_existing_codex_config() {
+        let mut env = vec![
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                "CODEX_CONFIG".to_string(),
+                r#"{"model":"gpt-5.1","model_provider":"router-acp-proxy"}"#.to_string(),
+            ),
+        ];
+        codex_hook_trust_env(&mut env);
+        let configs: Vec<_> = env.iter().filter(|(n, _)| n == "CODEX_CONFIG").collect();
+        assert_eq!(configs.len(), 1, "one CODEX_CONFIG reaches the adapter");
+        let value: serde_json::Value = serde_json::from_str(&configs[0].1).unwrap();
+        assert_eq!(value["bypass_hook_trust"], serde_json::Value::Bool(true));
+        assert_eq!(value["model"], "gpt-5.1");
+        assert_eq!(value["model_provider"], "router-acp-proxy");
+        assert!(env.iter().any(|(n, v)| n == "PATH" && v == "/bin"));
+
+        let mut bare = Vec::new();
+        codex_hook_trust_env(&mut bare);
+        assert_eq!(
+            bare,
+            vec![(
+                "CODEX_CONFIG".to_string(),
+                r#"{"bypass_hook_trust":true}"#.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn hook_trust_bypass_is_off_unless_set() {
+        let cfg = Config::from_yaml(spawn_config_yaml()).unwrap();
+        assert!(cfg.agents.iter().all(|a| !a.bypass_hook_trust));
+        let set = spawn_config_yaml().replace(
+            "  - name: codex\n",
+            "  - name: codex\n    bypass_hook_trust: true\n",
+        );
+        let cfg = Config::from_yaml(&set).unwrap();
+        assert!(
+            cfg.agents
+                .iter()
+                .find(|a| a.name == "codex")
+                .unwrap()
+                .bypass_hook_trust
+        );
     }
 
     #[test]

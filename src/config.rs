@@ -959,6 +959,13 @@ pub struct AgentConfig {
     /// Deleted membership keeps an adapter template for adding a new login.
     #[serde(default)]
     pub account_disabled: bool,
+    /// Codex adapters only: run every enabled hook without Codex's persisted
+    /// hook-trust review, the same override as `codex --dangerously-bypass-hook-trust`.
+    /// Codex skips hooks it has not trusted, and a delegate's fresh worktree is
+    /// never a trusted path, so without this a repository's guard hooks do not
+    /// run for delegated work. Off unless set.
+    #[serde(default)]
+    pub bypass_hook_trust: bool,
     /// Most delegated sub-sessions this agent runs at once, beside the global
     /// `delegation.max_concurrent`. Each account seat gets its own limit, so
     /// adding accounts or agents adds delegate capacity. Unset: only the
