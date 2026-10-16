@@ -1353,6 +1353,20 @@ pub struct PlannerRouterConfig {
     /// and starts them itself. Omitted keeps only the 20-minute heartbeat.
     #[serde(default)]
     pub capacity: Option<PlannerCapacityConfig>,
+    /// Repository-owned run auditor (the native watcher's guarantees): its
+    /// defects wake the idle parent, gate the parent's turn end and refuse
+    /// `complete`; a `hold_check` verifies each `hold`. See
+    /// `crate::planner_guard`.
+    #[serde(default)]
+    pub audit: Option<PlannerAuditConfig>,
+    /// Repository-owned check of every `integrate`, and of a `disposition` to
+    /// blocked/watching: exit 0 accepts, exit 2 rejects with its stderr.
+    #[serde(default)]
+    pub integrate_check: Option<PlannerHostConfig>,
+    /// `_router/planner_shutdown`: the resume-state host and the per-worker
+    /// drain bound. See `crate::planner_shutdown`.
+    #[serde(default)]
+    pub shutdown: Option<PlannerShutdownConfig>,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1402,6 +1416,9 @@ impl Default for PlannerRouterConfig {
             integrate_plan: PlannerSkillConfig::default(),
             workspace: None,
             capacity: None,
+            audit: None,
+            integrate_check: None,
+            shutdown: None,
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -1491,6 +1508,75 @@ fn default_capacity_auto_admit_after_secs() -> u64 {
 
 fn default_capacity_inflight_wake_secs() -> u64 {
     300
+}
+
+/// A repository host launched like `workspace`: no shell, cwd = the session
+/// repository, one JSON object on stdin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerHostConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// `routers.planner.audit`. See `crate::planner_guard`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerAuditConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// One audit fetches; it can take 10–15 s.
+    #[serde(default = "default_planner_host_slow_timeout_ms")]
+    pub timeout_ms: u64,
+    /// The capacity tick audits at most this often (plus at every parent
+    /// turn end).
+    #[serde(default = "default_audit_interval_secs")]
+    pub interval_secs: u64,
+}
+
+/// `routers.planner.shutdown`. See `crate::planner_shutdown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerShutdownConfig {
+    /// The resume-state host; without one nothing is saved, and the drain
+    /// still runs.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_planner_host_slow_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How long one live worker gets to commit, push and stop before it is
+    /// cancelled.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for PlannerShutdownConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            timeout_ms: default_planner_host_slow_timeout_ms(),
+            drain_timeout_secs: default_drain_timeout_secs(),
+        }
+    }
+}
+
+fn default_planner_host_slow_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_audit_interval_secs() -> u64 {
+    60
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

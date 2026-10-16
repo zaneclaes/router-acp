@@ -659,6 +659,9 @@ pub struct Shared {
     /// parent session's effort while that delegate runs.
     pub delegate_effort: Mutex<HashMap<String, crate::candidate::EffortLevel>>,
     pub planner_deliveries: Mutex<HashMap<String, crate::planner_workflow::PendingDelivery>>,
+    /// In-process planner state by parent session: turn ends for the
+    /// turn-end gate, child sessions and an active shutdown drain.
+    pub planner_runtime: Mutex<HashMap<String, crate::planner_guard::SessionRuntime>>,
     pub planner_child_routes:
         Mutex<HashMap<(ProcessKey, String), crate::planner_client::ChildRoute>>,
     pub planner_child_targets: Mutex<HashSet<ProcessKey>>,
@@ -799,6 +802,7 @@ impl Shared {
             background_interrupts: Mutex::new(HashMap::new()),
             delegate_effort: Mutex::new(HashMap::new()),
             planner_deliveries: Mutex::default(),
+            planner_runtime: Mutex::default(),
             planner_child_routes: Mutex::default(),
             planner_child_targets: Mutex::default(),
             agent_delegate_slots,
@@ -9572,7 +9576,7 @@ async fn on_set_config_option(
 
 fn on_prompt(
     shared: Arc<Shared>,
-    mut req: PromptRequest,
+    req: PromptRequest,
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
@@ -9582,29 +9586,88 @@ fn on_prompt(
         drop(activity);
         result
     });
+    // Operator input preempts a router-owned planner turn instead of queuing
+    // behind it (`planner_preempt`): steered into it, or it is cancelled and
+    // this prompt runs as the very next turn.
+    if crate::planner_workflow::human_prompt(&req)
+        && crate::planner_preempt::router_turn_in_flight(&shared, &router_sid)
+        && shared
+            .with_session(&router_sid, |s| s.prompt_activity > 1)
+            .unwrap_or(false)
+    {
+        let task_cx = cx.clone();
+        return cx.spawn(async move {
+            // A mode command must run as its own turn; anything else may be
+            // steered.
+            if crate::planner_workflow::command(&req).is_none()
+                && crate::planner_preempt::steer(&shared, &router_sid, &req.prompt).await
+            {
+                let recorded = crate::planner_workflow::record_steered_input(
+                    &shared,
+                    &router_sid,
+                    &req,
+                )
+                .and_then(|()| log_user_steer(&shared, &router_sid, &req.prompt));
+                if let Err(error) = recorded {
+                    tracing::warn!(session = router_sid, %error, "steered operator input not recorded");
+                }
+                notify_user(
+                    &shared,
+                    &router_sid,
+                    "router-acp · your message was steered into the running router-owned turn",
+                );
+                return responder.respond(PromptResponse::new(StopReason::EndTurn));
+            }
+            if crate::planner_preempt::preempt(&shared, &router_sid).await {
+                return continue_prompt(shared, router_sid, req, responder, task_cx);
+            }
+            // The router-owned turn ignored its cancel: keep the input safe.
+            queue_parent_prompt(&shared, &router_sid, req, responder)
+        });
+    }
     if shared
         .with_session(&router_sid, |s| {
             s.strategy == StrategyKind::Planner && s.prompt_activity > 1
         })
         .unwrap_or(false)
     {
-        let meta = req.meta.get_or_insert_with(Default::default);
-        let router = meta.entry("router_acp").or_insert_with(|| json!({}));
-        if router.get("input_id").is_none() {
-            router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
-        }
-        if let Err(error) =
-            crate::planner_workflow::enqueue_parent_input(&shared, &router_sid, &req)
-        {
-            return responder.respond_with_error(AcpError::invalid_params().data(error));
-        }
-        notify_user(
-            &shared,
-            &router_sid,
-            "router-acp · original input and controls retained for the next parent turn",
-        );
-        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        return queue_parent_prompt(&shared, &router_sid, req, responder);
     }
+    continue_prompt(shared, router_sid, req, responder, cx)
+}
+
+/// An operator prompt that arrives while an operator turn holds a planner
+/// parent waits, with its controls, for the next parent turn.
+fn queue_parent_prompt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    mut req: PromptRequest,
+    responder: Responder<PromptResponse>,
+) -> Result<(), AcpError> {
+    let meta = req.meta.get_or_insert_with(Default::default);
+    let router = meta.entry("router_acp").or_insert_with(|| json!({}));
+    if router.get("input_id").is_none() {
+        router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
+    }
+    if let Err(error) = crate::planner_workflow::enqueue_parent_input(shared, router_sid, &req) {
+        return responder.respond_with_error(AcpError::invalid_params().data(error));
+    }
+    notify_user(
+        shared,
+        router_sid,
+        "router-acp · original input and controls retained for the next parent turn",
+    );
+    responder.respond(PromptResponse::new(StopReason::EndTurn))
+}
+
+/// The ordinary prompt path, once the turn is this prompt's own.
+fn continue_prompt(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+    responder: Responder<PromptResponse>,
+    cx: ConnectionTo<ClientPeer>,
+) -> Result<(), AcpError> {
     if crate::accounts::intercepts(&shared, &router_sid, &req.prompt) {
         return cx.spawn(async move {
             crate::accounts::handle_prompt(shared, router_sid, req, responder).await
@@ -10653,6 +10716,14 @@ fn log_user_steer(
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
     if let Dispatch::Request(msg, responder) = message {
+        // kory's `/shutdown`: answered at once; the drain reports itself as
+        // `_router/shutdown_progress` notifications.
+        if msg.method() == crate::planner_shutdown::METHOD {
+            let result = crate::planner_shutdown::request(&shared, msg.params())
+                .map_err(|e| AcpError::invalid_params().data(e));
+            let _ = responder.respond_with_result(result);
+            return Ok(Handled::Yes);
+        }
         if msg.method() == "router-acp/planner-child" {
             let params = msg.params().clone();
             if let Some(upstream) = shared.upstream() {
@@ -10772,12 +10843,13 @@ fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dis
                             .forward_cancellation_from(responder.cancellation())
                             .block_task()
                             .await;
-                        if result
+                        let injected = result
                             .as_ref()
                             .ok()
                             .and_then(|v| v.get("outcome"))
                             .and_then(Value::as_str)
-                            == Some("injected")
+                            == Some("injected");
+                        if injected
                             && let Err(message) = log_user_steer(&task_shared, &router_sid, &prompt)
                         {
                             let _ = responder
@@ -10785,6 +10857,17 @@ fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dis
                             return Ok(());
                         }
                         let _ = responder.respond_with_result(result);
+                        // A steer the downstream would not take must not wait
+                        // behind router-owned work: cancel that turn, so the
+                        // client's follow-up prompt runs at once.
+                        if !injected
+                            && crate::planner_preempt::router_turn_in_flight(
+                                &task_shared,
+                                &router_sid,
+                            )
+                        {
+                            crate::planner_preempt::preempt(&task_shared, &router_sid).await;
+                        }
                         Ok(())
                     })?;
             } else {

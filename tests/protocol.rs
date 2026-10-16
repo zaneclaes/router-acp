@@ -13426,3 +13426,414 @@ async fn claude_runtimes_disable_the_project_copy_of_a_brokered_server() {
     })
     .await;
 }
+
+fn planner_gate_yaml(state: &std::path::Path, log: &std::path::Path, hook: &str) -> String {
+    format!(
+        r#"state_file: {}
+router: planner
+delegation: {{ enabled: true, max_concurrent: 1{hook} }}
+routers:
+  planner:
+    planning_candidates: ["planner/sol"]
+    implementation_candidates: ["planner/sol"]
+agents:
+{}"#,
+        state.display(),
+        agent_yaml(
+            "planner",
+            &[("sol", 3), ("haiku", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())],
+        )
+    )
+}
+
+/// A planner child never escapes unfinished: `max_continuations` does not
+/// bound it, and a lifecycle hook that cannot judge its turn continues it
+/// rather than releasing it.
+#[tokio::test]
+async fn a_planner_child_is_continued_when_its_hook_fails_whatever_max_continuations_says() {
+    let state = temp_state_file("planner-child-gate");
+    let log = temp_log("planner-child-gate");
+    let events = temp_events("planner-child-gate");
+    let repo = planner_wire_repository();
+    let script = format!(
+        "e=$(cat); case \"$e\" in *'\"event\":\"delegate_turn_end\"'*'\"turn\":1,'*) \
+         echo hook-crashed >&2; exit 1;; esac; printf '%s\\n' \"$e\" >> '{}'",
+        events.display()
+    );
+    let hook = format!(
+        ", lifecycle_hook: {{ command: /bin/sh, args: [\"-c\", {}], max_continuations: 0 }}",
+        serde_json::to_string(&script).unwrap()
+    );
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_gate_yaml(&state, &log, &hook),
+        async |cx, _observed, _shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+            let task = format!(
+                "{}MCP_CALL:router-delegate delegate_task {}",
+                planner_admit_wire_prompt(),
+                serde_json::json!({"work_id": "work-1", "task": "TEXT:child-turn"})
+            );
+            prompt_text(&cx, &sid, &task).await?;
+            wait_for_mock_prompt(&log, "could not judge this turn").await;
+            let recorded = hook_events(&events, 2).await;
+            let turn_end = recorded
+                .iter()
+                .find(|e| e["event"] == "delegate_turn_end")
+                .expect("the continued turn ended");
+            assert_eq!(turn_end["turn"], 2, "turn 1 was continued: {recorded:?}");
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
+/// parent records its resume point, a mid-turn worker gets the shutdown
+/// message at its turn end and stops, and the run ends paused for the next
+/// `/implement`.
+#[tokio::test]
+async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
+    let state = temp_state_file("planner-shutdown");
+    let log = temp_log("planner-shutdown");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+            let task = format!(
+                "{}MCP_CALL:router-delegate delegate_task {}",
+                planner_admit_wire_prompt(),
+                serde_json::json!({"work_id": "work-1", "task": "SLEEP:4000", "background": true})
+            );
+            prompt_text(&cx, &sid, &task).await?;
+            // The child's own prompt (the parent's also names SLEEP:4000).
+            wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+
+            let shutdown = |session: &str| {
+                agent_client_protocol::UntypedMessage::new(
+                    "_router/planner_shutdown",
+                    serde_json::json!({"sessionId": session}),
+                )
+                .unwrap()
+            };
+            assert!(
+                cx.send_request(shutdown("no-such-session"))
+                    .block_task()
+                    .await
+                    .is_err(),
+                "a session without a planner run is refused"
+            );
+            let ack = cx.send_request(shutdown(&sid)).block_task().await?;
+            assert_eq!(ack, serde_json::json!({"accepted": true}));
+
+            let paused = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let status = router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap()
+                        .status;
+                    if status == router_acp::planner_workflow::RunStatus::Paused {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(paused.is_ok(), "the drain never paused the run");
+            wait_for_mock_prompt(&log, "Shutdown requested by the operator").await;
+            wait_for_mock_prompt(&log, "Shutdown requested: commit and push your branch now").await;
+            let progress = router_acp::planner_shutdown::progress(&shared, &sid);
+            let phases = progress
+                .iter()
+                .map(|p| p["phase"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(phases.first().map(String::as_str), Some("saving"));
+            assert_eq!(phases.get(1).map(String::as_str), Some("saved"));
+            assert_eq!(phases.last().map(String::as_str), Some("drained"));
+            let done = progress.last().unwrap();
+            assert_eq!(
+                done["workers"],
+                serde_json::json!([{"workId": "work-1", "status": "stopped"}])
+            );
+            assert!(
+                progress.iter().any(|p| p["phase"] == "draining"
+                    && p["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("recorded its resume point"))),
+                "the parent's shutdown turn completed: {progress:?}"
+            );
+
+            // The next `/implement` resumes the paused run.
+            prompt_text(&cx, &sid, "/implement resume after the shutdown").await?;
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                router_acp::planner_workflow::RunStatus::Running
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// A planner repository whose router-owned wake turns (the `review-work`
+/// role) block until `release` exists, honoring `session/cancel`.
+fn preempt_repository(release: &std::path::Path) -> tempfile::TempDir {
+    let tmp = planner_wire_repository();
+    let skill = tmp.path().join("repo/.agents/skills/review-work/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        format!(
+            "---\nname: review-work\n---\nReconcile the wake.\nWAIT_FILE:{}\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    tmp
+}
+
+const WAKE_MARKER: &str = "[Router-owned child wake]";
+
+fn insert_wake(shared: &router_acp::session::Shared, sid: &str, id: &str) {
+    router_acp::planner_workflow::mutate(shared, sid, |run| {
+        run.wakes.insert(
+            id.into(),
+            router_acp::planner_workflow::Wake {
+                reason: "preemption test wake".into(),
+                work_id: sid.into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn mock_prompts(log: &PathBuf, marker: &str) -> Vec<usize> {
+    read_log(log)
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e["event"] == "prompt" && e["text"].as_str().is_some_and(|t| t.contains(marker))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+async fn open_planner_parent(
+    cx: &ConnectionTo<AgentPeer>,
+    repo: &tempfile::TempDir,
+) -> Result<String, AcpError> {
+    init(cx).await?;
+    let sid = cx
+        .send_request(NewSessionRequest::new(repo.path().join("repo")))
+        .block_task()
+        .await?
+        .session_id
+        .0
+        .to_string();
+    prompt_text(cx, &sid, "/implement prepare the assignment").await?;
+    Ok(sid)
+}
+
+/// Operator input reaches the parent inside a running router-owned wake
+/// turn: steered, never queued behind it.
+#[tokio::test]
+async fn operator_input_is_steered_into_a_running_router_owned_turn() {
+    let state = temp_state_file("preempt-steer");
+    let log = temp_log("preempt-steer");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            insert_wake(&shared, &sid, "work-1:attempt-1");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            let started = std::time::Instant::now();
+            let answer = prompt_text(&cx, &sid, "operator: please look at the build").await?;
+            assert_eq!(answer.stop_reason, StopReason::EndTurn);
+            assert!(
+                !release.exists() && started.elapsed() < Duration::from_secs(10),
+                "answered while the wake turn still runs"
+            );
+            let events = read_log(&log);
+            let steer = events
+                .iter()
+                .find(|e| e["event"] == "steer")
+                .expect("the operator's words were steered into the running turn");
+            assert!(
+                steer["params"]
+                    .to_string()
+                    .contains("please look at the build")
+            );
+            assert!(
+                !events.iter().any(|e| e["event"] == "cancel"),
+                "nothing cancelled"
+            );
+            let run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+            assert!(
+                run.inputs
+                    .values()
+                    .any(|input| input.text.contains("please look at the build")
+                        && input.delivered_to.contains(&sid)),
+                "the steered input has a delivery receipt for the parent"
+            );
+            assert!(
+                run.parent_queue.is_empty(),
+                "not queued behind the router turn"
+            );
+            std::fs::write(&release, "").unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
+/// An adapter that will not take a steer: the router-owned turn is
+/// cancelled, the operator's prompt runs as the very next turn, and the
+/// cancelled (router-owned) wake is redelivered after it.
+#[tokio::test]
+async fn operator_input_cancels_a_router_owned_turn_and_runs_next_when_steering_is_declined() {
+    let state = temp_state_file("preempt-cancel");
+    let log = temp_log("preempt-cancel");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            // A router-owned prefix: one delivery would normally answer it.
+            insert_wake(&shared, &sid, "audit:preempt-test");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            let answer = prompt_text(&cx, &sid, "DECLINED-STEER\nTEXT:operator-turn-ran").await?;
+            assert_eq!(answer.stop_reason, StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert!(
+                text.contains("operator-turn-ran"),
+                "the operator's own turn answered: {text}"
+            );
+
+            let events = read_log(&log);
+            let wake = mock_prompts(&log, WAKE_MARKER)[0];
+            let operator = mock_prompts(&log, "operator-turn-ran")[0];
+            let cancel = events
+                .iter()
+                .position(|e| e["event"] == "cancel")
+                .expect("the router-owned turn was cancelled");
+            assert!(wake < cancel && cancel < operator, "{events:?}");
+            assert!(
+                !mock_prompts(&log, WAKE_MARKER)
+                    .iter()
+                    .any(|i| *i > wake && *i < operator),
+                "no further router-owned turn ran first"
+            );
+            // The cancelled wake goes again after the operator's turn.
+            std::fs::write(&release, "").unwrap();
+            for _ in 0..150 {
+                if mock_prompts(&log, WAKE_MARKER)
+                    .iter()
+                    .any(|i| *i > operator)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                mock_prompts(&log, WAKE_MARKER)
+                    .iter()
+                    .any(|i| *i > operator),
+                "the cancelled wake was redelivered"
+            );
+            assert!(
+                read_log(&log)[mock_prompts(&log, WAKE_MARKER)[1]]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("audit:preempt-test")
+            );
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
+/// Operator input queued behind an operator turn goes before any wake.
+#[tokio::test]
+async fn queued_operator_input_is_delivered_before_the_next_router_owned_turn() {
+    let state = temp_state_file("preempt-queue");
+    let log = temp_log("preempt-queue");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&release, "").unwrap();
+    let hold = std::env::temp_dir().join(format!("hold-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let first = {
+                let cx = cx.clone();
+                let sid = sid.clone();
+                let text = format!("first operator turn\nWAIT_FILE:{}", hold.display());
+                tokio::spawn(async move { prompt_text(&cx, &sid, &text).await })
+            };
+            wait_for_mock_prompt(&log, "first operator turn").await;
+            insert_wake(&shared, &sid, "work-1:attempt-1");
+            // An operator turn holds the parent: this one queues (unchanged).
+            prompt_text(&cx, &sid, "TEXT:second-operator-input").await?;
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .parent_queue
+                    .len(),
+                1
+            );
+            std::fs::write(&hold, "").unwrap();
+            first.await.unwrap()?;
+            for _ in 0..150 {
+                if !mock_prompts(&log, WAKE_MARKER).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let second = mock_prompts(&log, "second-operator-input");
+            let wakes = mock_prompts(&log, WAKE_MARKER);
+            assert!(
+                !second.is_empty() && !wakes.is_empty(),
+                "{:?}",
+                read_log(&log)
+            );
+            assert!(second[0] < wakes[0], "queued operator input went first");
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&hold);
+}

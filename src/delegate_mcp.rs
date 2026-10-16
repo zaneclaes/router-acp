@@ -2066,6 +2066,13 @@ async fn run_delegate_task_inner(
                 }
                 let turn_start = std::time::Instant::now();
                 if let Some(identity) = &args.planner_identity {
+                    crate::planner_guard::track_child(
+                        shared,
+                        router_sid,
+                        &identity.work_id,
+                        opened.process_key.clone(),
+                        opened.downstream_sid.clone(),
+                    );
                     crate::planner_client::turn_state(shared, router_sid, identity, "started")?;
                     crate::planner_workflow::queue_delivery(
                         shared,
@@ -2103,6 +2110,8 @@ async fn run_delegate_task_inner(
                                 sub_sid: &sub_sid,
                                 worker_id: &worker_id,
                                 capture: &capture,
+                                parent_sid: router_sid,
+                                planner: args.planner_identity.as_ref(),
                             },
                             resp,
                             &mut turns,
@@ -2281,6 +2290,9 @@ struct TurnGate<'a> {
     sub_sid: &'a str,
     worker_id: &'a str,
     capture: &'a Arc<Mutex<String>>,
+    parent_sid: &'a str,
+    /// A planner child: never escapes unfinished (see `gate_turns`).
+    planner: Option<&'a crate::planner_workflow::WorkerIdentity>,
 }
 
 /// Ask the host whether a delegate turn may end (`delegate_turn_end`). While
@@ -2288,16 +2300,23 @@ struct TurnGate<'a> {
 /// at most `max_continuations` times — the way a provider's subagent-stop
 /// hook keeps a worker going. Without a lifecycle hook, or once the turn did
 /// not end normally, the response is returned unchanged.
+///
+/// A planner child is different: it is continued with no cap (immediately,
+/// then after 30 s, 2 min and every 5 min), a hook that cannot judge its turn
+/// continues it too, and a shutdown drain's message reaches it at its turn
+/// end. Only a stopped run, a paused work or a drain's cancel ends that.
 async fn gate_turns(
     shared: &Arc<Shared>,
     gate: &TurnGate<'_>,
     mut resp: agent_client_protocol::schema::v1::PromptResponse,
     turns: &mut u32,
 ) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
-    let (Some(hook), Some(event)) = (&shared.cfg.delegation.lifecycle_hook, gate.lifecycle) else {
+    let hook = shared.cfg.delegation.lifecycle_hook.as_ref();
+    let host = hook.zip(gate.lifecycle);
+    if host.is_none() && gate.planner.is_none() {
         return Ok(resp);
-    };
-    let mut continued = 0;
+    }
+    let mut continued = 0u32;
     loop {
         if !matches!(
             resp.stop_reason,
@@ -2305,27 +2324,54 @@ async fn gate_turns(
         ) {
             return Ok(resp);
         }
-        let text = gate.capture.lock().unwrap().clone();
-        let handoff = shared
-            .worker_handoffs
-            .lock()
-            .unwrap()
-            .get(gate.worker_id)
-            .cloned();
-        let message =
-            match crate::delegate_hook::turn_end(hook, &event.turn_ended(*turns, &text, handoff))
-                .await
-            {
-                crate::delegate_hook::TurnVerdict::Release => return Ok(resp),
-                crate::delegate_hook::TurnVerdict::Continue(message) => message,
-            };
-        if continued >= hook.max_continuations {
-            gate.capture.lock().unwrap().push_str(&format!(
-                "\n\n[router-acp · the host still returned this turn after {continued} \
-                 continuations: {message}]"
-            ));
-            return Ok(resp);
-        }
+        let shutdown = gate.planner.and_then(|identity| {
+            crate::planner_shutdown::take_injection(shared, gate.parent_sid, &identity.work_id)
+        });
+        let message = match (shutdown, host) {
+            (Some(message), _) => message,
+            (None, Some((hook, event))) => {
+                let text = gate.capture.lock().unwrap().clone();
+                let handoff = shared
+                    .worker_handoffs
+                    .lock()
+                    .unwrap()
+                    .get(gate.worker_id)
+                    .cloned();
+                let verdict = crate::delegate_hook::turn_end_for(
+                    hook,
+                    &event.turn_ended(*turns, &text, handoff),
+                    gate.planner.is_some(),
+                )
+                .await;
+                match verdict {
+                    crate::delegate_hook::TurnVerdict::Release => return Ok(resp),
+                    crate::delegate_hook::TurnVerdict::Continue(message) => {
+                        if let Some(identity) = gate.planner {
+                            match crate::planner_guard::child_continuation(
+                                shared,
+                                gate.parent_sid,
+                                identity,
+                                continued,
+                            )
+                            .await
+                            {
+                                None => return Ok(resp),
+                                Some(shutdown) => shutdown.unwrap_or(message),
+                            }
+                        } else if continued >= hook.max_continuations {
+                            gate.capture.lock().unwrap().push_str(&format!(
+                                "\n\n[router-acp · the host still returned this turn after \
+                                 {continued} continuations: {message}]"
+                            ));
+                            return Ok(resp);
+                        } else {
+                            message
+                        }
+                    }
+                }
+            }
+            (None, None) => return Ok(resp),
+        };
         continued += 1;
         *turns += 1;
         shared
@@ -2754,6 +2800,13 @@ async fn run_delegate_followup_inner(
     }
     let turn_start = std::time::Instant::now();
     if let Some(identity) = &args.planner_identity {
+        crate::planner_guard::track_child(
+            shared,
+            router_sid,
+            &identity.work_id,
+            process_key.clone(),
+            downstream_sid.clone(),
+        );
         crate::planner_client::turn_state(shared, router_sid, identity, "started")?;
         crate::planner_workflow::queue_delivery(
             shared,
@@ -2789,6 +2842,8 @@ async fn run_delegate_followup_inner(
                     sub_sid: &sub_sid,
                     worker_id: &worker_id,
                     capture: &capture,
+                    parent_sid: router_sid,
+                    planner: args.planner_identity.as_ref(),
                 },
                 resp,
                 &mut turns,

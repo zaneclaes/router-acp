@@ -135,5 +135,185 @@ candidate's `open` and `held` state), `unheld`, active `holds`,
 `unfilled_wakes`, `last_auto_admission` and `resumes`. The census line on
 every wake repeats the host state, the holds and the last auto-admission.
 
-Router-owned `capacity:`, `auto-admit:` and `inflight:` wakes are acknowledged
-once delivered; the router recreates them while their condition holds.
+Router-owned `capacity:`, `auto-admit:`, `inflight:`, `audit:`, `gate:` and
+`adopt-native:` wakes are acknowledged once delivered; the router recreates
+them while their condition holds.
+
+# The native watcher's guarantees
+
+A native implement-all run had a watcher (an audit, a Stop guard, verified
+holds, checked dispositions, a graceful shutdown). Under a planner run the
+router enforces the same guarantees (`src/planner_guard.rs`,
+`src/planner_shutdown.rs`). Each host below launches like `workspace` and
+`capacity`: no shell, cwd is the session repository, one JSON object on stdin.
+A host that fails, times out or answers malformed JSON is never read as a
+clean or valid answer.
+
+## Configuration
+
+```yaml
+routers:
+  planner:
+    audit:
+      command: planner-audit-host       # required when the block is present
+      args: []
+      timeout_ms: 120000                # default 120000 (one audit fetches)
+      interval_secs: 60                 # default 60
+    integrate_check:
+      command: planner-integrate-check  # required when the block is present
+      args: []
+      timeout_ms: 30000                 # default 30000
+    shutdown:
+      command: planner-shutdown-host    # optional: without it nothing is saved
+      args: []
+      timeout_ms: 120000                # default 120000
+      drain_timeout_secs: 900           # default 900
+```
+
+Every block is optional. Without `audit`, the gate below still enforces
+capacity candidates, and holds and completion are not audited.
+
+## Audit
+
+The capacity tick sends, at most every `interval_secs` and again after every
+parent turn end, whatever the free slots:
+
+```json
+{"event":"audit","cwd":"<repo>","session_id":"…","free":0,"max":20,
+ "run_status":"running","completing":false,
+ "works":[{"work_id":"…","plan_id":"…","status":"running","external_id":"…","revision":"…"}],
+ "holds":[{"plan_id":"…","reason":"…","detail":"…","expires_at_ms":0}]}
+```
+
+The host answers `{"defects":[{"code":"STAGING_IDLE","detail":"…"}]}`. Any
+defect, or a host that cannot answer ("audit host UNAVAILABLE"), wakes the
+idle parent with an `audit:` wake listing them, after `wake_after_secs`
+(capacity timing) and again every `wake_after_secs` while they remain, with no
+limit. `planner_workflow status` carries the last answer in its `capacity`
+block (`audit`, `audit_findings`, `audit_configured`), and every wake's census
+names the defect codes. While the audit has defects, full worker slots no
+longer excuse the 20-minute heartbeat.
+
+## Turn-end gate
+
+When the parent's turn ends while the audit (taken after that turn ended) has
+findings, or while a slot is free and the capacity host lists an unheld
+candidate, the router re-prompts the parent with a `gate:` wake listing them:
+at once, then 30 s, 2 min and every 5 min after each further turn end on the
+same condition, with no cap. A clean turn end resets the backoff
+(`capacity.gate` in `status`). This is the native Stop guard; it does not use
+`max_continuations`.
+
+## Wakes never give up
+
+An unacknowledged planner wake is redelivered 30 s after its first delivery,
+2 min after its second and every 5 min after that, with no limit; nothing
+drops it after three deliveries.
+
+## Planner children never escape unfinished
+
+For a planner child (a delegate started for a `work_id`):
+
+- a lifecycle host's `delegate_turn_end` continuation (exit 2) is sent with no
+  cap, immediately and then after 30 s, 2 min and every 5 min, ignoring
+  `delegation.lifecycle_hook.max_continuations`; it stops only when the run
+  stops, the work is paused, the attempt ends or a drain cancels the worker;
+- a lifecycle hook that fails, times out or exits 2 without a message
+  continues the child instead of releasing it;
+- a `delegate_stop` the host refuses with exit 2 means the worker stopped
+  with dirty or unpushed source: the work is set `interrupted` with that
+  reason (its handoff cleared), worker resumption brings it back to commit and
+  push, and the event is accepted instead of redelivered forever. Any other
+  refused event stays queued as before.
+
+## Completion, holds, integration
+
+- `complete` also sends the audit with `"completing":true` and is refused while
+  it reports any defect (including `CONTINUE_NOT_FINISHED`) or cannot answer.
+- `hold` first passes the router's own reason and evidence rules, then sends
+  the audit with `"hold_check":{"plan_id","reason","detail","expires_at_ms"}`.
+  The hold is refused, quoting `reason`, when the answer has
+  `"hold_valid":false`, and refused as retryable when the host cannot answer.
+- `integrate`, and a `disposition` to blocked or watching, send the operation
+  JSON (`{"action":"integrate","key","work_id","receipt":{"revision","evidence"}}`
+  or `{"action":"disposition","key","work_id","status","reason"}`) to
+  `integrate_check` after the router's own checks. Exit 0 accepts; exit 2
+  rejects with its stderr; anything else rejects with a message saying it is
+  retryable. A rejected operation records nothing.
+
+## Native adoption
+
+On a run's first `planner_allocate` (once per run, before that allocation),
+the workspace host gets `{"event":"adopt-native","session_id":"…"}` and
+answers `{"adopted":null}` or
+`{"adopted":{"run","session_id","runtime","cancelled","workers":[…]}}`. A
+non-zero exit is retried (four tries, 2 s apart). The answer, or the failure,
+goes to the parent in an `adopt-native:` wake and to `status`
+(`capacity.native_adoption`). A workspace host must therefore answer this
+event as well as `planner_allocate`.
+
+## Shutdown drain
+
+kory's shutdown command sends the ACP extension request
+`_router/planner_shutdown` with `{"sessionId"}`. The router answers
+`{"accepted":true}` at once (an error when the session has no planner run; a
+second request joins the running drain), then reports each step as the
+notification `_router/shutdown_progress` with
+`{"sessionId","phase","message","saved":[…],"workersTotal","workersStopped","workers":[{"workId","status"}]}`
+(`phase` is `saving`, `saved`, `draining`, `drained` or `failed`; a worker's
+`status` is `running`, `notified`, `stopped` or `cancelled`):
+
+1. The run becomes `draining`: admissions (`admit`, `hold` and `complete` are
+   refused with "run is shutting down"), capacity and audit wakes,
+   auto-admission, worker resumption, in-flight wakes and the turn-end gate
+   all stop. Workers and the parent can still record artifacts, reviews,
+   receipts and dispositions.
+2. `saving`, then the shutdown host gets
+   `{"event":"shutdown","session_id","cwd","run_status","works","holds"}`
+   (`run_status` is the status before the drain) and answers
+   `{"saved":[paths],"summary":"…"}`: `saved` carries the paths, with the
+   summary as its message. A failure is reported as `failed` with the error,
+   and the drain goes on.
+3. The parent, if loaded, is prompted once: "Shutdown requested by the
+   operator: rewrite Docs/CONTINUE.md and your registers now with the exact
+   resume point; admit nothing; end your turn." The router waits for that
+   turn, at most 10 minutes in all.
+4. Every live worker (a turn running, or an open sub-session) is told:
+   "Shutdown requested: commit and push your branch now, record your status
+   notes and exact resume point, then hand off `waiting` with that resume
+   point and stop." A mid-turn worker gets it at its turn end; an idle one as
+   a follow-up turn. Each gets `drain_timeout_secs` to stop and is then
+   cancelled. `draining` reports every change.
+5. The run becomes `paused` (`drained`); the next `implement` command resumes
+   it.
+
+A router that dies mid-drain leaves the run `draining`; the next `implement`
+command (or a person's follow-up) resumes it exactly like `paused`. While a
+drain is live in this router, the `implement` command is refused until the
+drain reports `drained`.
+
+# Operator input preempts router-owned turns
+
+A turn that delivers wakes (child, heartbeat, capacity, audit, in-flight,
+gate) is router-owned (`src/planner_preempt.rs`). Operator input never waits
+behind one:
+
+- A client prompt that arrives while a router-owned turn holds the parent is
+  first steered into it with `_session/steering`
+  (`_meta.steering.idleBehavior: "promptRequired"`). claude-agent-acp and
+  codex-acp support it (they advertise `_meta.steering.supported` in their
+  initialize response); grok does not. An `injected` outcome answers the
+  prompt at once: the parent sees the words at its next step, and the input
+  gets a delivery receipt for the parent to acknowledge.
+- A mode command, or a steer the adapter does not take (an error,
+  `declined`, `promptRequired`, no answer within 15 s), cancels the
+  router-owned turn (`session/cancel` downstream) and runs the prompt as the
+  very next turn, on its own request. The cancelled turn's wakes are not
+  acknowledged, including router-owned ones, and go again right after the
+  operator's turn. If the cancelled turn does not end within 60 s, the prompt
+  is queued as before.
+- A client `_session/steering` the downstream declines during a router-owned
+  turn also cancels that turn, so the client's follow-up prompt runs at once.
+- An operator turn in flight keeps the queue: the next prompt is retained for
+  the next parent turn, and the wake loop always delivers queued operator
+  input before any wake.

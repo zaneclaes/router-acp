@@ -482,6 +482,11 @@ async fn run_prompt(
         return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }
 
+    // A `session/cancel` ends the turn it interrupted, not the session: like
+    // a real adapter, a new prompt starts uncancelled.
+    if let Some(s) = mock.state.lock().unwrap().sessions.get_mut(&session_id) {
+        s.cancelled = false;
+    }
     let mut reply = Vec::new();
     let mut tool_seq = 0u32;
 

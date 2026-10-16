@@ -53,6 +53,16 @@ pub enum RunStatus {
     Paused,
     Cancelled,
     Complete,
+    /// A `_router/planner_shutdown` drain is stopping the run. Nothing is
+    /// admitted or resumed; it ends `paused`. A drain cut short by a router
+    /// exit stays here, and `/implement` resumes it like `paused`.
+    Draining,
+}
+
+/// A run's stored `draining` that no drain in this router owns: the router
+/// that drained it died, so it resumes like `paused`.
+fn stale_drain(shared: &Shared, sid: &str, status: RunStatus) -> bool {
+    status == RunStatus::Draining && !crate::planner_shutdown::draining(shared, sid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +610,13 @@ fn user_command_once(
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
+    if run.status == RunStatus::Draining && crate::planner_shutdown::draining(shared, sid) {
+        return Err(
+            "the planner run is shutting down; once its drain reports `drained`, /implement \
+             resumes it"
+                .into(),
+        );
+    }
     let input_id = record_input(&mut run, original)?;
     let first_admission = run.commands.insert(input_id.clone());
     if !first_admission && !queued {
@@ -607,7 +624,10 @@ fn user_command_once(
             "planner command {input_id} was already admitted; resume the recorded run instead of replaying it"
         ));
     }
-    let resuming = matches!(run.status, RunStatus::Paused | RunStatus::Cancelled);
+    let resuming = matches!(
+        run.status,
+        RunStatus::Paused | RunStatus::Cancelled | RunStatus::Draining
+    );
     run.phase = phase;
     run.coordinator |= shared.with_session(sid, |s| s.coordinator).unwrap_or(false);
     if phase == PlannerPhase::Implementation || run.status == RunStatus::Complete {
@@ -766,8 +786,12 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
         }
         // A person's follow-up continues a finished or paused run in its last
-        // phase: a question or an interrupted turn never ends the run.
-        if human && matches!(run.status, RunStatus::Complete | RunStatus::Paused) {
+        // phase: a question or an interrupted turn never ends the run. A live
+        // drain keeps its run until it is drained.
+        if human
+            && (matches!(run.status, RunStatus::Complete | RunStatus::Paused)
+                || stale_drain(shared, sid, run.status))
+        {
             run.approval_waits.clear();
             run.status = RunStatus::Running;
         }
@@ -779,10 +803,15 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         // Mirrors an explicit command: the run follows the human's phase, and
         // an implementation choice resumes a stopped run with the authentic
         // request work admission needs.
-        if let Some(phase) = directed {
+        if let Some(phase) = directed
+            && !(run.status == RunStatus::Draining && crate::planner_shutdown::draining(shared, sid))
+        {
             run.phase = phase;
             if phase == PlannerPhase::Implementation {
-                if matches!(run.status, RunStatus::Paused | RunStatus::Cancelled) {
+                if matches!(
+                    run.status,
+                    RunStatus::Paused | RunStatus::Cancelled | RunStatus::Draining
+                ) {
                     run.approval_waits.clear();
                 }
                 run.status = RunStatus::Running;
@@ -843,6 +872,27 @@ pub(crate) fn enqueue_parent_input(
                 work_id: sid.into(),
                 ..Default::default()
             });
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Operator input steered into a running parent turn: its receipt is
+/// recorded as delivered to the parent, so the parent acknowledges it like
+/// any other input. A session without a planner run records nothing.
+pub fn record_steered_input(
+    shared: &Arc<Shared>,
+    sid: &str,
+    req: &PromptRequest,
+) -> Result<(), String> {
+    if load(shared, sid)?.is_none() {
+        return Ok(());
+    }
+    mutate(shared, sid, |run| {
+        let input_id = record_input(run, req)?;
+        if let Some(input) = run.inputs.get_mut(&input_id) {
+            input.delivered_to.insert(sid.to_string());
+        }
         Ok(())
     })
     .map(|_| ())
@@ -1089,7 +1139,21 @@ async fn operate_once(
             "implementation children cannot coordinate, accept, integrate, or retire plans".into(),
         );
     }
-    if run.status != RunStatus::Running
+    // A draining run takes no new scope, but its parent and workers still
+    // record what they have (artifacts, reviews, receipts, dispositions).
+    if run.status == RunStatus::Draining
+        && matches!(
+            operation,
+            Operation::Admit { .. } | Operation::Hold { .. } | Operation::Complete { .. }
+        )
+    {
+        return Err(
+            "run is shutting down: admit nothing; record the exact resume point in \
+             Docs/CONTINUE.md and your registers, then end your turn"
+                .into(),
+        );
+    }
+    if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
         && !matches!(
             operation,
             Operation::AcknowledgeInput { .. } | Operation::AcknowledgeWake { .. }
@@ -1290,6 +1354,8 @@ async fn operate_once(
                     ));
                 }
             }
+            crate::planner_guard::integrate_check(shared, sid, &value).await?;
+            let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             work.integration = Some(receipt);
             work.status = WorkStatus::Integrated;
             next_role = Some(PlannerRole::SelectPlan);
@@ -1312,6 +1378,8 @@ async fn operate_once(
             if work.status == WorkStatus::Integrated {
                 return Err("integrated work cannot be silently reclassified".into());
             }
+            crate::planner_guard::integrate_check(shared, sid, &value).await?;
+            let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             work.status = status;
             work.reason = Some(reason);
         }
@@ -1350,6 +1418,17 @@ async fn operate_once(
             detail,
             ..
         } => {
+            // The router's own evidence rules first, then the host's check.
+            let mut probe = run.clone();
+            crate::planner_capacity::record_hold(
+                &mut probe,
+                &plan_id,
+                &reason,
+                &detail,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            crate::planner_guard::verify_hold(shared, sid, &run, &plan_id, &reason, &detail)
+                .await?;
             crate::planner_capacity::record_hold(
                 &mut run,
                 &plan_id,
@@ -1383,6 +1462,9 @@ async fn operate_once(
             // The capacity host decides whether admissible work remains; an
             // unknown answer is never "no work".
             crate::planner_capacity::completion_allowed(shared, sid, &run).await?;
+            // The auditor's completing pass (CONTINUE finished, every lane
+            // and disposition closed) has the last word.
+            crate::planner_guard::completion_audit(shared, sid, &run).await?;
             run.status = RunStatus::Complete;
         }
     }
@@ -1684,6 +1766,9 @@ async fn allocate_workspace(
         .with_session(sid, |s| s.cwd.clone())
         .ok_or("parent session missing")?;
     let workspace = if let Some(allocator) = &policy.workspace {
+        // The run's first allocation first takes over an active native
+        // implement-all run, so its workers and these never collide.
+        crate::planner_guard::adopt_native_once(shared, sid, allocator).await;
         let mut child = tokio::process::Command::new(&allocator.command)
             .args(&allocator.args)
             .current_dir(&cwd)
@@ -1905,7 +1990,10 @@ pub fn begin_followup(
 ) -> Result<String, String> {
     let mut context = String::new();
     mutate(shared, sid, |run| {
-        if run.status != RunStatus::Running || run.phase != PlannerPhase::Implementation {
+        // A drain's shutdown follow-up is the one turn a draining run gives.
+        if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
+            || run.phase != PlannerPhase::Implementation
+        {
             return Err("planner run is suspended".into());
         }
         let work = run

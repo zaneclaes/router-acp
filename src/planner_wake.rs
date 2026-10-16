@@ -26,7 +26,7 @@ impl PromptActivity {
         }
     }
 
-    fn idle(shared: &Arc<Shared>, sid: &str) -> Option<Self> {
+    pub(crate) fn idle(shared: &Arc<Shared>, sid: &str) -> Option<Self> {
         shared
             .with_session(sid, |s| {
                 // A cancel ends the turn it interrupted, not the run: once that
@@ -54,12 +54,21 @@ impl PromptActivity {
 
 impl Drop for PromptActivity {
     fn drop(&mut self) {
-        self.shared.with_session(&self.sid, |s| {
+        let ended = self.shared.with_session(&self.sid, |s| {
             s.prompt_activity = s.prompt_activity.saturating_sub(1);
             if self.wake {
                 s.planner_wake_active = false;
             }
+            s.prompt_activity == 0
         });
+        // The parent's turn is over: the turn-end gate judges it.
+        if ended == Some(true) {
+            crate::planner_guard::parent_turn_ended(
+                &self.shared,
+                &self.sid,
+                chrono::Utc::now().timestamp(),
+            );
+        }
     }
 }
 
@@ -126,32 +135,38 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
-                        .is_some_and(|wake| {
-                            wake.deliveries < 3
-                                && wake.retry_after <= chrono::Utc::now().timestamp()
-                        })
+                        .is_some_and(|wake| wake.retry_after <= chrono::Utc::now().timestamp())
                 });
                 if !run.parent_queue.is_empty() && !queued_input {
                     continue;
                 }
+                // Planner wakes never give up: an undelivered or unanswered
+                // wake is retried on a capped backoff, not dropped.
                 if !run.approval_waits.is_empty()
                     || (!queued_input
                         && (run.status != RunStatus::Running
-                            || !run
-                                .wakes
-                                .values()
-                                .any(|w| !w.acknowledged && w.deliveries < 3)))
+                            || !run.wakes.values().any(|w| !w.acknowledged)))
                 {
                     continue;
                 }
                 let Some(activity) = PromptActivity::idle(&shared, &sid) else {
                     continue;
                 };
+                // Queued operator input always goes first (`deliver`); only a
+                // turn that delivers wakes is router-owned, and operator input
+                // preempts that one (`planner_preempt`).
+                let router_owned = run.parent_queue.is_empty();
+                if router_owned {
+                    crate::planner_preempt::begin_router_turn(&shared, &sid);
+                }
                 let shared = shared.clone();
                 tokio::spawn(async move {
                     let _activity = activity;
                     if let Err(error) = deliver(&shared, &sid).await {
                         tracing::warn!(session = sid, %error, "planner wake remains pending for bounded retry or explicit resume");
+                    }
+                    if router_owned {
+                        crate::planner_preempt::end_router_turn(&shared, &sid);
                     }
                 });
             }
@@ -251,6 +266,7 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
         run,
         chrono::Utc::now().timestamp_millis(),
     ));
+    line.push_str(&crate::planner_guard::census(shared, run));
     line
 }
 
@@ -262,10 +278,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     if run.status != RunStatus::Running
         || !run.approval_waits.is_empty()
         || !run.parent_queue.is_empty()
-        || run
-            .wakes
-            .values()
-            .any(|w| !w.acknowledged && w.deliveries < 3)
+        || run.wakes.values().any(|w| !w.acknowledged)
         // Capacity wakes own an idle parent while the host lists unheld
         // candidates or cannot answer; the heartbeat stays for "no work".
         || crate::planner_capacity::supersedes_heartbeat(shared, run, now * 1000)
@@ -274,7 +287,8 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     }
     let live = live_workers(run);
     let cap = shared.cfg.delegation.max_concurrent;
-    if live >= cap {
+    // Full slots excuse the heartbeat only while the audit is clean.
+    if live >= cap && !crate::planner_guard::audit_open(run) {
         if run.idle_heartbeats != 0 {
             let _ = planner_workflow::mutate(shared, sid, |run| {
                 run.idle_heartbeats = 0;
@@ -309,11 +323,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         idle / 60
     );
     let _ = planner_workflow::mutate(shared, sid, |run| {
-        if run
-            .wakes
-            .values()
-            .any(|w| !w.acknowledged && w.deliveries < 3)
-        {
+        if run.wakes.values().any(|w| !w.acknowledged) {
             return Ok(());
         }
         run.idle_heartbeats += 1;
@@ -331,6 +341,8 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     let run = planner_workflow::load(shared, sid)?.ok_or("planner state missing")?;
     if let Some(input) = run.parent_queue.first() {
+        // Operator input: an operator turn, never preempted as router-owned.
+        crate::planner_preempt::end_router_turn(shared, sid);
         return deliver_queued_input(shared, sid, input.clone()).await;
     }
     let now = chrono::Utc::now().timestamp();
@@ -342,7 +354,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             return Ok(());
         }
         for (id, wake) in &mut run.wakes {
-            if wake.acknowledged || wake.deliveries >= 3 || wake.retry_after > now {
+            if wake.acknowledged || wake.retry_after > now {
                 continue;
             }
             if wake.claim_pid != 0 {
@@ -360,7 +372,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             wake.claim_pid = pid;
             wake.claim_started_at_ms = started;
             wake.deliveries += 1;
-            wake.retry_after = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp();
+            wake.retry_after = now + crate::planner_guard::wake_retry_secs(wake.deliveries);
             ids.push(id.clone());
             if ids.len() == 32 {
                 break;
@@ -413,6 +425,9 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     );
     let result =
         crate::session::run_primary_turn(shared.clone(), sid.to_string(), prompt, None).await;
+    // Cancelled for operator input: this turn answered nothing, so its wakes
+    // stay pending and go again right after the operator's turn.
+    let preempted = crate::planner_preempt::preempted(shared, sid);
     planner_workflow::mutate(shared, sid, |run| {
         for id in &ids {
             if let Some(wake) = run.wakes.get_mut(id)
@@ -420,6 +435,10 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
                 && wake.claim_started_at_ms == started
             {
                 wake.claim_pid = 0;
+                if preempted {
+                    wake.retry_after = 0;
+                    continue;
+                }
                 // Router-owned capacity/in-flight wakes are recreated while
                 // their condition holds; one delivery answers each.
                 if crate::planner_capacity::ROUTER_WAKE_PREFIXES
@@ -464,7 +483,8 @@ async fn deliver_queued_input(
         wake.claim_pid = pid;
         wake.claim_started_at_ms = started;
         wake.deliveries += 1;
-        wake.retry_after = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp();
+        wake.retry_after =
+            chrono::Utc::now().timestamp() + crate::planner_guard::wake_retry_secs(wake.deliveries);
         Ok(())
     })?;
     let result = match crate::session::prepare_queued_parent_prompt(

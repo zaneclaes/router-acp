@@ -242,27 +242,43 @@ pub enum TurnVerdict {
 /// keeps it going; a failing or silent hook releases the turn (and is logged)
 /// so a broken hook can never trap a worker in a loop.
 pub async fn turn_end(hook: &DelegateLifecycleHook, event: &DelegateEvent) -> TurnVerdict {
+    turn_end_for(hook, event, false).await
+}
+
+/// The message a planner child is continued with when the lifecycle host
+/// could not judge its turn.
+pub const UNJUDGED_CONTINUE: &str = "The router's lifecycle host could not judge this turn, so \
+     it is not released: your work is not finished until its branch is committed and pushed, its \
+     required checks pass and its finished receipt is recorded. Continue now.";
+
+/// [`turn_end`], except that a planner child (`planner`) never escapes
+/// unfinished: a hook that fails, times out or exits 2 without a message
+/// continues it instead of releasing the turn.
+pub async fn turn_end_for(
+    hook: &DelegateLifecycleHook,
+    event: &DelegateEvent,
+    planner: bool,
+) -> TurnVerdict {
+    let unjudged = |why: String| {
+        if planner {
+            tracing::warn!(worker = %event.worker_id, why, "delegate turn-end hook failed; continuing the planner child");
+            TurnVerdict::Continue(format!("{UNJUDGED_CONTINUE} ({why})"))
+        } else {
+            tracing::warn!(worker = %event.worker_id, why, "delegate turn-end hook failed; releasing the turn");
+            TurnVerdict::Release
+        }
+    };
     let payload = match serde_json::to_vec(event) {
         Ok(payload) => payload,
-        Err(_) => return TurnVerdict::Release,
+        Err(error) => return unjudged(format!("encode event: {error}")),
     };
     match invoke(hook, &payload).await {
         Ok(output) if output.code == Some(2) && !output.stderr.is_empty() => {
             TurnVerdict::Continue(output.stderr)
         }
         Ok(output) if output.code == Some(0) => TurnVerdict::Release,
-        Ok(output) => {
-            tracing::warn!(
-                worker = %event.worker_id,
-                result = describe(&output),
-                "delegate turn-end hook failed; releasing the turn"
-            );
-            TurnVerdict::Release
-        }
-        Err(err) => {
-            tracing::warn!(worker = %event.worker_id, %err, "delegate turn-end hook failed; releasing the turn");
-            TurnVerdict::Release
-        }
+        Ok(output) => unjudged(describe(&output)),
+        Err(err) => unjudged(err),
     }
 }
 
@@ -295,7 +311,21 @@ fn enqueue(
 }
 
 async fn attempt(shared: &Arc<Shared>, hook: &DelegateLifecycleHook, id: i64, payload: &str) {
-    match run_payload(hook, payload.as_bytes()).await {
+    let result = match invoke(hook, payload.as_bytes()).await {
+        Ok(output) if output.code == Some(0) => Ok(()),
+        // A planner child's stop refused with exit 2 (dirty or unpushed
+        // source) is not redelivered forever: the work is interrupted so it
+        // is resumed to commit and push, and the event is accepted.
+        Ok(output)
+            if output.code == Some(2)
+                && crate::planner_guard::planner_stop_refused(shared, payload, &output.stderr) =>
+        {
+            Ok(())
+        }
+        Ok(output) => Err(describe(&output)),
+        Err(err) => Err(err),
+    };
+    match result {
         Ok(()) => shared.state.lock().unwrap().outbox_done(id),
         Err(err) => {
             tracing::warn!(outbox = id, %err, "lifecycle hook did not accept an event; it stays queued");
@@ -460,6 +490,35 @@ mod tests {
         assert_eq!(
             turn_end(&sh("echo broken >&2; exit 1"), &ended).await,
             TurnVerdict::Release
+        );
+    }
+
+    #[tokio::test]
+    async fn a_planner_child_is_continued_when_its_hook_cannot_judge_the_turn() {
+        let ended = event().turn_ended(1, "done", None);
+        let mut slow = sh("sleep 5");
+        slow.timeout_ms = 100;
+        for (hook, why) in [
+            (sh("echo broken >&2; exit 1"), "broken"),
+            (sh("exit 2"), "exit status: 2"),
+            (slow, "timed out"),
+        ] {
+            match turn_end_for(&hook, &ended, true).await {
+                TurnVerdict::Continue(message) => {
+                    assert!(message.starts_with(UNJUDGED_CONTINUE), "{message}");
+                    assert!(message.contains(why), "{message}");
+                }
+                other => panic!("a planner child escaped on {why}: {other:?}"),
+            }
+        }
+        // The host's own verdicts still stand.
+        assert_eq!(
+            turn_end_for(&sh("exit 0"), &ended, true).await,
+            TurnVerdict::Release
+        );
+        assert_eq!(
+            turn_end_for(&sh("echo 'push it' >&2; exit 2"), &ended, true).await,
+            TurnVerdict::Continue("push it".into())
         );
     }
 }

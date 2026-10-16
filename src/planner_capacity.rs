@@ -24,12 +24,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
 
 use crate::config::{PlannerCapacityConfig, PlannerPhase};
 use crate::planner_workflow::{self, Operation, PlannerRun, RunStatus, Wake, WorkSpec, WorkStatus};
@@ -59,7 +57,14 @@ const PARENT_HANDOFFS: [&str; 7] = [
 ];
 /// Wake id prefixes the router owns. They are informational, are recreated
 /// while their condition holds, and are acknowledged once delivered.
-pub const ROUTER_WAKE_PREFIXES: [&str; 3] = ["capacity:", "auto-admit:", "inflight:"];
+pub const ROUTER_WAKE_PREFIXES: [&str; 6] = [
+    "capacity:",
+    "auto-admit:",
+    "inflight:",
+    "audit:",
+    "gate:",
+    "adopt-native:",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapacityState {
@@ -83,6 +88,17 @@ pub struct CapacityState {
     /// Backoff state of workers being resumed, by work id.
     #[serde(default)]
     pub resumes: BTreeMap<String, Resume>,
+    /// The audit host's last answer (`routers.planner.audit`).
+    #[serde(default)]
+    pub audit: Option<crate::planner_guard::AuditSnapshot>,
+    #[serde(default)]
+    pub last_audit_wake_at: i64,
+    /// The parent turn-end gate's backoff.
+    #[serde(default)]
+    pub gate: crate::planner_guard::GateState,
+    /// The workspace host's `adopt-native` answer, asked once per run.
+    #[serde(default)]
+    pub native_adoption: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +167,7 @@ fn host_configured(shared: &Shared) -> bool {
     shared.cfg.routers.planner.capacity.is_some()
 }
 
-fn slots(shared: &Shared, run: &PlannerRun) -> (usize, usize, usize) {
+pub(crate) fn slots(shared: &Shared, run: &PlannerRun) -> (usize, usize, usize) {
     let max = shared.cfg.delegation.max_concurrent;
     let live = crate::planner_wake::live_workers(run);
     (live, max, max.saturating_sub(live))
@@ -275,20 +291,8 @@ pub async fn query_host(
 ) -> Option<HostSnapshot> {
     let cfg = shared.cfg.routers.planner.capacity.clone()?;
     let (_, max, free) = slots(shared, run);
-    let works = run
-        .works
-        .iter()
-        .map(|(id, w)| {
-            json!({"work_id":id,"plan_id":w.spec.plan_id,"status":w.status,
-                "external_id":w.spec.external_id})
-        })
-        .collect::<Vec<_>>();
-    let holds = run
-        .capacity
-        .holds
-        .values()
-        .filter(|h| h.expires_at_ms > now_ms)
-        .collect::<Vec<_>>();
+    let works = crate::planner_guard::works_json(run);
+    let holds = crate::planner_guard::active_holds(run, now_ms);
     let answer = match shared.with_session(sid, |s| s.cwd.clone()) {
         Some(cwd) => {
             let input = json!({"event":"capacity","cwd":cwd,"free":free,"max":max,
@@ -325,33 +329,17 @@ async fn run_host(
     cwd: &Path,
     input: &Value,
 ) -> Result<Vec<Candidate>, String> {
-    let mut child = tokio::process::Command::new(&cfg.command)
-        .args(&cfg.args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("capacity host `{}` failed to start: {e}", cfg.command))?;
-    let mut stdin = child.stdin.take().ok_or("capacity host stdin missing")?;
-    // A host that never reads stdin must not fail the query.
-    let _ = stdin.write_all(input.to_string().as_bytes()).await;
-    drop(stdin);
-    let output = tokio::time::timeout(
-        std::time::Duration::from_millis(cfg.timeout_ms),
-        child.wait_with_output(),
+    let output = crate::planner_guard::run_host(
+        "capacity host",
+        &cfg.command,
+        &cfg.args,
+        cfg.timeout_ms,
+        cwd,
+        input,
     )
-    .await
-    .map_err(|_| format!("capacity host timed out after {} ms", cfg.timeout_ms))?
-    .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "capacity host exited with {}: {}",
-            output.status,
-            stderr.trim().chars().take(500).collect::<String>()
-        ));
+    .await?;
+    if output.code != Some(0) {
+        return Err(format!("capacity host exited with {}", output.describe()));
     }
     serde_json::from_slice::<HostReply>(&output.stdout)
         .map(|reply| reply.candidates)
@@ -423,13 +411,17 @@ pub fn status_block(shared: &Shared, run: &PlannerRun, now_ms: i64) -> Value {
                 "open":open(run, &c.work.work_id),"held":hold_for(run, c, now_ms).is_some()
             })).collect::<Vec<_>>()})
     });
-    json!({"live":live,"max":max,"free":free,"host_configured":host_configured(shared),
+    let mut block = json!({"live":live,"max":max,"free":free,"host_configured":host_configured(shared),
         "host":host,
         "unheld":unheld_candidates(run, now_ms).iter().map(|c| &c.work.work_id).collect::<Vec<_>>(),
         "holds":run.capacity.holds.values().filter(|h| h.expires_at_ms > now_ms).collect::<Vec<_>>(),
         "unfilled_wakes":run.capacity.unfilled_wakes,
         "last_auto_admission":run.capacity.last_auto_admission,
-        "resumes":run.capacity.resumes})
+        "resumes":run.capacity.resumes});
+    for (key, value) in crate::planner_guard::status_fields(shared, run) {
+        block[key] = value;
+    }
+    block
 }
 
 /// The host part of the census line every wake carries.
@@ -524,9 +516,14 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     }
     let timing = timing(shared);
     resume_workers(shared, sid, &run, now).await;
+    // The audit runs whatever the free slots and the parent's activity.
+    crate::planner_guard::audit_tick(shared, sid, now).await;
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
         return;
     };
+    if run.status != RunStatus::Running {
+        return;
+    }
     let parent_idle = shared
         .with_session(sid, |s| s.prompt_activity == 0 && !s.pinning)
         .unwrap_or(false)
@@ -543,6 +540,16 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if !filled {
         inflight_wake(shared, sid, now, idle, &timing);
     }
+    // The turn-end gate re-prompts at once; the audit wake repeats while
+    // findings stay open.
+    let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
+        return;
+    };
+    crate::planner_guard::gate_tick(shared, sid, &run, now);
+    let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
+        return;
+    };
+    crate::planner_guard::audit_wake(shared, sid, &run, now, last);
 }
 
 /// Returns whether this pass issued a capacity wake or auto-admitted.
@@ -925,10 +932,7 @@ fn inflight_wake(
         let due = !inflight.is_empty()
             && idle >= timing.wake_after_secs as i64
             && now - run.capacity.last_inflight_wake_at >= timing.inflight_wake_secs as i64
-            && !run
-                .wakes
-                .values()
-                .any(|w| !w.acknowledged && w.deliveries < 3);
+            && !run.wakes.values().any(|w| !w.acknowledged);
         due.then_some(inflight)
     };
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
