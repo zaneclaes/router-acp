@@ -242,26 +242,6 @@ fn accounts(shared: &Arc<Shared>, group: &str) -> Vec<AgentConfig> {
     agents
 }
 
-/// The account group an agent drains in: its provider, or the name before
-/// `@` for an agent no provider claims.
-fn account_group_key(agent: &AgentConfig) -> String {
-    provider(agent)
-        .unwrap_or_else(|| agent.name.split('@').next().unwrap())
-        .to_string()
-}
-
-/// True when two agents are account seats of one group, the group whose
-/// order `account_priority` sets.
-pub(crate) fn same_account_group(agents: &[AgentConfig], a: &str, b: &str) -> bool {
-    let key = |name: &str| {
-        agents
-            .iter()
-            .find(|agent| agent.name == name)
-            .map(account_group_key)
-    };
-    key(a).is_some_and(|group| key(b) == Some(group))
-}
-
 /// Account order is an eligibility gate, before any strategy's utility math.
 /// An explicit account pick may override order, while cordons still apply.
 pub fn prioritize(
@@ -269,7 +249,11 @@ pub fn prioritize(
     agents: &[AgentConfig],
     admit: Option<&CandidateId>,
 ) {
-    let group = account_group_key;
+    let group = |agent: &AgentConfig| {
+        provider(agent)
+            .unwrap_or_else(|| agent.name.split('@').next().unwrap())
+            .to_string()
+    };
     // Spend included capacity across accounts before using paid overage.
     let included: Vec<_> = views
         .iter()

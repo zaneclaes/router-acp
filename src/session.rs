@@ -4505,28 +4505,13 @@ async fn pin_session(
     larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
     crate::auth::refresh_before_selection(shared).await;
-    let (
-        cwd,
-        dirs,
-        client_mcp,
-        strategy,
-        override_,
-        override_source,
-        effort_request,
-        run_label,
-        planner_phase,
-    ) = shared
+    let (cwd, dirs, client_mcp, run_label) = shared
         .with_session(router_sid, |s| {
             (
                 s.cwd.clone(),
                 s.additional_directories.clone(),
                 s.mcp_servers.clone(),
-                s.strategy,
-                s.candidate_override.clone(),
-                s.candidate_override_source.clone(),
-                s.effort_request,
                 s.run_label.clone(),
-                s.planner_phase,
             )
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
@@ -4550,12 +4535,85 @@ async fn pin_session(
         _ => classify(&shared.cfg.classifier, &shared.rules, &input).await,
     };
     let required = RequiredCaps::from_prompt(prompt);
+    let excluded: Vec<CandidateId> = exclude.into_iter().cloned().collect();
+    let RoutePlan {
+        mut ranked,
+        strategy_kind,
+        picked,
+        cordon_redirect,
+        cordons,
+    } = plan_route(
+        shared,
+        router_sid,
+        &profile,
+        required,
+        &excluded,
+        larger_context_than,
+    )?;
+
+    note_pinned_versions(shared, router_sid, &mut ranked);
+    pin_ranked(
+        shared,
+        router_sid,
+        ranked,
+        PinRun {
+            cancellation,
+            cwd,
+            dirs,
+            client_mcp,
+            run_label,
+            parent_session_id,
+            session_kind,
+            profile,
+            strategy_kind,
+            picked,
+            cordon_redirect,
+            cordons,
+            is_failover,
+            prompt,
+        },
+    )
+    .await
+}
+
+/// The session's routing decision, before any candidate is opened.
+struct RoutePlan {
+    ranked: Vec<crate::strategies::RankedCandidate>,
+    strategy_kind: StrategyKind,
+    picked: Option<CandidateId>,
+    cordon_redirect: Option<(CandidateId, String, Option<String>)>,
+    cordons: Vec<(String, std::time::Duration, String)>,
+}
+
+/// Rank this session's candidates the way its active router does: the
+/// session's strategy (or `Static` for a live override), account order,
+/// cordons, coordinator pool, exclusions and preferences. `exclude` names
+/// candidates that must not be chosen (a failed or cordoned pin); an
+/// override naming one of them is dropped, so the session's own strategy
+/// decides instead. The first prompt's pin, every failover re-pin and the
+/// usage-cordon escape all choose through here.
+fn plan_route(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    profile: &crate::classifier::TaskProfile,
+    required: RequiredCaps,
+    exclude: &[CandidateId],
+    larger_context_than: Option<u64>,
+) -> Result<RoutePlan, AcpError> {
+    let (strategy, override_, override_source, effort_request, planner_phase) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.strategy,
+                s.candidate_override.clone(),
+                s.candidate_override_source.clone(),
+                s.effort_request,
+                s.planner_phase,
+            )
+        })
+        .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     // A failover must not keep re-selecting the failed candidate even when
     // it was explicitly pinned via router.candidate.
-    let override_ = match (&override_, exclude) {
-        (Some(o), Some(x)) if o == x => None,
-        _ => override_,
-    };
+    let override_ = override_.filter(|o| !exclude.contains(o));
     // A saved or explicit pin cannot keep an exhausted account selected.
     // Drop the override and disclose the redirect, even when paid-usage
     // permission exhausts the seat without installing a usage cordon.
@@ -4638,7 +4696,7 @@ async fn pin_session(
         .with_session(router_sid, |s| s.excluded.clone())
         .unwrap_or_default();
     let mut selection_exclusions = excluded_patterns.clone();
-    selection_exclusions.extend(exclude.map(ToString::to_string));
+    selection_exclusions.extend(exclude.iter().map(ToString::to_string));
     let agents = shared.agent_configs();
     let automatic_group = override_
         .as_ref()
@@ -4849,8 +4907,58 @@ async fn pin_session(
         ranked.insert(0, rc);
     }
 
-    note_pinned_versions(shared, router_sid, &mut ranked);
+    Ok(RoutePlan {
+        ranked,
+        strategy_kind,
+        picked,
+        cordon_redirect,
+        cordons,
+    })
+}
 
+/// What `pin_session` carries from routing into opening the pin.
+struct PinRun<'a> {
+    cancellation: Option<&'a RequestCancellation>,
+    cwd: PathBuf,
+    dirs: Vec<PathBuf>,
+    client_mcp: Vec<McpServer>,
+    run_label: Option<String>,
+    parent_session_id: Option<String>,
+    session_kind: &'static str,
+    profile: crate::classifier::TaskProfile,
+    strategy_kind: StrategyKind,
+    picked: Option<CandidateId>,
+    cordon_redirect: Option<(CandidateId, String, Option<String>)>,
+    cordons: Vec<(String, std::time::Duration, String)>,
+    is_failover: bool,
+    prompt: &'a [ContentBlock],
+}
+
+async fn pin_ranked(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    ranked: Vec<crate::strategies::RankedCandidate>,
+    run: PinRun<'_>,
+) -> Result<PinOutcome, AcpError> {
+    let PinRun {
+        cancellation,
+        cwd,
+        dirs,
+        client_mcp,
+        run_label,
+        parent_session_id,
+        session_kind,
+        profile,
+        strategy_kind,
+        picked,
+        cordon_redirect,
+        cordons,
+        is_failover,
+        prompt,
+    } = run;
+    let excluded_patterns = shared
+        .with_session(router_sid, |s| s.excluded.clone())
+        .unwrap_or_default();
     // 4. Walk the ranked list until a candidate opens and verifies,
     //    remembering why each earlier candidate was skipped.
     let mut skipped: Vec<(CandidateId, String)> = Vec::new();
@@ -7218,23 +7326,17 @@ fn select_route_target(
 
 /// Pick a replacement when the current pin is usage-cordoned.
 ///
-/// This is an escape from a dead seat, not a quality upgrade. A glob of `*`
-/// fed to [`first_eligible_candidate`] crowned the fleet's highest-scoring
-/// model (Fable → Sol) after a pin-rewrite 400 cordoned the incumbent — two
-/// equal-quality models, a full summarize+re-pin, for no capability gain.
-///
-/// The same model on the next account seat of the dead pin's group comes
-/// first: changing accounts keeps the model, so it is neither a lateral swap
-/// nor a downgrade, and account order says that seat drains next. Without it
-/// a capped Claude seat escaped to Codex while a sibling Claude seat sat at
-/// 21% of its week, because the sibling scores as a quality-peer and the
-/// peer rule below discarded it.
-///
-/// Skill-elevated pins stay inside that skill's `candidates` (same contract
-/// as demotion). Otherwise: drop quality-peers of the dead pin (normalized
-/// gap ≤ 0.05) when anything else is eligible, then pick max quality among
-/// what's left. If only peers remain, pick the cheapest so a lateral swap
-/// does not climb cost.
+/// The escape never chooses on its own: it asks the router that routes this
+/// session. A skill-elevated pin stays inside that skill's `candidates`
+/// (same contract as demotion) through [`select_route_target`]. Otherwise the
+/// session's active strategy ranks the pool through [`plan_route`], the path
+/// that chooses a first pin and every failover re-pin, with the dead pin
+/// excluded — so account order, usage cordons, the coordinator pool, planner
+/// `model_boosts` and preferences apply exactly as on a normal turn. A
+/// sibling account seat of the same model wins because that ranking puts it
+/// first. The hand-rolled rule this replaced (drop quality-peers, take the
+/// raw-quality max, else the cheapest) discarded the sibling Claude seat as a
+/// "peer" and escaped a capped seat to Codex while that sibling sat at 21%.
 fn cordon_escape_target(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -7242,11 +7344,9 @@ fn cordon_escape_target(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let (elevation_skill, current_q) = shared
-        .with_session(router_sid, |s| {
-            (s.elevation_skill.clone(), s.pinned_quality)
-        })
-        .unwrap_or((None, 0.0));
+    let elevation_skill = shared
+        .with_session(router_sid, |s| s.elevation_skill.clone())
+        .flatten();
     let route = elevation_skill.as_deref().and_then(|pattern| {
         shared
             .cfg
@@ -7254,53 +7354,38 @@ fn cordon_escape_target(
             .iter()
             .find(|r| r.pattern == pattern)
     });
-    let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
-    pool.retain(|v| v.id != *current && !view_excluded(v, excluded));
-    let agents = shared.agent_configs();
-    let sibling = pool
-        .iter()
-        .filter(|v| {
-            v.id.model == current.model
-                && crate::accounts::same_account_group(&agents, &v.id.agent, &current.agent)
-                && route.is_none_or(|r| r.candidates.iter().any(|p| view_matches(p, v)))
-        })
-        .min_by_key(|v| {
-            let priority = agents
-                .iter()
-                .find(|a| a.name == v.id.agent)
-                .and_then(|a| a.account_priority);
-            (priority.unwrap_or(u32::MAX), v.config_index)
-        });
-    if let Some(sibling) = sibling {
-        return Some(sibling.id.clone());
-    }
+    // The dead pin is never its own escape, under a skill route or not.
+    let mut excluded = excluded.to_vec();
+    excluded.push(current.to_string());
     if let Some(route) = route {
-        return select_route_target(shared, route, class, excluded).filter(|t| t != current);
+        return select_route_target(shared, route, class, &excluded);
     }
-    if pool.is_empty() {
-        return None;
-    }
-    const PEER_MARGIN: f64 = 0.05;
-    let current_u = crate::candidate::quality_utility(current_q);
-    let non_peers: Vec<&CandidateView> = pool
-        .iter()
-        .filter(|v| (crate::candidate::quality_utility(v.quality) - current_u).abs() > PEER_MARGIN)
-        .collect();
-    let pick_max = |xs: &[&CandidateView]| {
-        xs.iter()
-            .max_by(|a, b| {
-                a.quality
-                    .partial_cmp(&b.quality)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|v| v.id.clone())
-    };
-    if !non_peers.is_empty() {
-        pick_max(&non_peers)
-    } else {
-        pool.iter()
-            .min_by_key(|v| v.cost_rank)
-            .map(|v| v.id.clone())
+    let (preclass, complexity, cwd) = shared.with_session(router_sid, |s| {
+        (s.preclass_profile.clone(), s.task_complexity, s.cwd.clone())
+    })?;
+    let profile = preclass.unwrap_or_else(|| crate::classifier::TaskProfile {
+        class,
+        complexity,
+        languages: cwd_language_fingerprint(&shared.rules, &cwd),
+        effort: None,
+    });
+    match plan_route(
+        shared,
+        router_sid,
+        &profile,
+        RequiredCaps::default(),
+        std::slice::from_ref(current),
+        None,
+    ) {
+        Ok(plan) => plan
+            .ranked
+            .into_iter()
+            .map(|r| r.candidate)
+            .find(|c| c != current),
+        Err(error) => {
+            tracing::info!(session = router_sid, %current, %error, "no routable escape off usage-cordoned pin");
+            None
+        }
     }
 }
 

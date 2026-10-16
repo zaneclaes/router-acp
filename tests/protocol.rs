@@ -6651,21 +6651,22 @@ async fn usage_cordoned_pin_switches_proactively() {
     .await;
 }
 
-/// Live bug: a Fable pin-rewrite 400 cordoned the incumbent, then the
-/// proactive escape used `*` + max-quality and landed on Sol — two
-/// equal-quality models. Escaping a dead seat must skip quality-peers when
-/// a real alternative exists.
+/// The escape asks the session's active router; it never picks on its own.
+/// Here `auto` ranks b/m2 (higher quality, cheaper) first once a/m1 is out.
+/// The rule the escape used to apply by itself (drop quality-peers of the
+/// dead pin, take the raw-quality max of the rest) would have chosen c/m3.
+/// The escape must land exactly where a fresh session of the same router
+/// lands with a/m1 excluded.
 #[tokio::test]
-async fn usage_cordon_escape_skips_equal_quality_peer() {
+async fn usage_cordon_escape_follows_the_active_strategy() {
     let state = temp_state_file("proactive-cordon-peer");
     let log = temp_log("proactive-cordon-peer");
     let scores = std::env::temp_dir().join(format!(
         "router-acp-scores-{}.yaml",
         uuid::Uuid::new_v4().simple()
     ));
-    // a/m1 (incumbent) and b/m2 (peer, +0.02 raw ≈ 0.007 normalized) sit in
-    // the same quality band. c/m3 is a real step down. Cordon m1 → must
-    // land on m3, not the quality-max peer m2.
+    // a/m1 (incumbent) and b/m2 (+0.02 raw) sit in the same quality band;
+    // c/m3 is a real step down.
     std::fs::write(
         &scores,
         "version: 1\ncandidates:\n\
@@ -6716,23 +6717,32 @@ async fn usage_cordon_escape_skips_equal_quality_peer() {
         let resp = prompt_text(&cx, &sid, "continue the work").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
-        assert!(
-            !text.contains("echo:m2:") && !text.contains("switched a/m1 → b/m2"),
-            "must not swap onto an equal-quality peer: {text}"
+
+        // What the router itself chooses with the dead pin excluded.
+        let fresh = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &fresh, "[router: exclude=a/m1]\ncontinue the work").await?;
+        let routed = pinned(&shared, &fresh);
+        assert_eq!(routed, CandidateId::new("b", "m2"));
+        assert_eq!(
+            pinned(&shared, &sid),
+            routed,
+            "the escape lands where the active router lands: {text}"
         );
         assert!(
-            text.contains("echo:m3:") || text.contains("switched a/m1 → c/m3"),
-            "escape must land on the non-peer alternative: {text}"
+            !text.contains("echo:m3:"),
+            "the old raw-quality non-peer rule (c/m3) is gone: {text}"
         );
         Ok(())
     })
     .await;
 }
 
-/// Two Claude Opus seats in one account group (the drained one first, the
-/// other second), a Codex seat whose model scores higher than Opus, and a
-/// weaker Grok seat — the shape of the operator's fleet on 2026-10-16.
-fn two_claude_seats_yaml(tag: &str, log: &std::path::Path) -> String {
+/// The operator's fleet and router on 2026-10-16: `router: planner` with the
+/// live `model_boosts` (`*opus*` +3, `*gpt-6.1-sol` +2) and implementation
+/// pool, two Claude Opus seats in one account group (the drained one first),
+/// a Codex Sol seat whose raw quality is above Opus, and a Grok seat whose
+/// raw quality the test sets.
+fn two_claude_seats_yaml(tag: &str, log: &std::path::Path, grok_quality: f64) -> String {
     let state = temp_state_file(tag);
     let scores = std::env::temp_dir().join(format!(
         "router-acp-scores-{}.yaml",
@@ -6740,10 +6750,12 @@ fn two_claude_seats_yaml(tag: &str, log: &std::path::Path) -> String {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"claude@*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"codex@*\", default_quality: 3.30 }\n\
-         \x20 - { pattern: \"grok@*\", default_quality: 2.00 }\n",
+        format!(
+            "version: 1\ncandidates:\n\
+             \x20 - {{ pattern: \"claude@*\", default_quality: 2.90 }}\n\
+             \x20 - {{ pattern: \"codex@*\", default_quality: 3.30 }}\n\
+             \x20 - {{ pattern: \"grok@*\", default_quality: {grok_quality} }}\n"
+        ),
     )
     .unwrap();
     let log = log.display().to_string();
@@ -6756,12 +6768,54 @@ fn two_claude_seats_yaml(tag: &str, log: &std::path::Path) -> String {
     fresh.push_str("    preference: 0.1\n    account_priority: 1\n");
     format!(
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
-         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{drained}{}{fresh}{}",
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         router: planner\nrouters:\n  planner:\n    \
+         implementation_candidates: [\"*gpt-6.1-sol\", \"*opus*\", \"*grok*\"]\n    \
+         model_boosts:\n      \
+         - {{ pattern: \"*opus*\", planning: 3.0, implementation: 3.0 }}\n      \
+         - {{ pattern: \"*gpt-6.1-sol\", planning: 2.0, implementation: 2.0 }}\n\
+         agents:\n{drained}{}{fresh}{}",
         state.display(),
         scores.display(),
-        agent_yaml("codex@seat", &[("sol", 3)], &env),
-        agent_yaml("grok@seat", &[("grok", 1)], &env),
+        agent_yaml("codex@seat", &[("gpt-6.1-sol", 3)], &env),
+        agent_yaml("grok@seat", &[("grok-4.7", 1)], &env),
     )
+}
+
+/// Every Claude seat past its reserve, as the poller cordons them.
+fn cordon_both_claude_seats(shared: &router_acp::session::Shared) {
+    let cordon = router_acp::headroom::UsageCordon {
+        reason: "Weekly usage limit reached (10% capacity reserved)".to_string(),
+        resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+        soft: true,
+    };
+    shared
+        .headroom
+        .lock()
+        .unwrap()
+        .set_usage_cordons(std::collections::HashMap::from([
+            (CandidateId::new("claude@drained", "opus"), cordon.clone()),
+            (CandidateId::new("claude@fresh", "opus"), cordon),
+        ]));
+}
+
+/// Pin the session to the drained seat in the implementation phase, as the
+/// operator's planner parent was.
+async fn pin_drained_seat(
+    cx: &ConnectionTo<AgentPeer>,
+    shared: &router_acp::session::Shared,
+) -> Result<String, AcpError> {
+    let sid = new_session(cx).await?.session_id.0.to_string();
+    prompt_text(cx, &sid, "[router: candidate=claude@drained/opus]\nwarm up").await?;
+    shared.with_session(&sid, |s| {
+        s.planner_phase = Some(router_acp::config::PlannerPhase::Implementation)
+    });
+    assert_eq!(
+        pinned(shared, &sid),
+        CandidateId::new("claude@drained", "opus")
+    );
+    Ok(sid)
 }
 
 /// The drained seat is past its weekly reserve: a soft cordon, exactly what
@@ -6793,23 +6847,16 @@ fn pinned(shared: &router_acp::session::Shared, sid: &str) -> CandidateId {
         .unwrap()
 }
 
+/// One Claude seat capped: the planner router ranks the sibling Claude seat
+/// first (same Opus, same +3 boost, the next account in order), so the
+/// escape lands there and never on Codex while a Claude seat has headroom.
 #[tokio::test]
 async fn usage_cordon_escape_moves_to_the_sibling_account_seat_before_another_provider() {
     let log = temp_log("cordon-sibling-seat");
-    let yaml = two_claude_seats_yaml("cordon-sibling-seat", &log);
+    let yaml = two_claude_seats_yaml("cordon-sibling-seat", &log, 2.0);
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(
-            &cx,
-            &sid,
-            "[router: candidate=claude@drained/opus]\nwarm up",
-        )
-        .await?;
-        assert_eq!(
-            pinned(&shared, &sid),
-            CandidateId::new("claude@drained", "opus")
-        );
+        let sid = pin_drained_seat(&cx, &shared).await?;
 
         cordon_drained_seat(&shared);
         prompt_text(&cx, &sid, "continue the work").await?;
@@ -6824,26 +6871,100 @@ async fn usage_cordon_escape_moves_to_the_sibling_account_seat_before_another_pr
             !text.contains("codex@seat"),
             "Codex was never a target: {text}"
         );
+        Ok(())
+    })
+    .await;
+}
 
-        // Control: once every Claude seat is cordoned, the escape leaves the
-        // group by the ordinary rule.
-        let cordon = shared
-            .headroom
-            .lock()
-            .unwrap()
-            .usage_cordon(&CandidateId::new("claude@drained", "opus"))
-            .cloned()
-            .unwrap();
+/// Both Claude seats capped and Grok's raw quality above Sol's: the planner
+/// router's +2 Sol boost decides, so the escape lands on Sol. The rule the
+/// escape used to apply by itself (raw-quality max) would have taken Grok.
+#[tokio::test]
+async fn usage_cordon_escape_with_every_claude_seat_capped_follows_the_planner_boost() {
+    let log = temp_log("cordon-planner-boost");
+    let yaml = two_claude_seats_yaml("cordon-planner-boost", &log, 3.6);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = pin_drained_seat(&cx, &shared).await?;
+
+        cordon_both_claude_seats(&shared);
+        prompt_text(&cx, &sid, "continue the work").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("codex@seat", "gpt-6.1-sol"),
+            "the planner boost, not raw quality, picks the escape: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+/// A skill-elevated pin escapes inside its skill's candidates, in the
+/// route's own order: `first-match` names m1 before m2, although `auto`
+/// would rank m2 (higher quality, cheaper) first.
+#[tokio::test]
+async fn usage_cordon_escape_of_a_skill_pin_follows_the_route_order() {
+    let state = temp_state_file("cordon-skill-order");
+    let log = temp_log("cordon-skill-order");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"a/*\", default_quality: 2.90 }\n\
+         \x20 - { pattern: \"b/*\", default_quality: 2.00 }\n\
+         \x20 - { pattern: \"c/*\", default_quality: 3.30 }\n",
+    )
+    .unwrap();
+    let env = [("MOCK_LOG", log.to_str().unwrap())];
+    let yaml = format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         skill_routing:\n  - pattern: review-branch\n    selection: first-match\n\
+         \x20   candidates: [\"*m3*\", \"*m1*\", \"*m2*\"]\nagents:\n{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("a", &[("m3", 3)], &env),
+        agent_yaml("b", &[("m1", 2)], &env),
+        agent_yaml("c", &[("m2", 1)], &env),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m3]\nwarm up").await?;
+        prompt_text(&cx, &sid, "Run /review-branch").await?;
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.elevation_skill.clone())
+                .flatten()
+                .as_deref(),
+            Some("review-branch")
+        );
+        assert_eq!(pinned(&shared, &sid), CandidateId::new("a", "m3"));
+
         shared
             .headroom
             .lock()
             .unwrap()
-            .set_usage_cordons(std::collections::HashMap::from([
-                (CandidateId::new("claude@drained", "opus"), cordon.clone()),
-                (CandidateId::new("claude@fresh", "opus"), cordon),
-            ]));
-        prompt_text(&cx, &sid, "continue again").await?;
-        assert_eq!(pinned(&shared, &sid), CandidateId::new("codex@seat", "sol"));
+            .set_usage_cordons(std::collections::HashMap::from([(
+                CandidateId::new("a", "m3"),
+                router_acp::headroom::UsageCordon {
+                    reason: "Weekly usage limit reached".to_string(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+                    soft: false,
+                },
+            )]));
+        prompt_text(&cx, &sid, "continue the work").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("b", "m1"),
+            "the skill route's order picks the escape: {text}"
+        );
         Ok(())
     })
     .await;
@@ -6855,20 +6976,10 @@ async fn usage_cordon_escape_moves_to_the_sibling_account_seat_before_another_pr
 #[tokio::test]
 async fn usage_cordon_escape_runs_on_router_owned_wake_turns() {
     let log = temp_log("cordon-wake-turn");
-    let yaml = two_claude_seats_yaml("cordon-wake-turn", &log);
+    let yaml = two_claude_seats_yaml("cordon-wake-turn", &log, 2.0);
     run_test_shared(yaml, async |cx, _observed, shared| {
         init(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(
-            &cx,
-            &sid,
-            "[router: candidate=claude@drained/opus]\nwarm up",
-        )
-        .await?;
-        assert_eq!(
-            pinned(&shared, &sid),
-            CandidateId::new("claude@drained", "opus")
-        );
+        let sid = pin_drained_seat(&cx, &shared).await?;
 
         cordon_drained_seat(&shared);
         router_acp::planner_workflow::ensure(&shared, &sid).unwrap();
