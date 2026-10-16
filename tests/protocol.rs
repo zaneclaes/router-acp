@@ -6729,6 +6729,185 @@ async fn usage_cordon_escape_skips_equal_quality_peer() {
     .await;
 }
 
+/// Two Claude Opus seats in one account group (the drained one first, the
+/// other second), a Codex seat whose model scores higher than Opus, and a
+/// weaker Grok seat — the shape of the operator's fleet on 2026-10-16.
+fn two_claude_seats_yaml(tag: &str, log: &std::path::Path) -> String {
+    let state = temp_state_file(tag);
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"claude@*\", default_quality: 2.90 }\n\
+         \x20 - { pattern: \"codex@*\", default_quality: 3.30 }\n\
+         \x20 - { pattern: \"grok@*\", default_quality: 2.00 }\n",
+    )
+    .unwrap();
+    let log = log.display().to_string();
+    let env = [("MOCK_LOG", log.as_str())];
+    // Reserves (10% on the drained seat, 20% on the fresh one) need a live
+    // usage source; the test installs the cordon the poller would derive.
+    let mut drained = agent_yaml("claude@drained", &[("opus", 3)], &env);
+    drained.push_str("    preference: 0.1\n    account_priority: 0\n");
+    let mut fresh = agent_yaml("claude@fresh", &[("opus", 3)], &env);
+    fresh.push_str("    preference: 0.1\n    account_priority: 1\n");
+    format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{drained}{}{fresh}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("codex@seat", &[("sol", 3)], &env),
+        agent_yaml("grok@seat", &[("grok", 1)], &env),
+    )
+}
+
+/// The drained seat is past its weekly reserve: a soft cordon, exactly what
+/// the poller installs for "Weekly usage limit reached (10% capacity
+/// reserved)". The fresh seat is at 21% of its week.
+fn cordon_drained_seat(shared: &router_acp::session::Shared) {
+    let mut headroom = shared.headroom.lock().unwrap();
+    headroom.set_usage_cordons(std::collections::HashMap::from([(
+        CandidateId::new("claude@drained", "opus"),
+        router_acp::headroom::UsageCordon {
+            reason: "Weekly usage limit reached (10% capacity reserved)".to_string(),
+            resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+            resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+            soft: true,
+        },
+    )]));
+    headroom.set_polled_availability(
+        [(
+            CandidateId::new("claude@fresh", "opus"),
+            plan_availability(0.79, false),
+        )]
+        .into(),
+    );
+}
+
+fn pinned(shared: &router_acp::session::Shared, sid: &str) -> CandidateId {
+    shared
+        .with_session(sid, |s| s.pin.as_ref().unwrap().candidate.clone())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn usage_cordon_escape_moves_to_the_sibling_account_seat_before_another_provider() {
+    let log = temp_log("cordon-sibling-seat");
+    let yaml = two_claude_seats_yaml("cordon-sibling-seat", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@drained/opus]\nwarm up",
+        )
+        .await?;
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("claude@drained", "opus")
+        );
+
+        cordon_drained_seat(&shared);
+        prompt_text(&cx, &sid, "continue the work").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("claude@fresh", "opus"),
+            "a capped seat escapes to the same model on the next account, \
+             never to Codex while a Claude seat has headroom: {text}"
+        );
+        assert!(
+            !text.contains("codex@seat"),
+            "Codex was never a target: {text}"
+        );
+
+        // Control: once every Claude seat is cordoned, the escape leaves the
+        // group by the ordinary rule.
+        let cordon = shared
+            .headroom
+            .lock()
+            .unwrap()
+            .usage_cordon(&CandidateId::new("claude@drained", "opus"))
+            .cloned()
+            .unwrap();
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([
+                (CandidateId::new("claude@drained", "opus"), cordon.clone()),
+                (CandidateId::new("claude@fresh", "opus"), cordon),
+            ]));
+        prompt_text(&cx, &sid, "continue again").await?;
+        assert_eq!(pinned(&shared, &sid), CandidateId::new("codex@seat", "sol"));
+        Ok(())
+    })
+    .await;
+}
+
+/// A planner parent is driven by router-owned wake turns, and its human
+/// prompts queue behind them; neither enters `dispatch_prompt`. The cordon
+/// escape must run on those turns too, or a capped seat is never left.
+#[tokio::test]
+async fn usage_cordon_escape_runs_on_router_owned_wake_turns() {
+    let log = temp_log("cordon-wake-turn");
+    let yaml = two_claude_seats_yaml("cordon-wake-turn", &log);
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: candidate=claude@drained/opus]\nwarm up",
+        )
+        .await?;
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("claude@drained", "opus")
+        );
+
+        cordon_drained_seat(&shared);
+        router_acp::planner_workflow::ensure(&shared, &sid).unwrap();
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.wakes.insert(
+                "work-1:attempt-1".into(),
+                router_acp::planner_workflow::Wake {
+                    reason: "child state: Finished".into(),
+                    work_id: "work-1".into(),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let events = wait_for_mock_prompt(&log, "[Router-owned child wake]").await;
+        let wake = events
+            .iter()
+            .find(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[Router-owned child wake]"))
+            })
+            .unwrap();
+        assert_eq!(
+            wake["agent"], "claude@fresh",
+            "the wake turn ran on the sibling seat, not the capped one: {wake}"
+        );
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("claude@fresh", "opus")
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn delegate_children_inherit_run_label_and_parent() {
     // A labelled session that delegates gets a linked sub-session row that

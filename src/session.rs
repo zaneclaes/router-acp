@@ -5885,6 +5885,70 @@ async fn stop_managed_background(
     }
 }
 
+/// Proactive re-route: if the pin became usage-cordoned mid-session (cap or
+/// reserve reached after the pin was chosen) and nothing else has queued a
+/// switch, queue a move to the best still-eligible candidate before this
+/// turn runs. Without this, a long session stuck on opus at 100% keeps
+/// burning failed turns until reactive rate-limit failover kicks in, and a
+/// soft (reserve) cordon, which the provider still serves, is never left.
+///
+/// Every primary turn passes here, client prompts and router-owned turns
+/// (planner wakes, queued parent input) alike. It used to run only for a
+/// client prompt dispatched to an idle parent, so a planner parent driven by
+/// wakes, whose human prompts queue behind those wakes, kept spending a
+/// cordoned seat for nine hours.
+fn queue_usage_cordon_escape(shared: &Arc<Shared>, router_sid: &str) {
+    let (class, excluded, current, has_pending) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+                s.pending_switch.is_some() || s.escalation_requested.is_some(),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None, true));
+    let Some(cur) = current.filter(|_| !has_pending) else {
+        return;
+    };
+    let Some(c) = shared.headroom.lock().unwrap().usage_cordon(&cur).cloned() else {
+        return;
+    };
+    // Escaping a dead seat is not a quality upgrade: the same model on the
+    // next account seat comes first, then the non-peer rule. Skill-elevated
+    // pins stay inside that skill's `candidates`.
+    let Some(target) = cordon_escape_target(shared, router_sid, &cur, class, &excluded) else {
+        return;
+    };
+    let reason = format!(
+        "usage cordon: {} (resets {}) — switching off {}",
+        c.reason, c.resets_at_rfc3339, cur
+    );
+    shared.with_session(router_sid, |s| {
+        s.pending_switch = Some(SwitchRequest {
+            target: target.clone(),
+            reason: reason.clone(),
+            handoff: HandoffStyle::Full,
+            user_pick: false,
+        });
+        s.pending_switch_notice = Some(if c.soft {
+            crate::notice::Reason::Reserve
+        } else {
+            crate::notice::Reason::AccountLimit
+        });
+        // Not an elevation: this is escaping a dead seat, not climbing the
+        // capability ladder.
+        s.quiet_turns = 0;
+    });
+    tracing::info!(
+        session = router_sid,
+        from = %cur,
+        %target,
+        cordon = %c.reason,
+        "proactive switch off usage-cordoned pin"
+    );
+}
+
 async fn send_prompt_with_failover(
     shared: Arc<Shared>,
     router_sid: String,
@@ -5916,6 +5980,8 @@ pub(crate) async fn run_primary_turn(
             apply_skill_route(&shared, &router_sid, route);
         }
     }
+
+    queue_usage_cordon_escape(&shared, &router_sid);
 
     // A requested/auto-detected model switch fires here, before this turn is
     // forwarded, so the prompt lands on the new model. The current model first
@@ -7157,6 +7223,13 @@ fn select_route_target(
 /// model (Fable → Sol) after a pin-rewrite 400 cordoned the incumbent — two
 /// equal-quality models, a full summarize+re-pin, for no capability gain.
 ///
+/// The same model on the next account seat of the dead pin's group comes
+/// first: changing accounts keeps the model, so it is neither a lateral swap
+/// nor a downgrade, and account order says that seat drains next. Without it
+/// a capped Claude seat escaped to Codex while a sibling Claude seat sat at
+/// 21% of its week, because the sibling scores as a quality-peer and the
+/// peer rule below discarded it.
+///
 /// Skill-elevated pins stay inside that skill's `candidates` (same contract
 /// as demotion). Otherwise: drop quality-peers of the dead pin (normalized
 /// gap ≤ 0.05) when anything else is eligible, then pick max quality among
@@ -7174,17 +7247,36 @@ fn cordon_escape_target(
             (s.elevation_skill.clone(), s.pinned_quality)
         })
         .unwrap_or((None, 0.0));
-    if let Some(pattern) = elevation_skill.as_deref()
-        && let Some(route) = shared
+    let route = elevation_skill.as_deref().and_then(|pattern| {
+        shared
             .cfg
             .skill_routing
             .iter()
             .find(|r| r.pattern == pattern)
-    {
-        return select_route_target(shared, route, class, excluded).filter(|t| t != current);
-    }
+    });
     let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
     pool.retain(|v| v.id != *current && !view_excluded(v, excluded));
+    let agents = shared.agent_configs();
+    let sibling = pool
+        .iter()
+        .filter(|v| {
+            v.id.model == current.model
+                && crate::accounts::same_account_group(&agents, &v.id.agent, &current.agent)
+                && route.is_none_or(|r| r.candidates.iter().any(|p| view_matches(p, v)))
+        })
+        .min_by_key(|v| {
+            let priority = agents
+                .iter()
+                .find(|a| a.name == v.id.agent)
+                .and_then(|a| a.account_priority);
+            (priority.unwrap_or(u32::MAX), v.config_index)
+        });
+    if let Some(sibling) = sibling {
+        return Some(sibling.id.clone());
+    }
+    if let Some(route) = route {
+        return select_route_target(shared, route, class, excluded).filter(|t| t != current);
+    }
     if pool.is_empty() {
         return None;
     }
@@ -10152,63 +10244,8 @@ async fn dispatch_prompt(
         apply_skill_route(&shared, &router_sid, route);
     }
 
-    // Proactive re-route: if the pin became usage-cordoned mid-session (cap
-    // hit after the pin was chosen) and nothing else has queued a switch,
-    // move to the best still-eligible candidate before this turn runs. Without
-    // this, a long session stuck on opus at 100% keeps burning failed turns
-    // until reactive rate-limit failover kicks in.
-    {
-        let (class, excluded, current, has_pending) = shared
-            .with_session(&router_sid, |s| {
-                (
-                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                    s.excluded.clone(),
-                    s.pin.as_ref().map(|p| p.candidate.clone()),
-                    s.pending_switch.is_some() || s.escalation_requested.is_some(),
-                )
-            })
-            .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None, true));
-        if !has_pending && let Some(cur) = current.as_ref() {
-            let cordon = shared.headroom.lock().unwrap().usage_cordon(cur).cloned();
-            if let Some(c) = cordon {
-                // Escaping a dead seat is not a quality upgrade. The previous
-                // `*` + max-quality pick crowned the fleet champion (Fable →
-                // Sol) after a pin-rewrite 400 cordoned the incumbent — a
-                // lateral swap of two equal-quality models. Skill-elevated
-                // pins stay inside that skill's `candidates`.
-                let target = cordon_escape_target(&shared, &router_sid, cur, class, &excluded);
-                if let Some(target) = target {
-                    let reason = format!(
-                        "usage cordon: {} (resets {}) — switching off {}",
-                        c.reason, c.resets_at_rfc3339, cur
-                    );
-                    shared.with_session(&router_sid, |s| {
-                        s.pending_switch = Some(SwitchRequest {
-                            target: target.clone(),
-                            reason: reason.clone(),
-                            handoff: HandoffStyle::Full,
-                            user_pick: false,
-                        });
-                        s.pending_switch_notice = Some(if c.soft {
-                            crate::notice::Reason::Reserve
-                        } else {
-                            crate::notice::Reason::AccountLimit
-                        });
-                        // Not an elevation: this is escaping a dead seat, not
-                        // climbing the capability ladder.
-                        s.quiet_turns = 0;
-                    });
-                    tracing::info!(
-                        session = router_sid,
-                        from = %cur,
-                        %target,
-                        cordon = %c.reason,
-                        "proactive switch off usage-cordoned pin"
-                    );
-                }
-            }
-        }
-    }
+    // The proactive switch off a usage-cordoned pin runs in
+    // `run_primary_turn`, which router-owned turns enter too.
 
     enum Action {
         Relay,
