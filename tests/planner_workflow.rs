@@ -2377,6 +2377,19 @@ async fn only_three_hold_reasons_keep_a_candidate_out_and_holds_expire() {
     hold("h3", "plan-a", "disk-floor", "free 1073741824 bytes")
         .await
         .unwrap();
+    // A known production failure under repair is declared with the production SHA and its evidence.
+    let error = hold("hp0", "production", "production-failure", "it broke")
+        .await
+        .unwrap_err();
+    assert!(error.contains("production SHA"), "{error}");
+    hold(
+        "hp1",
+        "production",
+        "production-failure",
+        "production 05290d4f897f FULL FAIL in Docs/Plans/data/implementation/round-i.md",
+    )
+    .await
+    .unwrap();
 
     let last = parent_turn_ended(shared);
     tick(shared, last + 61).await;

@@ -9,7 +9,9 @@
 //!    worker brief. A failed, slow or malformed answer is "unknown", never
 //!    "no work".
 //! 2. A candidate may stay unadmitted only behind a 30-minute `hold` with one
-//!    of exactly three reasons ([`HOLD_REASONS`]).
+//!    of exactly three reasons ([`HOLD_REASONS`]). A fourth, `production-failure`,
+//!    holds no candidate: it declares a known production failure under repair,
+//!    which the audit host verifies against preserved evidence.
 //! 3. An idle parent below `delegation.max_concurrent` with an unheld
 //!    candidate gets a capacity wake every `wake_after_secs`, with no give-up.
 //! 4. After `auto_admit_after_wakes` such wakes, or `auto_admit_after_secs`
@@ -34,7 +36,12 @@ use crate::planner_workflow::{self, Operation, PlannerRun, RunStatus, Wake, Work
 use crate::session::Shared;
 
 /// The only reasons a capacity-host candidate may stay out of a free slot.
-pub const HOLD_REASONS: [&str; 3] = ["source-conflict", "dependency", "disk-floor"];
+pub const HOLD_REASONS: [&str; 4] = [
+    "source-conflict",
+    "dependency",
+    "disk-floor",
+    "production-failure",
+];
 /// How long a hold keeps its candidate unadmitted.
 pub const HOLD_MS: i64 = 30 * 60 * 1000;
 /// Delay before each successive resumption of a worker that stopped early;
@@ -255,6 +262,20 @@ pub fn record_hold(
             if !detail.chars().any(|c| c.is_ascii_digit()) {
                 return Err(
                     "a disk-floor hold must carry, in detail, the measured free bytes".into(),
+                );
+            }
+        }
+        // A known production failure under repair: the audit host's hold_check verifies the
+        // production SHA and the preserved FULL FAIL / ROUND FAILED evidence it names.
+        "production-failure" => {
+            if !detail
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .any(|w| w.len() >= 7)
+            {
+                return Err(
+                    "a production-failure hold must name, in detail, the production SHA and the \
+                     preserved evidence file of the observed failure"
+                        .into(),
                 );
             }
         }
