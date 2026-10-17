@@ -1959,6 +1959,55 @@ async fn idle_parent_below_its_worker_limit_gets_capacity_heartbeats() {
     assert!(reasons[0].starts_with("heartbeat: 1 of 3 worker slots are in use"));
 }
 
+/// A planner child keeps one worker id across attempts. Closing an older
+/// attempt's delegate revokes that delegate's `router-worker` token only: the
+/// token a newer attempt (finish-work) was just given must survive, or its MCP
+/// helper connects with an unknown token and the worker can never hand off.
+#[tokio::test]
+async fn closing_an_older_attempt_keeps_the_newer_attempts_worker_token() {
+    use router_acp::delegate_mcp::{DelegateBinding, WorkerBinding};
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    let binding = || DelegateBinding {
+        router_sid: SID.into(),
+        delegation_enabled: false,
+        worker: Some(WorkerBinding {
+            worker_id: "child-1".into(),
+            candidate: "test/model".into(),
+            parent_downstream_sid: "down-parent".into(),
+            planner: None,
+        }),
+    };
+    {
+        let mut tokens = shared.delegate_tokens.lock().unwrap();
+        tokens.insert("old-token".into(), binding());
+        tokens.insert("new-token".into(), binding());
+    }
+    let older = router_acp::session::LiveDelegate {
+        parent_sid: SID.into(),
+        process_key: router_acp::downstream::ProcessKey("key-old".into()),
+        downstream_sid: "down-old".into(),
+        candidate: router_acp::candidate::CandidateId::parse("test/model").unwrap(),
+        capture: Arc::default(),
+        sub_sid: "sub-old".into(),
+        lifecycle: None,
+        worker_id: "child-1".into(),
+        planner: None,
+        worker_token: Some("old-token".into()),
+        turns: 1,
+    };
+    older.finish(shared, "closed");
+    let tokens = shared.delegate_tokens.lock().unwrap();
+    assert!(
+        !tokens.contains_key("old-token"),
+        "the closed delegate's token was kept"
+    );
+    assert!(
+        tokens.contains_key("new-token"),
+        "the newer attempt's token was revoked"
+    );
+}
+
 /// Each planner attempt runs in its own agent process, kept open after its
 /// turn for a follow-up. Once the attempt can take no further turn its
 /// session is closed, so finished workers stop holding memory.
@@ -2008,6 +2057,7 @@ async fn sessions_of_attempts_that_cannot_take_another_turn_are_closed() {
                 lifecycle: None,
                 worker_id: format!("w-{id}"),
                 planner: Some(identity.clone()),
+                worker_token: None,
                 turns: 1,
             },
         );
@@ -2720,6 +2770,7 @@ async fn a_refused_follow_up_resumption_falls_back_to_a_fresh_attempt() {
             lifecycle: None,
             worker_id: "w-1".into(),
             planner: Some(identity.clone()),
+            worker_token: None,
             turns: 1,
         },
     );
@@ -3611,6 +3662,7 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
             lifecycle: None,
             worker_id: "w-2".into(),
             planner: Some(second.clone()),
+            worker_token: None,
             turns: 1,
         },
     );

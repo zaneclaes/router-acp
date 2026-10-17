@@ -1476,6 +1476,7 @@ async fn run_planner_attempt(
         result.is_err(),
     )?;
     crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+    crate::planner_client::release_finished_child(shared, router_sid, &identity);
     result
 }
 
@@ -1724,8 +1725,12 @@ async fn run_delegate_task_inner(
         // Host-directed workers get the router's worker tools (identity and
         // structured handoffs), bound to this worker id.
         let mut session_mcp = sub_mcp.clone();
+        // This delegate's own token. A planner child keeps one worker id across
+        // attempts, so tearing this delegate down revokes this token only, never
+        // the token a newer attempt of the same child is still connecting with.
+        let mut worker_token: Option<String> = None;
         if (lifecycle_hook.is_some() || args.planner_identity.is_some())
-            && let Some(entry) = worker_server_entry(
+            && let Some((entry, token)) = worker_server_entry(
                 shared,
                 router_sid,
                 WorkerBinding {
@@ -1737,7 +1742,9 @@ async fn run_delegate_task_inner(
             )
         {
             session_mcp.push(entry);
+            worker_token = Some(token);
         }
+        let worker_token = worker_token;
         let opening = if let Some(identity) = &args.planner_identity {
             crate::planner_client::open_child(
                 shared,
@@ -1785,7 +1792,7 @@ async fn run_delegate_task_inner(
                     .await
                 {
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     last_err = Some(error.to_string());
                     continue;
                 }
@@ -1839,7 +1846,7 @@ async fn run_delegate_task_inner(
                                     &opened.process_key,
                                     &opened.downstream_sid,
                                 );
-                                drop_worker_tokens(shared, &worker_id);
+                                drop_delegate_token(shared, worker_token.as_deref());
                                 continue;
                             } else {
                                 tracing::info!(
@@ -1865,7 +1872,7 @@ async fn run_delegate_task_inner(
                                 &opened.process_key,
                                 &opened.downstream_sid,
                             );
-                            drop_worker_tokens(shared, &worker_id);
+                            drop_delegate_token(shared, worker_token.as_deref());
                             continue;
                         }
                     }
@@ -1917,7 +1924,7 @@ async fn run_delegate_task_inner(
                         "delegate start hook refused the delegate"
                     );
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     // A start that timed out may still have registered the
                     // worker on the host's side; tell it the worker never ran.
                     crate::delegate_hook::deliver(
@@ -2030,7 +2037,7 @@ async fn run_delegate_task_inner(
                         .send_notification(CancelNotification::new(opened.downstream_sid.clone()));
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
                     shared.delegate_effort.lock().unwrap().remove(&sub_sid);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     if let Some(event) = &lifecycle {
                         crate::delegate_hook::deliver(shared, &event.stopped("cancelled", None));
                     }
@@ -2172,7 +2179,7 @@ async fn run_delegate_task_inner(
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
                     shared.delegate_effort.lock().unwrap().remove(&sub_sid);
                     shared.worker_handoffs.lock().unwrap().remove(&worker_id);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     if let Some(event) = &lifecycle {
                         crate::delegate_hook::deliver(shared, &event.stopped(outcome, detail));
                     }
@@ -2227,6 +2234,7 @@ async fn run_delegate_task_inner(
                                             lifecycle: lifecycle.clone(),
                                             worker_id: worker_id.clone(),
                                             planner: args.planner_identity.clone(),
+                                            worker_token: worker_token.clone(),
                                             turns,
                                         },
                                     );
@@ -2261,7 +2269,7 @@ async fn run_delegate_task_inner(
                 };
             }
             Err(err) => {
-                drop_worker_tokens(shared, &worker_id);
+                drop_delegate_token(shared, worker_token.as_deref());
                 tracing::warn!(candidate = %candidate, error = %err, "delegate candidate failed");
                 if crate::downstream::is_auth_required(&err) {
                     crate::auth::note_auth_failure_for_request(
@@ -2566,7 +2574,7 @@ fn worker_server_entry(
     shared: &Arc<Shared>,
     router_sid: &str,
     worker: WorkerBinding,
-) -> Option<McpServer> {
+) -> Option<(McpServer, String)> {
     let socket = shared.delegate_socket.get()?.clone();
     let exe = std::env::var("ROUTER_ACP_HELPER_EXE")
         .map(PathBuf::from)
@@ -2586,12 +2594,19 @@ fn worker_server_entry(
         "--socket".to_string(),
         socket.display().to_string(),
         "--token".to_string(),
-        token,
+        token.clone(),
     ]);
-    Some(McpServer::Stdio(stdio))
+    Some((McpServer::Stdio(stdio), token))
 }
 
-/// Forget a finished worker's MCP tokens.
+/// Forget one delegate's `router-worker` token.
+pub fn drop_delegate_token(shared: &Shared, token: Option<&str>) {
+    if let Some(token) = token {
+        shared.delegate_tokens.lock().unwrap().remove(token);
+    }
+}
+
+/// Forget every MCP token of a worker (stopping the child outright).
 pub fn drop_worker_tokens(shared: &Shared, worker_id: &str) {
     shared
         .delegate_tokens
@@ -2781,6 +2796,7 @@ pub async fn run_delegate_followup(
             result.is_err(),
         )?;
         crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+        crate::planner_client::release_finished_child(shared, router_sid, &identity);
         return result;
     }
     run_delegate_followup_inner(shared, router_sid, args).await

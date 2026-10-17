@@ -147,6 +147,8 @@ pub struct LiveDelegate {
     /// Router worker id (`b-…`/`w-…`), also the `worker_handoffs` key.
     pub worker_id: String,
     pub planner: Option<crate::planner_workflow::WorkerIdentity>,
+    /// This delegate's `router-worker` token, revoked when it finishes.
+    pub worker_token: Option<String>,
     /// Turns completed so far, for `delegate_turn_end` events.
     pub turns: u32,
 }
@@ -160,7 +162,7 @@ impl LiveDelegate {
             .lock()
             .unwrap()
             .remove(&self.worker_id);
-        crate::delegate_mcp::drop_worker_tokens(shared, &self.worker_id);
+        crate::delegate_mcp::drop_delegate_token(shared, self.worker_token.as_deref());
         if let Some(event) = &self.lifecycle {
             crate::delegate_hook::deliver(shared, &event.stopped(outcome, None));
         }

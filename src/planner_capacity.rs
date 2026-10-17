@@ -49,8 +49,9 @@ pub const HOLD_MS: i64 = 30 * 60 * 1000;
 pub const RESUME_BACKOFF_SECS: [i64; 3] = [30, 120, 300];
 /// The prompt a worker that stopped early is resumed with.
 pub const CONTINUE_PROMPT: &str = "Your work is not finished: continue until its required checks \
-     pass and you record the finished receipt; a wait is not a stop—poll the build or deploy \
-     yourself.";
+     pass and you record the finished receipt; poll your own branch build in the turn. Never \
+     wait for a staging or production deploy: releases are the parent's, so a worker whose \
+     branch is pushed and green reports its artifact and hands back.";
 /// Handoff kinds that ask the parent for something only it can give. Any
 /// other ended attempt without a receipt (including `waiting`) is resumed.
 const PARENT_HANDOFFS: [&str; 7] = [
