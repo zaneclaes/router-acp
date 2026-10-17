@@ -44,6 +44,37 @@ pub struct PlannerRun {
     /// wakes, auto-admissions and worker resumptions.
     #[serde(default)]
     pub capacity: crate::planner_capacity::CapacityState,
+    /// The router process that owns this run (it has the parent session
+    /// loaded). A run whose owner died can be resumed by a new `/implement`
+    /// in the same checkout (`crate::planner_adopt`).
+    #[serde(default)]
+    pub owner: Option<RunOwner>,
+    /// The session that adopted this run's works, holds, queue and wakes.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOwner {
+    pub pid: u32,
+    pub started_at_ms: u64,
+}
+
+impl RunOwner {
+    pub fn current() -> Self {
+        let (pid, started_at_ms) = process_identity();
+        Self { pid, started_at_ms }
+    }
+
+    pub fn alive(&self) -> bool {
+        owner_alive(&Attempt {
+            id: String::new(),
+            router_pid: self.pid,
+            router_started_at_ms: self.started_at_ms,
+            delegate_id: None,
+            ended: false,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +88,9 @@ pub enum RunStatus {
     /// admitted or resumed; it ends `paused`. A drain cut short by a router
     /// exit stays here, and `/implement` resumes it like `paused`.
     Draining,
+    /// Another session adopted this run (`superseded_by`); it continues
+    /// there and never resumes here.
+    Superseded,
 }
 
 /// A run's stored `draining` that no drain in this router owns: the router
@@ -449,6 +483,8 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         receipts: BTreeMap::new(),
         idle_heartbeats: 0,
         capacity: Default::default(),
+        owner: Some(RunOwner::current()),
+        superseded_by: None,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -610,6 +646,12 @@ fn user_command_once(
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
+    if run.status == RunStatus::Superseded {
+        return Err(format!(
+            "this planner run was resumed by session {}; continue it there",
+            run.superseded_by.as_deref().unwrap_or("(unknown)")
+        ));
+    }
     if run.status == RunStatus::Draining && crate::planner_shutdown::draining(shared, sid) {
         return Err(
             "the planner run is shutting down; once its drain reports `drained`, /implement \

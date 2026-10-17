@@ -651,6 +651,14 @@ impl StateStore {
             .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
     }
 
+    /// Every planner run stored beside `sid`'s: the same checkout's shard
+    /// (or the legacy file for a legacy id).
+    pub fn planner_run_ids_beside(&self, sid: &str) -> Result<Vec<String>, String> {
+        self.with_file(sid, |file| file.planner_run_ids())
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
     /// Optimistically save one planner document in its parent session shard.
     pub fn save_planner_run(
         &self,
@@ -1652,6 +1660,18 @@ impl StateFile {
             }
         }
         Ok(())
+    }
+
+    fn planner_run_ids(&self) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id FROM planner_runs")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {

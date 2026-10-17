@@ -2091,7 +2091,14 @@ async fn run_delegate_task_inner(
                     profile.class,
                 );
                 let prompt_generation = crate::auth::request_access_generation(shared, &candidate);
-                let result = prompt_unless_stalled(shared, &opened.conn, &sub_sid, prompt).await;
+                let result = prompt_unless_stalled(
+                    shared,
+                    &opened.conn,
+                    &sub_sid,
+                    prompt,
+                    args.planner_identity.as_ref().map(|_| router_sid),
+                )
+                .await;
                 if result.is_ok() {
                     crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
                 }
@@ -2398,7 +2405,14 @@ async fn gate_turns(
             gate.downstream_sid.to_string(),
             vec![ContentBlock::from(message)],
         );
-        resp = prompt_unless_stalled(shared, gate.conn, gate.sub_sid, prompt).await?;
+        resp = prompt_unless_stalled(
+            shared,
+            gate.conn,
+            gate.sub_sid,
+            prompt,
+            gate.planner.map(|_| gate.parent_sid),
+        )
+        .await?;
     }
 }
 
@@ -2418,10 +2432,72 @@ async fn prompt_unless_stalled(
     conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
     sub_sid: &str,
     prompt: PromptRequest,
+    planner_parent: Option<&str>,
 ) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
     let downstream_sid = prompt.session_id.clone();
+    let sent_at = std::time::Instant::now();
+    crate::planner_watchdog::begin(shared, sub_sid);
     let reply = conn.send_request(prompt).block_task();
     tokio::pin!(reply);
+    // A planner child runs under the stuck-turn watchdog: silence for
+    // `stuck_turn_secs` stalls it, an open tool call included.
+    if let Some(parent_sid) = planner_parent
+        && let Some(limit) = crate::planner_watchdog::stuck_limit(shared)
+    {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        let quiet = loop {
+            tokio::select! {
+                result = &mut reply => return result,
+                _ = tick.tick() => {}
+            }
+            if crate::planner_watchdog::folded_result(shared, sub_sid, sent_at) {
+                tracing::warn!(
+                    session = sub_sid,
+                    "the worker's adapter ended its turn under an autonomous result and never answered; settling it"
+                );
+                let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut reply).await;
+                return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                    StopReason::EndTurn,
+                ));
+            }
+            let quiet = crate::planner_watchdog::quiet_for(shared, sub_sid, sent_at);
+            if quiet >= limit {
+                break quiet;
+            }
+        };
+        let span = format!("{} min", quiet.as_secs() / 60);
+        tracing::error!(
+            session = sub_sid,
+            quiet_secs = quiet.as_secs(),
+            "planner child turn stalled: no downstream progress; cancelling it"
+        );
+        crate::session::notify_user(
+            shared,
+            parent_sid,
+            format!("router-acp · worker turn stalled {span}: cancelling ({sub_sid})"),
+        );
+        let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(crate::planner_watchdog::cancel_grace(shared), &mut reply).await
+            && resp.stop_reason != StopReason::Cancelled
+        {
+            return Ok(resp);
+        }
+        let reason = format!(
+            "worker turn stalled: no downstream progress for {span}; the router cancelled and released it"
+        );
+        shared.state.lock().unwrap().log(
+            sub_sid,
+            &crate::state::LogEntry {
+                kind: "router_notice".to_string(),
+                role: "router".to_string(),
+                summary: reason.clone(),
+                ..Default::default()
+            },
+        );
+        return Err(AcpError::internal_error().data(reason));
+    }
     let started = chrono::Utc::now().timestamp();
     let mut check = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
@@ -2825,7 +2901,14 @@ async fn run_delegate_followup_inner(
         TaskClass::CodingGeneral,
     );
     let request_generation = crate::auth::request_access_generation(shared, &candidate);
-    let result = prompt_unless_stalled(shared, &conn, &sub_sid, prompt).await;
+    let result = prompt_unless_stalled(
+        shared,
+        &conn,
+        &sub_sid,
+        prompt,
+        args.planner_identity.as_ref().map(|_| router_sid),
+    )
+    .await;
     if result.is_ok() {
         crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
     }

@@ -662,6 +662,10 @@ pub struct Shared {
     /// In-process planner state by parent session: turn ends for the
     /// turn-end gate, child sessions and an active shutdown drain.
     pub planner_runtime: Mutex<HashMap<String, crate::planner_guard::SessionRuntime>>,
+    /// Last downstream progress per router or delegate session id, for the
+    /// stuck-turn watchdog and the folded-result settle
+    /// (`crate::planner_watchdog`).
+    pub turn_progress: Mutex<HashMap<String, crate::planner_watchdog::TurnProgress>>,
     pub planner_child_routes:
         Mutex<HashMap<(ProcessKey, String), crate::planner_client::ChildRoute>>,
     pub planner_child_targets: Mutex<HashSet<ProcessKey>>,
@@ -803,6 +807,7 @@ impl Shared {
             delegate_effort: Mutex::new(HashMap::new()),
             planner_deliveries: Mutex::default(),
             planner_runtime: Mutex::default(),
+            turn_progress: Mutex::default(),
             planner_child_routes: Mutex::default(),
             planner_child_targets: Mutex::default(),
             agent_delegate_slots,
@@ -2735,6 +2740,9 @@ pub fn handle_downstream_dispatch(
     match route {
         DownstreamRoute::Primary { router_sid } => match message {
             Dispatch::Notification(msg) => {
+                // Downstream progress for the stuck-turn watchdog, before any
+                // early return (a summary capture is progress too).
+                crate::planner_watchdog::note_update(shared, &router_sid, msg.params());
                 let msg = crate::accounts::merge_commands(msg)?;
                 // Claude's narration of its user-facing prose arrives as
                 // thinking; relay it as the message it is (see
@@ -2953,6 +2961,7 @@ pub fn handle_downstream_dispatch(
                 Ok(Handled::Yes)
             }
             Dispatch::Request(msg, responder) => {
+                crate::planner_watchdog::note_progress(shared, &router_sid);
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
                 // A planner wake is a router-owned turn: the client has no
@@ -3023,6 +3032,11 @@ pub fn handle_downstream_dispatch(
             capture,
         } => match message {
             Dispatch::Notification(msg) => {
+                crate::planner_watchdog::note_update(
+                    shared,
+                    &format!("{parent_router_sid}::delegate-{down_sid}"),
+                    msg.params(),
+                );
                 // Sub-agent transcript streaming is not interleaved into the
                 // parent transcript; capture agent text for the tool result.
                 if msg.method() == "session/update" {
@@ -3078,6 +3092,10 @@ pub fn handle_downstream_dispatch(
                 Ok(Handled::Yes)
             }
             Dispatch::Request(msg, responder) => {
+                crate::planner_watchdog::note_progress(
+                    shared,
+                    &format!("{parent_router_sid}::delegate-{down_sid}"),
+                );
                 // Permission/fs/terminal callbacks go live to the client
                 // under the parent router session id.
                 let method = msg.method().to_string();
@@ -5815,6 +5833,7 @@ async fn send_primary_prompt(
         ));
     };
     let down_sid = fwd.session_id.clone();
+    let sent_at = std::time::Instant::now();
     let mut sent = conn.send_request(fwd);
     if let Some(cancellation) = &cancellation {
         sent = sent.forward_cancellation_from(cancellation.clone());
@@ -5829,6 +5848,19 @@ async fn send_primary_prompt(
                 if cancellation.as_ref().is_some_and(RequestCancellation::is_cancelled) || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
                     return (Ok(PromptResponse::new(StopReason::Cancelled)), None);
+                }
+                // The adapter closed this turn's last cycle under an
+                // autonomous origin and went quiet: it filed our result away
+                // and will never answer this prompt (`planner_watchdog`).
+                // Settle its orphaned turn and end ours with what streamed.
+                if crate::planner_watchdog::folded_result(shared, router_sid, sent_at) {
+                    tracing::warn!(
+                        session = router_sid,
+                        "the adapter ended this turn under an autonomous result and never answered the prompt; settling it"
+                    );
+                    let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut reply).await;
+                    return (Ok(PromptResponse::new(StopReason::EndTurn)), None);
                 }
                 if let Some(reason) = candidate_unavailable_reason(shared, candidate, true) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
@@ -6071,7 +6103,28 @@ async fn send_prompt_with_failover(
     responder.respond_with_result(result)
 }
 
+/// One primary turn. A planner parent's turn runs under the stuck-turn
+/// watchdog (`crate::planner_watchdog`), so no turn can hold its
+/// `PromptActivity`, and with it every wake and operator prompt, forever.
 pub(crate) async fn run_primary_turn(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+    cancellation: Option<RequestCancellation>,
+) -> Result<PromptResponse, AcpError> {
+    let planner_parent = crate::planner_workflow::load(&shared, &router_sid)
+        .ok()
+        .flatten()
+        .is_some();
+    let turn = run_primary_turn_inner(shared.clone(), router_sid.clone(), req, cancellation);
+    if planner_parent {
+        crate::planner_watchdog::guard_parent_turn(&shared, &router_sid, turn).await
+    } else {
+        turn.await
+    }
+}
+
+async fn run_primary_turn_inner(
     shared: Arc<Shared>,
     router_sid: String,
     mut req: PromptRequest,
@@ -10201,6 +10254,22 @@ fn prepare_parent_prompt_inner(
                     &router_sid,
                     format!("router-acp · explicit workflow phase: {phase:?}"),
                 );
+                // A restarted client's `/implement` resumes the checkout's
+                // ownerless run instead of starting an empty one.
+                if phase == crate::config::PlannerPhase::Implementation
+                    && !queued
+                    && let Some(report) =
+                        crate::planner_adopt::adopt_on_implement(shared.as_ref(), &router_sid)
+                {
+                    let summary = report.summary();
+                    tracing::warn!(session = router_sid, from = report.from, "{summary}");
+                    notify_user(&shared, &router_sid, format!("router-acp · {summary}"));
+                    req.prompt.push(ContentBlock::from(format!(
+                        "[router-acp · {summary}. Those works are now this run's: reconcile them \
+                         through planner_workflow. The earlier parent's unacknowledged operator \
+                         input is delivered to you right after this turn, before any other wake.]"
+                    )));
+                }
             }
             Ok(None) => {}
             Err(err) => return Err(AcpError::invalid_params().data(err)),

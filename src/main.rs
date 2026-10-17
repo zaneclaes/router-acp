@@ -265,6 +265,22 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Resume a planner run whose router exited: move its works, holds,
+    /// queued operator input and pending wakes into another session's run of
+    /// the same checkout and mark it superseded. Safe while the receiving
+    /// router runs (every write is revision-checked); refused while the old
+    /// run still has a live owner. Prints the result as JSON.
+    AdoptRun {
+        /// Path to the state DB (router.yaml's `state_file`).
+        #[arg(long, default_value = "~/.local/state/router-acp/sessions.db")]
+        state: PathBuf,
+        /// The router session id whose run is adopted.
+        #[arg(long)]
+        from: String,
+        /// The router session id that takes it over.
+        #[arg(long)]
+        into: String,
+    },
     /// Read router-owned state through the versioned, read-only JSON boundary.
     /// Hosts must use this instead of opening the SQLite database themselves.
     StateQuery {
@@ -871,6 +887,19 @@ async fn main() -> anyhow::Result<()> {
                     println!("    detail: {detail}");
                 }
             }
+            Ok(())
+        }
+        Command::AdoptRun { state, from, into } => {
+            // Never prune from this command (see Transcript).
+            let never_prune = router_acp::state::Retention {
+                max_age: std::time::Duration::MAX,
+            };
+            let path = router_acp::config::expand_tilde(&state);
+            let store = router_acp::state::StateStore::load(&path, never_prune);
+            let report = router_acp::planner_adopt::adopt(&store, &from, &into)
+                .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            eprintln!("router-acp · {}", report.summary());
             Ok(())
         }
         Command::StateStats { state } => {

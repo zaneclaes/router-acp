@@ -390,6 +390,35 @@ async fn restart_target(shared: &Arc<Shared>, key: &ProcessKey) -> Result<(), Ac
     start_downstream(shared, key).await
 }
 
+/// Replace an adapter process that holds a stalled turn it will not end
+/// (`crate::planner_watchdog`). Stopping it marks the target dead, which drops
+/// its session routes; the pinned session then reopens on the replacement
+/// through the dead-downstream path (a fresh session plus SQLite history
+/// lookup), exactly as after an adapter crash.
+pub(crate) async fn restart_stalled(
+    shared: &Arc<Shared>,
+    key: &ProcessKey,
+) -> Result<(), AcpError> {
+    let gate = shared
+        .targets
+        .lock()
+        .unwrap()
+        .get(key)
+        .map(|t| t.start_gate.clone())
+        .ok_or_else(|| AcpError::internal_error().data(format!("unknown target {key}")))?;
+    let _gate = tokio::time::timeout(std::time::Duration::from_secs(30), gate.lock())
+        .await
+        .map_err(|_| {
+            AcpError::internal_error().data("timed out waiting for this adapter's startup gate")
+        })?;
+    restart_target(shared, key).await?;
+    match probe_target_once(shared, key).await {
+        ProbeOutcome::Routeable => Ok(()),
+        _ => Err(AcpError::internal_error()
+            .data("the replacement adapter did not become routeable after a stalled turn")),
+    }
+}
+
 pub(crate) async fn restart_after_repair(
     shared: &Arc<Shared>,
     key: &ProcessKey,

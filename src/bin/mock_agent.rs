@@ -50,6 +50,10 @@
 //!   most 60 s), honoring `session/cancel`; a test releases the turn by
 //!   creating the file
 //! - `TEXT:<message>` — stream text before the remaining directives
+//! - `HANG_IGNORING_CANCEL` — go silent forever and ignore `session/cancel`
+//! - `FOLDED_RESULT` — send a cost-bearing `usage_update` stamped with an
+//!   autonomous `_claude/origin`, then never answer until cancelled (the
+//!   claude-agent-acp lost turn end)
 //! - `EXIT_NOW:<model>` — crash on this prompt if it reached `<model>` (a
 //!   respawned process is healthy; a failover replay to another model is not
 //!   killed)
@@ -505,7 +509,39 @@ async fn run_prompt(
         {
             return responder.respond(PromptResponse::new(StopReason::Cancelled));
         }
-        if let Some(message) = line.strip_prefix("TEXT:") {
+        if line == "HANG_IGNORING_CANCEL" {
+            // A wedged adapter: alive, silent, never answers, ignores cancel.
+            mock.log(json!({"event": "hang", "sessionId": session_id}));
+            std::future::pending::<()>().await;
+        } else if line == "FOLDED_RESULT" {
+            // claude-agent-acp's lost turn end: the last cycle's result frame
+            // carries an autonomous (task-notification) origin, and the
+            // session/prompt is never answered until a cancel settles it.
+            let frame = UntypedMessage::new(
+                "session/update",
+                json!({"sessionId": session_id, "update": {
+                    "sessionUpdate": "usage_update", "used": 1, "size": 100,
+                    "cost": {"amount": 0.01, "currency": "USD"},
+                    "_meta": {"_claude/origin": {"kind": "task-notification", "producer": "session-task"}}
+                }}),
+            )?;
+            let _ = cx.send_notification(frame);
+            mock.log(json!({"event": "folded_result", "sessionId": session_id}));
+            loop {
+                if mock
+                    .state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.cancelled)
+                    .unwrap_or(false)
+                {
+                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        } else if let Some(message) = line.strip_prefix("TEXT:") {
             let _ = cx.send_notification(chunk(&session_id, message.to_string()));
         } else if let Some(spec) = line.strip_prefix("TOOL:") {
             // Emit a real `session/update` tool_call, the way claude-agent-acp

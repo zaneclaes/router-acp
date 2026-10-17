@@ -113,6 +113,16 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let Some(run) = planner_workflow::load(&shared, &sid).ok().flatten() else {
                     continue;
                 };
+                // This router has the parent loaded: it owns the run. A run
+                // whose owner died is what a new `/implement` resumes
+                // (`crate::planner_adopt`).
+                let me = planner_workflow::RunOwner::current();
+                if run.owner != Some(me) && run.status != RunStatus::Superseded {
+                    let _ = planner_workflow::mutate(&shared, &sid, |run| {
+                        run.owner = Some(me);
+                        Ok(())
+                    });
+                }
                 // A missed stop caused by router death is reconciled before
                 // parent work resumes. Never infer that the child survived.
                 for (id, work) in &run.works {
@@ -353,7 +363,14 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
             return Ok(());
         }
-        for (id, wake) in &mut run.wakes {
+        // Original operator input (an `input:` wake) leads the batch.
+        let (inputs, others): (Vec<String>, Vec<String>) = run
+            .wakes
+            .keys()
+            .cloned()
+            .partition(|id| id.starts_with("input:"));
+        for id in inputs.into_iter().chain(others) {
+            let wake = run.wakes.get_mut(&id).expect("listed above");
             if wake.acknowledged || wake.retry_after > now {
                 continue;
             }
@@ -425,9 +442,11 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     );
     let result =
         crate::session::run_primary_turn(shared.clone(), sid.to_string(), prompt, None).await;
-    // Cancelled for operator input: this turn answered nothing, so its wakes
-    // stay pending and go again right after the operator's turn.
-    let preempted = crate::planner_preempt::preempted(shared, sid);
+    // Cancelled for operator input, or by the stuck-turn watchdog: this turn
+    // answered nothing, so its wakes stay pending and go again right after
+    // the next turn (queued operator input first).
+    let stalled = crate::planner_watchdog::take_stalled(shared, sid);
+    let preempted = crate::planner_preempt::preempted(shared, sid) || stalled;
     planner_workflow::mutate(shared, sid, |run| {
         for id in &ids {
             if let Some(wake) = run.wakes.get_mut(id)

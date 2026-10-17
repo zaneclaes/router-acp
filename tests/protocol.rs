@@ -13837,3 +13837,331 @@ async fn queued_operator_input_is_delivered_before_the_next_router_owned_turn() 
     let _ = std::fs::remove_file(&release);
     let _ = std::fs::remove_file(&hold);
 }
+
+fn planner_watchdog_yaml(
+    state: &std::path::Path,
+    log: &std::path::Path,
+    stuck_secs: u64,
+    cancel_secs: u64,
+) -> String {
+    planner_gate_yaml(state, log, "").replace(
+        "    implementation_candidates: [\"planner/sol\"]\n",
+        &format!(
+            "    implementation_candidates: [\"planner/sol\"]\n    stuck_turn_secs: {stuck_secs}\n    stuck_turn_cancel_secs: {cancel_secs}\n"
+        ),
+    )
+}
+
+async fn wait_for_mock_event(log: &PathBuf, event: &str) {
+    for _ in 0..300 {
+        if read_log(log).iter().any(|e| e["event"] == event) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("mock never logged {event}: {:?}", read_log(log));
+}
+
+async fn wait_for_prompt_index(log: &PathBuf, marker: &str) -> usize {
+    for _ in 0..600 {
+        if let Some(i) = mock_prompts(log, marker).first() {
+            return *i;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no prompt containing {marker}: {:?}", read_log(log));
+}
+
+/// The live failure: the adapter streamed the turn's answer, then closed its
+/// last cycle under an autonomous (task-notification) origin and never
+/// answered the prompt. The turn ends with its answer, before the stuck-turn
+/// watchdog, and the parent is free for its next wake.
+#[tokio::test]
+async fn a_turn_the_adapter_files_as_autonomous_ends_and_frees_the_parent() {
+    let state = temp_state_file("folded-result");
+    let log = temp_log("folded-result");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_watchdog_yaml(&state, &log, 8, 1),
+        async |cx, observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let started = std::time::Instant::now();
+            let answer = prompt_text(&cx, &sid, "TEXT:final-words\nFOLDED_RESULT").await?;
+            assert_eq!(answer.stop_reason, StopReason::EndTurn);
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "settled before the stuck-turn watchdog: {:?}",
+                started.elapsed()
+            );
+            assert!(agent_text(&observed, &sid).contains("final-words"));
+            assert!(
+                shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .log_for(&sid, 500)
+                    .iter()
+                    .any(|e| e.kind == "agent_response" && e.summary.contains("final-words")),
+                "the turn's answer is recorded as its response"
+            );
+            assert!(
+                read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                "the adapter's orphaned turn was settled with session/cancel"
+            );
+            assert_eq!(
+                shared.with_session(&sid, |s| s.prompt_activity),
+                Some(0),
+                "no PromptActivity leaked"
+            );
+            insert_wake(&shared, &sid, "work-1:attempt-1");
+            wait_for_prompt_index(&log, WAKE_MARKER).await;
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// A parent turn whose adapter goes silent and ignores its cancel is
+/// cancelled after `stuck_turn_secs`, released `stuck_turn_cancel_secs`
+/// later (the client's prompt answers `cancelled`), its adapter is restarted,
+/// and the operator input queued behind it runs next, before the wake.
+#[tokio::test]
+async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next() {
+    let state = temp_state_file("stuck-parent");
+    let log = temp_log("stuck-parent");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_watchdog_yaml(&state, &log, 2, 1),
+        async |cx, observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let initializes = read_log(&log)
+                .iter()
+                .filter(|e| e["event"] == "initialize")
+                .count();
+            let wedged = {
+                let cx = cx.clone();
+                let sid = sid.clone();
+                tokio::spawn(async move {
+                    prompt_text(&cx, &sid, "operator: wedge\nHANG_IGNORING_CANCEL").await
+                })
+            };
+            wait_for_mock_event(&log, "hang").await;
+            // An operator turn holds the parent, so this input queues.
+            prompt_text(&cx, &sid, "TEXT:queued-after-stall").await?;
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .parent_queue
+                    .len(),
+                1
+            );
+            insert_wake(&shared, &sid, "work-1:attempt-1");
+            let released = tokio::time::timeout(Duration::from_secs(20), wedged)
+                .await
+                .expect("the stalled turn was released")
+                .unwrap()?;
+            assert_eq!(released.stop_reason, StopReason::Cancelled);
+            assert!(
+                read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                "the stalled turn was cancelled first"
+            );
+            let text = agent_text(&observed, &sid);
+            assert!(
+                text.contains("parent turn stalled") && text.contains("restarting its adapter"),
+                "the operator was told: {text}"
+            );
+            let queued = wait_for_prompt_index(&log, "queued-after-stall").await;
+            let wake = wait_for_prompt_index(&log, WAKE_MARKER).await;
+            assert!(queued < wake, "queued operator input ran before the wake");
+            assert!(
+                read_log(&log)
+                    .iter()
+                    .filter(|e| e["event"] == "initialize")
+                    .count()
+                    > initializes,
+                "the adapter process was restarted"
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+fn dead_router() -> router_acp::planner_workflow::RunOwner {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    router_acp::planner_workflow::RunOwner {
+        pid: child.id(),
+        started_at_ms: 0,
+    }
+}
+
+/// Leave `sid`'s run as a dead router leaves it: not loaded, owner gone,
+/// with a work and an operator input still queued for the parent.
+fn orphan_run(shared: &Shared, sid: &str, input_text: &str) {
+    shared.sessions.lock().unwrap().remove(sid);
+    let input_id = uuid::Uuid::new_v4().to_string();
+    router_acp::planner_workflow::mutate(shared, sid, |run| {
+        run.owner = Some(dead_router());
+        run.works.insert(
+            "work-old".into(),
+            serde_json::from_value(serde_json::json!({
+                "spec": {"work_id": "work-old", "plan_id": "plan-old", "scope": "old scope",
+                    "external_id": null},
+                "child_id": "child-old", "status": "review-pending", "workspace": null,
+                "attempt": null, "artifact": null, "review": null, "finish": null,
+                "integration": null, "reason": null, "last_output": null
+            }))
+            .unwrap(),
+        );
+        run.inputs.insert(
+            input_id.clone(),
+            router_acp::planner_workflow::InputReceipt {
+                origin: "human".into(),
+                text: input_text.into(),
+                attachments: vec![],
+                owner: None,
+                acknowledged: false,
+                delivered_to: Default::default(),
+            },
+        );
+        run.parent_queue
+            .push(router_acp::planner_workflow::QueuedParentInput {
+                input_id: input_id.clone(),
+                request: PromptRequest::new(
+                    sid.to_string(),
+                    vec![ContentBlock::from(input_text.to_string())],
+                )
+                .meta(
+                    serde_json::from_value(
+                        serde_json::json!({"router_acp": {"input_id": input_id}}),
+                    )
+                    .ok(),
+                ),
+            });
+        run.wakes.insert(
+            format!("input:{input_id}"),
+            router_acp::planner_workflow::Wake {
+                reason: "Original parent input awaits its own turn".into(),
+                work_id: sid.into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A restarted client's `/implement` resumes the checkout's ownerless run:
+/// its works move over, its queued operator input runs first, and the old
+/// run is marked superseded.
+#[tokio::test]
+async fn implement_resumes_an_ownerless_running_run_with_its_works_and_inputs() {
+    let state = temp_state_file("adopt-implement");
+    let log = temp_log("adopt-implement");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let old = open_planner_parent(&cx, &repo).await?;
+            orphan_run(&shared, &old, "TEXT:old-operator-input");
+            let new = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &new, "/implement continue after the restart").await?;
+            let resumed = wait_for_prompt_index(&log, "continue after the restart").await;
+            assert!(
+                read_log(&log)[resumed]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("resumed planner run {old}")),
+                "the /implement turn names the resumed run"
+            );
+            let run = router_acp::planner_workflow::load(&shared, &new)
+                .unwrap()
+                .unwrap();
+            assert!(run.works.contains_key("work-old"), "the work moved over");
+            let previous = router_acp::planner_workflow::load(&shared, &old)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                previous.status,
+                router_acp::planner_workflow::RunStatus::Superseded
+            );
+            assert_eq!(previous.superseded_by.as_deref(), Some(new.as_str()));
+            assert!(previous.works.is_empty() && previous.parent_queue.is_empty());
+            let input = wait_for_prompt_index(&log, "old-operator-input").await;
+            assert!(resumed < input, "{:?}", read_log(&log));
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// `router-acp adopt-run` moves an ownerless run into a running router's
+/// session from outside it, and refuses while the old run's owner lives.
+#[tokio::test]
+async fn adopt_run_moves_an_ownerless_run_into_a_live_session() {
+    let state = temp_state_file("adopt-run-cli");
+    let log = temp_log("adopt-run-cli");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let old = open_planner_parent(&cx, &repo).await?;
+            let new = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &new, "/implement the new session").await?;
+            let adopt = || {
+                std::process::Command::new(router_exe())
+                    .args(["adopt-run", "--state"])
+                    .arg(&state)
+                    .args(["--from", &old, "--into", &new])
+                    .output()
+                    .unwrap()
+            };
+            let refused = adopt();
+            assert!(!refused.status.success());
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("live owner"),
+                "{}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+            orphan_run(&shared, &old, "TEXT:cli-operator-input");
+            let adopted = adopt();
+            assert!(
+                adopted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&adopted.stderr)
+            );
+            let report: serde_json::Value = serde_json::from_slice(&adopted.stdout).unwrap();
+            assert_eq!(report["works"][0][0], "work-old");
+            assert_eq!(report["operator_inputs"].as_array().unwrap().len(), 1);
+            let run = router_acp::planner_workflow::load(&shared, &new)
+                .unwrap()
+                .unwrap();
+            assert!(run.works.contains_key("work-old"));
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &old)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                router_acp::planner_workflow::RunStatus::Superseded
+            );
+            // The live router delivers the adopted operator input.
+            wait_for_prompt_index(&log, "cli-operator-input").await;
+            Ok(())
+        },
+    )
+    .await;
+}

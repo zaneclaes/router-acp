@@ -1307,6 +1307,14 @@ fn default_planner_floor_complexity() -> f64 {
     0.15
 }
 
+fn default_stuck_turn_secs() -> u64 {
+    600
+}
+
+fn default_stuck_turn_cancel_secs() -> u64 {
+    60
+}
+
 fn default_easy_planning_candidates() -> Vec<String> {
     vec!["*opus*".to_string(), "*sol*".to_string()]
 }
@@ -1401,6 +1409,16 @@ pub struct PlannerRouterConfig {
     /// protocol, coordination rules) belongs to the host.
     #[serde(default)]
     pub planning_instructions: String,
+    /// A planner parent or child turn with no downstream progress (no
+    /// session update, tool call or LLM response) for this many seconds is
+    /// stalled: the router cancels it and, if it does not end within
+    /// `stuck_turn_cancel_secs`, releases it and restarts its adapter.
+    /// `0` disables the watchdog. See `crate::planner_watchdog`.
+    #[serde(default = "default_stuck_turn_secs")]
+    pub stuck_turn_secs: u64,
+    /// How long a stalled turn may take to end after its `session/cancel`.
+    #[serde(default = "default_stuck_turn_cancel_secs")]
+    pub stuck_turn_cancel_secs: u64,
 }
 
 impl Default for PlannerRouterConfig {
@@ -1428,6 +1446,8 @@ impl Default for PlannerRouterConfig {
             easy_planning_candidates: default_easy_planning_candidates(),
             hard_planning_candidates: default_hard_planning_candidates(),
             planning_instructions: String::new(),
+            stuck_turn_secs: default_stuck_turn_secs(),
+            stuck_turn_cancel_secs: default_stuck_turn_cancel_secs(),
         }
     }
 }

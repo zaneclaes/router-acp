@@ -106,6 +106,9 @@ pub struct SessionRuntime {
     /// That router-owned turn was cancelled for operator input: its wakes
     /// stay pending and are redelivered after the operator's turn.
     pub preempted: bool,
+    /// The stuck-turn watchdog cancelled or released the current turn
+    /// (`crate::planner_watchdog`): its wakes go again at once.
+    pub stalled: bool,
     /// Each work's latest child session (process key, downstream session id).
     pub children: HashMap<String, (crate::downstream::ProcessKey, String)>,
     pub drain: Option<crate::planner_shutdown::Drain>,
