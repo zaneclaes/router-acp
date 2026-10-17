@@ -789,12 +789,17 @@ impl StateStore {
             // Removing a run releases its claims; one without a run is unknown.
             Ok(None) | Err(_) => return false,
         };
-        let running = document.get("status").and_then(serde_json::Value::as_str) == Some("running");
+        let status = document.get("status").and_then(serde_json::Value::as_str);
+        let running = status == Some("running");
+        let work_pointer = format!("/works/{}", work_id.replace('~', "~0").replace('/', "~1"));
+        // Adoption moves every work into the adopting run and marks the old run
+        // superseded, but its workspace claims stay under the old session. A
+        // superseded holder can never use a claim again: the adopting run takes it.
+        if status == Some("superseded") {
+            return true;
+        }
         let attempt = document
-            .pointer(&format!(
-                "/works/{}/attempt",
-                work_id.replace('~', "~0").replace('/', "~1")
-            ))
+            .pointer(&format!("{work_pointer}/attempt"))
             .cloned()
             .and_then(|a| serde_json::from_value::<crate::planner_workflow::Attempt>(a).ok());
         match attempt {

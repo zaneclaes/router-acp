@@ -280,6 +280,45 @@ async fn return_to_planning_preserves_active_work_but_stops_new_dispatch() {
     assert_ne!(replacement.attempt_id, actor.attempt_id);
 }
 
+/// Adoption moves every work into the adopting run and marks the old run
+/// superseded, but the workspace claims stay under the old session. The adopting
+/// run must take each claim over; a live run's claim on its own work is kept.
+#[test]
+fn a_superseded_holder_releases_its_workspace_claims() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::load(&tmp.path().join("state.db"), Retention::default());
+    let adopted = tmp.path().join("adopted");
+    let kept = tmp.path().join("kept");
+    store
+        .save_planner_run(
+            "old-session",
+            0,
+            &json!({"status": "superseded", "works": {}}),
+        )
+        .unwrap();
+    store
+        .save_planner_run(
+            "live-session",
+            0,
+            &json!({"status": "running", "works": {"work-2": {}}}),
+        )
+        .unwrap();
+    store
+        .claim_planner_workspace(&adopted, "old-session", "work-1", "old-lease")
+        .unwrap();
+    store
+        .claim_planner_workspace(&kept, "live-session", "work-2", "live-lease")
+        .unwrap();
+
+    store
+        .claim_planner_workspace(&adopted, "new-session", "work-1", "new-lease")
+        .expect("a superseded run's claim is taken over by the adopting run");
+    let error = store
+        .claim_planner_workspace(&kept, "new-session", "work-2", "new-lease")
+        .unwrap_err();
+    assert!(error.contains("held by another"), "{error}");
+}
+
 #[test]
 fn stale_cas_update_is_rejected_across_two_state_files() {
     let tmp = tempfile::tempdir().unwrap();
