@@ -149,6 +149,156 @@ fn authorize(shared: &Arc<Shared>) {
     planner_workflow::save(shared, SID, &mut run).unwrap();
 }
 
+#[test]
+fn external_monitor_input_is_durable_agent_origin_and_idempotent_after_delivery() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner::current());
+        run.approval_waits
+            .insert("existing-operator-decision".into());
+        Ok(())
+    })
+    .unwrap();
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    let send =
+        |message| router_acp::planner_input::send(&store, SID, &f.repo, "monitor-1", message);
+    let first = send("/implement this is advice, not new authorization").unwrap();
+    assert!(first.queued && first.awaiting_approval && first.owner_alive);
+    assert!(!first.delivered && !first.acknowledged);
+    assert!(
+        send("/implement this is advice, not new authorization")
+            .unwrap()
+            .queued
+    );
+    assert!(
+        send("different text")
+            .unwrap_err()
+            .contains("different original message")
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.parent_queue.len(), 1);
+    assert_eq!(run.inputs["monitor-1"].origin, "agent");
+    assert!(!planner_workflow::human_prompt(
+        &run.parent_queue[0].request
+    ));
+    assert!(planner_workflow::command(&run.parent_queue[0].request).is_none());
+    assert_eq!(
+        run.execution_request.as_deref(),
+        Some("implement the admitted plan")
+    );
+    assert!(run.wakes.contains_key("input:monitor-1"));
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.parent_queue.clear();
+        let input = run.inputs.get_mut("monitor-1").unwrap();
+        input.delivered_to.insert(SID.into());
+        input.acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    let retry = send("/implement this is advice, not new authorization").unwrap();
+    assert!(!retry.queued && retry.delivered && retry.acknowledged);
+    let readonly = StateStore::open_readonly(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    )
+    .unwrap();
+    assert!(
+        router_acp::planner_input::status(&readonly, SID, "monitor-1")
+            .unwrap()
+            .acknowledged
+    );
+}
+
+#[test]
+fn external_monitor_input_refuses_wrong_checkout_dead_or_stopped_run() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    assert!(
+        router_acp::planner_input::send(&store, SID, f._tmp.path(), "monitor-1", "test")
+            .unwrap_err()
+            .contains("checkout")
+    );
+    for run_status in [
+        RunStatus::Paused,
+        RunStatus::Draining,
+        RunStatus::Complete,
+        RunStatus::Cancelled,
+        RunStatus::Superseded,
+    ] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.owner = Some(planner_workflow::RunOwner::current());
+            run.status = run_status;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            router_acp::planner_input::send(&store, SID, &f.repo, "monitor-1", "test")
+                .unwrap_err()
+                .contains("not running")
+        );
+    }
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Running;
+        run.owner = None;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        router_acp::planner_input::send(&store, SID, &f.repo, "monitor-1", "test")
+            .unwrap_err()
+            .contains("no live owner")
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.inputs.is_empty() && run.parent_queue.is_empty());
+}
+
+#[test]
+fn external_monitor_input_preserves_concurrent_senders() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner::current());
+        Ok(())
+    })
+    .unwrap();
+    std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        for n in 0..4 {
+            let barrier = barrier.clone();
+            let state_path = &f.state_path;
+            let repo = &f.repo;
+            scope.spawn(move || {
+                let store = StateStore::load(
+                    state_path,
+                    Retention {
+                        max_age: std::time::Duration::MAX,
+                    },
+                );
+                barrier.wait();
+                router_acp::planner_input::send(&store, SID, repo, &format!("monitor-{n}"), "test")
+                    .unwrap();
+            });
+        }
+    });
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.parent_queue.len(), 4);
+    assert_eq!(run.inputs.len(), 4);
+}
+
 fn admit(shared: &Arc<Shared>, work: WorkSpec) {
     authorize(shared);
     futures::executor::block_on(planner_workflow::operate(
@@ -169,6 +319,8 @@ fn work(work_id: &str) -> WorkSpec {
         plan_id: "plan-1".into(),
         scope: "change README.md and run the checks".into(),
         dependencies: Vec::new(),
+        ready_dependencies: BTreeMap::new(),
+        owned_paths: Vec::new(),
         required_checks: Vec::new(),
         required_integration_evidence: Vec::new(),
         external_id: Some("external-1".into()),
@@ -182,6 +334,7 @@ fn artifact(revision: &str) -> Artifact {
         checks: BTreeMap::new(),
         evidence: vec!["check-log.txt".into()],
         unresolved: Vec::new(),
+        integration_requirements: BTreeMap::new(),
     }
 }
 
@@ -235,6 +388,20 @@ fn policy_snapshot_survives_policy_source_and_config_change() {
     let resumed = planner_workflow::load(&second, SID).unwrap().unwrap();
     assert_eq!(resumed.policy.policy.text, "policy version one\n");
     assert_eq!(resumed.policy.identity, saved.policy.identity);
+    planner_workflow::mutate(&second, SID, |run| {
+        run.status = RunStatus::Paused;
+        Ok(())
+    })
+    .unwrap();
+    let mut command = input_request(
+        Some("restart-policy"),
+        "/implement resume admitted scope",
+        false,
+    );
+    planner_workflow::user_command(&second, SID, &mut command).unwrap();
+    let restarted = planner_workflow::load(&second, SID).unwrap().unwrap();
+    assert_eq!(restarted.policy.policy.text, "new configured policy\n");
+    assert_eq!(restarted.prior_policies[0].identity, saved.policy.identity);
 }
 
 #[tokio::test]
@@ -2322,9 +2489,17 @@ async fn idle_parent_below_its_limit_gets_capacity_wakes_that_never_give_up() {
 
     // Status and the census carry the same block.
     let status: serde_json::Value = serde_json::from_str(
-        &planner_workflow::operate(shared, SID, None, Operation::Status { offset: 0 })
-            .await
-            .unwrap(),
+        &planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
     )
     .unwrap();
     let capacity = &status["capacity"];
@@ -2408,6 +2583,95 @@ async fn unanswered_capacity_wakes_make_the_router_admit_and_start_exactly_the_f
         "{notice}"
     );
     assert_eq!(run.capacity.unfilled_wakes, 0);
+}
+
+#[tokio::test]
+async fn adopted_custody_recovery_does_not_starve_independent_capacity_wakes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["independent"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 1_000, 1_000_000));
+    admit(&f.shared, work("recovery"));
+    // An admitted assignment restored from an older run can need reconciliation
+    // even before its first attempt; tick must queue its wake and still fill slots.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .get_mut("recovery")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(&f.shared);
+    tick(&f.shared, last + 61).await;
+    assert_eq!(wakes_with(&f.shared, "recovery:").len(), 1);
+    assert_eq!(wakes_with(&f.shared, "capacity:").len(), 1);
+    deliver_all(&f.shared);
+    tick(&f.shared, last + 122).await;
+    assert_eq!(wakes_with(&f.shared, "capacity:").len(), 2);
+    assert_eq!(wakes_with(&f.shared, "recovery:").len(), 1);
+    assert!(
+        planner_workflow::begin_work(&f.shared, SID, "recovery")
+            .await
+            .unwrap_err()
+            .contains("reconciliation required")
+    );
+}
+
+#[tokio::test]
+async fn adopted_custody_allows_independent_auto_admission_but_keeps_conflict_and_dependency_gates()
+{
+    let mut independent = candidate_json("independent");
+    independent["work"]["owned_paths"] = json!(["independent"]);
+    let mut conflict = candidate_json("conflict");
+    conflict["work"]["owned_paths"] = json!(["shared/file.rs"]);
+    let mut dependent = candidate_json("dependent");
+    dependent["work"]["dependencies"] = json!(["recovery"]);
+    let reply = json!({"candidates":[conflict, dependent, independent]});
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 4;
+        capacity_host(
+            cfg,
+            format!("cat >/dev/null; printf '%s' '{reply}'"),
+            1_000,
+            300,
+        );
+    });
+    let mut spec = work("recovery");
+    spec.owned_paths = vec!["shared".into()];
+    admit(&f.shared, spec);
+    pin_parent(&f.shared);
+    let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "recovery")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(&f.shared, SID, &identity, None, "stopped".into(), false)
+        .unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .get_mut("recovery")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(&f.shared);
+    tick(&f.shared, last + 301).await;
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.capacity.last_auto_admission.as_ref().unwrap().admitted,
+        vec!["work-independent"]
+    );
+    assert!(run.works["work-independent"].attempt.is_some());
+    assert!(!run.works.contains_key("work-conflict"));
+    assert!(run.works["work-dependent"].attempt.is_none());
+    assert_eq!(
+        run.works["recovery"].attempt.as_ref().unwrap().id,
+        identity.attempt_id
+    );
+    assert!(run.works["recovery"].reconciliation.required);
+    assert_eq!(run.capacity.holds["plan-dependent"].reason, "dependency");
+    assert_eq!(wakes_with(&f.shared, "recovery:recovery").len(), 1);
 }
 
 #[tokio::test]
@@ -2626,7 +2890,15 @@ async fn attempt_settled(shared: &Arc<Shared>, work_id: &str) {
     for _ in 0..200 {
         let run = planner_workflow::load(shared, SID).unwrap().unwrap();
         let work = &run.works[work_id];
-        if work.status == WorkStatus::Interrupted && work.attempt.as_ref().is_some_and(|a| a.ended)
+        let pending_job = shared
+            .background_delegates
+            .lock()
+            .unwrap()
+            .values()
+            .any(|job| job.parent_sid == SID && job.planner && job.result.is_none());
+        if !pending_job
+            && work.status == WorkStatus::Interrupted
+            && work.attempt.as_ref().is_some_and(|a| a.ended)
         {
             return;
         }
@@ -2636,7 +2908,7 @@ async fn attempt_settled(shared: &Arc<Shared>, work_id: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_worker_that_stops_without_a_receipt_is_resumed_with_backoff_and_no_cap() {
+async fn unchanged_worker_failures_suspend_retries_without_stopping_other_work() {
     let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 2);
     let shared = &fixture.shared;
     admit(shared, work("work-1"));
@@ -2681,7 +2953,12 @@ async fn a_worker_that_stops_without_a_receipt_is_resumed_with_backoff_and_no_ca
     };
     let mut now = chrono::Utc::now().timestamp() + 10_000;
     let mut previous_attempt = identity.attempt_id.clone();
-    for (round, delay) in [30, 120, 300, 300, 300].into_iter().enumerate() {
+    for (round, delay) in [30, 120].into_iter().enumerate() {
+        planner_workflow::mutate(shared, SID, |run| {
+            run.works.get_mut("work-1").unwrap().reason = Some("unchanged host refusal".into());
+            Ok(())
+        })
+        .unwrap();
         tick(shared, now).await;
         let state = resumes("work-1").unwrap();
         assert_eq!(state.count, round as u32);
@@ -2702,6 +2979,25 @@ async fn a_worker_that_stops_without_a_receipt_is_resumed_with_backoff_and_no_ca
         previous_attempt = attempt;
         now += delay + 1;
     }
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("work-1").unwrap().reason = Some("unchanged host refusal".into());
+        Ok(())
+    })
+    .unwrap();
+    tick(shared, now).await;
+    let blocked = resumes("work-1").unwrap();
+    assert_eq!(blocked.same_failure_count, 3);
+    assert!(blocked.suspended.is_some());
+    assert_eq!(blocked.count, 2);
+    for later in [300, 3_000, 30_000] {
+        tick(shared, now + later).await;
+    }
+    assert_eq!(resumes("work-1").unwrap().count, 2);
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(run.wakes.contains_key("recovery:work-1"));
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.works["work-1"].status, WorkStatus::Interrupted);
+    assert!(run.works["work-1"].finish.is_none());
     assert!(resumes("asks-parent").is_none());
     assert_eq!(
         planner_workflow::load(shared, SID).unwrap().unwrap().works["asks-parent"]
@@ -2855,7 +3151,915 @@ async fn a_refused_follow_up_resumption_falls_back_to_a_fresh_attempt() {
     assert_eq!(run.capacity.resumes["work-1"].count, 2);
 }
 
+#[tokio::test]
+async fn a_missing_workspace_is_reconciled_before_any_model_attempt() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    pin_parent(shared);
+    let (identity, workspace, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(shared, SID, &identity, None, "stopped".into(), false).unwrap();
+    let preserved = workspace.path.with_extension("preserved");
+    std::fs::rename(&workspace.path, &preserved).unwrap();
+    let error = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(error.contains("workspace unavailable"), "{error}");
+    let now = chrono::Utc::now().timestamp() + 10_000;
+    tick(shared, now).await;
+    tick(shared, now + 600).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works["work-1"].attempt.as_ref().unwrap().id,
+        identity.attempt_id
+    );
+    assert_eq!(run.capacity.resumes["work-1"].count, 0);
+    assert!(
+        run.capacity.resumes["work-1"]
+            .suspended
+            .as_ref()
+            .unwrap()
+            .contains("workspace unavailable")
+    );
+    assert_eq!(
+        run.wakes
+            .keys()
+            .filter(|id| id.starts_with("recovery:"))
+            .count(),
+        1
+    );
+    std::fs::rename(&preserved, &workspace.path).unwrap();
+    tick(shared, now + 601).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(run.capacity.resumes["work-1"].suspended.is_none());
+    assert_eq!(run.capacity.resumes["work-1"].due_at, Some(now + 631));
+    assert!(run.wakes["recovery:work-1"].acknowledged);
+}
+
+#[tokio::test]
+async fn accepted_artifacts_survive_interruption_and_exact_packet_replay() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    let revision = finished_work(shared).await;
+    planner_workflow::mutate(shared, SID, |run| {
+        let work = run.works.get_mut("work-1").unwrap();
+        work.status = WorkStatus::Interrupted;
+        work.finish = None;
+        work.attempt.as_mut().unwrap().ended = true;
+        Ok(())
+    })
+    .unwrap();
+    let (identity, _, _, instructions) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    assert!(instructions.contains("finish-work"), "{instructions}");
+    let packet = planner_workflow::load(shared, SID).unwrap().unwrap().works["work-1"]
+        .artifact
+        .clone()
+        .unwrap();
+    planner_workflow::operate(
+        shared,
+        SID,
+        Some(&identity),
+        Operation::Artifact {
+            key: "reconnected-artifact".into(),
+            work_id: "work-1".into(),
+            attempt_id: identity.attempt_id.clone(),
+            artifact: packet.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["work-1"].status, WorkStatus::Accepted);
+    assert!(run.works["work-1"].review.as_ref().unwrap().accepted);
+    planner_workflow::operate(
+        shared,
+        SID,
+        Some(&identity),
+        Operation::Finished {
+            key: "reconnected-finish".into(),
+            work_id: "work-1".into(),
+            attempt_id: identity.attempt_id.clone(),
+            receipt: receipt(&revision, "remote"),
+        },
+    )
+    .await
+    .unwrap();
+    // Reusing a SHA does not excuse changed evidence from independent review.
+    let mut changed = packet;
+    changed.evidence.push("different-check-log.txt".into());
+    planner_workflow::operate(
+        shared,
+        SID,
+        Some(&identity),
+        Operation::Artifact {
+            key: "changed-evidence".into(),
+            work_id: "work-1".into(),
+            attempt_id: identity.attempt_id.clone(),
+            artifact: changed,
+        },
+    )
+    .await
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["work-1"].status, WorkStatus::ReviewPending);
+    assert!(run.works["work-1"].review.is_none());
+    assert!(run.works["work-1"].finish.is_none());
+}
+
+#[tokio::test]
+async fn targeted_status_keeps_worker_visibility_and_reports_outstanding_integration() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    finished_work(shared).await;
+    admit(shared, work("work-2"));
+    let query = |id: &str| Operation::Status {
+        offset: 0,
+        work_id: Some(id.into()),
+    };
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(shared, SID, None, query("work-1"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["works"].as_array().unwrap().len(), 1);
+    assert_eq!(status["works"][0]["work_id"], "work-1");
+    assert_eq!(status["progress"]["awaiting_integration"], 1);
+    assert_eq!(status["progress"]["integrated"], 0);
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-2")
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(shared, SID, Some(&identity), query("work-1"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(status["works"].as_array().unwrap().is_empty());
+}
+
 // ---------------------------------------------------------------------------
+#[tokio::test]
+async fn source_dependencies_can_start_before_deployment_but_not_before_acceptance() {
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut dependent = work("dependent");
+    dependent
+        .ready_dependencies
+        .insert("work-1".into(), revision);
+    dependent.owned_paths = vec!["src/client".into()];
+    admit(&f.shared, dependent);
+    let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "dependent")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(&f.shared, SID, &identity, None, "stopped".into(), false)
+        .unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .get_mut("work-1")
+            .unwrap()
+            .review
+            .as_mut()
+            .unwrap()
+            .accepted = false;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_workflow::begin_followup(&f.shared, SID, &identity)
+            .unwrap_err()
+            .contains("source dependency")
+    );
+    assert!(
+        planner_workflow::begin_work(&f.shared, SID, "dependent")
+            .await
+            .unwrap_err()
+            .contains("source dependency")
+    );
+    let mut overlapping = work("overlap");
+    overlapping.owned_paths = vec!["src/client/page.rs".into()];
+    let error = planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "overlap".into(),
+            work: overlapping,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("source ownership conflict"));
+    let mut disjoint = work("disjoint");
+    disjoint.owned_paths = vec!["src/server".into()];
+    admit(&f.shared, disjoint);
+    planner_workflow::begin_work(&f.shared, SID, "disjoint")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
+    use router_acp::planner_release::{self, Checkpoint, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let checkpoint = |stage, key: &str| Checkpoint {
+        stage,
+        revision: revision.clone(),
+        works: BTreeMap::new(),
+        replaces: None,
+        evidence: BTreeMap::from([(key.into(), "preserved-evidence.md".into())]),
+    };
+    let mut selected = checkpoint(Stage::Selected, "selection");
+    selected.works.insert("work-1".into(), revision.clone());
+    run.works
+        .get_mut("work-1")
+        .unwrap()
+        .spec
+        .ready_dependencies
+        .insert("missing-source".into(), revision.clone());
+    assert!(
+        planner_release::record(&mut run, "round-1", &selected)
+            .unwrap_err()
+            .contains("source dependency")
+    );
+    run.works
+        .get_mut("work-1")
+        .unwrap()
+        .spec
+        .ready_dependencies
+        .clear();
+    planner_release::record(&mut run, "round-1", &selected).unwrap();
+    planner_release::record(&mut run, "round-1", &selected).unwrap();
+    assert_eq!(run.releases["round-1"].checkpoints.len(), 1);
+    assert!(
+        planner_release::record(
+            &mut run,
+            "round-1",
+            &checkpoint(Stage::ProductionPassed, "production-smoke")
+        )
+        .is_err()
+    );
+    assert!(
+        planner_release::integration_allowed(&run, "work-1", &receipt(&revision, "merge")).is_err()
+    );
+    assert!(planner_release::record(&mut run, "round-2", &selected).is_err());
+    for (stage, key) in [
+        (Stage::CandidatePassed, "candidate-build"),
+        (Stage::StagingDeployed, "staging-rollout"),
+        (Stage::StagingPassed, "staging-smoke"),
+        (Stage::ProductionMerged, "production-pr"),
+    ] {
+        planner_release::record(&mut run, "round-1", &checkpoint(stage, key)).unwrap();
+    }
+    let mut second = run.works["work-1"].clone();
+    assert!(
+        planner_release::record(&mut run, "duplicate-head", &selected)
+            .unwrap_err()
+            .contains("already selected")
+    );
+    second.spec.work_id = "work-2".into();
+    second
+        .spec
+        .ready_dependencies
+        .insert("work-1".into(), revision.clone());
+    run.works.insert("work-2".into(), second);
+    selected.works = BTreeMap::from([("work-2".into(), revision.clone())]);
+    planner_release::record(&mut run, "round-2", &selected).unwrap();
+    for (stage, key) in [
+        (Stage::CandidatePassed, "candidate-build"),
+        (Stage::StagingDeployed, "staging-rollout"),
+        (Stage::StagingPassed, "staging-smoke"),
+    ] {
+        planner_release::record(&mut run, "round-2", &checkpoint(stage, key)).unwrap();
+    }
+    assert!(
+        planner_release::record(
+            &mut run,
+            "round-2",
+            &checkpoint(Stage::ProductionMerged, "production-pr")
+        )
+        .is_err()
+    );
+    let mut failed_overlap = run.clone();
+    planner_release::record(
+        &mut failed_overlap,
+        "round-1",
+        &checkpoint(Stage::Failed, "failure"),
+    )
+    .unwrap();
+    planner_release::record(
+        &mut failed_overlap,
+        "round-2",
+        &checkpoint(Stage::Abandoned, "abandonment"),
+    )
+    .unwrap();
+    let mut repair = checkpoint(Stage::Selected, "selection");
+    repair.works.insert("work-1".into(), revision.clone());
+    repair.replaces = Some("round-1".into());
+    planner_release::record(&mut failed_overlap, "repair", &repair).unwrap();
+    assert_eq!(failed_overlap.works["work-2"].status, WorkStatus::Finished);
+    assert!(
+        planner_release::integration_allowed(
+            &failed_overlap,
+            "work-2",
+            &receipt(&revision, "merge")
+        )
+        .is_err()
+    );
+    for (stage, key) in [
+        (Stage::ProductionDeployed, "production-rollout"),
+        (Stage::ProductionPassed, "production-smoke"),
+    ] {
+        planner_release::record(&mut run, "round-1", &checkpoint(stage, key)).unwrap();
+    }
+    let mut integration = receipt(&revision, "merge");
+    integration
+        .evidence
+        .insert("release-round".into(), "round-1".into());
+    planner_release::integration_allowed(&run, "work-1", &integration).unwrap();
+    assert!(
+        planner_release::record(
+            &mut run,
+            "round-1",
+            &checkpoint(Stage::Disposed, "disposition-commit")
+        )
+        .is_err()
+    );
+    let work = run.works.get_mut("work-1").unwrap();
+    work.status = WorkStatus::Integrated;
+    work.integration = Some(integration);
+    planner_release::record(
+        &mut run,
+        "round-1",
+        &checkpoint(Stage::Disposed, "disposition-commit"),
+    )
+    .unwrap();
+    planner_release::record(
+        &mut run,
+        "round-2",
+        &checkpoint(Stage::ProductionMerged, "production-pr"),
+    )
+    .unwrap();
+    planner_release::record(&mut run, "round-2", &checkpoint(Stage::Failed, "failure")).unwrap();
+    assert!(
+        planner_release::record(
+            &mut run,
+            "round-2",
+            &checkpoint(Stage::ProductionPassed, "production-smoke")
+        )
+        .is_err()
+    );
+    selected.replaces = Some("round-2".into());
+    planner_release::record(&mut run, "repair", &selected).unwrap();
+    assert!(
+        planner_release::integration_allowed(&run, "work-2", &receipt(&revision, "merge")).is_err()
+    );
+    assert_eq!(
+        run.releases["round-2"].superseded_by.as_deref(),
+        Some("repair")
+    );
+    planner_workflow::save(&f.shared, SID, &mut run).unwrap();
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .releases["repair"]
+            .stage(),
+        Stage::Selected
+    );
+}
+
+#[tokio::test]
+async fn parent_finalization_is_host_verified_and_release_proofs_remain_required() {
+    let tmp = tempfile::tempdir().unwrap();
+    let verdict = tmp.path().join("verdict");
+    std::fs::write(&verdict, "reject").unwrap();
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "cat >/dev/null; v=$(cat '{}'); if [ \"$v\" = legacy ]; then exit 0; fi; test \"$v\" = ok || exit 2; echo '{{\"verified_action\":\"finalize\"}}'",
+                    verdict.display()
+                ),
+            ],
+            timeout_ms: 5_000,
+        })
+    });
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let work = run.works.get_mut("work-1").unwrap();
+        work.status = WorkStatus::Accepted;
+        work.finish = None;
+        work.artifact
+            .as_mut()
+            .unwrap()
+            .integration_requirements
+            .insert(
+                "signup-proof".into(),
+                "verify signup on deployed candidate".into(),
+            );
+        Ok(())
+    })
+    .unwrap();
+    let finalize = || {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Finalize {
+                key: "finalize".into(),
+                work_id: "work-1".into(),
+                receipt: receipt(&revision, "handoff"),
+            },
+        )
+    };
+    assert!(finalize().await.unwrap_err().contains("rejected"));
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works["work-1"]
+            .status,
+        WorkStatus::Accepted
+    );
+    std::fs::write(&verdict, "legacy").unwrap();
+    assert!(
+        finalize()
+            .await
+            .unwrap_err()
+            .contains("explicitly acknowledge")
+    );
+    std::fs::write(&verdict, "ok").unwrap();
+    finalize().await.unwrap();
+    let mut evidence = receipt(&revision, "merge");
+    let missing = planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Integrate {
+            key: "integrate".into(),
+            work_id: "work-1".into(),
+            receipt: evidence.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(missing.contains("signup-proof"));
+    evidence
+        .evidence
+        .insert("signup-proof".into(), "production-proof.md".into());
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Integrate {
+            key: "integrate".into(),
+            work_id: "work-1".into(),
+            receipt: evidence,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn audit_observations_wake_once_per_change_and_never_complete_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    admit(&f.shared, work("work-1"));
+    let revision = current_revision(&f.repo);
+    let response = |state: &str| {
+        json!({"defects":[],"observations":{"branch:42":{"revision":revision,"reference":"build:42","state":state,"evidence":"ci-result.json"}}}).to_string()
+    };
+    let now = chrono::Utc::now().timestamp();
+    std::fs::write(&reply, response("pending")).unwrap();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now).await;
+    assert!(wakes_with(&f.shared, "observation:").is_empty());
+    std::fs::write(&reply, response("passed")).unwrap();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now + 61).await;
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["work-1"].status, WorkStatus::Admitted);
+    assert_eq!(wakes_with(&f.shared, "observation:").len(), 1);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.wakes
+            .get_mut("observation:branch:42")
+            .unwrap()
+            .acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now + 122).await;
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes["observation:branch:42"]
+            .acknowledged
+    );
+    std::fs::write(&reply, response("failed")).unwrap();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now + 183).await;
+    assert!(
+        !planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes["observation:branch:42"]
+            .acknowledged
+    );
+    std::fs::write(&reply, response("invented-pass")).unwrap();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now + 244).await;
+    assert!(
+        !planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .capacity
+            .audit
+            .unwrap()
+            .ok
+    );
+}
+
+#[test]
+fn runtime_worker_capacity_increases_permits_without_disturbing_live_workers() {
+    let f = fixture(|cfg| cfg.delegation.max_concurrent = 2);
+    let permit = f.shared.delegate_semaphore.try_acquire().unwrap();
+    f.shared.increase_delegate_limit(5).unwrap();
+    assert_eq!(f.shared.delegate_limit(), 5);
+    assert_eq!(f.shared.delegate_semaphore.available_permits(), 4);
+    assert!(f.shared.increase_delegate_limit(1).is_err());
+    assert!(f.shared.increase_delegate_limit(0).is_err());
+    f.shared.increase_delegate_limit(5).unwrap();
+    drop(permit);
+    assert_eq!(f.shared.delegate_semaphore.available_permits(), 5);
+    let run = planner_workflow::ensure(&f.shared, SID).unwrap();
+    let status = router_acp::planner_capacity::status_block(&f.shared, &run, 0);
+    assert_eq!(status["effective_limit"], 5);
+    assert_eq!(status["configured_at_start"], 2);
+}
+
+#[tokio::test]
+async fn a_fresh_exact_ci_observation_parks_a_wait_without_spawning_a_retry() {
+    let f = fixture(|_| {});
+    admit(&f.shared, work("work-1"));
+    let (identity, workspace, _, _) = planner_workflow::begin_work(&f.shared, SID, "work-1")
+        .await
+        .unwrap();
+    let revision = current_revision(&workspace.path);
+    planner_workflow::attempt_ended(
+        &f.shared,
+        SID,
+        &identity,
+        None,
+        "waiting for own build".into(),
+        false,
+    )
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works.get_mut("work-1").unwrap().handoff = Some(router_acp::delegate_hook::Handoff {
+            kind: "waiting".into(),
+            message: format!("ci:work-1@{revision} build 42 running"),
+        });
+        run.observations.insert(
+            "ci:work-1".into(),
+            router_acp::planner_guard::Observation {
+                revision: revision.clone(),
+                reference: "wip/work-1".into(),
+                state: router_acp::planner_guard::ObservationState::Pending,
+                evidence: "build:42".into(),
+            },
+        );
+        run.capacity.audit = Some(router_acp::planner_guard::AuditSnapshot {
+            at_ms: now * 1000,
+            ok: true,
+            error: None,
+            defects: vec![],
+            observed: ["ci:work-1".into()].into(),
+            completed_guides: None,
+        });
+        Ok(())
+    })
+    .unwrap();
+    tick(&f.shared, now + 60).await;
+    assert!(
+        !planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .capacity
+            .resumes
+            .contains_key("work-1")
+    );
+    tick(&f.shared, now + 121).await;
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .capacity
+            .resumes["work-1"]
+            .due_at
+            .is_some(),
+        "stale observation must not suppress recovery indefinitely"
+    );
+}
+
+#[tokio::test]
+async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_progress() {
+    use router_acp::planner_adopt::{self, RunStore};
+    use router_acp::planner_release::{self, Checkpoint, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    admit(&f.shared, work("retry"));
+    let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "retry")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(
+        &f.shared,
+        SID,
+        &identity,
+        None,
+        "unchanged failure".into(),
+        false,
+    )
+    .unwrap();
+    let mut source = planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        run.capacity
+            .resumes
+            .entry("retry".into())
+            .or_default()
+            .suspended = Some("missing prerequisite".into());
+        planner_release::record(
+            run,
+            "round",
+            &Checkpoint {
+                stage: Stage::Selected,
+                revision: revision.clone(),
+                works: BTreeMap::from([("work-1".into(), revision.clone())]),
+                replaces: None,
+                evidence: BTreeMap::from([("selection".into(), "selection.md".into())]),
+            },
+        )
+    })
+    .unwrap();
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    {
+        let store = f.shared.state.lock().unwrap();
+        planner_adopt::adopt(&*store, SID, "next").unwrap();
+    }
+    let adopted = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert!(adopted.works["retry"].reconciliation.required);
+    // Adoption retains custody gating even while the destination still awaits its
+    // own execution authorization. The dedicated reconciliation test exercises dispatch.
+    assert!(
+        planner_workflow::begin_work(&f.shared, "next", "retry")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        adopted.capacity.resumes["retry"].suspended.as_deref(),
+        Some("missing prerequisite")
+    );
+    assert_eq!(adopted.releases["round"].stage(), Stage::Selected);
+    planner_workflow::mutate(&f.shared, "next", |run| {
+        planner_release::record(
+            run,
+            "round",
+            &Checkpoint {
+                stage: Stage::CandidatePassed,
+                revision: revision.clone(),
+                works: BTreeMap::new(),
+                replaces: None,
+                evidence: BTreeMap::from([("candidate-build".into(), "build.md".into())]),
+            },
+        )
+    })
+    .unwrap();
+    // Simulate the destination save surviving a crash before source retirement.
+    source.revision = planner_workflow::load(&f.shared, SID)
+        .unwrap()
+        .unwrap()
+        .revision;
+    planner_workflow::save(&f.shared, SID, &mut source).unwrap();
+    let store = f.shared.state.lock().unwrap();
+    planner_adopt::adopt(&*store, SID, "next").unwrap();
+    assert_eq!(
+        RunStore::load(&*store, "next").unwrap().unwrap().releases["round"].stage(),
+        Stage::CandidatePassed
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
+    let f = fixture(|_| {});
+    admit(&f.shared, work("handoff"));
+    let (old, workspace, _, _) = planner_workflow::begin_work(&f.shared, SID, "handoff")
+        .await
+        .unwrap();
+    let mut updated = work("handoff");
+    updated.scope = "carry the combined transferred repair, not the old three-file patch".into();
+    updated.owned_paths = vec!["transfer.txt".into()];
+    std::fs::write(workspace.path.join("transfer.txt"), "preserved source\n").unwrap();
+    git(&workspace.path, &["add", "transfer.txt"]);
+    git(&workspace.path, &["commit", "--quiet", "-m", "transfer"]);
+    let revision = git(&workspace.path, &["rev-parse", "HEAD"]);
+    let operation = Operation::Reconcile {
+        key: "handoff".into(),
+        work: updated.clone(),
+        source_revision: revision.clone(),
+        evidence: vec!["preserved source reviewed against CONTINUE".into()],
+    };
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, operation.clone())
+            .await
+            .unwrap_err()
+            .contains("stop first")
+    );
+    planner_workflow::attempt_ended(&f.shared, SID, &old, None, "interrupted".into(), false)
+        .unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .get_mut("handoff")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_workflow::begin_work(&f.shared, SID, "handoff")
+            .await
+            .unwrap_err()
+            .contains("reconciliation required")
+    );
+    assert!(
+        planner_workflow::operate(&f.shared, SID, Some(&old), operation.clone())
+            .await
+            .is_err()
+    );
+    planner_workflow::operate(&f.shared, SID, None, operation.clone())
+        .await
+        .unwrap();
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, operation)
+            .await
+            .unwrap()
+            .contains("replayed")
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works["handoff"].reconciliation.prior_specs,
+        vec![work("handoff")]
+    );
+    assert!(run.works["handoff"].attempt.is_none());
+    let (current, _, _, prompt) = planner_workflow::begin_work(&f.shared, SID, "handoff")
+        .await
+        .unwrap();
+    assert_ne!(current.attempt_id, old.attempt_id);
+    assert!(prompt.contains(&updated.scope) && prompt.contains(&revision));
+    planner_workflow::attempt_ended(&f.shared, SID, &current, None, "interrupted".into(), false)
+        .unwrap();
+    git(&workspace.path, &["reset", "--hard", "HEAD~1"]);
+    assert!(
+        planner_workflow::begin_work(&f.shared, SID, "handoff")
+            .await
+            .unwrap_err()
+            .contains("reconciled source is not carried")
+    );
+}
+
+#[tokio::test]
+async fn obsolete_worker_retirement_is_verified_terminal_and_not_integration() {
+    let temp = tempfile::tempdir().unwrap();
+    let verdict = temp.path().join("verdict");
+    std::fs::write(&verdict, "legacy").unwrap();
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "cat >/dev/null; test \"$(cat '{}')\" = ok && echo '{{\"verified_action\":\"retire\"}}'; exit 0",
+                    verdict.display()
+                ),
+            ],
+            timeout_ms: 5_000,
+        });
+    });
+    admit(&f.shared, work("release-old"));
+    let (attempt, workspace, _, _) = planner_workflow::begin_work(&f.shared, SID, "release-old")
+        .await
+        .unwrap();
+    let operation = Operation::Retire {
+        key: "retire-old".into(),
+        work_id: "release-old".into(),
+        reason: "parent now owns releases; source and proof remain owed".into(),
+        evidence: BTreeMap::from([("parent-takeover".into(), "evidence.md".into())]),
+    };
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, operation.clone())
+            .await
+            .is_err()
+    );
+    planner_workflow::attempt_ended(&f.shared, SID, &attempt, None, "stopped".into(), false)
+        .unwrap();
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, operation.clone())
+            .await
+            .unwrap_err()
+            .contains("explicitly acknowledge")
+    );
+    std::fs::write(&verdict, "ok").unwrap();
+    planner_workflow::operate(&f.shared, SID, None, operation.clone())
+        .await
+        .unwrap();
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, operation)
+            .await
+            .unwrap()
+            .contains("replayed")
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let retired = &run.works["release-old"];
+    assert_eq!(retired.status, WorkStatus::Retired);
+    assert!(retired.integration.is_none() && retired.artifact.is_none() && workspace.path.exists());
+    assert!(
+        planner_workflow::begin_work(&f.shared, SID, "release-old")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn explicit_implement_adopts_a_cleanly_drained_run_without_losing_accepted_work() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    let empty = planner_workflow::ensure(&f.shared, "next").unwrap();
+    assert!(
+        empty.works.is_empty(),
+        "ordinary session loading must not resume a paused run"
+    );
+    {
+        let store = f.shared.state.lock().unwrap();
+        let report = planner_adopt::adopt_on_implement(&*store, "next").unwrap();
+        assert_eq!(report.works.len(), 1);
+    }
+    let adopted = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert_eq!(adopted.works["work-1"].status, WorkStatus::Finished);
+    assert_eq!(
+        adopted.works["work-1"].artifact.as_ref().unwrap().revision,
+        revision
+    );
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Superseded
+    );
+}
+
 // The native implement-all watcher's guarantees (`planner_guard`) and the
 // `/shutdown` drain (`planner_shutdown`)
 // ---------------------------------------------------------------------------
@@ -2898,9 +4102,17 @@ fn defects(codes: &[&str]) -> String {
 
 async fn status_json(shared: &Arc<Shared>) -> serde_json::Value {
     serde_json::from_str(
-        &planner_workflow::operate(shared, SID, None, Operation::Status { offset: 0 })
-            .await
-            .unwrap(),
+        &planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
     )
     .unwrap()
 }

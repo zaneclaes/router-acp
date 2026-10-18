@@ -19,9 +19,8 @@
 //!    candidates itself through the normal admit / allocate / delegate path.
 //! 5. `complete` is refused while an unheld candidate exists or the host is
 //!    unavailable.
-//! 6. A worker whose turn ends without a receipt is resumed with backoff and
-//!    no cap; an idle parent with a release or running work mid-flight is
-//!    woken.
+//! 6. Workers resume with backoff while recovery can make progress. Missing
+//!    prerequisites and repeated unchanged failures require reconciliation.
 //! 7. `planner_workflow status` and every wake carry the same census.
 
 use std::collections::{BTreeMap, HashSet};
@@ -44,9 +43,9 @@ pub const HOLD_REASONS: [&str; 4] = [
 ];
 /// How long a hold keeps its candidate unadmitted.
 pub const HOLD_MS: i64 = 30 * 60 * 1000;
-/// Delay before each successive resumption of a worker that stopped early;
-/// the last entry repeats with no cap.
+/// Delay before each successive resumption of a worker that stopped early.
 pub const RESUME_BACKOFF_SECS: [i64; 3] = [30, 120, 300];
+pub const SAME_FAILURE_LIMIT: u32 = 3;
 /// The prompt a worker that stopped early is resumed with.
 pub const CONTINUE_PROMPT: &str = "Your work is not finished: continue until its required checks \
      pass and you record the finished receipt; poll your own branch build in the turn. Never \
@@ -153,6 +152,14 @@ pub struct Resume {
     /// count then; a follow-up that completed no turn is not repeated.
     #[serde(default)]
     pub followup: Option<(String, u32)>,
+    #[serde(default)]
+    pub failure_fingerprint: Option<String>,
+    #[serde(default)]
+    pub same_failure_count: u32,
+    /// Suspension does not mark work complete or pause unrelated work. A
+    /// changed prerequisite or explicit parent retry can recover it.
+    #[serde(default)]
+    pub suspended: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,7 +183,7 @@ fn host_configured(shared: &Shared) -> bool {
 }
 
 pub(crate) fn slots(shared: &Shared, run: &PlannerRun) -> (usize, usize, usize) {
-    let max = shared.cfg.delegation.max_concurrent;
+    let max = shared.delegate_limit();
     let live = crate::planner_wake::live_workers(run);
     (live, max, max.saturating_sub(live))
 }
@@ -184,7 +191,7 @@ pub(crate) fn slots(shared: &Shared, run: &PlannerRun) -> (usize, usize, usize) 
 fn terminal(status: WorkStatus) -> bool {
     matches!(
         status,
-        WorkStatus::Integrated | WorkStatus::Blocked | WorkStatus::Watching
+        WorkStatus::Integrated | WorkStatus::Blocked | WorkStatus::Watching | WorkStatus::Retired
     )
 }
 
@@ -434,6 +441,7 @@ pub fn status_block(shared: &Shared, run: &PlannerRun, now_ms: i64) -> Value {
             })).collect::<Vec<_>>()})
     });
     let mut block = json!({"live":live,"max":max,"free":free,"host_configured":host_configured(shared),
+        "configured_at_start":shared.cfg.delegation.max_concurrent,"effective_limit":max,
         "host":host,
         "unheld":unheld_candidates(run, now_ms).iter().map(|c| &c.work.work_id).collect::<Vec<_>>(),
         "holds":run.capacity.holds.values().filter(|h| h.expires_at_ms > now_ms).collect::<Vec<_>>(),
@@ -545,6 +553,25 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     };
     if run.status != RunStatus::Running {
         return;
+    }
+    // Custody fences the affected assignment, not the entire queue. Keep its
+    // recovery wake without starving independent capacity or release/audit wakes.
+    // Admission and dispatch still enforce source ownership and dependencies.
+    if run.works.iter().any(|(id, work)| {
+        work.reconciliation.required && !run.wakes.contains_key(&format!("recovery:{id}"))
+    }) {
+        let _ = planner_workflow::mutate(shared, sid, |current| {
+            for (id, work) in &current.works {
+                if work.reconciliation.required {
+                    current.wakes.entry(format!("recovery:{id}")).or_insert_with(|| Wake {
+                        work_id: id.clone(),
+                        reason: "Parent reconciliation required before resuming this adopted assignment: review current scope, source and CONTINUE, then record planner_workflow reconcile. Independent admissions and releases continue under their normal ownership, dependency and evidence gates.".into(),
+                        ..Default::default()
+                    });
+                }
+            }
+            Ok(())
+        });
     }
     let parent_idle = shared
         .with_session(sid, |s| s.prompt_activity == 0 && !s.pinning)
@@ -816,91 +843,180 @@ async fn auto_admit(
     crate::session::notify_user(shared, sid, format!("router-acp · {reason}"));
 }
 
-/// Resume each worker whose attempt ended without an artifact, a finishing
-/// receipt or a handoff that asks the parent for something, after a backoff
-/// of 30 s, then 2 min, then every 5 min, with no cap.
+fn recovery_prerequisite(run: &PlannerRun, work: &planner_workflow::Work) -> Option<String> {
+    if work.reconciliation.required {
+        return Some("parent reconciliation required: record current scope and preserved source with planner_workflow reconcile".into());
+    }
+    let workspace = work.workspace.as_ref()?;
+    if let Err(error) = planner_workflow::workspace_available(workspace) {
+        return Some(error);
+    }
+    planner_workflow::dependencies_ready(run, work).err()
+}
+
+fn failure_fingerprint(work: &planner_workflow::Work, prerequisite: &Option<String>) -> String {
+    crate::planner_skills::content_hash(
+        &json!({
+            "reason":work.reason,"prerequisite":prerequisite,"artifact":work.artifact,
+            "workspace":work.workspace.as_ref().map(|w| (&w.path, &w.lease)),
+            "review":work.review
+        })
+        .to_string(),
+    )
+}
+
+fn stopped_early(work: &planner_workflow::Work) -> bool {
+    work.attempt.as_ref().is_some_and(|a| a.ended)
+        && work.status == WorkStatus::Interrupted
+        && !work.paused
+        && work.finish.is_none()
+        && work.workspace.is_some()
+        && work
+            .handoff
+            .as_ref()
+            .is_none_or(|h| !PARENT_HANDOFFS.contains(&h.kind.as_str()))
+}
+
+/// Opt-in exact observation identity in a waiting handoff. A stale or failed
+/// observer never parks work indefinitely; normal reconciliation resumes.
+pub(crate) fn waiting_on_build(run: &PlannerRun, work: &planner_workflow::Work, now: i64) -> bool {
+    let id = format!("ci:{}", work.spec.work_id);
+    run.capacity.audit.as_ref().is_some_and(|audit| {
+        audit.ok
+            && audit.observed.contains(&id)
+            && now * 1000 >= audit.at_ms
+            && now * 1000 - audit.at_ms < 120_000
+    }) && run.observations.get(&id).is_some_and(|observation| {
+        observation.state == crate::planner_guard::ObservationState::Pending
+            && work.handoff.as_ref().is_some_and(|handoff| {
+                handoff.kind == "waiting"
+                    && handoff
+                        .message
+                        .split_whitespace()
+                        .any(|word| word == format!("{id}@{}", observation.revision))
+            })
+    })
+}
+
+/// Retry transient interruptions, but do not allocate another model to an
+/// unchanged failure or a missing workspace. The parent owns reconciliation.
 async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: i64) {
     let (mut live, max, _) = slots(shared, run);
     let pinned = shared
         .with_session(sid, |s| s.pin.is_some())
         .unwrap_or(false);
-    let mut schedule = Vec::new();
-    let mut forget = Vec::new();
-    let mut due = Vec::new();
     for (id, work) in &run.works {
         let Some(attempt) = &work.attempt else {
             continue;
         };
-        let stopped_early = attempt.ended
-            && work.status == WorkStatus::Interrupted
-            && !work.paused
-            && work.finish.is_none()
-            && work.workspace.is_some()
-            && work
-                .handoff
-                .as_ref()
-                .is_none_or(|h| !PARENT_HANDOFFS.contains(&h.kind.as_str()));
         let state = run.capacity.resumes.get(id);
-        if !stopped_early {
-            // A resumed turn runs as Running; anything else left this path.
+        if !stopped_early(work) {
             if state.is_some()
-                && !matches!(work.status, WorkStatus::Running | WorkStatus::Allocating)
+                && matches!(work.status, WorkStatus::Finished | WorkStatus::Integrated)
             {
-                forget.push(id.clone());
+                let _ = planner_workflow::mutate(shared, sid, |run| {
+                    if run.works.get(id).is_some_and(|w| {
+                        matches!(w.status, WorkStatus::Finished | WorkStatus::Integrated)
+                    }) {
+                        run.capacity.resumes.remove(id);
+                    }
+                    Ok(())
+                });
             }
             continue;
         }
-        match state.and_then(|s| s.due_at) {
-            None => {
-                let count = state.map_or(0, |s| s.count);
-                let step = RESUME_BACKOFF_SECS[(count as usize).min(RESUME_BACKOFF_SECS.len() - 1)];
-                schedule.push((id.clone(), now + step));
+        let prerequisite = recovery_prerequisite(run, work);
+        if prerequisite.is_none() && waiting_on_build(run, work, now) {
+            continue;
+        }
+        let fingerprint = failure_fingerprint(work, &prerequisite);
+        let changed = state.is_none_or(|s| s.failure_fingerprint.as_ref() != Some(&fingerprint));
+        if changed || state.is_some_and(|s| s.due_at.is_none() && s.suspended.is_none()) {
+            let count = if changed {
+                1
+            } else {
+                state.map_or(1, |s| s.same_failure_count.saturating_add(1))
+            };
+            let suspended = prerequisite.clone().or_else(|| (count >= SAME_FAILURE_LIMIT).then(||
+                format!("{count} consecutive unchanged failures; reconcile this work's evidence and prerequisite before explicitly retrying")));
+            let _ = planner_workflow::mutate(shared, sid, |current| {
+                let current_work = current.works.get(id).ok_or("work disappeared")?;
+                if !stopped_early(current_work)
+                    || current_work.attempt.as_ref().map(|a| &a.id) != Some(&attempt.id)
+                    || failure_fingerprint(
+                        current_work,
+                        &recovery_prerequisite(current, current_work),
+                    ) != fingerprint
+                {
+                    return Err("recovery observation changed".into());
+                }
+                let state = current.capacity.resumes.entry(id.clone()).or_default();
+                state.failure_fingerprint = Some(fingerprint.clone());
+                state.same_failure_count = count;
+                state.suspended = suspended.clone();
+                let step =
+                    RESUME_BACKOFF_SECS[(state.count as usize).min(RESUME_BACKOFF_SECS.len() - 1)];
+                state.due_at = suspended.is_none().then_some(now + step);
+                let wake_id = format!("recovery:{id}");
+                if let Some(reason) = &suspended {
+                    current.wakes.insert(wake_id, Wake {
+                        work_id: id.clone(),
+                        reason: format!("recovery required: {reason}. Automatic retries are suspended for this unchanged condition; other work continues. No receipt or completion was inferred."),
+                        ..Default::default()
+                    });
+                } else if let Some(wake) = current.wakes.get_mut(&wake_id) {
+                    wake.acknowledged = true;
+                }
+                Ok(())
+            });
+            continue;
+        }
+        if state.is_none_or(|s| s.suspended.is_some() || s.due_at.is_none_or(|at| at > now))
+            || !pinned
+            || live >= max
+        {
+            continue;
+        }
+        let open = attempt.delegate_id.as_ref().and_then(|delegate| {
+            shared
+                .live_delegates
+                .lock()
+                .unwrap()
+                .get(delegate)
+                .map(|d| (delegate.clone(), d.turns))
+        });
+        let prior = state.and_then(|s| s.followup.as_ref());
+        let followup = open.filter(|(delegate, turns)| {
+            prior.is_none_or(|(was, at_turns)| was != delegate || turns > at_turns)
+        });
+        let saved = planner_workflow::mutate(shared, sid, |current| {
+            let current_work = current.works.get(id).ok_or("work disappeared")?;
+            if current.status != RunStatus::Running
+                || current.phase != PlannerPhase::Implementation
+                || !stopped_early(current_work)
+                || current_work.attempt.as_ref().map(|a| &a.id) != Some(&attempt.id)
+                || failure_fingerprint(current_work, &recovery_prerequisite(current, current_work))
+                    != fingerprint
+            {
+                return Err("recovery observation changed".into());
             }
-            Some(at) if at <= now && pinned && live < max => {
-                live += 1;
-                // Resume on the open sub-session, unless the last follow-up
-                // there completed no turn (it was refused): then a fresh
-                // attempt in the same workspace.
-                let open = attempt.delegate_id.as_ref().and_then(|delegate| {
-                    shared
-                        .live_delegates
-                        .lock()
-                        .unwrap()
-                        .get(delegate)
-                        .map(|d| (delegate.clone(), d.turns))
-                });
-                let prior = state.and_then(|s| s.followup.as_ref());
-                let followup = open.filter(|(delegate, turns)| {
-                    prior.is_none_or(|(was, at_turns)| was != delegate || turns > at_turns)
-                });
-                due.push((id.clone(), followup, work.spec.scope.clone()));
+            let state = current
+                .capacity
+                .resumes
+                .get_mut(id)
+                .ok_or("recovery state disappeared")?;
+            if state.suspended.is_some() || state.due_at.is_none_or(|at| at > now) {
+                return Err("recovery already claimed".into());
             }
-            Some(_) => {}
-        }
-    }
-    if schedule.is_empty() && forget.is_empty() && due.is_empty() {
-        return;
-    }
-    let saved = planner_workflow::mutate(shared, sid, |run| {
-        for id in &forget {
-            run.capacity.resumes.remove(id);
-        }
-        for (id, at) in &schedule {
-            run.capacity.resumes.entry(id.clone()).or_default().due_at = Some(*at);
-        }
-        for (id, followup, _) in &due {
-            let state = run.capacity.resumes.entry(id.clone()).or_default();
             state.count += 1;
             state.due_at = None;
             state.followup = followup.clone();
+            Ok(())
+        });
+        if saved.is_err() {
+            continue;
         }
-        Ok(())
-    });
-    if let Err(error) = saved {
-        tracing::warn!(session = sid, %error, "worker resumption state not saved");
-        return;
-    }
-    for (work_id, followup, scope) in due {
+        live += 1;
         let result = match followup {
             Some((delegate_id, _)) => crate::delegate_mcp::resume_planner_worker(
                 shared,
@@ -912,8 +1028,8 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
                 crate::delegate_mcp::start_planner_worker(
                     shared,
                     sid,
-                    &work_id,
-                    format!("{CONTINUE_PROMPT}\nAssigned scope: {scope}"),
+                    id,
+                    format!("{CONTINUE_PROMPT}\nAssigned scope: {}", work.spec.scope),
                 )
                 .await
             }
@@ -921,11 +1037,11 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
         match result {
             Ok(_) => tracing::info!(
                 session = sid,
-                work_id,
+                work_id = id,
                 "resumed a worker that stopped early"
             ),
             Err(error) => {
-                tracing::warn!(session = sid, work_id, %error, "worker resumption failed; retrying on backoff")
+                tracing::warn!(session = sid, work_id = id, %error, "worker resumption failed; reconciliation applies before another retry")
             }
         }
     }
@@ -942,7 +1058,7 @@ fn inflight_wake(
     timing: &PlannerCapacityConfig,
 ) {
     let inflight = |run: &PlannerRun| {
-        let inflight = run
+        let mut inflight = run
             .works
             .iter()
             .filter(|(_, w)| {
@@ -951,6 +1067,12 @@ fn inflight_wake(
             })
             .map(|(id, w)| format!("{id} ({:?})", w.status))
             .collect::<Vec<_>>();
+        inflight.extend(
+            run.releases
+                .iter()
+                .filter(|(_, release)| release.active())
+                .map(|(id, release)| format!("{id} ({:?})", release.stage())),
+        );
         let due = !inflight.is_empty()
             && idle >= timing.wake_after_secs as i64
             && now - run.capacity.last_inflight_wake_at >= timing.inflight_wake_secs as i64

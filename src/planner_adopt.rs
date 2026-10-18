@@ -8,7 +8,8 @@
 //! `rtr-…-7e0b07cc` started from nothing). Now:
 //!
 //! - `/implement` adopts the latest earlier run of the same checkout when it
-//!   is `running` or `draining` and has no live owner (`adopt_on_implement`);
+//!   is `running`, `draining` or cleanly `paused` and has no live owner
+//!   (`adopt_on_implement`); ordinary session loading never resumes it;
 //! - `router-acp adopt-run --from <old> --into <new>` does the same for two
 //!   named sessions, against the state database, while the new router runs.
 //!
@@ -113,6 +114,7 @@ pub struct AdoptReport {
     /// Works the new run already had under the same id: left with the old run.
     pub conflicting_works: Vec<String>,
     pub holds: Vec<String>,
+    pub releases: Vec<String>,
     pub wakes: Vec<String>,
     /// Operator inputs surfaced to the new parent first, in delivery order.
     pub operator_inputs: Vec<String>,
@@ -211,10 +213,23 @@ pub fn live_owner(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -
 }
 
 fn adoptable(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Result<(), String> {
-    if !matches!(run.status, RunStatus::Running | RunStatus::Draining) {
+    if !matches!(
+        run.status,
+        RunStatus::Running | RunStatus::Draining | RunStatus::Paused
+    ) {
         return Err(format!(
-            "planner run {sid} is {:?}, not running or draining",
+            "planner run {sid} is {:?}, not running, draining or paused",
             run.status
+        ));
+    }
+    if run.status == RunStatus::Paused
+        && run
+            .works
+            .values()
+            .any(|work| work.attempt.as_ref().is_some_and(|attempt| !attempt.ended))
+    {
+        return Err(format!(
+            "paused planner run {sid} still has unfinished attempts; finish its drain first"
         ));
     }
     if let Some(reason) = live_owner(store, sid, run, now) {
@@ -226,25 +241,94 @@ fn adoptable(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Res
 }
 
 /// Move `from`'s adoptable state into `into` (in memory).
-fn merge(into: &mut PlannerRun, from: &PlannerRun, from_sid: &str, into_sid: &str) -> AdoptReport {
+fn merge(
+    into: &mut PlannerRun,
+    from: &PlannerRun,
+    from_sid: &str,
+    into_sid: &str,
+) -> Result<AdoptReport, String> {
     let mut report = AdoptReport {
         from: from_sid.into(),
         into: into_sid.into(),
         ..Default::default()
     };
+    for policy in from
+        .prior_policies
+        .iter()
+        .chain(std::iter::once(&from.policy))
+    {
+        if policy.identity != into.policy.identity
+            && !into
+                .prior_policies
+                .iter()
+                .any(|p| p.identity == policy.identity)
+        {
+            into.prior_policies.push(policy.clone());
+        }
+    }
+    if into.completed_guides_at_start.is_none() {
+        into.completed_guides_at_start = from.completed_guides_at_start.clone();
+    }
     for (id, work) in &from.works {
-        if into.works.contains_key(id) {
-            report.conflicting_works.push(id.clone());
+        if let Some(existing) = into.works.get(id) {
+            if existing.child_id == work.child_id
+                && (existing.spec == work.spec
+                    || existing.reconciliation.prior_specs.contains(&work.spec))
+            {
+                // The destination save may have survived a crash before the
+                // source was retired. Never overwrite its subsequent progress.
+                report.works.push((id.clone(), existing.status));
+            } else {
+                report.conflicting_works.push(id.clone());
+            }
         } else {
-            into.works.insert(id.clone(), work.clone());
+            let mut adopted = work.clone();
+            crate::planner_workflow::mark_reconciliation_required(&mut adopted);
+            into.works.insert(id.clone(), adopted);
+            if let Some(recovery) = from.capacity.resumes.get(id) {
+                into.capacity.resumes.insert(id.clone(), recovery.clone());
+            }
             report.works.push((id.clone(), work.status));
         }
+    }
+    for (id, release) in &from.releases {
+        if release
+            .works
+            .keys()
+            .any(|work| report.conflicting_works.contains(work))
+        {
+            return Err(format!(
+                "release {id} includes a conflicting work identity; reconcile it before adoption"
+            ));
+        }
+        if let Some(existing) = into.releases.get(id) {
+            if existing.candidate != release.candidate
+                || existing.works != release.works
+                || !existing.checkpoints.starts_with(&release.checkpoints)
+                || release
+                    .superseded_by
+                    .as_ref()
+                    .is_some_and(|replacement| existing.superseded_by.as_ref() != Some(replacement))
+            {
+                return Err(format!(
+                    "release {id} already names different evidence; reconcile it before adoption"
+                ));
+            }
+        } else {
+            into.releases.insert(id.clone(), release.clone());
+        }
+        report.releases.push(id.clone());
     }
     for (plan, hold) in &from.capacity.holds {
         if !into.capacity.holds.contains_key(plan) {
             into.capacity.holds.insert(plan.clone(), hold.clone());
             report.holds.push(plan.clone());
         }
+    }
+    for (id, observation) in &from.observations {
+        into.observations
+            .entry(id.clone())
+            .or_insert_with(|| observation.clone());
     }
     for (id, input) in &from.inputs {
         into.inputs
@@ -339,13 +423,17 @@ fn merge(into: &mut PlannerRun, from: &PlannerRun, from_sid: &str, into_sid: &st
         report.wakes.push(id.clone());
     }
     into.idle_heartbeats = 0;
-    report
+    Ok(report)
 }
 
 /// What stays with the superseded run: everything not moved.
 fn retire(from: &mut PlannerRun, report: &AdoptReport) {
     for (id, _) in &report.works {
         from.works.remove(id);
+        from.capacity.resumes.remove(id);
+    }
+    for id in &report.releases {
+        from.releases.remove(id);
     }
     for plan in &report.holds {
         from.capacity.holds.remove(plan);
@@ -367,7 +455,7 @@ fn retire(from: &mut PlannerRun, report: &AdoptReport) {
 }
 
 /// Adopt `from_sid`'s run into `into_sid`'s. Both runs must exist; `from`
-/// must be running or draining with no live owner.
+/// must be running, draining or cleanly paused with no live owner.
 pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<AdoptReport, String> {
     if from_sid == into_sid {
         return Err("a run cannot adopt itself".into());
@@ -384,7 +472,7 @@ pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<Ado
             return Err(format!("planner run {into_sid} is itself superseded"));
         }
         adoptable(store, from_sid, &from, chrono::Utc::now().timestamp())?;
-        let merged = merge(&mut into, &from, from_sid, into_sid);
+        let merged = merge(&mut into, &from, from_sid, into_sid)?;
         match store.save(into_sid, &mut into) {
             Ok(()) => {
                 report = Some(merged);
@@ -412,7 +500,7 @@ pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<Ado
 }
 
 /// `/implement` in `into_sid`: resume the checkout's latest earlier planner
-/// run when it is running or draining with no live owner. Older runs are what
+/// run when it is running, draining or cleanly paused with no live owner. Older runs are what
 /// that latest one replaced and are left alone.
 pub fn adopt_on_implement(store: &dyn RunStore, into_sid: &str) -> Option<AdoptReport> {
     let ids = store.run_ids_beside(into_sid).ok()?;

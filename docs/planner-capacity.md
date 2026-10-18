@@ -116,13 +116,25 @@ is not one) is resumed with:
 
 It resumes on its open sub-session when that is still live, otherwise as a
 fresh attempt in the same workspace, after 30 s, then 2 min, then every 5 min,
-with no cap, whenever a slot is free. Interrupted works with a live workspace
-(for example after a router restart) are retried the same way. A paused work
-or a run outside the implementation phase is never resumed.
+whenever a slot is free. Three identical failure observations suspend retry and emit
+one reconciliation wake. Missing workspaces and unmet prerequisites suspend before
+any model attempt. The fingerprint includes reason, prerequisite, artifact, workspace
+lease and review. Changed conditions rearm recovery; explicit parent retry remains
+possible. Paused work never auto-resumes. Accepted unchanged packets resume finish-work.
+
+Adopted assignments with `reconciliation.required` stay fenced until the parent reconciles
+their scope and source. Their recovery wakes do not stop capacity checks, independent
+auto-admission, or release/audit reminders. Ownership conflicts and dependencies still block
+the affected candidates through the normal admission and dispatch checks.
+
+A waiting handoff can name `ci:<work_id>@<full SHA>` as a whitespace-delimited token.
+A fresh matching pending observation parks it without a model turn. Terminal, missing,
+stale (two minutes) or failed observations restore normal reconciliation. Observations
+never supply branch qualification themselves.
 
 ## In-flight wakes
 
-While a `release` work (any work whose `plan_id` is `release`) or any running
+While a durable release checkpoint, a legacy `release` work, or any running
 work is mid-flight, an idle parent gets an `inflight:` wake after
 `wake_after_secs`, then at most every `inflight_wake_secs`. It must not sit
 idle after a staging deploy.
@@ -134,6 +146,13 @@ idle after a staging deploy.
 candidate's `open` and `held` state), `unheld`, active `holds`,
 `unfilled_wakes`, `last_auto_admission` and `resumes`. The census line on
 every wake repeats the host state, the holds and the last auto-admission.
+
+`configured_at_start` and `effective_limit` distinguish file settings from running
+permits. Direct ACP `router.worker_limit` acknowledges immediate increases; decreases need
+a configured restart. Kory's current Goose config handler does not forward this custom
+option; use the configured limit on restart there, and never infer live capacity from
+a file edit. Targeted `status {work_id}` gives compact capacity. Progress
+separates work counts from host-observed landed guides. See [durable progress](planner-throughput.md).
 
 Router-owned `capacity:`, `auto-admit:`, `inflight:`, `audit:`, `gate:` and
 `adopt-native:` wakes are acknowledged once delivered; the router recreates

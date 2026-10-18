@@ -243,12 +243,20 @@ pub fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
 /// The worker census every wake carries, so a parent below its limit sees the
 /// free slots and the interrupted works waiting for a retry.
 pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -> String {
-    let cap = shared.cfg.delegation.max_concurrent;
+    let cap = shared.delegate_limit();
     let live = live_workers(run);
     let mut interrupted = run
         .works
         .iter()
-        .filter(|(_, w)| w.status == planner_workflow::WorkStatus::Interrupted)
+        .filter(|(id, w)| {
+            w.status == planner_workflow::WorkStatus::Interrupted
+                && !w.paused
+                && run
+                    .capacity
+                    .resumes
+                    .get(*id)
+                    .is_none_or(|r| r.suspended.is_none())
+        })
         .map(|(id, _)| id.as_str())
         .collect::<Vec<_>>();
     interrupted.sort_unstable();
@@ -261,6 +269,52 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
             " Interrupted, awaiting retry: {}.",
             interrupted.join(", ")
         ));
+    }
+    let recovery = run
+        .capacity
+        .resumes
+        .iter()
+        .filter(|(_, state)| state.suspended.is_some())
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    if !recovery.is_empty() {
+        line.push_str(&format!(" Reconciliation required (automatic retries suspended): {}. Repair the prerequisite before an explicit retry; do not re-delegate an unchanged failure.", recovery.join(", ")));
+    }
+    let ready = run
+        .works
+        .values()
+        .filter(|w| w.status == planner_workflow::WorkStatus::Finished)
+        .count();
+    let review = run
+        .works
+        .values()
+        .filter(|w| w.status == planner_workflow::WorkStatus::ReviewPending)
+        .count();
+    line.push_str(&format!(" [Progress] {ready} work packets await integration; {review} await review. These are not completed plans. Prioritize actionable release gates and dispositions, while independent workers continue."));
+    if let Some(at) = run
+        .works
+        .values()
+        .filter(|work| work.status == planner_workflow::WorkStatus::Finished)
+        .filter_map(|work| work.ready_at_ms)
+        .min()
+    {
+        line.push_str(&format!(
+            " Oldest measured ready packet: {}s.",
+            (chrono::Utc::now().timestamp_millis() - at).max(0) / 1000
+        ));
+    }
+    for (id, release) in run.releases.iter().filter(|(_, release)| release.active()) {
+        line.push_str(&format!(" Release {id}: {:?}.", release.stage()));
+    }
+    if let Some(current) = run
+        .capacity
+        .audit
+        .as_ref()
+        .filter(|audit| audit.ok)
+        .and_then(|audit| audit.completed_guides.as_ref())
+        && let Some(initial) = &run.completed_guides_at_start
+    {
+        line.push_str(&format!(" Repository host confirms {} guides now in Completed on staging; {} new paths since this run's first audit.", current.len(), current.difference(initial).count()));
     }
     if live < cap {
         line.push_str(
@@ -296,7 +350,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     }
     let live = live_workers(run);
-    let cap = shared.cfg.delegation.max_concurrent;
+    let cap = shared.delegate_limit();
     // Full slots excuse the heartbeat only while the audit is clean.
     if live >= cap && !crate::planner_guard::audit_open(run) {
         if run.idle_heartbeats != 0 {
@@ -348,6 +402,24 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     });
 }
 
+fn wake_priority(id: &str) -> u8 {
+    if id.starts_with("input:") {
+        0
+    } else if id.starts_with("release:") || id.starts_with("observation:") {
+        1
+    } else if id.starts_with("recovery:") {
+        2
+    } else if id.starts_with("capacity:")
+        || id.starts_with("inflight:")
+        || id.starts_with("gate:")
+        || id.starts_with("audit:")
+    {
+        4
+    } else {
+        3
+    }
+}
+
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     let run = planner_workflow::load(shared, sid)?.ok_or("planner state missing")?;
     if let Some(input) = run.parent_queue.first() {
@@ -363,13 +435,11 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
             return Ok(());
         }
-        // Original operator input (an `input:` wake) leads the batch.
-        let (inputs, others): (Vec<String>, Vec<String>) = run
-            .wakes
-            .keys()
-            .cloned()
-            .partition(|id| id.starts_with("input:"));
-        for id in inputs.into_iter().chain(others) {
+        // Keep every durable wake, but actionable release/review transitions
+        // lead repetitive capacity reminders. Operator input always wins.
+        let mut ordered = run.wakes.keys().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|id| wake_priority(id));
+        for id in ordered {
             let wake = run.wakes.get_mut(&id).expect("listed above");
             if wake.acknowledged || wake.retry_after > now {
                 continue;

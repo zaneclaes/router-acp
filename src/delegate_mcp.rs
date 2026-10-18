@@ -1417,6 +1417,8 @@ async fn begin_planner_attempt(
         .work_id
         .clone()
         .ok_or("planner attempt needs a work_id")?;
+    let (identity, workspace, child_id, instructions) =
+        crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
     args.planner_role = Some(
         if crate::planner_workflow::load(shared, router_sid)?
             .and_then(|run| run.works.get(&work_id).map(|w| w.status))
@@ -1427,8 +1429,6 @@ async fn begin_planner_attempt(
             crate::planner_skills::PlannerRole::ImplementWork
         },
     );
-    let (identity, workspace, child_id, instructions) =
-        crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
     args.classification_text = Some(args.task.clone());
     args.task = format!("{instructions}\n[Assignment briefing]\n{}", args.task);
     args.planner_identity = Some(identity.clone());

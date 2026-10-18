@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
@@ -681,6 +681,7 @@ pub struct Shared {
     /// body)), so concurrent sessions share one fetch.
     pub ticket_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
     pub delegate_semaphore: Arc<tokio::sync::Semaphore>,
+    delegate_limit: AtomicUsize,
     pub delegate_socket: OnceLock<PathBuf>,
     upstream: OnceLock<ConnectionTo<ClientPeer>>,
     client_caps: OnceLock<ClientCapabilities>,
@@ -816,6 +817,7 @@ impl Shared {
             worker_handoffs: Mutex::new(HashMap::new()),
             ticket_cache: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            delegate_limit: AtomicUsize::new(max_concurrent),
             delegate_socket: OnceLock::new(),
             upstream: OnceLock::new(),
             client_caps: OnceLock::new(),
@@ -1568,6 +1570,36 @@ impl Shared {
     // Router-owned session config options
     // ------------------------------------------------------------------
 
+    pub fn delegate_limit(&self) -> usize {
+        self.delegate_limit.load(Ordering::Acquire)
+    }
+
+    /// Increasing capacity never disturbs live permits. Decreases take
+    /// effect through the configured limit at the next process start.
+    pub fn increase_delegate_limit(&self, requested: usize) -> Result<(), String> {
+        if requested == 0 || requested > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err("worker limit is outside the supported positive range".into());
+        }
+        let mut previous = self.delegate_limit();
+        loop {
+            if requested < previous {
+                return Err("lowering the worker limit requires a restart with the configured limit; running workers were not changed".into());
+            }
+            match self.delegate_limit.compare_exchange(
+                previous,
+                requested,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.delegate_semaphore.add_permits(requested - previous);
+                    return Ok(());
+                }
+                Err(current) => previous = current,
+            }
+        }
+    }
+
     pub fn router_config_options(&self, router_sid: &str) -> Vec<SessionConfigOption> {
         let (strategy, override_, effort) = self
             .with_session(router_sid, |s| {
@@ -1743,7 +1775,21 @@ impl Shared {
                 .to_string(),
         );
 
-        vec![strategy_option, candidate_option, effort_option]
+        let limit = self.delegate_limit();
+        let mut limits = vec![limit, 20, 32, 50, 64, 100];
+        limits.retain(|value| *value >= limit);
+        limits.sort_unstable();
+        limits.dedup();
+        let worker_option = SessionConfigOption::select(
+            "router.worker_limit", "Worker limit (this router process)", limit.to_string(),
+            limits.into_iter().map(|value| SessionConfigSelectOption::new(value.to_string(), value.to_string())).collect::<Vec<_>>()
+        ).description(format!("Effective limit: {limit}; configured at startup: {}. Increasing takes effect immediately. Saved configuration controls the next restart.", self.cfg.delegation.max_concurrent));
+        vec![
+            strategy_option,
+            candidate_option,
+            effort_option,
+            worker_option,
+        ]
     }
 }
 
@@ -9492,7 +9538,16 @@ async fn on_set_config_option(
                         SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
                         _ => String::new(),
                     };
-                    if config_id == "router.effort" {
+                    if config_id == "router.worker_limit" {
+                        match value
+                            .parse::<usize>()
+                            .map_err(|_| "worker limit must be a positive integer".to_string())
+                            .and_then(|limit| shared.increase_delegate_limit(limit))
+                        {
+                            Ok(()) => Action::RouterUpdated,
+                            Err(error) => Action::BadValue(error),
+                        }
+                    } else if config_id == "router.effort" {
                         match EffortLevel::parse(&value) {
                             Some(EffortLevel::Auto) => {
                                 session.effort_request = None;

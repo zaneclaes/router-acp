@@ -281,6 +281,26 @@ enum Command {
         #[arg(long)]
         into: String,
     },
+    /// Send an agent-origin correction to a running planner's durable queue,
+    /// or inspect its delivery receipt. Does not start or take over a session.
+    PlannerInput {
+        #[arg(long, default_value = "~/.local/state/router-acp/sessions.db")]
+        state: PathBuf,
+        #[arg(long)]
+        session: String,
+        /// Stable caller-chosen id; retrying the same id never duplicates input.
+        #[arg(long)]
+        id: String,
+        /// Expected checkout. Required for sending; ignored for status.
+        #[arg(long, required_unless_present = "status")]
+        cwd: Option<PathBuf>,
+        /// Read a UTF-8 message from this file (use - for stdin).
+        #[arg(long, required_unless_present = "status", conflicts_with = "status")]
+        message_file: Option<PathBuf>,
+        /// Read delivery/acknowledgment metadata without modifying state.
+        #[arg(long)]
+        status: bool,
+    },
     /// Read router-owned state through the versioned, read-only JSON boundary.
     /// Hosts must use this instead of opening the SQLite database themselves.
     StateQuery {
@@ -887,6 +907,48 @@ async fn main() -> anyhow::Result<()> {
                     println!("    detail: {detail}");
                 }
             }
+            Ok(())
+        }
+        Command::PlannerInput {
+            state,
+            session,
+            id,
+            cwd,
+            message_file,
+            status,
+        } => {
+            let path = router_acp::config::expand_tilde(&state);
+            let retention = router_acp::state::Retention {
+                max_age: std::time::Duration::MAX,
+            };
+            let report = if status {
+                let store = router_acp::state::StateStore::open_readonly(&path, retention)?;
+                router_acp::planner_input::status(&store, &session, &id)
+            } else {
+                use std::io::Read;
+                let file = message_file.expect("clap requires a message file");
+                let reader: Box<dyn Read> = if file.as_os_str() == "-" {
+                    Box::new(std::io::stdin())
+                } else {
+                    Box::new(std::fs::File::open(file)?)
+                };
+                let mut message = String::new();
+                reader.take(65537).read_to_string(&mut message)?;
+                anyhow::ensure!(
+                    !router_acp::state::StateStore::state_absent(&path),
+                    "router state does not exist"
+                );
+                let store = router_acp::state::StateStore::load(&path, retention);
+                router_acp::planner_input::send(
+                    &store,
+                    &session,
+                    &cwd.expect("clap requires cwd"),
+                    &id,
+                    &message,
+                )
+            }
+            .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Command::AdoptRun { state, from, into } => {

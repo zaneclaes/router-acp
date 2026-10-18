@@ -1912,6 +1912,64 @@ async fn pre_pin_candidate_override_and_post_pin_rejection() {
 }
 
 // goose sets its configured model on the session before the first prompt and
+#[tokio::test]
+async fn worker_limit_change_is_acknowledged_after_pin_and_visible_to_other_sessions() {
+    let state = temp_state_file("worker-limit");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 2 }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, _observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        prompt_text(&cx, &sid, "pin").await?;
+        let set = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                sid.clone(),
+                "router.worker_limit".to_string(),
+                SessionConfigOptionValue::value_id("5"),
+            ))
+            .block_task()
+            .await?;
+        let option = set
+            .config_options
+            .iter()
+            .find(|o| o.id.0.as_ref() == "router.worker_limit")
+            .unwrap();
+        let SessionConfigKind::Select(select) = &option.kind else {
+            panic!("select expected")
+        };
+        assert_eq!(select.current_value.0.as_ref(), "5");
+        let error = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                sid,
+                "router.worker_limit".to_string(),
+                SessionConfigOptionValue::value_id("1"),
+            ))
+            .block_task()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("restart"));
+        let other = new_session(&cx).await?;
+        let option = other
+            .config_options
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|o| o.id.0.as_ref() == "router.worker_limit")
+            .unwrap();
+        let SessionConfigKind::Select(select) = &option.kind else {
+            panic!("select expected")
+        };
+        assert_eq!(select.current_value.0.as_ref(), "5");
+        Ok(())
+    })
+    .await;
+}
+
+// goose sets its configured model on the session before the first prompt and
 // aborts the run if the set is refused, which took down every scheduled recipe.
 // `default`/`auto` carries no preference (router-acp picks), but a concrete
 // candidate must be honored rather than silently dropped.
@@ -12969,6 +13027,8 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
                     plan_id: "plan-1".into(),
                     scope: "restore the child presentation".into(),
                     dependencies: Vec::new(),
+                    ready_dependencies: Default::default(),
+                    owned_paths: Vec::new(),
                     required_checks: Vec::new(),
                     required_integration_evidence: Vec::new(),
                     external_id: Some("external-work".into()),
@@ -13830,6 +13890,104 @@ async fn queued_operator_input_is_delivered_before_the_next_router_owned_turn() 
                 read_log(&log)
             );
             assert!(second[0] < wakes[0], "queued operator input went first");
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&hold);
+}
+
+/// A separate CLI process can send to a live, busy parent without taking it
+/// over. The existing wake loop delivers once after the active turn ends.
+#[tokio::test]
+async fn planner_input_cli_delivers_to_live_parent_without_takeover_or_duplicate() {
+    let state = temp_state_file("monitor-input-cli");
+    let log = temp_log("monitor-input-cli");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&release, "").unwrap();
+    let hold = std::env::temp_dir().join(format!("hold-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    let message = repo.path().join("monitor.txt");
+    std::fs::write(&message, "TEXT:external-monitor-correction").unwrap();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let first = {
+                let cx = cx.clone();
+                let sid = sid.clone();
+                let text = format!("busy operator turn\nWAIT_FILE:{}", hold.display());
+                tokio::spawn(async move { prompt_text(&cx, &sid, &text).await })
+            };
+            wait_for_mock_prompt(&log, "busy operator turn").await;
+            router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                run.owner = Some(router_acp::planner_workflow::RunOwner::current());
+                Ok(())
+            })
+            .unwrap();
+            let call = |status: bool| {
+                let mut cmd = std::process::Command::new(router_exe());
+                cmd.args(["planner-input", "--state"]).arg(&state).args([
+                    "--session",
+                    &sid,
+                    "--id",
+                    "external-monitor",
+                ]);
+                if status {
+                    cmd.arg("--status");
+                } else {
+                    cmd.arg("--cwd")
+                        .arg(repo.path().join("repo"))
+                        .arg("--message-file")
+                        .arg(&message);
+                }
+                let output = cmd.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&output.stdout)
+                        .contains("external-monitor-correction")
+                );
+                report
+            };
+            assert_eq!(call(false)["queued"], true);
+            assert_eq!(call(false)["queued"], true);
+            assert!(
+                !first.is_finished(),
+                "monitor did not interrupt the active turn"
+            );
+            std::fs::write(&hold, "").unwrap();
+            first.await.unwrap()?;
+            wait_for_prompt_index(&log, "external-monitor-correction").await;
+            for _ in 0..150 {
+                let run = router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap();
+                if run.parent_queue.is_empty()
+                    && run.inputs["external-monitor"].delivered_to.contains(&sid)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let receipt = call(true);
+            assert_eq!(receipt["queued"], false);
+            assert_eq!(receipt["delivered"], true);
+            assert_eq!(call(false)["queued"], false);
+            let run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                run.owner,
+                Some(router_acp::planner_workflow::RunOwner::current())
+            );
+            assert_eq!(run.inputs["external-monitor"].origin, "agent");
+            assert_eq!(mock_prompts(&log, "external-monitor-correction").len(), 1);
             Ok(())
         },
     )

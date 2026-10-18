@@ -69,6 +69,10 @@ pub struct AuditSnapshot {
     pub error: Option<String>,
     #[serde(default)]
     pub defects: Vec<Defect>,
+    #[serde(default)]
+    pub observed: BTreeSet<String>,
+    #[serde(default)]
+    pub completed_guides: Option<BTreeSet<String>>,
 }
 
 /// Turn-end gate state: the backoff step of the next re-prompt. (Which turn
@@ -89,6 +93,76 @@ struct AuditReply {
     hold_valid: Option<bool>,
     #[serde(default)]
     reason: Option<String>,
+    /// Optional observations from the repository's existing CI/rollout
+    /// readers. They wake the parent; they never satisfy a release gate.
+    #[serde(default)]
+    observations: BTreeMap<String, Observation>,
+    #[serde(default)]
+    completed_guides: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observation {
+    pub revision: String,
+    pub reference: String,
+    pub state: ObservationState,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObservationState {
+    Pending,
+    Passed,
+    Failed,
+    Unknown,
+}
+
+fn validate_observations(observations: &BTreeMap<String, Observation>) -> Result<(), String> {
+    if observations.len() > 128 {
+        return Err("audit returned more than 128 observations".into());
+    }
+    for (id, observation) in observations {
+        if id.trim().is_empty()
+            || id.len() > 256
+            || observation.revision.len() != 40
+            || !observation.revision.bytes().all(|b| b.is_ascii_hexdigit())
+            || !planner_workflow::valid_evidence(&observation.reference)
+            || !planner_workflow::valid_evidence(&observation.evidence)
+        {
+            return Err(
+                "audit observation requires an id, full revision, exact reference and evidence"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn record_observations(
+    run: &mut PlannerRun,
+    sid: &str,
+    observations: &BTreeMap<String, Observation>,
+) {
+    for (id, observation) in observations {
+        if run.observations.get(id) == Some(observation) {
+            continue;
+        }
+        // One pending wake per observed target; the model sees the latest
+        // actionable delta. Existing conversation history is not pruned.
+        run.observations.insert(id.clone(), observation.clone());
+        let wake_id = format!("observation:{id}");
+        if observation.state != ObservationState::Pending {
+            run.wakes.insert(wake_id, Wake {
+                work_id: sid.into(),
+                reason: format!("Repository observation {id}: {:?} for {} at {}. Evidence: {}. Reconcile the exact revision and advance its next required step; this observation is not an acceptance, smoke or completion receipt.", observation.state, observation.reference, observation.revision, observation.evidence),
+                ..Default::default()
+            });
+        } else if let Some(wake) = run.wakes.get_mut(&wake_id) {
+            wake.acknowledged = true;
+        }
+    }
 }
 
 /// In-process state of one planner session that never needs to survive the
@@ -263,7 +337,7 @@ async fn audit(
     let (_, max, free) = planner_capacity::slots(shared, run);
     let mut input = json!({"event":"audit","cwd":cwd,"session_id":sid,"free":free,"max":max,
         "run_status":run.status,"completing":completing,"works":works_json(run),
-        "holds":active_holds(run, now_ms)});
+        "holds":active_holds(run, now_ms),"releases":run.releases,"observations":run.observations});
     if let Some(check) = hold_check {
         input["hold_check"] = check;
     }
@@ -278,7 +352,11 @@ async fn audit(
     .await
     {
         Ok(out) if out.code == Some(0) => serde_json::from_slice::<AuditReply>(&out.stdout)
-            .map_err(|e| format!("audit host returned invalid JSON: {e}")),
+            .map_err(|e| format!("audit host returned invalid JSON: {e}"))
+            .and_then(|reply| {
+                validate_observations(&reply.observations)?;
+                Ok(reply)
+            }),
         Ok(out) => Err(format!("audit host exited with {}", out.describe())),
         Err(error) => Err(error),
     };
@@ -308,21 +386,34 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     let Some(answer) = audit(shared, sid, &run, now_ms, false, None).await else {
         return;
     };
+    let observations = answer
+        .as_ref()
+        .ok()
+        .map(|reply| reply.observations.clone())
+        .unwrap_or_default();
     let snapshot = match answer {
         Ok(reply) => AuditSnapshot {
             at_ms: now_ms,
             ok: true,
             error: None,
             defects: reply.defects,
+            observed: reply.observations.keys().cloned().collect(),
+            completed_guides: reply.completed_guides,
         },
         Err(error) => AuditSnapshot {
             at_ms: now_ms,
             ok: false,
             error: Some(error),
             defects: Vec::new(),
+            observed: BTreeSet::new(),
+            completed_guides: None,
         },
     };
     if let Err(error) = planner_workflow::mutate(shared, sid, |run| {
+        record_observations(run, sid, &observations);
+        if run.completed_guides_at_start.is_none() {
+            run.completed_guides_at_start = snapshot.completed_guides.clone();
+        }
         run.capacity.audit = Some(snapshot.clone());
         Ok(())
     }) {
@@ -599,7 +690,24 @@ pub async fn integrate_check(shared: &Shared, sid: &str, operation: &Value) -> R
     )
     .await
     {
-        Ok(out) if out.code == Some(0) => Ok(()),
+        Ok(out) if out.code == Some(0) => {
+            if matches!(action.as_str(), "finalize" | "release" | "retire")
+                && serde_json::from_slice::<Value>(&out.stdout)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("verified_action")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    != Some(&action)
+            {
+                return Err(format!(
+                    "{action} not recorded: integrate-check host did not explicitly acknowledge this action; update the repository host before using it"
+                ));
+            }
+            Ok(())
+        }
         Ok(out) if out.code == Some(2) => Err(format!(
             "{action} rejected by the integrate-check host: {}",
             if out.stderr.is_empty() {
