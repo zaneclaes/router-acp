@@ -345,8 +345,7 @@ fn tool_definition() -> Value {
                         "effort": {
                             "type": "string",
                             "enum": ["low", "medium", "high", "xhigh", "max"],
-                            "description": "Reasoning effort for this sub-agent (applied by the \
-                                 router's LLM proxy; otherwise it inherits this session's effort)."
+                            "description": "Automatic effort recommendation for this assignment, bounded by host policy and candidate effort caps. Omitted hints use the assignment baseline, not the parent's effort."
                         }
                     }
                 },
@@ -1323,6 +1322,19 @@ fn parse_effort_hint(raw: Option<&str>) -> Result<Option<EffortLevel>, String> {
     }
 }
 
+fn candidate_delegate_effort(
+    cfg: &crate::config::DelegationConfig,
+    candidate: &CandidateId,
+    baseline: Option<EffortLevel>,
+) -> Option<EffortLevel> {
+    baseline.map(|level| {
+        cfg.candidate_effort_caps
+            .iter()
+            .filter(|(pattern, _)| crate::session::candidate_matches(pattern, candidate))
+            .fold(level, |level, (_, cap)| level.min(*cap))
+    })
+}
+
 /// Scope a delegate candidate pool by cost: strictly cheaper than the parent
 /// (cost shedding; an empty result is the caller's "do the subtask yourself"
 /// error), same agent first. Reaching a same- or higher-tier model, or
@@ -1592,15 +1604,8 @@ async fn run_delegate_task_inner(
     // A model-generated hint is an automatic recommendation, never a human
     // override. Resolve each bounded assignment from its own scope.
     let baseline_effort = profile.effort.unwrap_or(EffortLevel::Medium);
-    let effort = crate::session::session_effort(
-        &shared.cfg,
-        None,
-        Some(
-            hinted_effort
-                .map(|hint| hint.min(baseline_effort))
-                .unwrap_or(baseline_effort),
-        ),
-    );
+    let effort = crate::session::session_effort(&shared.cfg, None, Some(baseline_effort))
+        .map(|baseline| hinted_effort.map_or(baseline, |hint| hint.min(baseline)));
     let exact = shared.cfg.delegation.candidate_hints == CandidateHintMode::Exact;
     let mut pool = match (&args.hints.candidate, &hinted) {
         // `exact`: the named model or an error — never a substitute, whatever
@@ -1801,7 +1806,9 @@ async fn run_delegate_task_inner(
         };
         match opening {
             Ok(opened) => {
-                let mut resolution = effort.map(|level| {
+                let candidate_effort =
+                    candidate_delegate_effort(&shared.cfg.delegation, &candidate, effort);
+                let mut resolution = candidate_effort.map(|level| {
                     shared
                         .scores
                         .lookup_exact(&candidate)
@@ -2037,7 +2044,7 @@ async fn run_delegate_task_inner(
                             "required_capabilities": args.required_capabilities,
                             "work_id": args.work_id,
                             "attempt_id": args.planner_identity.as_ref().map(|p| &p.attempt_id),
-                            "effort": {"requested": hinted_effort.map(EffortLevel::as_str), "effective": effort.map(EffortLevel::as_str), "source":"assigned-scope", "reason":"bounded task baseline; model hint cannot exceed automatic policy"},
+                            "effort": {"requested": hinted_effort.map(EffortLevel::as_str), "effective": candidate_effort.map(EffortLevel::as_str), "source":"assigned-scope", "reason":"bounded task baseline and candidate ceiling; model hint cannot exceed automatic policy"},
                         })),
                         tokens_input: crate::state::estimate_tokens(&args.task),
                         tokens_estimated: true,
@@ -3365,6 +3372,41 @@ mod tests {
             Some(EffortLevel::Low)
         );
         assert!(parse_effort_hint(Some("turbo")).is_err());
+    }
+
+    #[test]
+    fn candidate_effort_caps_apply_without_hints_and_never_raise_effort() {
+        let mut cfg = crate::config::DelegationConfig::default();
+        cfg.candidate_effort_caps
+            .insert("*/gpt-6.1-sol".into(), EffortLevel::Low);
+        cfg.candidate_effort_caps
+            .insert("codex*/*".into(), EffortLevel::High);
+        let sol = CandidateId::new("codex@seat", "gpt-6.1-sol");
+        assert_eq!(
+            candidate_delegate_effort(&cfg, &sol, Some(EffortLevel::Medium)),
+            Some(EffortLevel::Low)
+        );
+        assert_eq!(
+            candidate_delegate_effort(&cfg, &sol, Some(EffortLevel::Max)),
+            Some(EffortLevel::Low)
+        );
+        assert_eq!(candidate_delegate_effort(&cfg, &sol, None), None);
+        assert_eq!(
+            candidate_delegate_effort(
+                &cfg,
+                &CandidateId::new("claude", "opus"),
+                Some(EffortLevel::Medium)
+            ),
+            Some(EffortLevel::Medium)
+        );
+        assert_eq!(
+            candidate_delegate_effort(
+                &cfg,
+                &CandidateId::new("codex@seat", "other"),
+                Some(EffortLevel::Low)
+            ),
+            Some(EffortLevel::Low)
+        );
     }
 
     #[test]

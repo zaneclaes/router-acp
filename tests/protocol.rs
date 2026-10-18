@@ -3127,6 +3127,45 @@ async fn lifecycle_hook_registers_each_delegate_before_it_runs() {
     .await;
 }
 
+#[tokio::test]
+async fn delegate_candidate_effort_cap_reaches_native_adapter_and_start_hook_without_hint() {
+    for with_cap in [true, false] {
+        let state = temp_state_file("delegate-effort-cap");
+        let events = temp_events("delegate-effort-cap");
+        let hook = recording_hook(&events, "");
+        let cap = if with_cap {
+            ", candidate_effort_caps: { 'peer/*': low }"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            "state_file: {}\neffort: {{ default: medium }}\ndelegation: {{ enabled: true{cap}{hook} }}\nrouters:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+            state.display(),
+            agent_yaml("peer", &[("sonnet", 3)], &[("MOCK_NATIVE_EFFORTS", "1")]),
+            agent_yaml("fancy", &[("opus", 5)], &[]),
+        );
+        unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+        run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let hint = if with_cap { "" } else { "DELEGATE_EFFORT:low\n" };
+        prompt_text(
+            &cx,
+            &sid,
+            &format!("hard integration work\nDELEGATE_HINT:peer/sonnet\n{hint}DELEGATE:implement the plan"),
+        )
+        .await?;
+        let recorded = hook_events(&events, 3).await;
+        assert_eq!(recorded[0]["event"], "delegate_start");
+        assert_eq!(recorded[0]["effort"], "low");
+        assert_eq!(recorded[2]["outcome"], "completed");
+        assert!(agent_text(&observed, &sid).contains("echo:sonnet"));
+        Ok(())
+    })
+    .await;
+    }
+}
+
 /// A lifecycle hook that appends each event it accepts to `events` and runs
 /// `gate` (shell) first; the gate may `exit 2` with a message.
 fn recording_hook(events: &std::path::Path, gate: &str) -> String {
@@ -4750,6 +4789,14 @@ async fn never_signed_in_grok_is_not_started() {
                 ("MOCK_AUTH_REQUIRED", "1"),
                 ("MOCK_AUTH_HANG", "1"),
                 ("GROK_HOME", &grok_home.path().display().to_string()),
+                // This fixture asserts no credential exists, including keys
+                // inherited from the developer/CI environment. Do not read them.
+                ("ANTHROPIC_API_KEY", ""),
+                ("ANTHROPIC_AUTH_TOKEN", ""),
+                ("CLAUDE_CODE_OAUTH_TOKEN", ""),
+                ("OPENAI_API_KEY", ""),
+                ("XAI_API_KEY", ""),
+                ("KIMI_API_KEY", ""),
             ],
         ),
     );

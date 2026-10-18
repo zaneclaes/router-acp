@@ -1,6 +1,6 @@
 //! YAML configuration: parsing, defaults, env interpolation, validation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,11 @@ pub struct DelegationConfig {
     /// specific worker model (e.g. a Sol parent with a Grok worker).
     #[serde(default)]
     pub candidate_hints: CandidateHintMode,
+    /// Host-owned ceilings for automatic delegate effort, keyed by candidate
+    /// pattern. All matching ceilings apply; omitted candidates keep the
+    /// assignment baseline. This also covers router-initiated planner work.
+    #[serde(default)]
+    pub candidate_effort_caps: BTreeMap<String, crate::candidate::EffortLevel>,
     /// Whether the injected delegation directive forbids provider-native
     /// Task/spawn/subagent tools (`forbid`, default) or leaves them to the
     /// host's own workflow (`allow`).
@@ -262,6 +267,7 @@ impl Default for DelegationConfig {
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
             candidate_hints: CandidateHintMode::default(),
+            candidate_effort_caps: BTreeMap::new(),
             native_subagents: NativeSubagentPolicy::default(),
             lifecycle_hook: None,
         }
@@ -2488,6 +2494,11 @@ impl Config {
                     .into(),
             ));
         }
+        for (pattern, cap) in &self.delegation.candidate_effort_caps {
+            if pattern.trim().is_empty() || *cap == crate::candidate::EffortLevel::Auto {
+                return Err(ConfigError("delegation.candidate_effort_caps requires nonempty patterns and concrete effort levels".into()));
+            }
+        }
         if let (Some(default), Some(cap)) = (self.effort.default, self.effort.max_automatic)
             && default > cap
         {
@@ -2911,6 +2922,22 @@ agents:
 
     #[test]
     fn parses_effort_policy() {
+        for mapping in ["{ '*/gpt-6.1-sol': auto }", "{ '': low }"] {
+            let yaml = format!(
+                "delegation: {{ candidate_effort_caps: {mapping} }}\n{}",
+                minimal_yaml()
+            );
+            assert!(Config::from_yaml(&yaml).is_err());
+        }
+        let yaml = format!(
+            "delegation: {{ candidate_effort_caps: {{ '*/gpt-6.1-sol': low }} }}\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            cfg.delegation.candidate_effort_caps["*/gpt-6.1-sol"],
+            crate::candidate::EffortLevel::Low
+        );
         let yaml = format!(
             "effort: {{ default: medium, max_automatic: high }}\n{}",
             minimal_yaml()

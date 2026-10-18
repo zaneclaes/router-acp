@@ -1679,7 +1679,7 @@ fn confirmed_wire_effort(
                     .find_map(|(level, mapped)| (mapped == value).then_some(*level))
             })
     });
-    json!({"resolved":resolved.map(EffortLevel::as_str),"provider_value":value,"source":"provider-request","confirmed":true})
+    json!({"resolved":resolved.map(EffortLevel::as_str),"provider_value":value,"source":"provider-request","confirmed":resolved.is_some()})
 }
 
 fn publish_effective_effort(shared: &Shared, active: &ActiveTurn, confirmed: &Value) {
@@ -2848,6 +2848,7 @@ agents:
             confirmed_wire_effort(&shared, &candidate, &capped, LlmWireProtocol::Anthropic);
         assert_eq!(confirmed["resolved"], "high");
         assert_eq!(confirmed["provider_value"], "high");
+        assert_eq!(confirmed["confirmed"], true);
         let omitted = shape_provider_request(
             &json!({"output_config":{"effort":"max"}}),
             None,
@@ -2857,6 +2858,20 @@ agents:
         )
         .unwrap();
         assert!(confirmed_wire_effort(&shared, &candidate, &omitted, LlmWireProtocol::Anthropic)["resolved"].is_null());
+        assert_eq!(
+            confirmed_wire_effort(&shared, &candidate, &omitted, LlmWireProtocol::Anthropic)["confirmed"],
+            false
+        );
+        for missing in [
+            br#"{}"#.as_slice(),
+            br#"{"reasoning_effort":"auto"}"#,
+            br#"{"reasoning_effort":"unrecognized"}"#,
+        ] {
+            assert_eq!(
+                confirmed_wire_effort(&shared, &candidate, missing, LlmWireProtocol::Openai)["confirmed"],
+                false
+            );
+        }
         let unchanged = serde_json::to_vec(&json!({"reasoning":{"effort":"medium"}})).unwrap();
         assert_eq!(
             confirmed_wire_effort(&shared, &candidate, &unchanged, LlmWireProtocol::Openai)["resolved"],

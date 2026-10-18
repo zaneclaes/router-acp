@@ -434,7 +434,10 @@ candidates:
   - pattern: "*grok-4.7*"
     coding_tier: high
     coding_percentile: 0.88
-    context_window: 256000
+    context_window: 500000
+    # https://docs.x.ai/developers/grok-4-7
+    effort_levels: [low, medium, high, xhigh]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: xhigh }
     default_quality: 3.10
     quality:
       UiTweak: 3.10
