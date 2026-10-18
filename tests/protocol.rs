@@ -13907,6 +13907,50 @@ fn insert_wake(shared: &router_acp::session::Shared, sid: &str, id: &str) {
     .unwrap();
 }
 
+#[tokio::test]
+async fn adopted_input_delivers_historical_header_and_one_wake_ack_closes_both() {
+    use router_acp::planner_workflow as workflow;
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let state = temp_state_file("historical-input-wire");
+    let log = temp_log("historical-input-wire");
+    let repo = planner_wire_repository();
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        let sid = open_planner_parent(&cx, &repo).await?;
+        shared.with_session(&sid, |s| s.prompt_activity += 1);
+        let source = "historical-source";
+        let persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        shared.state.lock().unwrap().upsert(source.into(), persisted);
+        let mut old = workflow::load(&shared, &sid).unwrap().unwrap();
+        old.revision = 0;
+        old.owner = Some(workflow::RunOwner { pid: u32::MAX, started_at_ms: 1 });
+        old.wakes.clear();
+        old.inputs.insert("old-replay".into(), workflow::InputReceipt {
+            origin: "human".into(), replayed_from: None, owner: None, acknowledged: false,
+            attachments: vec![], delivered_to: [source.into()].into(),
+            text: "TEXT:Historical receipt received\nMCP_CALL:router-delegate planner_workflow {\"action\":\"acknowledge-wake\",\"key\":\"history-wire-once\",\"wake_id\":\"input:old-replay\"}".into(),
+        });
+        workflow::save(&shared, source, &mut old).unwrap();
+        router_acp::planner_adopt::adopt(shared.as_ref(), source, &sid).unwrap();
+        shared.with_session(&sid, |s| s.prompt_activity -= 1);
+        let events = wait_for_mock_prompt(&log, "[HISTORICAL input: old-replay").await;
+        let prompt = events.iter().find(|e| e["event"] == "prompt"
+            && e["text"].as_str().is_some_and(|t| t.contains("[HISTORICAL input: old-replay"))).unwrap();
+        assert!(prompt["text"].as_str().unwrap().contains("replayed_from: historical-source"));
+        assert!(prompt["text"].as_str().unwrap().contains("do not answer or act on it again"));
+        for _ in 0..100 {
+            let run = workflow::load(&shared, &sid).unwrap().unwrap();
+            if run.inputs["old-replay"].acknowledged {
+                assert!(run.wakes["input:old-replay"].acknowledged);
+                assert!(run.inputs["old-replay"].delivered_to.contains(&sid));
+                assert!(workflow::parent_input_blocks(&shared, &sid, &["old-replay".into()]).unwrap().is_empty());
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("one acknowledge-wake did not close the historical input and its wake");
+    }).await;
+}
+
 fn mock_prompts(log: &PathBuf, marker: &str) -> Vec<usize> {
     read_log(log)
         .iter()
@@ -14500,6 +14544,7 @@ fn orphan_run(shared: &Shared, sid: &str, input_text: &str) {
             input_id.clone(),
             router_acp::planner_workflow::InputReceipt {
                 origin: "human".into(),
+                replayed_from: None,
                 text: input_text.into(),
                 attachments: vec![],
                 owner: None,

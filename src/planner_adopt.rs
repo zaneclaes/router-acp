@@ -343,9 +343,21 @@ fn merge(
             into.receipts
                 .insert(format!("input-withdrawal:{id}"), receipt.clone());
         }
-        into.inputs
-            .entry(id.clone())
-            .or_insert_with(|| input.clone());
+        into.inputs.entry(id.clone()).or_insert_with(|| {
+            let mut adopted = input.clone();
+            // Never turn a genuinely undelivered queued request into an
+            // acknowledgment-only replay. Already delivered queue entries
+            // (e.g. a crash before cleanup) become historical wakes below.
+            if !input.resolved()
+                && input.origin == "human"
+                && !from.commands.contains(id)
+                && (!from.parent_queue.iter().any(|q| &q.input_id == id)
+                    || input.delivered_to.contains(from_sid))
+            {
+                adopted.replayed_from.get_or_insert_with(|| from_sid.into());
+            }
+            adopted
+        });
     }
     // Operator input the old parent received but never acknowledged: an
     // `input:` wake, which leads the next wake batch.
@@ -358,7 +370,7 @@ fn merge(
         if input.resolved()
             || input.origin != "human"
             || from.commands.contains(id)
-            || queued.contains(id)
+            || (queued.contains(id) && !input.delivered_to.contains(from_sid))
         {
             continue;
         }
@@ -370,9 +382,9 @@ fn merge(
             wake_id.clone(),
             Wake {
                 reason: format!(
-                    "Operator input adopted from the superseded planner run {from_sid}: the \
-                     earlier parent received it but never acknowledged it. Handle it if it still \
-                     applies, then acknowledge it."
+                    "HISTORICAL input adopted from {from_sid}: reconcile the earlier parent's \
+                     missing acknowledgment in this turn. Do not answer or act on the old message again; \
+                     it is not new operator input."
                 ),
                 work_id: into_sid.into(),
                 ..Default::default()
@@ -388,7 +400,7 @@ fn merge(
         if into
             .inputs
             .get(&queued.input_id)
-            .is_some_and(|input| input.resolved())
+            .is_some_and(|input| input.resolved() || input.replayed_from.is_some())
         {
             continue;
         }

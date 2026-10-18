@@ -234,6 +234,9 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputReceipt {
     pub origin: String,
+    /// Earlier-session input delivered again solely to reconcile its receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_from: Option<String>,
     pub text: String,
     pub attachments: Vec<Value>,
     pub owner: Option<String>,
@@ -923,6 +926,7 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let receipt = InputReceipt {
         origin: if human_prompt(req) { "human" } else { "agent" }.into(),
+        replayed_from: None,
         text: display_text(req),
         attachments: req
             .prompt
@@ -1158,10 +1162,15 @@ pub fn parent_input_blocks(
         if input.resolved() {
             continue;
         }
-        blocks.push(ContentBlock::from(format!(
-            "[Original queued input: {id}, origin: {}]\n{}",
-            input.origin, input.text
-        )));
+        let header = if let Some(source) = &input.replayed_from {
+            format!(
+                "[HISTORICAL input: {id}, origin: {}, replayed_from: {source}]\nHISTORICAL: the earlier parent already received and acted on this; acknowledge it, do not answer or act on it again. This is router receipt reconciliation, not new operator input.",
+                input.origin
+            )
+        } else {
+            format!("[Original queued input: {id}, origin: {}]", input.origin)
+        };
+        blocks.push(ContentBlock::from(format!("{header}\n{}", input.text)));
         for attachment in &input.attachments {
             blocks.push(
                 serde_json::from_value(attachment.clone())
@@ -1339,7 +1348,7 @@ async fn operate_once(
                 "reason":work.reason.as_ref().map(|s| s.chars().take(500).collect::<String>())})).collect::<Vec<_>>();
         let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id))
                 && work_id.as_ref().is_none_or(|wanted| input.owner.as_ref() == Some(wanted)))
-            .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"owner":input.owner,"acknowledged":input.acknowledged && crate::planner_input::withdrawal(&run, id).is_none(),"withdrawn":crate::planner_input::withdrawal(&run, id),
+            .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"replayed_from":input.replayed_from,"owner":input.owner,"acknowledged":input.acknowledged && crate::planner_input::withdrawal(&run, id).is_none(),"withdrawn":crate::planner_input::withdrawal(&run, id),
                 "text":input.text.chars().take(500).collect::<String>(),"attachment_count":input.attachments.len(),"delivered_to":input.delivered_to})).collect::<Vec<_>>();
         let wakes = run
             .wakes

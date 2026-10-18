@@ -4631,6 +4631,102 @@ async fn turn_end_excludes_commands_and_wake_acknowledgment_resolves_input() {
 }
 
 #[tokio::test]
+async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_records() {
+    for stale_queue in [false, true] {
+        let f = fixture(|_| {});
+        authorize(&f.shared);
+        let request = input_request(
+            Some("old-message"),
+            "previously handled operator request",
+            false,
+        );
+        planner_workflow::record_steered_input(&f.shared, SID, &request).unwrap();
+        let pending = input_request(
+            Some("never-delivered"),
+            "still needs its first delivery",
+            false,
+        );
+        planner_workflow::observe_input(&f.shared, SID, &pending).unwrap();
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.parent_queue.push(planner_workflow::QueuedParentInput {
+                input_id: "never-delivered".into(),
+                request: pending.clone(),
+            });
+            if stale_queue {
+                run.parent_queue.push(planner_workflow::QueuedParentInput {
+                    input_id: "old-message".into(),
+                    request: request.clone(),
+                });
+            }
+            run.owner = Some(planner_workflow::RunOwner {
+                pid: u32::MAX,
+                started_at_ms: 1,
+            });
+            Ok(())
+        })
+        .unwrap();
+        let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+        f.shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert("next".into(), persisted.clone());
+        f.shared.sessions.lock().unwrap().insert(
+            "next".into(),
+            RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+        );
+        planner_workflow::ensure(&f.shared, "next").unwrap();
+        f.shared.sessions.lock().unwrap().remove(SID); // The old router exited.
+        router_acp::planner_adopt::adopt(f.shared.as_ref(), SID, "next").unwrap();
+        let run = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+        assert_eq!(
+            run.inputs["old-message"].replayed_from.as_deref(),
+            Some(SID)
+        );
+        assert!(run.wakes["input:old-message"].reason.contains("HISTORICAL"));
+        assert_eq!(run.parent_queue.len(), 1);
+        assert_eq!(run.parent_queue[0].input_id, "never-delivered");
+        assert!(
+            run.inputs["never-delivered"].replayed_from.is_none(),
+            "never discard an undelivered request"
+        );
+        let ids = vec!["old-message".into()];
+        let blocks = planner_workflow::parent_input_blocks(&f.shared, "next", &ids).unwrap();
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("historical header missing")
+        };
+        assert!(text.text.starts_with("[HISTORICAL input: old-message"));
+        assert!(text.text.contains(&format!("replayed_from: {SID}")));
+        assert!(
+            text.text
+                .contains("acknowledge it, do not answer or act on it again")
+        );
+        planner_workflow::queue_delivery(&f.shared, "next", "next", "next", ids.clone());
+        planner_workflow::confirm_delivery(&f.shared, "next").unwrap();
+        planner_workflow::operate(
+            &f.shared,
+            "next",
+            None,
+            Operation::AcknowledgeWake {
+                key: "ack-history-once".into(),
+                wake_id: "input:old-message".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+        assert!(
+            run.inputs["old-message"].acknowledged && run.wakes["input:old-message"].acknowledged
+        );
+        assert!(
+            planner_workflow::parent_input_blocks(&f.shared, "next", &ids)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn adoption_skips_resolved_inputs_even_when_old_wakes_and_queue_entries_remain() {
     let f = fixture(|_| {});
     authorize(&f.shared);

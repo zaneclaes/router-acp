@@ -356,6 +356,12 @@ with the adapter's allow option even on operator-owned turns. Other tools on
 those turns retain normal client permission handling. Wakes and delegates keep
 their existing automatic permission handling.
 
+Adopted human inputs already delivered by an earlier parent carry `replayed_from`
+and a `HISTORICAL` header. They reconcile missing receipts; the parent acknowledges
+them in the delivery turn without answering or acting on the old text again.
+Acknowledging the `input:` wake closes both records. A genuinely undelivered queued
+request retains its first delivery instead of becoming an acknowledgment-only replay.
+
 - A client prompt that arrives while a router-owned turn holds the parent is
   first steered into it with `_session/steering`
   (`_meta.steering.idleBehavior: "promptRequired"`). claude-agent-acp and
