@@ -75,6 +75,10 @@ pub const ROUTER_WAKE_PREFIXES: [&str; 6] = [
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapacityState {
+    /// An explicit implement overlapped the previous owner's drain. Retry its
+    /// handoff before admitting anything against an incomplete work inventory.
+    #[serde(default)]
+    pub pending_adoption: Option<String>,
     /// Active holds by `plan_id` (a hold may also name a `work_id`).
     #[serde(default)]
     pub holds: BTreeMap<String, Hold>,
@@ -447,7 +451,7 @@ pub fn status_block(shared: &Shared, run: &PlannerRun, now_ms: i64) -> Value {
         "holds":run.capacity.holds.values().filter(|h| h.expires_at_ms > now_ms).collect::<Vec<_>>(),
         "unfilled_wakes":run.capacity.unfilled_wakes,
         "last_auto_admission":run.capacity.last_auto_admission,
-        "resumes":run.capacity.resumes});
+        "resumes":run.capacity.resumes,"pending_adoption":run.capacity.pending_adoption});
     for (key, value) in crate::planner_guard::status_fields(shared, run) {
         block[key] = value;
     }
@@ -544,6 +548,19 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     {
         return;
     }
+    if run.capacity.pending_adoption.is_some() {
+        match crate::planner_adopt::retry_pending(shared.as_ref(), sid) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(session = sid, %error, "planner adoption remains pending");
+                return;
+            }
+        }
+    }
+    let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
+        return;
+    };
     let timing = timing(shared);
     resume_workers(shared, sid, &run, now).await;
     // The audit runs whatever the free slots and the parent's activity.

@@ -318,6 +318,14 @@ command (or a person's follow-up) resumes it exactly like `paused`. While a
 drain is live in this router, the `implement` command is refused until the
 drain reports `drained`.
 
+If a replacement router receives `implement` before the previous owner exits,
+it records `capacity.pending_adoption` and an `adoption:handoff` wake. The normal
+capacity cycle retries that exact handoff after owner exit; no second command or
+monitor prompt is needed. Admission, dispatch and release mutations wait for the
+preserved inventory. Status and input acknowledgments remain available. Successful
+adoption wakes the parent to reconcile the transferred assignments. Merely loading
+a session does not create an adoption request.
+
 # Operator input preempts router-owned turns
 
 A turn that delivers wakes (child, heartbeat, capacity, audit, in-flight,

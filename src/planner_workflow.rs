@@ -1313,6 +1313,16 @@ async fn operate_once(
         operation,
         Operation::Artifact { .. } | Operation::Finished { .. }
     );
+    if let Some(source) = &run.capacity.pending_adoption
+        && !matches!(
+            operation,
+            Operation::AcknowledgeInput { .. } | Operation::AcknowledgeWake { .. }
+        )
+    {
+        return Err(format!(
+            "planner adoption of {source} is pending; the capacity cycle retries the handoff before new work or release mutations"
+        ));
+    }
     if actor.is_some() && !worker_operation {
         return Err(
             "implementation children cannot coordinate, accept, integrate, or retire plans".into(),
@@ -2196,6 +2206,7 @@ async fn begin_work_once(
     if run.status != RunStatus::Running
         || run.execution_request.is_none()
         || run.phase != PlannerPhase::Implementation
+        || run.capacity.pending_adoption.is_some()
     {
         return Err("planner execution is not authorized or is suspended".into());
     }

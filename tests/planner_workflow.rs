@@ -4132,6 +4132,89 @@ async fn obsolete_worker_retirement_is_verified_terminal_and_not_integration() {
 }
 
 #[tokio::test]
+async fn implement_retries_adoption_after_the_previous_router_finishes_draining() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Draining;
+        run.owner = Some(planner_workflow::RunOwner::current());
+        Ok(())
+    })
+    .unwrap();
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    planner_workflow::mutate(&f.shared, "next", |run| {
+        run.phase = router_acp::config::PlannerPhase::Implementation;
+        run.execution_request = Some("implement".into());
+        Ok(())
+    })
+    .unwrap();
+    {
+        let store = f.shared.state.lock().unwrap();
+        assert!(planner_adopt::adopt_on_implement(&*store, "next").is_none());
+    }
+    // The old owner must keep its state while it is still alive.
+    router_acp::planner_capacity::tick(&f.shared, "next", chrono::Utc::now().timestamp()).await;
+    assert!(
+        planner_workflow::load(&f.shared, "next")
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty()
+    );
+    let refused = planner_workflow::operate(
+        &f.shared,
+        "next",
+        None,
+        Operation::Admit {
+            key: "premature-admit".into(),
+            work: work("premature"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("adoption"));
+    f.shared.sessions.lock().unwrap().remove(SID);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    // No repeated implement command, monitor input or manual adopt-run.
+    router_acp::planner_capacity::tick(&f.shared, "next", chrono::Utc::now().timestamp()).await;
+    let adopted = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert_eq!(
+        adopted
+            .works
+            .get("work-1")
+            .and_then(|w| w.artifact.as_ref())
+            .map(|a| &a.revision),
+        Some(&revision)
+    );
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Superseded
+    );
+    assert!(adopted.capacity.pending_adoption.is_none());
+}
+
+#[tokio::test]
 async fn explicit_implement_adopts_a_cleanly_drained_run_without_losing_accepted_work() {
     use router_acp::planner_adopt;
     let f = fixture(|_| {});

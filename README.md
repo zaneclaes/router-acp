@@ -936,6 +936,9 @@ Adopted unfinished assignments require scope/source reconciliation before dispat
 That fence applies to each affected assignment: independent capacity checks and
 release reminders continue under the normal ownership and dependency gates.
 See [durable planner progress](docs/planner-throughput.md).
+An `implement` command that overlaps a previous router's drain records a pending
+handoff. The ordinary capacity cycle retries after owner exit before new work can
+start; see [recovery details](docs/planner-capacity.md).
 Restored effort preferences do not establish confirmed active effort.
 Planner close pauses running work while retaining assignments and repository artifacts.
 Planner delete refuses unfinished assignments, including their live attempts, pending inputs, wakes, and approval waits.

@@ -489,7 +489,10 @@ pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<Ado
             .ok_or_else(|| format!("planner run {from_sid} disappeared"))?;
         retire(&mut from, &report);
         match store.save(from_sid, &mut from) {
-            Ok(()) => return Ok(report),
+            Ok(()) => {
+                adoption_pending(store, into_sid, None, &report.summary())?;
+                return Ok(report);
+            }
             Err(e) if concurrent(&e) => continue,
             Err(e) => return Err(e),
         }
@@ -510,15 +513,85 @@ pub fn adopt_on_implement(store: &dyn RunStore, into_sid: &str) -> Option<AdoptR
         .max_by_key(|id| store.updated_at(id).unwrap_or(0))?;
     let run = store.load(&latest).ok().flatten()?;
     if run.superseded_by.is_some()
-        || adoptable(store, &latest, &run, chrono::Utc::now().timestamp()).is_err()
+        || !matches!(
+            run.status,
+            RunStatus::Running | RunStatus::Draining | RunStatus::Paused
+        )
     {
         return None;
     }
-    match adopt(store, &latest, into_sid) {
-        Ok(report) => Some(report),
+    // The old router may still be finishing shutdown when its replacement
+    // receives implement. Persist this handoff instead of silently starting
+    // from zero works and forgetting the previous run at the next tick.
+    let reason = format!(
+        "Awaiting adoption of planner run {latest}; the ordinary capacity cycle retries after its owner exits. New admissions and release mutations wait for the preserved inventory."
+    );
+    if let Err(error) = adoption_pending(store, into_sid, Some(&latest), &reason) {
+        tracing::warn!(from = latest, into = into_sid, %error, "could not record planner adoption");
+        return None;
+    }
+    match retry_pending(store, into_sid) {
+        Ok(report) => report,
         Err(error) => {
             tracing::warn!(from = latest, into = into_sid, %error, "could not resume the earlier planner run");
             None
         }
     }
+}
+
+fn adoption_pending(
+    store: &dyn RunStore,
+    sid: &str,
+    source: Option<&str>,
+    reason: &str,
+) -> Result<(), String> {
+    for _ in 0..16 {
+        let mut run = store.load(sid)?.ok_or("planner destination disappeared")?;
+        run.capacity.pending_adoption = source.map(str::to_string);
+        run.wakes.insert(
+            "adoption:handoff".into(),
+            Wake {
+                work_id: sid.into(),
+                reason: reason.into(),
+                ..Default::default()
+            },
+        );
+        match store.save(sid, &mut run) {
+            Ok(()) => return Ok(()),
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("planner adoption remained contended".into())
+}
+
+/// Retry only the handoff authorized by the explicit implement command.
+/// Ordinary session loading never discovers or adopts a different run.
+pub fn retry_pending(store: &dyn RunStore, into_sid: &str) -> Result<Option<AdoptReport>, String> {
+    let into = store
+        .load(into_sid)?
+        .ok_or("planner destination disappeared")?;
+    let Some(source) = into.capacity.pending_adoption else {
+        return Ok(None);
+    };
+    let from = store
+        .load(&source)?
+        .ok_or("pending planner source disappeared")?;
+    if from.superseded_by.as_deref() == Some(into_sid) {
+        adoption_pending(
+            store,
+            into_sid,
+            None,
+            "Planner adoption completed; reconcile the preserved assignments before resuming them.",
+        )?;
+        return Ok(Some(AdoptReport {
+            from: source,
+            into: into_sid.into(),
+            ..Default::default()
+        }));
+    }
+    if live_owner(store, &source, &from, chrono::Utc::now().timestamp()).is_some() {
+        return Ok(None);
+    }
+    adopt(store, &source, into_sid).map(Some)
 }
