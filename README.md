@@ -491,6 +491,10 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
 
 - **Correcting a live planner.** `router-acp planner-input --session <router-id> --cwd <checkout> --id <stable-id> --message-file <file>` sends an explicitly agent-origin message through the existing parent queue without interrupting or taking over the running session. Read delivery and acknowledgment with `planner-input --session <router-id> --id <stable-id> --status`. Same-id retries are idempotent; operator approval holds remain effective. See [monitor input](docs/planner-throughput.md#messages-from-a-local-monitor). Use this for a live parent; `prompt` is for a parent whose client has gone.
 
+  A parent turn ending with delivered but unacknowledged input creates an `input:` reconciliation wake, with its origin. Commands are excluded. Either `acknowledge-input` or `acknowledge-wake` for that input closes both records and removes its queue entry; acknowledgment records handling, not success of the requested work. Reconcile an action already taken without repeating it.
+
+  `planner-input --session <id> --list` lists unresolved metadata. To withdraw an obsolete message, use `planner-input --session <id> --cwd <checkout> --id <input-id> --delete --reason <reason>`; replace `--id … --delete` with `--drain` for all unresolved agent-origin inputs. Both preview by default; add `--apply` to write. Human-origin input requires `--include-human` explicitly, regardless of words in its text. Withdrawal retains the original input and a reason, closes its wake and queue entry, and is reported separately from acknowledgment. A live delivery must finish before withdrawal; this command never cancels a turn. Re-sending the same input id cannot reopen it.
+
 Delegates still end when their router exits: the router kills every adapter when its client disconnects or is interrupted, so a worker cannot outlive the goose session that started it. Committed work survives; a host recovers the rest through its stop events, the router-pid liveness check, `delegate_result` and `router-acp prompt`.
 
 ```yaml

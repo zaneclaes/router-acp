@@ -10842,6 +10842,12 @@ fn log_user_steer(
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
     if let Dispatch::Request(msg, responder) = message {
+        if msg.method() == crate::planner_shutdown::STATUS_METHOD {
+            let result = crate::planner_shutdown::status(&shared, msg.params())
+                .map_err(|e| AcpError::invalid_params().data(e));
+            let _ = responder.respond_with_result(result);
+            return Ok(Handled::Yes);
+        }
         // kory's `/shutdown`: answered at once; the drain reports itself as
         // `_router/shutdown_progress` notifications.
         if msg.method() == crate::planner_shutdown::METHOD {

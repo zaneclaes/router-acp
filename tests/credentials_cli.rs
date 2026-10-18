@@ -78,6 +78,7 @@ async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair()
             .env("GROK_AUTH_EXPIRED", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
         command
     };
     let mut helper = command().spawn().unwrap();

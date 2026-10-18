@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+mod support;
 
 struct Client {
     child: Child,
@@ -12,6 +13,11 @@ struct Client {
     events: Vec<Value>,
     next_id: u64,
     answers: std::collections::VecDeque<String>,
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        support::stop_router(&mut self.child);
+    }
 }
 impl Client {
     async fn request(&mut self, method: &str, params: Value) -> Value {

@@ -303,7 +303,11 @@ notification `_router/shutdown_progress` with
 3. The parent, if loaded, is prompted once: "Shutdown requested by the
    operator: rewrite Docs/CONTINUE.md and your registers now with the exact
    resume point; admit nothing; end your turn." The router waits for that
-   turn, at most 10 minutes in all.
+   turn, at most 10 minutes in all. A busy router-owned turn is cancelled through
+   the same preemption path as operator input, then the shutdown prompt runs.
+   Only an operator turn is allowed to finish naturally. While waiting for either
+   cancellation, an operator turn or the shutdown turn, `shutdown_progress`
+   reports progress every 30 seconds.
 4. Every live worker (a turn running, or an open sub-session) is told:
    "Shutdown requested: commit and push your branch now, record your status
    notes and exact resume point, then hand off `waiting` with that resume
@@ -320,13 +324,22 @@ drain reports `drained`.
 
 If a replacement router receives `implement` before the previous owner exits,
 it records `capacity.pending_adoption` and an `adoption:handoff` wake. The normal
-capacity cycle retries that exact handoff after owner exit; no second command or
-monitor prompt is needed. Admission, dispatch and release mutations wait for the
-preserved inventory. Status and input acknowledgments remain available. Successful
-adoption wakes the parent to reconcile the transferred assignments. Merely loading
-a session does not create an adoption request.
+capacity cycle retries that exact handoff at most every 15 seconds; no second
+command or monitor prompt is needed. Only new admissions wait: worker resumption,
+audits, release observations and existing-work mutations continue. The wake records
+the live owner, attempt or wake claim blocking adoption, with one user notice per
+changed reason. If the source becomes terminal, is superseded by another session,
+or its run/session disappears, the handoff clears with that reason and admission
+continues in the same tick. Successful adoption wakes the parent to reconcile the
+transferred assignments. Merely loading a session does not create an adoption request.
 
 # Operator input preempts router-owned turns
+
+`_router/planner_status` with `{"sessionId":"…"}` returns the existing read-only
+capacity census as `{"status":"running","live":2,"admissible":7}`. An unknown
+capacity-host answer gives `admissible:null`. Kory uses it after a turn cancellation
+and before exit: cancelling a parent turn leaves the run's admission and recovery
+loops active. Shutdown drains; exit disconnects and cuts workers off.
 
 A turn that delivers wakes (child, heartbeat, capacity, audit, in-flight,
 gate) is router-owned (`src/planner_preempt.rs`). Operator input never waits

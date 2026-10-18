@@ -1201,6 +1201,7 @@ async fn main() {
                     // round-trip (elicitation is opt-in per client).
                     mock.log(json!({
                         "event": "initialize",
+                        "pid": std::process::id(),
                         "client_elicitation_form": req
                             .client_capabilities
                             .elicitation

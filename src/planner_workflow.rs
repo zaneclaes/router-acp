@@ -243,6 +243,74 @@ pub struct InputReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputWithdrawal {
+    pub at_ms: i64,
+    pub reason: String,
+}
+
+impl InputReceipt {
+    pub fn resolved(&self) -> bool {
+        self.acknowledged
+    }
+}
+
+/// Explicit reconciliation closes both records in one revision. Delivery
+/// alone is never acknowledgment, nor proof that the requested work succeeded.
+fn acknowledge_input(
+    run: &mut PlannerRun,
+    sid: &str,
+    id: &str,
+    owner: Option<String>,
+) -> Result<(), String> {
+    if owner
+        .as_ref()
+        .is_some_and(|owner| !run.works.contains_key(owner))
+    {
+        return Err("input owner is not an admitted work identity".into());
+    }
+    if crate::planner_input::withdrawal(run, id).is_some() {
+        return Ok(()); // already explicitly reconciled by withdrawal
+    }
+    let input = run.inputs.get_mut(id).ok_or("unknown input receipt")?;
+    if input.owner.is_some() && input.owner != owner {
+        return Err("input correction must retain its original work owner".into());
+    }
+    if !input.delivered_to.contains(owner.as_deref().unwrap_or(sid)) {
+        return Err(
+            "original input and attachments have no delivery receipt for this owner".into(),
+        );
+    }
+    input.owner = owner;
+    input.acknowledged = true;
+    if let Some(wake) = run.wakes.get_mut(&format!("input:{id}")) {
+        wake.acknowledged = true;
+    }
+    run.parent_queue.retain(|queued| queued.input_id != id);
+    Ok(())
+}
+
+/// Direct/steered input used to remain unacknowledged silently until adoption
+/// recreated it as fresh work. Demand reconciliation at the ordinary turn end.
+pub fn reconcile_delivered_inputs(shared: &Shared, sid: &str) -> Result<(), String> {
+    if load(shared, sid)?.is_none() {
+        return Ok(());
+    }
+    mutate(shared, sid, |run| {
+        if !matches!(run.status, RunStatus::Running | RunStatus::Draining) { return Ok(()) }
+        for (id, input) in &run.inputs {
+            if run.commands.contains(id) || input.resolved() || input.owner.is_some() || !input.delivered_to.contains(sid) { continue }
+            let wake = run.wakes.entry(format!("input:{id}")).or_default();
+            // Keep a live delivery's claim and retry/backoff. A separate wake
+            // acknowledgment cannot make an unresolved input disappear.
+            wake.work_id = sid.into();
+            wake.acknowledged = false;
+            wake.reason = format!("Input {id} (origin: {}) was delivered but your turn ended without its acknowledgment. Reconcile the action already taken, record acknowledge-input, and continue useful work. Do not repeat a completed action; acknowledgment records handling, not a release or completion verdict.", input.origin);
+        }
+        Ok(())
+    }).map(|_| ())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedParentInput {
     pub input_id: String,
     pub request: PromptRequest,
@@ -998,6 +1066,9 @@ pub(crate) fn queue_parent_request(
     req: &PromptRequest,
 ) -> Result<String, String> {
     let input_id = record_input(run, req)?;
+    if run.inputs[&input_id].resolved() {
+        return Ok(input_id);
+    }
     if !run
         .parent_queue
         .iter()
@@ -1084,6 +1155,9 @@ pub fn parent_input_blocks(
     let mut blocks = Vec::new();
     for id in ids {
         let input = run.inputs.get(id).ok_or("unknown original input receipt")?;
+        if input.resolved() {
+            continue;
+        }
         blocks.push(ContentBlock::from(format!(
             "[Original queued input: {id}, origin: {}]\n{}",
             input.origin, input.text
@@ -1119,6 +1193,9 @@ pub fn input_blocks(
             .inputs
             .get(&id)
             .ok_or("unknown original input receipt")?;
+        if crate::planner_input::withdrawal(&run, &id).is_some() {
+            continue;
+        }
         if input
             .owner
             .as_deref()
@@ -1262,7 +1339,7 @@ async fn operate_once(
                 "reason":work.reason.as_ref().map(|s| s.chars().take(500).collect::<String>())})).collect::<Vec<_>>();
         let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id))
                 && work_id.as_ref().is_none_or(|wanted| input.owner.as_ref() == Some(wanted)))
-            .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"owner":input.owner,"acknowledged":input.acknowledged,
+            .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"owner":input.owner,"acknowledged":input.acknowledged && crate::planner_input::withdrawal(&run, id).is_none(),"withdrawn":crate::planner_input::withdrawal(&run, id),
                 "text":input.text.chars().take(500).collect::<String>(),"attachment_count":input.attachments.len(),"delivered_to":input.delivered_to})).collect::<Vec<_>>();
         let wakes = run
             .wakes
@@ -1314,13 +1391,10 @@ async fn operate_once(
         Operation::Artifact { .. } | Operation::Finished { .. }
     );
     if let Some(source) = &run.capacity.pending_adoption
-        && !matches!(
-            operation,
-            Operation::AcknowledgeInput { .. } | Operation::AcknowledgeWake { .. }
-        )
+        && matches!(operation, Operation::Admit { .. })
     {
         return Err(format!(
-            "planner adoption of {source} is pending; the capacity cycle retries the handoff before new work or release mutations"
+            "planner adoption of {source} is pending; the capacity cycle retries the handoff before new admissions"
         ));
     }
     if actor.is_some() && !worker_operation {
@@ -1802,27 +1876,18 @@ async fn operate_once(
         Operation::AcknowledgeInput {
             input_id, owner, ..
         } => {
-            if let Some(owner) = &owner
-                && !run.works.contains_key(owner)
-            {
-                return Err("input owner is not an admitted work identity".into());
-            }
-            let input = run
-                .inputs
-                .get_mut(&input_id)
-                .ok_or("unknown input receipt")?;
-            if input.owner.is_some() && input.owner != owner {
-                return Err("input correction must retain its original work owner".into());
-            }
-            if !input.delivered_to.contains(owner.as_deref().unwrap_or(sid)) {
-                return Err(
-                    "original input and attachments have no delivery receipt for this owner".into(),
-                );
-            }
-            input.owner = owner;
-            input.acknowledged = true;
+            acknowledge_input(&mut run, sid, &input_id, owner)?;
         }
         Operation::AcknowledgeWake { wake_id, .. } => {
+            if let Some(id) = wake_id.strip_prefix("input:") {
+                let owner = run
+                    .inputs
+                    .get(id)
+                    .ok_or("unknown input receipt")?
+                    .owner
+                    .clone();
+                acknowledge_input(&mut run, sid, id, owner)?;
+            }
             run.wakes
                 .get_mut(&wake_id)
                 .ok_or("unknown wake receipt")?
@@ -1874,7 +1939,7 @@ async fn operate_once(
                 .map(|(id, w)| format!("{id} ({:?})", w.status))
                 .collect::<Vec<_>>();
             if !pending.is_empty()
-                || run.inputs.values().any(|i| !i.acknowledged)
+                || run.inputs.values().any(|i| !i.resolved())
                 || run.wakes.values().any(|w| !w.acknowledged)
             {
                 return Err(format!(
@@ -2206,7 +2271,6 @@ async fn begin_work_once(
     if run.status != RunStatus::Running
         || run.execution_request.is_none()
         || run.phase != PlannerPhase::Implementation
-        || run.capacity.pending_adoption.is_some()
     {
         return Err("planner execution is not authorized or is suspended".into());
     }

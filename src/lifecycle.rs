@@ -196,7 +196,7 @@ pub fn on_session_delete(
             && (run.works.values().any(|work| {
                 work.status != crate::planner_workflow::WorkStatus::Integrated
                     || work.attempt.as_ref().is_some_and(|attempt| !attempt.ended)
-            }) || run.inputs.values().any(|input| !input.acknowledged)
+            }) || run.inputs.values().any(|input| !input.resolved())
                 || run.wakes.values().any(|wake| !wake.acknowledged)))
             || !run.parent_queue.is_empty()
             || !run.approval_waits.is_empty()

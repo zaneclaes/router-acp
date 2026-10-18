@@ -217,6 +217,210 @@ fn external_monitor_input_is_durable_agent_origin_and_idempotent_after_delivery(
     );
 }
 
+#[tokio::test]
+async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let request = input_request(Some("acted-on"), "Continue the authorized repair", false);
+    planner_workflow::record_steered_input(&f.shared, SID, &request).unwrap();
+    // The parent acted, but forgot its input receipt. Do not wait for restart
+    // to rediscover this, and do not treat the action as proof of acknowledgment.
+    admit(&f.shared, work("repair"));
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.wakes.contains_key("input:acted-on"));
+    assert!(!run.inputs["acted-on"].acknowledged);
+    assert!(
+        run.wakes["input:acted-on"]
+            .reason
+            .contains("acknowledge-input")
+    );
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::AcknowledgeInput {
+            key: "ack-acted-on".into(),
+            input_id: "acted-on".into(),
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.inputs["acted-on"].acknowledged && run.wakes["input:acted-on"].acknowledged);
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes["input:acted-on"]
+            .acknowledged
+    );
+}
+
+#[test]
+fn queue_withdrawal_is_explicit_atomic_and_survives_adoption() {
+    use router_acp::planner_input;
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    planner_input::send(&store, SID, &f.repo, "monitor-old", "old correction").unwrap();
+    planner_workflow::record_steered_input(
+        &f.shared,
+        SID,
+        &input_request(Some("human-old"), "operator instruction", true),
+    )
+    .unwrap();
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    let before = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let preview = planner_input::withdraw(&store, SID, &f.repo, None, false, "", false).unwrap();
+    assert_eq!(preview.len(), 1);
+    assert_eq!(preview[0].input_id, "monitor-old");
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .revision,
+        before.revision
+    );
+    assert!(
+        planner_input::withdraw(
+            &store,
+            SID,
+            &f.repo,
+            Some("human-old"),
+            false,
+            "obsolete",
+            true
+        )
+        .unwrap_err()
+        .contains("--include-human")
+    );
+    let me = planner_workflow::RunOwner::current();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let wake = run.wakes.get_mut("input:monitor-old").unwrap();
+        wake.claim_pid = me.pid;
+        wake.claim_started_at_ms = me.started_at_ms;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_input::withdraw(&store, SID, &f.repo, None, true, "obsolete", true)
+            .unwrap_err()
+            .contains("active delivery")
+    );
+    assert_eq!(planner_input::list(&store, SID).unwrap().len(), 2);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.wakes.get_mut("input:monitor-old").unwrap().claim_pid = 0;
+        Ok(())
+    })
+    .unwrap();
+    let deleted =
+        planner_input::withdraw(&store, SID, &f.repo, None, false, "superseded", true).unwrap();
+    assert!(
+        !deleted[0].acknowledged && deleted[0].withdrawn.as_ref().unwrap().reason == "superseded"
+    );
+    assert!(!deleted[0].queued);
+    assert_eq!(planner_input::list(&store, SID).unwrap().len(), 1);
+    assert!(
+        !planner_input::send(&store, SID, &f.repo, "monitor-old", "old correction")
+            .unwrap()
+            .queued
+    );
+    planner_input::withdraw(
+        &store,
+        SID,
+        &f.repo,
+        None,
+        true,
+        "explicitly superseded",
+        true,
+    )
+    .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.inputs["human-old"].attachments.len(), 1);
+    assert!(run.inputs["monitor-old"].text.contains("old correction"));
+    assert!(run.parent_queue.is_empty() && run.wakes.values().all(|w| w.acknowledged));
+    // Ordinary old-version-compatible state writes keep the terminal flag and
+    // receipt map; adoption must neither replay nor relabel withdrawn input.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let persisted = store.get(SID).unwrap();
+    store.upsert("after-cleanup".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "after-cleanup".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "after-cleanup").unwrap();
+    router_acp::planner_adopt::adopt(&store, SID, "after-cleanup").unwrap();
+    let adopted = planner_workflow::load(&f.shared, "after-cleanup")
+        .unwrap()
+        .unwrap();
+    assert!(!adopted.wakes.contains_key("input:human-old"));
+    assert!(
+        planner_input::status(&store, "after-cleanup", "human-old")
+            .unwrap()
+            .withdrawn
+            .is_some()
+    );
+}
+
+#[test]
+fn planner_input_cli_previews_and_applies_selected_deletion() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    router_acp::planner_input::send(&store, SID, &f.repo, "monitor-cli", "obsolete").unwrap();
+    let invoke = |apply: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_router-acp"));
+        command
+            .args(["planner-input", "--state"])
+            .arg(&f.state_path)
+            .args(["--session", SID, "--cwd"])
+            .arg(&f.repo)
+            .args(["--id", "monitor-cli", "--delete", "--reason", "superseded"]);
+        if apply {
+            command.arg("--apply");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert!(invoke(false)[0]["withdrawn"].is_null());
+    assert!(
+        router_acp::planner_input::status(&store, SID, "monitor-cli")
+            .unwrap()
+            .queued
+    );
+    assert_eq!(invoke(true)[0]["withdrawn"]["reason"], "superseded");
+    assert!(
+        !router_acp::planner_input::status(&store, SID, "monitor-cli")
+            .unwrap()
+            .queued
+    );
+}
+
 #[test]
 fn external_monitor_input_refuses_wrong_checkout_dead_or_stopped_run() {
     let f = fixture(|_| {});
@@ -4194,7 +4398,8 @@ async fn implement_retries_adoption_after_the_previous_router_finishes_draining(
     })
     .unwrap();
     // No repeated implement command, monitor input or manual adopt-run.
-    router_acp::planner_capacity::tick(&f.shared, "next", chrono::Utc::now().timestamp()).await;
+    router_acp::planner_capacity::tick(&f.shared, "next", chrono::Utc::now().timestamp() + 15)
+        .await;
     let adopted = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
     assert_eq!(
         adopted
@@ -4212,6 +4417,251 @@ async fn implement_retries_adoption_after_the_previous_router_finishes_draining(
         RunStatus::Superseded
     );
     assert!(adopted.capacity.pending_adoption.is_none());
+}
+
+fn pending_source(shared: &Arc<Shared>, status: RunStatus, superseded_by: Option<&str>) {
+    let persisted = shared.state.lock().unwrap().get(SID).unwrap();
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("source".into(), persisted);
+    let mut source = planner_workflow::load(shared, SID).unwrap().unwrap();
+    source.revision = 0;
+    source.status = status;
+    source.superseded_by = superseded_by.map(str::to_string);
+    source.owner = Some(planner_workflow::RunOwner::current());
+    planner_workflow::save(shared, "source", &mut source).unwrap();
+    planner_workflow::mutate(shared, SID, |run| {
+        run.capacity.pending_adoption = Some("source".into());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_adoption_source_clears_itself_and_capacity_still_fills_slots() {
+    for (status, successor, expected) in [
+        (
+            RunStatus::Superseded,
+            Some("third-session"),
+            "superseded by session third-session",
+        ),
+        (RunStatus::Cancelled, None, "Cancelled"),
+        (RunStatus::Complete, None, "Complete"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = tmp.path().join("capacity.json");
+        let f = fixture(|cfg| capacity_host(cfg, host_script(&["a"], &called), 1000, 1000000));
+        authorize(&f.shared);
+        pending_source(&f.shared, status, successor);
+        let last = parent_turn_ended(&f.shared);
+        tick(&f.shared, last + 61).await;
+        let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+        assert!(run.capacity.pending_adoption.is_none());
+        assert!(run.wakes["adoption:handoff"].reason.contains(expected));
+        assert!(called.exists() && !wakes_with(&f.shared, "capacity:").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn missing_adoption_source_clears_itself() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.capacity.pending_adoption = Some("deleted-session".into());
+        Ok(())
+    })
+    .unwrap();
+    tick(&f.shared, chrono::Utc::now().timestamp()).await;
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.capacity.pending_adoption.is_none());
+    assert!(run.wakes["adoption:handoff"].reason.contains("disappeared"));
+}
+
+#[tokio::test]
+async fn cancellation_census_is_read_only_and_counts_live_workers_and_admissible_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 3;
+        capacity_host(
+            cfg,
+            host_script(&["a", "b"], &tmp.path().join("capacity.json")),
+            1000,
+            1000000,
+        );
+    });
+    admit(&f.shared, work("running"));
+    planner_workflow::begin_work(&f.shared, SID, "running")
+        .await
+        .unwrap();
+    let now = parent_turn_ended(&f.shared);
+    tick(&f.shared, now).await;
+    let before = planner_workflow::load(&f.shared, SID)
+        .unwrap()
+        .unwrap()
+        .revision;
+    let census =
+        router_acp::planner_shutdown::status(&f.shared, &json!({"sessionId":SID})).unwrap();
+    assert_eq!(census, json!({"status":"running","live":1,"admissible":2}));
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .revision,
+        before
+    );
+}
+
+#[tokio::test]
+async fn pending_adoption_only_blocks_admission_and_retries_every_fifteen_seconds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capacity = tmp.path().join("capacity.json");
+    let log = tmp.path().join("audit.jsonl");
+    let reply = tmp.path().join("audit.json");
+    std::fs::write(&reply, defects(&["STAGING_IDLE", "DATADOG_DUE"])).unwrap();
+    let f = fixture(|cfg| {
+        capacity_host(cfg, host_script(&["a"], &capacity), 1000, 1000000);
+        audit_host(cfg, audit_script(&reply, &log));
+    });
+    admit(&f.shared, work("stopped"));
+    let (worker, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "stopped")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(&f.shared, SID, &worker, None, "interrupted".into(), true)
+        .unwrap();
+    pending_source(&f.shared, RunStatus::Draining, None);
+    let now = parent_turn_ended(&f.shared) + 61;
+    tick(&f.shared, now).await;
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.capacity.resumes.contains_key("stopped"));
+    assert_eq!(run.capacity.audit.as_ref().unwrap().defects.len(), 2);
+    assert!(!host_calls(&log).is_empty());
+    assert!(!wakes_with(&f.shared, "audit:").is_empty());
+    assert!(!capacity.exists(), "only admission waits");
+    assert!(
+        run.wakes["adoption:handoff"]
+            .reason
+            .contains(&format!("pid {}", std::process::id()))
+    );
+    // A source transition is deliberately not loaded until the next retry.
+    planner_workflow::mutate(&f.shared, "source", |run| {
+        run.superseded_by = Some("third".into());
+        Ok(())
+    })
+    .unwrap();
+    for offset in 1..15 {
+        tick(&f.shared, now + offset).await;
+    }
+    let pending = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(pending.capacity.pending_adoption.is_some());
+    assert_eq!(pending.capacity.last_adoption_retry_at, now);
+    let notices = f
+        .shared
+        .with_session(SID, |s| {
+            s.pending_disclosure
+                .iter()
+                .filter(|s| s.contains("Adoption of source is waiting"))
+                .count()
+        })
+        .unwrap();
+    assert_eq!(notices, 1);
+    tick(&f.shared, now + 15).await;
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .capacity
+            .pending_adoption
+            .is_none()
+    );
+    assert!(capacity.exists());
+}
+
+#[tokio::test]
+async fn turn_end_excludes_commands_and_wake_acknowledgment_resolves_input() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    for (id, origin) in [
+        ("operator-message", false),
+        ("monitor-message", true),
+        ("command", false),
+    ] {
+        let mut request = input_request(Some(id), "input text", false);
+        if origin {
+            request.meta =
+                serde_json::from_value(json!({"router_acp":{"input_id":id,"agent_origin":true}}))
+                    .ok();
+        }
+        planner_workflow::record_steered_input(&f.shared, SID, &request).unwrap();
+    }
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.commands.insert("command".into());
+        Ok(())
+    })
+    .unwrap();
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(!run.wakes.contains_key("input:command"));
+    assert!(
+        run.wakes["input:operator-message"]
+            .reason
+            .contains("origin: human")
+    );
+    assert!(
+        run.wakes["input:monitor-message"]
+            .reason
+            .contains("origin: agent")
+    );
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::AcknowledgeWake {
+            key: "ack-via-wake".into(),
+            wake_id: "input:operator-message".into(),
+        },
+    )
+    .await
+    .unwrap();
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.inputs["operator-message"].acknowledged);
+    assert!(run.wakes["input:operator-message"].acknowledged);
+}
+
+#[tokio::test]
+async fn adoption_skips_resolved_inputs_even_when_old_wakes_and_queue_entries_remain() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    router_acp::planner_input::send(&store, SID, &f.repo, "resolved", "already handled").unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.inputs.get_mut("resolved").unwrap().acknowledged = true;
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let persisted = store.get(SID).unwrap();
+    store.upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    let report = router_acp::planner_adopt::adopt(&store, SID, "next").unwrap();
+    let next = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert!(next.inputs["resolved"].resolved());
+    assert!(!next.wakes.contains_key("input:resolved"));
+    assert!(next.parent_queue.is_empty() && report.operator_inputs.is_empty());
 }
 
 #[tokio::test]
@@ -5076,6 +5526,42 @@ async fn run_reaches(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    pin_parent(&f.shared);
+    f.shared.with_session(SID, |s| s.prompt_activity = 1);
+    router_acp::planner_shutdown::request(&f.shared, &json!({"sessionId":SID})).unwrap();
+    let waiting = || {
+        router_acp::planner_shutdown::progress(&f.shared, SID)
+            .iter()
+            .filter(|p| {
+                p["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("waiting for the parent's shutdown handoff"))
+            })
+            .count()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(33), async {
+        while waiting() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("shutdown remains visible while an operator turn is busy");
+    assert!(!router_acp::planner_preempt::preempted(&f.shared, SID));
+    assert!(
+        !router_acp::planner_shutdown::progress(&f.shared, SID)
+            .iter()
+            .any(|p| p["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("prompting the parent")))
+    );
+    f.shared.with_session(SID, |s| s.prompt_activity = 0);
+    run_reaches(&f.shared, RunStatus::Paused).await;
+}
+
+#[tokio::test]
 async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run() {
     let tmp = tempfile::tempdir().unwrap();
     let stdin = tmp.path().join("shutdown-stdin.json");

@@ -261,7 +261,11 @@ pub(crate) fn pending_steer(
                 ended: false,
             })
     }
-    if let Some(input) = queue.first() {
+    if let Some(input) = queue.iter().find(|input| {
+        !wakes
+            .get(&format!("input:{}", input.input_id))
+            .is_some_and(|w| w.acknowledged)
+    }) {
         let key = format!("input:{}", input.input_id);
         let live_delivery = wakes.get(&key).is_some_and(|w| claimed(w, &key));
         if !steered.contains(&key)
@@ -676,6 +680,13 @@ async fn deliver_queued_input(
     let wake_id = format!("input:{}", input.input_id);
     let (pid, started) = planner_workflow::process_identity();
     planner_workflow::mutate(shared, sid, |run| {
+        if run
+            .inputs
+            .get(&input.input_id)
+            .is_some_and(|i| i.resolved())
+        {
+            return Err("original parent input is already resolved".into());
+        }
         if run.parent_queue.first().map(|queued| &queued.input_id) != Some(&input.input_id) {
             return Err("original parent input is no longer first in the queue".into());
         }
@@ -751,6 +762,23 @@ async fn deliver_queued_input(
 mod steer_tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn resolved_input_is_not_steered_even_if_a_stale_queue_entry_remains() {
+        let queue = vec![input("withdrawn", true), input("pending", true)];
+        let wakes = BTreeMap::from([(
+            "input:withdrawn".into(),
+            planner_workflow::Wake {
+                acknowledged: true,
+                ..Default::default()
+            },
+        )]);
+        assert!(pending_steer(&queue[..1], &wakes, &HashSet::new()).is_none());
+        assert_eq!(
+            pending_steer(&queue, &wakes, &HashSet::new()).unwrap().0,
+            "input:pending"
+        );
+    }
 
     fn input(id: &str, agent: bool) -> planner_workflow::QueuedParentInput {
         let meta = if agent {

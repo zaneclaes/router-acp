@@ -13,6 +13,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+mod support;
 
 struct Client {
     child: Child,
@@ -20,6 +21,41 @@ struct Client {
     output: tokio::io::Lines<BufReader<ChildStdout>>,
     events: Vec<Value>,
     next_id: u64,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        support::stop_router(&mut self.child);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_panicked_harness_reaps_the_router_and_its_mock_agent() {
+    let fixture = fixture("panic-cleanup");
+    let mut client = spawn(&fixture);
+    client.initialize().await;
+    let router_pid = client.child.id().unwrap();
+    let events = std::fs::read_to_string(&fixture.mock_log).unwrap();
+    let mock_pid = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|e| e["event"] == "initialize")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap() as i32;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _client = client;
+        panic!("exercise assertion cleanup");
+    }));
+    assert!(result.is_err());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while unsafe { libc::kill(router_pid as i32, 0) == 0 || libc::kill(mock_pid, 0) == 0 } {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("test router and mock must both exit on unwind");
 }
 
 impl Client {

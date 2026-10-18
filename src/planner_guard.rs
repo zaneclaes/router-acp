@@ -170,6 +170,7 @@ fn record_observations(
 /// an active drain.
 #[derive(Default)]
 pub struct SessionRuntime {
+    pub adoption_notice: Option<String>,
     pub turn_ends: u64,
     pub turn_ended_at: i64,
     /// The last turn end the gate judged.
@@ -208,6 +209,9 @@ pub fn with_runtime<T>(shared: &Shared, sid: &str, f: impl FnOnce(&mut SessionRu
 /// The parent's turn ended at `at` (unix seconds): the gate evaluates it and
 /// the next tick audits.
 pub fn parent_turn_ended(shared: &Shared, sid: &str, at: i64) {
+    if let Err(error) = planner_workflow::reconcile_delivered_inputs(shared, sid) {
+        tracing::warn!(session = sid, %error, "input acknowledgment reconciliation failed");
+    }
     with_runtime(shared, sid, |rt| {
         rt.turn_ends += 1;
         rt.turn_ended_at = at;

@@ -44,9 +44,13 @@ pub trait RunStore {
     fn run_ids_beside(&self, sid: &str) -> Result<Vec<String>, String>;
     /// The session is loaded in this process (so its owner is alive).
     fn loaded_here(&self, sid: &str) -> bool;
+    fn session_exists(&self, sid: &str) -> bool;
 }
 
 impl RunStore for crate::session::Shared {
+    fn session_exists(&self, sid: &str) -> bool {
+        self.state.lock().unwrap().get(sid).is_some()
+    }
     fn load(&self, sid: &str) -> Result<Option<PlannerRun>, String> {
         crate::planner_workflow::load(self, sid)
     }
@@ -76,6 +80,9 @@ impl RunStore for crate::session::Shared {
 }
 
 impl RunStore for crate::state::StateStore {
+    fn session_exists(&self, sid: &str) -> bool {
+        self.get(sid).is_some()
+    }
     fn load(&self, sid: &str) -> Result<Option<PlannerRun>, String> {
         self.planner_run(sid)?
             .map(|(revision, value)| {
@@ -205,8 +212,7 @@ pub fn live_owner(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -
         && now - last < LEGACY_QUIET_SECS
     {
         return Some(format!(
-            "it records no owner and was active {} s ago",
-            now - last
+            "it records no owner and its last activity was at unix second {last}; waiting for the legacy quiet period"
         ));
     }
     None
@@ -331,6 +337,12 @@ fn merge(
             .or_insert_with(|| observation.clone());
     }
     for (id, input) in &from.inputs {
+        if !into.inputs.contains_key(id)
+            && let Some(receipt) = from.receipts.get(&format!("input-withdrawal:{id}"))
+        {
+            into.receipts
+                .insert(format!("input-withdrawal:{id}"), receipt.clone());
+        }
         into.inputs
             .entry(id.clone())
             .or_insert_with(|| input.clone());
@@ -343,7 +355,7 @@ fn merge(
         .map(|q| q.input_id.clone())
         .collect::<BTreeSet<_>>();
     for (id, input) in &from.inputs {
-        if input.acknowledged
+        if input.resolved()
             || input.origin != "human"
             || from.commands.contains(id)
             || queued.contains(id)
@@ -374,6 +386,13 @@ fn merge(
     let mut front = Vec::new();
     for queued in &from.parent_queue {
         if into
+            .inputs
+            .get(&queued.input_id)
+            .is_some_and(|input| input.resolved())
+        {
+            continue;
+        }
+        if into
             .parent_queue
             .iter()
             .any(|q| q.input_id == queued.input_id)
@@ -398,6 +417,13 @@ fn merge(
     front.extend(std::mem::take(&mut into.parent_queue));
     into.parent_queue = front;
     for (id, wake) in &from.wakes {
+        if id
+            .strip_prefix("input:")
+            .and_then(|id| into.inputs.get(id))
+            .is_some_and(|input| input.resolved())
+        {
+            continue;
+        }
         // A wake about a work the new run kept its own of describes the old
         // attempt, not the new one.
         let stale_work = report.conflicting_works.contains(&wake.work_id)
@@ -524,7 +550,7 @@ pub fn adopt_on_implement(store: &dyn RunStore, into_sid: &str) -> Option<AdoptR
     // receives implement. Persist this handoff instead of silently starting
     // from zero works and forgetting the previous run at the next tick.
     let reason = format!(
-        "Awaiting adoption of planner run {latest}; the ordinary capacity cycle retries after its owner exits. New admissions and release mutations wait for the preserved inventory."
+        "Awaiting adoption of planner run {latest}; the capacity cycle retries every 15 seconds. Only new admissions wait for the preserved inventory."
     );
     if let Err(error) = adoption_pending(store, into_sid, Some(&latest), &reason) {
         tracing::warn!(from = latest, into = into_sid, %error, "could not record planner adoption");
@@ -547,6 +573,14 @@ fn adoption_pending(
 ) -> Result<(), String> {
     for _ in 0..16 {
         let mut run = store.load(sid)?.ok_or("planner destination disappeared")?;
+        if run.capacity.pending_adoption.as_deref() == source
+            && run
+                .wakes
+                .get("adoption:handoff")
+                .is_some_and(|w| w.reason == reason)
+        {
+            return Ok(());
+        }
         run.capacity.pending_adoption = source.map(str::to_string);
         run.wakes.insert(
             "adoption:handoff".into(),
@@ -568,15 +602,81 @@ fn adoption_pending(
 /// Retry only the handoff authorized by the explicit implement command.
 /// Ordinary session loading never discovers or adopts a different run.
 pub fn retry_pending(store: &dyn RunStore, into_sid: &str) -> Result<Option<AdoptReport>, String> {
+    retry_pending_at(store, into_sid, chrono::Utc::now().timestamp())
+}
+
+pub fn retry_pending_at(
+    store: &dyn RunStore,
+    into_sid: &str,
+    now: i64,
+) -> Result<Option<AdoptReport>, String> {
+    // Claim the retry before reading the potentially large source document.
+    let mut source = None;
+    for _ in 0..16 {
+        let mut into = store
+            .load(into_sid)?
+            .ok_or("planner destination disappeared")?;
+        if into.capacity.pending_adoption.is_none()
+            || (into.capacity.last_adoption_retry_at != 0
+                && now - into.capacity.last_adoption_retry_at < 15)
+        {
+            return Ok(None);
+        }
+        into.capacity.last_adoption_retry_at = now;
+        match store.save(into_sid, &mut into) {
+            Ok(()) => {
+                source = into.capacity.pending_adoption;
+                break;
+            }
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let source = source.ok_or("planner adoption retry remained contended")?;
+    match retry_source(store, into_sid, &source, now) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            adoption_pending(
+                store,
+                into_sid,
+                Some(&source),
+                &format!(
+                    "Adoption of {source} is waiting: {error}. Retrying in 15 seconds; worker recovery and audits continue."
+                ),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn retry_source(
+    store: &dyn RunStore,
+    into_sid: &str,
+    source: &str,
+    now: i64,
+) -> Result<Option<AdoptReport>, String> {
     let into = store
         .load(into_sid)?
         .ok_or("planner destination disappeared")?;
-    let Some(source) = into.capacity.pending_adoption else {
+    if into.capacity.pending_adoption.as_deref() != Some(source) {
+        return Ok(None);
+    }
+    let from = if store.session_exists(source) {
+        store.load(source)?
+    } else {
+        None
+    };
+    let Some(from) = from else {
+        adoption_pending(
+            store,
+            into_sid,
+            None,
+            &format!(
+                "Adoption of {source} abandoned: its run or session row disappeared. New admissions may continue."
+            ),
+        )?;
         return Ok(None);
     };
-    let from = store
-        .load(&source)?
-        .ok_or("pending planner source disappeared")?;
     if from.superseded_by.as_deref() == Some(into_sid) {
         adoption_pending(
             store,
@@ -585,13 +685,41 @@ pub fn retry_pending(store: &dyn RunStore, into_sid: &str) -> Result<Option<Adop
             "Planner adoption completed; reconcile the preserved assignments before resuming them.",
         )?;
         return Ok(Some(AdoptReport {
-            from: source,
+            from: source.into(),
             into: into_sid.into(),
             ..Default::default()
         }));
     }
-    if live_owner(store, &source, &from, chrono::Utc::now().timestamp()).is_some() {
+    let terminal = from
+        .superseded_by
+        .as_ref()
+        .map(|sid| format!("superseded by session {sid}"))
+        .or_else(|| {
+            (!matches!(
+                from.status,
+                RunStatus::Running | RunStatus::Draining | RunStatus::Paused
+            ))
+            .then(|| format!("source is {:?}", from.status))
+        });
+    if let Some(reason) = terminal {
+        adoption_pending(
+            store,
+            into_sid,
+            None,
+            &format!("Adoption of {source} abandoned: {reason}. New admissions may continue."),
+        )?;
         return Ok(None);
     }
-    adopt(store, &source, into_sid).map(Some)
+    if let Some(reason) = live_owner(store, source, &from, now) {
+        adoption_pending(
+            store,
+            into_sid,
+            Some(source),
+            &format!(
+                "Adoption of {source} is waiting: {reason}. Retrying in 15 seconds; worker recovery and audits continue."
+            ),
+        )?;
+        return Ok(None);
+    }
+    adopt(store, source, into_sid).map(Some)
 }

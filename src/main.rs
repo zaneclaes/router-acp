@@ -289,17 +289,34 @@ enum Command {
         #[arg(long)]
         session: String,
         /// Stable caller-chosen id; retrying the same id never duplicates input.
-        #[arg(long)]
-        id: String,
+        #[arg(long, required_unless_present_any = ["list", "drain"])]
+        id: Option<String>,
         /// Expected checkout. Required for sending; ignored for status.
-        #[arg(long, required_unless_present = "status")]
+        #[arg(long, required_unless_present_any = ["status", "list"])]
         cwd: Option<PathBuf>,
         /// Read a UTF-8 message from this file (use - for stdin).
-        #[arg(long, required_unless_present = "status", conflicts_with = "status")]
+        #[arg(long, required_unless_present_any = ["status", "list", "delete", "drain"], conflicts_with_all = ["status", "list", "delete", "drain"])]
         message_file: Option<PathBuf>,
         /// Read delivery/acknowledgment metadata without modifying state.
         #[arg(long)]
         status: bool,
+        /// List unresolved input metadata, including already-delivered input.
+        #[arg(long, conflicts_with_all = ["status", "delete", "drain"])]
+        list: bool,
+        /// Withdraw --id from delivery/reconciliation (preview unless --apply).
+        #[arg(long, conflicts_with_all = ["status", "drain"])]
+        delete: bool,
+        /// Withdraw unresolved agent inputs (preview unless --apply).
+        #[arg(long, conflicts_with_all = ["status", "id"])]
+        drain: bool,
+        /// Explicitly include human-origin inputs in a withdrawal.
+        #[arg(long)]
+        include_human: bool,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Apply --delete/--drain; requires --reason. Never interrupts a turn.
+        #[arg(long, requires = "reason")]
+        apply: bool,
     },
     /// Read router-owned state through the versioned, read-only JSON boundary.
     /// Hosts must use this instead of opening the SQLite database themselves.
@@ -916,14 +933,56 @@ async fn main() -> anyhow::Result<()> {
             cwd,
             message_file,
             status,
+            list,
+            delete,
+            drain,
+            include_human,
+            reason,
+            apply,
         } => {
             let path = router_acp::config::expand_tilde(&state);
             let retention = router_acp::state::Retention {
                 max_age: std::time::Duration::MAX,
             };
-            let report = if status {
+            anyhow::ensure!(
+                !(apply || include_human || reason.is_some()) || delete || drain,
+                "--apply, --include-human and --reason require --delete or --drain"
+            );
+            let report = if list || delete || drain {
+                let store = if apply {
+                    anyhow::ensure!(
+                        !router_acp::state::StateStore::state_absent(&path),
+                        "router state does not exist"
+                    );
+                    router_acp::state::StateStore::load(&path, retention)
+                } else {
+                    router_acp::state::StateStore::open_readonly(&path, retention)?
+                };
+                let rows = if list {
+                    router_acp::planner_input::list(&store, &session)
+                } else {
+                    router_acp::planner_input::withdraw(
+                        &store,
+                        &session,
+                        &cwd.expect("clap requires cwd"),
+                        id.as_deref(),
+                        include_human,
+                        reason.as_deref().unwrap_or(""),
+                        apply,
+                    )
+                }
+                .map_err(anyhow::Error::msg)?;
+                serde_json::to_value(rows)?
+            } else if status {
                 let store = router_acp::state::StateStore::open_readonly(&path, retention)?;
-                router_acp::planner_input::status(&store, &session, &id)
+                serde_json::to_value(
+                    router_acp::planner_input::status(
+                        &store,
+                        &session,
+                        id.as_deref().expect("clap requires id"),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                )?
             } else {
                 use std::io::Read;
                 let file = message_file.expect("clap requires a message file");
@@ -939,15 +998,17 @@ async fn main() -> anyhow::Result<()> {
                     "router state does not exist"
                 );
                 let store = router_acp::state::StateStore::load(&path, retention);
-                router_acp::planner_input::send(
-                    &store,
-                    &session,
-                    &cwd.expect("clap requires cwd"),
-                    &id,
-                    &message,
-                )
-            }
-            .map_err(anyhow::Error::msg)?;
+                serde_json::to_value(
+                    router_acp::planner_input::send(
+                        &store,
+                        &session,
+                        &cwd.expect("clap requires cwd"),
+                        id.as_deref().expect("clap requires id"),
+                        &message,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                )?
+            };
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }

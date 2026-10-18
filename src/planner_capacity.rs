@@ -79,6 +79,8 @@ pub struct CapacityState {
     /// handoff before admitting anything against an incomplete work inventory.
     #[serde(default)]
     pub pending_adoption: Option<String>,
+    #[serde(default)]
+    pub last_adoption_retry_at: i64,
     /// Active holds by `plan_id` (a hold may also name a `work_id`).
     #[serde(default)]
     pub holds: BTreeMap<String, Hold>,
@@ -549,18 +551,23 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
         return;
     }
     if run.capacity.pending_adoption.is_some() {
-        match crate::planner_adopt::retry_pending(shared.as_ref(), sid) {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(session = sid, %error, "planner adoption remains pending");
-                return;
-            }
-        }
+        let _ = crate::planner_adopt::retry_pending_at(shared.as_ref(), sid, now);
     }
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
         return;
     };
+    if let Some(wake) = run.wakes.get("adoption:handoff") {
+        let notify = crate::planner_guard::with_runtime(shared, sid, |rt| {
+            if rt.adoption_notice.as_deref() == Some(&wake.reason) {
+                return false;
+            }
+            rt.adoption_notice = Some(wake.reason.clone());
+            true
+        });
+        if notify {
+            crate::session::notify_user(shared, sid, format!("router-acp · {}", wake.reason));
+        }
+    }
     let timing = timing(shared);
     resume_workers(shared, sid, &run, now).await;
     // The audit runs whatever the free slots and the parent's activity.
@@ -602,7 +609,11 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
         return;
     };
     let idle = now - last;
-    let filled = fill_slots(shared, sid, run, now, last, &timing).await;
+    let filled = if run.capacity.pending_adoption.is_none() {
+        fill_slots(shared, sid, run, now, last, &timing).await
+    } else {
+        false
+    };
     if !filled {
         inflight_wake(shared, sid, now, idle, &timing);
     }

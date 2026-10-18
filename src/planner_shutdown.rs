@@ -32,6 +32,32 @@ use crate::session::Shared;
 
 pub const METHOD: &str = "_router/planner_shutdown";
 pub const PROGRESS_METHOD: &str = "_router/shutdown_progress";
+pub const STATUS_METHOD: &str = "_router/planner_status";
+
+/// A read-only census for the CLI after cancelling a turn or before exit.
+pub fn status(shared: &Shared, params: &Value) -> Result<Value, String> {
+    let sid = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or("planner status requires sessionId")?;
+    let run = planner_workflow::load(shared, sid)?.ok_or("session has no planner run")?;
+    let capacity =
+        crate::planner_capacity::status_block(shared, &run, chrono::Utc::now().timestamp_millis());
+    let admitting = run.status == RunStatus::Running
+        && run.phase == crate::config::PlannerPhase::Implementation
+        && run.execution_request.is_some()
+        && run.capacity.pending_adoption.is_none();
+    let admissible = if !admitting {
+        Some(0)
+    } else {
+        run.capacity
+            .host
+            .as_ref()
+            .filter(|host| host.ok)
+            .map(|_| capacity["unheld"].as_array().map_or(0, Vec::len))
+    };
+    Ok(json!({"status":run.status,"live":capacity["live"],"admissible":admissible}))
+}
 pub const PARENT_PROMPT: &str = "Shutdown requested by the operator: rewrite Docs/CONTINUE.md and \
      your registers now with the exact resume point; admit nothing; end your turn.";
 pub const WORKER_PROMPT: &str = "Shutdown requested: commit and push your branch now, record your \
@@ -192,7 +218,7 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
     }
 
     if matches!(prior, RunStatus::Running | RunStatus::Draining) {
-        let outcome = prompt_parent(shared, sid).await;
+        let outcome = prompt_parent(shared, sid, &saved, &workers).await;
         notify(shared, sid, "draining", &outcome, &saved, &workers);
     }
 
@@ -313,7 +339,30 @@ async fn save_state(
 }
 
 /// Prompt the parent once, then wait for that turn, all within 10 minutes.
-async fn prompt_parent(shared: &Arc<Shared>, sid: &str) -> String {
+async fn prompt_parent(
+    shared: &Arc<Shared>,
+    sid: &str,
+    saved: &[String],
+    workers: &BTreeMap<String, String>,
+) -> String {
+    let prompt = prompt_parent_once(shared, sid, saved, workers);
+    tokio::pin!(prompt);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            outcome = &mut prompt => return outcome,
+            _ = heartbeat.tick() => notify(shared, sid, "draining",
+                "waiting for the parent's shutdown handoff; operator turns are allowed to finish", saved, workers),
+        }
+    }
+}
+
+async fn prompt_parent_once(
+    shared: &Arc<Shared>,
+    sid: &str,
+    saved: &[String],
+    workers: &BTreeMap<String, String>,
+) -> String {
     if shared
         .with_session(sid, |s| s.pin.is_none())
         .unwrap_or(true)
@@ -323,6 +372,19 @@ async fn prompt_parent(shared: &Arc<Shared>, sid: &str) -> String {
             .into();
     }
     let started = Instant::now();
+    if crate::planner_preempt::router_turn_in_flight(shared, sid) {
+        notify(
+            shared,
+            sid,
+            "draining",
+            "cancelling the router-owned parent turn for shutdown",
+            saved,
+            workers,
+        );
+        if !crate::planner_preempt::preempt(shared, sid).await {
+            return "the router-owned parent turn did not stop within its cancellation bound; the saved resume state stands and workers drain anyway".into();
+        }
+    }
     let activity = loop {
         if let Some(activity) = crate::planner_wake::PromptActivity::idle(shared, sid) {
             break activity;
@@ -332,6 +394,14 @@ async fn prompt_parent(shared: &Arc<Shared>, sid: &str) -> String {
         }
         tokio::time::sleep(POLL).await;
     };
+    notify(
+        shared,
+        sid,
+        "draining",
+        "prompting the parent to record its shutdown resume point",
+        saved,
+        workers,
+    );
     let prompt = PromptRequest::new(sid.to_string(), vec![ContentBlock::from(PARENT_PROMPT)]).meta(
         serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(
             json!({"router_acp":{"agent_origin":true,"origin":"planner-shutdown"}}),

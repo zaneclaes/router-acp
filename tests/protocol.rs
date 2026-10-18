@@ -236,6 +236,23 @@ struct Observed {
 
 type ObservedHandle = Arc<Mutex<Observed>>;
 
+/// Test panics and timeouts must tear down this router's adapters too. Do not
+/// use the process-wide downstream registry: other tests run concurrently.
+struct TestRouterGuard {
+    task: tokio::task::JoinHandle<Result<(), AcpError>>,
+    shared: Arc<Shared>,
+}
+
+impl Drop for TestRouterGuard {
+    fn drop(&mut self) {
+        self.shared.sessions.lock().unwrap().clear();
+        for target in self.shared.targets.lock().unwrap().values() {
+            target.stop.cancel();
+        }
+        self.task.abort();
+    }
+}
+
 /// Run the router over a duplex channel and drive it with a test client.
 async fn run_test<F>(cfg_yaml: String, test_fn: F)
 where
@@ -275,7 +292,10 @@ where
     let shared = Shared::new(cfg).expect("shared state builds");
     let shared_for_test = shared.clone();
     let (channel_a, channel_b) = Channel::duplex();
-    let router = tokio::spawn(serve_shared(shared, channel_a));
+    let router = TestRouterGuard {
+        task: tokio::spawn(serve_shared(shared.clone(), channel_a)),
+        shared,
+    };
 
     let observed: ObservedHandle = Arc::new(Mutex::new(Observed::default()));
     let o_updates = observed.clone();
@@ -515,7 +535,7 @@ where
     )
     .await;
 
-    router.abort();
+    drop(router);
     match client_result {
         Ok(result) => result.expect("test client failed"),
         Err(_) => panic!("test timed out"),
@@ -13722,6 +13742,99 @@ fn preempt_repository(release: &std::path::Path) -> tempfile::TempDir {
 }
 
 const WAKE_MARKER: &str = "[Router-owned child wake]";
+
+#[tokio::test]
+async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
+    let state = temp_state_file("shutdown-preempt");
+    let log = temp_log("shutdown-preempt");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            insert_wake(&shared, &sid, "audit:shutdown-preempt");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            let started = std::time::Instant::now();
+            router_acp::planner_shutdown::request(&shared, &serde_json::json!({"sessionId":sid}))
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_mock_prompt(&log, router_acp::planner_shutdown::PARENT_PROMPT),
+            )
+            .await
+            .expect("shutdown promptly preempts the router turn");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let events = read_log(&log);
+            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
+            let shutdown = mock_prompts(&log, router_acp::planner_shutdown::PARENT_PROMPT)[0];
+            assert!(cancel < shutdown);
+            assert!(
+                !release.exists(),
+                "the original router turn could only end by cancellation"
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn withdrawn_parent_input_is_neither_delivered_nor_steered_over_the_wire() {
+    let state = temp_state_file("withdraw-input");
+    let log = temp_log("withdraw-input");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            // Hold the parent before queueing so no delivery can race the withdrawal.
+            shared.with_session(&sid, |s| s.prompt_activity += 1);
+            {
+                let store = shared.state.lock().unwrap();
+                router_acp::planner_input::send(
+                    &store,
+                    &sid,
+                    &repo.path().join("repo"),
+                    "obsolete",
+                    "WITHDRAWN-CORRECTION",
+                )
+                .unwrap();
+                router_acp::planner_input::withdraw(
+                    &store,
+                    &sid,
+                    &repo.path().join("repo"),
+                    Some("obsolete"),
+                    false,
+                    "superseded",
+                    true,
+                )
+                .unwrap();
+            }
+            shared.with_session(&sid, |s| s.prompt_activity -= 1);
+            insert_wake(&shared, &sid, "audit:after-withdrawal");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            // Let the periodic steering loop run while the adapter holds a router turn.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(
+                !read_log(&log)
+                    .iter()
+                    .any(|e| e.to_string().contains("WITHDRAWN-CORRECTION"))
+            );
+            let run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+            assert!(run.wakes["input:obsolete"].acknowledged);
+            assert!(run.inputs["obsolete"].delivered_to.is_empty());
+            assert!(run.parent_queue.is_empty());
+            std::fs::write(&release, "").unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
 
 fn insert_wake(shared: &router_acp::session::Shared, sid: &str, id: &str) {
     router_acp::planner_workflow::mutate(shared, sid, |run| {
