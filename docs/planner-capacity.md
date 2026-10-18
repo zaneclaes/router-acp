@@ -345,6 +345,12 @@ A turn that delivers wakes (child, heartbeat, capacity, audit, in-flight,
 gate) is router-owned (`src/planner_preempt.rs`). Operator input never waits
 behind one:
 
+Router-generated steering is limited to queued agent corrections, `release:*`
+transitions and `observation:ci-job-failures*`, at most once per session per 60
+seconds across turn boundaries. Routine `observation:ci:<work>` wakes wait for
+the boundary. Every injected block explicitly identifies itself as router text,
+not operator input; its durable wake still requires acknowledgment at delivery.
+
 - A client prompt that arrives while a router-owned turn holds the parent is
   first steered into it with `_session/steering`
   (`_meta.steering.idleBehavior: "promptRequired"`). claude-agent-acp and

@@ -198,6 +198,25 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
 /// the boundary; the steer only lets the parent act on it now. An operator turn
 /// is never steered into (`router_turn_in_flight` is false for it), and an item
 /// a delivery already claims is left to that delivery.
+/// At most one steer per session per `STEER_INTERVAL_SECS`, and only the urgent
+/// items: on 2026-10-18 the first version steered 47 routine `observation:ci:<work>`
+/// wakes into one parent turn in 47 seconds, one per tick, and the parent read
+/// the flood as operator speech.
+const STEER_INTERVAL_SECS: u64 = 60;
+
+fn claim_steer(rt: &mut crate::planner_guard::SessionRuntime, now: std::time::Instant) -> bool {
+    if rt.steering
+        || rt
+            .last_steer
+            .is_some_and(|last| now.saturating_duration_since(last).as_secs() < STEER_INTERVAL_SECS)
+    {
+        return false;
+    }
+    rt.steering = true;
+    rt.last_steer = Some(now);
+    true
+}
+
 fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
     if !crate::planner_preempt::router_turn_in_flight(shared, sid) {
         return;
@@ -207,12 +226,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     };
     let claimed = crate::planner_guard::with_runtime(shared, sid, |rt| {
-        if rt.steering {
-            false
-        } else {
-            rt.steering = true;
-            true
-        }
+        claim_steer(rt, std::time::Instant::now())
     });
     if !claimed {
         return;
@@ -285,7 +299,7 @@ pub(crate) fn pending_steer(
             return Some((
                 key,
                 format!(
-                    "[Router steer] Agent correction `{}` is queued for this parent. It is redelivered for \
+                    "[Router steer] This is router text, not operator input. Agent correction `{}` is queued for this parent. It is redelivered for \
                      acknowledgment when this turn ends; read it now and act on it in this turn if it changes \
                      what you are doing:\n{body}",
                     input.input_id
@@ -293,17 +307,18 @@ pub(crate) fn pending_steer(
             ));
         }
     }
+    // Only a release transition or a failed CI job is worth interrupting a turn
+    // for; a routine `observation:ci:<work>` branch state waits for the boundary.
     let (id, wake) = wakes.iter().find(|(id, w)| {
         !w.acknowledged
-            && wake_priority(id) <= 1
-            && !id.starts_with("input:")
+            && (id.starts_with("release:") || id.starts_with("observation:ci-job-failures"))
             && !steered.contains(*id)
             && !claimed(w, id)
     })?;
     Some((
         id.clone(),
         format!(
-            "[Router steer] Pending wake `{id}` (work {}): {}. It is redelivered when this turn ends; a failed \
+            "[Router steer] This is router text, not operator input. Pending wake `{id}` (work {}): {}. It is redelivered when this turn ends; a failed \
              CI job or a release transition is actionable now, in this turn.",
             wake.work_id, wake.reason
         ),
@@ -807,32 +822,40 @@ mod steer_tests {
     #[test]
     fn agent_correction_steers_first_once_and_never_an_operator_prompt() {
         let mut wakes = BTreeMap::new();
-        wakes.insert("observation:ci".to_string(), wake("ci job failed"));
+        wakes.insert(
+            "observation:ci-job-failures:staging".to_string(),
+            wake("ci job failed"),
+        );
         let queue = vec![input("fix-now", true)];
         let (key, text) =
             pending_steer(&queue, &wakes, &HashSet::new()).expect("steers the correction");
         assert_eq!(key, "input:fix-now");
         assert!(text.contains("body of fix-now") && text.contains("redelivered"));
+        assert!(text.starts_with("[Router steer] This is router text, not operator input."));
         let steered = HashSet::from([key]);
         let (next, _) = pending_steer(&queue, &wakes, &steered).expect("then the observation");
-        assert_eq!(next, "observation:ci");
+        assert_eq!(next, "observation:ci-job-failures:staging");
         let operator = vec![input("typed", false)];
         let (key, _) =
             pending_steer(&operator, &wakes, &HashSet::new()).expect("skips the operator prompt");
         assert_eq!(
-            key, "observation:ci",
+            key, "observation:ci-job-failures:staging",
             "an operator prompt is never steered by the router loop"
         );
     }
 
     #[test]
-    fn only_release_and_observation_wakes_steer_and_acknowledged_or_claimed_ones_do_not() {
+    fn only_release_and_failed_job_wakes_steer_and_acknowledged_or_claimed_ones_do_not() {
         let mut wakes = BTreeMap::new();
         wakes.insert("capacity:1".to_string(), wake("slots free"));
         wakes.insert("audit:2".to_string(), wake("defect"));
+        wakes.insert(
+            "observation:ci:dashboard-r1".to_string(),
+            wake("branch build passed"),
+        );
         assert!(
             pending_steer(&[], &wakes, &HashSet::new()).is_none(),
-            "routine wakes wait for the boundary"
+            "routine wakes, including a branch build observation, wait for the boundary"
         );
         let mut done = wake("round passed");
         done.acknowledged = true;
@@ -841,14 +864,41 @@ mod steer_tests {
         let mut live = wake("ci job failed");
         live.claim_pid = std::process::id();
         live.claim_started_at_ms = planner_workflow::process_identity().1;
-        wakes.insert("observation:claimed".to_string(), live);
+        wakes.insert("observation:ci-job-failures:claimed".to_string(), live);
         assert!(
             pending_steer(&[], &wakes, &HashSet::new()).is_none(),
             "a wake a live delivery claims is its"
         );
-        wakes.insert("observation:open".to_string(), wake("ci job failed"));
+        wakes.insert(
+            "observation:ci-job-failures:open".to_string(),
+            wake("ci job failed"),
+        );
         let (id, text) = pending_steer(&[], &wakes, &HashSet::new()).expect("the open observation");
-        assert_eq!(id, "observation:open");
+        assert_eq!(id, "observation:ci-job-failures:open");
         assert!(text.contains("ci job failed"));
+        assert!(text.starts_with("[Router steer] This is router text, not operator input."));
+    }
+
+    #[test]
+    fn second_steer_waits_sixty_seconds_even_across_turns() {
+        let mut rt = crate::planner_guard::SessionRuntime::default();
+        let now = std::time::Instant::now();
+        assert!(claim_steer(&mut rt, now));
+        rt.steering = false;
+        rt.steered.clear();
+        assert!(!claim_steer(
+            &mut rt,
+            now + std::time::Duration::from_secs(59)
+        ));
+        assert!(claim_steer(
+            &mut rt,
+            now + std::time::Duration::from_secs(60)
+        ));
+        assert!(!claim_steer(
+            &mut rt,
+            now + std::time::Duration::from_secs(120)
+        ));
+        let mut other_session = crate::planner_guard::SessionRuntime::default();
+        assert!(claim_steer(&mut other_session, now));
     }
 }

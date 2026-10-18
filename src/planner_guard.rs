@@ -190,6 +190,8 @@ pub struct SessionRuntime {
     pub steered: std::collections::HashSet<String>,
     /// A steer request is in flight for this session (one at a time).
     pub steering: bool,
+    /// Session-wide throttle, retained across parent turn boundaries.
+    pub last_steer: Option<std::time::Instant>,
     /// Each work's latest child session (process key, downstream session id).
     pub children: HashMap<String, (crate::downstream::ProcessKey, String)>,
     pub drain: Option<crate::planner_shutdown::Drain>,
