@@ -2738,7 +2738,7 @@ pub fn run_delegate_result(
                 Some(Ok(output)) => format!("delegate {id} — finished\n{output}"),
                 Some(Err(error)) => format!("delegate {id} — FAILED\n{error}"),
                 None => format!(
-                    "delegate {id} — queued or starting ({seconds}s): {summary}\nNo child session has opened yet; this is not proof of worker activity."
+                    "delegate {id} — pending ({seconds}s): {summary}\nNo child session is linked to this job id; verify the owning attempt before reporting worker activity."
                 ),
             });
         }

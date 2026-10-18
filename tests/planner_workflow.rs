@@ -2428,7 +2428,7 @@ async fn background_planner_failure_is_observable_without_a_child_session() {
 }
 
 #[test]
-fn background_result_distinguishes_queued_job_from_an_open_child() {
+fn background_result_reports_unlinked_job_activity_as_unverified() {
     let f = fixture(|_| {});
     f.shared.background_delegates.lock().unwrap().insert(
         "b-queued".into(),
@@ -2448,11 +2448,12 @@ fn background_result_distinguishes_queued_job_from_an_open_child() {
         },
     )
     .unwrap();
-    assert!(result.contains("queued or starting"), "{result}");
+    assert!(result.contains("pending"), "{result}");
     assert!(
-        result.contains("No child session has opened yet"),
+        result.contains("No child session is linked to this job id"),
         "{result}"
     );
+    assert!(result.contains("verify the owning attempt"), "{result}");
 }
 
 // ---------------------------------------------------------------------------
