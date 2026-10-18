@@ -43,6 +43,7 @@ pub fn end_router_turn(shared: &Shared, sid: &str) {
     with_runtime(shared, sid, |rt| {
         rt.router_turn = false;
         rt.preempted = false;
+        rt.steered.clear();
     });
 }
 

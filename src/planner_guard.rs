@@ -183,6 +183,12 @@ pub struct SessionRuntime {
     /// The stuck-turn watchdog cancelled or released the current turn
     /// (`crate::planner_watchdog`): its wakes go again at once.
     pub stalled: bool,
+    /// Pending wake ids and `input:<id>` keys already steered into the current
+    /// router-owned turn (`crate::planner_wake::steer_pending`); cleared when
+    /// that turn ends, because the boundary delivers them for real.
+    pub steered: std::collections::HashSet<String>,
+    /// A steer request is in flight for this session (one at a time).
+    pub steering: bool,
     /// Each work's latest child session (process key, downstream session id).
     pub children: HashMap<String, (crate::downstream::ProcessKey, String)>,
     pub drain: Option<crate::planner_shutdown::Drain>,

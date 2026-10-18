@@ -160,6 +160,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                     continue;
                 }
                 let Some(activity) = PromptActivity::idle(&shared, &sid) else {
+                    steer_pending(&shared, &sid, &run);
                     continue;
                 };
                 // Agent corrections, like wakes, must yield to live operator
@@ -184,6 +185,125 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// A router-owned turn is in flight and something actionable is pending. A
+/// parent that spends half an hour on receipts otherwise learns of a failed CI
+/// job, a release transition or a monitor correction only at its next turn
+/// boundary (2026-10-18: three staging smoke jobs failed and two corrections
+/// queued while the parent rewrote CONTINUE; nothing reached it for 25 minutes).
+/// Steer one pending item per tick into the running turn with
+/// `_session/steering`, exactly as operator input is steered, once per item per
+/// turn. The durable wake or queued input is still delivered and acknowledged at
+/// the boundary; the steer only lets the parent act on it now. An operator turn
+/// is never steered into (`router_turn_in_flight` is false for it), and an item
+/// a delivery already claims is left to that delivery.
+fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
+    if !crate::planner_preempt::router_turn_in_flight(shared, sid) {
+        return;
+    }
+    let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
+    let Some((key, text)) = pending_steer(&run.parent_queue, &run.wakes, &steered) else {
+        return;
+    };
+    let claimed = crate::planner_guard::with_runtime(shared, sid, |rt| {
+        if rt.steering {
+            false
+        } else {
+            rt.steering = true;
+            true
+        }
+    });
+    if !claimed {
+        return;
+    }
+    let shared = shared.clone();
+    let sid = sid.to_string();
+    tokio::spawn(async move {
+        let blocks = vec![ContentBlock::from(text.clone())];
+        let injected = crate::planner_preempt::steer(&shared, &sid, &blocks).await;
+        crate::planner_guard::with_runtime(&shared, &sid, |rt| {
+            rt.steering = false;
+            if injected && rt.router_turn {
+                rt.steered.insert(key.clone());
+            }
+        });
+        if injected {
+            shared.state.lock().unwrap().log(
+                &sid,
+                &crate::state::LogEntry {
+                    kind: "planner_steer".into(),
+                    role: "router".into(),
+                    summary: format!("Steered pending {key} into the running parent turn"),
+                    detail: Some(Value::from(text)),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+}
+
+/// The one pending item to steer now: the queued agent correction first, then
+/// the first unacknowledged release/observation wake, skipping anything already
+/// steered this turn or claimed by a live delivery. Pure, for tests.
+pub(crate) fn pending_steer(
+    queue: &[planner_workflow::QueuedParentInput],
+    wakes: &std::collections::BTreeMap<String, planner_workflow::Wake>,
+    steered: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    fn claimed(wake: &planner_workflow::Wake, id: &str) -> bool {
+        wake.claim_pid != 0
+            && planner_workflow::owner_alive(&planner_workflow::Attempt {
+                id: id.to_string(),
+                router_pid: wake.claim_pid,
+                router_started_at_ms: wake.claim_started_at_ms,
+                delegate_id: None,
+                ended: false,
+            })
+    }
+    if let Some(input) = queue.first() {
+        let key = format!("input:{}", input.input_id);
+        let live_delivery = wakes.get(&key).is_some_and(|w| claimed(w, &key));
+        if !steered.contains(&key)
+            && !live_delivery
+            && !planner_workflow::human_prompt(&input.request)
+        {
+            let body = input
+                .request
+                .prompt
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some((
+                key,
+                format!(
+                    "[Router steer] Agent correction `{}` is queued for this parent. It is redelivered for \
+                     acknowledgment when this turn ends; read it now and act on it in this turn if it changes \
+                     what you are doing:\n{body}",
+                    input.input_id
+                ),
+            ));
+        }
+    }
+    let (id, wake) = wakes.iter().find(|(id, w)| {
+        !w.acknowledged
+            && wake_priority(id) <= 1
+            && !id.starts_with("input:")
+            && !steered.contains(*id)
+            && !claimed(w, id)
+    })?;
+    Some((
+        id.clone(),
+        format!(
+            "[Router steer] Pending wake `{id}` (work {}): {}. It is redelivered when this turn ends; a failed \
+             CI job or a release transition is actionable now, in this turn.",
+            wake.work_id, wake.reason
+        ),
+    ))
 }
 
 /// A planner worker's sub-session is kept open after its turn so the same
@@ -625,4 +745,82 @@ async fn deliver_queued_input(
         );
     }
     result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashSet};
+
+    fn input(id: &str, agent: bool) -> planner_workflow::QueuedParentInput {
+        let meta = if agent {
+            json!({"router_acp": {"agent_origin": true, "input_id": id}})
+        } else {
+            json!({})
+        };
+        planner_workflow::QueuedParentInput {
+            input_id: id.into(),
+            request: PromptRequest::new(
+                "s".to_string(),
+                vec![ContentBlock::from(format!("body of {id}"))],
+            )
+            .meta(serde_json::from_value(meta).ok()),
+        }
+    }
+
+    fn wake(reason: &str) -> planner_workflow::Wake {
+        planner_workflow::Wake {
+            reason: reason.into(),
+            work_id: "w".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn agent_correction_steers_first_once_and_never_an_operator_prompt() {
+        let mut wakes = BTreeMap::new();
+        wakes.insert("observation:ci".to_string(), wake("ci job failed"));
+        let queue = vec![input("fix-now", true)];
+        let (key, text) =
+            pending_steer(&queue, &wakes, &HashSet::new()).expect("steers the correction");
+        assert_eq!(key, "input:fix-now");
+        assert!(text.contains("body of fix-now") && text.contains("redelivered"));
+        let steered = HashSet::from([key]);
+        let (next, _) = pending_steer(&queue, &wakes, &steered).expect("then the observation");
+        assert_eq!(next, "observation:ci");
+        let operator = vec![input("typed", false)];
+        let (key, _) =
+            pending_steer(&operator, &wakes, &HashSet::new()).expect("skips the operator prompt");
+        assert_eq!(
+            key, "observation:ci",
+            "an operator prompt is never steered by the router loop"
+        );
+    }
+
+    #[test]
+    fn only_release_and_observation_wakes_steer_and_acknowledged_or_claimed_ones_do_not() {
+        let mut wakes = BTreeMap::new();
+        wakes.insert("capacity:1".to_string(), wake("slots free"));
+        wakes.insert("audit:2".to_string(), wake("defect"));
+        assert!(
+            pending_steer(&[], &wakes, &HashSet::new()).is_none(),
+            "routine wakes wait for the boundary"
+        );
+        let mut done = wake("round passed");
+        done.acknowledged = true;
+        wakes.insert("release:r".to_string(), done);
+        assert!(pending_steer(&[], &wakes, &HashSet::new()).is_none());
+        let mut live = wake("ci job failed");
+        live.claim_pid = std::process::id();
+        live.claim_started_at_ms = planner_workflow::process_identity().1;
+        wakes.insert("observation:claimed".to_string(), live);
+        assert!(
+            pending_steer(&[], &wakes, &HashSet::new()).is_none(),
+            "a wake a live delivery claims is its"
+        );
+        wakes.insert("observation:open".to_string(), wake("ci job failed"));
+        let (id, text) = pending_steer(&[], &wakes, &HashSet::new()).expect("the open observation");
+        assert_eq!(id, "observation:open");
+        assert!(text.contains("ci job failed"));
+    }
 }
