@@ -351,6 +351,11 @@ seconds across turn boundaries. Routine `observation:ci:<work>` wakes wait for
 the boundary. Every injected block explicitly identifies itself as router text,
 not operator input; its durable wake still requires acknowledgment at delivery.
 
+Planner `delegate_task` and `planner_workflow` permission callbacks are answered
+with the adapter's allow option even on operator-owned turns. Other tools on
+those turns retain normal client permission handling. Wakes and delegates keep
+their existing automatic permission handling.
+
 - A client prompt that arrives while a router-owned turn holds the parent is
   first steered into it with `_session/steering`
   (`_meta.steering.idleBehavior: "promptRequired"`). claude-agent-acp and

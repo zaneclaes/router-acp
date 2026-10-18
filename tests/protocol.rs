@@ -2893,6 +2893,62 @@ async fn a_planner_wake_permission_request_is_answered_by_the_router() {
 }
 
 #[tokio::test]
+async fn operator_turn_planner_tool_permissions_are_allowed_without_relay() {
+    let state = temp_state_file("operator-planner-permission");
+    let log = temp_log("operator-planner-permission");
+    let repo = planner_wire_repository();
+    let yaml = planner_wire_yaml(&state, &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        for tool in ["planner_workflow", "mcp__router-delegate__delegate_task"] {
+            prompt_text(&cx, &sid, &format!("ASK_PERMISSION:{tool}")).await?;
+        }
+        assert!(
+            observed.lock().unwrap().permission_session_ids.is_empty(),
+            "planner tool requests never reach the terminal"
+        );
+        assert_eq!(
+            agent_text(&observed, &sid)
+                .matches("\"optionId\":\"always\"")
+                .count(),
+            2
+        );
+        assert!(
+            !shared
+                .with_session(&sid, |s| s.planner_wake_active)
+                .unwrap()
+        );
+        prompt_text(&cx, &sid, "ASK_PERMISSION:run an unrelated command").await?;
+        assert_eq!(
+            observed.lock().unwrap().permission_session_ids,
+            vec![sid.clone()],
+            "other operator-turn permissions still reach the terminal"
+        );
+        // Router strategy changes are only supported before the first prompt.
+        let ordinary = new_session(&cx).await?.session_id.0.to_string();
+        shared.with_session(&ordinary, |s| {
+            s.strategy = router_acp::config::StrategyKind::Auto
+        });
+        prompt_text(&cx, &ordinary, "ASK_PERMISSION:planner_workflow").await?;
+        assert_eq!(
+            observed.lock().unwrap().permission_session_ids.len(),
+            2,
+            "the auto-answer is scoped to planner sessions"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn delegate_task_routes_to_lower_cost_candidate() {
     let state = temp_state_file("delegate");
     let log = temp_log("delegate");

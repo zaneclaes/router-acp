@@ -2642,6 +2642,25 @@ pub(crate) fn auto_permission_answer(params: &Value) -> Value {
     }
 }
 
+/// These router-owned orchestration tools are authorized by selecting the
+/// planner strategy, including when the operator starts the parent turn.
+fn planner_tool_permission(params: &Value) -> bool {
+    let call = &params["toolCall"];
+    let name = call
+        .pointer("/_meta/claudeCode/toolName")
+        .and_then(Value::as_str)
+        .or_else(|| call.get("title").and_then(Value::as_str));
+    matches!(
+        name,
+        Some(
+            "delegate_task"
+                | "planner_workflow"
+                | "mcp__router-delegate__delegate_task"
+                | "mcp__router-delegate__planner_workflow"
+        )
+    )
+}
+
 fn track_approval(
     shared: &Arc<Shared>,
     sid: &str,
@@ -3012,13 +3031,17 @@ pub fn handle_downstream_dispatch(
                 crate::planner_watchdog::note_progress(shared, &router_sid);
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
-                // A planner wake is a router-owned turn: the client has no
-                // prompt in flight, so it cannot show the request (goose
-                // answers it with an internal error, which pauses the run).
-                // Answer as a delegate's turn is answered.
+                // Wakes have no client prompt to answer a permission callback.
+                // Planner orchestration also remains authorized when an
+                // operator prompt owns the turn; a missing terminal response
+                // must not become a refused worker start.
                 if method == "session/request_permission"
                     && shared
-                        .with_session(&router_sid, |s| s.planner_wake_active)
+                        .with_session(&router_sid, |s| {
+                            s.planner_wake_active
+                                || (s.strategy == StrategyKind::Planner
+                                    && planner_tool_permission(msg.params()))
+                        })
                         .unwrap_or(false)
                 {
                     let answer = auto_permission_answer(msg.params());
@@ -3028,7 +3051,7 @@ pub fn handle_downstream_dispatch(
                             kind: "auto_permission".to_string(),
                             role: "router".to_string(),
                             summary: format!(
-                                "planner wake answered a permission request: {answer}"
+                                "planner answered an authorized permission request: {answer}"
                             ),
                             tokens_estimated: true,
                             ..Default::default()
@@ -11013,6 +11036,26 @@ fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dis
             Ok(Handled::Yes)
         }
         Dispatch::Response(..) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod planner_permission_tests {
+    use super::*;
+
+    #[test]
+    fn permission_uses_authoritative_tool_identity_not_a_title_substring() {
+        assert!(planner_tool_permission(&json!({"toolCall": {
+            "title": "Update planner run", "_meta": {"claudeCode": {
+                "toolName": "mcp__router-delegate__planner_workflow"
+            }}
+        }})));
+        assert!(!planner_tool_permission(&json!({"toolCall": {
+            "title": "planner_workflow", "_meta": {"claudeCode": {"toolName": "Bash"}}
+        }})));
+        assert!(!planner_tool_permission(
+            &json!({"toolCall": {"title": "echo delegate_task"}})
+        ));
     }
 }
 
