@@ -122,6 +122,13 @@ any model attempt. The fingerprint includes reason, prerequisite, artifact, work
 lease and review. Changed conditions rearm recovery; explicit parent retry remains
 possible. Paused work never auto-resumes. Accepted unchanged packets resume finish-work.
 
+A parent's background dispatch claims the work before returning its job id. Claim errors
+are synchronous tool failures, not orphaned background results. Later background failures
+record a parent wake and remain readable through `delegate_result`, even without a child
+session row. `delegate_await` collects completed failures without waiting on live planner
+jobs. A rejected review still needs explicit dispatch of its correction; verify the owning
+attempt and actual activity instead of repeating the initial background acknowledgment.
+
 Adopted assignments with `reconciliation.required` stay fenced until the parent reconciles
 their scope and source. Their recovery wakes do not stop capacity checks, independent
 auto-admission, or release/audit reminders. Ownership conflicts and dependencies still block

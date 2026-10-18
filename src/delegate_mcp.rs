@@ -857,19 +857,12 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                                     ));
                                 }
                             };
-                            if args.background {
-                                // Start the job and ack immediately — the
-                                // subtask runs on its own tokio task so
-                                // serially-executed tool calls still yield
-                                // parallel subtasks.
-                                let result = start_background_delegate(&shared, &router_sid, args);
-                                return responder.respond(match result {
-                                    Ok(text) => text_result(text, false),
-                                    Err(msg) => text_result(msg, true),
-                                });
-                            }
                             cx.spawn(async move {
-                                let result = run_delegate_task(&shared, &router_sid, args).await;
+                                let result = if args.background {
+                                    start_background_delegate(&shared, &router_sid, args).await
+                                } else {
+                                    run_delegate_task(&shared, &router_sid, args).await
+                                };
                                 let _ = responder.respond(match result {
                                     Ok(text) => text_result(text, false),
                                     Err(msg) => text_result(msg, true),
@@ -1040,7 +1033,7 @@ async fn run_background_start(
 /// `run_delegate_task` on its own tokio task, and return the `b-…` id
 /// immediately. The `delegate_semaphore` inside `run_delegate_task` still
 /// bounds how many jobs actually execute at once.
-fn start_background_delegate(
+pub async fn start_background_delegate(
     shared: &Arc<Shared>,
     router_sid: &str,
     mut args: DelegateTaskArgs,
@@ -1048,12 +1041,29 @@ fn start_background_delegate(
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     args.worker_id = Some(job_id.clone());
     let summary = args.task.clone();
-    let planner = args.work_id.is_some();
+    // A refused claim must reach the caller before any "started" acknowledgment.
+    let identity = if args.work_id.is_some() {
+        Some(begin_planner_attempt(shared, router_sid, &mut args).await?)
+    } else {
+        None
+    };
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, planner, async move {
-        run_delegate_task(&task_shared, &task_sid, args).await
-    })
+    start_background_job(
+        shared,
+        router_sid,
+        job_id,
+        &summary,
+        identity.is_some(),
+        async move {
+            match identity {
+                Some(identity) => {
+                    run_planner_attempt(&task_shared, &task_sid, args, identity).await
+                }
+                None => run_delegate_task_inner(&task_shared, &task_sid, args).await,
+            }
+        },
+    )
 }
 
 /// `delegate_followup` with `background: true`: the follow-up turn runs as a
@@ -1109,8 +1119,27 @@ fn start_background_job(
     );
     let task_shared = shared.clone();
     let task_job_id = job_id.clone();
+    let router_sid_owned = router_sid.to_string();
     tokio::spawn(async move {
         let result = job.await;
+        if planner && let Err(error) = &result {
+            // A follow-up can fail before it opens an attempt, so no attempt-ended
+            // wake exists. Persist the failure through the same parent wake queue.
+            if let Err(wake_error) = crate::planner_workflow::mutate(
+                &task_shared,
+                &router_sid_owned,
+                |run| {
+                    run.wakes.entry(format!("delegate-failed:{task_job_id}")).or_insert_with(|| crate::planner_workflow::Wake {
+                    work_id: router_sid_owned.clone(),
+                    reason: format!("Background planner delegate {task_job_id} failed: {error}. Read delegate_result and current work status before retrying; no completion is implied."),
+                    ..Default::default()
+                });
+                    Ok(())
+                },
+            ) {
+                tracing::warn!(session = %router_sid_owned, job = %task_job_id, %wake_error, "failed to persist background delegate failure wake");
+            }
+        }
         // The parent may have closed while we ran (its jobs are dropped from
         // the registry) — only record a result somebody can still collect.
         let mut jobs = task_shared.background_delegates.lock().unwrap();
@@ -1159,8 +1188,15 @@ pub async fn run_delegate_await(
         let mine = jobs
             .iter()
             .filter(|(id, j)| j.parent_sid == router_sid && wanted(id));
-        let skipped = mine.clone().filter(|(_, j)| j.planner).count();
-        if mine.filter(|(_, j)| !j.planner).count() == 0 {
+        let skipped = mine
+            .clone()
+            .filter(|(_, j)| j.planner && !j.result.as_ref().is_some_and(Result::is_err))
+            .count();
+        if mine
+            .filter(|(_, j)| !j.planner || j.result.as_ref().is_some_and(Result::is_err))
+            .count()
+            == 0
+        {
             if skipped > 0 {
                 return Ok(PLANNER_AWAIT_NOTE.to_string());
             }
@@ -1184,7 +1220,7 @@ pub async fn run_delegate_await(
                 .iter()
                 .filter(|(id, j)| {
                     j.parent_sid == router_sid
-                        && !j.planner
+                        && (!j.planner || j.result.as_ref().is_some_and(Result::is_err))
                         && (args.delegate_ids.is_empty() || args.delegate_ids.contains(id))
                 })
                 .map(|(id, _)| id.clone())
@@ -1367,22 +1403,14 @@ pub async fn start_planner_worker(
     work_id: &str,
     task: String,
 ) -> Result<String, String> {
-    let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let mut args = DelegateTaskArgs {
+    let args = DelegateTaskArgs {
         task,
         work_id: Some(work_id.to_string()),
         keep_open: true,
         background: true,
-        worker_id: Some(job_id.clone()),
         ..Default::default()
     };
-    let summary = format!("{work_id}: {}", args.task);
-    let identity = begin_planner_attempt(shared, router_sid, &mut args).await?;
-    let task_shared = shared.clone();
-    let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, true, async move {
-        run_planner_attempt(&task_shared, &task_sid, args, identity).await
-    })
+    start_background_delegate(shared, router_sid, args).await
 }
 
 /// Resume a planner worker whose attempt ended without a receipt: a
@@ -2661,12 +2689,28 @@ fn worker_whoami(worker: &WorkerBinding) -> String {
 /// `delegate_result`: re-read a delegate's latest output from the state DB,
 /// by background job id (`b-…`), worker id (`w-…`) or live delegate id
 /// (`d-…`), even after `delegate_await` consumed it.
-fn run_delegate_result(
+pub fn run_delegate_result(
     shared: &Shared,
     router_sid: &str,
     args: DelegateResultArgs,
 ) -> Result<String, String> {
     let id = args.delegate_id.trim();
+    let background = shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .get(id)
+        .filter(|job| job.parent_sid == router_sid)
+        .map(|job| {
+            (
+                job.result.clone(),
+                job.summary.clone(),
+                job.started.elapsed().as_secs(),
+            )
+        });
+    if let Some((Some(Err(error)), _, _)) = &background {
+        return Ok(format!("delegate {id} — FAILED\n{error}"));
+    }
     let live_sub = shared
         .live_delegates
         .lock()
@@ -2689,6 +2733,15 @@ fn run_delegate_result(
                 }))
     });
     let Some((sub_sid, row)) = row else {
+        if let Some((result, summary, seconds)) = background {
+            return Ok(match result {
+                Some(Ok(output)) => format!("delegate {id} — finished\n{output}"),
+                Some(Err(error)) => format!("delegate {id} — FAILED\n{error}"),
+                None => format!(
+                    "delegate {id} — queued or starting ({seconds}s): {summary}\nNo child session has opened yet; this is not proof of worker activity."
+                ),
+            });
+        }
         return Err(format!(
             "no delegate `{id}` in this session (ids are b-…, w-… or d-…)"
         ));

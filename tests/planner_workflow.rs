@@ -2334,6 +2334,125 @@ async fn awaiting_background_work_never_waits_on_planner_workers() {
             .unwrap()
             .contains_key("b-worker")
     );
+
+    // A failed launch may have no attempt/child to produce a lifecycle wake.
+    // Collect its error immediately, while the live planner remains untouched.
+    shared.background_delegates.lock().unwrap().insert(
+        "b-failed".into(),
+        job(true, Some(Err("workspace claim refused".into()))),
+    );
+    let started = std::time::Instant::now();
+    let out = await_all().await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(out.contains("delegate b-failed — FAILED"), "{out}");
+    assert!(out.contains("workspace claim refused"), "{out}");
+    assert!(
+        shared
+            .background_delegates
+            .lock()
+            .unwrap()
+            .contains_key("b-worker")
+    );
+    assert!(
+        !shared
+            .background_delegates
+            .lock()
+            .unwrap()
+            .contains_key("b-failed")
+    );
+}
+
+#[tokio::test]
+async fn background_planner_claim_failure_is_returned_before_started_ack() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let result = router_acp::delegate_mcp::start_background_delegate(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateTaskArgs {
+            work_id: Some("missing-work".into()),
+            task: "apply the reviewed correction".into(),
+            background: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result.unwrap_err().contains("admit this work identity"));
+    assert!(f.shared.background_delegates.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn background_planner_failure_is_observable_without_a_child_session() {
+    let f = fixture(|_| {});
+    admit(&f.shared, work("work-1"));
+    let ack = router_acp::delegate_mcp::start_planner_worker(
+        &f.shared,
+        SID,
+        "work-1",
+        "implement".into(),
+    )
+    .await
+    .unwrap();
+    assert!(ack.contains("background delegate"));
+    // This fixture has no pinned provider: the claimed attempt fails before session/new.
+    attempt_settled(&f.shared, "work-1").await;
+    let id = f
+        .shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let result = router_acp::delegate_mcp::run_delegate_result(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateResultArgs {
+            delegate_id: id.clone(),
+        },
+    )
+    .unwrap();
+    assert!(result.contains("FAILED"), "{result}");
+    assert!(result.contains("not pinned"), "{result}");
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.wakes.contains_key(&format!("delegate-failed:{id}")));
+    assert!(
+        router_acp::delegate_mcp::run_delegate_result(
+            &f.shared,
+            "other-parent",
+            router_acp::delegate_mcp::DelegateResultArgs { delegate_id: id },
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn background_result_distinguishes_queued_job_from_an_open_child() {
+    let f = fixture(|_| {});
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-queued".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "pending".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+        },
+    );
+    let result = router_acp::delegate_mcp::run_delegate_result(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateResultArgs {
+            delegate_id: "b-queued".into(),
+        },
+    )
+    .unwrap();
+    assert!(result.contains("queued or starting"), "{result}");
+    assert!(
+        result.contains("No child session has opened yet"),
+        "{result}"
+    );
 }
 
 // ---------------------------------------------------------------------------

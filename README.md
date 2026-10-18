@@ -464,6 +464,12 @@ For **review → fix → re-review** loops, a delegated sub-session can be kept 
 
 For **parallel** subtasks there is a background mode: MCP clients execute tool calls one at a time, so N plain `delegate_task` calls run the subtasks serially no matter what the router allows. `delegate_task` with `background: true` instead returns a `b-…` job id immediately and runs the subtask on its own task; `delegate_await` collects results — it waits up to `timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default: all pending), returns every finished job's output exactly once, and lists the ones still running so the caller polls with short, idle-timeout-safe calls. `background` composes with `keep_open` (the collected result carries the `delegate_id`), and `delegation.max_concurrent` still bounds how many jobs execute at once.
 
+Planner background dispatch claims the admitted work and workspace before acknowledging
+startup; a refused claim returns directly to the caller. Live planner workers report through
+wakes and are never held in `delegate_await`, but a completed background failure can be
+collected and records a parent wake. `delegate_result` also reports failed or queued jobs
+before a child session exists. A queued job is not proof that a worker is making progress.
+
 ### Host-directed workers
 
 Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:
