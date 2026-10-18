@@ -97,6 +97,67 @@ pub(crate) struct RuntimeCredential {
     pub generation: String,
     /// For Claude: the configuration directory the runtime mirrors.
     claude_config: Option<PathBuf>,
+    /// Held for the runtime's whole life. A sweep removes a sibling whose lock
+    /// it can take, so a runtime left by a killed router is reclaimed.
+    _lock: Option<File>,
+}
+
+/// The lock file inside each runtime directory.
+const RUNTIME_LOCK: &str = ".router-acp-runtime.lock";
+/// A runtime directory written before the lock existed is removed once nothing
+/// near its top has changed for this long. A live adapter writes its session
+/// files every turn.
+const UNLOCKED_RUNTIME_IDLE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Removes every runtime under `parent` that no process holds. `Drop` removes a
+/// runtime on a clean exit; a killed or restarted router never runs it, and
+/// each grok runtime carried its own multi-gigabyte package caches.
+pub(crate) fn sweep_runtimes(parent: &Path) -> usize {
+    let Ok(listing) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in listing.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let lock = path.join(RUNTIME_LOCK);
+        if lock.exists() {
+            // The lock stays held while the directory is removed.
+            if let Ok(file) = OpenOptions::new().write(true).open(&lock)
+                && file.try_lock().is_ok()
+                && std::fs::remove_dir_all(&path).is_ok()
+            {
+                removed += 1;
+            }
+            continue;
+        }
+        let idle = newest_change(&path)
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= UNLOCKED_RUNTIME_IDLE);
+        if idle && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The newest modification time of a directory, its entries and their entries.
+/// Two levels cover an adapter's session files without walking package caches.
+fn newest_change(dir: &Path) -> Option<std::time::SystemTime> {
+    let modified = |p: &Path| std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok();
+    let mut newest = modified(dir)?;
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        newest = newest.max(modified(&path).unwrap_or(newest));
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            for inner in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                newest = newest.max(modified(&inner.path()).unwrap_or(newest));
+            }
+        }
+    }
+    Some(newest)
 }
 
 impl RuntimeCredential {
@@ -200,10 +261,19 @@ pub(crate) async fn runtime(
         credential = Some(read(agent).ok_or("Credential unavailable after refresh")?);
     }
     let dir = directory(agent).ok_or("Credential directory unavailable")?;
+    sweep_runtimes(&dir.join(".router-acp-runtime"));
     let root = dir
         .join(".router-acp-runtime")
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&root).map_err(|_| "Could not isolate adapter credentials")?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(RUNTIME_LOCK))
+        .map_err(|_| "Could not isolate adapter credentials")?;
+    lock.lock()
+        .map_err(|_| "Could not isolate adapter credentials")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -222,6 +292,7 @@ pub(crate) async fn runtime(
             .map(|c| marker(c, record(&dir).as_ref()))
             .unwrap_or_else(|| "missing".into()),
         claude_config: None,
+        _lock: Some(lock),
     };
     // The account directory supplies the login; everything else (skills,
     // plugins, settings, config.toml) is the computer-wide configuration.
@@ -333,7 +404,19 @@ pub(crate) async fn runtime(
         #[cfg(unix)]
         {
             // Preserve tools without exposing another provider's auth store.
-            for name in [".local", ".cargo", ".rustup", ".gitconfig", ".ssh"] {
+            // Package caches are shared too: a private HOME downloaded its own
+            // NuGet, npm and uv caches, about 4 GB for every grok session.
+            for name in [
+                ".local",
+                ".cargo",
+                ".rustup",
+                ".gitconfig",
+                ".ssh",
+                ".nuget",
+                ".npm",
+                ".dotnet",
+                ".cache",
+            ] {
                 let source = Path::new(&home).join(name);
                 if source.exists() {
                     std::os::unix::fs::symlink(source, isolated_home.join(name))
@@ -1538,6 +1621,49 @@ pub async fn repair_for_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime a dead router left behind is removed; one a live process holds,
+    /// and an unlocked one changed recently, are kept.
+    #[test]
+    fn sweep_removes_only_unheld_runtimes() {
+        let parent = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let dir = parent.path().join(name);
+            std::fs::create_dir_all(dir.join("home/.nuget")).unwrap();
+            dir
+        };
+        let lock_in = |dir: &Path| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(RUNTIME_LOCK))
+                .unwrap()
+        };
+        let held = make("held");
+        let holder = lock_in(&held);
+        holder.lock().unwrap();
+        let abandoned = make("abandoned");
+        drop(lock_in(&abandoned));
+        let recent = make("recent-unlocked");
+        let old = make("old-unlocked");
+        let past = std::time::SystemTime::now() - UNLOCKED_RUNTIME_IDLE - Duration::from_secs(60);
+        for path in [old.join("home/.nuget"), old.join("home"), old.clone()] {
+            File::open(&path).unwrap().set_modified(past).unwrap();
+        }
+
+        assert_eq!(sweep_runtimes(parent.path()), 2);
+        assert!(held.exists(), "a held runtime was removed");
+        assert!(
+            recent.exists(),
+            "a recently changed unlocked runtime was removed"
+        );
+        assert!(!abandoned.exists(), "an unheld runtime was kept");
+        assert!(!old.exists(), "an idle unlocked runtime was kept");
+        drop(holder);
+        assert_eq!(sweep_runtimes(parent.path()), 1);
+        assert!(!held.exists(), "a released runtime was kept");
+    }
 
     /// An account directory holds only its login; switching accounts must not
     /// change the computer-wide skills, plugins or settings an adapter sees.

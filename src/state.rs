@@ -651,6 +651,14 @@ impl StateStore {
             .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
     }
 
+    /// Every planner run stored beside `sid`'s: the same checkout's shard
+    /// (or the legacy file for a legacy id).
+    pub fn planner_run_ids_beside(&self, sid: &str) -> Result<Vec<String>, String> {
+        self.with_file(sid, |file| file.planner_run_ids())
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
     /// Optimistically save one planner document in its parent session shard.
     pub fn save_planner_run(
         &self,
@@ -781,12 +789,17 @@ impl StateStore {
             // Removing a run releases its claims; one without a run is unknown.
             Ok(None) | Err(_) => return false,
         };
-        let running = document.get("status").and_then(serde_json::Value::as_str) == Some("running");
+        let status = document.get("status").and_then(serde_json::Value::as_str);
+        let running = status == Some("running");
+        let work_pointer = format!("/works/{}", work_id.replace('~', "~0").replace('/', "~1"));
+        // Adoption moves every work into the adopting run and marks the old run
+        // superseded, but its workspace claims stay under the old session. A
+        // superseded holder can never use a claim again: the adopting run takes it.
+        if status == Some("superseded") {
+            return true;
+        }
         let attempt = document
-            .pointer(&format!(
-                "/works/{}/attempt",
-                work_id.replace('~', "~0").replace('/', "~1")
-            ))
+            .pointer(&format!("{work_pointer}/attempt"))
             .cloned()
             .and_then(|a| serde_json::from_value::<crate::planner_workflow::Attempt>(a).ok());
         match attempt {
@@ -1652,6 +1665,18 @@ impl StateFile {
             }
         }
         Ok(())
+    }
+
+    fn planner_run_ids(&self) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id FROM planner_runs")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {

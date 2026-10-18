@@ -274,6 +274,29 @@ pub(crate) fn stop_child(shared: &Arc<Shared>, sid: &str, child: &str) {
     crate::delegate_mcp::drop_worker_tokens(shared, child);
 }
 
+/// A child whose work holds its finished receipt (or is integrated) has nothing
+/// left to do: close it at the end of that turn. A finished worker never stays
+/// alive waiting for a release; deploys and their proof are the parent's.
+pub(crate) fn release_finished_child(shared: &Arc<Shared>, sid: &str, identity: &WorkerIdentity) {
+    let child = planner_workflow::load(shared, sid)
+        .ok()
+        .flatten()
+        .and_then(|run| {
+            run.works.get(&identity.work_id).and_then(|work| {
+                matches!(
+                    work.status,
+                    planner_workflow::WorkStatus::Finished
+                        | planner_workflow::WorkStatus::Integrated
+                )
+                .then(|| work.child_id.clone())
+            })
+        });
+    if let Some(child) = child {
+        tracing::info!(parent = sid, work = %identity.work_id, "finished child closed at its turn end");
+        stop_child(shared, sid, &child);
+    }
+}
+
 pub async fn control(shared: &Arc<Shared>, params: Value) -> Result<Value, String> {
     if !supported(shared) {
         return Err("client did not negotiate planner children".into());

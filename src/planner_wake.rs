@@ -26,12 +26,13 @@ impl PromptActivity {
         }
     }
 
-    fn idle(shared: &Arc<Shared>, sid: &str, queued_input: bool) -> Option<Self> {
+    pub(crate) fn idle(shared: &Arc<Shared>, sid: &str) -> Option<Self> {
         shared
             .with_session(sid, |s| {
+                // A cancel ends the turn it interrupted, not the run: once that
+                // turn is over, wakes resume with a fresh turn.
                 if s.prompt_activity != 0
                     || s.pinning
-                    || (s.cancelled && !queued_input)
                     || s.pin.is_none()
                     || s.capturing_summary.is_some()
                 {
@@ -39,9 +40,7 @@ impl PromptActivity {
                 }
                 s.prompt_activity += 1;
                 s.planner_wake_active = true;
-                if queued_input {
-                    s.cancelled = false;
-                }
+                s.cancelled = false;
                 true
             })
             .filter(|idle| *idle)
@@ -55,12 +54,21 @@ impl PromptActivity {
 
 impl Drop for PromptActivity {
     fn drop(&mut self) {
-        self.shared.with_session(&self.sid, |s| {
+        let ended = self.shared.with_session(&self.sid, |s| {
             s.prompt_activity = s.prompt_activity.saturating_sub(1);
             if self.wake {
                 s.planner_wake_active = false;
             }
+            s.prompt_activity == 0
         });
+        // The parent's turn is over: the turn-end gate judges it.
+        if ended == Some(true) {
+            crate::planner_guard::parent_turn_ended(
+                &self.shared,
+                &self.sid,
+                chrono::Utc::now().timestamp(),
+            );
+        }
     }
 }
 
@@ -105,6 +113,16 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let Some(run) = planner_workflow::load(&shared, &sid).ok().flatten() else {
                     continue;
                 };
+                // This router has the parent loaded: it owns the run. A run
+                // whose owner died is what a new `/implement` resumes
+                // (`crate::planner_adopt`).
+                let me = planner_workflow::RunOwner::current();
+                if run.owner != Some(me) && run.status != RunStatus::Superseded {
+                    let _ = planner_workflow::mutate(&shared, &sid, |run| {
+                        run.owner = Some(me);
+                        Ok(())
+                    });
+                }
                 // A missed stop caused by router death is reconciled before
                 // parent work resumes. Never infer that the child survived.
                 for (id, work) in &run.works {
@@ -120,36 +138,45 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                                 "Owning router exited. Reconcile preserved workspace/evidence before replacement.".into(), true);
                     }
                 }
-                heartbeat(&shared, &sid, &run, chrono::Utc::now().timestamp());
+                close_stale_delegates(&shared, &sid, &run);
+                let now = chrono::Utc::now().timestamp();
+                heartbeat(&shared, &sid, &run, now);
+                crate::planner_capacity::spawn_tick(&shared, &sid, now);
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
-                        .is_some_and(|wake| {
-                            wake.deliveries < 3
-                                && wake.retry_after <= chrono::Utc::now().timestamp()
-                        })
+                        .is_some_and(|wake| wake.retry_after <= chrono::Utc::now().timestamp())
                 });
                 if !run.parent_queue.is_empty() && !queued_input {
                     continue;
                 }
+                // Planner wakes never give up: an undelivered or unanswered
+                // wake is retried on a capped backoff, not dropped.
                 if !run.approval_waits.is_empty()
                     || (!queued_input
                         && (run.status != RunStatus::Running
-                            || !run
-                                .wakes
-                                .values()
-                                .any(|w| !w.acknowledged && w.deliveries < 3)))
+                            || !run.wakes.values().any(|w| !w.acknowledged)))
                 {
                     continue;
                 }
-                let Some(activity) = PromptActivity::idle(&shared, &sid, queued_input) else {
+                let Some(activity) = PromptActivity::idle(&shared, &sid) else {
                     continue;
                 };
+                // Queued operator input always goes first (`deliver`); only a
+                // turn that delivers wakes is router-owned, and operator input
+                // preempts that one (`planner_preempt`).
+                let router_owned = run.parent_queue.is_empty();
+                if router_owned {
+                    crate::planner_preempt::begin_router_turn(&shared, &sid);
+                }
                 let shared = shared.clone();
                 tokio::spawn(async move {
                     let _activity = activity;
                     if let Err(error) = deliver(&shared, &sid).await {
                         tracing::warn!(session = sid, %error, "planner wake remains pending for bounded retry or explicit resume");
+                    }
+                    if router_owned {
+                        crate::planner_preempt::end_router_turn(&shared, &sid);
                     }
                 });
             }
@@ -157,31 +184,175 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// A parent idle this long with no worker running gets a heartbeat wake. Each
-/// further heartbeat before a worker runs again waits one more step, up to
-/// `HEARTBEAT_MAX_STEPS` steps.
-const HEARTBEAT_SECS: i64 = 30 * 60;
-const HEARTBEAT_MAX_STEPS: u32 = 4;
+/// A planner worker's sub-session is kept open after its turn so the same
+/// attempt can take a follow-up turn with its context. Each attempt runs in its
+/// own agent process, so once the attempt can take no further turn (a newer
+/// attempt replaced it, or its work is finished, integrated, blocked or
+/// watching) the open session only holds memory: a long run left over a
+/// hundred idle agent processes and their MCP servers behind. Close those.
+pub fn close_stale_delegates(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
+    use planner_workflow::WorkStatus;
+    let stale = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, d)| d.parent_sid == sid)
+        .filter_map(|(id, d)| {
+            let identity = d.planner.as_ref()?;
+            let current = run.works.get(&identity.work_id).is_some_and(|w| {
+                w.attempt.as_ref().is_some_and(|a| {
+                    a.id == identity.attempt_id
+                        && (!a.ended
+                            || !matches!(
+                                w.status,
+                                WorkStatus::Finished
+                                    | WorkStatus::Integrated
+                                    | WorkStatus::Blocked
+                                    | WorkStatus::Watching
+                            ))
+                })
+            });
+            (!current).then(|| id.clone())
+        })
+        .collect::<Vec<_>>();
+    for delegate_id in stale {
+        // A completing turn or an explicit close may get there first.
+        let _ = crate::delegate_mcp::run_delegate_close(
+            shared,
+            sid,
+            crate::delegate_mcp::DelegateCloseArgs { delegate_id },
+        );
+    }
+}
+
+/// A parent idle this long with a free worker slot gets a heartbeat wake, and
+/// another every time it stays idle that long again. There is no backoff: a
+/// run only ends when its work is done, and a parent that ended its turn on a
+/// reason of its own is woken to act on it, not left to wait (a release once
+/// sat overnight behind a "blocker" that was a defect in its own build).
+const HEARTBEAT_SECS: i64 = 20 * 60;
+
+pub fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
+    run.works
+        .values()
+        .filter(|w| w.attempt.as_ref().is_some_and(|a| !a.ended))
+        .count()
+}
+
+/// The worker census every wake carries, so a parent below its limit sees the
+/// free slots and the interrupted works waiting for a retry.
+pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -> String {
+    let cap = shared.delegate_limit();
+    let live = live_workers(run);
+    let mut interrupted = run
+        .works
+        .iter()
+        .filter(|(id, w)| {
+            w.status == planner_workflow::WorkStatus::Interrupted
+                && !w.paused
+                && run
+                    .capacity
+                    .resumes
+                    .get(*id)
+                    .is_none_or(|r| r.suspended.is_none())
+        })
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    interrupted.sort_unstable();
+    let mut line = format!(
+        "[Capacity] {live} of {cap} worker slots in use, {} free.",
+        cap.saturating_sub(live)
+    );
+    if !interrupted.is_empty() {
+        line.push_str(&format!(
+            " Interrupted, awaiting retry: {}.",
+            interrupted.join(", ")
+        ));
+    }
+    let recovery = run
+        .capacity
+        .resumes
+        .iter()
+        .filter(|(_, state)| state.suspended.is_some())
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    if !recovery.is_empty() {
+        line.push_str(&format!(" Reconciliation required (automatic retries suspended): {}. Repair the prerequisite before an explicit retry; do not re-delegate an unchanged failure.", recovery.join(", ")));
+    }
+    let ready = run
+        .works
+        .values()
+        .filter(|w| w.status == planner_workflow::WorkStatus::Finished)
+        .count();
+    let review = run
+        .works
+        .values()
+        .filter(|w| w.status == planner_workflow::WorkStatus::ReviewPending)
+        .count();
+    line.push_str(&format!(" [Progress] {ready} work packets await integration; {review} await review. These are not completed plans. Prioritize actionable release gates and dispositions, while independent workers continue."));
+    if let Some(at) = run
+        .works
+        .values()
+        .filter(|work| work.status == planner_workflow::WorkStatus::Finished)
+        .filter_map(|work| work.ready_at_ms)
+        .min()
+    {
+        line.push_str(&format!(
+            " Oldest measured ready packet: {}s.",
+            (chrono::Utc::now().timestamp_millis() - at).max(0) / 1000
+        ));
+    }
+    for (id, release) in run.releases.iter().filter(|(_, release)| release.active()) {
+        line.push_str(&format!(" Release {id}: {:?}.", release.stage()));
+    }
+    if let Some(current) = run
+        .capacity
+        .audit
+        .as_ref()
+        .filter(|audit| audit.ok)
+        .and_then(|audit| audit.completed_guides.as_ref())
+        && let Some(initial) = &run.completed_guides_at_start
+    {
+        line.push_str(&format!(" Repository host confirms {} guides now in Completed on staging; {} new paths since this run's first audit.", current.len(), current.difference(initial).count()));
+    }
+    if live < cap {
+        line.push_str(
+            " Re-read the plan source for work that became runnable since your last turn (a \
+             changed roadmap, a cleared blocker, recovered host memory or disk), retry \
+             interrupted works, and fill the free slots; a reason recorded in an earlier turn \
+             does not hold a slot without being re-checked now. Stopping is correct only when \
+             all of the work is done; a claimed blocker is a defect to investigate.",
+        );
+    }
+    line.push_str(&crate::planner_capacity::census(
+        shared,
+        run,
+        chrono::Utc::now().timestamp_millis(),
+    ));
+    line.push_str(&crate::planner_guard::census(shared, run));
+    line
+}
 
 /// A parent that ended its turn blocked on something outside the run (a
-/// sign-in, host memory, a person) has no child left to wake it when that
-/// clears. Wake it on a backed-off timer so it re-checks its own blockers.
+/// sign-in, host memory, a person, a roadmap that has since changed) may have
+/// no child event coming that would wake it when that clears. While any
+/// worker slot is free, wake it on a backed-off timer so it re-checks.
 pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun, now: i64) {
     if run.status != RunStatus::Running
         || !run.approval_waits.is_empty()
         || !run.parent_queue.is_empty()
-        || run
-            .wakes
-            .values()
-            .any(|w| !w.acknowledged && w.deliveries < 3)
+        || run.wakes.values().any(|w| !w.acknowledged)
+        // Capacity wakes own an idle parent while the host lists unheld
+        // candidates or cannot answer; the heartbeat stays for "no work".
+        || crate::planner_capacity::supersedes_heartbeat(shared, run, now * 1000)
     {
         return;
     }
-    if run
-        .works
-        .values()
-        .any(|w| w.attempt.as_ref().is_some_and(|a| !a.ended))
-    {
+    let live = live_workers(run);
+    let cap = shared.delegate_limit();
+    // Full slots excuse the heartbeat only while the audit is clean.
+    if live >= cap && !crate::planner_guard::audit_open(run) {
         if run.idle_heartbeats != 0 {
             let _ = planner_workflow::mutate(shared, sid, |run| {
                 run.idle_heartbeats = 0;
@@ -202,23 +373,21 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     };
     let idle = now - last;
-    let steps = i64::from(run.idle_heartbeats.min(HEARTBEAT_MAX_STEPS - 1) + 1);
-    if idle < HEARTBEAT_SECS * steps {
+    if idle < HEARTBEAT_SECS {
         return;
     }
     let reason = format!(
-        "heartbeat: no worker has run and the parent has been idle for {} min. Re-check each \
-         blocker your last turn reported (sign-ins, host state, a person's action). Resume or \
-         admit the work that no longer waits on it; otherwise end the turn with the same \
-         waiting reason.",
+        "heartbeat: {live} of {cap} worker slots are in use and the parent has been idle for {} \
+         min. A run ends only when all of its work is done; any other reason to stop is a \
+         hypothesis to disprove now, not a state to wait in. For each blocker your last turn \
+         reported, prove where it is: reproduce it, check whether the previous build or path \
+         worked, and probe the system yourself. Anything in our own code, build, config or \
+         environment is a defect: admit a worker to fix it now. Even a proven human-only action \
+         holds only its own item. Fill every free slot with other runnable work this turn.",
         idle / 60
     );
     let _ = planner_workflow::mutate(shared, sid, |run| {
-        if run
-            .wakes
-            .values()
-            .any(|w| !w.acknowledged && w.deliveries < 3)
-        {
+        if run.wakes.values().any(|w| !w.acknowledged) {
             return Ok(());
         }
         run.idle_heartbeats += 1;
@@ -233,9 +402,29 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     });
 }
 
+fn wake_priority(id: &str) -> u8 {
+    if id.starts_with("input:") {
+        0
+    } else if id.starts_with("release:") || id.starts_with("observation:") {
+        1
+    } else if id.starts_with("recovery:") {
+        2
+    } else if id.starts_with("capacity:")
+        || id.starts_with("inflight:")
+        || id.starts_with("gate:")
+        || id.starts_with("audit:")
+    {
+        4
+    } else {
+        3
+    }
+}
+
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     let run = planner_workflow::load(shared, sid)?.ok_or("planner state missing")?;
     if let Some(input) = run.parent_queue.first() {
+        // Operator input: an operator turn, never preempted as router-owned.
+        crate::planner_preempt::end_router_turn(shared, sid);
         return deliver_queued_input(shared, sid, input.clone()).await;
     }
     let now = chrono::Utc::now().timestamp();
@@ -246,8 +435,13 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
             return Ok(());
         }
-        for (id, wake) in &mut run.wakes {
-            if wake.acknowledged || wake.deliveries >= 3 || wake.retry_after > now {
+        // Keep every durable wake, but actionable release/review transitions
+        // lead repetitive capacity reminders. Operator input always wins.
+        let mut ordered = run.wakes.keys().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|id| wake_priority(id));
+        for id in ordered {
+            let wake = run.wakes.get_mut(&id).expect("listed above");
+            if wake.acknowledged || wake.retry_after > now {
                 continue;
             }
             if wake.claim_pid != 0 {
@@ -265,7 +459,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             wake.claim_pid = pid;
             wake.claim_started_at_ms = started;
             wake.deliveries += 1;
-            wake.retry_after = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp();
+            wake.retry_after = now + crate::planner_guard::wake_retry_secs(wake.deliveries);
             ids.push(id.clone());
             if ids.len() == 32 {
                 break;
@@ -290,9 +484,10 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         PlannerRole::ReviewWork
     };
     let text = format!(
-        "{}\n[Router-owned child wake]\n{}\nReconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason.",
+        "{}\n[Router-owned child wake]\n{}\n{}\nReconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason.",
         run.policy.instructions(role),
-        serde_json::to_string(&wakes).map_err(|e| e.to_string())?
+        serde_json::to_string(&wakes).map_err(|e| e.to_string())?,
+        capacity_line(shared, &run)
     );
     let mut blocks = vec![ContentBlock::from(text)];
     blocks.extend(planner_workflow::parent_input_blocks(
@@ -317,6 +512,11 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     );
     let result =
         crate::session::run_primary_turn(shared.clone(), sid.to_string(), prompt, None).await;
+    // Cancelled for operator input, or by the stuck-turn watchdog: this turn
+    // answered nothing, so its wakes stay pending and go again right after
+    // the next turn (queued operator input first).
+    let stalled = crate::planner_watchdog::take_stalled(shared, sid);
+    let preempted = crate::planner_preempt::preempted(shared, sid) || stalled;
     planner_workflow::mutate(shared, sid, |run| {
         for id in &ids {
             if let Some(wake) = run.wakes.get_mut(id)
@@ -324,6 +524,18 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
                 && wake.claim_started_at_ms == started
             {
                 wake.claim_pid = 0;
+                if preempted {
+                    wake.retry_after = 0;
+                    continue;
+                }
+                // Router-owned capacity/in-flight wakes are recreated while
+                // their condition holds; one delivery answers each.
+                if crate::planner_capacity::ROUTER_WAKE_PREFIXES
+                    .iter()
+                    .any(|prefix| id.starts_with(prefix))
+                {
+                    wake.acknowledged = true;
+                }
             }
         }
         Ok(())
@@ -360,7 +572,8 @@ async fn deliver_queued_input(
         wake.claim_pid = pid;
         wake.claim_started_at_ms = started;
         wake.deliveries += 1;
-        wake.retry_after = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp();
+        wake.retry_after =
+            chrono::Utc::now().timestamp() + crate::planner_guard::wake_retry_secs(wake.deliveries);
         Ok(())
     })?;
     let result = match crate::session::prepare_queued_parent_prompt(

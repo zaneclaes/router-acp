@@ -22,6 +22,8 @@ pub struct PlannerRun {
     #[serde(skip)]
     pub revision: u64,
     pub policy: ResolvedPlanner,
+    #[serde(default)]
+    pub prior_policies: Vec<ResolvedPlanner>,
     pub phase: PlannerPhase,
     pub coordinator: bool,
     pub status: RunStatus,
@@ -30,6 +32,12 @@ pub struct PlannerRun {
     pub execution_input_id: Option<String>,
     pub commands: BTreeSet<String>,
     pub works: BTreeMap<String, Work>,
+    #[serde(default)]
+    pub releases: BTreeMap<String, crate::planner_release::Release>,
+    #[serde(default)]
+    pub observations: BTreeMap<String, crate::planner_guard::Observation>,
+    #[serde(default)]
+    pub completed_guides_at_start: Option<BTreeSet<String>>,
     pub inputs: BTreeMap<String, InputReceipt>,
     #[serde(default)]
     pub parent_queue: Vec<QueuedParentInput>,
@@ -40,6 +48,41 @@ pub struct PlannerRun {
     /// Heartbeat wakes sent since a worker last ran; spaces the next one out.
     #[serde(default)]
     pub idle_heartbeats: u32,
+    /// Router-enforced worker capacity: host candidates, holds, capacity
+    /// wakes, auto-admissions and worker resumptions.
+    #[serde(default)]
+    pub capacity: crate::planner_capacity::CapacityState,
+    /// The router process that owns this run (it has the parent session
+    /// loaded). A run whose owner died can be resumed by a new `/implement`
+    /// in the same checkout (`crate::planner_adopt`).
+    #[serde(default)]
+    pub owner: Option<RunOwner>,
+    /// The session that adopted this run's works, holds, queue and wakes.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOwner {
+    pub pid: u32,
+    pub started_at_ms: u64,
+}
+
+impl RunOwner {
+    pub fn current() -> Self {
+        let (pid, started_at_ms) = process_identity();
+        Self { pid, started_at_ms }
+    }
+
+    pub fn alive(&self) -> bool {
+        owner_alive(&Attempt {
+            id: String::new(),
+            router_pid: self.pid,
+            router_started_at_ms: self.started_at_ms,
+            delegate_id: None,
+            ended: false,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +92,19 @@ pub enum RunStatus {
     Paused,
     Cancelled,
     Complete,
+    /// A `_router/planner_shutdown` drain is stopping the run. Nothing is
+    /// admitted or resumed; it ends `paused`. A drain cut short by a router
+    /// exit stays here, and `/implement` resumes it like `paused`.
+    Draining,
+    /// Another session adopted this run (`superseded_by`); it continues
+    /// there and never resumes here.
+    Superseded,
+}
+
+/// A run's stored `draining` that no drain in this router owns: the router
+/// that drained it died, so it resumes like `paused`.
+fn stale_drain(shared: &Shared, sid: &str, status: RunStatus) -> bool {
+    status == RunStatus::Draining && !crate::planner_shutdown::draining(shared, sid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +115,13 @@ pub struct WorkSpec {
     pub scope: String,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Exact accepted upstream revisions sufficient for source work. These
+    /// never satisfy the existing integrated dependencies or release gates.
+    #[serde(default)]
+    pub ready_dependencies: BTreeMap<String, String>,
+    /// Explicit file or directory ownership for coordinated parallel tracks.
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
     #[serde(default)]
     pub required_checks: Vec<String>,
     #[serde(default)]
@@ -71,6 +134,7 @@ pub struct WorkSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkStatus {
+    Retired,
     Admitted,
     Allocating,
     Running,
@@ -86,6 +150,8 @@ pub enum WorkStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Work {
+    #[serde(default)]
+    pub reconciliation: Reconciliation,
     pub spec: WorkSpec,
     pub child_id: String,
     pub status: WorkStatus,
@@ -99,10 +165,21 @@ pub struct Work {
     pub last_output: Option<String>,
     #[serde(default)]
     pub paused: bool,
+    /// Unknown for work adopted from older routers; never invent an age.
+    #[serde(default)]
+    pub ready_at_ms: Option<i64>,
     /// The structured handoff the current attempt recorded (`worker_handoff`),
     /// so its end reads as that handoff rather than as a lost attempt.
     #[serde(default)]
     pub handoff: Option<crate::delegate_hook::Handoff>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Reconciliation {
+    pub required: bool,
+    pub source_revision: Option<String>,
+    pub evidence: Vec<String>,
+    pub prior_specs: Vec<WorkSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +212,9 @@ pub struct Artifact {
     pub evidence: Vec<String>,
     #[serde(default)]
     pub unresolved: Vec<String>,
+    /// Proof recipes owned by integration, rather than worker acceptance.
+    #[serde(default)]
+    pub integration_requirements: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,10 +325,25 @@ pub enum Operation {
     Status {
         #[serde(default)]
         offset: usize,
+        #[serde(default)]
+        work_id: Option<String>,
     },
     Admit {
         key: String,
         work: WorkSpec,
+    },
+    /// Explicit parent handoff of the current scope and preserved source after recovery.
+    Reconcile {
+        key: String,
+        work: WorkSpec,
+        source_revision: String,
+        evidence: Vec<String>,
+    },
+    Retire {
+        key: String,
+        work_id: String,
+        reason: String,
+        evidence: BTreeMap<String, String>,
     },
     Artifact {
         key: String,
@@ -270,10 +365,22 @@ pub enum Operation {
         attempt_id: String,
         receipt: Receipt,
     },
+    /// Parent records a mechanical handoff only when the trusted repository
+    /// host verifies custody and closed resources. Review stays independent.
+    Finalize {
+        key: String,
+        work_id: String,
+        receipt: Receipt,
+    },
     Integrate {
         key: String,
         work_id: String,
         receipt: Receipt,
+    },
+    Release {
+        key: String,
+        release_id: String,
+        checkpoint: crate::planner_release::Checkpoint,
     },
     Disposition {
         key: String,
@@ -289,6 +396,14 @@ pub enum Operation {
     AcknowledgeWake {
         key: String,
         wake_id: String,
+    },
+    /// Keep one capacity-host candidate unadmitted for 30 minutes. The only
+    /// way a candidate may stay out of a free slot.
+    Hold {
+        key: String,
+        plan_id: String,
+        reason: String,
+        detail: String,
     },
     Complete {
         key: String,
@@ -331,6 +446,19 @@ pub fn save(shared: &Shared, sid: &str, run: &mut PlannerRun) -> Result<(), Stri
                 events.push(wake_event(sid, run, wake_id, wake).to_string());
             }
         }
+        // A work that reached `integrated` in this save: the router no longer
+        // needs its workspace, so the host may give it back.
+        let previous_works = previous.as_ref().and_then(|(_, v)| v.get("works"));
+        for (work_id, work) in &run.works {
+            let was_integrated = previous_works
+                .and_then(|w| w.get(work_id))
+                .and_then(|w| w.get("status"))
+                .and_then(Value::as_str)
+                == Some("integrated");
+            if work.status == WorkStatus::Integrated && !was_integrated {
+                events.push(work_finished_event(sid, work_id, work).to_string());
+            }
+        }
     }
     run.revision = state.save_planner_run_with_wakes(
         sid,
@@ -346,6 +474,24 @@ fn wake_event(sid: &str, run: &PlannerRun, wake_id: &str, wake: &Wake) -> Value 
     json!({"event":"planner_wake","wake_id":wake_id,"parent_router_session_id":sid,
         "work_id":wake.work_id,"reason":wake.reason,"revision":run.revision+1,
         "attempt_id":run.works.get(&wake.work_id).and_then(|w| w.attempt.as_ref()).map(|a| &a.id),
+        "router_pid":pid,"router_started_at_ms":started})
+}
+
+/// `work_finished`: a work reached its terminal `integrated` state (only then:
+/// `integrate` still verifies the workspace HEAD, so a `finished` work keeps
+/// it). Sent once per transition, through the same outbox as `planner_wake`,
+/// so a host can retire the workspace. `worker_id` is the work's child id
+/// (what the host's allocation lease records) and `cwd` its workspace path.
+pub fn work_finished_event(sid: &str, work_id: &str, work: &Work) -> Value {
+    let (pid, started) = process_identity();
+    json!({"event":"work_finished","work_id":work_id,"plan_id":work.spec.plan_id,
+        "external_id":work.spec.external_id,"status":work.status,
+        "parent_router_session_id":sid,"worker_id":work.child_id,"child_id":work.child_id,
+        "cwd":work.workspace.as_ref().map(|w| w.path.display().to_string()),
+        "lease":work.workspace.as_ref().map(|w| &w.lease),
+        "attempt_id":work.attempt.as_ref().map(|a| &a.id),
+        "attempt_ended":work.attempt.as_ref().is_none_or(|a| a.ended),
+        "revision":work.integration.as_ref().map(|r| &r.revision),
         "router_pid":pid,"router_started_at_ms":started})
 }
 
@@ -382,6 +528,7 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
     let mut run = PlannerRun {
         revision: 0,
         policy: crate::planner_skills::resolve(&shared.cfg.routers.planner, &cwd)?,
+        prior_policies: Vec::new(),
         phase: PlannerPhase::Planning,
         coordinator,
         status: RunStatus::Running,
@@ -389,12 +536,18 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         execution_input_id: None,
         commands: BTreeSet::new(),
         works: BTreeMap::new(),
+        releases: BTreeMap::new(),
+        observations: BTreeMap::new(),
+        completed_guides_at_start: None,
         inputs: BTreeMap::new(),
         parent_queue: Vec::new(),
         wakes: BTreeMap::new(),
         approval_waits: BTreeSet::new(),
         receipts: BTreeMap::new(),
         idle_heartbeats: 0,
+        capacity: Default::default(),
+        owner: Some(RunOwner::current()),
+        superseded_by: None,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -556,6 +709,19 @@ fn user_command_once(
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
+    if run.status == RunStatus::Superseded {
+        return Err(format!(
+            "this planner run was resumed by session {}; continue it there",
+            run.superseded_by.as_deref().unwrap_or("(unknown)")
+        ));
+    }
+    if run.status == RunStatus::Draining && crate::planner_shutdown::draining(shared, sid) {
+        return Err(
+            "the planner run is shutting down; once its drain reports `drained`, /implement \
+             resumes it"
+                .into(),
+        );
+    }
     let input_id = record_input(&mut run, original)?;
     let first_admission = run.commands.insert(input_id.clone());
     if !first_admission && !queued {
@@ -563,7 +729,36 @@ fn user_command_once(
             "planner command {input_id} was already admitted; resume the recorded run instead of replaying it"
         ));
     }
-    let resuming = matches!(run.status, RunStatus::Paused | RunStatus::Cancelled);
+    let resuming = matches!(
+        run.status,
+        RunStatus::Paused | RunStatus::Cancelled | RunStatus::Draining
+    );
+    // Ordinary load/resume retains the immutable policy snapshot. A new
+    // explicit implementation command after a completed drain is the safe
+    // boundary for installing revised repository skills, with old policy
+    // retained for audit and all work/review/release records preserved.
+    if first_admission
+        && !queued
+        && explicit
+        && resuming
+        && phase == PlannerPhase::Implementation
+        && run
+            .works
+            .values()
+            .all(|work| work.attempt.as_ref().is_none_or(|attempt| attempt.ended))
+    {
+        let cwd = shared
+            .with_session(sid, |s| s.cwd.clone())
+            .ok_or("planner session missing")?;
+        let policy = crate::planner_skills::resolve(&shared.cfg.routers.planner, &cwd)?;
+        if policy.identity != run.policy.identity {
+            run.prior_policies
+                .push(std::mem::replace(&mut run.policy, policy));
+        }
+        for work in run.works.values_mut() {
+            mark_reconciliation_required(work);
+        }
+    }
     run.phase = phase;
     run.coordinator |= shared.with_session(sid, |s| s.coordinator).unwrap_or(false);
     if phase == PlannerPhase::Implementation || run.status == RunStatus::Complete {
@@ -649,7 +844,7 @@ fn display_text(req: &PromptRequest) -> String {
         .join("\n")
 }
 
-fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<String, String> {
+pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<String, String> {
     let id = req
         .meta
         .as_ref()
@@ -721,8 +916,14 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         if run.status == RunStatus::Complete && !human {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
         }
-        // A person's follow-up continues a finished run in its last phase.
-        if run.status == RunStatus::Complete {
+        // A person's follow-up continues a finished or paused run in its last
+        // phase: a question or an interrupted turn never ends the run. A live
+        // drain keeps its run until it is drained.
+        if human
+            && (matches!(run.status, RunStatus::Complete | RunStatus::Paused)
+                || stale_drain(shared, sid, run.status))
+        {
+            run.approval_waits.clear();
             run.status = RunStatus::Running;
         }
         let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
@@ -733,10 +934,15 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         // Mirrors an explicit command: the run follows the human's phase, and
         // an implementation choice resumes a stopped run with the authentic
         // request work admission needs.
-        if let Some(phase) = directed {
+        if let Some(phase) = directed
+            && !(run.status == RunStatus::Draining && crate::planner_shutdown::draining(shared, sid))
+        {
             run.phase = phase;
             if phase == PlannerPhase::Implementation {
-                if matches!(run.status, RunStatus::Paused | RunStatus::Cancelled) {
+                if matches!(
+                    run.status,
+                    RunStatus::Paused | RunStatus::Cancelled | RunStatus::Draining
+                ) {
                     run.approval_waits.clear();
                 }
                 run.status = RunStatus::Running;
@@ -774,29 +980,60 @@ pub(crate) fn enqueue_parent_input(
             }
             run.status = RunStatus::Running;
         }
-        let input_id = record_input(run, req)?;
-        if !run
-            .parent_queue
-            .iter()
-            .any(|input| input.input_id == input_id)
-        {
-            run.parent_queue.push(QueuedParentInput {
-                input_id: input_id.clone(),
-                request: req.clone(),
-            });
-        }
+        queue_parent_request(run, sid, req)?;
         // A return to planning stops new child dispatch immediately. Model,
         // effort, and command execution wait for this input's own turn.
         if phase == Some(PlannerPhase::Planning) {
             run.phase = PlannerPhase::Planning;
         }
-        run.wakes
-            .entry(format!("input:{input_id}"))
-            .or_insert(Wake {
-                reason: "Original parent input awaits its own turn".into(),
-                work_id: sid.into(),
-                ..Default::default()
-            });
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Shared durable queue primitive for ACP input and the local monitor CLI.
+pub(crate) fn queue_parent_request(
+    run: &mut PlannerRun,
+    sid: &str,
+    req: &PromptRequest,
+) -> Result<String, String> {
+    let input_id = record_input(run, req)?;
+    if !run
+        .parent_queue
+        .iter()
+        .any(|input| input.input_id == input_id)
+    {
+        run.parent_queue.push(QueuedParentInput {
+            input_id: input_id.clone(),
+            request: req.clone(),
+        });
+    }
+    run.wakes
+        .entry(format!("input:{input_id}"))
+        .or_insert(Wake {
+            reason: "Original parent input awaits its own turn".into(),
+            work_id: sid.into(),
+            ..Default::default()
+        });
+    Ok(input_id)
+}
+
+/// Operator input steered into a running parent turn: its receipt is
+/// recorded as delivered to the parent, so the parent acknowledges it like
+/// any other input. A session without a planner run records nothing.
+pub fn record_steered_input(
+    shared: &Arc<Shared>,
+    sid: &str,
+    req: &PromptRequest,
+) -> Result<(), String> {
+    if load(shared, sid)?.is_none() {
+        return Ok(());
+    }
+    mutate(shared, sid, |run| {
+        let input_id = record_input(run, req)?;
+        if let Some(input) = run.inputs.get_mut(&input_id) {
+            input.delivered_to.insert(sid.to_string());
+        }
         Ok(())
     })
     .map(|_| ())
@@ -922,11 +1159,14 @@ pub fn input_blocks(
 }
 
 pub fn tool_definition() -> Value {
-    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions: status, admit, review, integrate, disposition, acknowledge-input, acknowledge-wake, complete. Worker actions: artifact and finished for its own assignment. Use an idempotency key for every mutation. This tool never grants merge/deploy authority.",
+    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. WorkSpec owned_paths declares literal source ownership; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
-            "action": {"type":"string", "enum":["status","admit","artifact","review","finished","integrate","disposition","acknowledge-input","acknowledge-wake","complete"]},
+            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
+            "release_id":{"type":"string"}, "checkpoint":{"type":"object"},
+            "plan_id":{"type":"string"}, "detail":{"type":"string"},
             "key":{"type":"string"}, "work":{"type":"object"}, "work_id":{"type":"string"}, "attempt_id":{"type":"string"},
-            "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"type":"array","items":{"type":"string"}},
+            "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"object","additionalProperties":{"type":"string"}}]},
             "corrections":{"type":["string","null"]}, "receipt":{"type":"object"}, "status":{"type":"string"}, "reason":{"type":"string"},
             "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "offset":{"type":"integer","minimum":0}
         }, "required":["action"] } })
@@ -959,17 +1199,17 @@ fn accepted_revision(work: &Work, revision: &str) -> Result<(), String> {
         .review
         .as_ref()
         .is_some_and(|r| r.accepted && r.revision == revision)
-        || !work
+        || work
             .artifact
             .as_ref()
-            .is_some_and(|a| a.revision == revision)
+            .is_none_or(|a| a.revision != revision)
     {
         return Err("current artifact has no acceptance bound to this revision".into());
     }
     Ok(())
 }
 
-fn valid_evidence(value: &str) -> bool {
+pub(crate) fn valid_evidence(value: &str) -> bool {
     !value.trim().is_empty()
         && !["unknown", "pending", "unverified"]
             .contains(&value.trim().to_ascii_lowercase().as_str())
@@ -999,25 +1239,62 @@ async fn operate_once(
     operation: Operation,
 ) -> Result<String, String> {
     let mut run = ensure(shared, sid)?;
-    if let Operation::Status { offset } = operation {
-        let works = run.works.iter().filter(|(id, _)| actor.is_none_or(|a| a.work_id == **id)).skip(offset).take(32)
+    if let Operation::Status {
+        offset,
+        ref work_id,
+    } = operation
+    {
+        let visible = |id: &str| {
+            actor.is_none_or(|a| a.work_id == id)
+                && work_id.as_ref().is_none_or(|wanted| wanted == id)
+        };
+        let matched_works = run.works.keys().filter(|id| visible(id)).count();
+        let works = run.works.iter().filter(|(id, _)| visible(id)).skip(offset).take(32)
             .map(|(id, work)| json!({"work_id":id,"plan_id":work.spec.plan_id,"child_id":work.child_id,"status":work.status,
-                "attempt":work.attempt,"workspace":work.workspace,"external_id":work.spec.external_id,
+                "attempt":work.attempt,"workspace":work.workspace.as_ref().map(|w| json!({"path":w.path,"lease":w.lease})),"external_id":work.spec.external_id,
                 "revision":work.artifact.as_ref().map(|a| &a.revision),"review":work.review.as_ref().map(|r| json!({"revision":r.revision,"accepted":r.accepted})),
+                "paused":work.paused,"recovery":run.capacity.resumes.get(id),"reconciliation":work.reconciliation,
+                "spec":work_id.as_ref().map(|_| &work.spec),
+                "ready_at_ms":work.ready_at_ms,"ready_age_secs":work.ready_at_ms.map(|at| (chrono::Utc::now().timestamp_millis() - at).max(0) / 1000),
+                "required_checks":work.spec.required_checks,"required_integration_evidence":work.spec.required_integration_evidence,
+                "unresolved":work.artifact.as_ref().map(|a| &a.unresolved),
+                "integration_requirements":work.artifact.as_ref().map(|a| &a.integration_requirements),"integration":work.integration,
                 "reason":work.reason.as_ref().map(|s| s.chars().take(500).collect::<String>())})).collect::<Vec<_>>();
-        let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id)))
+        let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id))
+                && work_id.as_ref().is_none_or(|wanted| input.owner.as_ref() == Some(wanted)))
             .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"owner":input.owner,"acknowledged":input.acknowledged,
                 "text":input.text.chars().take(500).collect::<String>(),"attachment_count":input.attachments.len(),"delivered_to":input.delivered_to})).collect::<Vec<_>>();
         let wakes = run
             .wakes
             .iter()
-            .filter(|(_, w)| actor.is_none_or(|a| w.work_id == a.work_id))
+            .filter(|(_, w)| visible(&w.work_id))
             .skip(offset)
             .take(32)
             .collect::<BTreeMap<_, _>>();
+        let mut capacity = crate::planner_capacity::status_block(
+            shared,
+            &run,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        if (work_id.is_some() || actor.is_some())
+            && let Some(fields) = capacity.as_object_mut()
+        {
+            fields.retain(|key, _| {
+                [
+                    "live",
+                    "max",
+                    "free",
+                    "configured_at_start",
+                    "effective_limit",
+                ]
+                .contains(&key.as_str())
+            });
+        }
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
-            "offset":offset,"next_offset":offset+32,"counts":{"works":run.works.len(),"inputs":run.inputs.len(),"wakes":run.wakes.len()}})).map_err(|e| e.to_string());
+            "capacity":capacity,
+            "progress":progress(&run),"releases":crate::planner_release::status(&run, actor.map(|a| a.work_id.as_str()).or(work_id.as_deref())),
+            "offset":offset,"next_offset":offset+32,"matched_works":matched_works,"counts":{"works":run.works.len(),"inputs":run.inputs.len(),"wakes":run.wakes.len()}})).map_err(|e| e.to_string());
     }
     let value = serde_json::to_value(&operation).map_err(|e| e.to_string())?;
     let key = value
@@ -1041,7 +1318,24 @@ async fn operate_once(
             "implementation children cannot coordinate, accept, integrate, or retire plans".into(),
         );
     }
-    if run.status != RunStatus::Running
+    // A draining run takes no new scope, but its parent and workers still
+    // record what they have (artifacts, reviews, receipts, dispositions).
+    if run.status == RunStatus::Draining
+        && matches!(
+            operation,
+            Operation::Admit { .. }
+                | Operation::Reconcile { .. }
+                | Operation::Hold { .. }
+                | Operation::Complete { .. }
+        )
+    {
+        return Err(
+            "run is shutting down: admit nothing; record the exact resume point in \
+             Docs/CONTINUE.md and your registers, then end your turn"
+                .into(),
+        );
+    }
+    if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
         && !matches!(
             operation,
             Operation::AcknowledgeInput { .. } | Operation::AcknowledgeWake { .. }
@@ -1055,6 +1349,135 @@ async fn operate_once(
     let mut next_role = None;
     match operation.clone() {
         Operation::Status { .. } => unreachable!(),
+        Operation::Retire {
+            work_id,
+            reason,
+            evidence,
+            ..
+        } => {
+            if shared.cfg.routers.planner.integrate_check.is_none() {
+                return Err("retire requires a configured host to verify obsolete scope and parent takeover".into());
+            }
+            let work = run.works.get(&work_id).ok_or("unknown work identity")?;
+            if reason.trim().is_empty()
+                || evidence.is_empty()
+                || work.attempt.as_ref().is_some_and(|a| !a.ended)
+                || matches!(work.status, WorkStatus::Integrated | WorkStatus::Finished)
+                || run
+                    .releases
+                    .values()
+                    .any(|release| release.works.contains_key(&work_id))
+            {
+                return Err("retire requires an ended obsolete assignment, parent takeover evidence and no frozen release membership".into());
+            }
+            let mut check = value.clone();
+            check["assignment"] = serde_json::to_value(work).map_err(|e| e.to_string())?;
+            crate::planner_guard::integrate_check(shared, sid, &check).await?;
+            let work = run.works.get_mut(&work_id).unwrap();
+            work.status = WorkStatus::Retired;
+            work.reason = Some(reason);
+            work.paused = true;
+            work.reconciliation.required = false;
+            run.capacity.resumes.remove(&work_id);
+            for wake in run
+                .wakes
+                .values_mut()
+                .filter(|wake| wake.work_id == work_id)
+            {
+                wake.acknowledged = true;
+            }
+        }
+        Operation::Reconcile {
+            work,
+            source_revision,
+            evidence,
+            ..
+        } => {
+            let existing = run
+                .works
+                .get(&work.work_id)
+                .ok_or("unknown reconciliation work")?
+                .clone();
+            if run.execution_request.is_none()
+                || work.plan_id != existing.spec.plan_id
+                || work.scope.trim().is_empty()
+                || evidence.is_empty()
+                || evidence.iter().any(|e| e.trim().is_empty())
+            {
+                return Err("reconcile requires the same admitted plan, complete current scope and parent custody evidence".into());
+            }
+            if existing
+                .attempt
+                .as_ref()
+                .is_some_and(|a| !a.ended && owner_alive(a))
+            {
+                return Err("reconcile requires the owning attempt to stop first; never change a live worker's assignment".into());
+            }
+            if matches!(
+                existing.status,
+                WorkStatus::Finished
+                    | WorkStatus::Integrated
+                    | WorkStatus::Watching
+                    | WorkStatus::Retired
+            ) || run
+                .releases
+                .values()
+                .any(|release| release.works.contains_key(&work.work_id))
+            {
+                return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
+            }
+            let workspace = existing
+                .workspace
+                .as_ref()
+                .ok_or("reconcile needs the original allocated worktree restored")?;
+            verify_source_revision(&workspace.path, &source_revision).await?;
+            let mut validation = run.clone();
+            validation.works.remove(&work.work_id);
+            validate_owned_paths(&validation, &work)?;
+            if work.dependencies.contains(&work.work_id)
+                || work.ready_dependencies.contains_key(&work.work_id)
+            {
+                return Err("work cannot depend on itself".into());
+            }
+            let changed = work != existing.spec
+                || existing
+                    .artifact
+                    .as_ref()
+                    .is_some_and(|a| a.revision != source_revision);
+            let current = run.works.get_mut(&work.work_id).unwrap();
+            if work != current.spec {
+                current
+                    .reconciliation
+                    .prior_specs
+                    .push(current.spec.clone());
+            }
+            current.spec = work;
+            current.reconciliation.required = false;
+            current.reconciliation.source_revision = Some(source_revision);
+            current.reconciliation.evidence = evidence;
+            // Fence the prior child and its obsolete briefing. A fresh attempt receives the current spec.
+            current.attempt = None;
+            current.handoff = None;
+            current.reason = None;
+            current.paused = false;
+            if changed {
+                current.artifact = None;
+                current.review = None;
+                current.finish = None;
+            }
+            current.status = if current.review.as_ref().is_some_and(|r| r.accepted) {
+                WorkStatus::Accepted
+            } else {
+                WorkStatus::Admitted
+            };
+            run.capacity.resumes.remove(&current.spec.work_id);
+            if let Some(wake) = run
+                .wakes
+                .get_mut(&format!("recovery:{}", current.spec.work_id))
+            {
+                wake.acknowledged = true;
+            }
+        }
         Operation::Admit { work, .. } => {
             if run.execution_request.is_none() || run.phase != PlannerPhase::Implementation {
                 return Err("work admission requires an authentic implementation request".into());
@@ -1070,9 +1493,12 @@ async fn operate_once(
                     return Err("work identity already names a different assignment".into());
                 }
             } else {
-                if work.dependencies.contains(&work.work_id) {
+                if work.dependencies.contains(&work.work_id)
+                    || work.ready_dependencies.contains_key(&work.work_id)
+                {
                     return Err("work cannot depend on itself".into());
                 }
+                validate_owned_paths(&run, &work)?;
                 let child_id = format!(
                     "child-{}",
                     &content_hash(&format!("{sid}/{}", work.work_id))[..24]
@@ -1080,9 +1506,11 @@ async fn operate_once(
                 run.works.insert(
                     work.work_id.clone(),
                     Work {
+                        reconciliation: Reconciliation::default(),
                         spec: work,
                         child_id,
                         status: WorkStatus::Admitted,
+                        ready_at_ms: None,
                         workspace: None,
                         attempt: None,
                         artifact: None,
@@ -1109,9 +1537,22 @@ async fn operate_once(
                 .as_ref()
                 .ok_or("assignment has no isolated workspace")?;
             verify_revision(&workspace.path, &artifact.revision).await?;
+            if let Some(source) = &work.reconciliation.source_revision {
+                verify_source_revision(&workspace.path, source).await?;
+            }
             if artifact.evidence.is_empty() || artifact.evidence.iter().any(|v| !valid_evidence(v))
             {
                 return Err("artifact requires usable evidence references".into());
+            }
+            if artifact
+                .integration_requirements
+                .iter()
+                .any(|(key, recipe)| key.trim().is_empty() || !valid_evidence(recipe))
+            {
+                return Err(
+                    "integration requirements need a stable check name and usable proof recipe"
+                        .into(),
+                );
             }
             if artifact.changed_paths.iter().any(|p| {
                 Path::new(p).is_absolute()
@@ -1122,17 +1563,21 @@ async fn operate_once(
                 return Err("artifact paths must stay relative to the workspace".into());
             }
             for check in &work.spec.required_checks {
-                if !artifact.checks.get(check).is_some_and(|r| r == "pass") {
+                if artifact.checks.get(check).is_none_or(|r| r != "pass") {
                     return Err(format!("required check `{check}` is not proven pass"));
                 }
             }
-            // Even equal revisions require fresh review if evidence changes.
-            work.artifact = Some(artifact);
-            work.review = None;
-            work.finish = None;
-            work.integration = None;
-            work.status = WorkStatus::ReviewPending;
-            next_role = Some(PlannerRole::ReviewWork);
+            // Reconnecting a worker may replay the exact packet with a new
+            // operation key. Only a changed packet invalidates its review.
+            if work.artifact.as_ref() != Some(&artifact) {
+                work.artifact = Some(artifact);
+                work.review = None;
+                work.ready_at_ms = None;
+                work.finish = None;
+                work.integration = None;
+                work.status = WorkStatus::ReviewPending;
+                next_role = Some(PlannerRole::ReviewWork);
+            }
         }
         Operation::Review {
             work_id,
@@ -1204,18 +1649,54 @@ async fn operate_once(
             }
             work.finish = Some(receipt);
             work.status = WorkStatus::Finished;
+            work.ready_at_ms
+                .get_or_insert_with(|| chrono::Utc::now().timestamp_millis());
+            next_role = Some(PlannerRole::IntegratePlan);
+        }
+        Operation::Finalize {
+            work_id, receipt, ..
+        } => {
+            if shared.cfg.routers.planner.integrate_check.is_none() {
+                return Err("parent finalization requires a trusted integrate-check host; use the child's finished receipt otherwise".into());
+            }
+            let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
+            accepted_revision(work, &receipt.revision)?;
+            if !matches!(work.status, WorkStatus::Accepted | WorkStatus::Interrupted)
+                || work.attempt.as_ref().is_some_and(|a| !a.ended)
+            {
+                return Err(
+                    "parent finalization requires an accepted revision and an ended attempt".into(),
+                );
+            }
+            verify_revision(
+                &work.workspace.as_ref().ok_or("workspace missing")?.path,
+                &receipt.revision,
+            )
+            .await?;
+            if receipt.evidence.is_empty() || receipt.evidence.values().any(|v| !valid_evidence(v))
+            {
+                return Err("finalization requires durable handoff and custody evidence".into());
+            }
+            let mut check = value.clone();
+            check["assignment"] = serde_json::to_value(&*work).map_err(|e| e.to_string())?;
+            crate::planner_guard::integrate_check(shared, sid, &check).await?;
+            work.finish = Some(receipt);
+            work.status = WorkStatus::Finished;
+            work.ready_at_ms
+                .get_or_insert_with(|| chrono::Utc::now().timestamp_millis());
             next_role = Some(PlannerRole::IntegratePlan);
         }
         Operation::Integrate {
             work_id, receipt, ..
         } => {
+            crate::planner_release::integration_allowed(&run, &work_id, &receipt)?;
             let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             accepted_revision(work, &receipt.revision)?;
             if work.status != WorkStatus::Finished
-                || !work
+                || work
                     .finish
                     .as_ref()
-                    .is_some_and(|r| r.revision == receipt.revision)
+                    .is_none_or(|r| r.revision != receipt.revision)
             {
                 return Err("integration requires the finished accepted revision".into());
             }
@@ -1231,7 +1712,11 @@ async fn operate_once(
             {
                 return Err("integration requires verified disposition evidence".into());
             }
-            for required in &work.spec.required_integration_evidence {
+            for required in work.spec.required_integration_evidence.iter().chain(
+                work.artifact
+                    .iter()
+                    .flat_map(|a| a.integration_requirements.keys()),
+            ) {
                 if !receipt
                     .evidence
                     .get(required)
@@ -1242,9 +1727,44 @@ async fn operate_once(
                     ));
                 }
             }
+            crate::planner_guard::integrate_check(shared, sid, &value).await?;
+            let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             work.integration = Some(receipt);
             work.status = WorkStatus::Integrated;
             next_role = Some(PlannerRole::SelectPlan);
+        }
+        Operation::Release {
+            release_id,
+            checkpoint,
+            ..
+        } => {
+            if shared.cfg.routers.planner.integrate_check.is_none() {
+                return Err("release checkpoints require a trusted integrate-check host".into());
+            }
+            crate::planner_release::record(&mut run, &release_id, &checkpoint)?;
+            let mut check = value.clone();
+            check["release_record"] =
+                serde_json::to_value(&run.releases[&release_id]).map_err(|e| e.to_string())?;
+            check["release_record"]["plans"] = json!(
+                run.releases[&release_id]
+                    .works
+                    .keys()
+                    .filter_map(|id| run
+                        .works
+                        .get(id)
+                        .and_then(|work| work.spec.external_id.as_ref())
+                        .map(|path| (id, path)))
+                    .collect::<BTreeMap<_, _>>()
+            );
+            check["release_record"]["source_dependencies"] = json!(
+                run.releases[&release_id]
+                    .works
+                    .keys()
+                    .filter_map(|id| run.works.get(id))
+                    .flat_map(|work| work.spec.ready_dependencies.iter())
+                    .collect::<BTreeMap<_, _>>()
+            );
+            crate::planner_guard::integrate_check(shared, sid, &check).await?;
         }
         Operation::Disposition {
             work_id,
@@ -1264,6 +1784,8 @@ async fn operate_once(
             if work.status == WorkStatus::Integrated {
                 return Err("integrated work cannot be silently reclassified".into());
             }
+            crate::planner_guard::integrate_check(shared, sid, &value).await?;
+            let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             work.status = status;
             work.reason = Some(reason);
         }
@@ -1296,22 +1818,81 @@ async fn operate_once(
                 .ok_or("unknown wake receipt")?
                 .acknowledged = true;
         }
+        Operation::Hold {
+            plan_id,
+            reason,
+            detail,
+            ..
+        } => {
+            // The router's own evidence rules first, then the host's check.
+            let mut probe = run.clone();
+            crate::planner_capacity::record_hold(
+                &mut probe,
+                &plan_id,
+                &reason,
+                &detail,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            crate::planner_guard::verify_hold(shared, sid, &run, &plan_id, &reason, &detail)
+                .await?;
+            crate::planner_capacity::record_hold(
+                &mut run,
+                &plan_id,
+                &reason,
+                &detail,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+        }
         Operation::Complete { queue_evidence, .. } => {
             if !valid_evidence(&queue_evidence) {
                 return Err("completion requires a verified queue/disposition result".into());
             }
-            if run.works.values().any(|w| {
-                w.status != WorkStatus::Integrated || w.attempt.as_ref().is_some_and(|a| !a.ended)
-            }) || run.inputs.values().any(|i| !i.acknowledged)
+            if run
+                .releases
+                .values()
+                .any(crate::planner_release::Release::active)
+            {
+                return Err("completion requires every release's verified plan disposition".into());
+            }
+            let pending = run
+                .works
+                .iter()
+                .filter(|(_, w)| {
+                    !matches!(w.status, WorkStatus::Integrated | WorkStatus::Retired)
+                        || w.attempt.as_ref().is_some_and(|a| !a.ended)
+                })
+                .map(|(id, w)| format!("{id} ({:?})", w.status))
+                .collect::<Vec<_>>();
+            if !pending.is_empty()
+                || run.inputs.values().any(|i| !i.acknowledged)
                 || run.wakes.values().any(|w| !w.acknowledged)
             {
-                return Err("completion requires all admitted scope, input and wakes to be reconciled; blocked/watching scope remains explicitly pending".into());
+                return Err(format!(
+                    "completion requires all admitted scope, input and wakes to be reconciled; blocked/watching scope remains explicitly pending. Unfinished works: [{}]",
+                    pending.join(", ")
+                ));
             }
+            // The capacity host decides whether admissible work remains; an
+            // unknown answer is never "no work".
+            crate::planner_capacity::completion_allowed(shared, sid, &run).await?;
+            // The auditor's completing pass (CONTINUE finished, every lane
+            // and disposition closed) has the last word.
+            crate::planner_guard::completion_audit(shared, sid, &run).await?;
             run.status = RunStatus::Complete;
         }
     }
     run.receipts.insert(key.to_string(), fingerprint);
     save(shared, sid, &mut run)?;
+    // Deliver the queued `work_finished` now rather than on the next flusher
+    // tick; a host that refuses it keeps it queued, never this operation.
+    if matches!(operation, Operation::Integrate { .. })
+        && let Some(hook) = shared.cfg.delegation.lifecycle_hook.clone()
+    {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            crate::delegate_hook::flush(&shared, &hook).await;
+        });
+    }
     Ok(json!({"revision":run.revision,"next_role":next_role,"instructions":next_role.map(|r| run.policy.instructions(r))}).to_string())
 }
 
@@ -1350,10 +1931,9 @@ async fn verify_revision(path: &Path, revision: &str) -> Result<(), String> {
 }
 
 pub(crate) fn process_identity() -> (u32, u64) {
-    let pid = std::process::id();
     #[cfg(target_os = "linux")]
-    if let Some(started) = linux_process_start_identity(pid) {
-        return (pid, started);
+    if let Some(started) = linux_process_start_identity(std::process::id()) {
+        return (std::process::id(), started);
     }
     crate::delegate_hook::process_identity()
 }
@@ -1416,6 +1996,183 @@ pub(crate) fn owner_alive(attempt: &Attempt) -> bool {
     }
 }
 
+pub(crate) fn workspace_available(workspace: &Workspace) -> Result<(), String> {
+    if !workspace.path.is_dir() {
+        return Err(format!(
+            "planner workspace unavailable: {}. Reconcile the allocation lease and restore the workspace before retrying; changing models cannot repair a missing directory",
+            workspace.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn continuation_role(work: &Work) -> PlannerRole {
+    if matches!(work.status, WorkStatus::Accepted | WorkStatus::Interrupted)
+        && work.artifact.as_ref().is_some_and(|artifact| {
+            work.review
+                .as_ref()
+                .is_some_and(|review| review.accepted && review.revision == artifact.revision)
+        })
+    {
+        PlannerRole::FinishWork
+    } else {
+        PlannerRole::ImplementWork
+    }
+}
+
+pub(crate) fn mark_reconciliation_required(work: &mut Work) {
+    if matches!(
+        work.status,
+        WorkStatus::Admitted
+            | WorkStatus::Allocating
+            | WorkStatus::Running
+            | WorkStatus::Interrupted
+            | WorkStatus::Corrections
+            | WorkStatus::Accepted
+    ) && work.workspace.is_some()
+    {
+        work.reconciliation.required = true;
+    }
+}
+
+async fn verify_source_revision(path: &Path, revision: &str) -> Result<(), String> {
+    if revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("reconciliation source_revision must be a full commit SHA".into());
+    }
+    git(path, &["merge-base", "--is-ancestor", revision, "HEAD"]).await
+        .map_err(|_| "reconciled source is not carried in workspace HEAD; preserve and integrate it before proceeding".to_string())?;
+    Ok(())
+}
+
+fn validate_owned_paths(run: &PlannerRun, work: &WorkSpec) -> Result<(), String> {
+    for path in &work.owned_paths {
+        if path.trim().is_empty()
+            || Path::new(path).is_absolute()
+            || path
+                .trim_end_matches('/')
+                .split('/')
+                .any(|p| matches!(p, "" | "." | ".."))
+            || path.contains(['\\', '*', '?', '[', ']'])
+        {
+            return Err(
+                "owned_paths must name relative files or directories without traversal".into(),
+            );
+        }
+        for other in run.works.values().filter(|w| {
+            matches!(
+                w.status,
+                WorkStatus::Admitted
+                    | WorkStatus::Allocating
+                    | WorkStatus::Running
+                    | WorkStatus::Corrections
+                    | WorkStatus::Interrupted
+            )
+        }) {
+            if other
+                .spec
+                .owned_paths
+                .iter()
+                .any(|owned| paths_overlap(path, owned))
+            {
+                return Err(format!(
+                    "source ownership conflict: {path} is owned by {}",
+                    other.spec.work_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+pub(crate) fn dependencies_ready(run: &PlannerRun, work: &Work) -> Result<(), String> {
+    for other in run.works.values().filter(|other| {
+        other.spec.work_id != work.spec.work_id
+            && matches!(
+                other.status,
+                WorkStatus::Admitted
+                    | WorkStatus::Allocating
+                    | WorkStatus::Running
+                    | WorkStatus::Corrections
+                    | WorkStatus::Interrupted
+            )
+    }) {
+        if let Some(path) = work.spec.owned_paths.iter().find(|path| {
+            other
+                .spec
+                .owned_paths
+                .iter()
+                .any(|owned| paths_overlap(path, owned))
+        }) {
+            return Err(format!(
+                "source ownership conflict: {path} is owned by {}",
+                other.spec.work_id
+            ));
+        }
+    }
+    for id in &work.spec.dependencies {
+        if !run
+            .works
+            .get(id)
+            .is_some_and(|w| w.status == WorkStatus::Integrated)
+        {
+            return Err(format!("assignment dependencies are not integrated: {id}"));
+        }
+    }
+    for (id, revision) in &work.spec.ready_dependencies {
+        if !run.works.get(id).is_some_and(|w| {
+            matches!(
+                w.status,
+                WorkStatus::Accepted | WorkStatus::Finished | WorkStatus::Integrated
+            ) && w
+                .review
+                .as_ref()
+                .is_some_and(|r| r.accepted && &r.revision == revision)
+                && w.artifact.as_ref().is_some_and(|a| &a.revision == revision)
+                && w.attempt.as_ref().is_none_or(|a| a.ended)
+        }) {
+            return Err(format!(
+                "accepted source dependency {id}@{revision} is not ready"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// These are work counts, never a claim that a repository plan is complete.
+pub fn progress(run: &PlannerRun) -> Value {
+    let mut states = BTreeMap::<String, usize>::new();
+    for work in run.works.values() {
+        let state = serde_json::to_value(work.status).expect("work status is serializable");
+        *states
+            .entry(state.as_str().unwrap().to_string())
+            .or_default() += 1;
+    }
+    let completed = run
+        .capacity
+        .audit
+        .as_ref()
+        .filter(|audit| audit.ok)
+        .and_then(|audit| audit.completed_guides.as_ref());
+    let newly_completed = completed
+        .zip(run.completed_guides_at_start.as_ref())
+        .map(|(current, initial)| current.difference(initial).collect::<Vec<_>>());
+    json!({"work_states":states,
+        "repository_completed_guides":completed.map(BTreeSet::len),"new_completed_guides_since_first_audit":newly_completed,
+        "observed_at_ms":run.capacity.audit.as_ref().map(|audit| audit.at_ms),
+        "awaiting_review":run.works.values().filter(|w| w.status == WorkStatus::ReviewPending).count(),
+        "awaiting_integration":run.works.values().filter(|w| w.status == WorkStatus::Finished).count(),
+        "integrated":run.works.values().filter(|w| w.status == WorkStatus::Integrated).count(),
+        "recovery_required":run.capacity.resumes.iter().filter(|(_, r)| r.suspended.is_some()).map(|(id, _)| id).collect::<Vec<_>>()})
+}
+
 pub async fn begin_work(
     shared: &Arc<Shared>,
     sid: &str,
@@ -1447,18 +2204,15 @@ async fn begin_work_once(
         .get(work_id)
         .ok_or("admit this work identity before dispatch")?
         .clone();
+    if snapshot.reconciliation.required {
+        return Err("parent reconciliation required: record current scope and preserved source with planner_workflow reconcile before resuming".into());
+    }
     if snapshot.paused {
         return Err(
             "assignment was stopped by the client; explicit child resume is required".into(),
         );
     }
-    if snapshot.spec.dependencies.iter().any(|id| {
-        !run.works
-            .get(id)
-            .is_some_and(|w| w.status == WorkStatus::Integrated)
-    }) {
-        return Err("assignment dependencies are not integrated".into());
-    }
+    dependencies_ready(&run, &snapshot)?;
     if snapshot
         .attempt
         .as_ref()
@@ -1480,11 +2234,24 @@ async fn begin_work_once(
     ) {
         return Err("assignment is waiting for parent review or integration, not another implementation attempt".into());
     }
-    let role = if snapshot.status == WorkStatus::Accepted {
-        PlannerRole::FinishWork
-    } else {
-        PlannerRole::ImplementWork
-    };
+    if let Some(workspace) = &snapshot.workspace {
+        workspace_available(workspace)?;
+        if let Some(source) = &snapshot.reconciliation.source_revision {
+            verify_source_revision(&workspace.path, source).await?;
+        }
+    }
+    let role = continuation_role(&snapshot);
+    if role == PlannerRole::FinishWork {
+        let artifact = snapshot
+            .artifact
+            .as_ref()
+            .ok_or("accepted artifact missing")?;
+        verify_revision(
+            &snapshot.workspace.as_ref().ok_or("workspace missing")?.path,
+            &artifact.revision,
+        )
+        .await?;
+    }
     let (router_pid, router_started_at_ms) = process_identity();
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let work = run.works.get_mut(work_id).unwrap();
@@ -1505,6 +2272,7 @@ async fn begin_work_once(
             Some(workspace) => workspace,
             None => allocate_workspace(shared, sid, &snapshot, &run.policy).await?,
         };
+        workspace_available(&workspace)?;
         shared.state.lock().unwrap().claim_planner_workspace(
             &workspace.path,
             sid,
@@ -1577,6 +2345,7 @@ async fn begin_work_once(
         }
     }
     instructions.push_str(&format!("\n[Durable assignment]\nwork_id: {work_id}\nattempt_id: {attempt_id}\nchild_id: {}\nplan_id: {}\nAssigned scope: {}\nRequired checks: {:?}\nPrior evidence: {:?}\nPrior corrections: {:?}\nPrior output: {:?}\n", snapshot.child_id, snapshot.spec.plan_id, snapshot.spec.scope, snapshot.spec.required_checks, snapshot.artifact, snapshot.review, snapshot.last_output));
+    instructions.push_str(&format!("\n[Current source custody]\n{}\nThis current assignment supersedes older briefs. Preserve and carry its source revision; do not reset transferred changes as foreign work.\n", serde_json::to_string(&snapshot.reconciliation).map_err(|e| e.to_string())?));
     Ok((
         WorkerIdentity {
             work_id: work_id.into(),
@@ -1598,6 +2367,9 @@ async fn allocate_workspace(
         .with_session(sid, |s| s.cwd.clone())
         .ok_or("parent session missing")?;
     let workspace = if let Some(allocator) = &policy.workspace {
+        // The run's first allocation first takes over an active native
+        // implement-all run, so its workers and these never collide.
+        crate::planner_guard::adopt_native_once(shared, sid, allocator).await;
         let mut child = tokio::process::Command::new(&allocator.command)
             .args(&allocator.args)
             .current_dir(&cwd)
@@ -1819,13 +2591,28 @@ pub fn begin_followup(
 ) -> Result<String, String> {
     let mut context = String::new();
     mutate(shared, sid, |run| {
-        if run.status != RunStatus::Running || run.phase != PlannerPhase::Implementation {
+        // A drain's shutdown follow-up is the one turn a draining run gives.
+        if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
+            || run.phase != PlannerPhase::Implementation
+        {
             return Err("planner run is suspended".into());
+        }
+        let work = run
+            .works
+            .get(&actor.work_id)
+            .ok_or("unknown work identity")?;
+        dependencies_ready(run, work)?;
+        if work.reconciliation.required {
+            return Err("parent reconciliation required before a child follow-up".into());
         }
         let work = run
             .works
             .get_mut(&actor.work_id)
             .ok_or("unknown work identity")?;
+        let role = continuation_role(work);
+        if let Some(workspace) = &work.workspace {
+            workspace_available(workspace)?;
+        }
         let attempt = work.attempt.as_mut().ok_or("assignment has no attempt")?;
         if work.paused {
             return Err(
@@ -1835,26 +2622,28 @@ pub fn begin_followup(
         if attempt.id != actor.attempt_id || !attempt.ended {
             return Err("attempt is stale or already busy".into());
         }
-        let role = match work.status {
-            WorkStatus::Accepted => PlannerRole::FinishWork,
-            WorkStatus::Corrections | WorkStatus::Interrupted => PlannerRole::ImplementWork,
-            _ => {
-                return Err(
-                    "parent review must accept or return corrections before another child turn"
-                        .into(),
-                );
-            }
-        };
-        attempt.ended = false;
-        if role == PlannerRole::ImplementWork {
-            work.status = WorkStatus::Running;
+        if !matches!(
+            work.status,
+            WorkStatus::Accepted | WorkStatus::Corrections | WorkStatus::Interrupted
+        ) {
+            return Err(
+                "parent review must accept or return corrections before another child turn".into(),
+            );
         }
+        attempt.ended = false;
+        work.status = if role == PlannerRole::FinishWork {
+            WorkStatus::Accepted
+        } else {
+            WorkStatus::Running
+        };
         context = format!(
-            "{}\nwork_id: {}\nattempt_id: {}\nAcceptance/corrections: {:?}",
+            "{}\nwork_id: {}\nattempt_id: {}\nAcceptance/corrections: {:?}\nCurrent assignment: {:?}\nSource custody: {:?}",
             run.policy.instructions(role),
             actor.work_id,
             actor.attempt_id,
-            work.review
+            work.review,
+            work.spec,
+            work.reconciliation
         );
         Ok(())
     })?;

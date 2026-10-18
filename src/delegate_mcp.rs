@@ -857,19 +857,12 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                                     ));
                                 }
                             };
-                            if args.background {
-                                // Start the job and ack immediately — the
-                                // subtask runs on its own tokio task so
-                                // serially-executed tool calls still yield
-                                // parallel subtasks.
-                                let result = start_background_delegate(&shared, &router_sid, args);
-                                return responder.respond(match result {
-                                    Ok(text) => text_result(text, false),
-                                    Err(msg) => text_result(msg, true),
-                                });
-                            }
                             cx.spawn(async move {
-                                let result = run_delegate_task(&shared, &router_sid, args).await;
+                                let result = if args.background {
+                                    start_background_delegate(&shared, &router_sid, args).await
+                                } else {
+                                    run_delegate_task(&shared, &router_sid, args).await
+                                };
                                 let _ = responder.respond(match result {
                                     Ok(text) => text_result(text, false),
                                     Err(msg) => text_result(msg, true),
@@ -1040,7 +1033,7 @@ async fn run_background_start(
 /// `run_delegate_task` on its own tokio task, and return the `b-…` id
 /// immediately. The `delegate_semaphore` inside `run_delegate_task` still
 /// bounds how many jobs actually execute at once.
-fn start_background_delegate(
+pub async fn start_background_delegate(
     shared: &Arc<Shared>,
     router_sid: &str,
     mut args: DelegateTaskArgs,
@@ -1048,11 +1041,29 @@ fn start_background_delegate(
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     args.worker_id = Some(job_id.clone());
     let summary = args.task.clone();
+    // A refused claim must reach the caller before any "started" acknowledgment.
+    let identity = if args.work_id.is_some() {
+        Some(begin_planner_attempt(shared, router_sid, &mut args).await?)
+    } else {
+        None
+    };
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, async move {
-        run_delegate_task(&task_shared, &task_sid, args).await
-    })
+    start_background_job(
+        shared,
+        router_sid,
+        job_id,
+        &summary,
+        identity.is_some(),
+        async move {
+            match identity {
+                Some(identity) => {
+                    run_planner_attempt(&task_shared, &task_sid, args, identity).await
+                }
+                None => run_delegate_task_inner(&task_shared, &task_sid, args).await,
+            }
+        },
+    )
 }
 
 /// `delegate_followup` with `background: true`: the follow-up turn runs as a
@@ -1064,9 +1075,15 @@ fn start_background_followup(
 ) -> Result<String, String> {
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let summary = format!("follow-up to {}: {}", args.delegate_id, args.message);
+    let planner = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .get(&args.delegate_id)
+        .is_some_and(|d| d.planner.is_some());
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, async move {
+    start_background_job(shared, router_sid, job_id, &summary, planner, async move {
         run_delegate_followup(&task_shared, &task_sid, args).await
     })
 }
@@ -1079,6 +1096,7 @@ fn start_background_job(
     router_sid: &str,
     job_id: String,
     summary: &str,
+    planner: bool,
     job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
 ) -> Result<String, String> {
     if shared.with_session(router_sid, |_| ()).is_none() {
@@ -1096,12 +1114,32 @@ fn start_background_job(
             summary: summary.clone(),
             started: std::time::Instant::now(),
             result: None,
+            planner,
         },
     );
     let task_shared = shared.clone();
     let task_job_id = job_id.clone();
+    let router_sid_owned = router_sid.to_string();
     tokio::spawn(async move {
         let result = job.await;
+        if planner && let Err(error) = &result {
+            // A follow-up can fail before it opens an attempt, so no attempt-ended
+            // wake exists. Persist the failure through the same parent wake queue.
+            if let Err(wake_error) = crate::planner_workflow::mutate(
+                &task_shared,
+                &router_sid_owned,
+                |run| {
+                    run.wakes.entry(format!("delegate-failed:{task_job_id}")).or_insert_with(|| crate::planner_workflow::Wake {
+                    work_id: router_sid_owned.clone(),
+                    reason: format!("Background planner delegate {task_job_id} failed: {error}. Read delegate_result and current work status before retrying; no completion is implied."),
+                    ..Default::default()
+                });
+                    Ok(())
+                },
+            ) {
+                tracing::warn!(session = %router_sid_owned, job = %task_job_id, %wake_error, "failed to persist background delegate failure wake");
+            }
+        }
         // The parent may have closed while we ran (its jobs are dropped from
         // the registry) — only record a result somebody can still collect.
         let mut jobs = task_shared.background_delegates.lock().unwrap();
@@ -1128,7 +1166,10 @@ pub async fn run_delegate_await(
     args: DelegateAwaitArgs,
 ) -> Result<String, String> {
     // Validate explicit ids up front: they must exist and belong to us.
-    {
+    // Planner work delegates are never awaited: each reports through a router
+    // wake, and an await would hold the parent's turn (and every other wake)
+    // for as long as the slowest worker runs.
+    let skipped_planner = {
         let jobs = shared.background_delegates.lock().unwrap();
         for id in &args.delegate_ids {
             match jobs.get(id) {
@@ -1143,10 +1184,26 @@ pub async fn run_delegate_await(
                 }
             }
         }
-        if args.delegate_ids.is_empty() && !jobs.values().any(|j| j.parent_sid == router_sid) {
+        let wanted = |id: &String| args.delegate_ids.is_empty() || args.delegate_ids.contains(id);
+        let mine = jobs
+            .iter()
+            .filter(|(id, j)| j.parent_sid == router_sid && wanted(id));
+        let skipped = mine
+            .clone()
+            .filter(|(_, j)| j.planner && !j.result.as_ref().is_some_and(Result::is_err))
+            .count();
+        if mine
+            .filter(|(_, j)| !j.planner || j.result.as_ref().is_some_and(Result::is_err))
+            .count()
+            == 0
+        {
+            if skipped > 0 {
+                return Ok(PLANNER_AWAIT_NOTE.to_string());
+            }
             return Err("no background delegates are pending for this session".to_string());
         }
-    }
+        skipped
+    };
     let timeout =
         std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(600).clamp(5, 1500));
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1163,6 +1220,7 @@ pub async fn run_delegate_await(
                 .iter()
                 .filter(|(id, j)| {
                     j.parent_sid == router_sid
+                        && (!j.planner || j.result.as_ref().is_some_and(Result::is_err))
                         && (args.delegate_ids.is_empty() || args.delegate_ids.contains(id))
                 })
                 .map(|(id, _)| id.clone())
@@ -1178,11 +1236,14 @@ pub async fn run_delegate_await(
                 }
             }
         }
-        if running.is_empty() {
-            return Ok(render_await(&collected, &[]));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(render_await(&collected, &running));
+        let done = running.is_empty() || tokio::time::Instant::now() >= deadline;
+        if done {
+            let mut out = render_await(&collected, &running);
+            if skipped_planner > 0 {
+                out.push_str("\n\n");
+                out.push_str(PLANNER_AWAIT_NOTE);
+            }
+            return Ok(out);
         }
         tokio::select! {
             _ = &mut notified => {}
@@ -1190,6 +1251,10 @@ pub async fn run_delegate_await(
         }
     }
 }
+
+const PLANNER_AWAIT_NOTE: &str = "Planner work delegates are not awaited: each one reports \
+    through a router wake when it hands off. End your turn; awaiting a worker would hold every \
+    other wake until it finished.";
 
 fn render_await(
     collected: &[(String, Result<String, String>)],
@@ -1320,59 +1385,127 @@ pub async fn run_delegate_task(
     router_sid: &str,
     mut args: DelegateTaskArgs,
 ) -> Result<String, String> {
-    if let Some(work_id) = args.work_id.clone() {
-        args.planner_role = Some(
-            if crate::planner_workflow::load(shared, router_sid)?
-                .and_then(|run| run.works.get(&work_id).map(|w| w.status))
-                == Some(crate::planner_workflow::WorkStatus::Accepted)
-            {
-                crate::planner_skills::PlannerRole::FinishWork
-            } else {
-                crate::planner_skills::PlannerRole::ImplementWork
-            },
-        );
-        let (identity, workspace, child_id, instructions) =
-            crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
-        args.classification_text = Some(args.task.clone());
-        args.task = format!("{instructions}\n[Assignment briefing]\n{}", args.task);
-        args.planner_identity = Some(identity.clone());
-        args.planner_workspace = Some(workspace.path);
-        args.planner_environment = workspace.environment;
-        args.worker_id = Some(child_id);
-        args.keep_open = true;
-        let original_inputs =
-            crate::planner_workflow::input_blocks(shared, router_sid, &identity, &args.input_ids);
-        let result = match original_inputs {
-            Ok((blocks, ids)) => {
-                args.planner_input_blocks = blocks;
-                args.planner_receipt_ids = ids;
-                run_delegate_task_inner(shared, router_sid, args).await
-            }
-            Err(error) => Err(error),
-        };
-        let delegate_id = shared
-            .live_delegates
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, live)| {
-                live.planner.as_ref().is_some_and(|p| {
-                    p.work_id == identity.work_id && p.attempt_id == identity.attempt_id
-                })
-            })
-            .map(|(id, _)| id.clone());
-        crate::planner_workflow::attempt_ended(
-            shared,
-            router_sid,
-            &identity,
-            delegate_id,
-            result.clone().unwrap_or_else(|e| e),
-            result.is_err(),
-        )?;
-        crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
-        return result;
+    if args.work_id.is_some() {
+        let identity = begin_planner_attempt(shared, router_sid, &mut args).await?;
+        return run_planner_attempt(shared, router_sid, args, identity).await;
     }
     run_delegate_task_inner(shared, router_sid, args).await
+}
+
+/// Start a durable planner work exactly as a parent's `delegate_task
+/// {work_id, background: true}` does: the attempt and workspace are claimed
+/// before this returns (so a host refusal is the caller's error to record),
+/// then the turn runs as a background job on the normal delegate routing
+/// path. Used by the router's capacity auto-admission and worker resumption.
+pub async fn start_planner_worker(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    work_id: &str,
+    task: String,
+) -> Result<String, String> {
+    let args = DelegateTaskArgs {
+        task,
+        work_id: Some(work_id.to_string()),
+        keep_open: true,
+        background: true,
+        ..Default::default()
+    };
+    start_background_delegate(shared, router_sid, args).await
+}
+
+/// Resume a planner worker whose attempt ended without a receipt: a
+/// follow-up turn on its open sub-session, through the same path as the
+/// parent's `delegate_followup {background: true}`.
+pub fn resume_planner_worker(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    delegate_id: String,
+    message: String,
+) -> Result<String, String> {
+    start_background_followup(
+        shared,
+        router_sid,
+        DelegateFollowupArgs {
+            delegate_id,
+            message,
+            background: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Claim the attempt and workspace for a durable planner work and shape
+/// `args` into its assignment brief.
+async fn begin_planner_attempt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: &mut DelegateTaskArgs,
+) -> Result<crate::planner_workflow::WorkerIdentity, String> {
+    let work_id = args
+        .work_id
+        .clone()
+        .ok_or("planner attempt needs a work_id")?;
+    let (identity, workspace, child_id, instructions) =
+        crate::planner_workflow::begin_work(shared, router_sid, &work_id).await?;
+    args.planner_role = Some(
+        if crate::planner_workflow::load(shared, router_sid)?
+            .and_then(|run| run.works.get(&work_id).map(|w| w.status))
+            == Some(crate::planner_workflow::WorkStatus::Accepted)
+        {
+            crate::planner_skills::PlannerRole::FinishWork
+        } else {
+            crate::planner_skills::PlannerRole::ImplementWork
+        },
+    );
+    args.classification_text = Some(args.task.clone());
+    args.task = format!("{instructions}\n[Assignment briefing]\n{}", args.task);
+    args.planner_identity = Some(identity.clone());
+    args.planner_workspace = Some(workspace.path);
+    args.planner_environment = workspace.environment;
+    args.worker_id = Some(child_id);
+    args.keep_open = true;
+    Ok(identity)
+}
+
+/// Run a claimed planner attempt's turn and record its end.
+async fn run_planner_attempt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    mut args: DelegateTaskArgs,
+    identity: crate::planner_workflow::WorkerIdentity,
+) -> Result<String, String> {
+    let original_inputs =
+        crate::planner_workflow::input_blocks(shared, router_sid, &identity, &args.input_ids);
+    let result = match original_inputs {
+        Ok((blocks, ids)) => {
+            args.planner_input_blocks = blocks;
+            args.planner_receipt_ids = ids;
+            run_delegate_task_inner(shared, router_sid, args).await
+        }
+        Err(error) => Err(error),
+    };
+    let delegate_id = shared
+        .live_delegates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, live)| {
+            live.planner.as_ref().is_some_and(|p| {
+                p.work_id == identity.work_id && p.attempt_id == identity.attempt_id
+            })
+        })
+        .map(|(id, _)| id.clone());
+    crate::planner_workflow::attempt_ended(
+        shared,
+        router_sid,
+        &identity,
+        delegate_id,
+        result.clone().unwrap_or_else(|e| e),
+        result.is_err(),
+    )?;
+    crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+    crate::planner_client::release_finished_child(shared, router_sid, &identity);
+    result
 }
 
 async fn run_delegate_task_inner(
@@ -1620,8 +1753,12 @@ async fn run_delegate_task_inner(
         // Host-directed workers get the router's worker tools (identity and
         // structured handoffs), bound to this worker id.
         let mut session_mcp = sub_mcp.clone();
+        // This delegate's own token. A planner child keeps one worker id across
+        // attempts, so tearing this delegate down revokes this token only, never
+        // the token a newer attempt of the same child is still connecting with.
+        let mut worker_token: Option<String> = None;
         if (lifecycle_hook.is_some() || args.planner_identity.is_some())
-            && let Some(entry) = worker_server_entry(
+            && let Some((entry, token)) = worker_server_entry(
                 shared,
                 router_sid,
                 WorkerBinding {
@@ -1633,7 +1770,9 @@ async fn run_delegate_task_inner(
             )
         {
             session_mcp.push(entry);
+            worker_token = Some(token);
         }
+        let worker_token = worker_token;
         let opening = if let Some(identity) = &args.planner_identity {
             crate::planner_client::open_child(
                 shared,
@@ -1681,7 +1820,7 @@ async fn run_delegate_task_inner(
                     .await
                 {
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     last_err = Some(error.to_string());
                     continue;
                 }
@@ -1735,7 +1874,7 @@ async fn run_delegate_task_inner(
                                     &opened.process_key,
                                     &opened.downstream_sid,
                                 );
-                                drop_worker_tokens(shared, &worker_id);
+                                drop_delegate_token(shared, worker_token.as_deref());
                                 continue;
                             } else {
                                 tracing::info!(
@@ -1761,7 +1900,7 @@ async fn run_delegate_task_inner(
                                 &opened.process_key,
                                 &opened.downstream_sid,
                             );
-                            drop_worker_tokens(shared, &worker_id);
+                            drop_delegate_token(shared, worker_token.as_deref());
                             continue;
                         }
                     }
@@ -1813,7 +1952,7 @@ async fn run_delegate_task_inner(
                         "delegate start hook refused the delegate"
                     );
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     // A start that timed out may still have registered the
                     // worker on the host's side; tell it the worker never ran.
                     crate::delegate_hook::deliver(
@@ -1926,7 +2065,7 @@ async fn run_delegate_task_inner(
                         .send_notification(CancelNotification::new(opened.downstream_sid.clone()));
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
                     shared.delegate_effort.lock().unwrap().remove(&sub_sid);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     if let Some(event) = &lifecycle {
                         crate::delegate_hook::deliver(shared, &event.stopped("cancelled", None));
                     }
@@ -1962,6 +2101,13 @@ async fn run_delegate_task_inner(
                 }
                 let turn_start = std::time::Instant::now();
                 if let Some(identity) = &args.planner_identity {
+                    crate::planner_guard::track_child(
+                        shared,
+                        router_sid,
+                        &identity.work_id,
+                        opened.process_key.clone(),
+                        opened.downstream_sid.clone(),
+                    );
                     crate::planner_client::turn_state(shared, router_sid, identity, "started")?;
                     crate::planner_workflow::queue_delivery(
                         shared,
@@ -1980,7 +2126,14 @@ async fn run_delegate_task_inner(
                     profile.class,
                 );
                 let prompt_generation = crate::auth::request_access_generation(shared, &candidate);
-                let result = prompt_unless_stalled(shared, &opened.conn, &sub_sid, prompt).await;
+                let result = prompt_unless_stalled(
+                    shared,
+                    &opened.conn,
+                    &sub_sid,
+                    prompt,
+                    args.planner_identity.as_ref().map(|_| router_sid),
+                )
+                .await;
                 if result.is_ok() {
                     crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
                 }
@@ -1999,6 +2152,8 @@ async fn run_delegate_task_inner(
                                 sub_sid: &sub_sid,
                                 worker_id: &worker_id,
                                 capture: &capture,
+                                parent_sid: router_sid,
+                                planner: args.planner_identity.as_ref(),
                             },
                             resp,
                             &mut turns,
@@ -2052,7 +2207,7 @@ async fn run_delegate_task_inner(
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
                     shared.delegate_effort.lock().unwrap().remove(&sub_sid);
                     shared.worker_handoffs.lock().unwrap().remove(&worker_id);
-                    drop_worker_tokens(shared, &worker_id);
+                    drop_delegate_token(shared, worker_token.as_deref());
                     if let Some(event) = &lifecycle {
                         crate::delegate_hook::deliver(shared, &event.stopped(outcome, detail));
                     }
@@ -2107,6 +2262,7 @@ async fn run_delegate_task_inner(
                                             lifecycle: lifecycle.clone(),
                                             worker_id: worker_id.clone(),
                                             planner: args.planner_identity.clone(),
+                                            worker_token: worker_token.clone(),
                                             turns,
                                         },
                                     );
@@ -2141,7 +2297,7 @@ async fn run_delegate_task_inner(
                 };
             }
             Err(err) => {
-                drop_worker_tokens(shared, &worker_id);
+                drop_delegate_token(shared, worker_token.as_deref());
                 tracing::warn!(candidate = %candidate, error = %err, "delegate candidate failed");
                 if crate::downstream::is_auth_required(&err) {
                     crate::auth::note_auth_failure_for_request(
@@ -2177,6 +2333,9 @@ struct TurnGate<'a> {
     sub_sid: &'a str,
     worker_id: &'a str,
     capture: &'a Arc<Mutex<String>>,
+    parent_sid: &'a str,
+    /// A planner child: never escapes unfinished (see `gate_turns`).
+    planner: Option<&'a crate::planner_workflow::WorkerIdentity>,
 }
 
 /// Ask the host whether a delegate turn may end (`delegate_turn_end`). While
@@ -2184,16 +2343,23 @@ struct TurnGate<'a> {
 /// at most `max_continuations` times — the way a provider's subagent-stop
 /// hook keeps a worker going. Without a lifecycle hook, or once the turn did
 /// not end normally, the response is returned unchanged.
+///
+/// A planner child is different: it is continued with no cap (immediately,
+/// then after 30 s, 2 min and every 5 min), a hook that cannot judge its turn
+/// continues it too, and a shutdown drain's message reaches it at its turn
+/// end. Only a stopped run, a paused work or a drain's cancel ends that.
 async fn gate_turns(
     shared: &Arc<Shared>,
     gate: &TurnGate<'_>,
     mut resp: agent_client_protocol::schema::v1::PromptResponse,
     turns: &mut u32,
 ) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
-    let (Some(hook), Some(event)) = (&shared.cfg.delegation.lifecycle_hook, gate.lifecycle) else {
+    let hook = shared.cfg.delegation.lifecycle_hook.as_ref();
+    let host = hook.zip(gate.lifecycle);
+    if host.is_none() && gate.planner.is_none() {
         return Ok(resp);
-    };
-    let mut continued = 0;
+    }
+    let mut continued = 0u32;
     loop {
         if !matches!(
             resp.stop_reason,
@@ -2201,27 +2367,54 @@ async fn gate_turns(
         ) {
             return Ok(resp);
         }
-        let text = gate.capture.lock().unwrap().clone();
-        let handoff = shared
-            .worker_handoffs
-            .lock()
-            .unwrap()
-            .get(gate.worker_id)
-            .cloned();
-        let message =
-            match crate::delegate_hook::turn_end(hook, &event.turn_ended(*turns, &text, handoff))
-                .await
-            {
-                crate::delegate_hook::TurnVerdict::Release => return Ok(resp),
-                crate::delegate_hook::TurnVerdict::Continue(message) => message,
-            };
-        if continued >= hook.max_continuations {
-            gate.capture.lock().unwrap().push_str(&format!(
-                "\n\n[router-acp · the host still returned this turn after {continued} \
-                 continuations: {message}]"
-            ));
-            return Ok(resp);
-        }
+        let shutdown = gate.planner.and_then(|identity| {
+            crate::planner_shutdown::take_injection(shared, gate.parent_sid, &identity.work_id)
+        });
+        let message = match (shutdown, host) {
+            (Some(message), _) => message,
+            (None, Some((hook, event))) => {
+                let text = gate.capture.lock().unwrap().clone();
+                let handoff = shared
+                    .worker_handoffs
+                    .lock()
+                    .unwrap()
+                    .get(gate.worker_id)
+                    .cloned();
+                let verdict = crate::delegate_hook::turn_end_for(
+                    hook,
+                    &event.turn_ended(*turns, &text, handoff),
+                    gate.planner.is_some(),
+                )
+                .await;
+                match verdict {
+                    crate::delegate_hook::TurnVerdict::Release => return Ok(resp),
+                    crate::delegate_hook::TurnVerdict::Continue(message) => {
+                        if let Some(identity) = gate.planner {
+                            match crate::planner_guard::child_continuation(
+                                shared,
+                                gate.parent_sid,
+                                identity,
+                                continued,
+                            )
+                            .await
+                            {
+                                None => return Ok(resp),
+                                Some(shutdown) => shutdown.unwrap_or(message),
+                            }
+                        } else if continued >= hook.max_continuations {
+                            gate.capture.lock().unwrap().push_str(&format!(
+                                "\n\n[router-acp · the host still returned this turn after \
+                                 {continued} continuations: {message}]"
+                            ));
+                            return Ok(resp);
+                        } else {
+                            message
+                        }
+                    }
+                }
+            }
+            (None, None) => return Ok(resp),
+        };
         continued += 1;
         *turns += 1;
         shared
@@ -2248,7 +2441,14 @@ async fn gate_turns(
             gate.downstream_sid.to_string(),
             vec![ContentBlock::from(message)],
         );
-        resp = prompt_unless_stalled(shared, gate.conn, gate.sub_sid, prompt).await?;
+        resp = prompt_unless_stalled(
+            shared,
+            gate.conn,
+            gate.sub_sid,
+            prompt,
+            gate.planner.map(|_| gate.parent_sid),
+        )
+        .await?;
     }
 }
 
@@ -2268,10 +2468,72 @@ async fn prompt_unless_stalled(
     conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
     sub_sid: &str,
     prompt: PromptRequest,
+    planner_parent: Option<&str>,
 ) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
     let downstream_sid = prompt.session_id.clone();
+    let sent_at = std::time::Instant::now();
+    crate::planner_watchdog::begin(shared, sub_sid);
     let reply = conn.send_request(prompt).block_task();
     tokio::pin!(reply);
+    // A planner child runs under the stuck-turn watchdog: silence for
+    // `stuck_turn_secs` stalls it, an open tool call included.
+    if let Some(parent_sid) = planner_parent
+        && let Some(limit) = crate::planner_watchdog::stuck_limit(shared)
+    {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        let quiet = loop {
+            tokio::select! {
+                result = &mut reply => return result,
+                _ = tick.tick() => {}
+            }
+            if crate::planner_watchdog::folded_result(shared, sub_sid, sent_at) {
+                tracing::warn!(
+                    session = sub_sid,
+                    "the worker's adapter ended its turn under an autonomous result and never answered; settling it"
+                );
+                let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut reply).await;
+                return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                    StopReason::EndTurn,
+                ));
+            }
+            let quiet = crate::planner_watchdog::quiet_for(shared, sub_sid, sent_at);
+            if quiet >= limit {
+                break quiet;
+            }
+        };
+        let span = format!("{} min", quiet.as_secs() / 60);
+        tracing::error!(
+            session = sub_sid,
+            quiet_secs = quiet.as_secs(),
+            "planner child turn stalled: no downstream progress; cancelling it"
+        );
+        crate::session::notify_user(
+            shared,
+            parent_sid,
+            format!("router-acp · worker turn stalled {span}: cancelling ({sub_sid})"),
+        );
+        let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(crate::planner_watchdog::cancel_grace(shared), &mut reply).await
+            && resp.stop_reason != StopReason::Cancelled
+        {
+            return Ok(resp);
+        }
+        let reason = format!(
+            "worker turn stalled: no downstream progress for {span}; the router cancelled and released it"
+        );
+        shared.state.lock().unwrap().log(
+            sub_sid,
+            &crate::state::LogEntry {
+                kind: "router_notice".to_string(),
+                role: "router".to_string(),
+                summary: reason.clone(),
+                ..Default::default()
+            },
+        );
+        return Err(AcpError::internal_error().data(reason));
+    }
     let started = chrono::Utc::now().timestamp();
     let mut check = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
@@ -2340,7 +2602,7 @@ fn worker_server_entry(
     shared: &Arc<Shared>,
     router_sid: &str,
     worker: WorkerBinding,
-) -> Option<McpServer> {
+) -> Option<(McpServer, String)> {
     let socket = shared.delegate_socket.get()?.clone();
     let exe = std::env::var("ROUTER_ACP_HELPER_EXE")
         .map(PathBuf::from)
@@ -2360,12 +2622,19 @@ fn worker_server_entry(
         "--socket".to_string(),
         socket.display().to_string(),
         "--token".to_string(),
-        token,
+        token.clone(),
     ]);
-    Some(McpServer::Stdio(stdio))
+    Some((McpServer::Stdio(stdio), token))
 }
 
-/// Forget a finished worker's MCP tokens.
+/// Forget one delegate's `router-worker` token.
+pub fn drop_delegate_token(shared: &Shared, token: Option<&str>) {
+    if let Some(token) = token {
+        shared.delegate_tokens.lock().unwrap().remove(token);
+    }
+}
+
+/// Forget every MCP token of a worker (stopping the child outright).
 pub fn drop_worker_tokens(shared: &Shared, worker_id: &str) {
     shared
         .delegate_tokens
@@ -2420,12 +2689,28 @@ fn worker_whoami(worker: &WorkerBinding) -> String {
 /// `delegate_result`: re-read a delegate's latest output from the state DB,
 /// by background job id (`b-…`), worker id (`w-…`) or live delegate id
 /// (`d-…`), even after `delegate_await` consumed it.
-fn run_delegate_result(
+pub fn run_delegate_result(
     shared: &Shared,
     router_sid: &str,
     args: DelegateResultArgs,
 ) -> Result<String, String> {
     let id = args.delegate_id.trim();
+    let background = shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .get(id)
+        .filter(|job| job.parent_sid == router_sid)
+        .map(|job| {
+            (
+                job.result.clone(),
+                job.summary.clone(),
+                job.started.elapsed().as_secs(),
+            )
+        });
+    if let Some((Some(Err(error)), _, _)) = &background {
+        return Ok(format!("delegate {id} — FAILED\n{error}"));
+    }
     let live_sub = shared
         .live_delegates
         .lock()
@@ -2448,6 +2733,15 @@ fn run_delegate_result(
                 }))
     });
     let Some((sub_sid, row)) = row else {
+        if let Some((result, summary, seconds)) = background {
+            return Ok(match result {
+                Some(Ok(output)) => format!("delegate {id} — finished\n{output}"),
+                Some(Err(error)) => format!("delegate {id} — FAILED\n{error}"),
+                None => format!(
+                    "delegate {id} — pending ({seconds}s): {summary}\nNo child session is linked to this job id; verify the owning attempt before reporting worker activity."
+                ),
+            });
+        }
         return Err(format!(
             "no delegate `{id}` in this session (ids are b-…, w-… or d-…)"
         ));
@@ -2555,6 +2849,7 @@ pub async fn run_delegate_followup(
             result.is_err(),
         )?;
         crate::planner_client::turn_state(shared, router_sid, &identity, "idle")?;
+        crate::planner_client::release_finished_child(shared, router_sid, &identity);
         return result;
     }
     run_delegate_followup_inner(shared, router_sid, args).await
@@ -2650,6 +2945,13 @@ async fn run_delegate_followup_inner(
     }
     let turn_start = std::time::Instant::now();
     if let Some(identity) = &args.planner_identity {
+        crate::planner_guard::track_child(
+            shared,
+            router_sid,
+            &identity.work_id,
+            process_key.clone(),
+            downstream_sid.clone(),
+        );
         crate::planner_client::turn_state(shared, router_sid, identity, "started")?;
         crate::planner_workflow::queue_delivery(
             shared,
@@ -2668,7 +2970,14 @@ async fn run_delegate_followup_inner(
         TaskClass::CodingGeneral,
     );
     let request_generation = crate::auth::request_access_generation(shared, &candidate);
-    let result = prompt_unless_stalled(shared, &conn, &sub_sid, prompt).await;
+    let result = prompt_unless_stalled(
+        shared,
+        &conn,
+        &sub_sid,
+        prompt,
+        args.planner_identity.as_ref().map(|_| router_sid),
+    )
+    .await;
     if result.is_ok() {
         crate::planner_workflow::confirm_delivery(shared, &sub_sid)?;
     }
@@ -2685,6 +2994,8 @@ async fn run_delegate_followup_inner(
                     sub_sid: &sub_sid,
                     worker_id: &worker_id,
                     capture: &capture,
+                    parent_sid: router_sid,
+                    planner: args.planner_identity.as_ref(),
                 },
                 resp,
                 &mut turns,

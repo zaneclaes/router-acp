@@ -1059,9 +1059,9 @@ pub fn codex_availability_with_spend(
             && let Some(il) = field(pool, "individual_limit", "individualLimit")
             && let Some(remaining) =
                 field(il, "remaining_percent", "remainingPercent").and_then(Value::as_f64)
-            && !field(il, "resets_at", "resetsAt")
+            && field(il, "resets_at", "resetsAt")
                 .and_then(Value::as_u64)
-                .is_some_and(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now)
+                .is_none_or(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) > now)
         {
             // The member limit already reports real dollars (`limit`/`used`)
             // — no estimation needed, unlike the plan windows above.

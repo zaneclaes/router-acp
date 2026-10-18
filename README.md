@@ -464,6 +464,12 @@ For **review → fix → re-review** loops, a delegated sub-session can be kept 
 
 For **parallel** subtasks there is a background mode: MCP clients execute tool calls one at a time, so N plain `delegate_task` calls run the subtasks serially no matter what the router allows. `delegate_task` with `background: true` instead returns a `b-…` job id immediately and runs the subtask on its own task; `delegate_await` collects results — it waits up to `timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default: all pending), returns every finished job's output exactly once, and lists the ones still running so the caller polls with short, idle-timeout-safe calls. `background` composes with `keep_open` (the collected result carries the `delegate_id`), and `delegation.max_concurrent` still bounds how many jobs execute at once.
 
+Planner background dispatch claims the admitted work and workspace before acknowledging
+startup; a refused claim returns directly to the caller. Live planner workers report through
+wakes and are never held in `delegate_await`, but a completed background failure can be
+collected and records a parent wake. `delegate_result` also reports failed or queued jobs
+before a child session exists. A queued job is not proof that a worker is making progress.
+
 ### Host-directed workers
 
 Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:
@@ -482,6 +488,8 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   `delegate_stop` and `parent_repinned` go through a `hook_outbox` table in the state DB: an event the hook did not accept stays queued, and every router process sharing that DB retries it every 30 s and at startup. Delegate events carry `worker_id` (the `b-…` job id for a background delegate, else a `w-…` id), `parent_router_session_id`, `parent_downstream_session_id` (the id the provider's own hooks report for the parent), `parent_candidate`, `candidate`, `lineage`, `downstream_session_id`, `state_session_id`, `cwd`, `effort`, `background`, `keep_open` and `task_summary`; every event carries `router_pid` and `router_started_at_ms`, so a host can treat a dead router's workers as stopped even if no stop event arrives.
 - **Worker tools.** While a hook is configured, each delegate gets a `router-worker` MCP server: `worker_whoami` returns its worker id, model and parent session, and `worker_handoff {kind, message}` records a structured handoff (`commit_paths_ready`, `waiting`, `lease_requested`, `ownership_requested`, `staging_gate_request`, `round_verified`, `round_failed`, `reassignment_required`) that the turn-end event carries. The delegate's prompt also opens with `[router-acp delegate] worker id: … · model: … · parent session: …`, and the tool result names the worker (`[delegated to grok/grok-4.7, worker b-…]`).
 - **Resuming a parent without its client.** `router-acp prompt --config <file> --session <id> --mode auto --message <text>` reopens a router session (`session/resume`, else `session/load`) and sends one message with no ACP client attached, streaming the reply to stdout. `--session` takes a router id or the provider session id the router pinned it to — what the provider's own hooks recorded — so a supervisor can wake a parent whose goose is gone. A reloaded or resumed session gets its router tools back. Every adapter the router spawns inherits `ROUTER_ACP_CONFIG` and `ROUTER_ACP_BIN`, so a host's hooks can tell they run under the router and build that command.
+
+- **Correcting a live planner.** `router-acp planner-input --session <router-id> --cwd <checkout> --id <stable-id> --message-file <file>` sends an explicitly agent-origin message through the existing parent queue without interrupting or taking over the running session. Read delivery and acknowledgment with `planner-input --session <router-id> --id <stable-id> --status`. Same-id retries are idempotent; operator approval holds remain effective. See [monitor input](docs/planner-throughput.md#messages-from-a-local-monitor). Use this for a live parent; `prompt` is for a parent whose client has gone.
 
 Delegates still end when their router exits: the router kills every adapter when its client disconnects or is interrupted, so a worker cannot outlive the goose session that started it. Committed work survives; a host recovers the rest through its stop events, the router-pid liveness check, `delegate_result` and `router-acp prompt`.
 
@@ -924,6 +932,10 @@ Do not launch a provider CLI against canonical credentials outside the router.
 - Unknown ids fail. SQLite write failures fail the ACP operation rather than creating an unresumable conversation.
 
 Planner Resume also restores the durable phase, coordinator role, and assignments.
+Adopted unfinished assignments require scope/source reconciliation before dispatch.
+That fence applies to each affected assignment: independent capacity checks and
+release reminders continue under the normal ownership and dependency gates.
+See [durable planner progress](docs/planner-throughput.md).
 Restored effort preferences do not establish confirmed active effort.
 Planner close pauses running work while retaining assignments and repository artifacts.
 Planner delete refuses unfinished assignments, including their live attempts, pending inputs, wakes, and approval waits.

@@ -1245,6 +1245,7 @@ fn start_request_record(
             routing_event: event.clone(),
             estimated_input_tokens: estimated_input,
         });
+    crate::planner_watchdog::note_progress(&state.shared, &active.state_sid);
     state.shared.state.lock().unwrap().log(
         &active.state_sid,
         &LogEntry {
@@ -2207,6 +2208,7 @@ fn complete_request(
         &usage,
     );
     let duration_ms = context.started.elapsed().as_millis() as u64;
+    crate::planner_watchdog::note_progress(shared, &context.state_sid);
     {
         let state = shared.state.lock().unwrap();
         state.finish_llm_request(
