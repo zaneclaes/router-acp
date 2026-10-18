@@ -80,6 +80,10 @@ uses StateStore and revision-checked writes to the existing FIFO input queue; it
 does not launch an adapter, take over ownership, interrupt a turn, or read provider
 credentials. Existing routers that support queued parent input deliver it at the
 next idle opportunity, ahead of ordinary wakes. Approval waits remain effective.
+Once delivery starts, an agent-origin correction is router-owned: live operator
+input can steer it, or cancel it when steering is unavailable. An interrupted
+correction stays queued for redelivery after the operator's turn. Actual operator
+turns remain protected and preserve their FIFO queue behavior.
 
 Messages are explicitly agent-origin and cannot authorize new scope, change phase,
 resume a paused run, or acknowledge an operator decision. Sending requires an exact

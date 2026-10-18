@@ -13890,6 +13890,113 @@ async fn operator_input_cancels_a_router_owned_turn_and_runs_next_when_steering_
     let _ = std::fs::remove_file(&release);
 }
 
+/// A monitor correction is agent-owned even though it uses the durable input
+/// queue. Live operator input can steer it or cancel it without losing it.
+#[tokio::test]
+async fn operator_input_preempts_queued_agent_correction_and_preserves_cancelled_delivery() {
+    for decline in [false, true] {
+        let state = temp_state_file("agent-input-preempt");
+        let log = temp_log("agent-input-preempt");
+        let release =
+            std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+        let repo = preempt_repository(&release);
+        let message = repo.path().join("monitor.txt");
+        std::fs::write(
+            &message,
+            format!("monitor-correction\nWAIT_FILE:{}", release.display()),
+        )
+        .unwrap();
+        run_test_shared(
+            planner_gate_yaml(&state, &log, ""),
+            async |cx, observed, shared| {
+                let sid = open_planner_parent(&cx, &repo).await?;
+                router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                    run.owner = Some(router_acp::planner_workflow::RunOwner::current());
+                    Ok(())
+                })
+                .unwrap();
+                let output = std::process::Command::new(router_exe())
+                    .args(["planner-input", "--state"])
+                    .arg(&state)
+                    .args(["--session", &sid, "--id", "monitor-preempt", "--cwd"])
+                    .arg(repo.path().join("repo"))
+                    .arg("--message-file")
+                    .arg(&message)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                wait_for_mock_prompt(&log, "monitor-correction").await;
+                let prompt = if decline {
+                    "DECLINED-STEER\nTEXT:live-operator-correction"
+                } else {
+                    "TEXT:live-operator-correction"
+                };
+                let answer = prompt_text(&cx, &sid, prompt).await?;
+                assert_eq!(answer.stop_reason, StopReason::EndTurn);
+                assert!(
+                    !release.exists(),
+                    "operator input must not wait for the monitor turn"
+                );
+                let events = read_log(&log);
+                if decline {
+                    assert!(events.iter().any(|e| e["event"] == "cancel"));
+                    assert!(agent_text(&observed, &sid).contains("live-operator-correction"));
+                    let run = router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        run.parent_queue
+                            .iter()
+                            .any(|q| q.input_id == "monitor-preempt"),
+                        "Ok(Cancelled) must retain the interrupted correction"
+                    );
+                } else {
+                    assert!(events.iter().any(|e| e["event"] == "steer"));
+                    assert!(!events.iter().any(|e| e["event"] == "cancel"));
+                }
+                std::fs::write(&release, "").unwrap();
+                for _ in 0..150 {
+                    if router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap()
+                        .parent_queue
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let run = router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    run.parent_queue.is_empty(),
+                    "completed delivery retires the queue entry"
+                );
+                assert_eq!(
+                    mock_prompts(&log, "monitor-correction").len(),
+                    if decline { 2 } else { 1 }
+                );
+                assert!(run.inputs["monitor-preempt"].delivered_to.contains(&sid));
+                if decline {
+                    let operator = mock_prompts(&log, "live-operator-correction")[0];
+                    assert!(
+                        mock_prompts(&log, "monitor-correction")[1] > operator,
+                        "live operator turn precedes redelivery"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await;
+        let _ = std::fs::remove_file(&release);
+    }
+}
+
 /// Operator input queued behind an operator turn goes before any wake.
 #[tokio::test]
 async fn queued_operator_input_is_delivered_before_the_next_router_owned_turn() {

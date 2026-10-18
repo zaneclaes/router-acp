@@ -162,10 +162,12 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let Some(activity) = PromptActivity::idle(&shared, &sid) else {
                     continue;
                 };
-                // Queued operator input always goes first (`deliver`); only a
-                // turn that delivers wakes is router-owned, and operator input
-                // preempts that one (`planner_preempt`).
-                let router_owned = run.parent_queue.is_empty();
+                // Agent corrections, like wakes, must yield to live operator
+                // input. Only an actual operator request owns a protected turn.
+                let router_owned = run
+                    .parent_queue
+                    .first()
+                    .is_none_or(|input| !planner_workflow::human_prompt(&input.request));
                 if router_owned {
                     crate::planner_preempt::begin_router_turn(&shared, &sid);
                 }
@@ -423,8 +425,10 @@ fn wake_priority(id: &str) -> u8 {
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     let run = planner_workflow::load(shared, sid)?.ok_or("planner state missing")?;
     if let Some(input) = run.parent_queue.first() {
-        // Operator input: an operator turn, never preempted as router-owned.
-        crate::planner_preempt::end_router_turn(shared, sid);
+        if planner_workflow::human_prompt(&input.request) {
+            // Actual operator turns stay protected; monitor input does not.
+            crate::planner_preempt::end_router_turn(shared, sid);
+        }
         return deliver_queued_input(shared, sid, input.clone()).await;
     }
     let now = chrono::Utc::now().timestamp();
@@ -548,6 +552,7 @@ async fn deliver_queued_input(
     sid: &str,
     input: planner_workflow::QueuedParentInput,
 ) -> Result<(), String> {
+    let agent_input = !planner_workflow::human_prompt(&input.request);
     let wake_id = format!("input:{}", input.input_id);
     let (pid, started) = planner_workflow::process_identity();
     planner_workflow::mutate(shared, sid, |run| {
@@ -584,13 +589,24 @@ async fn deliver_queued_input(
         Ok(req) => crate::session::run_primary_turn(shared.clone(), sid.into(), req, None).await,
         Err(error) => Err(error),
     };
+    // Cancellation can return Ok(Cancelled). Keep an interrupted correction
+    // durable until a subsequent delivery finishes, just as for normal wakes.
+    let stalled = crate::planner_watchdog::take_stalled(shared, sid);
+    let interrupted = agent_input
+        && (crate::planner_preempt::preempted(shared, sid)
+            || stalled
+            || result.as_ref().is_ok_and(|reply| {
+                reply.stop_reason == agent_client_protocol::schema::v1::StopReason::Cancelled
+            }));
     planner_workflow::mutate(shared, sid, |run| {
         if let Some(wake) = run.wakes.get_mut(&wake_id)
             && wake.claim_pid == pid
             && wake.claim_started_at_ms == started
         {
             wake.claim_pid = 0;
-            if result.is_ok()
+            if interrupted {
+                wake.retry_after = 0;
+            } else if result.is_ok()
                 && run.parent_queue.first().map(|queued| &queued.input_id) == Some(&input.input_id)
             {
                 run.parent_queue.remove(0);
