@@ -503,12 +503,6 @@ fn raise_open_file_limit() {
 }
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(result) =
-        router_acp::resource_guard::internal_entry(&std::env::args().collect::<Vec<_>>())
-    {
-        return result.map_err(Into::into);
-    }
     run()
 }
 
@@ -519,8 +513,6 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            let _resources = router_acp::resource_guard::start(true)?;
             // stdout carries the ACP protocol; all logging goes to stderr.
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -710,8 +702,6 @@ async fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Command::UsageMonitor { config } => {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            let _resources = router_acp::resource_guard::start(false)?;
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -738,8 +728,6 @@ async fn run() -> anyhow::Result<()> {
             mode,
             message,
         } => {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            let _resources = router_acp::resource_guard::start(false)?;
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()

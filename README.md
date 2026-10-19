@@ -103,14 +103,18 @@ updating Kory Code. Keep source builds for development and testing.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
-### Host resource protection
+### Worker command resource protection
 
-On macOS and Linux, `serve`, `prompt` and `usage-monitor` start an independent,
-detached watchdog before launching adapters or hooks. When the direct ACP client
-is Kory/goose, the watched tree includes that client and its other descendants.
-The watcher follows process birth identities and owned process groups across
-reparenting, and cleans up if the router, client or launching terminal process dies.
-Normal router shutdown cleans up router descendants without stopping Kory.
+Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
+watchdog. The router has no resource-guard authority over Kory/goose or the
+supervisor's process tree.
+
+`cargo install --path .` also installs `router-resource-run`. Explicitly wrap a
+worker build/tool with `router-resource-run -- <command> [arguments]` to contain
+that command and its descendants. Its detached watcher follows process birth
+identities and owned groups across reparenting; its root is always the runner
+itself, never its parent or the enclosing supervisor. Chordzy's worker wrapper
+combines this with cross-worker RAM reservations and per-job budgets.
 
 Every 250ms, native OS calls check the tree's footprint, host memory/pressure,
 swap and free space on the working, startup and temporary filesystems. Keep at
@@ -125,11 +129,6 @@ This is sampled protection, not a kernel cgroup or a guarantee against allocatio
 between samples. A process that escapes both ancestry and its group between
 samples cannot be attributed reliably; use a VM/cgroup for kernel containment.
 
-`cargo install --path .` also installs `router-resource-run`. Use
-`router-resource-run -- <command> [arguments]` for standalone tooling/builds that
-do not already run beneath a guarded router. It gives short commands a persistent
-process-group owner and uses the same watchdog. Chordzy's worker wrapper combines
-this with its cross-worker RAM reservation and per-job budgets.
 `--inherit-group -- <command>` preserves a verified enclosing reservation's group
 for nested worker commands; ordinary standalone callers use the default isolated group.
 

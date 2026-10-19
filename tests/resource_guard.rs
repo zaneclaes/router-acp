@@ -4,6 +4,52 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const RUNNER: &str = env!("CARGO_BIN_EXE_router-resource-run");
+const ROUTER: &str = env!("CARGO_BIN_EXE_router-acp");
+
+#[test]
+fn router_commands_do_not_probe_resources_or_start_a_resource_watcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("missing-router-config.yaml");
+    for command in ["serve", "prompt", "usage-monitor"] {
+        let mut cli = Command::new(ROUTER);
+        cli.arg(command).arg("--config").arg(&config);
+        if command == "prompt" {
+            cli.args(["--message", "fixture"]);
+        }
+        // The removed watcher probes temp_dir at startup and fails before config
+        // loading. Router commands must reach their own config error instead,
+        // without requiring the worker-resource opt-out.
+        let result = cli
+            .env_remove("AGENT_GUARD_RESOURCES")
+            .env("TMPDIR", dir.path().join("missing-temp-directory"))
+            .env("TMP", dir.path().join("missing-temp-directory"))
+            .env("TEMP", dir.path().join("missing-temp-directory"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            error.contains("missing-router-config.yaml"),
+            "{command}: {error}"
+        );
+        assert!(!error.contains("AGENT_RESOURCES"), "{command}: {error}");
+    }
+}
+
+#[test]
+fn router_cannot_act_as_a_resource_watcher() {
+    let result = Command::new(ROUTER)
+        .args(["__resource-watch", "0", "0", "0", "0", "0", "0"])
+        .env_remove("AGENT_GUARD_RESOURCES")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("unrecognized subcommand")
+    );
+}
 
 struct Job {
     child: Child,

@@ -1,4 +1,4 @@
-//! Independent host-resource backstop. No provider or workflow decisions live here.
+//! Resource containment for explicitly wrapped worker commands only.
 //! Sampling is native (no ps/sysctl/df subprocesses), and only verified descendants
 //! may be signalled. The detached watcher survives loss of the terminal/router.
 
@@ -167,17 +167,13 @@ impl Drop for Guard {
     }
 }
 
-/// Called before adapters, hooks or build children can be launched.
-pub fn start(include_kory: bool) -> io::Result<Option<Guard>> {
+/// Called only by router-resource-run before launching its explicit command.
+pub fn start() -> io::Result<Option<Guard>> {
     if !enabled() {
         return Ok(None);
     } // No probes, helper, thread or timers when disabled.
     let owner = native::process(std::process::id() as i32)?;
-    let root = if include_kory && native::is_kory(owner.parent) {
-        native::process(owner.parent)?
-    } else {
-        owner.clone()
-    };
+    let root = owner.clone();
     let parent = native::process(root.parent)?;
     let mut command = Command::new(std::env::current_exe()?);
     command.args([
@@ -377,20 +373,6 @@ mod native {
         }
         let info = unsafe { info.assume_init() };
         Ok((info.f_bavail as u64).saturating_mul(info.f_frsize as u64))
-    }
-
-    pub fn is_kory(pid: i32) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            let mut name = [0u8; 64];
-            let n = unsafe { libc::proc_name(pid, name.as_mut_ptr().cast(), name.len() as u32) };
-            n > 0 && matches!(&name[..n as usize], b"kory" | b"goose")
-        }
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                .is_ok_and(|s| matches!(s.trim(), "kory" | "goose"))
-        }
     }
 
     #[cfg(target_os = "macos")]

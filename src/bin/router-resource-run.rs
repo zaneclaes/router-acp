@@ -31,7 +31,7 @@ fn main() -> std::io::Result<()> {
     {
         return Err(std::io::Error::last_os_error());
     }
-    let guard = resource_guard::start(false)?;
+    let guard = resource_guard::start()?;
     let result = command.status()?;
     drop(guard);
     std::process::exit(
