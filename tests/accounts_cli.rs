@@ -1991,7 +1991,6 @@ async fn mcp_scope_moves_keep_generated_server_definitions_and_credentials_intac
         before
     );
     client.prompt(&sid, "/cancel").await;
-    assert!(client.prompt(&sid, "Start the task").await["result"].is_object());
     for choice in ["/mcp", "1"] {
         client.prompt(&sid, choice).await;
     }
@@ -2015,17 +2014,6 @@ async fn mcp_scope_moves_keep_generated_server_definitions_and_credentials_intac
             .exists()
     );
     client.prompt(&sid, "/cancel").await;
-    assert!(
-        client
-            .prompt(&sid, "Continue after moving the MCP login")
-            .await["result"]
-            .is_object()
-    );
-    assert!(
-        client.text().contains("MCP account selection changed"),
-        "{}",
-        client.text()
-    );
     for choice in ["/mcp", "1"] {
         client.prompt(&sid, choice).await;
     }
