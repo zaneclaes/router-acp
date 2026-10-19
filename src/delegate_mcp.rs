@@ -1062,6 +1062,13 @@ pub async fn start_background_delegate(
     } else {
         None
     };
+    let claim = identity
+        .as_ref()
+        .map(|identity| crate::session::PlannerJobClaim {
+            work_id: identity.work_id.clone(),
+            attempt_id: identity.attempt_id.clone(),
+            child_id: args.worker_id.clone().unwrap_or_default(),
+        });
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
     start_background_job(
@@ -1070,6 +1077,8 @@ pub async fn start_background_delegate(
         job_id,
         &summary,
         identity.is_some(),
+        claim,
+        None,
         async move {
             match identity {
                 Some(identity) => {
@@ -1090,17 +1099,36 @@ fn start_background_followup(
 ) -> Result<String, String> {
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let summary = format!("follow-up to {}: {}", args.delegate_id, args.message);
-    let planner = shared
-        .live_delegates
-        .lock()
-        .unwrap()
-        .get(&args.delegate_id)
-        .is_some_and(|d| d.planner.is_some());
+    let (planner, claim) = {
+        let live = shared.live_delegates.lock().unwrap();
+        match live.get(&args.delegate_id) {
+            Some(existing) => (
+                existing.planner.is_some(),
+                existing
+                    .planner
+                    .as_ref()
+                    .map(|identity| crate::session::PlannerJobClaim {
+                        work_id: identity.work_id.clone(),
+                        attempt_id: identity.attempt_id.clone(),
+                        child_id: existing.worker_id.clone(),
+                    }),
+            ),
+            None => (false, None),
+        }
+    };
+    let resume_of = Some(args.delegate_id.clone());
     let task_shared = shared.clone();
     let task_sid = router_sid.to_string();
-    start_background_job(shared, router_sid, job_id, &summary, planner, async move {
-        run_delegate_followup(&task_shared, &task_sid, args).await
-    })
+    start_background_job(
+        shared,
+        router_sid,
+        job_id,
+        &summary,
+        planner,
+        claim,
+        resume_of,
+        async move { run_delegate_followup(&task_shared, &task_sid, args).await },
+    )
 }
 
 /// Register a background job, run `job` on its own tokio task, and return
@@ -1112,6 +1140,8 @@ fn start_background_job(
     job_id: String,
     summary: &str,
     planner: bool,
+    claim: Option<crate::session::PlannerJobClaim>,
+    resume_of: Option<String>,
     job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
 ) -> Result<String, String> {
     if shared.with_session(router_sid, |_| ()).is_none() {
@@ -1130,6 +1160,8 @@ fn start_background_job(
             started: std::time::Instant::now(),
             result: None,
             planner,
+            claim,
+            resume_of,
         },
     );
     let task_shared = shared.clone();
@@ -2874,39 +2906,71 @@ pub fn run_delegate_result(
                 job.result.clone(),
                 job.summary.clone(),
                 job.started.elapsed().as_secs(),
+                job.claim.clone(),
+                job.resume_of.clone(),
             )
         });
-    if let Some((Some(Err(error)), _, _)) = &background {
+    if let Some((Some(Err(error)), _, _, _, _)) = &background {
         return Ok(format!("delegate {id} — FAILED\n{error}"));
     }
-    let live_sub = shared
-        .live_delegates
-        .lock()
-        .unwrap()
-        .get(id)
-        .filter(|d| d.parent_sid == router_sid)
-        .map(|d| d.sub_sid.clone());
+    let resume_of = background.as_ref().and_then(|job| job.4.clone());
+    let live_sub = {
+        let live = shared.live_delegates.lock().unwrap();
+        live.get(id)
+            .filter(|d| d.parent_sid == router_sid)
+            .map(|d| d.sub_sid.clone())
+            .or_else(|| {
+                resume_of.as_ref().and_then(|resume| {
+                    live.get(resume)
+                        .filter(|d| d.parent_sid == router_sid)
+                        .map(|d| d.sub_sid.clone())
+                })
+            })
+    };
     let running = shared
         .background_delegates
         .lock()
         .unwrap()
         .get(id)
         .is_some_and(|j| j.parent_sid == router_sid && j.result.is_none());
-    let state = shared.state.lock().unwrap();
-    let row = state.all().into_iter().find(|(row_id, row)| {
-        row.parent_session_id.as_deref() == Some(router_sid)
-            && (live_sub.as_deref() == Some(row_id.as_str())
-                || row.routing.as_ref().is_some_and(|r| {
-                    r["worker_id"].as_str() == Some(id) || r["background_id"].as_str() == Some(id)
-                }))
-    });
-    let Some((sub_sid, row)) = row else {
-        if let Some((result, summary, seconds)) = background {
+    // Copy the row out and drop the state lock before naming a planner claim.
+    // `pending_without_session` loads the planner run, which locks state again;
+    // `std::sync::Mutex` is not reentrant, so holding it across that load stalls.
+    let located = {
+        let state = shared.state.lock().unwrap();
+        let row = state.all().into_iter().find(|(row_id, row)| {
+            row.parent_session_id.as_deref() == Some(router_sid)
+                && (live_sub.as_deref() == Some(row_id.as_str())
+                    || row.routing.as_ref().is_some_and(|r| {
+                        r["worker_id"].as_str() == Some(id)
+                            || r["background_id"].as_str() == Some(id)
+                    }))
+        });
+        row.map(|(sub_sid, row)| {
+            let latest = state
+                .log_for(&sub_sid, 200)
+                .into_iter()
+                .rev()
+                .find(|e| e.kind == "agent_response")
+                .and_then(|e| {
+                    e.detail
+                        .and_then(|d| d["text"].as_str().map(str::to_string))
+                });
+            (row.agent, row.model, latest)
+        })
+    };
+    let Some((agent, model, latest)) = located else {
+        if let Some((result, summary, seconds, claim, _)) = background {
             return Ok(match result {
                 Some(Ok(output)) => format!("delegate {id} — finished\n{output}"),
                 Some(Err(error)) => format!("delegate {id} — FAILED\n{error}"),
-                None => format!(
-                    "delegate {id} — pending ({seconds}s): {summary}\nNo child session is linked to this job id; verify the owning attempt before reporting worker activity."
+                None => pending_without_session(
+                    shared,
+                    router_sid,
+                    id,
+                    &summary,
+                    seconds,
+                    claim.as_ref(),
                 ),
             });
         }
@@ -2914,15 +2978,6 @@ pub fn run_delegate_result(
             "no delegate `{id}` in this session (ids are b-…, w-… or d-…)"
         ));
     };
-    let latest = state
-        .log_for(&sub_sid, 200)
-        .into_iter()
-        .rev()
-        .find(|e| e.kind == "agent_response")
-        .and_then(|e| {
-            e.detail
-                .and_then(|d| d["text"].as_str().map(str::to_string))
-        });
     let status = if running {
         "still running"
     } else if live_sub.is_some() {
@@ -2931,11 +2986,53 @@ pub fn run_delegate_result(
         "finished"
     };
     Ok(format!(
-        "delegate {id} on {}/{} — {status}\n{}",
-        row.agent,
-        row.model,
+        "delegate {id} on {agent}/{model} — {status}\n{}",
         latest.unwrap_or_else(|| "(no output recorded yet)".to_string())
     ))
+}
+
+/// A pending background job with no child session row. When the job claimed
+/// a planner attempt, name that owner so a caller cannot treat the job id as
+/// a free slot and start a second attempt.
+fn pending_without_session(
+    shared: &Shared,
+    router_sid: &str,
+    id: &str,
+    summary: &str,
+    seconds: u64,
+    claim: Option<&crate::session::PlannerJobClaim>,
+) -> String {
+    let Some(claim) = claim else {
+        return format!(
+            "delegate {id} — pending ({seconds}s): {summary}\nNo child session is linked to this job id; verify the owning attempt before reporting worker activity."
+        );
+    };
+    let stage = crate::planner_workflow::load(shared, router_sid)
+        .ok()
+        .flatten()
+        .and_then(|run| {
+            let work = run.works.get(&claim.work_id)?;
+            let attempt = work.attempt.as_ref()?;
+            let live = attempt.id == claim.attempt_id && !attempt.ended;
+            Some(if live {
+                format!(
+                    "Startup stage: session-unlinked. Owning attempt {} child {} work {} is live; do not start another attempt. A background job id is not startup evidence.",
+                    claim.attempt_id, claim.child_id, claim.work_id
+                )
+            } else {
+                format!(
+                    "Startup stage: attempt-ended. Attempt {} child {} work {} is not the live owner; read its status before any retry. A background job id is not startup evidence.",
+                    claim.attempt_id, claim.child_id, claim.work_id
+                )
+            })
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Startup stage: unknown. Claimed attempt {} child {} work {} is not in the planner run; verify it before any retry. A background job id is not startup evidence.",
+                claim.attempt_id, claim.child_id, claim.work_id
+            )
+        });
+    format!("delegate {id} — pending ({seconds}s): {summary}\n{stage}")
 }
 
 /// Send a follow-up instruction to a delegate sub-session kept alive by an

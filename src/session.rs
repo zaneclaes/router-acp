@@ -177,6 +177,15 @@ impl LiveDelegate {
     }
 }
 
+/// The planner attempt a background job claimed before its child session
+/// row exists. A pending job id is not evidence that startup has no owner.
+#[derive(Clone)]
+pub struct PlannerJobClaim {
+    pub work_id: String,
+    pub attempt_id: String,
+    pub child_id: String,
+}
+
 /// A `delegate_task background: true` job. The subtask runs on its own tokio
 /// task; the parent collects the outcome later via `delegate_await`.
 /// `result` stays `None` while running and is consumed (entry removed) when an
@@ -190,6 +199,12 @@ pub struct BackgroundDelegate {
     /// A planner work delegate. It reports through router wakes, so
     /// `delegate_await` never blocks the parent's turn on it.
     pub planner: bool,
+    /// Set when this job claimed a planner attempt. Empty for an ordinary
+    /// delegate and for a job registered before the claim existed.
+    pub claim: Option<PlannerJobClaim>,
+    /// A follow-up job's original `d-…` delegate. Its session row keeps the
+    /// first job's id, so a result read must follow this link.
+    pub resume_of: Option<String>,
 }
 
 pub struct RouterSession {

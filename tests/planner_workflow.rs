@@ -2577,6 +2577,8 @@ async fn awaiting_background_work_never_waits_on_planner_workers() {
             started: std::time::Instant::now(),
             result,
             planner,
+            claim: None,
+            resume_of: None,
         }
     };
     let await_all = || {
@@ -2719,6 +2721,8 @@ fn background_result_reports_unlinked_job_activity_as_unverified() {
             started: std::time::Instant::now(),
             result: None,
             planner: true,
+            claim: None,
+            resume_of: None,
         },
     );
     let result = router_acp::delegate_mcp::run_delegate_result(
@@ -2735,6 +2739,196 @@ fn background_result_reports_unlinked_job_activity_as_unverified() {
         "{result}"
     );
     assert!(result.contains("verify the owning attempt"), "{result}");
+}
+
+#[tokio::test]
+async fn unlinked_background_job_names_its_live_attempt_and_a_second_claim_is_refused() {
+    let f = fixture(|_| {});
+    admit(&f.shared, work("design-jam"));
+    let (identity, _, child_id, _) = planner_workflow::begin_work(&f.shared, SID, "design-jam")
+        .await
+        .unwrap();
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-queued".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "pending".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+            claim: Some(router_acp::session::PlannerJobClaim {
+                work_id: identity.work_id.clone(),
+                attempt_id: identity.attempt_id.clone(),
+                child_id: child_id.clone(),
+            }),
+            resume_of: None,
+        },
+    );
+    let result = router_acp::delegate_mcp::run_delegate_result(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateResultArgs {
+            delegate_id: "b-queued".into(),
+        },
+    )
+    .unwrap();
+    assert!(result.contains("session-unlinked"), "{result}");
+    assert!(result.contains(&identity.attempt_id), "{result}");
+    assert!(result.contains(&child_id), "{result}");
+    assert!(result.contains("do not start another attempt"), "{result}");
+    assert!(
+        result.contains("A background job id is not startup evidence"),
+        "{result}"
+    );
+    let second = planner_workflow::begin_work(&f.shared, SID, "design-jam")
+        .await
+        .unwrap_err();
+    assert!(second.contains("live owning attempt"), "{second}");
+}
+
+#[tokio::test]
+async fn unlinked_background_job_names_an_ended_attempt_before_any_retry() {
+    let f = fixture(|_| {});
+    admit(&f.shared, work("design-jam"));
+    let (identity, _, child_id, _) = planner_workflow::begin_work(&f.shared, SID, "design-jam")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(&f.shared, SID, &identity, None, "stopped".into(), true)
+        .unwrap();
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-ended".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "pending".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+            claim: Some(router_acp::session::PlannerJobClaim {
+                work_id: identity.work_id.clone(),
+                attempt_id: identity.attempt_id.clone(),
+                child_id: child_id.clone(),
+            }),
+            resume_of: None,
+        },
+    );
+    let result = router_acp::delegate_mcp::run_delegate_result(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateResultArgs {
+            delegate_id: "b-ended".into(),
+        },
+    )
+    .unwrap();
+    assert!(result.contains("attempt-ended"), "{result}");
+    assert!(result.contains(&identity.attempt_id), "{result}");
+    assert!(result.contains("not the live owner"), "{result}");
+    assert!(
+        result.contains("A background job id is not startup evidence"),
+        "{result}"
+    );
+}
+
+#[test]
+fn unlinked_background_job_names_a_claim_missing_from_the_run() {
+    let f = fixture(|_| {});
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-missing".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "pending".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+            claim: Some(router_acp::session::PlannerJobClaim {
+                work_id: "design-jam".into(),
+                attempt_id: "attempt-missing".into(),
+                child_id: "child-missing".into(),
+            }),
+            resume_of: None,
+        },
+    );
+    let result = router_acp::delegate_mcp::run_delegate_result(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateResultArgs {
+            delegate_id: "b-missing".into(),
+        },
+    )
+    .unwrap();
+    assert!(result.contains("Startup stage: unknown"), "{result}");
+    assert!(result.contains("attempt-missing"), "{result}");
+    assert!(result.contains("child-missing"), "{result}");
+    assert!(
+        result.contains("A background job id is not startup evidence"),
+        "{result}"
+    );
+}
+
+#[test]
+fn follow_up_background_job_reports_the_open_child_session() {
+    let f = fixture(|_| {});
+    f.shared.state.lock().unwrap().upsert(
+        "sub-follow".into(),
+        PersistedSession {
+            agent: "planner".into(),
+            model: "sol".into(),
+            downstream_session_id: "down-follow".into(),
+            cwd: f.repo.clone(),
+            kind: "delegate".into(),
+            parent_session_id: Some(SID.into()),
+            routing: Some(json!({
+                "worker_id": "child-live",
+                "background_id": "b-original"
+            })),
+            ..PersistedSession::default()
+        },
+    );
+    f.shared.live_delegates.lock().unwrap().insert(
+        "d-live".into(),
+        router_acp::session::LiveDelegate {
+            resume_args: None,
+            parent_sid: SID.into(),
+            process_key: router_acp::downstream::ProcessKey("key-follow".into()),
+            downstream_sid: "down-follow".into(),
+            candidate: router_acp::candidate::CandidateId::parse("test/model").unwrap(),
+            capture: Arc::default(),
+            sub_sid: "sub-follow".into(),
+            lifecycle: None,
+            worker_id: "child-live".into(),
+            planner: Some(router_acp::planner_workflow::WorkerIdentity {
+                work_id: "design-jam".into(),
+                attempt_id: "attempt-live".into(),
+            }),
+            worker_token: None,
+            turns: 1,
+        },
+    );
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-follow".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "follow-up".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+            claim: Some(router_acp::session::PlannerJobClaim {
+                work_id: "design-jam".into(),
+                attempt_id: "attempt-live".into(),
+                child_id: "child-live".into(),
+            }),
+            resume_of: Some("d-live".into()),
+        },
+    );
+    let result = router_acp::delegate_mcp::run_delegate_result(
+        &f.shared,
+        SID,
+        router_acp::delegate_mcp::DelegateResultArgs {
+            delegate_id: "b-follow".into(),
+        },
+    )
+    .unwrap();
+    assert!(result.contains("planner/sol — still running"), "{result}");
+    assert!(!result.contains("No child session is linked"), "{result}");
 }
 
 // ---------------------------------------------------------------------------
