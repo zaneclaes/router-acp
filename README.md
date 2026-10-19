@@ -254,6 +254,12 @@ symlink aliases share a lock. Native login commands run in disposable local dire
 only credentials and account identity are published back into configuration.
 MCP client registrations and tokens remain portable in `~/.config/router-acp/mcp/`.
 
+Legacy host helper scripts such as `pi-acp` and `repo-host` also belong outside
+configuration. Move an old `~/.config/router-acp/bin/` into
+`~/.local/state/router-acp/bin/` and update its command references and Goose's
+`GOOSE_SEARCH_PATHS`. Archive old YAML backups and abandoned temporary writes
+outside the configuration tree as well; only active settings and logins need syncing.
+
 Restart all older router sessions and usage monitors when upgrading this storage layout.
 Starting `serve`, `prompt` or `usage-monitor` migrates old account caches and repair records,
 MCP pending/health state and unused locks, and reclaims old account-local runtime directories.
