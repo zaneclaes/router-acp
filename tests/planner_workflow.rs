@@ -5647,6 +5647,10 @@ async fn integration_and_blocked_dispositions_pass_the_integrate_check_host() {
     assert_eq!(status("work-1"), WorkStatus::Integrated);
 
     admit(shared, work("work-2"));
+    let assignment = serde_json::to_value(
+        &planner_workflow::load(shared, SID).unwrap().unwrap().works["work-2"],
+    )
+    .unwrap();
     let dispose = || {
         planner_workflow::operate(
             shared,
@@ -5665,6 +5669,7 @@ async fn integration_and_blocked_dispositions_pass_the_integrate_check_host() {
     assert!(error.contains("disposition rejected"), "{error}");
     assert_eq!(asked()["action"], "disposition");
     assert_eq!(asked()["status"], "blocked");
+    assert_eq!(asked()["assignment"], assignment);
     assert_eq!(asked()["reason"], "waits on Docs/BLOCKED.md#gated-key");
     assert_eq!(status("work-2"), WorkStatus::Admitted);
     std::fs::write(&verdict, "ok").unwrap();
@@ -6046,4 +6051,76 @@ async fn a_run_left_draining_by_a_dead_router_resumes_on_the_next_implement() {
         planner_workflow::load(shared, SID).unwrap().unwrap().status,
         RunStatus::Running
     );
+}
+
+#[tokio::test]
+async fn reconciliation_allocates_an_unallocated_identity_with_its_corrected_brief() {
+    let f = fixture(|_| {});
+    let mut original = work("allocation-recovery");
+    original.external_id = Some("Docs/Plans/OLD.md".into());
+    admit(&f.shared, original.clone());
+    let revision = git(&f.repo, &["rev-parse", "HEAD"]);
+    let child = planner_workflow::load(&f.shared, SID)
+        .unwrap()
+        .unwrap()
+        .works["allocation-recovery"]
+        .child_id
+        .clone();
+    let mut corrected = original.clone();
+    corrected.external_id = Some("Docs/Completed/OLD.md".into());
+    corrected.scope =
+        "reconcile preserved completed-guide evidence without changing its disposition".into();
+    let operation = |revision: String, key: &str| Operation::Reconcile {
+        key: key.into(),
+        work: corrected.clone(),
+        source_revision: revision,
+        evidence: vec![
+            "original allocator refused the stale guide; preserved source reviewed".into(),
+        ],
+    };
+    assert!(
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            operation("0".repeat(40), "bad-source")
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works["allocation-recovery"]
+            .workspace
+            .is_none()
+    );
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        operation(revision.clone(), "corrected-allocation"),
+    )
+    .await
+    .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let current = &run.works["allocation-recovery"];
+    assert_eq!(current.child_id, child);
+    assert_eq!(current.spec, corrected);
+    assert_eq!(current.reconciliation.prior_specs, vec![original]);
+    assert_eq!(
+        current.reconciliation.source_revision.as_ref(),
+        Some(&revision)
+    );
+    let allocated = current.workspace.as_ref().unwrap();
+    assert_ne!(allocated.path, f.repo);
+    assert_eq!(git(&allocated.path, &["rev-parse", "HEAD"]), revision);
+    let (_, resumed, resumed_child, prompt) =
+        planner_workflow::begin_work(&f.shared, SID, "allocation-recovery")
+            .await
+            .unwrap();
+    assert_eq!(resumed.path, allocated.path);
+    assert_eq!(resumed_child, child);
+    assert!(prompt.contains(&corrected.scope));
 }

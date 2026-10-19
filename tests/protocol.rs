@@ -3642,6 +3642,78 @@ async fn five_bug_acceptance_scenario() {
 }
 
 #[tokio::test]
+async fn background_planner_result_preserves_job_and_child_identity() {
+    let state = temp_state_file("planner-background-correlation");
+    let log = temp_log("planner-background-correlation");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+            let task = format!(
+                "{}MCP_CALL:router-delegate delegate_task {}",
+                planner_admit_wire_prompt(),
+                serde_json::json!({"work_id": "work-1", "task": "SLEEP:4000", "background": true})
+            );
+            prompt_text(&cx, &sid, &task).await?;
+            wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+            let text = agent_text(&observed, &sid);
+            let job_id = regex::Regex::new(r"background delegate (b-[0-9a-f]+)")
+                .unwrap()
+                .captures(&text)
+                .expect("background dispatch returns its job id")[1]
+                .to_string();
+            let child_id = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .works["work-1"]
+                .child_id
+                .clone();
+            let row = shared
+                .state
+                .lock()
+                .unwrap()
+                .all()
+                .into_iter()
+                .find(|(_, row)| {
+                    row.parent_session_id.as_deref() == Some(sid.as_str())
+                        && row.routing.as_ref().is_some_and(|routing| {
+                            routing["worker_id"].as_str() == Some(child_id.as_str())
+                        })
+                })
+                .expect("the actual started planner child is persisted")
+                .1;
+            let routing = row.routing.unwrap();
+            assert_eq!(routing["background_id"].as_str(), Some(job_id.as_str()));
+            let result = router_acp::delegate_mcp::run_delegate_result(
+                &shared,
+                &sid,
+                router_acp::delegate_mcp::DelegateResultArgs {
+                    delegate_id: job_id,
+                },
+            )
+            .unwrap();
+            assert!(
+                result.contains("on planner/sol — still running"),
+                "{result}"
+            );
+            assert!(!result.contains("No child session is linked"), "{result}");
+            Ok(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn background_delegates_run_in_parallel_and_await_collects() {
     // Two `background: true` delegations return immediately and execute
     // CONCURRENTLY (each sub-agent sleeps ~900ms; a serial run would take

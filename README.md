@@ -216,6 +216,29 @@ A seat configured with no directory of its own still shares its CLI's directory.
 
 See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.
 
+**Moving accounts between machines.** For preset-backed accounts (`claude@…`, `codex@…`, `grok@…`),
+copying `~/.config/router-acp/` to the same location under another user's home preserves the
+logins, account identities, plan labels, priorities, reserves and router settings. Canonical
+credentials (including refresh tokens) are ordinary private files in `accounts/`, not macOS
+Keychain entries. Account paths derive from the destination's home, and preset executables
+resolve through its `PATH`. Install router-acp and the provider adapters on the destination.
+For example, once the destination directory exists:
+
+```sh
+rsync -a --exclude='.router-acp-runtime/' ~/.config/router-acp/ linux:~/.config/router-acp/
+```
+
+Stop source router sessions and its usage monitor while taking the copy so refresh/login writes
+cannot race it. Runtime directories are disposable and are recreated on the destination; do not
+reuse them. `router-acp account-status --config ~/.config/router-acp/router.yaml` checks the copied
+accounts without spawning adapters or refreshing tokens. The transfer test runs with a different
+home and no provider executables or keychain, and compares all four accounts' status and settings.
+This is account portability: CLI-wide skills/plugins/settings in `~/.claude`, `~/.codex` and
+`~/.grok`, explicit external credential directories, and absolute project-hook or custom executable
+paths are separate machine configuration. OAuth expiry/revocation still belongs to the provider;
+two machines independently rotating copies of one refresh token can invalidate the older copy.
+An rsync is a snapshot, not distributed credential-refresh coordination.
+
 A saved account pin also yields when its included plan is exhausted and paid usage is unavailable or denied. The router announces the replacement and applies the session's normal strategy. An unavailable prompt pin cannot block an eligible sibling, even when static fallback is disabled. A configured static strategy retains its own fallback policy.
 
 ### Token limits, outages, and failover

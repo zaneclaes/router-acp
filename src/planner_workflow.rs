@@ -1519,11 +1519,9 @@ async fn operate_once(
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
             }
-            let workspace = existing
-                .workspace
-                .as_ref()
-                .ok_or("reconcile needs the original allocated worktree restored")?;
-            verify_source_revision(&workspace.path, &source_revision).await?;
+            // An allocator refusal can leave an admitted identity without a workspace.
+            // Validate the corrected brief first, then retry its supported allocator;
+            // existing allocations still require their original source to be restored.
             let mut validation = run.clone();
             validation.works.remove(&work.work_id);
             validate_owned_paths(&validation, &work)?;
@@ -1532,6 +1530,15 @@ async fn operate_once(
             {
                 return Err("work cannot depend on itself".into());
             }
+            let workspace = match existing.workspace.clone() {
+                Some(workspace) => workspace,
+                None => {
+                    let mut allocation = existing.clone();
+                    allocation.spec = work.clone();
+                    allocate_workspace(shared, sid, &allocation, &run.policy).await?
+                }
+            };
+            verify_source_revision(&workspace.path, &source_revision).await?;
             let changed = work != existing.spec
                 || existing
                     .artifact
@@ -1545,6 +1552,7 @@ async fn operate_once(
                     .push(current.spec.clone());
             }
             current.spec = work;
+            current.workspace = Some(workspace);
             current.reconciliation.required = false;
             current.reconciliation.source_revision = Some(source_revision);
             current.reconciliation.evidence = evidence;
@@ -1877,7 +1885,9 @@ async fn operate_once(
             if work.status == WorkStatus::Integrated {
                 return Err("integrated work cannot be silently reclassified".into());
             }
-            crate::planner_guard::integrate_check(shared, sid, &value).await?;
+            let mut check = value.clone();
+            check["assignment"] = serde_json::to_value(&*work).map_err(|e| e.to_string())?;
+            crate::planner_guard::integrate_check(shared, sid, &check).await?;
             let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             work.status = status;
             work.reason = Some(reason);

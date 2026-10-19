@@ -225,10 +225,13 @@ pub struct DelegateTaskArgs {
     /// `delegate_id`).
     #[serde(default)]
     pub background: bool,
-    /// Router-assigned worker id: the `b-…` job id of a background delegate.
-    /// Not part of the tool input; foreground delegates get a fresh `w-…` id.
+    /// Router-assigned worker identity; a durable planner claim replaces it with its child id.
     #[serde(skip)]
     pub worker_id: Option<String>,
+    /// Correlation for the original background job, retained separately across a planner claim.
+    /// Never accepted from tool input.
+    #[serde(skip)]
+    pub background_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1051,6 +1054,7 @@ pub async fn start_background_delegate(
 ) -> Result<String, String> {
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     args.worker_id = Some(job_id.clone());
+    args.background_id = Some(job_id.clone());
     let summary = args.task.clone();
     // A refused claim must reach the caller before any "started" acknowledgment.
     let identity = if args.work_id.is_some() {
@@ -2035,7 +2039,7 @@ async fn run_delegate_task_inner(
                             "reason": rc.reason,
                             "parent": router_sid,
                             "worker_id": worker_id,
-                            "background_id": args.worker_id,
+                            "background_id": args.background_id,
                             "continued_from": args.resume.history,
                             "effort": resolution.as_ref().map(|r| json!({"requested":r.requested.as_str(),"resolved":r.resolved.map(EffortLevel::as_str),"provider_value":r.provider_value,"confirmed":r.confirmed})),
                         })),
