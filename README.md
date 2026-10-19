@@ -257,7 +257,15 @@ MCP client registrations and tokens remain portable in `~/.config/router-acp/mcp
 Legacy host helper scripts such as `pi-acp` and `repo-host` also belong outside
 configuration. Move an old `~/.config/router-acp/bin/` into
 `~/.local/state/router-acp/bin/` and update its command references and Goose's
-`GOOSE_SEARCH_PATHS`. Archive old YAML backups and abandoned temporary writes
+`GOOSE_SEARCH_PATHS`. In synchronized router YAML, use
+`command: $HOME/.local/state/router-acp/bin/repo-host` instead of a machine's
+absolute home path. Both `$HOME` and `${HOME}` expand when that machine loads
+the config; configuration saves preserve the variable reference. Install the
+referenced helper on each machine. Expansion uses environment values, never
+shell execution; unknown variables, model placeholders and `$$` stay intact.
+This applies to every file loaded with `--config`, including `router.yaml`
+and `implement-all.yaml`, and to all planner and delegation hook commands.
+Archive old YAML backups and abandoned temporary writes
 outside the configuration tree as well; only active settings and logins need syncing.
 
 Restart all older router sessions and usage monitors when upgrading this storage layout.
@@ -949,7 +957,7 @@ it would not.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `agents[].name` | – | Unique, no `/`. Candidate ids are `name/model-id`. |
-| `agents[].command` | – | `type: stdio` command/args/env for the adapter. `${VAR}` in the whole file interpolates from the environment (unknown names are left intact). |
+| `agents[].command` | – | `type: stdio` command/args/env for the adapter. `$VAR` and `${VAR}` in the whole file interpolate from the launching process's environment (unknown names are left intact). |
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
 | `agents[].models[]` | – | `id` (must match the downstream selector's value for `config-option`; a `[1m]` suffix difference is accepted), optional `display_name`, `api_model` (provider model id for proxy rewrites; defaults to `id`), `versions`, `cost_rank` (1 = cheapest/least scarce), `auto_eligible`, and optional `pricing`. |

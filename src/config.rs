@@ -1881,39 +1881,52 @@ fn default_probe_timeout_ms() -> u64 {
     120_000
 }
 
-/// Interpolate `${VAR}` environment references in a string. Unknown
+/// Interpolate `$VAR` and `${VAR}` environment references in a string. Unknown
 /// variables are left intact so later per-model substitution (e.g.
 /// `${model_id}` in spawn-config process templates) still sees them.
 pub fn interpolate_env(input: &str) -> String {
     interpolate(input, &|name| std::env::var(name).ok())
 }
 
-/// Interpolate `${name}` references using the provided lookup. References
-/// the lookup does not resolve are left as-is.
+/// Interpolate `$name` and `${name}` references using the provided lookup.
+/// Bare names use shell identifier boundaries. Unknown references and `$$`
+/// stay intact; inserted values are never expanded again.
 pub fn interpolate(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(start) = rest.find("${") {
+    while let Some(start) = rest.find('$') {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let name = &after[..end];
-                match lookup(name) {
-                    Some(value) => out.push_str(&value),
-                    None => {
-                        out.push_str("${");
-                        out.push_str(name);
-                        out.push('}');
-                    }
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                out.push_str("${");
-                rest = after;
-            }
+        rest = &rest[start..];
+        if let Some(after) = rest.strip_prefix("$$") {
+            out.push_str("$$");
+            rest = after;
+            continue;
         }
+        let (name, end) = if let Some(after) = rest.strip_prefix("${") {
+            let Some(end) = after.find('}') else {
+                break;
+            };
+            (&after[..end], end + 3)
+        } else {
+            let len = rest.as_bytes()[1..]
+                .iter()
+                .enumerate()
+                .take_while(|(i, b)| {
+                    b.is_ascii_alphabetic() || **b == b'_' || (*i > 0 && b.is_ascii_digit())
+                })
+                .count();
+            if len == 0 {
+                out.push('$');
+                rest = &rest[1..];
+                continue;
+            }
+            (&rest[1..1 + len], 1 + len)
+        };
+        match lookup(name) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
     }
     out.push_str(rest);
     out
@@ -3160,6 +3173,49 @@ agents:
     fn interpolate_leaves_unknown_and_unterminated_intact() {
         let out = interpolate("a${missing}b${unterminated", &|_| None);
         assert_eq!(out, "a${missing}b${unterminated");
+    }
+
+    #[test]
+    fn interpolates_bare_and_braced_variables_without_shell_evaluation() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some("/Users/Zane".into()),
+            "_BIN2" => Some("bin".into()),
+            "LITERAL" => Some("$HOME".into()),
+            _ => None,
+        };
+        assert_eq!(
+            interpolate("$HOME/$_BIN2 ${HOME}/hooks $HOME_suffix $LITERAL", &lookup),
+            "/Users/Zane/bin /Users/Zane/hooks $HOME_suffix $HOME"
+        );
+        let untouched = "$missing ${model_id} $0 $$HOME $(whoami) $ €$HOMELESS ${unfinished";
+        assert_eq!(interpolate(untouched, &lookup), untouched);
+        assert_eq!(interpolate("é$HOME/曲", &lookup), "é/Users/Zane/曲");
+    }
+
+    #[test]
+    fn home_variables_resolve_hook_paths_and_survive_minimization() {
+        let yaml = format!(
+            "state_file: $HOME/.local/state/router-acp/sessions.db\ndelegation:\n  lifecycle_hook:\n    command: $HOME/.local/state/router-acp/bin/repo-host\n    args: ['${{HOME}}/workspace', '${{model_id}}']\n{}",
+            minimal_yaml()
+        );
+        let home = std::env::var("HOME").unwrap();
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        let hook = cfg.delegation.lifecycle_hook.unwrap();
+        assert_eq!(
+            hook.command,
+            format!("{home}/.local/state/router-acp/bin/repo-host")
+        );
+        assert_eq!(
+            hook.args,
+            [format!("{home}/workspace"), "${model_id}".into()]
+        );
+        assert_eq!(
+            cfg.state_file,
+            PathBuf::from(format!("{home}/.local/state/router-acp/sessions.db"))
+        );
+        let minimized = Config::minimize_yaml(&yaml).unwrap();
+        assert!(minimized.contains("$HOME/.local/state/router-acp/bin/repo-host"));
+        assert!(minimized.contains("${HOME}/workspace"));
     }
 
     #[test]
