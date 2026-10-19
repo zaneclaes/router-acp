@@ -4610,9 +4610,7 @@ async fn with_no_fallback_the_prompt_waits_out_the_outage_and_retries() {
 }
 
 #[tokio::test]
-async fn a_soft_cordon_finishes_the_turn_then_switches_with_a_summary() {
-    // A reserve breach is a saving, not a wall: the running turn completes,
-    // and the next turn moves with the outgoing model's own summary.
+async fn reserve_cordon_interrupts_the_active_parent_turn() {
     let state = temp_state_file("soft-cordon");
     let yaml = format!(
         "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\n\
@@ -4655,28 +4653,218 @@ async fn a_soft_cordon_finishes_the_turn_then_switches_with_a_summary() {
         };
         let (response, ()) = tokio::join!(prompt, cordon);
         assert_eq!(response?.stop_reason, StopReason::EndTurn);
-        let first = agent_text(&observed, &sid);
-        assert!(
-            !first.contains("failover"),
-            "a soft cordon never interrupts: {first}"
-        );
-
-        let before = first.len();
-        prompt_text(&cx, &sid, "next").await?;
-        let text = agent_text(&observed, &sid)[before..].to_string();
+        let text = agent_text(&observed, &sid);
         assert!(
             text.contains("router-acp · Reserve reached: switching to sonnet"),
             "labeled reserve switch: {text}"
         );
-        assert!(text.contains("summarized by the previous model"), "{text}");
-        assert!(text.contains("echo:sonnet:"), "{text}");
+        assert_eq!(
+            shared.with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.clone()),
+            Some(CandidateId::new("b", "sonnet"))
+        );
         let notices = notices_for(&observed, &sid);
         let switch = notices
             .iter()
-            .find(|n| n["kind"] == "switch")
+            .find(|n| n["kind"] == "failover")
             .unwrap_or_else(|| panic!("typed switch notice: {notices:?}"));
         assert_eq!(switch["cordon"], "soft");
-        assert_eq!(switch["handoff"], "summary");
+        assert_eq!(switch["handoff"], "lookup");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reserve_cordon_hot_migrates_new_and_kept_open_delegates() {
+    use router_acp::delegate_mcp::{
+        DelegateCloseArgs, DelegateFollowupArgs, DelegateTaskArgs, run_delegate_close,
+        run_delegate_followup, run_delegate_task,
+    };
+    let state = temp_state_file("delegate-hot-reserve");
+    let old_log = temp_log("delegate-hot-old");
+    let peer_log = temp_log("delegate-hot-peer");
+    let yaml = format!(
+        "state_file: {}\ncordon: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\n\
+         delegation: {{enabled: true, max_concurrent: 2}}\nagents:\n{}{}{}",
+        state.display(),
+        agent_yaml("parent", &[("opus", 4)], &[]),
+        agent_yaml(
+            "a",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &old_log.display().to_string())]
+        ),
+        agent_yaml(
+            "b",
+            &[("haiku", 1)],
+            &[("MOCK_LOG", &peer_log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=parent/opus]\nprepare").await?;
+        let args = |task: &str| {
+            serde_json::from_value::<DelegateTaskArgs>(serde_json::json!({
+                "task": task, "keep_open": true, "hints": {"candidate": "a/haiku"}
+            }))
+            .unwrap()
+        };
+        run_delegate_task(&shared, &sid, args("first completed assignment"))
+            .await
+            .unwrap();
+        let kept_id = shared
+            .live_delegates
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let kept_sub = shared.live_delegates.lock().unwrap()[&kept_id]
+            .sub_sid
+            .clone();
+        run_delegate_task(&shared, &sid, args("idle assignment"))
+            .await
+            .unwrap();
+        let idle_id = shared
+            .live_delegates
+            .lock()
+            .unwrap()
+            .keys()
+            .find(|id| **id != kept_id)
+            .unwrap()
+            .clone();
+        let fresh = run_delegate_task(&shared, &sid, args("new assignment\nTOOL:edit\nSLEEP:1500"));
+        let followup = run_delegate_followup(
+            &shared,
+            &sid,
+            DelegateFollowupArgs {
+                delegate_id: kept_id.clone(),
+                message: "followup assignment\nTOOL:edit\nSLEEP:1500".into(),
+                ..Default::default()
+            },
+        );
+        let cordon = async {
+            for _ in 0..300 {
+                if read_log(&old_log)
+                    .iter()
+                    .filter(|e| e["event"] == "prompt")
+                    .count()
+                    == 4
+                {
+                    shared.headroom.lock().unwrap().set_usage_cordons(
+                        [(
+                            CandidateId::new("a", "haiku"),
+                            router_acp::headroom::UsageCordon {
+                                reason: "Weekly usage limit reached (10% capacity reserved)".into(),
+                                resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                                resets_at_rfc3339: "2099-01-01T00:00:00Z".into(),
+                                soft: true,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("both delegate turns must be active before the reserve breach");
+        };
+        let (fresh, followup, ()) = tokio::join!(fresh, followup, cordon);
+        assert!(fresh.unwrap().contains("b/haiku"));
+        assert!(followup.unwrap().contains("b/haiku"));
+        {
+            let live = shared.live_delegates.lock().unwrap();
+            assert_eq!(live.len(), 3);
+            assert!(
+                live.iter()
+                    .filter(|(id, _)| **id != idle_id)
+                    .all(|(_, d)| d.candidate.agent == "b")
+            );
+            assert_ne!(
+                live[&kept_id].sub_sid, kept_sub,
+                "stable public delegate id, fresh downstream"
+            );
+        }
+        let prompts: Vec<_> = read_log(&peer_log)
+            .into_iter()
+            .filter(|e| e["event"] == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        for prompt in &prompts {
+            let text = prompt["text"].as_str().unwrap();
+            assert!(
+                text.contains("Hot failover:") && text.contains("transcript --state"),
+                "{text}"
+            );
+            assert!(text.contains("Do not repeat completed actions"), "{text}");
+        }
+        // An idle delegate migrates before sending its next request, retaining
+        // its public id. No task or summary is sent to the reserved account.
+        run_delegate_followup(
+            &shared,
+            &sid,
+            DelegateFollowupArgs {
+                delegate_id: idle_id.clone(),
+                message: "continue idle assignment".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            shared.live_delegates.lock().unwrap()[&idle_id]
+                .candidate
+                .agent,
+            "b"
+        );
+        assert_eq!(
+            read_log(&old_log)
+                .iter()
+                .filter(|e| e["event"] == "prompt")
+                .count(),
+            4
+        );
+
+        // Cancellation wins over a simultaneous capacity signal.
+        let followup = run_delegate_followup(
+            &shared,
+            &sid,
+            DelegateFollowupArgs {
+                delegate_id: kept_id.clone(),
+                message: "cancel this turn\nSLEEP:1500".into(),
+                ..Default::default()
+            },
+        );
+        let cancel = async {
+            wait_for_mock_prompt(&peer_log, "cancel this turn").await;
+            shared.with_session(&sid, |s| s.cancelled = true);
+            shared.headroom.lock().unwrap().cordon(
+                "b",
+                Some(Duration::from_secs(60)),
+                "capacity reached",
+            );
+        };
+        let (result, ()) = tokio::join!(followup, cancel);
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(
+            read_log(&peer_log)
+                .iter()
+                .filter(|e| e["event"] == "prompt")
+                .count(),
+            4
+        );
+        let ids: Vec<_> = shared
+            .live_delegates
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for delegate_id in ids {
+            run_delegate_close(&shared, &sid, DelegateCloseArgs { delegate_id }).unwrap();
+        }
         Ok(())
     })
     .await;
@@ -12180,6 +12368,129 @@ async fn planner_child_streaming_failure_fences_initial_and_followup_receipts() 
         }
         Ok(())
     }).await;
+}
+
+#[tokio::test]
+async fn reserve_cordon_preserves_planner_child_attempt_and_workspace() {
+    use router_acp::delegate_mcp::{DelegateTaskArgs, run_delegate_task};
+    let state = temp_state_file("planner-child-hot-reserve");
+    let log = temp_log("planner-child-hot-reserve");
+    let peer_log = temp_log("planner-child-hot-peer");
+    let repo = planner_wire_repository();
+    let yaml = planner_wire_yaml(&state, &log).replace(
+        "implementation_candidates: [\"planner/sol\"]",
+        "implementation_candidates: [\"planner/sol\", \"peer/sol\"]",
+    ) + &agent_yaml(
+        "peer",
+        &[("sol", 3)],
+        &[
+            ("MOCK_LOG", peer_log.to_str().unwrap()),
+            ("MOCK_CAPS_IMAGE", "1"),
+        ],
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        prompt_text(&cx, &sid, planner_admit_wire_prompt()).await?;
+        let cordon_seat = |agent: &str| {
+            shared.headroom.lock().unwrap().set_usage_cordons(
+                [(
+                    CandidateId::new(agent, "sol"),
+                    router_acp::headroom::UsageCordon {
+                        reason: "Weekly reserve reached".into(),
+                        resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                        resets_at_rfc3339: "2099-01-01T00:00:00Z".into(),
+                        soft: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+        };
+        // Candidate hints are advisory. Make the first seat deterministic, then
+        // make the spare eligible at the exact observed mid-turn transition.
+        cordon_seat("peer");
+        let args = serde_json::from_value::<DelegateTaskArgs>(serde_json::json!({
+            "work_id": "work-1", "task": "durable-reserve-task\nTOOL:edit\nSLEEP:1500",
+            "hints": {"candidate": "planner/sol"}
+        }))
+        .unwrap();
+        let task = run_delegate_task(&shared, &sid, args);
+        let cordon = async {
+            wait_for_mock_prompt(&log, "durable-reserve-task").await;
+            let before = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .works["work-1"]
+                .clone();
+            cordon_seat("planner");
+            before
+        };
+        let (result, before) = tokio::join!(task, cordon);
+        assert!(result.unwrap().contains("peer/sol"));
+        let after = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap()
+            .works["work-1"]
+            .clone();
+        assert_eq!(after.child_id, before.child_id);
+        assert_eq!(
+            after.attempt.as_ref().unwrap().id,
+            before.attempt.as_ref().unwrap().id
+        );
+        assert_eq!(
+            after.workspace.as_ref().unwrap().path,
+            before.workspace.as_ref().unwrap().path
+        );
+        let live = shared.live_delegates.lock().unwrap();
+        let delegate = &live[after
+            .attempt
+            .as_ref()
+            .unwrap()
+            .delegate_id
+            .as_ref()
+            .unwrap()];
+        assert_eq!(delegate.candidate, CandidateId::new("peer", "sol"));
+        assert_eq!(delegate.worker_id, before.child_id);
+        assert_eq!(
+            delegate.planner.as_ref().unwrap().attempt_id,
+            before.attempt.as_ref().unwrap().id
+        );
+        let child_session = delegate.downstream_sid.clone();
+        drop(live);
+        let prompts: Vec<_> = read_log(&peer_log)
+            .into_iter()
+            // The parent can independently migrate for a queued wake. Separate mock
+            // adapters reuse session IDs, so bind both the session and assignment.
+            .filter(|e| {
+                e["event"] == "prompt"
+                    && e["sessionId"].as_str() == Some(child_session.as_str())
+                    && e["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("durable-reserve-task"))
+            })
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "one hot continuation, without a parent instruction"
+        );
+        assert!(
+            prompts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Hot failover:")
+        );
+        Ok(())
+    })
+    .await;
 }
 
 #[tokio::test]

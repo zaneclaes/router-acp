@@ -1722,6 +1722,81 @@ async fn allocator_rejects_parent_workspace_and_claim_lease_is_unique() {
 }
 
 #[tokio::test]
+async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repository(&tmp);
+    let state_path = tmp.path().join("state.db");
+    let workspace = tmp.path().join("worker");
+    assert!(
+        std::process::Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&repo)
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let receipt = tmp.path().join("workspace.json");
+    let write_receipt = |lease: &str, cache: &str| {
+        std::fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({
+                "path": workspace, "lease": lease,
+                "environment": {"CHORDZY_HOOK_CACHE": cache}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    write_receipt("stable", "/old/cache");
+    let shared = shared_for(&repo, &state_path, |cfg| {
+        cfg.routers.planner.workspace = Some(PlannerWorkspaceConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(),
+                "case \"$(cat)\" in *adopt-native*) echo '{\"adopted\":null}';; *) cat \"$1\";; esac".into(),
+                "allocator".into(), receipt.display().to_string()],
+            timeout_ms: 5_000,
+        });
+    });
+    admit(&shared, work("work-1"));
+    let first = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap();
+    let interrupt = || {
+        let mut run = planner_workflow::load(&shared, SID).unwrap().unwrap();
+        let work = run.works.get_mut("work-1").unwrap();
+        work.attempt.as_mut().unwrap().ended = true;
+        work.status = WorkStatus::Interrupted;
+        planner_workflow::save(&shared, SID, &mut run).unwrap();
+    };
+    interrupt();
+    write_receipt("stable", "/physical/current/cache");
+    let second = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap();
+    assert_eq!(first.1.path, second.1.path);
+    assert_eq!(
+        second.1.environment["CHORDZY_HOOK_CACHE"],
+        "/physical/current/cache"
+    );
+    assert_eq!(first.1.lease, second.1.lease);
+    interrupt();
+    write_receipt("different-lease", "/physical/current/cache");
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("changed the existing source path or lease"),
+        "{error}"
+    );
+    let saved = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    assert_eq!(
+        saved.works["work-1"].workspace.as_ref().unwrap().lease,
+        "stable"
+    );
+}
+
+#[tokio::test]
 async fn allocation_failure_ends_interruption_and_can_retry_in_same_router() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = repository(&tmp);
@@ -2394,6 +2469,7 @@ async fn closing_an_older_attempt_keeps_the_newer_attempts_worker_token() {
         tokens.insert("new-token".into(), binding());
     }
     let older = router_acp::session::LiveDelegate {
+        resume_args: None,
         parent_sid: SID.into(),
         process_key: router_acp::downstream::ProcessKey("key-old".into()),
         downstream_sid: "down-old".into(),
@@ -2458,6 +2534,7 @@ async fn sessions_of_attempts_that_cannot_take_another_turn_are_closed() {
         shared.live_delegates.lock().unwrap().insert(
             format!("d-{id}"),
             router_acp::session::LiveDelegate {
+                resume_args: None,
                 parent_sid: SID.into(),
                 process_key: router_acp::downstream::ProcessKey(format!("key-{id}")),
                 downstream_sid: format!("down-{id}"),
@@ -3420,6 +3497,7 @@ async fn a_refused_follow_up_resumption_falls_back_to_a_fresh_attempt() {
     shared.live_delegates.lock().unwrap().insert(
         "d-1".into(),
         router_acp::session::LiveDelegate {
+            resume_args: None,
             parent_sid: SID.into(),
             process_key: router_acp::downstream::ProcessKey("key-1".into()),
             downstream_sid: "down-1".into(),
@@ -5689,6 +5767,7 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     shared.live_delegates.lock().unwrap().insert(
         "d-2".into(),
         router_acp::session::LiveDelegate {
+            resume_args: None,
             parent_sid: SID.into(),
             process_key: router_acp::downstream::ProcessKey("gone".into()),
             downstream_sid: "down-2".into(),

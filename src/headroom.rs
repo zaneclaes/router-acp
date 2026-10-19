@@ -22,9 +22,9 @@ pub struct UsageCordon {
     /// The provider's reset timestamp, verbatim (RFC 3339), for advertising.
     pub resets_at_rfc3339: String,
     /// A reserve-capacity cordon: the seat crossed its configured reserve but
-    /// still has plan or overage headroom. A soft cordon moves new turns off
-    /// the seat at the next turn boundary, with a handoff summary from the
-    /// outgoing model, and never interrupts a running turn. Every other cordon
+    /// still has plan or overage headroom. Both soft and hard cordons trigger
+    /// hot failover, including active parent and delegate turns; `soft` labels
+    /// the reason, not permission to spend the reserve. Every other cordon
     /// (true exhaustion, a member limit, a provider error) is hard.
     pub soft: bool,
 }

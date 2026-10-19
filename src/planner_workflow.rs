@@ -2353,6 +2353,18 @@ async fn begin_work_once(
     save(shared, sid, &mut run)?;
     let allocation = async {
         let workspace = match snapshot.workspace.clone() {
+            Some(previous) if run.policy.workspace.is_some() => {
+                // A saved workspace owns source and a lease, not an eternal snapshot
+                // of its launch environment. Let the repository refresh tooling on
+                // every attempt, including recovery after a router/host crash.
+                let refreshed = allocate_workspace(shared, sid, &snapshot, &run.policy).await?;
+                if refreshed.path != previous.path || refreshed.lease != previous.lease {
+                    return Err(
+                        "workspace refresh changed the existing source path or lease".into(),
+                    );
+                }
+                refreshed
+            }
             Some(workspace) => workspace,
             None => allocate_workspace(shared, sid, &snapshot, &run.policy).await?,
         };

@@ -103,6 +103,45 @@ updating Kory Code. Keep source builds for development and testing.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
+### Host resource protection
+
+On macOS and Linux, `serve`, `prompt` and `usage-monitor` start an independent,
+detached watchdog before launching adapters or hooks. When the direct ACP client
+is Kory/goose, the watched tree includes that client and its other descendants.
+The watcher follows process birth identities and owned process groups across
+reparenting, and cleans up if the router, client or launching terminal process dies.
+Normal router shutdown cleans up router descendants without stopping Kory.
+
+Every 250ms, native OS calls check the tree's footprint, host memory/pressure,
+swap and free space on the working, startup and temporary filesystems. Keep at
+least 8GiB memory headroom and 10GiB free disk; warning memory pressure, swap above
+8GiB, or tree footprint above physical RAM minus headroom stops the owned tree.
+macOS accounting includes compressed memory; Linux includes resident and swapped
+memory. Unknown telemetry fails closed. Diagnostics contain resource counters,
+never command arguments or credentials. Source/worktrees are never deleted.
+An ancestry chain of 32 processes also stops the tree before a recursive launcher
+can exhaust the host. This backstop covers legacy tools without their own call guard.
+This is sampled protection, not a kernel cgroup or a guarantee against allocations
+between samples. A process that escapes both ancestry and its group between
+samples cannot be attributed reliably; use a VM/cgroup for kernel containment.
+
+`cargo install --path .` also installs `router-resource-run`. Use
+`router-resource-run -- <command> [arguments]` for standalone tooling/builds that
+do not already run beneath a guarded router. It gives short commands a persistent
+process-group owner and uses the same watchdog. Chordzy's worker wrapper combines
+this with its cross-worker RAM reservation and per-job budgets.
+`--inherit-group -- <command>` preserves a verified enclosing reservation's group
+for nested worker commands; ordinary standalone callers use the default isolated group.
+
+Set **`AGENT_GUARD_RESOURCES=false`** in the launching environment when a container
+or VM owns resource containment. This skips watchdog creation, resource probes
+and polling entirely; the standalone runner directly execs the command. Chordzy's
+worker launcher likewise directly execs before looking up git, its guard cache,
+the .NET runtime or this helper. Its RAM admission and RouterHost disk checks are
+disabled too. Other repository checks still apply. Unset or any value other than
+the literal `false` keeps resource protection enabled. Existing processes need a
+new launch to inherit a changed environment or binary.
+
 ## How routing works
 
 1. **`session/new`** creates a router-owned session; no downstream session exists yet. The response includes router-owned config options (`router.strategy`, `router.candidate`) so a client with a model picker gets a useful control.
@@ -190,7 +229,7 @@ The router degrades gracefully when seats run dry or adapters fall over, and it 
 - The shared usage snapshots are safe to consume across credential changes: `account` identifies the seat, while the additive optional `access_generation` identifies the access credential used for that fetch. Missing or legacy generation data, malformed credentials, and cache contention are unknown. A 401 or probe result alone is unknown. Only a definitive current-generation refresh rejection is durable authentication evidence.
 - **Outage failover.** If the pinned model fails mid-session (process death, connection loss, provider overload) or hits a limit, the router fails the session over to the next best candidate: the failure and its reason are announced in the transcript, the strategy re-ranks the remaining pool, a fresh downstream session is opened (mode re-applied), and the prompt is retried there, given the same SQLite history lookup reference a switch falls back to (the failed model is in no state to summarize), so the replacement continues the work. Hot failover also works after partial output: the replacement looks up the partial response and tool statuses with continuation instructions to inspect uncertain effects and avoid repeating completed actions. Availability is watched during the turn, so an account or model cordon interrupts that session and triggers the same handoff. A model the provider reports at capacity is cordoned on its own and the session fails over to the eligible model nearest its quality; a human pick follows that substitute for the rest of the session, and a handoff never accepts the capacity notice as a summary (`failover.on_model_capacity`). Client cancellation never triggers failover. Configure with `failover.enabled` / `failover.max_attempts`.
 - **Outage cordons and waits.** A provider outage (HTTP 5xx, overloaded, transport failure) cordons that exact model on every account of its lineage for `failover.outage_cordon_secs`: the same model on another account is down too, so failover moves to a different model, across families when needed, and a human pick is no exception. A local adapter failure (process exited, connection closed) only respawns that process. When nothing else can serve, the prompt stays open: the router announces the wait, retries the old model when its cordon ends (within `failover.max_wait_secs`), and announces the retry. A completed turn resets the per-prompt `max_attempts` budget, so a long prompt that runs through background waits does not inherit the failures of turns it already recovered from.
-- **Hard and soft cordons.** A usage cordon is **soft** when only the configured `reserve_capacity` put the seat over the line and the plan or paid overage still has headroom; true exhaustion, a member limit, and every error-driven cordon are **hard**. A soft cordon never interrupts a running turn. The next turn moves to another model, and the outgoing model still writes the handoff summary. A hard cordon interrupts the turn and hands off through the SQLite history lookup, because the old model cannot serve.
+- **Hard and soft cordons.** A usage cordon is **soft** when the configured `reserve_capacity` is reached while plan or overage headroom remains; true exhaustion, a member limit, and error-driven cordons are **hard**. Both interrupt active parent and delegate requests as soon as the router observes the threshold, without waiting for a turn boundary. Each request continues on an eligible account with a SQLite history lookup, preserving partial work and checking uncertain tool effects. The reserved account is not asked for a summary. Idle delegates migrate before their next request. Worker identity, assignment, attempt, workspace and public `delegate_id` survive the handoff; cancellation never starts a replacement. Recovery honors `failover.enabled`, `failover.max_attempts`, model constraints and concurrency limits. `soft` describes the reason, not permission to consume the reserve.
 - **Labeled notices.** Every failover, cordon switch, per-request fallback and retry leads its `router-acp ·` block with a labeled headline (`GPT-6.1 Sol outage: switching to Claude Opus 5.5`, `Reserve reached: switching to …`, `GPT-6.1 Sol outage: no other model can serve; retrying GPT-6.1 Sol in 5m (at …)`). The block starts on a fresh paragraph, never glued to the model's sentence. The same chunk carries a typed copy in `_meta.router_acp.notices[]`: `{kind: failover|switch|retry|retry_wait, reason: outage|account_limit|reserve|capacity|context_overflow|auth|rejected, cordon: hard|soft, label, headline, from, to, handoff: summary|lookup|null, retry_at, detail}`. Each delivered block is logged as a `router_notice` row, and `session/load` replays it with its typed copy. A Codex transport error printed as reply text is held out of the prose and carried in the notice detail (`provider: …`) when the turn fails over on it.
 - **Automatic respawn.** A downstream process that died is respawned and re-probed at the next routing decision (subject to `failover.respawn_cooldown_secs`), so a recovered agent rejoins the pool without restarting the router. An explicit switch to a dead model revives it immediately, cooldown or not.
 

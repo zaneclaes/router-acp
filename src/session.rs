@@ -133,6 +133,9 @@ pub struct DelegateHandle {
 /// can send follow-up instructions to the same sub-agent (preserving its
 /// context) rather than re-briefing a fresh session each time.
 pub struct LiveDelegate {
+    /// Original routing/workspace inputs for an account handoff. Synthetic
+    /// lifecycle-only delegates may omit these.
+    pub resume_args: Option<crate::delegate_mcp::DelegateTaskArgs>,
     pub parent_sid: String,
     pub process_key: ProcessKey,
     pub downstream_sid: String,
@@ -154,8 +157,8 @@ pub struct LiveDelegate {
 }
 
 impl LiveDelegate {
-    /// Release per-delegate state and report the stop to the lifecycle hook.
-    pub fn finish(&self, shared: &Arc<Shared>, outcome: &str) {
+    /// Release transport-owned state without ending the logical worker.
+    pub(crate) fn release(&self, shared: &Arc<Shared>) {
         shared.delegate_effort.lock().unwrap().remove(&self.sub_sid);
         shared
             .worker_handoffs
@@ -163,6 +166,11 @@ impl LiveDelegate {
             .unwrap()
             .remove(&self.worker_id);
         crate::delegate_mcp::drop_delegate_token(shared, self.worker_token.as_deref());
+    }
+
+    /// Release per-delegate state and report the stop to the lifecycle hook.
+    pub fn finish(&self, shared: &Arc<Shared>, outcome: &str) {
+        self.release(shared);
         if let Some(event) = &self.lifecycle {
             crate::delegate_hook::deliver(shared, &event.stopped(outcome, None));
         }
@@ -1368,9 +1376,9 @@ impl Shared {
         )
     }
 
-    /// `candidate_view` for a candidate that is already serving: a soft
-    /// (reserve) cordon or a model outage does not stop it finishing work
-    /// it holds — a running turn or a handoff summary.
+    /// `candidate_view` for a candidate already serving: a model outage
+    /// elsewhere does not interrupt its healthy request. Usage/reserve
+    /// cordons still exclude it, including from handoff summaries.
     pub fn candidate_view_serving(
         &self,
         id: &CandidateId,
@@ -1459,14 +1467,9 @@ impl Shared {
             if headroom.cordon_active(&c.id.agent).is_some() {
                 continue;
             }
-            // Candidates proactively cordoned by the provider's usage API (cap
-            // exhausted, no overage headroom) sit out until their reset. A
-            // serving candidate finishes its work through a soft cordon.
+            // A usage/reserve cordon stops spending on this seat immediately.
             let serving_this = serving == Some(&c.id);
-            if headroom
-                .usage_cordon(&c.id)
-                .is_some_and(|cordon| !(serving_this && cordon.soft))
-            {
+            if headroom.usage_cordon(&c.id).is_some() {
                 continue;
             }
             // A provider outage takes the model down on every account.
@@ -5818,10 +5821,9 @@ fn build_question_instructions() -> String {
 /// candidate when the pinned model is rate-limited or down, unless the client
 /// cancelled. Partial work is handed off as a continuation.
 ///
-/// A soft (reserve) cordon never stops a send or a running turn: the pre-turn
-/// cordon escape moves the session at the next turn boundary instead. A model
+/// Every usage cordon stops new sends and running turns, including reserves. A model
 /// outage stops a new send, but not a turn already running (`mid_turn`).
-fn candidate_unavailable_reason(
+pub(crate) fn candidate_unavailable_reason(
     shared: &Arc<Shared>,
     candidate: &CandidateId,
     mid_turn: bool,
@@ -5830,11 +5832,13 @@ fn candidate_unavailable_reason(
     let lineage = shared.runtime_config().lineage_of(&candidate.agent);
     {
         let mut headroom = shared.headroom.lock().unwrap();
-        if let Some(cordon) = headroom.usage_cordon(candidate)
-            && !cordon.soft
-        {
+        if let Some(cordon) = headroom.usage_cordon(candidate) {
             return Some((
-                Reason::AccountLimit,
+                if cordon.soft {
+                    Reason::Reserve
+                } else {
+                    Reason::AccountLimit
+                },
                 format!("{} (resets {})", cordon.reason, cordon.resets_at_rfc3339),
             ));
         }
@@ -8330,7 +8334,7 @@ fn frame_summary(from: &CandidateId, summary: &str) -> String {
 }
 
 /// Provide a SQLite history lookup when the previous model cannot summarize.
-fn frame_lookup(shared: &Arc<Shared>, router_sid: &str) -> String {
+pub(crate) fn frame_lookup(shared: &Arc<Shared>, router_sid: &str) -> String {
     crate::restoration::lookup_context(shared, router_sid)
         .into_iter()
         .filter_map(|block| match block {
@@ -8482,8 +8486,7 @@ async fn switch_pin(
         .with_session(router_sid, |session| session.task_class)
         .flatten()
         .unwrap_or(TaskClass::CodingGeneral);
-    // A soft (reserve) cordon still lets the outgoing model write the summary:
-    // the account has headroom, the router is only saving it.
+    // Usage/reserve cordons also exclude summary requests: use saved history.
     let live_conn = shared
         .candidate_view_serving(&old_candidate, class)
         .and_then(|_| shared.route_for(&old_process_key, &old_down_sid))

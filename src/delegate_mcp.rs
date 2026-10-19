@@ -179,6 +179,9 @@ pub struct McpToolsCallResult {
 /// `delegate_task` tool input.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DelegateTaskArgs {
+    /// Router-owned continuation across account changes; never model input.
+    #[serde(skip)]
+    pub resume: DelegateResume,
     pub task: String,
     /// Optional durable planner assignment. Omitted keeps legacy lightweight
     /// delegation semantics and its shared read-only context.
@@ -226,6 +229,15 @@ pub struct DelegateTaskArgs {
     /// Not part of the tool input; foreground delegates get a fresh `w-…` id.
     #[serde(skip)]
     pub worker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DelegateResume {
+    history: Vec<String>,
+    failed_candidates: Vec<CandidateId>,
+    delegate_id: Option<String>,
+    worker_id: Option<String>,
+    turns: u32,
 }
 
 /// `delegate_await` tool input.
@@ -1523,7 +1535,7 @@ async fn run_planner_attempt(
 async fn run_delegate_task_inner(
     shared: &Arc<Shared>,
     router_sid: &str,
-    args: DelegateTaskArgs,
+    mut args: DelegateTaskArgs,
 ) -> Result<String, String> {
     // Bounded concurrency across all delegated sessions.
     let _permit = shared
@@ -1646,6 +1658,7 @@ async fn run_delegate_task_inner(
     if let Some(min_quality) = args.hints.min_quality {
         pool.retain(|v| v.quality >= min_quality);
     }
+    pool.retain(|v| !args.resume.failed_candidates.contains(&v.id));
     if let Some(hinted) = &hinted {
         // Honor the hint only when it survives the cost scoping.
         if pool.iter().any(|v| &v.id == hinted) {
@@ -1659,10 +1672,7 @@ async fn run_delegate_task_inner(
         ));
     }
     if pool.is_empty() {
-        return Err(
-            "no lower-cost candidate is available for delegation; do the subtask yourself"
-                .to_string(),
-        );
+        return Err("no eligible candidate is available for delegation".to_string());
     }
 
     // Rank with the session's strategy; `static` has no meaning over the
@@ -1718,7 +1728,9 @@ async fn run_delegate_task_inner(
     let worker_id = args
         .worker_id
         .clone()
+        .or_else(|| args.resume.worker_id.clone())
         .unwrap_or_else(|| format!("w-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    args.resume.worker_id = Some(worker_id.clone());
     let lifecycle_hook = shared.cfg.delegation.lifecycle_hook.clone();
 
     let mut last_err = None;
@@ -2024,6 +2036,7 @@ async fn run_delegate_task_inner(
                             "parent": router_sid,
                             "worker_id": worker_id,
                             "background_id": args.worker_id,
+                            "continued_from": args.resume.history,
                             "effort": resolution.as_ref().map(|r| json!({"requested":r.requested.as_str(),"resolved":r.resolved.map(EffortLevel::as_str),"provider_value":r.provider_value,"confirmed":r.confirmed})),
                         })),
                         parent_session_id: Some(router_sid.to_string()),
@@ -2043,6 +2056,7 @@ async fn run_delegate_task_inner(
                             "context_files": args.context_files,
                             "required_capabilities": args.required_capabilities,
                             "work_id": args.work_id,
+                            "continued_from": args.resume.history,
                             "attempt_id": args.planner_identity.as_ref().map(|p| &p.attempt_id),
                             "effort": {"requested": hinted_effort.map(EffortLevel::as_str), "effective": candidate_effort.map(EffortLevel::as_str), "source":"assigned-scope", "reason":"bounded task baseline and candidate ceiling; model hint cannot exceed automatic policy"},
                         })),
@@ -2080,6 +2094,19 @@ async fn run_delegate_task_inner(
                 }
 
                 let mut content: Vec<ContentBlock> = Vec::new();
+                if !args.resume.history.is_empty() {
+                    for prior in &args.resume.history {
+                        content.push(ContentBlock::from(crate::session::frame_lookup(
+                            shared, prior,
+                        )));
+                    }
+                    content.push(ContentBlock::from(
+                        "[Hot failover: continue the interrupted assignment in the same workspace. \
+                         Read the recorded partial response and tool statuses first. Do not repeat completed actions. \
+                         Check actual state before retrying running or uncertain tools. The assignment below \
+                         is task context, not an instruction to restart completed work.]"
+                    ));
+                }
                 if let Some(event) = &lifecycle {
                     // The worker names itself with the id its host registered.
                     content.push(ContentBlock::from(crate::delegate_hook::identity_line(
@@ -2138,6 +2165,8 @@ async fn run_delegate_task_inner(
                     &opened.conn,
                     &sub_sid,
                     prompt,
+                    &candidate,
+                    router_sid,
                     args.planner_identity.as_ref().map(|_| router_sid),
                 )
                 .await;
@@ -2147,7 +2176,7 @@ async fn run_delegate_task_inner(
                 shared.planner_deliveries.lock().unwrap().remove(&sub_sid);
                 // The host may send the worker back to finish before the turn
                 // returns to the parent (`delegate_turn_end`).
-                let mut turns = 1;
+                let mut turns = args.resume.turns + 1;
                 let result = match result {
                     Ok(resp) => {
                         gate_turns(
@@ -2160,6 +2189,7 @@ async fn run_delegate_task_inner(
                                 worker_id: &worker_id,
                                 capture: &capture,
                                 parent_sid: router_sid,
+                                candidate: &candidate,
                                 planner: args.planner_identity.as_ref(),
                             },
                             resp,
@@ -2215,10 +2245,27 @@ async fn run_delegate_task_inner(
                     shared.delegate_effort.lock().unwrap().remove(&sub_sid);
                     shared.worker_handoffs.lock().unwrap().remove(&worker_id);
                     drop_delegate_token(shared, worker_token.as_deref());
-                    if let Some(event) = &lifecycle {
+                    if outcome != "failover"
+                        && let Some(event) = &lifecycle
+                    {
                         crate::delegate_hook::deliver(shared, &event.stopped(outcome, detail));
                     }
                 };
+
+                if let Err(err) = &result
+                    && let Some(mut resumed) =
+                        delegate_failover(shared, router_sid, &candidate, &args, err)
+                {
+                    resumed.resume.history.push(sub_sid.clone());
+                    resumed.resume.turns = turns;
+                    teardown("failover", None);
+                    // Release both concurrency permits before re-ranking; a
+                    // one-slot installation must be able to migrate too.
+                    drop(_llm_turn);
+                    drop(_agent_slot);
+                    drop(_permit);
+                    return Box::pin(run_delegate_task_inner(shared, router_sid, resumed)).await;
+                }
 
                 return match result {
                     Ok(resp) => {
@@ -2253,13 +2300,17 @@ async fn run_delegate_task_inner(
                                     // Keep the sub-session alive for follow-ups.
                                     // The handle stays in `s.delegates` so parent
                                     // cancel still propagates to it.
-                                    let delegate_id = format!(
-                                        "d-{}",
-                                        &uuid::Uuid::new_v4().simple().to_string()[..8]
-                                    );
+                                    let delegate_id =
+                                        args.resume.delegate_id.clone().unwrap_or_else(|| {
+                                            format!(
+                                                "d-{}",
+                                                &uuid::Uuid::new_v4().simple().to_string()[..8]
+                                            )
+                                        });
                                     shared.live_delegates.lock().unwrap().insert(
                                         delegate_id.clone(),
                                         crate::session::LiveDelegate {
+                                            resume_args: Some(args.clone()),
                                             parent_sid: router_sid.to_string(),
                                             process_key: opened.process_key.clone(),
                                             downstream_sid: opened.downstream_sid.clone(),
@@ -2334,6 +2385,7 @@ async fn run_delegate_task_inner(
 
 /// What `gate_turns` needs to continue one delegate session.
 struct TurnGate<'a> {
+    candidate: &'a CandidateId,
     lifecycle: Option<&'a DelegateEvent>,
     conn: &'a agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
     downstream_sid: &'a str,
@@ -2453,6 +2505,8 @@ async fn gate_turns(
             gate.conn,
             gate.sub_sid,
             prompt,
+            gate.candidate,
+            gate.parent_sid,
             gate.planner.map(|_| gate.parent_sid),
         )
         .await?;
@@ -2471,6 +2525,109 @@ const STALL_OPEN_TOOL_SECS: i64 = 3 * 60 * 60;
 /// with the reason, so its planner attempt ends and wakes the parent instead
 /// of reading as running indefinitely.
 async fn prompt_unless_stalled(
+    shared: &Arc<Shared>,
+    conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    sub_sid: &str,
+    prompt: PromptRequest,
+    candidate: &CandidateId,
+    parent_sid: &str,
+    planner_parent: Option<&str>,
+) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
+    let downstream_sid = prompt.session_id.clone();
+    let unavailable = |reason: String| {
+        AcpError::internal_error().data(json!({
+            "router_delegate_unavailable": true, "reason": reason,
+        }))
+    };
+    if shared
+        .with_session(parent_sid, |s| s.cancelled)
+        .unwrap_or(true)
+    {
+        return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+            StopReason::Cancelled,
+        ));
+    }
+    if let Some((_, reason)) =
+        crate::session::candidate_unavailable_reason(shared, candidate, false)
+    {
+        return Err(unavailable(reason));
+    }
+    let reply = prompt_unless_stalled_inner(shared, conn, sub_sid, prompt, planner_parent);
+    tokio::pin!(reply);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            result = &mut reply => return result,
+            _ = tick.tick() => {}
+        }
+        if shared
+            .with_session(parent_sid, |s| s.cancelled)
+            .unwrap_or(true)
+        {
+            let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+            return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ));
+        }
+        if let Some((_, reason)) =
+            crate::session::candidate_unavailable_reason(shared, candidate, true)
+        {
+            let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
+            return Err(unavailable(reason));
+        }
+    }
+}
+
+/// Apply only routing failures, never client cancellation or task errors.
+/// The retry carries the same durable child/attempt and exact workspace.
+fn delegate_failover(
+    shared: &Arc<Shared>,
+    parent_sid: &str,
+    candidate: &CandidateId,
+    args: &DelegateTaskArgs,
+    error: &AcpError,
+) -> Option<DelegateTaskArgs> {
+    if shared
+        .with_session(parent_sid, |s| s.cancelled)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let reason = if error
+        .data
+        .as_ref()
+        .is_some_and(|d| d["router_delegate_unavailable"] == true)
+    {
+        error.data.as_ref()?["reason"].as_str()?.to_string()
+    } else {
+        let class = crate::limits::classify_failure(error);
+        if !(matches!(class, crate::limits::FailureClass::RateLimited { .. })
+            || shared.cfg.failover.on_model_capacity
+                && matches!(class, crate::limits::FailureClass::ModelAtCapacity))
+        {
+            return None;
+        }
+        crate::session::apply_failure(shared, candidate, error, &class)
+    };
+    if !shared.cfg.failover.enabled
+        || args.resume.failed_candidates.len() + 1
+            >= shared.cfg.failover.max_attempts.max(1) as usize
+    {
+        return None;
+    }
+    let mut resumed = args.clone();
+    resumed.resume.failed_candidates.push(candidate.clone());
+    crate::session::notify_user(
+        shared,
+        parent_sid,
+        format!(
+            "router-acp · worker {candidate} unavailable — {reason}; continuing on an eligible account with saved history"
+        ),
+    );
+    Some(resumed)
+}
+
+async fn prompt_unless_stalled_inner(
     shared: &Arc<Shared>,
     conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
     sub_sid: &str,
@@ -2874,7 +3031,17 @@ async fn run_delegate_followup_inner(
         .map_err(|_| "router shutting down".to_string())?;
 
     // Look up the live delegate and verify it belongs to this parent session.
-    let (process_key, downstream_sid, candidate, capture, sub_sid, lifecycle, worker_id, turns) = {
+    let (
+        process_key,
+        downstream_sid,
+        candidate,
+        capture,
+        sub_sid,
+        lifecycle,
+        worker_id,
+        turns,
+        resume_args,
+    ) = {
         let live = shared.live_delegates.lock().unwrap();
         let d = live.get(&args.delegate_id).ok_or_else(|| {
             format!(
@@ -2894,6 +3061,7 @@ async fn run_delegate_followup_inner(
             d.lifecycle.clone(),
             d.worker_id.clone(),
             d.turns,
+            d.resume_args.clone(),
         )
     };
     let _agent_slot = match shared.agent_delegate_slots.get(&candidate.agent) {
@@ -2982,6 +3150,8 @@ async fn run_delegate_followup_inner(
         &conn,
         &sub_sid,
         prompt,
+        &candidate,
+        router_sid,
         args.planner_identity.as_ref().map(|_| router_sid),
     )
     .await;
@@ -3002,6 +3172,7 @@ async fn run_delegate_followup_inner(
                     worker_id: &worker_id,
                     capture: &capture,
                     parent_sid: router_sid,
+                    candidate: &candidate,
                     planner: args.planner_identity.as_ref(),
                 },
                 resp,
@@ -3045,6 +3216,40 @@ async fn run_delegate_followup_inner(
         .lock()
         .unwrap()
         .add_compute_ms(&sub_sid, turn_start.elapsed().as_millis() as u64);
+    if let (Err(err), Some(mut resume_args)) = (&result, resume_args) {
+        resume_args.task = args.message.clone();
+        resume_args.planner_role = args.planner_role;
+        resume_args.planner_input_blocks = args.planner_input_blocks.clone();
+        resume_args.planner_receipt_ids = args.planner_receipt_ids.clone();
+        // Each follow-up owns a new bounded retry budget.
+        resume_args.resume.failed_candidates.clear();
+        if let Some(mut resumed) =
+            delegate_failover(shared, router_sid, &candidate, &resume_args, err)
+        {
+            resumed.resume.history.push(sub_sid.clone());
+            resumed.resume.delegate_id = Some(args.delegate_id.clone());
+            resumed.resume.turns = turns;
+            let removed = shared
+                .live_delegates
+                .lock()
+                .unwrap()
+                .remove(&args.delegate_id);
+            let Some(old) = removed else {
+                return Err("delegate was closed during failover".into());
+            };
+            shared.with_session(router_sid, |s| {
+                s.delegates
+                    .retain(|d| d.downstream_sid != downstream_sid || d.process_key != process_key);
+            });
+            close_downstream_session(shared, &process_key, &downstream_sid);
+            // This is the same running worker, not a completed/stopped work.
+            old.release(shared);
+            drop(_llm_turn);
+            drop(_agent_slot);
+            drop(_permit);
+            return run_delegate_task_inner(shared, router_sid, resumed).await;
+        }
+    }
     match result {
         Ok(resp) => {
             let text = capture.lock().unwrap().clone();

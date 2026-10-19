@@ -38,6 +38,8 @@ pub mod planner_workflow;
 pub mod pre_classifier;
 pub mod presets;
 pub mod relay;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod resource_guard;
 pub mod restoration;
 pub mod session;
 pub mod state;
