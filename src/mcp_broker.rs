@@ -237,9 +237,8 @@ impl Broker {
     }
 
     /// The broker entries for a session in `cwd`: each brokered project server
-    /// the router is signed in to. A server that needs a human sign-in is left
-    /// to the adapters as before (Kory likewise omits a hard disconnect and
-    /// still starts the session).
+    /// the router is signed in to, plus explicit account profiles. Unsigned
+    /// default-profile servers are left to adapters as before.
     pub fn session_servers(&self, cwd: &FsPath, session: Option<&str>) -> Vec<McpServer> {
         let Some(addr) = self.addr.get() else {
             return Vec::new();
@@ -250,14 +249,17 @@ impl Broker {
                 continue;
             };
             let source = self.source_for(&remote);
-            if !source.injectable() {
+            // An explicit identity stays brokered even before login. Letting
+            // the adapter use its own default credentials would cross accounts.
+            if !source.injectable() && remote.account.is_none() {
                 continue;
             }
             let id: String = Sha256::digest(
                 format!(
-                    "{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}",
                     remote.name,
                     remote.url,
+                    remote.store_key(),
                     session.unwrap_or_default()
                 )
                 .as_bytes(),
@@ -1106,6 +1108,52 @@ mod tests {
     use crate::mcp_oauth::tests::{serve, server, signed_in, token_endpoint, tokens};
     use axum::routing::post;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn project_profiles_have_distinct_broker_entries_even_before_login() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for (project, account) in [(first.path(), "first"), (second.path(), "second")] {
+            std::fs::write(
+                project.join(".mcp.json"),
+                serde_json::to_vec(&json!({"mcpServers":{
+                    "datadog":{"type":"http", "url":upstream_url, "oauth":{"account":account}}
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let broker = Broker::new(root.path().into(), None);
+        let listener = broker.bind().await.unwrap();
+        let a = broker.session_servers(first.path(), None);
+        let b = broker.session_servers(second.path(), None);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        let (McpServer::Http(a), McpServer::Http(b)) = (&a[0], &b[0]) else {
+            panic!("expected HTTP brokers")
+        };
+        assert_ne!(a.url, b.url);
+        assert_eq!(broker.sources.lock().unwrap().len(), 2);
+        assert_eq!(broker.entries.lock().unwrap().len(), 2);
+        for (project, account) in [(&first, "first"), (&second, "second")] {
+            let mut remote = server("datadog", &upstream_url);
+            remote.account = Some(account.into());
+            signed_in(
+                root.path(),
+                &remote,
+                "http://127.0.0.1:1/token",
+                &tokens(account, 3_600_000),
+            );
+            call_through(&broker, project, "shared-session", "search").await;
+            assert_eq!(
+                upstream.seen.lock().unwrap().last().unwrap().1.as_deref(),
+                Some(format!("Bearer {account}").as_str())
+            );
+        }
+        listener.abort();
+    }
 
     /// (body, Authorization, Mcp-Session-Id) per request.
     type Seen = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;

@@ -1018,6 +1018,13 @@ pub struct ReserveCapacityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ReserveCapacityOverride {
+    pub weekly: Option<f64>,
+    pub session: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     pub name: String,
     #[serde(default)]
@@ -1027,7 +1034,7 @@ pub struct AccountConfig {
     #[serde(default)]
     pub env: Vec<EnvVarConfig>,
     #[serde(default)]
-    pub reserve_capacity: Option<ReserveCapacityConfig>,
+    pub reserve_capacity: Option<ReserveCapacityOverride>,
     #[serde(default)]
     pub account_plan: Option<String>,
 }
@@ -1700,6 +1707,16 @@ pub struct Config {
     /// for: a host helper that supplies a bearer (`mcp_broker::supply`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_credential_command: Option<McpCredentialCommand>,
+    /// Project-selected MCP identities, keyed by resource URL (or server name).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub mcp_accounts: std::collections::HashMap<String, McpAccountConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAccountConfig {
+    /// None explicitly selects the shared system login.
+    pub account: Option<String>,
 }
 
 /// A helper process that supplies a bearer for one MCP server. It reads
@@ -2062,7 +2079,12 @@ impl Config {
                 seat.lineage = Some(agent.lineage.clone().unwrap_or_else(|| agent.name.clone()));
                 seat.command.env.extend(account.env);
                 if let Some(reserve) = account.reserve_capacity {
-                    seat.reserve_capacity = reserve;
+                    if let Some(weekly) = reserve.weekly {
+                        seat.reserve_capacity.weekly = weekly;
+                    }
+                    if let Some(session) = reserve.session {
+                        seat.reserve_capacity.session = session;
+                    }
                 }
                 if account.account_plan.is_some() {
                     seat.account_plan = account.account_plan;
@@ -2150,10 +2172,17 @@ impl Config {
     }
 
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
-        let yaml = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
+        let yaml = crate::project_config::read(path)
+            .map_err(ConfigError)?
+            .ok_or_else(|| {
+                ConfigError(format!("Configuration does not exist: {}", path.display()))
+            })?;
         let mut cfg = Self::from_yaml(&yaml)?;
-        cfg.source_path = Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        cfg.source_path = Some(if crate::project_config::is_project(path) {
+            std::path::absolute(path).map_err(|e| ConfigError(e.to_string()))?
+        } else {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        });
         Ok(cfg)
     }
 
@@ -2175,7 +2204,10 @@ impl Config {
                         agent.name
                     )));
                 }
-                if reserve > 0.0 && (!self.cordon.enabled || agent.usage_source.is_none()) {
+                if reserve > 0.0
+                    && reserve < 100.0
+                    && (!self.cordon.enabled || agent.usage_source.is_none())
+                {
                     return Err(ConfigError(format!(
                         "agent `{}`: reserve_capacity requires cordon.enabled and a usage_source",
                         agent.name
@@ -3306,7 +3338,7 @@ agents:
         assert_eq!(cfg.agents[0].lineage, cfg.agents[1].lineage);
         assert_eq!(cfg.agents[0].reserve_capacity.session, 20.0);
         assert_eq!(cfg.agents[1].reserve_capacity.weekly, 5.0);
-        assert_eq!(cfg.agents[1].reserve_capacity.session, 0.0);
+        assert_eq!(cfg.agents[1].reserve_capacity.session, 20.0);
         assert_ne!(
             cfg.agents[0].config_dir("CLAUDE_CONFIG_DIR", ".claude"),
             cfg.agents[1].config_dir("CLAUDE_CONFIG_DIR", ".claude")

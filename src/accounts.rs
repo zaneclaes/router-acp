@@ -16,14 +16,15 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::account_scope::{Paths, Scope};
 use crate::candidate::CandidateId;
 use crate::config::{AgentConfig, Config, EnvVarConfig, UsageSourceConfig};
 use crate::session::{CandidateRuntime, CandidateStatus, Shared, TargetRuntime};
 use crate::strategies::CandidateView;
 
 const PROVIDERS: [&str; 4] = ["claude", "codex", "grok", "kimi"];
-/// Reserve percentages offered by `/login` → account → Set reserve capacity.
-const RESERVE_STEPS: [u32; 10] = [0, 5, 10, 15, 20, 25, 30, 40, 50, 75];
+/// Reserve percentages offered by both account reserve menus.
+const RESERVE_STEPS: [u32; 11] = [0, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100];
 
 pub fn advertise(shared: &Arc<Shared>, sid: &str) {
     if let Some(cx) = shared.upstream() {
@@ -232,6 +233,12 @@ pub(crate) fn registered(agent: &AgentConfig) -> bool {
     !agent.account_disabled && provider(agent).is_some()
 }
 
+pub(crate) fn routing_disabled(agent: &AgentConfig) -> bool {
+    agent.account_disabled
+        || agent.reserve_capacity.weekly >= 100.0
+        || agent.reserve_capacity.session >= 100.0
+}
+
 fn accounts(shared: &Arc<Shared>, group: &str) -> Vec<AgentConfig> {
     let mut agents: Vec<_> = shared
         .agent_configs()
@@ -297,9 +304,11 @@ pub enum Menu {
     Providers,
     Provider(String, Vec<String>),
     Account(String),
+    AddScope(String),
+    Scope(String),
     Priority(String),
-    Reserve(String),
-    ReserveWindow(String, ReserveWindow),
+    Reserve(String, Scope),
+    ReserveWindow(String, Scope, ReserveWindow),
     Delete(String),
 }
 
@@ -310,7 +319,7 @@ pub enum ReserveWindow {
 }
 
 impl ReserveWindow {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             ReserveWindow::Weekly => "weekly",
             ReserveWindow::Session => "session",
@@ -320,21 +329,25 @@ impl ReserveWindow {
 
 const RELOGIN: &str = "Re-login";
 const SET_PRIORITY: &str = "Set priority";
-const SET_RESERVE: &str = "Set reserve capacity";
+const SYSTEM_RESERVE: &str = "Reserve Capacity (System)";
+const PROJECT_RESERVE: &str = "Reserve Capacity (Project)";
+const SET_SCOPE: &str = "Change account scope";
 const DELETE: &str = "Delete account";
 const BACK: &str = "Back";
 
-fn account_options(agent: &AgentConfig) -> Vec<String> {
+fn account_options(_agent: &AgentConfig) -> Vec<String> {
     // Re-login and Delete keep their original numbers (1 and 2).
     let mut options = vec![
         RELOGIN.to_string(),
         DELETE.to_string(),
         SET_PRIORITY.to_string(),
     ];
-    // Reserves cordon from usage readings, so they need a usage source.
-    if agent.usage_source.is_some() {
-        options.push(SET_RESERVE.to_string());
-    }
+    // 100% disables even providers that do not report numeric usage.
+    options.extend([
+        SYSTEM_RESERVE.into(),
+        PROJECT_RESERVE.into(),
+        SET_SCOPE.into(),
+    ]);
     options.push(BACK.to_string());
     options
 }
@@ -470,7 +483,7 @@ pub(crate) fn emit(shared: &Arc<Shared>, sid: &str, message: &str) {
     }
 }
 
-fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
+fn menu(shared: &Arc<Shared>, sid: &str, state: &Menu) -> (String, Vec<String>) {
     match state {
         Menu::Providers => (
             "Manage logins".into(),
@@ -483,6 +496,7 @@ fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
                         if count == 1 { "account" } else { "accounts" }
                     )
                 })
+                .chain(std::iter::once("MCP accounts".into()))
                 .collect(),
         ),
         Menu::Provider(p, names) => {
@@ -502,11 +516,35 @@ fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
         }
         Menu::Account(name) => match shared.agent_configs().iter().find(|a| &a.name == name) {
             Some(a) => (
-                crate::account_usage::summarize_account(shared, a),
+                format!(
+                    "{}\nAccount scope: {}",
+                    crate::account_usage::summarize_account(shared, a),
+                    Paths::for_session(shared, sid)
+                        .map(|p| p.scope(name).label())
+                        .unwrap_or("Unavailable")
+                ),
                 account_options(a),
             ),
             None => ("Account was removed".into(), vec![BACK.into()]),
         },
+        Menu::AddScope(provider) => (
+            format!("Where should the new {provider} account be available?"),
+            vec![
+                "System-level account (all projects)".into(),
+                "Project-level account (this project only)".into(),
+                BACK.into(),
+            ],
+        ),
+        Menu::Scope(name) => (
+            format!(
+                "Move {name} to which scope? Project moves remove system membership. Credentials are retained; other running routers pick up the change when restarted."
+            ),
+            vec![
+                "System-level account (all projects)".into(),
+                "Project-level account (this project only)".into(),
+                BACK.into(),
+            ],
+        ),
         Menu::Priority(name) => {
             let group = account_group(shared, name);
             let agents = shared.agent_configs();
@@ -537,14 +575,17 @@ fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
                 options,
             )
         }
-        Menu::Reserve(name) => {
+        Menu::Reserve(name, scope) => {
             let agent = shared.agent_configs().into_iter().find(|a| &a.name == name);
             let label = agent.as_ref().map(account_label).unwrap_or(name.clone());
-            let reserve = agent.map(|a| a.reserve_capacity).unwrap_or_default();
+            let reserve = Paths::for_session(shared, sid)
+                .and_then(|p| p.reserve(name, *scope))
+                .unwrap_or_default();
             (
                 format!(
-                    "Reserve capacity for {label}: the share of each included-plan window kept \
+                    "Reserve Capacity ({}) for {label}: the share of each included-plan window kept \
                      unused. The router moves to another account at {}% weekly or {}% session usage.",
+                    scope.label(),
                     100.0 - reserve.weekly,
                     100.0 - reserve.session
                 ),
@@ -555,25 +596,35 @@ fn menu(shared: &Arc<Shared>, state: &Menu) -> (String, Vec<String>) {
                 ],
             )
         }
-        Menu::ReserveWindow(name, window) => {
+        Menu::ReserveWindow(name, scope, window) => {
             let agent = shared.agent_configs().into_iter().find(|a| &a.name == name);
             let label = agent.as_ref().map(account_label).unwrap_or(name.clone());
-            let current = agent
-                .map(|a| match window {
-                    ReserveWindow::Weekly => a.reserve_capacity.weekly,
-                    ReserveWindow::Session => a.reserve_capacity.session,
+            let current = Paths::for_session(shared, sid)
+                .and_then(|p| p.reserve(name, *scope))
+                .ok()
+                .map(|reserve| match window {
+                    ReserveWindow::Weekly => reserve.weekly,
+                    ReserveWindow::Session => reserve.session,
                 })
                 .unwrap_or_default();
             let mut options: Vec<String> = RESERVE_STEPS
                 .iter()
                 .map(|&p| {
-                    if f64::from(p) == current {
-                        format!("{p}% (current)")
+                    let label = if p == 100 {
+                        "100% (disabled)".into()
                     } else {
                         format!("{p}%")
+                    };
+                    if f64::from(p) == current {
+                        format!("{label} (current)")
+                    } else {
+                        label
                     }
                 })
                 .collect();
+            if *scope == Scope::Project {
+                options.push("Use system reserve".into());
+            }
             options.push(BACK.into());
             (
                 format!(
@@ -738,7 +789,7 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
         state = Menu::Providers;
     }
     loop {
-        let (body, options) = menu(shared, &state);
+        let (body, options) = menu(shared, sid, &state);
         let choice = match typed_choice.take() {
             Some(c) => c,
             None if structured => {
@@ -774,6 +825,10 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
             }
         };
         match state.clone() {
+            Menu::Providers if choice == PROVIDERS.len() + 1 => {
+                shared.account_menus.lock().unwrap().remove(sid);
+                return crate::mcp_menu::handle(shared, sid, "/mcp", structured).await;
+            }
             Menu::Providers if (1..=PROVIDERS.len()).contains(&choice) => {
                 state = provider_menu(shared, PROVIDERS[choice - 1])
             }
@@ -781,15 +836,57 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
                 if choice > 0 && choice <= names.len() {
                     state = Menu::Account(names[choice - 1].clone());
                 } else if choice == names.len() + 1 {
-                    let (agent, source) = new_account(shared, &p)?;
-                    let flow = start_login(shared, sid, agent, Some(source))?;
-                    shared.account_menus.lock().unwrap().remove(sid);
-                    return finish_login(shared, sid, flow, structured).await;
+                    state = Menu::AddScope(p);
                 } else if choice == names.len() + 2 {
                     state = Menu::Providers;
                 } else {
                     emit(shared, sid, "Choose a listed number.");
                 }
+            }
+            Menu::AddScope(p) => {
+                if choice == 1 || choice == 2 {
+                    let scope = if choice == 1 {
+                        Scope::System
+                    } else {
+                        Scope::Project
+                    };
+                    let paths = Paths::for_session(shared, sid)
+                        .map_err(|e| AcpError::invalid_params().data(e))?;
+                    if scope == Scope::Project {
+                        paths
+                            .prepare_project(shared)
+                            .map_err(|e| AcpError::invalid_params().data(e))?;
+                    }
+                    let (agent, source) = new_account(shared, &p)?;
+                    let flow = start_login(
+                        shared,
+                        sid,
+                        agent,
+                        Some((source, paths.path(scope).to_path_buf())),
+                    )?;
+                    shared.account_menus.lock().unwrap().remove(sid);
+                    return finish_login(shared, sid, flow, structured).await;
+                } else {
+                    state = provider_menu(shared, &p);
+                }
+            }
+            Menu::Scope(name) => {
+                if choice == 1 || choice == 2 {
+                    let scope = if choice == 1 {
+                        Scope::System
+                    } else {
+                        Scope::Project
+                    };
+                    match crate::account_scope::move_account(shared, sid, &name, scope).await {
+                        Ok(()) => emit(
+                            shared,
+                            sid,
+                            &format!("Account moved to {} scope. Login retained.", scope.label()),
+                        ),
+                        Err(error) => emit(shared, sid, &format!("Scope change failed: {error}")),
+                    }
+                }
+                state = Menu::Account(name);
             }
             Menu::Account(name) => {
                 let agent = shared
@@ -805,7 +902,9 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
                         return finish_login(shared, sid, flow, structured).await;
                     }
                     Some(o) if o == SET_PRIORITY => state = Menu::Priority(name),
-                    Some(o) if o == SET_RESERVE => state = Menu::Reserve(name),
+                    Some(o) if o == SYSTEM_RESERVE => state = Menu::Reserve(name, Scope::System),
+                    Some(o) if o == PROJECT_RESERVE => state = Menu::Reserve(name, Scope::Project),
+                    Some(o) if o == SET_SCOPE => state = Menu::Scope(name),
                     Some(o) if o == DELETE => state = Menu::Delete(name),
                     Some(_) => state = provider_menu(shared, provider(&agent).unwrap()),
                     None => emit(shared, sid, "Choose a listed number."),
@@ -827,16 +926,25 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
                     emit(shared, sid, "Choose a listed number.");
                 }
             }
-            Menu::Reserve(name) => match choice {
-                1 => state = Menu::ReserveWindow(name, ReserveWindow::Weekly),
-                2 => state = Menu::ReserveWindow(name, ReserveWindow::Session),
+            Menu::Reserve(name, scope) => match choice {
+                1 => state = Menu::ReserveWindow(name, scope, ReserveWindow::Weekly),
+                2 => state = Menu::ReserveWindow(name, scope, ReserveWindow::Session),
                 3 => state = Menu::Account(name),
                 _ => emit(shared, sid, "Choose a listed number."),
             },
-            Menu::ReserveWindow(name, window) => {
+            Menu::ReserveWindow(name, scope, window) => {
                 if choice > 0 && choice <= RESERVE_STEPS.len() {
                     let percent = RESERVE_STEPS[choice - 1];
-                    match set_reserve(shared, &name, window, percent).await {
+                    match crate::account_scope::set_reserve(
+                        shared,
+                        sid,
+                        &name,
+                        scope,
+                        window,
+                        Some(percent),
+                    )
+                    .await
+                    {
                         Ok(()) => emit(
                             shared,
                             sid,
@@ -844,9 +952,21 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
                         ),
                         Err(e) => emit(shared, sid, &format!("router-acp: {e}")),
                     }
-                    state = Menu::Reserve(name);
-                } else if choice == RESERVE_STEPS.len() + 1 {
-                    state = Menu::Reserve(name);
+                    state = Menu::Reserve(name, scope);
+                } else if scope == Scope::Project && choice == RESERVE_STEPS.len() + 1 {
+                    match crate::account_scope::set_reserve(shared, sid, &name, scope, window, None)
+                        .await
+                    {
+                        Ok(()) => emit(
+                            shared,
+                            sid,
+                            "Project override removed; using system reserve.",
+                        ),
+                        Err(error) => emit(shared, sid, &format!("Reserve change failed: {error}")),
+                    }
+                    state = Menu::Reserve(name, scope);
+                } else if choice == options.len() {
+                    state = Menu::Reserve(name, scope);
                 } else {
                     emit(shared, sid, "Choose a listed number.");
                 }
@@ -958,7 +1078,7 @@ fn start_login(
     shared: &Arc<Shared>,
     sid: &str,
     agent: AgentConfig,
-    source: Option<String>,
+    source: Option<(String, PathBuf)>,
 ) -> Result<LoginFlow, AcpError> {
     let adding = source.is_some();
     let p = provider(&agent).ok_or_else(AcpError::invalid_params)?;
@@ -1013,7 +1133,8 @@ fn start_login(
                 "{p} reported a successful sign-in, but did not publish a usable credential. Retry sign-in."
             )),
             Ok(()) if adding => {
-                publish_added(&shared, &agent, source.as_deref().unwrap(), &runner.cancel).await
+                let (source, path) = source.as_ref().unwrap();
+                publish_added_at(&shared, &agent, source, &runner.cancel, Some(path)).await
             }
             other => other,
         };
@@ -1333,16 +1454,19 @@ async fn write_config(
     shared: &Arc<Shared>,
     edit: impl FnOnce(&mut Value) -> Result<(), String>,
 ) -> Result<Config, String> {
+    let path = crate::account_scope::active_path(shared)?;
+    write_config_at(shared, &path, edit).await
+}
+
+async fn write_config_at(
+    shared: &Arc<Shared>,
+    path: &Path,
+    edit: impl FnOnce(&mut Value) -> Result<(), String>,
+) -> Result<Config, String> {
     let _guard = shared.account_write.lock().await;
-    let path = shared
-        .cfg
-        .source_path
-        .as_ref()
-        .ok_or("Account management needs a file-backed router configuration")?;
     let _file_lock = ConfigLock::acquire(path.to_path_buf())?;
     // Edit the uninterpolated document, so env secrets never become file values.
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut document: Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut document = crate::account_scope::document(path)?;
     edit(&mut document)?;
     save_document(path, &document)
 }
@@ -1354,7 +1478,19 @@ pub(crate) fn save_document(path: &Path, document: &Value) -> Result<Config, Str
     let yaml = serde_yaml::to_string(document).map_err(|e| e.to_string())?;
     let mut cfg = Config::from_yaml(&yaml).map_err(|e| e.to_string())?;
     cfg.source_path = Some(path.to_path_buf());
-    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let stored = crate::project_config::for_write(path, document)?;
+    let yaml = serde_yaml::to_string(&stored).map_err(|e| e.to_string())?;
+    save_private(path, yaml.as_bytes())?;
+    Ok(cfg)
+}
+
+pub(crate) fn save_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Resolve existing file symlinks before atomic replacement.
+    let destination = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1365,20 +1501,31 @@ pub(crate) fn save_document(path: &Path, document: &Value) -> Result<Config, Str
     let result = (|| {
         use std::io::Write;
         let mut file = options.open(&tmp)?;
-        file.write_all(yaml.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, &destination)
     })();
     if let Err(e) = result {
         let _ = std::fs::remove_file(tmp);
         return Err(e.to_string());
     }
-    Ok(cfg)
+    Ok(())
 }
 
-pub(crate) struct ConfigLock(std::fs::File);
+pub(crate) struct ConfigLock(Vec<std::fs::File>);
 impl ConfigLock {
     pub(crate) fn acquire(path: PathBuf) -> Result<Self, String> {
+        let mut locks = Vec::new();
+        // Every project writer first locks the shared base, then its overlay.
+        // Computing the overlay against a concurrently changed base could
+        // otherwise persist stale inherited values as project overrides.
+        for path in crate::project_config::lock_paths(&path)? {
+            locks.push(Self::acquire_one(path)?);
+        }
+        Ok(Self(locks))
+    }
+
+    fn acquire_one(path: PathBuf) -> Result<std::fs::File, String> {
         crate::local_state::retire_lock(&path.with_extension("accounts.lock"))?;
         let dir = crate::local_state::directory("config-locks", &path)?;
         crate::local_state::private_dir(&dir)?;
@@ -1397,12 +1544,14 @@ impl ConfigLock {
                 path.display()
             )
         })?;
-        Ok(Self(file))
+        Ok(file)
     }
 }
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        for file in &self.0 {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -1452,7 +1601,8 @@ pub fn adopt_seat_directories(config_path: &Path) -> Result<Vec<String>, String>
             "seat directories: configuration busy; retried at the next start".into(),
         ]);
     };
-    let raw = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
+    let raw = crate::project_config::read(config_path)?.ok_or("Missing router configuration")?;
+    let inherited = crate::project_config::inherited_names(config_path)?;
     let cfg = Config::from_yaml(&raw).map_err(|e| e.to_string())?;
     let mut document: Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
     let mut report = Vec::new();
@@ -1478,6 +1628,9 @@ pub fn adopt_seat_directories(config_path: &Path) -> Result<Vec<String>, String>
         let Some(agent) = cfg.agents.iter().find(|a| a.name == name) else {
             continue;
         };
+        if inherited.contains(&name) {
+            continue;
+        }
         let Some(p) = provider(agent) else { continue };
         let variable = directory_variable(p);
         let configured = |v: &str| agent.env_var(v).is_some_and(|value| !value.is_empty());
@@ -1641,13 +1794,27 @@ fn remove_entry(path: &Path) {
     let _ = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
 }
 
+#[cfg(test)]
 async fn publish_added(
     shared: &Arc<Shared>,
     agent: &AgentConfig,
     source: &str,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
-    let cfg = write_config(shared, |doc| {
+    publish_added_at(shared, agent, source, cancel, None).await
+}
+
+async fn publish_added_at(
+    shared: &Arc<Shared>,
+    agent: &AgentConfig,
+    source: &str,
+    cancel: &CancellationToken,
+    destination: Option<&Path>,
+) -> Result<(), String> {
+    let active = crate::account_scope::active_path(shared)?;
+    let templates = crate::account_scope::document(&active)?;
+    let path = destination.unwrap_or(&active);
+    write_config_at(shared, path, |doc| {
         if cancel.is_cancelled() {
             return Err("Login cancelled. Existing accounts remain registered.".into());
         }
@@ -1655,11 +1822,15 @@ async fn publish_added(
             .get_mut("agents")
             .and_then(Value::as_array_mut)
             .ok_or("Missing agents configuration")?;
-        let template = agents
+        let template = templates["agents"]
+            .as_array()
+            .ok_or("Missing provider templates")?
             .iter()
             .find(|a| a.get("name").and_then(Value::as_str) == Some(source))
             .or_else(|| {
-                agents
+                templates["agents"]
+                    .as_array()
+                    .unwrap()
                     .iter()
                     .find(|a| a.get("name").and_then(Value::as_str) == source.split('@').next())
             })
@@ -1681,6 +1852,9 @@ async fn publish_added(
         added["name"] = Value::String(agent.name.clone());
         added.as_object_mut().unwrap().remove("accounts");
         added.as_object_mut().unwrap().remove("account_disabled");
+        if crate::project_config::is_project(path) {
+            added["account_disabled"] = serde_json::json!(false);
+        }
         added["account_priority"] = serde_json::json!(agent.account_priority);
         added["lineage"] = serde_json::json!(agent.lineage);
         added["reserve_capacity"] = serde_json::json!(agent.reserve_capacity);
@@ -1728,6 +1902,9 @@ async fn publish_added(
                 added = small;
             }
         }
+        if crate::project_config::is_project(path) {
+            added["account_disabled"] = serde_json::json!(false);
+        }
         agents.push(added);
         if let Some(pins) = doc
             .get_mut("pinned_versions")
@@ -1746,6 +1923,7 @@ async fn publish_added(
         Ok(())
     })
     .await?;
+    let cfg = Config::from_file(&active).map_err(|e| e.to_string())?;
     let saved = cfg
         .agents
         .iter()
@@ -1883,39 +2061,6 @@ async fn set_priority(shared: &Arc<Shared>, name: &str, position: usize) -> Resu
     Ok(())
 }
 
-/// Set one reserve window, keeping the account's other window as it is.
-async fn set_reserve(
-    shared: &Arc<Shared>,
-    name: &str,
-    window: ReserveWindow,
-    percent: u32,
-) -> Result<(), String> {
-    let mut reserve = shared
-        .agent_configs()
-        .into_iter()
-        .find(|a| a.name == name)
-        .ok_or("Account no longer exists")?
-        .reserve_capacity;
-    match window {
-        ReserveWindow::Weekly => reserve.weekly = f64::from(percent),
-        ReserveWindow::Session => reserve.session = f64::from(percent),
-    }
-    let value = serde_json::json!(reserve);
-    let cfg = write_config(shared, |doc| {
-        set_account_fields(
-            doc,
-            name,
-            &[("reserve_capacity", value.clone())],
-            &[("reserve_capacity", value)],
-        )
-    })
-    .await?;
-    *shared.account_config.lock().unwrap() = cfg;
-    // Re-read usage now, so the new cordon threshold applies before the next poll.
-    crate::usage::refresh_after_turn(shared, name);
-    Ok(())
-}
-
 async fn delete_account(shared: &Arc<Shared>, name: &str) -> Result<String, AcpError> {
     if shared.account_login.lock().unwrap().contains(name) {
         return Err(AcpError::invalid_params().data("Cancel this account's login first"));
@@ -1988,6 +2133,16 @@ async fn delete_account(shared: &Arc<Shared>, name: &str) -> Result<String, AcpE
         .unwrap()
         .retain(|c| c.id.agent != name);
     shared.llm_proxy.remove_agent(name);
+    if shared
+        .runtime_config()
+        .source_path
+        .as_deref()
+        .is_some_and(crate::project_config::is_project)
+    {
+        return Ok(
+            "Account removed from this project. Its shared login credentials were retained.".into(),
+        );
+    }
     if shared_store {
         return Ok("Account removed. Credentials were retained because another configured account shares that directory.".into());
     }

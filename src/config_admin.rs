@@ -59,11 +59,7 @@ pub fn revision(raw: &[u8]) -> String {
 }
 
 fn read(path: &Path) -> Result<Option<String>, AdminError> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => Ok(Some(raw)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(invalid(e)),
-    }
+    crate::project_config::read(path).map_err(invalid)
 }
 
 fn shown(raw: Option<&str>) -> Result<Value, AdminError> {

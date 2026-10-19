@@ -13,9 +13,9 @@
 //! RFC 8414 / OpenID metadata, dynamic client registration (`client_name`
 //! `router-acp`), and an RFC 8707 resource indicator on every grant.
 //!
-//! State is keyed by the server's normalized URL (its resource indicator), in
+//! State is keyed by the server's normalized URL and optional account profile, in
 //! `~/.config/router-acp/mcp/<host>-<hash>/` (`ROUTER_ACP_MCP_DIR` overrides
-//! the root), so one sign-in serves every project that names that server:
+//! the root), so one sign-in serves every project selecting that server/profile:
 //! directory 0700, every file 0600 and written atomically (temp + rename).
 //! `client.json` names the client that issued the current refresh token and
 //! is written only after a successful exchange; `tokens.json` holds the
@@ -74,6 +74,8 @@ pub struct RemoteServer {
     pub client_id: Option<String>,
     /// `.mcp.json` `oauth.callbackPort`: a fixed loopback redirect port.
     pub callback_port: Option<u16>,
+    /// Optional portable login profile selected by this project's `.mcp.json`.
+    pub account: Option<String>,
 }
 
 impl RemoteServer {
@@ -83,12 +85,12 @@ impl RemoteServer {
             url: url.into(),
             client_id: None,
             callback_port: None,
+            account: None,
         }
     }
 
-    /// The store directory name for this server's URL: `<host>-<hash>` of
-    /// its resource indicator, so query variants (`?toolsets=…`) share one
-    /// sign-in and different servers never collide.
+    /// `<host>-<hash>` of the resource indicator and optional account profile.
+    /// Query variants share a sign-in; different profiles stay independent.
     pub fn store_key(&self) -> String {
         let resource = resource_indicator(&self.url);
         let normalized = resource.trim_end_matches('/');
@@ -105,7 +107,12 @@ impl RemoteServer {
                 }
             })
             .collect::<String>();
-        let digest = Sha256::digest(normalized.as_bytes());
+        let mut identity = normalized.as_bytes().to_vec();
+        if let Some(account) = &self.account {
+            identity.push(0);
+            identity.extend_from_slice(account.as_bytes());
+        }
+        let digest = Sha256::digest(&identity);
         let hash: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
         format!("{host}-{hash}")
     }
@@ -139,6 +146,7 @@ pub struct ProjectServer {
     pub static_auth: bool,
     pub client_id: Option<String>,
     pub callback_port: Option<u16>,
+    pub account: Option<String>,
 }
 
 impl ProjectServer {
@@ -154,6 +162,7 @@ impl ProjectServer {
             url: self.url.clone()?,
             client_id: self.client_id.clone(),
             callback_port: self.callback_port,
+            account: self.account.clone(),
         })
     }
 
@@ -247,6 +256,10 @@ pub fn parse_project_servers(text: &str) -> Vec<ProjectServer> {
                     .and_then(|o| o.get("callbackPort"))
                     .and_then(Value::as_u64)
                     .and_then(|p| u16::try_from(p).ok()),
+                account: oauth
+                    .and_then(|o| o.get("account"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             })
         })
         .collect();
@@ -256,10 +269,136 @@ pub fn parse_project_servers(text: &str) -> Vec<ProjectServer> {
 
 /// The servers a session in `cwd` is configured with (empty without a file).
 pub fn project_servers(cwd: &Path) -> Vec<ProjectServer> {
-    project_file(cwd)
+    let mut servers = project_file(cwd)
         .and_then(|file| std::fs::read_to_string(file).ok())
         .map(|text| parse_project_servers(&text))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let overrides = match project_accounts(cwd) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            tracing::warn!("MCP account configuration unavailable: {error}");
+            return Vec::new();
+        }
+    };
+    for server in &mut servers {
+        if let Some(account) = server
+            .url
+            .as_ref()
+            .and_then(|url| overrides.get(&resource_indicator(url)))
+            .or_else(|| overrides.get(&server.name))
+        {
+            server.account = account.account.clone();
+        }
+    }
+    servers
+}
+
+fn project_accounts(
+    cwd: &Path,
+) -> Result<std::collections::HashMap<String, crate::config::McpAccountConfig>, String> {
+    // MCP belongs to the session's project, including when the process was
+    // launched with an explicit router strategy file for a planner worker.
+    let project = crate::account_scope::project_path(cwd);
+    let path = if project.exists() {
+        project
+    } else {
+        crate::project_config::user_path()?
+    };
+    let Some(raw) = crate::project_config::read(&path)? else {
+        return Ok(Default::default());
+    };
+    let doc: Value = serde_yaml::from_str(&crate::config::interpolate_env(&raw))
+        .map_err(|_| "Invalid MCP account configuration")?;
+    doc.get("mcp_accounts")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map(|v| v.unwrap_or_default())
+        .map_err(|_| "Invalid MCP account selection".into())
+}
+
+/// Change the project selection without modifying a generated `.mcp.json`.
+fn save_account_selection(cwd: &Path, server: &RemoteServer) -> Result<(), String> {
+    let path = crate::account_scope::project_path(cwd);
+    let mut doc: Value =
+        serde_yaml::from_str(&crate::project_config::raw(&path)?.unwrap_or_else(|| "{}".into()))
+            .map_err(|_| "Invalid project configuration")?;
+    if !doc.is_object() {
+        return Err("Project configuration must be a mapping".into());
+    }
+    if !doc["mcp_accounts"].is_object() {
+        doc["mcp_accounts"] = json!({});
+    }
+    doc["mcp_accounts"][resource_indicator(&server.url)] = json!({"account":server.account});
+    crate::accounts::save_private(
+        &path,
+        serde_yaml::to_string(&doc)
+            .map_err(|_| "Could not encode project configuration")?
+            .as_bytes(),
+    )
+}
+
+/// Scope changes move the saved login; no second copy can refresh the same grant.
+/// A populated destination is never silently replaced.
+pub async fn set_account_scope(
+    cwd: &Path,
+    server: &RemoteServer,
+    scope: crate::account_scope::Scope,
+    move_login: bool,
+) -> Result<RemoteServer, String> {
+    let mut target = server.clone();
+    match scope {
+        crate::account_scope::Scope::System => target.account = None,
+        crate::account_scope::Scope::Project if target.account.is_none() => {
+            target.account = Some(format!("project-{}", uuid::Uuid::new_v4().simple()))
+        }
+        _ => {}
+    }
+    if target.account == server.account {
+        return Ok(target);
+    }
+    let path = crate::account_scope::project_path(cwd);
+    let _config_lock = crate::accounts::ConfigLock::acquire(path)?;
+    let source = server.store(&store_root());
+    let destination = target.store(&store_root());
+    let (first, second) = if source.dir() < destination.dir() {
+        (&source, &destination)
+    } else {
+        (&destination, &source)
+    };
+    let _first = first.lock().await?;
+    let _second = second.lock().await?;
+    if [source.flow(), destination.flow()]
+        .into_iter()
+        .flatten()
+        .any(|flow| flow.expires_at > now_ms())
+    {
+        return Err("Finish or cancel the pending MCP sign-in before changing its scope".into());
+    }
+    if move_login && destination.configured() {
+        return Err("The target scope already has a saved login. Choose Use existing system login to select it without replacing either account; the current account was retained.".into());
+    }
+    let moved = move_login && source.configured();
+    if moved {
+        std::fs::rename(source.dir(), destination.dir())
+            .map_err(|_| "Could not move the saved MCP login")?;
+    }
+    if let Err(error) = save_account_selection(cwd, &target) {
+        if moved {
+            std::fs::rename(destination.dir(), source.dir())
+                .map_err(|_| "MCP scope save failed and the saved login could not be restored")?;
+        }
+        return Err(error);
+    }
+    if moved {
+        for store in [&source, &destination] {
+            store.clear_flow();
+            if let Ok(path) = store.file(HEALTH) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    Ok(target)
 }
 
 /// Resolve a CLI target: a raw `--url`, else `name` in the project's file.
@@ -283,9 +422,7 @@ pub fn resolve_target(
             project.display()
         ));
     };
-    let servers = std::fs::read_to_string(&file)
-        .map(|text| parse_project_servers(&text))
-        .unwrap_or_default();
+    let servers = project_servers(project);
     let Some(server) = servers.iter().find(|s| s.name == name) else {
         let known: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
         return Err(format!(
@@ -833,7 +970,7 @@ pub async fn project_status_json(
     let mut servers = Vec::new();
     for server in project_servers(project) {
         let mut row = json!({"name": server.name, "transport": server.transport,
-            "url": server.url, "handling": server.handling()});
+            "url": server.url, "handling": server.handling(), "account": server.account});
         if let Some(remote) = server.remote() {
             let source = TokenSource::new(remote.store(root), reqwest::Client::new())
                 .with_supplier(Supplier::for_server(helper, &remote));
@@ -951,6 +1088,7 @@ pub async fn start_flow(
     store: &Store,
     redirect_uri: &str,
 ) -> Result<(String, PendingFlow), String> {
+    let _lock = store.lock().await?;
     let endpoints = resolve_endpoints(http, server).await?;
     let client_id = match &server.client_id {
         Some(id) => id.clone(),
@@ -984,6 +1122,7 @@ pub async fn start_flow(
         client,
         expires_at: now_ms() + FLOW_TTL_MS,
     };
+    store.write_flow(&flow)?;
     Ok((url.to_string(), flow))
 }
 
@@ -1029,6 +1168,9 @@ pub async fn finish_flow(
         }
     };
     let _lock = store.lock().await?;
+    if store.flow().is_none_or(|saved| saved.state != flow.state) {
+        return Err("This sign-in was cancelled or replaced; start it again".into());
+    }
     // The exchange succeeded under this client: now it may own client.json
     // (the new refresh token is bound to it).
     store.write_client(client)?;
@@ -1094,6 +1236,11 @@ impl Supplier {
         helper: Option<&crate::config::McpCredentialCommand>,
         server: &RemoteServer,
     ) -> Option<Self> {
+        // A project explicitly selected another identity. A user-wide host
+        // helper must never silently supply credentials for the default one.
+        if server.account.is_some() {
+            return None;
+        }
         helper
             .filter(|h| h.covers(&server.name))
             .map(|h| Self::new(h.clone(), server))
@@ -1611,7 +1758,6 @@ pub async fn loopback_redirect(
 pub async fn login_start(server: &RemoteServer, redirect_uri: &str) -> Result<Value, String> {
     let store = server.store(&store_root());
     let (url, flow) = start_flow(&reqwest::Client::new(), server, &store, redirect_uri).await?;
-    store.write_flow(&flow)?;
     Ok(
         json!({"url": url, "expiresAt": chrono::DateTime::from_timestamp_millis(flow.expires_at)
         .map(|t| t.to_rfc3339())}),
@@ -1727,6 +1873,52 @@ pub(crate) mod tests {
             expires_at: Some(now_ms() + expires_in_ms),
             refresh_failed_at: None,
         }
+    }
+
+    #[test]
+    fn project_login_profiles_isolate_credentials_and_never_use_the_default_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let default = server("datadog", "https://mcp.datadoghq.com/v1/mcp");
+        let entries = parse_project_servers(
+            r#"{"mcpServers":{"datadog":{
+            "type":"http","url":"https://mcp.datadoghq.com/v1/mcp?toolsets=core",
+            "oauth":{"account":"chordzy"}}}}"#,
+        );
+        let project = entries[0].remote().unwrap();
+        assert_ne!(project.store_key(), default.store_key());
+        assert_eq!(project.account.as_deref(), Some("chordzy"));
+        let default_store = signed_in(
+            root.path(),
+            &default,
+            "https://example.test/token",
+            &tokens("default", 600_000),
+        );
+        let project_store = project.store(root.path());
+        assert!(project_store.tokens().is_none());
+        let helper = crate::config::McpCredentialCommand {
+            command: "unused".into(),
+            args: vec![],
+            timeout_ms: 100,
+            servers: vec![],
+        };
+        assert!(Supplier::for_server(Some(&helper), &default).is_some());
+        assert!(Supplier::for_server(Some(&helper), &project).is_none());
+        signed_in(
+            root.path(),
+            &project,
+            "https://example.test/token",
+            &tokens("project", 600_000),
+        );
+        assert_eq!(default_store.tokens().unwrap().access_token, "default");
+        assert_eq!(project_store.tokens().unwrap().access_token, "project");
+        let mut same_profile = default.clone();
+        same_profile.account = Some("chordzy".into());
+        assert_eq!(same_profile.store_key(), project.store_key());
+        same_profile.account = Some("another-project".into());
+        assert_ne!(same_profile.store_key(), project.store_key());
+        project_store.remove().unwrap();
+        assert!(project_store.tokens().is_none());
+        assert!(default_store.tokens().is_some());
     }
 
     #[test]
@@ -2228,6 +2420,13 @@ pub(crate) mod tests {
         assert_eq!(store.tokens().unwrap().access_token, "at");
         assert_eq!(store.client().unwrap().name, "svc");
         assert_eq!(status(&store).state, StatusState::SignedIn);
+        assert!(
+            finish_flow(&http, &store, &flow, "late-code", &flow.state)
+                .await
+                .unwrap_err()
+                .contains("cancelled or replaced")
+        );
+        assert_eq!(store.tokens().unwrap().access_token, "at");
     }
 
     #[tokio::test]

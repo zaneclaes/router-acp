@@ -172,6 +172,53 @@ Four routers ("strategies") decide the initial pick. Whichever runs, candidates 
 
 Set the default with the top-level `router:` key, override per-session with the `router.strategy` config option, or steer any client with a prompt directive — see [Prompt routing directives](#prompt-routing-directives).
 
+### Project configuration
+
+`router-acp serve` and goose/Kory discover configuration from the session's
+working directory. Selection order is an explicit `--config` path (or the
+host's `ROUTER_ACP_CONFIG` setting), `ROUTER_ACP_CONFIG` in the environment,
+the nearest `.router-acp/router.yaml`, then `~/.config/router-acp/router.yaml`.
+Project discovery searches parents through the enclosing git root, inclusive.
+`router-acp config-path --cwd <directory>` prints the selected absolute path;
+hosts use this command rather than implementing their own discovery.
+Explicit paths support `$HOME`, `${HOME}` and `~`.
+
+A `.router-acp/router.yaml` overlays the user's default file. Mappings merge
+recursively; `agents` and nested `accounts` merge by `name`, appending new
+names. Other lists replace the inherited list. `null` removes an inherited
+setting, restoring the router's default. For example:
+
+```yaml
+# <project>/.router-acp/router.yaml
+router: auto
+agents:
+  - name: claude@existing-account-id
+    reserve_capacity: {weekly: 40, session: 20}
+  - name: codex@project-account-id
+```
+
+Use the actual IDs from `account-status`; the nested `accounts` form should
+use the same provider/account structure as the user file. An explicit path
+to another filename selects a standalone configuration. Explicitly selecting
+a `.router-acp/router.yaml` still loads it as an overlay.
+
+`config-show` returns the effective, uninterpolated configuration. Its revision
+changes when either layer changes the effective values. Project edits write
+only differences into the project file, preserving inherited user defaults.
+The `/login` menus explicitly select System or Project for account membership
+and reserves. Set `account_disabled: true` on an inherited agent
+(or `disabled: true` on a nested account) to exclude it from this project.
+
+Provider credentials stay in the user's existing account store. **Add Account**
+asks whether the new account belongs to System or Project before sign-in.
+**Change account scope** moves membership: moving to Project removes the
+account from the system account list, while keeping its login and independent
+reserve settings. Removing an account from a project disables its project
+membership and retains shared credentials; other
+projects remain signed in. Re-login repairs the selected shared account for
+every project using its ID. To use a different identity, add a separate account.
+Runtime files and locks stay in machine-local state, never in `.router-acp`.
+
 ### Multiple accounts
 
 Type `/login` in any router session to manage your provider accounts. The router handles this command itself.
@@ -182,13 +229,36 @@ Manage logins
 2. codex (2 accounts)
 3. grok (0 accounts)
 4. kimi (0 accounts)
+5. MCP accounts
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Its `credentialPresent` field distinguishes a saved but unprobed credential from a configured account with no credential. Its `routing` object reports the router's read-only availability outcome: `available`, a machine-readable `reason` (`authentication` or `capacity`), and the capacity reset when known. Each account also carries its `priority`, `reserveCapacity`, `sharedDirectory` (still on the provider CLI's own directory), and `usage`: the normalized meters `/usage` shows, as `{plan, windows, credits, updatedAt, error}`. A window is `{id, label, percent, resetsAt, severity, active, scope, windowMinutes, reserveKind}`, plus `capacityDollars` when the router has measured the seat's window. `active` means the limit is reached. The top-level `revision` identifies the configuration that membership came from. Hosts display this outcome and never infer authentication, capacity, cordons, or route eligibility from provider usage. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its scope and status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order), **Reserve Capacity (System)**, **Reserve Capacity (Project)** and **Change account scope**.
+
+Each reserve menu edits weekly and session percentages independently. Project
+values override only the selected window; **Use system reserve** removes that
+window's project override. Both menus offer **100% (disabled)**: either window
+at 100% prevents routing to the account, including explicit model picks and
+unknown usage. This works without a usage source or proactive cordoning.
+Intermediate percentages require both. A 100% project reserve therefore
+disables an inherited system account only in that project.
+
+Hosts read the same metadata with `router-acp account-status --config <path>`,
+which returns JSON without starting providers. `credentialPresent` distinguishes
+a saved but unprobed login from a configured account with no credential. The
+`routing` object reports `available`, a machine-readable `reason`
+(`authentication`, `capacity` or `disabled`), and the capacity reset when known.
+Each account includes `priority`, `reserveCapacity`, `sharedDirectory` and
+`usage`: `{plan, windows, credits, updatedAt, error}`. Each window reports
+`{id, label, percent, resetsAt, severity, active, scope, windowMinutes,
+reserveKind}`, plus `capacityDollars` when measured. `active` means the limit
+is reached. The top-level `revision` identifies the effective configuration.
+Hosts display these outcomes rather than inferring eligibility from usage.
+New accounts get router-owned canonical credentials and private access-only
+runtime stores. An expired login remains registered for **Re-login**.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
-The provider's ACP adapter must be configured. The router validates and atomically saves membership in the configuration passed to `serve --config`. It makes a new login available in the current router too. Deleting removes membership and the router-owned credential. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
+The provider's ACP adapter must be configured. The router validates and atomically saves membership in the selected configuration. It makes a new login available in the current router too. Deleting from a standalone configuration removes membership and the router-owned credential; deleting from a project overlay retains the shared credential. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
 
 A host that generates this configuration never opens the file. It uses router commands, which print JSON:
 
@@ -656,6 +726,7 @@ How each `.mcp.json` entry is handled:
 | --- | --- |
 | `type: http` (or a bare `url`), no `headers` / `headersHelper`, router signed in | **brokered**: replaced in every session by the router's loopback entry |
 | the same, not signed in | left as it is today (Claude reads it itself; the others never see it) |
+| `oauth.account` selected, not signed in | brokered; authentication required, with no default-account fallback |
 | `headers` or `headersHelper` (static credential) | left as it is today |
 | `type: sse` (legacy HTTP+SSE transport) | left as it is today |
 | stdio (`command`) | left as it is today |
@@ -663,6 +734,49 @@ How each `.mcp.json` entry is handled:
 `${VAR}` and `${VAR:-default}` in a URL are expanded as Claude Code does. An
 entry's `oauth.clientId` (a pre-registered public client) and
 `oauth.callbackPort` (a fixed redirect port) are honored.
+
+To use a different MCP account, open **/login → MCP accounts**, choose a
+server, then **Sign in** or **Sign in again**. Choose System or Project before
+browser sign-in. **Change account scope** moves an existing saved login;
+moving it to Project removes that login from the system scope. A destination
+with an existing login is retained; **Use existing system login** switches the
+project's selection without replacing either saved login.
+Finish or cancel a pending sign-in before moving its account.
+
+The menu saves a stable profile selection under `mcp_accounts` in
+`.router-acp/router.yaml`, leaving generated `.mcp.json` files untouched:
+
+```yaml
+mcp_accounts:
+  https://mcp.datadoghq.com/v1/mcp:
+    account: chordzy
+```
+
+Keys may also be server names; URL selections take precedence. `{account: null}`
+selects the system login. Selections inherit from the user router file and
+override `oauth.account` in `.mcp.json`. For manually managed MCP definitions,
+`oauth.account` is also supported:
+
+```json
+{
+  "mcpServers": {
+    "datadog": {
+      "type": "http",
+      "url": "https://mcp.datadoghq.com/v1/mcp",
+      "oauth": { "account": "chordzy" }
+    }
+  }
+}
+```
+
+Run `router-acp mcp-login datadog` from that project, or use its `/login`
+menu, to sign into that profile. The name is portable: two projects selecting
+`chordzy` share that login; a different name gets independent credentials.
+Omitting `oauth.account` keeps the existing user-wide login. Login, refresh,
+status, tool calls and logout all use the selected profile. Named profiles
+never fall back to the default account or the host's credential helper; before
+login they stay brokered and report authentication required. Tokens remain in
+the user's synced credential store, not in the project repository.
 
 **Sign-in** (`mcp-login <name>`, `--project <dir>` for another project,
 `--url <url>` for a server no project names yet) is OAuth 2.1 authorization
@@ -676,15 +790,16 @@ grant to the server with an RFC 8707 `resource` (the URL without its query).
 `--no-browser` only prints the sign-in URL. `mcp-logout <name>` forgets the
 sign-in locally.
 
-**Storage.** Sign-ins are keyed by the server's URL (scheme, host and path;
-the query is ignored, so `?toolsets=…` variants share one sign-in), in
+**Storage.** Sign-ins are keyed by the server's URL and optional `oauth.account`
+profile (scheme, host and path; the query is ignored, so `?toolsets=…` variants
+of the same profile share one sign-in), in
 `~/.config/router-acp/mcp/<host>-<hash>/` (`ROUTER_ACP_MCP_DIR` moves the
 root). The directory is 0700, every file 0600 and written atomically.
 `client.json` names the client that issued the current refresh token and is
 written only after a successful exchange; `tokens.json` holds the tokens;
 `configured` marks that a sign-in once succeeded, so a lost token file reads
 "reconnect needed" rather than "not signed in". One sign-in serves every
-project that names the same server. Only the router reads or refreshes these
+project that names the same server and profile. Only the router reads or refreshes these
 files, and it never touches Claude's own MCP sign-ins in the macOS Keychain.
 
 **The broker.** `serve` binds a loopback listener on `127.0.0.1` (random

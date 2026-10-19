@@ -1437,7 +1437,7 @@ impl Shared {
                 || cfg
                     .agents
                     .iter()
-                    .any(|a| a.name == c.id.agent && a.account_disabled)
+                    .any(|a| a.name == c.id.agent && crate::accounts::routing_disabled(a))
             {
                 continue;
             }
@@ -5829,6 +5829,16 @@ pub(crate) fn candidate_unavailable_reason(
     mid_turn: bool,
 ) -> Option<(crate::notice::Reason, String)> {
     use crate::notice::Reason;
+    if shared
+        .agent_configs()
+        .iter()
+        .any(|agent| agent.name == candidate.agent && crate::accounts::routing_disabled(agent))
+    {
+        return Some((
+            Reason::Reserve,
+            "account is disabled by configuration or 100% reserve".into(),
+        ));
+    }
     let lineage = shared.runtime_config().lineage_of(&candidate.agent);
     {
         let mut headroom = shared.headroom.lock().unwrap();

@@ -1459,8 +1459,9 @@ async fn router_login_text_menu_and_usage_never_prompt_a_model() {
         assert!(text.contains("Add Account"));
         assert!(text.contains("Re-login"));
         assert!(text.contains("Set priority"));
-        // No usage source on this agent, so no reserve to set.
-        assert!(!text.contains("Set reserve capacity"));
+        // Even without usage telemetry, 100% reserves can disable the account.
+        assert!(text.contains("Reserve Capacity (System)"));
+        assert!(text.contains("Reserve Capacity (Project)"));
         assert!(text.contains("Delete account"));
         assert!(text.contains("auth: unknown"));
         assert!(!text.contains("auth: rejected"));
@@ -8583,6 +8584,57 @@ fn plan_availability(free: f64, paid: bool) -> router_acp::headroom::SeatAvailab
         overage_headroom: paid.then_some(1.0),
         overage_remaining_dollars: paid.then_some(100.0),
         source: "poll",
+    }
+}
+
+#[tokio::test]
+async fn full_reserve_disables_unknown_usage_even_for_an_explicit_pick() {
+    for window in ["weekly", "session"] {
+        let yaml = ordered_accounts_yaml("account-disabled-reserve", false).replacen(
+            "    account_priority: 0",
+            &format!("    account_priority: 0\n    reserve_capacity: {{{window}: 100}}"),
+            1,
+        );
+        run_test_shared(yaml, async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "Complete the task").await?;
+            assert_eq!(
+                shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                    .unwrap(),
+                "claude@second"
+            );
+            shared.account_config.lock().unwrap().agents[1]
+                .reserve_capacity
+                .weekly = 100.0;
+            prompt_text(&cx, &sid, "Continue the task").await?;
+            assert_eq!(
+                shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
+                    .unwrap(),
+                "claude@third"
+            );
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            shared.with_session(&sid, |s| {
+                s.candidate_override = Some(CandidateId::new("claude@first", "sonnet"));
+                s.candidate_override_source =
+                    Some(router_acp::strategies::OverrideSource::UserPick);
+            });
+            // An explicit pick may be refused or routed to an eligible fallback;
+            // it must never open the disabled account.
+            let _ = prompt_text(&cx, &sid, "Complete the task").await;
+            assert!(
+                !shared
+                    .with_session(&sid, |s| s
+                        .pin
+                        .as_ref()
+                        .is_some_and(|p| p.candidate.agent == "claude@first"))
+                    .unwrap()
+            );
+            Ok(())
+        })
+        .await;
     }
 }
 

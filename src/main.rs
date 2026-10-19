@@ -19,11 +19,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Resolve explicit config, ROUTER_ACP_CONFIG, nearest project overlay,
+    /// or the user's default file. Prints the selected absolute path.
+    ConfigPath {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Serve the router as an ACP agent on stdio.
     Serve {
         /// Path to the YAML configuration file.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
     /// Keep router-owned account usage snapshots current for hosts that also
     /// run provider adapters directly, without an active router conversation.
@@ -513,6 +521,9 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => {
+            let config =
+                router_acp::project_config::select(config.as_deref(), &std::env::current_dir()?)
+                    .map_err(anyhow::Error::msg)?;
             // stdout carries the ACP protocol; all logging goes to stderr.
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -553,6 +564,16 @@ async fn run() -> anyhow::Result<()> {
                 }
                 Err(e) => Err(anyhow::anyhow!("router exited with error: {e}")),
             }
+        }
+        Command::ConfigPath { config, cwd } => {
+            let cwd = match cwd {
+                Some(cwd) => std::path::absolute(cwd)?,
+                None => std::env::current_dir()?,
+            };
+            let path = router_acp::project_config::select(config.as_deref(), &cwd)
+                .map_err(anyhow::Error::msg)?;
+            println!("{}", path.display());
+            Ok(())
         }
         Command::AccountStatus { config } => {
             let config = Config::from_file(&config)?;
@@ -1202,7 +1223,8 @@ async fn run() -> anyhow::Result<()> {
 /// wake it again through `router-acp prompt --config <this config>`.
 fn export_router_env(config: &std::path::Path) {
     let mut env = Vec::new();
-    if let Ok(path) = std::fs::canonicalize(config) {
+    // Preserve the project marker when the selected file is a symlink.
+    if let Ok(path) = std::path::absolute(config) {
         env.push(("ROUTER_ACP_CONFIG".to_string(), path.display().to_string()));
     }
     if let Ok(exe) = std::env::current_exe() {
