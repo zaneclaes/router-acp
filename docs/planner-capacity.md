@@ -73,6 +73,17 @@ and expire on their own.
 
 ## Capacity wakes
 
+Parent wake delivery gives staging/production build, failed-job and smoke observations
+and release checkpoints priority over ordinary WIP build observations, reviews and refill.
+An unfinished release (including a failed deploy, corrective selection and owed disposition)
+selects `integrate-plan` for ordinary implementation wakes. Superseded, abandoned and disposed
+rounds do not. Explicit operator commands retain their normal selection/planning role.
+The integration role advances the release first or reconciles its concrete prerequisite,
+then handles independent work while that prerequisite is pending. This changes only parent
+role selection and wake ordering: child execution, admission, holds and release gates remain
+unchanged. A repository's unrelated primary-checkout edits must not be mistaken for a defect
+in its qualified isolated release candidate; the repository host validates that boundary.
+
 An unfilled slot with an unheld candidate gets a `capacity:` wake after
 `wake_after_secs`, and another every
 `wake_after_secs` while that holds, with no limit on deliveries. The wake

@@ -548,21 +548,58 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     });
 }
 
+fn environment_wake(id: &str) -> bool {
+    matches!(
+        id,
+        "observation:ci:staging"
+            | "observation:ci:production"
+            | "observation:ci-job-failures:staging"
+            | "observation:ci-job-failures:production"
+            | "observation:smoke:staging"
+            | "observation:smoke:production"
+    )
+}
+
 fn wake_priority(id: &str) -> u8 {
     if id.starts_with("input:") {
         0
-    } else if id.starts_with("release:") || id.starts_with("observation:") {
+    } else if id.starts_with("release:") || environment_wake(id) {
         1
-    } else if id.starts_with("recovery:") {
+    } else if id.starts_with("observation:") {
         2
+    } else if id.starts_with("recovery:") {
+        3
     } else if id.starts_with("capacity:")
         || id.starts_with("inflight:")
         || id.starts_with("gate:")
         || id.starts_with("audit:")
     {
-        4
+        5
     } else {
-        3
+        4
+    }
+}
+
+fn wake_role<'a>(
+    phase: crate::config::PlannerPhase,
+    explicit_command: bool,
+    mut releases: impl Iterator<Item = &'a crate::planner_release::Release>,
+    environment_changed: bool,
+) -> PlannerRole {
+    if explicit_command {
+        match phase {
+            crate::config::PlannerPhase::Planning => PlannerRole::CreatePlan,
+            crate::config::PlannerPhase::Implementation => PlannerRole::SelectPlan,
+        }
+    } else if phase == crate::config::PlannerPhase::Implementation
+        && (environment_changed || releases.any(crate::planner_release::Release::active))
+    {
+        // A failed deploy and its corrective candidate stay the parent's integration job.
+        // This selects a role only; independent child execution, ownership and admission
+        // remain unchanged. The role handles genuine release waits before routine review.
+        PlannerRole::IntegratePlan
+    } else {
+        PlannerRole::ReviewWork
     }
 }
 
@@ -623,16 +660,19 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         .iter()
         .filter_map(|id| id.strip_prefix("input:").map(str::to_string))
         .collect::<Vec<_>>();
-    let role = if input_ids.iter().any(|id| run.commands.contains(id)) {
-        match run.phase {
-            crate::config::PlannerPhase::Planning => PlannerRole::CreatePlan,
-            crate::config::PlannerPhase::Implementation => PlannerRole::SelectPlan,
-        }
+    let role = wake_role(
+        run.phase,
+        input_ids.iter().any(|id| run.commands.contains(id)),
+        run.releases.values(),
+        ids.iter().any(|id| environment_wake(id)),
+    );
+    let task = if role == PlannerRole::IntegratePlan {
+        "First advance the open release or reconcile its concrete repair/build prerequisite. Failed staging/production recovery takes priority over routine review and bulk refill; independent WIP workers continue. Then reconcile the supplied work identities as that prerequisite permits, acknowledging wakes only after their own reconciliation. Preserve human authorization and all release gates."
     } else {
-        PlannerRole::ReviewWork
+        "Reconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason."
     };
     let text = format!(
-        "{}\n[Router-owned child wake]\n{}\n{}\nReconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason.",
+        "{}\n[Router-owned child wake]\n{}\n{}\n{task}",
         run.policy.instructions(role),
         serde_json::to_string(&wakes).map_err(|e| e.to_string())?,
         capacity_line(shared, &run)
@@ -822,6 +862,133 @@ mod steer_tests {
             work_id: "w".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unfinished_releases_select_integration_without_changing_worker_lifecycle() {
+        use crate::config::PlannerPhase;
+        use crate::planner_release::{Checkpoint, Release, Stage};
+        for stage in [
+            Stage::Selected,
+            Stage::StagingDeployed,
+            Stage::ProductionMerged,
+            Stage::ProductionDeployed,
+            Stage::Failed,
+            Stage::ProductionPassed,
+        ] {
+            let mut release = Release {
+                candidate: "a".repeat(40),
+                works: BTreeMap::new(),
+                superseded_by: None,
+                checkpoints: vec![Checkpoint {
+                    stage,
+                    revision: "a".repeat(40),
+                    works: BTreeMap::new(),
+                    replaces: None,
+                    evidence: BTreeMap::new(),
+                }],
+            };
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    false,
+                    [&release].into_iter(),
+                    false
+                ),
+                PlannerRole::IntegratePlan,
+                "release stage {stage:?} was sent to routine review"
+            );
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    true,
+                    [&release].into_iter(),
+                    false
+                ),
+                PlannerRole::SelectPlan
+            );
+            assert_eq!(
+                wake_role(PlannerPhase::Planning, false, [&release].into_iter(), false),
+                PlannerRole::ReviewWork
+            );
+            release.superseded_by = Some("replacement".into());
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    false,
+                    [&release].into_iter(),
+                    false
+                ),
+                PlannerRole::ReviewWork
+            );
+            release.superseded_by = None;
+            release.checkpoints[0].stage = Stage::Disposed;
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    false,
+                    [&release].into_iter(),
+                    false
+                ),
+                PlannerRole::ReviewWork
+            );
+            release.checkpoints[0].stage = Stage::Abandoned;
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    false,
+                    [&release].into_iter(),
+                    false
+                ),
+                PlannerRole::ReviewWork
+            );
+        }
+    }
+
+    #[test]
+    fn environment_recovery_precedes_unrelated_branch_observations_and_refill() {
+        use crate::config::PlannerPhase;
+        // An environment can fail before its parent has recorded a release checkpoint.
+        for id in [
+            "observation:ci-job-failures:staging",
+            "observation:ci-job-failures:production",
+        ] {
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    false,
+                    std::iter::empty(),
+                    environment_wake(id)
+                ),
+                PlannerRole::IntegratePlan
+            );
+        }
+        assert_eq!(
+            wake_role(
+                PlannerPhase::Implementation,
+                false,
+                std::iter::empty(),
+                environment_wake("observation:ci:ordinary-worker")
+            ),
+            PlannerRole::ReviewWork
+        );
+        let mut ids = [
+            "capacity:1",
+            "observation:ci:a-worker",
+            "done:worker",
+            "observation:ci-job-failures:staging",
+            "release:corrective",
+            "input:operator",
+        ];
+        ids.sort_by_key(|id| wake_priority(id));
+        assert_eq!(
+            &ids[..3],
+            &[
+                "input:operator",
+                "observation:ci-job-failures:staging",
+                "release:corrective"
+            ]
+        );
     }
 
     #[test]
