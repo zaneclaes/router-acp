@@ -1361,10 +1361,11 @@ pub struct PlannerRouterConfig {
     /// Omitted allocation uses isolated local clones, never shared writes.
     #[serde(default)]
     pub workspace: Option<PlannerWorkspaceConfig>,
-    /// Repository-owned capacity host. While the parent is idle below
+    /// Repository-owned capacity host. While the parent is below
     /// `delegation.max_concurrent`, the router asks it for admissible
-    /// candidates, wakes the parent to admit them and, if it does not, admits
-    /// and starts them itself. Omitted keeps only the 20-minute heartbeat.
+    /// candidates and wakes the parent even during coordination. If the idle
+    /// parent does not respond, it admits and starts them itself. Omitted keeps
+    /// only the 20-minute heartbeat.
     #[serde(default)]
     pub capacity: Option<PlannerCapacityConfig>,
     /// Repository-owned run auditor (the native watcher's guarantees): its

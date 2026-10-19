@@ -258,7 +258,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
 }
 
 /// The one pending item to steer now: the queued agent correction first, then
-/// the first unacknowledged release/observation wake, skipping anything already
+/// an urgent release/failed-job wake, then capacity, skipping anything already
 /// steered this turn or claimed by a live delivery. Pure, for tests.
 pub(crate) fn pending_steer(
     queue: &[planner_workflow::QueuedParentInput],
@@ -307,19 +307,24 @@ pub(crate) fn pending_steer(
             ));
         }
     }
-    // Only a release transition or a failed CI job is worth interrupting a turn
-    // for; a routine `observation:ci:<work>` branch state waits for the boundary.
-    let (id, wake) = wakes.iter().find(|(id, w)| {
-        !w.acknowledged
-            && (id.starts_with("release:") || id.starts_with("observation:ci-job-failures"))
-            && !steered.contains(*id)
-            && !claimed(w, id)
-    })?;
+    // Capacity starvation, release transitions and failed CI jobs can affect
+    // coordination now. Routine branch observations still wait for the boundary.
+    let (id, wake) = wakes
+        .iter()
+        .filter(|(id, w)| {
+            !w.acknowledged
+                && (id.starts_with("release:")
+                    || id.starts_with("observation:ci-job-failures")
+                    || id.starts_with("capacity:"))
+                && !steered.contains(*id)
+                && !claimed(w, id)
+        })
+        .min_by_key(|(id, _)| wake_priority(id))?;
     Some((
         id.clone(),
         format!(
             "[Router steer] This is router text, not operator input. Pending wake `{id}` (work {}): {}. It is redelivered when this turn ends; a failed \
-             CI job or a release transition is actionable now, in this turn.",
+             CI job, release transition or unfilled capacity is actionable now, in this turn.",
             wake.work_id, wake.reason
         ),
     ))
@@ -845,9 +850,8 @@ mod steer_tests {
     }
 
     #[test]
-    fn only_release_and_failed_job_wakes_steer_and_acknowledged_or_claimed_ones_do_not() {
+    fn routine_wakes_wait_and_acknowledged_or_claimed_urgent_ones_do_not_steer() {
         let mut wakes = BTreeMap::new();
-        wakes.insert("capacity:1".to_string(), wake("slots free"));
         wakes.insert("audit:2".to_string(), wake("defect"));
         wakes.insert(
             "observation:ci:dashboard-r1".to_string(),
@@ -877,6 +881,33 @@ mod steer_tests {
         assert_eq!(id, "observation:ci-job-failures:open");
         assert!(text.contains("ci job failed"));
         assert!(text.starts_with("[Router steer] This is router text, not operator input."));
+    }
+
+    #[test]
+    fn capacity_wake_reaches_busy_parent_once_without_steering_routine_observations() {
+        let mut wakes = BTreeMap::from([
+            (
+                "capacity:1".to_string(),
+                wake("admissible work with free slots"),
+            ),
+            (
+                "observation:ci:work".to_string(),
+                wake("branch build passed"),
+            ),
+        ]);
+        let (id, text) =
+            pending_steer(&[], &wakes, &HashSet::new()).expect("capacity must reach busy parent");
+        assert_eq!(id, "capacity:1");
+        assert!(text.starts_with("[Router steer] This is router text, not operator input."));
+        assert!(pending_steer(&[], &wakes, &HashSet::from([id])).is_none());
+        wakes.insert("release:ready".to_string(), wake("release transition"));
+        assert_eq!(
+            pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,
+            "release:ready"
+        );
+        wakes.remove("release:ready");
+        wakes.get_mut("capacity:1").unwrap().acknowledged = true;
+        assert!(pending_steer(&[], &wakes, &HashSet::new()).is_none());
     }
 
     #[test]

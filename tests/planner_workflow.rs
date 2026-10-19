@@ -2822,6 +2822,115 @@ async fn tick(shared: &Arc<Shared>, now: i64) {
     router_acp::planner_capacity::tick(shared, SID, now).await;
 }
 
+fn parent_tool_activity(shared: &Arc<Shared>, now: i64) {
+    shared.state.lock().unwrap().log(
+        SID,
+        &router_acp::state::LogEntry {
+            ts: Some(now),
+            kind: "tool_call".into(),
+            role: "agent".into(),
+            summary: "reviewing an existing worker".into(),
+            ..Default::default()
+        },
+    );
+}
+
+#[tokio::test]
+async fn busy_parent_capacity_queries_and_wakes_survive_continuous_tool_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 2;
+        capacity_host(cfg, script, 1, 5);
+    });
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    let start = parent_turn_ended(shared);
+    for elapsed in [1, 2, 30, 61] {
+        let now = start + elapsed;
+        parent_tool_activity(shared, now);
+        tick(shared, now).await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        let host = run
+            .capacity
+            .host
+            .expect("busy parent must still query capacity");
+        assert!(host.ok);
+        if elapsed < 31 {
+            assert_eq!(
+                host.at_ms,
+                (start + 1) * 1000,
+                "activity must not cause host polling on every tick"
+            );
+        }
+        assert!(
+            run.works.is_empty(),
+            "auto-admission still waits for the idle parent"
+        );
+    }
+    assert_eq!(
+        wakes_with(shared, "capacity:").len(),
+        1,
+        "tool activity must not postpone the wake"
+    );
+    tick(shared, start + 62).await;
+    assert_eq!(
+        wakes_with(shared, "capacity:").len(),
+        1,
+        "pending wake is not duplicated"
+    );
+    deliver_all(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 0);
+    tick(shared, start + 63).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(
+        run.works.contains_key("work-a"),
+        "existing idle auto-admission remains available"
+    );
+}
+
+#[tokio::test]
+async fn busy_parent_capacity_clock_resets_when_all_candidates_are_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 100, 100_000));
+    let shared = &f.shared;
+    authorize(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    let start = parent_turn_ended(shared);
+    parent_tool_activity(shared, start);
+    tick(shared, start).await;
+    planner_workflow::mutate(shared, SID, |run| {
+        router_acp::planner_capacity::record_hold(
+            run,
+            "plan-a",
+            "dependency",
+            "waiting for plan-b",
+            (start + 10) * 1000,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    parent_tool_activity(shared, start + 40);
+    tick(shared, start + 40).await;
+    planner_workflow::mutate(shared, SID, |run| {
+        run.capacity.holds.clear();
+        Ok(())
+    })
+    .unwrap();
+    parent_tool_activity(shared, start + 61);
+    tick(shared, start + 61).await;
+    assert!(
+        wakes_with(shared, "capacity:").is_empty(),
+        "held time must not count as unfilled time"
+    );
+    parent_tool_activity(shared, start + 122);
+    tick(shared, start + 122).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 1);
+}
+
 #[tokio::test]
 async fn idle_parent_below_its_limit_gets_capacity_wakes_that_never_give_up() {
     let tmp = tempfile::tempdir().unwrap();

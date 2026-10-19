@@ -12,7 +12,7 @@
 //!    of exactly three reasons ([`HOLD_REASONS`]). A fourth, `production-failure`,
 //!    holds no candidate: it declares a known production failure under repair,
 //!    which the audit host verifies against preserved evidence.
-//! 3. An idle parent below `delegation.max_concurrent` with an unheld
+//! 3. A parent below `delegation.max_concurrent` with an unheld
 //!    candidate gets a capacity wake every `wake_after_secs`, with no give-up.
 //! 4. After `auto_admit_after_wakes` such wakes, or `auto_admit_after_secs`
 //!    of idleness with a free slot, the router admits and starts the
@@ -90,6 +90,9 @@ pub struct CapacityState {
     /// Capacity wakes issued for the current unfilled condition.
     #[serde(default)]
     pub unfilled_wakes: u32,
+    /// Start of the current unfilled condition; parent tool activity does not reset it.
+    #[serde(default)]
+    pub unfilled_since: Option<i64>,
     #[serde(default)]
     pub last_wake_at: i64,
     #[serde(default)]
@@ -538,8 +541,8 @@ pub fn spawn_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
 }
 
 /// One capacity pass over a planner run at `now` (unix seconds): resume
-/// workers that stopped early, then, for an idle parent, fill free slots
-/// (wake, or auto-admit) and wake it while work is mid-flight.
+/// workers that stopped early, then check capacity even during coordination.
+/// Capacity wakes reach busy parents; auto-admission and in-flight wakes stay idle-only.
 pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
         return;
@@ -597,12 +600,12 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
             Ok(())
         });
     }
-    let parent_idle = shared
-        .with_session(sid, |s| s.prompt_activity == 0 && !s.pinning)
-        .unwrap_or(false)
-        && run.approval_waits.is_empty()
-        && run.parent_queue.is_empty();
-    if !parent_idle {
+    let Some((parent_idle, pinning)) =
+        shared.with_session(sid, |s| (s.prompt_activity == 0, s.pinning))
+    else {
+        return;
+    };
+    if pinning || !run.approval_waits.is_empty() || !run.parent_queue.is_empty() {
         return;
     }
     let Some((last, _)) = shared.state.lock().unwrap().last_activity(sid) else {
@@ -610,10 +613,13 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     };
     let idle = now - last;
     let filled = if run.capacity.pending_adoption.is_none() {
-        fill_slots(shared, sid, run, now, last, &timing).await
+        fill_slots(shared, sid, run, now, last, parent_idle, &timing).await
     } else {
         false
     };
+    if !parent_idle {
+        return;
+    }
     if !filled {
         inflight_wake(shared, sid, now, idle, &timing);
     }
@@ -636,6 +642,7 @@ async fn fill_slots(
     mut run: PlannerRun,
     now: i64,
     last: i64,
+    parent_idle: bool,
     timing: &PlannerCapacityConfig,
 ) -> bool {
     if !host_configured(shared) {
@@ -647,13 +654,14 @@ async fn fill_slots(
         reset_unfilled(shared, sid, &run);
         return false;
     }
-    // Re-ask after any parent activity, and at most every 30 s otherwise.
+    // Re-ask at most every 30 s. Continuous parent tool calls must neither
+    // suppress capacity checks nor turn them into one host process per tick.
     let query_ms = (timing.wake_after_secs as i64).clamp(5, 30) * 1000;
     let fresh = run
         .capacity
         .host
         .as_ref()
-        .is_some_and(|h| h.at_ms >= last * 1000 && now_ms - h.at_ms < query_ms);
+        .is_some_and(|h| now_ms - h.at_ms < query_ms);
     if !fresh {
         let Some(snapshot) = query_host(shared, sid, &run, now_ms).await else {
             return false;
@@ -675,11 +683,25 @@ async fn fill_slots(
         reset_unfilled(shared, sid, &run);
         return false;
     }
+    if run.capacity.unfilled_since.is_none() {
+        let since = if parent_idle { last } else { now };
+        match planner_workflow::mutate(shared, sid, |current| {
+            current.capacity.unfilled_since.get_or_insert(since);
+            Ok(())
+        }) {
+            Ok(saved) => run = saved,
+            Err(error) => {
+                tracing::warn!(session = sid, %error, "capacity condition not saved");
+                return false;
+            }
+        }
+    }
     let idle = now - last;
     let pinned = shared
         .with_session(sid, |s| s.pin.is_some())
         .unwrap_or(false);
-    if host.ok
+    if parent_idle
+        && host.ok
         && pinned
         && !pending_wake(&run, "capacity:")
         && (run.capacity.unfilled_wakes >= timing.auto_admit_after_wakes
@@ -688,7 +710,11 @@ async fn fill_slots(
         auto_admit(shared, sid, &run, unheld, live, max, now).await;
         return true;
     }
-    let since = last.max(run.capacity.last_wake_at);
+    let since = run
+        .capacity
+        .unfilled_since
+        .unwrap_or(now)
+        .max(run.capacity.last_wake_at);
     if now - since < timing.wake_after_secs as i64 || pending_wake(&run, "capacity:") {
         return false;
     }
@@ -753,11 +779,15 @@ async fn fill_slots(
 }
 
 fn reset_unfilled(shared: &Shared, sid: &str, run: &PlannerRun) {
-    if run.capacity.unfilled_wakes == 0 && !pending_wake(run, "capacity:") {
+    if run.capacity.unfilled_since.is_none()
+        && run.capacity.unfilled_wakes == 0
+        && !pending_wake(run, "capacity:")
+    {
         return;
     }
     let _ = planner_workflow::mutate(shared, sid, |run| {
         run.capacity.unfilled_wakes = 0;
+        run.capacity.unfilled_since = None;
         ack_router_wakes(run, "capacity:");
         Ok(())
     });

@@ -27,7 +27,7 @@ completion check need it.
 ## Host contract
 
 The command launches like `workspace`: no shell, cwd is the session
-repository. While the parent is idle below `delegation.max_concurrent` (and on
+repository. While the parent is below `delegation.max_concurrent` (and on
 every `complete`), the router writes one JSON object to its stdin:
 
 ```json
@@ -47,8 +47,10 @@ The host answers on stdout with the admissible candidates, in priority order:
 non-zero exit, a timeout or invalid JSON is logged as an error and recorded as
 **unknown**, never as "no work": the parent is woken with the host error, no
 candidate is auto-admitted, and `complete` is refused until the host answers.
-The router asks at most every 30 s while the parent is idle with a free slot,
-and again after any parent activity.
+The router asks at most every 30 s with a free slot, including during an active
+coordination turn. Parent tool activity neither postpones the check nor triggers
+another host process before that interval. Pinning, an approval wait, or queued
+parent input still defers the check.
 
 A candidate still needs a slot when its `work_id` is not admitted, is admitted
 but was never started, or was interrupted before it got a workspace.
@@ -71,8 +73,8 @@ and expire on their own.
 
 ## Capacity wakes
 
-An idle parent (its turn ended) with a free slot and an unheld candidate gets
-a `capacity:` wake after `wake_after_secs`, and another every
+An unfilled slot with an unheld candidate gets a `capacity:` wake after
+`wake_after_secs`, and another every
 `wake_after_secs` while that holds, with no limit on deliveries. The wake
 lists the free slot count and each candidate (`work_id`, `external_id`, plan)
 and tells the parent to admit up to the free count now, in order, or record a
@@ -81,11 +83,19 @@ ordering never leaves a slot empty. While the host lists unheld candidates or
 cannot answer, these wakes replace the 20-minute heartbeat; the heartbeat
 remains for "no candidates", so blockers are still re-checked.
 
+The unfilled-condition clock is independent of parent tool activity and resets
+when slots fill or every candidate is held/closed. A busy router-owned parent
+receives the pending capacity wake through the existing mid-turn delivery path:
+one delivery per wake per turn, sharing its 60-second rate limit with urgent
+release and failed-job wakes. Routine branch observations remain deferred.
+This supports ongoing coordination; implementation and diagnostic execution
+remain worker responsibilities under the host's role contract.
+
 ## Auto-admission
 
 After `auto_admit_after_wakes` delivered capacity wakes for the same unfilled
 condition, or `auto_admit_after_secs` of parent idleness with a free slot, the
-router admits and starts up to the free count of unheld candidates, in host
+router, when the parent is idle, admits and starts up to the free count of unheld candidates, in host
 order. It uses the parent's own path: `admit` with idempotency key
 `auto-admit:<work_id>:<round>`, workspace allocation through the workspace
 host, then the delegate started as a background planner job whose seat the
