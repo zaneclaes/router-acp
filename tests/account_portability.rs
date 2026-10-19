@@ -94,15 +94,6 @@ fn copying_only_config_directory_preserves_four_accounts_in_a_different_home() {
             "auth.json"
         };
         std::fs::write(dir.join(file), serde_json::to_vec(&credential).unwrap()).unwrap();
-        let material = if claude {
-            &credential["claudeAiOauth"]
-        } else {
-            &credential
-        };
-        std::fs::write(dir.join(".router-acp-auth.json"), serde_json::to_vec(&json!({
-            "generation": router_acp::usage_cache::fingerprint(&material.to_string()),
-            "epoch": "fixture-epoch", "outcome": "Repaired", "attempted_at": "2026-10-18T00:00:00Z"
-        })).unwrap()).unwrap();
         if claude {
             std::fs::write(
                 dir.join(".claude.json"),
@@ -119,7 +110,7 @@ fn copying_only_config_directory_preserves_four_accounts_in_a_different_home() {
     assert_eq!(accounts.len(), 4);
     for account in accounts {
         assert_eq!(account["credentialPresent"], true);
-        assert_eq!(account["authState"], "authenticated");
+        assert_eq!(account["authState"], "unknown");
         assert_eq!(account["sharedDirectory"], false);
         assert_ne!(account["label"], account["id"]);
     }

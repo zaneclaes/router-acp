@@ -49,13 +49,15 @@ fn claude_credential_fixture(outcome: Option<&str>) -> tempfile::TempDir {
     )
     .unwrap();
     if let Some(outcome) = outcome {
+        let local = router_acp::local_state::account(directory.path()).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
         use sha2::{Digest, Sha256};
         let generation = format!(
             "{:x}",
             Sha256::digest(value["claudeAiOauth"].to_string().as_bytes())
         );
         std::fs::write(
-            directory.path().join(".router-acp-auth.json"),
+            local.join("auth.json"),
             serde_json::json!({"generation":generation,"epoch":"fixture","outcome":outcome,
                 "attempted_at":chrono::Utc::now().to_rfc3339()})
             .to_string(),
@@ -5837,7 +5839,12 @@ async fn switch_starts_a_target_skipped_at_boot_and_hands_off() {
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart the work").await?;
         // Native login has replaced the manager's rejected generation.
-        std::fs::remove_file(credential.path().join(".router-acp-auth.json")).unwrap();
+        std::fs::remove_file(
+            router_acp::local_state::account(credential.path())
+                .unwrap()
+                .join("auth.json"),
+        )
+        .unwrap();
         let resp = prompt_text(
             &cx,
             &sid,
@@ -5879,7 +5886,12 @@ async fn config_refresh_advertises_a_target_signed_in_after_boot() {
             "signed-out target is disabled"
         );
 
-        std::fs::remove_file(credential.path().join(".router-acp-auth.json")).unwrap();
+        std::fs::remove_file(
+            router_acp::local_state::account(credential.path())
+                .unwrap()
+                .join("auth.json"),
+        )
+        .unwrap();
         let refreshed = cx
             .send_request(
                 SetSessionConfigOptionRequest::new(

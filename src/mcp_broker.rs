@@ -1812,6 +1812,10 @@ mod tests {
 
     /// A credential helper script: prints `answer` (or sleeps, or declines).
     fn helper(dir: &FsPath, body: &str) -> crate::config::McpCredentialCommand {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
         let path = dir.join("helper.sh");
         std::fs::write(
             &path,

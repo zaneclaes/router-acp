@@ -81,7 +81,7 @@ pub fn show(path: &Path) -> Result<Value, AdminError> {
 }
 
 fn lock(path: &Path) -> Result<ConfigLock, AdminError> {
-    ConfigLock::acquire(path.with_extension("accounts.lock")).map_err(AdminError::Conflict)
+    ConfigLock::acquire(path.to_path_buf()).map_err(AdminError::Conflict)
 }
 
 /// Replace the configuration with `proposed`, keeping the router's account

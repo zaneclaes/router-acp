@@ -1113,6 +1113,9 @@ async fn run_login(
     if flow.cancel.is_cancelled() {
         return Err("Login cancelled. Existing accounts remain registered.".into());
     }
+    let canonical = agent;
+    let (login, _runtime) = crate::credentials::login_runtime(agent)?;
+    let agent = &login;
     let p = provider(agent).unwrap();
     let default_args: &[&str] = match p {
         "claude" => &["auth", "login", "--claudeai"],
@@ -1213,7 +1216,7 @@ async fn run_login(
     loop {
         tokio::select! {
             status = child.wait() => return match status {
-                Ok(s) if s.success() => crate::credentials::login_succeeded(agent),
+                Ok(s) if s.success() => crate::credentials::publish_login(agent, canonical),
                 Ok(s) => Err(format!("{p} login failed ({s}). Re-login keeps the account registered.")),
                 Err(e) => Err(format!("{p} login failed: {e}")),
             },
@@ -1336,8 +1339,7 @@ async fn write_config(
         .source_path
         .as_ref()
         .ok_or("Account management needs a file-backed router configuration")?;
-    let lock_path = path.with_extension("accounts.lock");
-    let _file_lock = ConfigLock::acquire(lock_path)?;
+    let _file_lock = ConfigLock::acquire(path.to_path_buf())?;
     // Edit the uninterpolated document, so env secrets never become file values.
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut document: Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
@@ -1377,6 +1379,10 @@ pub(crate) fn save_document(path: &Path, document: &Value) -> Result<Config, Str
 pub(crate) struct ConfigLock(std::fs::File);
 impl ConfigLock {
     pub(crate) fn acquire(path: PathBuf) -> Result<Self, String> {
+        crate::local_state::retire_lock(&path.with_extension("accounts.lock"))?;
+        let dir = crate::local_state::directory("config-locks", &path)?;
+        crate::local_state::private_dir(&dir)?;
+        let path = dir.join("write.lock");
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)]
@@ -1411,20 +1417,20 @@ pub(crate) fn directory_variable(provider: &str) -> &'static str {
     }
 }
 
-/// The entries of a provider's config directory that are the login itself,
-/// with the router's repair record for it. Everything else is configuration.
+/// The entries of a provider's config directory that are the login itself.
+/// Repair records and coordination belong in machine-local state.
 fn credential_entries(provider: &str) -> &'static [&'static str] {
     match provider {
-        "claude" => &[".credentials.json", ".router-acp-auth.json"],
-        "codex" | "grok" => &["auth.json", ".router-acp-auth.json"],
-        "kimi" => &["credentials", ".router-acp-auth.json"],
+        "claude" => &[".credentials.json"],
+        "codex" | "grok" => &["auth.json"],
+        "kimi" => &["credentials"],
         _ => &[],
     }
 }
 
 /// Every seat is an account: `<agent>@<id>`, owning
 /// `~/.config/router-acp/accounts/<agent>@<id>`, which holds only its login
-/// and its usage cache (`.router-acp-usage/`). Skills, plugins and settings
+/// and account identity. Usage caches live in local state. Skills, plugins and settings
 /// stay the computer-wide CLI configuration its adapters read
 /// (`credentials::configuration_directory`). A seat still on its CLI's default
 /// directory (`~/.claude`, `~/.codex`, `~/.grok`, `~/.kimi`) becomes one once:
@@ -1441,7 +1447,7 @@ fn credential_entries(provider: &str) -> &'static [&'static str] {
 /// left alone. Another router holding the lock defers this to a later start.
 /// Returns one line per seat that became an account or could not.
 pub fn adopt_seat_directories(config_path: &Path) -> Result<Vec<String>, String> {
-    let Ok(_lock) = ConfigLock::acquire(config_path.with_extension("accounts.lock")) else {
+    let Ok(_lock) = ConfigLock::acquire(config_path.to_path_buf()) else {
         return Ok(vec![
             "seat directories: configuration busy; retried at the next start".into(),
         ]);
@@ -2214,12 +2220,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_root, original, shared, accounts) = seat_fixture();
         // The atomic save writes a temp file beside the config; forbid only
-        // that. The lock file already exists, as after any earlier save.
+        // that. Its lock lives outside the configuration directory.
         let dir = original.parent().unwrap().join("conf");
         std::fs::create_dir(&dir).unwrap();
         let config = dir.join("router.yaml");
         std::fs::rename(&original, &config).unwrap();
-        std::fs::write(config.with_extension("accounts.lock"), "").unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = adopt_seat_directories(&config);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2241,7 +2246,7 @@ mod tests {
     #[test]
     fn a_busy_configuration_defers_the_move() {
         let (_root, config, shared, accounts) = seat_fixture();
-        let _held = ConfigLock::acquire(config.with_extension("accounts.lock")).unwrap();
+        let _held = ConfigLock::acquire(config.clone()).unwrap();
         let report = adopt_seat_directories(&config).unwrap();
         assert!(report[0].contains("busy"), "{report:?}");
         assert!(shared.join(".credentials.json").is_file());
@@ -2249,6 +2254,22 @@ mod tests {
             no_accounts(&accounts),
             "nothing changes while another router holds the lock"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_aliases_share_a_lock_outside_config() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("router.yaml");
+        let alias = root.path().join("alias.yaml");
+        std::fs::write(&config, "agents: []").unwrap();
+        std::os::unix::fs::symlink(&config, &alias).unwrap();
+        let held = ConfigLock::acquire(config.clone()).unwrap();
+        assert!(ConfigLock::acquire(alias.clone()).is_err());
+        assert!(!config.with_extension("accounts.lock").exists());
+        assert!(!alias.with_extension("accounts.lock").exists());
+        drop(held);
+        assert!(ConfigLock::acquire(alias).is_ok());
     }
 
     #[test]

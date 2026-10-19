@@ -21,8 +21,8 @@
 //! is written only after a successful exchange; `tokens.json` holds the
 //! tokens; `configured` is the durable marker that a sign-in once succeeded,
 //! so a lost store reads "reconnect needed" rather than "never signed in";
-//! `status.json` records the broker's last live outcome; `flow.json` holds a
-//! host-delegated pending sign-in.
+//! Machine-local `status.json`, `flow.json` and the OAuth lock live separately
+//! under the local state root, keyed by the canonical credential directory.
 //!
 //! The router is the only reader and refresher of these files. Token material
 //! is never logged, printed, or copied into an error string; error text names
@@ -595,8 +595,16 @@ impl Store {
         &self.dir
     }
 
+    fn file(&self, name: &str) -> Result<PathBuf, String> {
+        if matches!(name, FLOW | HEALTH) {
+            Ok(crate::local_state::directory("mcp", &self.dir)?.join(name))
+        } else {
+            Ok(self.dir.join(name))
+        }
+    }
+
     fn read<T: serde::de::DeserializeOwned>(&self, name: &str) -> Option<T> {
-        let bytes = std::fs::read(self.dir.join(name)).ok()?;
+        let bytes = std::fs::read(self.file(name).ok()?).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -640,10 +648,10 @@ impl Store {
     fn write_private(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         use std::io::Write;
         self.ensure_dir()?;
-        let path = self.dir.join(name);
-        let temp = self
-            .dir
-            .join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let path = self.file(name)?;
+        let parent = path.parent().ok_or("MCP store directory unavailable")?;
+        crate::local_state::private_dir(parent)?;
+        let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -679,7 +687,9 @@ impl Store {
     }
 
     pub fn clear_flow(&self) {
-        let _ = std::fs::remove_file(self.dir.join(FLOW));
+        if let Ok(path) = self.file(FLOW) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn mark_configured(&self) -> Result<(), String> {
@@ -696,6 +706,12 @@ impl Store {
 
     /// Remove the whole server directory. True when anything was there.
     pub fn remove(&self) -> Result<bool, String> {
+        // Keep the lock inode stable across logout/re-login.
+        for name in [FLOW, HEALTH] {
+            if let Ok(path) = self.file(name) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         match std::fs::remove_dir_all(&self.dir) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -707,6 +723,12 @@ impl Store {
     /// across every router process, and waiters re-read the result.
     pub async fn lock(&self) -> Result<File, String> {
         self.ensure_dir()?;
+        crate::local_state::retire_lock(&self.dir.join(".lock"))?;
+        let local = crate::local_state::directory("mcp", &self.dir)?;
+        crate::local_state::private_dir(&local)?;
+        for name in [FLOW, HEALTH] {
+            crate::local_state::move_file(&self.dir.join(name), &local.join(name))?;
+        }
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -715,7 +737,7 @@ impl Store {
             options.mode(0o600);
         }
         let file = options
-            .open(self.dir.join(".lock"))
+            .open(local.join("oauth.lock"))
             .map_err(|_| "MCP credential lock unavailable")?;
         tokio::time::timeout(LOCK_WAIT, async {
             loop {
@@ -1012,7 +1034,7 @@ pub async fn finish_flow(
     store.write_client(client)?;
     store.write_tokens(&tokens)?;
     store.mark_configured()?;
-    let _ = std::fs::remove_file(store.dir().join(HEALTH));
+    let _ = std::fs::remove_file(store.file(HEALTH)?);
     store.clear_flow();
     Ok(())
 }
@@ -1928,6 +1950,40 @@ pub(crate) mod tests {
         assert!(!format!("{:?}", store.tokens().unwrap()).contains("refresh-1"));
         assert!(store.remove().unwrap());
         assert!(!store.remove().unwrap());
+    }
+
+    #[tokio::test]
+    async fn oauth_coordination_and_health_stay_outside_config() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(&root.path().join(".config/router-acp/mcp"), "test");
+        store
+            .write_tokens(&tokens("fixture-access", 60_000))
+            .unwrap();
+        store.write_private(FLOW, b"pending local sign-in").unwrap();
+        store
+            .write_health(&Health {
+                state: StatusState::Degraded,
+                label: "local error".into(),
+                at: now_ms(),
+            })
+            .unwrap();
+        let held = store.lock().await.unwrap();
+        let local = crate::local_state::directory("mcp", store.dir()).unwrap();
+        assert!(local.join("oauth.lock").exists());
+        assert!(local.join(FLOW).exists());
+        assert!(local.join(HEALTH).exists());
+        let files: Vec<_> = std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, [TOKENS]);
+        let other = OpenOptions::new()
+            .write(true)
+            .open(local.join("oauth.lock"))
+            .unwrap();
+        assert!(other.try_lock().is_err());
+        drop(held);
+        assert!(other.try_lock().is_ok());
     }
 
     #[test]

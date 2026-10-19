@@ -43,6 +43,7 @@ pub async fn monitor(config_path: PathBuf) -> anyhow::Result<()> {
 
 async fn monitor_once(config_path: &std::path::Path) -> anyhow::Result<Duration> {
     let cfg = crate::config::Config::from_file(config_path)?;
+    crate::local_state::migrate(&cfg).map_err(anyhow::Error::msg)?;
     let interval = Duration::from_secs(cfg.cordon.poll_secs.max(30));
     let shared = crate::session::Shared::new(cfg)
         .map_err(|err| anyhow::anyhow!("invalid router runtime: {err:?}"))?;
@@ -1740,11 +1741,12 @@ state_file: {}
 cordon: {{poll_secs: 1}}
 agents:
   - name: claude
-    command: {{type: stdio, command: /bin/true}}
+    command: {{type: stdio, command: /bin/true, env: [{{name: HOME, value: {}}}]}}
     model_selection: {{type: config-option}}
     models: [{{id: sonnet, cost_rank: 1}}]
 "#,
-                dir.path().join("state.db").display()
+                dir.path().join("state.db").display(),
+                dir.path().display()
             ),
         )
         .unwrap();

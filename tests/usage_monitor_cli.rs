@@ -58,6 +58,10 @@ done
         tokio::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
             .args(["usage-monitor", "--config", config.to_str().unwrap()])
             .env("HOME", home)
+            .env(
+                "XDG_STATE_HOME",
+                router_acp::local_state::root().unwrap().parent().unwrap(),
+            )
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -71,10 +75,7 @@ done
     // Each account publishes into its own directory.
     let usage: Vec<_> = ["first", "second"]
         .iter()
-        .map(|name| {
-            home.join(name)
-                .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
-        })
+        .map(|name| router_acp::usage_cache::account_usage_dir(&home.join(name)).unwrap())
         .collect();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -106,7 +107,15 @@ done
     let reads = std::fs::read_to_string(home.join("usage-reads")).unwrap();
     assert_eq!(reads.lines().count(), 2);
     for name in ["first", "second"] {
-        assert!(reads.contains(home.join(name).to_str().unwrap()));
+        let prefix = router_acp::local_state::root()
+            .unwrap()
+            .join("runtimes")
+            .join(format!("{name}-"));
+        assert!(
+            reads
+                .lines()
+                .any(|line| line.starts_with(prefix.to_str().unwrap()))
+        );
         let auth: Value =
             serde_json::from_slice(&std::fs::read(home.join(name).join("auth.json")).unwrap())
                 .unwrap();

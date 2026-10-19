@@ -57,7 +57,7 @@ pub(crate) fn directory(agent: &AgentConfig) -> Option<PathBuf> {
 /// computer-wide directory (`~/.claude`, `~/.codex`, `~/.grok`, `~/.kimi`)
 /// under the seat's `HOME`. A router account directory
 /// (`~/.config/router-acp/accounts/<seat>`) holds only that account's login
-/// and usage, so switching accounts never changes skills, plugins or
+/// and identity, so switching accounts never changes skills, plugins or
 /// settings. A seat configured with any other directory (a mounted volume, a
 /// dedicated config) keeps using that directory for everything.
 pub(crate) fn configuration_directory(agent: &AgentConfig, dir: &Path) -> PathBuf {
@@ -161,6 +161,58 @@ fn newest_change(dir: &Path) -> Option<std::time::SystemTime> {
 }
 
 impl RuntimeCredential {
+    fn create(owner: &Path) -> Result<Self, String> {
+        let parent = crate::local_state::root()?.join("runtimes");
+        crate::local_state::private_dir(&parent)?;
+        // Publishing a lock file and acquiring it are separate operations.
+        // Serialize that short allocation window with other sweeps so a
+        // sibling cannot reclaim a runtime whose creator is about to lock it.
+        let allocation = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.join(".allocation.lock"))
+            .map_err(|_| "Could not lock runtime allocation")?;
+        allocation
+            .lock()
+            .map_err(|_| "Could not lock runtime allocation")?;
+        sweep_runtimes(&parent);
+        // Retain a readable owner label for diagnostics; UUIDs keep identical
+        // basenames and simultaneous sessions isolated.
+        let label: String = owner
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .take(48)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "@._-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let root = parent.join(format!("{label}-{}", uuid::Uuid::new_v4()));
+        crate::local_state::private_dir(&root)?;
+        let mut runtime = Self {
+            root,
+            generation: "missing".into(),
+            claude_config: None,
+            _lock: None,
+        };
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(runtime.root.join(RUNTIME_LOCK))
+            .map_err(|_| "Could not isolate adapter credentials")?;
+        lock.lock()
+            .map_err(|_| "Could not isolate adapter credentials")?;
+        runtime._lock = Some(lock);
+        Ok(runtime)
+    }
+
     /// `(runtime root, mirrored configuration directory)` for a Claude
     /// runtime, where the MCP broker writes its private settings.
     pub(crate) fn claude_settings(&self) -> Option<(PathBuf, PathBuf)> {
@@ -211,6 +263,17 @@ pub(crate) async fn runtime(
         return Err("Kimi credential isolation requires its default config location. Use KIMI_SHARE_DIR or KIMI_CODE_HOME for account configuration.".into());
     }
     env.retain(|(k, _)| !crate::accounts::AUTH_ENV.contains(&k.as_str()));
+    // Grok gets an isolated HOME. Its credential helper must still use the
+    // router's machine-local locks/records, rather than a second state tree.
+    env.retain(|(k, _)| k != "XDG_STATE_HOME");
+    env.push((
+        "XDG_STATE_HOME".into(),
+        crate::local_state::root()?
+            .parent()
+            .ok_or("Local state directory unavailable")?
+            .to_string_lossy()
+            .into_owned(),
+    ));
     if provider == "claude" {
         let base = env
             .iter()
@@ -261,39 +324,16 @@ pub(crate) async fn runtime(
         credential = Some(read(agent).ok_or("Credential unavailable after refresh")?);
     }
     let dir = directory(agent).ok_or("Credential directory unavailable")?;
-    sweep_runtimes(&dir.join(".router-acp-runtime"));
-    let root = dir
-        .join(".router-acp-runtime")
-        .join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&root).map_err(|_| "Could not isolate adapter credentials")?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(root.join(RUNTIME_LOCK))
-        .map_err(|_| "Could not isolate adapter credentials")?;
-    lock.lock()
-        .map_err(|_| "Could not isolate adapter credentials")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            root.parent().unwrap(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|_| "Could not protect adapter credentials")?;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| "Could not protect adapter credentials")?;
-    }
-    let mut runtime = RuntimeCredential {
-        root,
-        generation: credential
-            .as_ref()
-            .map(|c| marker(c, record(&dir).as_ref()))
-            .unwrap_or_else(|| "missing".into()),
-        claude_config: None,
-        _lock: Some(lock),
-    };
+    // Old versions put sockets and adapter state inside the syncable account
+    // directory. Reclaim abandoned legacy runtimes, but leave live ones alone.
+    let legacy = dir.join(".router-acp-runtime");
+    sweep_runtimes(&legacy);
+    let _ = std::fs::remove_dir(&legacy); // only succeeds when empty
+    let mut runtime = RuntimeCredential::create(&dir)?;
+    runtime.generation = credential
+        .as_ref()
+        .map(|c| marker(c, record(&dir).as_ref()))
+        .unwrap_or_else(|| "missing".into());
     // The account directory supplies the login; everything else (skills,
     // plugins, settings, config.toml) is the computer-wide configuration.
     let config = configuration_directory(agent, &dir);
@@ -565,13 +605,18 @@ fn merge_toml_strings(
     Ok(())
 }
 
-fn read(agent: &AgentConfig) -> Option<Credential> {
+fn credential_path(agent: &AgentConfig) -> Option<PathBuf> {
     let provider = crate::accounts::provider(agent)?;
-    let path = directory(agent)?.join(match provider {
+    Some(directory(agent)?.join(match provider {
         "claude" => ".credentials.json",
         "kimi" => "credentials/kimi-code.json",
         _ => "auth.json",
-    });
+    }))
+}
+
+fn read(agent: &AgentConfig) -> Option<Credential> {
+    let provider = crate::accounts::provider(agent)?;
+    let path = credential_path(agent)?;
     let value: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
     // Include refresh material so a login or refresh with an unchanged access
     // token still supersedes an older rejection. Never persist token values.
@@ -613,7 +658,16 @@ fn read(agent: &AgentConfig) -> Option<Credential> {
 }
 
 fn record(dir: &Path) -> Option<Record> {
-    serde_json::from_slice(&std::fs::read(dir.join(".router-acp-auth.json")).ok()?).ok()
+    serde_json::from_slice(
+        &std::fs::read(crate::local_state::account(dir).ok()?.join("auth.json")).ok()?,
+    )
+    .ok()
+}
+
+fn write_record(dir: &Path, record: &Record) -> Result<(), String> {
+    let local = crate::local_state::account(dir)?;
+    crate::local_state::private_dir(&local)?;
+    write_private(&local.join("auth.json"), record)
 }
 
 fn marker(credential: &Credential, record: Option<&Record>) -> String {
@@ -757,8 +811,8 @@ pub(crate) fn record_success(agent: &AgentConfig) {
     let epoch = previous
         .map(|r| r.epoch)
         .unwrap_or_else(|| "initial".into());
-    let _ = write_private(
-        &dir.join(".router-acp-auth.json"),
+    let _ = write_record(
+        &dir,
         &Record {
             generation: credential.generation,
             epoch,
@@ -926,21 +980,81 @@ fn write_claude_state(config: &Path, dir: &Path, root: &Path) -> Result<(), Stri
     write_private(&root.join(".claude.json"), &state)
 }
 
+/// Login CLIs may write logs, databases and locks too. Run them in local state;
+/// the caller holds the canonical credential lock throughout login/publication.
+pub(crate) fn login_runtime(
+    agent: &AgentConfig,
+) -> Result<(AgentConfig, RuntimeCredential), String> {
+    let runtime =
+        RuntimeCredential::create(&directory(agent).ok_or("Credential directory unavailable")?)?;
+    let provider = crate::accounts::provider(agent).ok_or("Unknown login provider")?;
+    let variable = match provider {
+        "claude" => "CLAUDE_CONFIG_DIR",
+        "codex" => "CODEX_HOME",
+        "grok" => "GROK_HOME",
+        "kimi" => "KIMI_SHARE_DIR",
+        _ => return Err("Unknown login provider".into()),
+    };
+    let mut login = agent.clone();
+    login.command.env.push(crate::config::EnvVarConfig {
+        name: variable.into(),
+        value: runtime.root.to_string_lossy().into_owned(),
+    });
+    // Seed unrelated credential fields (for example Claude's MCP OAuth data)
+    // without exposing the original file to a native login writer.
+    let source = credential_path(agent).ok_or("Credential path unavailable")?;
+    match std::fs::read(&source) {
+        Ok(bytes) => {
+            let dir = directory(agent).ok_or("Credential directory unavailable")?;
+            let relative = source
+                .strip_prefix(&dir)
+                .map_err(|_| "Credential path unavailable")?;
+            let path = runtime.root.join(relative);
+            crate::local_state::private_dir(
+                path.parent().ok_or("Credential directory unavailable")?,
+            )?;
+            write_private_bytes(&path, &bytes)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("Could not prepare login credentials".into()),
+    }
+    Ok((login, runtime))
+}
+
+pub(crate) fn publish_login(login: &AgentConfig, agent: &AgentConfig) -> Result<(), String> {
+    let credential = read(login).ok_or("Login completed without usable credentials")?;
+    let source = directory(login).ok_or("Login directory unavailable")?;
+    let dir = directory(agent).ok_or("Credential directory unavailable")?;
+    let path = dir.join(
+        credential
+            .path
+            .strip_prefix(&source)
+            .map_err(|_| "Credential path unavailable")?,
+    );
+    crate::local_state::private_dir(path.parent().ok_or("Credential directory unavailable")?)?;
+    write_private(&path, &credential.value)?;
+    if crate::accounts::provider(agent) == Some("claude")
+        && let Some(identity) = claude_identity(&source.join(".claude.json"))
+    {
+        write_claude_identity(&dir.join(".claude.json"), identity)?;
+    }
+    login_succeeded(agent)
+}
+
 pub(crate) fn login_succeeded(agent: &AgentConfig) -> Result<(), String> {
     let Some(credential) = read(agent) else {
         return Ok(());
     };
     let dir = directory(agent).ok_or("Credential directory unavailable")?;
-    // A login run in an account directory leaves Claude's whole client state
-    // there; the account keeps only who signed in.
+    // Keep only Claude's account identity even when adopting an older store.
     if crate::accounts::provider(agent) == Some("claude")
         && configuration_directory(agent, &dir) != dir
         && let Some(identity) = claude_identity(&dir.join(".claude.json"))
     {
         write_claude_identity(&dir.join(".claude.json"), identity)?;
     }
-    write_private(
-        &dir.join(".router-acp-auth.json"),
+    write_record(
+        &dir,
         &Record {
             generation: credential.generation,
             epoch: uuid::Uuid::new_v4().to_string(),
@@ -988,6 +1102,8 @@ pub(crate) async fn lock(agent: &AgentConfig) -> Result<File, String> {
 
 async fn lock_at(dir: &Path) -> Result<File, String> {
     std::fs::create_dir_all(dir).map_err(|_| "Credential directory unavailable")?;
+    let local = crate::local_state::account(dir)?;
+    crate::local_state::private_dir(&local)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -996,7 +1112,7 @@ async fn lock_at(dir: &Path) -> Result<File, String> {
         options.mode(0o600);
     }
     let file = options
-        .open(dir.join(".router-acp-auth.lock"))
+        .open(local.join("auth.lock"))
         .map_err(|_| "Credential repair lock unavailable")?;
     tokio::time::timeout(WAIT, async {
         loop {
@@ -1154,7 +1270,7 @@ where
         outcome: result.outcome.clone(),
         attempted_at: chrono::Utc::now().to_rfc3339(),
     };
-    if write_private(&dir.join(".router-acp-auth.json"), &state).is_err() {
+    if write_record(&dir, &state).is_err() {
         return RepairOutcome::Unknown;
     }
     result.outcome
@@ -1622,6 +1738,93 @@ pub async fn repair_for_helper(
 mod tests {
     use super::*;
 
+    #[test]
+    fn concurrent_runtime_allocation_never_sweeps_a_live_directory() {
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        let runtime =
+                            RuntimeCredential::create(Path::new("concurrent-test")).unwrap();
+                        std::thread::yield_now();
+                        std::fs::write(runtime.root.join("live"), "live").unwrap();
+                    }
+                });
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_runtime_and_login_leave_the_whole_config_tree_copyable() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    assert!(
+                        entry.file_type().unwrap().is_file(),
+                        "config contains runtime state"
+                    );
+                    assert!(!entry.file_name().to_string_lossy().ends_with(".lock"));
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        for provider in ["claude", "codex", "grok", "kimi"] {
+            let (home, mut agent) = fixture(provider);
+            let config = home.path().join(".config/router-acp");
+            let account = config.join("accounts").join(format!("{provider}@test"));
+            std::fs::create_dir_all(account.parent().unwrap()).unwrap();
+            std::fs::rename(directory(&agent).unwrap(), &account).unwrap();
+            let variable = match provider {
+                "claude" => "CLAUDE_CONFIG_DIR",
+                "codex" => "CODEX_HOME",
+                "grok" => "GROK_HOME",
+                _ => "KIMI_SHARE_DIR",
+            };
+            agent.command.env.push(crate::config::EnvVarConfig {
+                name: variable.into(),
+                value: account.to_string_lossy().into_owned(),
+            });
+            let canonical = read(&agent).unwrap();
+            let before = std::fs::read(&canonical.path).unwrap();
+            let held = lock(&agent).await.unwrap();
+            let config_lock =
+                crate::accounts::ConfigLock::acquire(config.join("router.yaml")).unwrap();
+            let view = runtime(&agent, &mut vec![]).await.unwrap().unwrap();
+            assert!(
+                view.root
+                    .starts_with(crate::local_state::root().unwrap().join("runtimes"))
+            );
+            assert_eq!(
+                std::fs::metadata(&view.root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            // A short alias keeps the Unix socket address within macOS's limit.
+            let alias = tempfile::tempdir_in("/tmp").unwrap();
+            std::os::unix::fs::symlink(&view.root, alias.path().join("r")).unwrap();
+            let socket = UnixListener::bind(alias.path().join("r/control.sock")).unwrap();
+            let (login, login_runtime) = login_runtime(&agent).unwrap();
+            std::fs::write(login_runtime.root.join("machine.lock"), "local").unwrap();
+            std::fs::write(login_runtime.root.join("session.db"), "local").unwrap();
+            publish_login(&login, &agent).unwrap();
+            assert_eq!(std::fs::read(&canonical.path).unwrap(), before);
+            let copied = tempfile::tempdir().unwrap();
+            copy_tree(&config, &copied.path().join("config"));
+            assert!(!account.join(".router-acp-runtime").exists());
+            assert!(!account.join("machine.lock").exists());
+            assert!(!account.join("session.db").exists());
+            let root = view.root.clone();
+            drop((socket, view, login_runtime, held, config_lock));
+            assert!(!root.exists());
+        }
+    }
+
     /// A runtime a dead router left behind is removed; one a live process holds,
     /// and an unlocked one changed recently, are kept.
     #[test]
@@ -1736,7 +1939,6 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != ".router-acp-runtime")
             .collect();
         kept.sort();
         assert_eq!(
@@ -2032,7 +2234,9 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
         assert_eq!(directory(&agent), directory(&helper));
         let held = lock(&agent).await.unwrap();
         assert!(!lockable_elsewhere(
-            &directory(&helper).unwrap().join(".router-acp-auth.lock")
+            &crate::local_state::account(&directory(&helper).unwrap())
+                .unwrap()
+                .join("auth.lock")
         ));
         drop(held);
     }
@@ -2495,7 +2699,9 @@ flag = 7
     async fn os_lock_is_shared_with_other_processes_and_released_on_drop() {
         let (_root, agent) = fixture("claude");
         let held = lock(&agent).await.unwrap();
-        let path = directory(&agent).unwrap().join(".router-acp-auth.lock");
+        let path = crate::local_state::account(&directory(&agent).unwrap())
+            .unwrap()
+            .join("auth.lock");
         assert!(!lockable_elsewhere(&path));
         drop(held);
         assert!(lockable_elsewhere(&path));
@@ -2589,7 +2795,9 @@ flag = 7
             }
         })
         .await;
-        let path = directory(&agent).unwrap().join(".router-acp-auth.json");
+        let path = crate::local_state::account(&directory(&agent).unwrap())
+            .unwrap()
+            .join("auth.json");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("synthetic-access") && !text.contains("synthetic-refresh"));
         #[cfg(unix)]

@@ -206,7 +206,7 @@ async fn wait_for_file(path: &Path) -> String {
 
 async fn wait_for_ambient_paths(path: &Path, account_dir: &Path) -> String {
     let path = path.to_path_buf();
-    let account_dir = account_dir.to_string_lossy().to_string();
+    let runtime_prefix = runtime_prefix(account_dir);
     let diagnostic_path = path.clone();
     let result = tokio::time::timeout(Duration::from_secs(3), async move {
         loop {
@@ -215,11 +215,9 @@ async fn wait_for_ambient_paths(path: &Path, account_dir: &Path) -> String {
                     value.lines().any(|line| {
                         let fields: Vec<_> = line.split('|').collect();
                         fields.first() == Some(label)
-                            && fields.get(1).is_some_and(|observed| {
-                                observed == &account_dir
-                                    || observed
-                                        .starts_with(&format!("{account_dir}/.router-acp-runtime/"))
-                            })
+                            && fields
+                                .get(1)
+                                .is_some_and(|observed| observed.starts_with(&runtime_prefix))
                     })
                 })
             {
@@ -244,7 +242,7 @@ async fn wait_for_ambient_observations(
     minimum: usize,
 ) {
     let path = path.to_path_buf();
-    let account_dir = account_dir.to_string_lossy().to_string();
+    let runtime_prefix = runtime_prefix(account_dir);
     tokio::time::timeout(Duration::from_secs(3), async move {
         loop {
             if std::fs::read_to_string(&path)
@@ -253,11 +251,9 @@ async fn wait_for_ambient_observations(
                 .filter(|line| {
                     let fields: Vec<_> = line.split('|').collect();
                     fields.first() == Some(&label)
-                        && fields.get(1).is_some_and(|observed| {
-                            *observed == account_dir.as_str()
-                                || observed
-                                    .starts_with(&format!("{account_dir}/.router-acp-runtime/"))
-                        })
+                        && fields
+                            .get(1)
+                            .is_some_and(|observed| observed.starts_with(&runtime_prefix))
                 })
                 .count()
                 >= minimum
@@ -269,6 +265,18 @@ async fn wait_for_ambient_observations(
     })
     .await
     .expect("account adapter did not restart after login management");
+}
+
+fn runtime_prefix(account_dir: &Path) -> String {
+    router_acp::local_state::root()
+        .unwrap()
+        .join("runtimes")
+        .join(format!(
+            "{}-",
+            account_dir.file_name().unwrap().to_string_lossy()
+        ))
+        .to_string_lossy()
+        .into_owned()
 }
 
 async fn wait_for_event_count(path: &Path, event: &str, minimum: usize) {
@@ -661,8 +669,8 @@ agents:
             payload: Some(json!({"limits":[{"kind":"weekly","percent":percent}]})),
         };
         // Each account's usage lives in its own directory.
-        let path = config_dir
-            .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+        let path = router_acp::usage_cache::account_usage_dir(&config_dir)
+            .unwrap()
             .join("anthropic-oauth.json");
         router_acp::usage_cache::write_snapshot(&path, &snapshot).unwrap();
     }
@@ -699,8 +707,8 @@ fn account_status_reports_router_owned_capacity_outcomes() {
             "resets_at":chrono::DateTime::from_timestamp((now + 3600) as i64, 0).unwrap().to_rfc3339()
         }]})),
     };
-    let snapshot_path = config_dir
-        .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+    let snapshot_path = router_acp::usage_cache::account_usage_dir(&config_dir)
+        .unwrap()
         .join("anthropic-oauth.json");
     router_acp::usage_cache::write_snapshot(&snapshot_path, &snapshot).unwrap();
 
@@ -708,6 +716,10 @@ fn account_status_reports_router_owned_capacity_outcomes() {
         .args(["account-status", "--config"])
         .arg(&config)
         .env("HOME", &home)
+        .env(
+            "XDG_STATE_HOME",
+            router_acp::local_state::root().unwrap().parent().unwrap(),
+        )
         .output()
         .unwrap();
     assert!(
@@ -1019,7 +1031,9 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
     );
     let recorded_dirs = wait_for_file(&fixture.login_state.join("dirs")).await;
     assert!(
-        recorded_dirs.lines().any(|line| line == added_dir),
+        recorded_dirs
+            .lines()
+            .any(|line| line.starts_with(&runtime_prefix(Path::new(&added_dir)))),
         "{recorded_dirs}"
     );
     assert!(
@@ -1058,7 +1072,7 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
         std::fs::read_to_string(&fixture.probe_log)
             .unwrap()
             .lines()
-            .any(|line| line.starts_with(&format!("{added_dir}/.router-acp-runtime/")))
+            .any(|line| line.starts_with(&runtime_prefix(Path::new(&added_dir))))
     );
     restarted.close().await;
 }
@@ -1155,7 +1169,7 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     let ambient = wait_for_file(&fixture.ambient_log).await;
     let added_lines: Vec<_> = ambient
         .lines()
-        .filter(|line| line.contains(added_dir.to_string_lossy().as_ref()))
+        .filter(|line| line.contains(&runtime_prefix(&added_dir)))
         .collect();
     assert!(!added_lines.is_empty(), "{ambient}");
     for label in ["login", "downstream"] {
@@ -1202,7 +1216,7 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     let ambient = wait_for_ambient_paths(&fixture.ambient_log, &added_dir).await;
     let added_lines: Vec<_> = ambient
         .lines()
-        .filter(|line| line.contains(added_dir.to_string_lossy().as_ref()))
+        .filter(|line| line.contains(&runtime_prefix(&added_dir)))
         .collect();
     for label in ["login", "probe", "downstream"] {
         assert!(
@@ -1317,7 +1331,7 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         wait_for_file(&fixture.login_state.join("dirs"))
             .await
             .lines()
-            .any(|line| line == existing_dir.to_string_lossy())
+            .any(|line| line.starts_with(&runtime_prefix(&existing_dir)))
     );
     assert_eq!(prompt_count(&fixture.original_log), 0);
     client.close().await;
@@ -1344,8 +1358,7 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         std::fs::read_to_string(&fixture.probe_log)
             .unwrap()
             .lines()
-            .any(|line| line
-                .starts_with(&format!("{}/.router-acp-runtime/", existing_dir.display())))
+            .any(|line| line.starts_with(&runtime_prefix(&existing_dir)))
     );
     restarted.close().await;
 }

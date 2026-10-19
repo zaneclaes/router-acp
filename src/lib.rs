@@ -18,6 +18,7 @@ pub mod headroom;
 pub mod lifecycle;
 pub mod limits;
 pub mod llm_proxy;
+pub mod local_state;
 pub mod maintenance;
 pub mod mcp_broker;
 pub mod mcp_menu;

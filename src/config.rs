@@ -3164,10 +3164,10 @@ agents:
 
     #[test]
     fn expand_tilde_str_only_touches_leading_home() {
-        // SAFETY: test-local env mutation.
-        unsafe { std::env::set_var("HOME", "/home/zane") };
-        assert_eq!(expand_tilde_str("~"), "/home/zane");
-        assert_eq!(expand_tilde_str("~/bin/x"), "/home/zane/bin/x");
+        // Other tests resolve machine-local state concurrently; never mutate HOME.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde_str("~"), home);
+        assert_eq!(expand_tilde_str("~/bin/x"), format!("{home}/bin/x"));
         // A bare ~word (another user's home) is not ours to resolve.
         assert_eq!(expand_tilde_str("~other/x"), "~other/x");
         // Non-leading tildes are untouched.
@@ -3177,8 +3177,7 @@ agents:
 
     #[test]
     fn expands_tilde_in_command_path_and_args() {
-        // SAFETY: test-local env mutation.
-        unsafe { std::env::set_var("HOME", "/home/zane") };
+        let home = std::env::var("HOME").unwrap();
         let yaml = r#"
 agents:
   - name: claude
@@ -3194,11 +3193,15 @@ agents:
         let cfg = Config::from_yaml(yaml).unwrap();
         assert_eq!(
             cfg.agents[0].command.command,
-            "/home/zane/nvm/bin/claude-agent-acp"
+            format!("{home}/nvm/bin/claude-agent-acp")
         );
         assert_eq!(
             cfg.agents[0].command.args,
-            vec!["--config", "/home/zane/cfg.yaml", "--flag"]
+            vec![
+                "--config".to_string(),
+                format!("{home}/cfg.yaml"),
+                "--flag".to_string()
+            ]
         );
     }
 

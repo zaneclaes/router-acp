@@ -280,14 +280,13 @@ fn snapshot_path(file_name: &str) -> Option<PathBuf> {
     )
 }
 
-/// The directory inside an account's own config directory that holds its
-/// published usage. The account owns its cache next to the credential it
-/// measures, so every router process on the box shares it, and deleting the
-/// account removes it. Adapters never see it (`.router-acp-*` stays out of
-/// their runtime stores). Hosts read it through `account-status`.
-pub const ACCOUNT_USAGE_DIR: &str = ".router-acp-usage";
+/// Account usage and poll locks are local state, keyed by canonical account
+/// path. Hosts read them through `account-status`.
+pub fn account_usage_dir(dir: &Path) -> Option<PathBuf> {
+    Some(crate::local_state::account(dir).ok()?.join("usage"))
+}
 
-/// One account's snapshot file: `<account dir>/.router-acp-usage/<file>`, or
+/// One account's local snapshot file, or
 /// the shared location when no account directory resolves.
 fn account_snapshot_path(
     file: &str,
@@ -296,12 +295,7 @@ fn account_snapshot_path(
     default: &str,
 ) -> Option<PathBuf> {
     match crate::usage::provider_config_dir(agent, variable, default) {
-        Some(dir) => Some(
-            dir.canonicalize()
-                .unwrap_or(dir)
-                .join(ACCOUNT_USAGE_DIR)
-                .join(file),
-        ),
+        Some(dir) => Some(account_usage_dir(&dir)?.join(file)),
         None => snapshot_path(file),
     }
 }
@@ -745,13 +739,15 @@ mod tests {
             .unwrap()
         };
         let (a, b) = (path(&cfg.agents[0]), path(&cfg.agents[1]));
-        // Each account's usage lives inside that account's own directory.
+        // Each account has its own local state directory.
         for (snapshot, dir) in [(&a, "/tmp/work"), (&b, "/tmp/personal")] {
             let dir = PathBuf::from(dir);
             let dir = dir.canonicalize().unwrap_or(dir);
             assert_eq!(
                 snapshot,
-                &dir.join(ACCOUNT_USAGE_DIR).join("anthropic-oauth.json")
+                &account_usage_dir(&dir)
+                    .unwrap()
+                    .join("anthropic-oauth.json")
             );
         }
         let root = tempfile::tempdir().unwrap();

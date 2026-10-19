@@ -527,6 +527,7 @@ async fn run() -> anyhow::Result<()> {
                 Err(err) => tracing::warn!("{err}"),
             }
             let cfg = Config::from_file(&config)?;
+            router_acp::local_state::migrate(&cfg).map_err(anyhow::Error::msg)?;
             export_router_env(&config);
             // Downstream agents run with workspace write access; they must die
             // when the router does. On a signal (goose's Ctrl+C) neither
@@ -741,6 +742,7 @@ async fn run() -> anyhow::Result<()> {
                 Err(err) => tracing::warn!("{err}"),
             }
             let cfg = Config::from_file(&config)?;
+            router_acp::local_state::migrate(&cfg).map_err(anyhow::Error::msg)?;
             export_router_env(&config);
             let cwd = match cwd {
                 Some(cwd) => cwd,

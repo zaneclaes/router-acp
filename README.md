@@ -210,7 +210,7 @@ Accounts use lower `priority` numbers first. For example, `priority: 0`, `priori
 
 `reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves.
 
-Every seat is an account named `<agent>@<id>`, with a directory `~/.config/router-acp/accounts/<agent>@<id>`. That directory holds only what lets the router switch accounts: the login, and the usage cache (the session and weekly snapshot and the measured window size) in `.router-acp-usage/`. Hosts read the cache only through `account-status`. Skills, plugins and settings stay computer-wide. Every account's adapters read them from the CLI's own directory (`~/.claude`, `~/.codex`, `~/.grok` or `~/.kimi`), so switching accounts never changes them. A reference written without the account, such as `claude/opus[1m]` in a routing directive or a delegate hint, names that agent's account seats, and account priority decides among them.
+Every seat is an account named `<agent>@<id>`, with a directory `~/.config/router-acp/accounts/<agent>@<id>`. That directory holds its portable login and account identity. Usage snapshots, measured capacity, credential-repair records and locks live in the machine's local state directory. Hosts read the cache only through `account-status`. Skills, plugins and settings stay computer-wide. Every account's adapters read them from the CLI's own directory (`~/.claude`, `~/.codex`, `~/.grok` or `~/.kimi`), so switching accounts never changes them. A reference written without the account, such as `claude/opus[1m]` in a routing directive or a delegate hint, names that agent's account seats, and account priority decides among them.
 
 A seat configured with no directory of its own still shares its CLI's directory. The router's next start makes it an account once. It copies the login into the new directory (readable only by you), so the native CLI stays signed in, and renames the seat's exact references in the configuration. From then on each side refreshes its own copy. A provider that rotates refresh tokens may later ask one of them to sign in again. A seat that already names a directory, such as an added account or a mounted volume, stays where it is. A seat configured with a directory outside the accounts folder keeps using that directory for its configuration too.
 
@@ -225,19 +225,42 @@ resolve through its `PATH`. Install router-acp and the provider adapters on the 
 For example, once the destination directory exists:
 
 ```sh
-rsync -a --exclude='.router-acp-runtime/' ~/.config/router-acp/ linux:~/.config/router-acp/
+rsync -a ~/.config/router-acp/ linux:~/.config/router-acp/
 ```
 
 Stop source router sessions and its usage monitor while taking the copy so refresh/login writes
-cannot race it. Runtime directories are disposable and are recreated on the destination; do not
-reuse them. `router-acp account-status --config ~/.config/router-acp/router.yaml` checks the copied
+cannot race it. The configuration tree needs no runtime or lock exclusions.
+`router-acp account-status --config ~/.config/router-acp/router.yaml` checks the copied
 accounts without spawning adapters or refreshing tokens. The transfer test runs with a different
 home and no provider executables or keychain, and compares all four accounts' status and settings.
+Local authentication evidence and usage caches are rebuilt on the destination; their absence
+means unknown, not logged out. A regression also copies the whole configuration tree with
+live provider sockets, credential locks, configuration locks and a login in progress.
 This is account portability: CLI-wide skills/plugins/settings in `~/.claude`, `~/.codex` and
 `~/.grok`, explicit external credential directories, and absolute project-hook or custom executable
 paths are separate machine configuration. OAuth expiry/revocation still belongs to the provider;
 two machines independently rotating copies of one refresh token can invalidate the older copy.
 An rsync is a snapshot, not distributed credential-refresh coordination.
+
+**Machine-local storage.** Adapter and login runtimes live in
+`$XDG_STATE_HOME/router-acp/runtimes/<account>-<uuid>/`, defaulting to
+`~/.local/state/router-acp/runtimes/<account>-<uuid>/` when `XDG_STATE_HOME` is unset or relative.
+Directories are private (`0700`) and runtimes are removed on exit; abandoned runtimes are
+reclaimed on the next launch without removing a live process's locked directory.
+The same state root holds `accounts/<path-hash>/` (repair records, usage caches and credential
+locks), `config-locks/<path-hash>/` (configuration write locks), and `mcp/<path-hash>/`
+(OAuth locks, pending sign-ins and connection health). Canonical paths identify owners so
+symlink aliases share a lock. Native login commands run in disposable local directories;
+only credentials and account identity are published back into configuration.
+MCP client registrations and tokens remain portable in `~/.config/router-acp/mcp/`.
+
+Restart all older router sessions and usage monitors when upgrading this storage layout.
+Starting `serve`, `prompt` or `usage-monitor` migrates old account caches and repair records,
+MCP pending/health state and unused locks, and reclaims old account-local runtime directories.
+A live legacy runtime or held legacy lock refuses migration until its process exits.
+Legacy runtimes without locks are retained for six hours after their last change.
+Read-only commands such as `account-status` do not migrate files. Sync the configuration
+directory, not the local state directory.
 
 A saved account pin also yields when its included plan is exhausted and paid usage is unavailable or denied. The router announces the replacement and applies the session's normal strategy. An unavailable prompt pin cannot block an eligible sibling, even when static fallback is disabled. A configured static strategy retains its own fallback policy.
 
