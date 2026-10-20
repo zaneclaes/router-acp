@@ -4539,6 +4539,40 @@ async fn a_fresh_exact_ci_observation_parks_a_wait_without_spawning_a_retry() {
         Ok(())
     })
     .unwrap();
+    let parked = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let census = router_acp::planner_wake::capacity_line(&f.shared, &parked);
+    assert!(
+        !census.contains("Interrupted, awaiting retry: work-1"),
+        "the parent was told to retry a worker that automatic recovery correctly parks"
+    );
+    assert!(census.contains("Waiting for exact-head CI: work-1"));
+    assert_eq!(
+        router_acp::planner_guard::works_json(&parked)[0]["waiting_build_revision"],
+        revision
+    );
+    for variant in 0..5 {
+        let mut changed = parked.clone();
+        match variant {
+            0 => {
+                changed.observations.get_mut("ci:work-1").unwrap().state =
+                    router_acp::planner_guard::ObservationState::Failed
+            }
+            1 => {
+                changed.observations.get_mut("ci:work-1").unwrap().state =
+                    router_acp::planner_guard::ObservationState::Passed
+            }
+            2 => changed.observations.get_mut("ci:work-1").unwrap().revision = "f".repeat(40),
+            3 => changed.capacity.audit.as_mut().unwrap().at_ms -= 121_000,
+            _ => changed.capacity.audit.as_mut().unwrap().ok = false,
+        }
+        assert!(
+            router_acp::planner_guard::works_json(&changed)[0]["waiting_build_revision"].is_null()
+        );
+        assert!(
+            router_acp::planner_wake::capacity_line(&f.shared, &changed)
+                .contains("Interrupted, awaiting retry: work-1")
+        );
+    }
     tick(&f.shared, now + 60).await;
     assert!(
         !planner_workflow::load(&f.shared, SID)

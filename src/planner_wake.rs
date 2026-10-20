@@ -489,12 +489,20 @@ pub fn live_workers(run: &planner_workflow::PlannerRun) -> usize {
 pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -> String {
     let cap = shared.delegate_limit();
     let live = live_workers(run);
+    let now = chrono::Utc::now().timestamp();
+    let waiting = run
+        .works
+        .iter()
+        .filter(|(_, work)| crate::planner_capacity::waiting_on_build(run, work, now))
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
     let mut interrupted = run
         .works
         .iter()
         .filter(|(id, w)| {
             w.status == planner_workflow::WorkStatus::Interrupted
                 && !w.paused
+                && !waiting.contains(&id.as_str())
                 && run
                     .capacity
                     .resumes
@@ -513,6 +521,9 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
             " Interrupted, awaiting retry: {}.",
             interrupted.join(", ")
         ));
+    }
+    if !waiting.is_empty() {
+        line.push_str(&format!(" Waiting for exact-head CI: {}. These owners handed back for fresh pending builds; do not retry unchanged waits merely to occupy worker slots. Resume on changed CI evidence or independent runnable scope.", waiting.join(", ")));
     }
     let recovery = run
         .capacity
