@@ -6331,7 +6331,7 @@ async fn run_primary_turn_inner(
     // Managed watcher completions are continuations of the same provider
     // attempt. Give them their own bounded budget so repeated CI waits do not
     // consume failover attempts or hold an upstream prompt forever.
-    for _iteration in 1..=(max_iters + 20) {
+    'attempts: for _iteration in 1..=(max_iters + 20) {
         attempt += 1;
         let Some((process_key, down_sid, candidate)) = shared
             .with_session(&router_sid, |s| {
@@ -7058,34 +7058,43 @@ async fn run_primary_turn_inner(
                             &router_sid,
                             format!("router-acp · no fallback candidate available — {pin_err}"),
                         );
-                        // Nothing else can serve. Keep the prompt open and
-                        // retry the old model when its cordon ends.
-                        if let Some(until) = retry_wait_until(&shared, &candidate) {
+                        // Keep the bounded wait, but retry routing when another
+                        // seat recovers. Availability is only a wake hint: the
+                        // ordinary selector still owns every pool/effort rule.
+                        let mut retry_error = pin_err;
+                        let mut seen_available = HashSet::new();
+                        let mut retry_mark = mark;
+                        while let Some(until) = retry_wait_until(&shared, &candidate) {
                             if !wait_for_retry(
                                 &shared,
                                 &router_sid,
                                 cancellation.clone(),
-                                mark,
+                                retry_mark,
                                 notice_reason,
                                 &candidate,
                                 until,
+                                &mut seen_available,
                             )
                             .await
                             {
                                 return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
+                            let retry_exclude =
+                                candidate_unavailable_reason(&shared, &candidate, false)
+                                    .is_some()
+                                    .then_some(&candidate);
                             match pin_session(
                                 &shared,
                                 &router_sid,
                                 &req.prompt,
                                 cancellation.as_ref(),
-                                None,
+                                retry_exclude,
                                 true,
                                 None,
                             )
                             .await
                             {
-                                Ok(PinOutcome::Pinned) => continue,
+                                Ok(PinOutcome::Pinned) => continue 'attempts,
                                 Ok(PinOutcome::Cancelled) => {
                                     return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
@@ -7096,12 +7105,13 @@ async fn run_primary_turn_inner(
                                         format!("router-acp · retry failed — {retry_err}"),
                                     );
                                     flush_pending_disclosure(&shared, &router_sid);
-                                    return Err(retry_err);
+                                    retry_error = retry_err;
+                                    retry_mark = notice_mark(&shared, &router_sid);
                                 }
                             }
                         }
                         flush_pending_disclosure(&shared, &router_sid);
-                        return Err(pin_err);
+                        return Err(retry_error);
                     }
                 }
             }
@@ -7183,8 +7193,9 @@ fn retry_wait_until(
     (wait <= std::time::Duration::from_secs(shared.cfg.failover.max_wait_secs)).then_some(until)
 }
 
-/// Announce a cordon wait, keep the prompt open until `until`, and announce
-/// the retry. Returns false when the client cancelled during the wait.
+/// Keep the prompt open until the bounded reset or a newly available candidate
+/// warrants rerunning normal selection. Returns false on client cancellation.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_retry(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -7193,6 +7204,7 @@ async fn wait_for_retry(
     reason: crate::notice::Reason,
     candidate: &CandidateId,
     until: std::time::SystemTime,
+    seen_available: &mut HashSet<CandidateId>,
 ) -> bool {
     let cfg = shared.runtime_config();
     let model = crate::notice::display(&cfg, candidate);
@@ -7229,6 +7241,7 @@ async fn wait_for_retry(
     tracing::info!(session = router_sid, %candidate, wait_secs = wait.as_secs(), "no fallback; waiting for cordon to end");
     let deadline = tokio::time::Instant::now() + wait;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut availability_changed = false;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
@@ -7237,6 +7250,21 @@ async fn wait_for_retry(
                     || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true)
                 {
                     return false;
+                }
+                // The router owns this intentional, bounded wait; silence from
+                // an adapter is expected and must not trigger its stall recovery.
+                crate::planner_watchdog::note_progress(shared, router_sid);
+                let class = shared.with_session(router_sid, |s| s.task_class)
+                    .flatten().unwrap_or(TaskClass::CodingGeneral);
+                let available: HashSet<_> = shared
+                    .eligible_views(&RequiredCaps::default(), class)
+                    .into_iter().map(|view| view.id).collect();
+                let recovered = available.difference(seen_available).next().is_some();
+                availability_changed = available.difference(seen_available)
+                    .any(|id| id != candidate);
+                *seen_available = available;
+                if recovered {
+                    break;
                 }
             }
         }
@@ -7249,10 +7277,14 @@ async fn wait_for_retry(
         crate::notice::Notice {
             kind: "retry",
             reason,
-            headline: format!("{label}: retrying {model} now"),
+            headline: if availability_changed {
+                format!("{label}: model availability changed; retrying routing")
+            } else {
+                format!("{label}: retrying {model} now")
+            },
             label,
             from: Some(candidate.to_string()),
-            to: Some(candidate.to_string()),
+            to: (!availability_changed).then(|| candidate.to_string()),
             handoff: None,
             retry_at: None,
             detail: Vec::new(),

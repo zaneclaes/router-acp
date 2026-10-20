@@ -364,6 +364,8 @@ The router degrades gracefully when seats run dry or adapters fall over, and it 
 
 Codex can report an exhausted HTTP 5xx connection failure as assistant text and still mark the turn complete. The router recognizes that terminal error only when its proxy observed the matching failed HTTP response in that turn. It starts normal outage recovery, preserving partial work and the human's model pick when that model remains eligible. Quoted errors in successful replies and errors from earlier turns do not trigger recovery. Recovery uses the existing `failover.max_attempts` budget and cordons the model like any provider outage. With failover disabled, the turn returns an error instead of false success.
 
+When all eligible models are unavailable, the bounded retry wait also watches for newly available candidates. A recovered seat reruns the normal selector immediately; model pools, exclusions, effort requirements and reserves still apply. An availability change outside those constraints leaves the existing wait in place. The router treats this deliberate wait as progress, so the planner's stalled-adapter timer does not cancel it or restart a healthy adapter; client cancellation remains effective.
+
 ### Headroom, quarantine, and availability-aware preference
 
 Without provider usage data, headroom falls back to a per-agent sliding-window counter (default 5 h) of prompts and sessions, normalized against `budget_prompts_5h`. A rate-limit/auth/quota error before the first prompt zeroes an agent's headroom; a candidate that keeps failing to open sessions is quarantined for a cool-off (`headroom.quarantine_*`). Limit, authentication and outage failures on a pinned session trigger hot failover when enabled. Other task errors are surfaced to the client.

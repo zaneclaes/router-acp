@@ -4685,6 +4685,75 @@ async fn with_no_fallback_the_prompt_waits_out_the_outage_and_retries() {
 }
 
 #[tokio::test]
+async fn quota_wait_resumes_when_another_seat_becomes_available() {
+    for exclude_alternative in [false, true] {
+        let state = temp_state_file("quota-wait-alternative");
+        let failure = if exclude_alternative {
+            "usage limit"
+        } else {
+            "usage limit; retry-after: 60"
+        };
+        let yaml = format!(
+            "state_file: {}\ndelegation: {{ enabled: false }}\nheadroom: {{ cordon_default_secs: 4 }}\n\
+         auto_upgrade: {{ enabled: false }}\nagents:\n{}{}",
+            state.display(),
+            agent_yaml(
+                "a",
+                &[("sonnet", 1)],
+                &[
+                    ("MOCK_FAIL_PROMPT_MSG", failure),
+                    ("MOCK_FAIL_PROMPT_TIMES", "1")
+                ]
+            ),
+            agent_yaml("b", &[("sonnet", 2)], &[]),
+        );
+        run_test_shared(yaml, async |cx, observed, shared| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            if exclude_alternative {
+                shared.with_session(&sid, |session| session.excluded.push("b/*".into()));
+            }
+            shared.headroom.lock().unwrap().set_usage_cordons(
+                [(
+                    CandidateId::new("b", "sonnet"),
+                    router_acp::headroom::UsageCordon {
+                        reason: "weekly reset pending".into(),
+                        resets_at: std::time::SystemTime::now() + Duration::from_secs(2),
+                        resets_at_rfc3339: String::new(),
+                        soft: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(6),
+                prompt_text(
+                    &cx,
+                    &sid,
+                    "[router: candidate=a/sonnet]\nresume existing task",
+                ),
+            )
+            .await
+            .expect("retry routing when a seat returns without bypassing exclusions")?;
+            assert_eq!(result.stop_reason, StopReason::EndTurn);
+            assert_eq!(
+                shared.with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.clone()),
+                Some(CandidateId::new(
+                    if exclude_alternative { "a" } else { "b" },
+                    "sonnet"
+                ))
+            );
+            let text = agent_text(&observed, &sid);
+            assert!(text.contains("no other model can serve"), "{text}");
+            assert!(text.contains("echo:sonnet:"), "{text}");
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn reserve_cordon_interrupts_the_active_parent_turn() {
     let state = temp_state_file("soft-cordon");
     let yaml = format!(
@@ -15025,6 +15094,34 @@ async fn a_turn_the_adapter_files_as_autonomous_ends_and_frees_the_parent() {
 /// cancelled after `stuck_turn_secs`, released `stuck_turn_cancel_secs`
 /// later (the client's prompt answers `cancelled`), its adapter is restarted,
 /// and the operator input queued behind it runs next, before the wake.
+#[tokio::test]
+async fn quota_wait_is_not_a_stalled_planner_turn() {
+    let state = temp_state_file("quota-wait-watchdog");
+    let log = temp_log("quota-wait-watchdog");
+    let repo = planner_wire_repository();
+    let yaml = planner_watchdog_yaml(&state, &log, 1, 1).replacen("      env:\n",
+        "      env:\n        - { name: MOCK_FAIL_PROMPT_MSG, value: 'usage limit' }\n        - { name: MOCK_FAIL_PROMPT_TIMES, value: '1' }\n        - { name: MOCK_FAIL_PROMPT_AFTER, value: '1' }\n", 1);
+    let yaml = format!("headroom: {{ cordon_default_secs: 4 }}\n{yaml}");
+    run_test_shared(yaml, async |cx, observed, _shared| {
+        let sid = open_planner_parent(&cx, &repo).await?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            prompt_text(&cx, &sid, "resume after the quota reset"),
+        )
+        .await
+        .expect("bounded quota wait must finish")?;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("no other model can serve"), "{text}");
+        assert!(
+            !text.contains("parent turn stalled"),
+            "intentional wait is router progress: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next() {
     let state = temp_state_file("stuck-parent");
