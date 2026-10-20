@@ -1128,24 +1128,8 @@ async fn run_prompt(
             ));
             return responder.respond(PromptResponse::new(StopReason::EndTurn));
         }
-        let quota_refused = matches!(response.status().as_u16(), 402 | 429);
         // Fully consume the response before the ACP completion, as an adapter does.
         let _ = response.bytes().await.unwrap();
-        if quota_refused && std::env::var("MOCK_PROXY_STALL_ON_LIMIT").as_deref() == Ok("1") {
-            loop {
-                if mock
-                    .state
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .get(&session_id)
-                    .is_none_or(|session| session.cancelled)
-                {
-                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        }
     }
     finish_prompt(&text, model, session_id, reply, &cx, responder)
 }
