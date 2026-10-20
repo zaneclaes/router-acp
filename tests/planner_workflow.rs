@@ -2475,6 +2475,11 @@ fn a_goose_expansion_becomes_the_role_invocation_with_its_typed_arguments() {
 #[tokio::test]
 async fn an_attempt_that_handed_off_reads_as_that_handoff() {
     let fixture = fixture(|_| {});
+    let query = || Operation::Status {
+        offset: 0,
+        work_id: Some("work-1".into()),
+    };
+    let message = "WAITING build 3729 is still running\n\nThe source under test is identical to staging; merging staging did not change the failing fixture.";
     admit(&fixture.shared, work("work-1"));
     let (actor, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
         .await
@@ -2485,7 +2490,7 @@ async fn an_attempt_that_handed_off_reads_as_that_handoff() {
         &actor,
         router_acp::delegate_hook::Handoff {
             kind: "waiting".into(),
-            message: "WAITING build 3729 is still running\nmore detail".into(),
+            message: message.into(),
         },
     )
     .unwrap();
@@ -2494,17 +2499,76 @@ async fn an_attempt_that_handed_off_reads_as_that_handoff() {
     let run = planner_workflow::load(&fixture.shared, SID)
         .unwrap()
         .unwrap();
-    let work = &run.works["work-1"];
-    assert_eq!(work.status, planner_workflow::WorkStatus::Interrupted);
+    let stopped = &run.works["work-1"];
+    assert_eq!(stopped.status, planner_workflow::WorkStatus::Interrupted);
     assert_eq!(
-        work.reason.as_deref(),
+        stopped.reason.as_deref(),
         Some("handed off `waiting`: WAITING build 3729 is still running")
     );
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(&fixture.shared, SID, None, query())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["works"][0]["handoff"]["kind"], "waiting");
+    assert_eq!(status["works"][0]["handoff"]["message"], message);
+    let list: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            &fixture.shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        list["works"][0]["handoff"].is_null(),
+        "queue reads stay compact"
+    );
+
+    // Targeting a work does not let another worker read its handoff.
+    admit(&fixture.shared, work("work-2"));
+    let (other, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-2")
+        .await
+        .unwrap();
+    let hidden: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(&fixture.shared, SID, Some(&other), query())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(hidden["works"].as_array().unwrap().is_empty());
 
     // A new attempt forgets the old handoff; ending it without one reads as before.
     let (next, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
         .await
         .unwrap();
+    planner_workflow::record_handoff(
+        &fixture.shared,
+        SID,
+        &actor,
+        router_acp::delegate_hook::Handoff {
+            kind: "waiting".into(),
+            message: "stale evidence".into(),
+        },
+    )
+    .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(&fixture.shared, SID, None, query())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        status["works"][0]["handoff"].is_null(),
+        "a new attempt clears old evidence and ignores stale writes"
+    );
     planner_workflow::attempt_ended(&fixture.shared, SID, &next, None, "gone".into(), false)
         .unwrap();
     let run = planner_workflow::load(&fixture.shared, SID)

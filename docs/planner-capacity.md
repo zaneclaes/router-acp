@@ -203,7 +203,11 @@ every wake repeats the host state, the holds and the last auto-admission.
 permits. Direct ACP `router.worker_limit` acknowledges immediate increases; decreases need
 a configured restart. Kory's current Goose config handler does not forward this custom
 option; use the configured limit on restart there, and never infer live capacity from
-a file edit. Targeted `status {work_id}` gives compact capacity. Progress
+a file edit. Targeted `status {work_id}` gives compact capacity and the current attempt's
+full structured `handoff`, including the diagnosis after its first-line wait summary.
+Queue-wide reads keep the compact `reason`; targeting a work retains worker visibility
+restrictions. A replacement attempt clears the prior handoff, and stale attempts cannot
+restore it. Progress
 separates work counts from host-observed landed guides. See [durable progress](planner-throughput.md).
 
 Router-owned `capacity:`, `auto-admit:`, `inflight:`, `audit:`, `gate:` and

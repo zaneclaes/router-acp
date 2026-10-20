@@ -1338,6 +1338,7 @@ async fn operate_once(
                 "revision":work.artifact.as_ref().map(|a| &a.revision),"review":work.review.as_ref().map(|r| json!({"revision":r.revision,"accepted":r.accepted})),
                 "paused":work.paused,"recovery":run.capacity.resumes.get(id),"reconciliation":work.reconciliation,
                 "spec":work_id.as_ref().map(|_| &work.spec),
+                "handoff":work_id.as_ref().and(work.handoff.as_ref()),
                 "ready_at_ms":work.ready_at_ms,"ready_age_secs":work.ready_at_ms.map(|at| (chrono::Utc::now().timestamp_millis() - at).max(0) / 1000),
                 "required_checks":work.spec.required_checks,"required_integration_evidence":work.spec.required_integration_evidence,
                 "unresolved":work.artifact.as_ref().map(|a| &a.unresolved),
