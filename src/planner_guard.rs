@@ -314,6 +314,7 @@ pub fn works_json(run: &PlannerRun) -> Vec<Value> {
         .map(|(id, w)| {
             json!({"work_id":id,"plan_id":w.spec.plan_id,"status":w.status,
                 "external_id":w.spec.external_id,
+                "attempt_active":w.attempt.as_ref().is_some_and(|attempt| !attempt.ended),
                 "revision":w.artifact.as_ref().map(|a| &a.revision)})
         })
         .collect()

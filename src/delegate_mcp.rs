@@ -1076,9 +1076,11 @@ pub async fn start_background_delegate(
         router_sid,
         job_id,
         &summary,
-        identity.is_some(),
-        claim,
-        None,
+        BackgroundJobBinding {
+            planner: identity.is_some(),
+            claim,
+            resume_of: None,
+        },
         async move {
             match identity {
                 Some(identity) => {
@@ -1124,11 +1126,19 @@ fn start_background_followup(
         router_sid,
         job_id,
         &summary,
-        planner,
-        claim,
-        resume_of,
+        BackgroundJobBinding {
+            planner,
+            claim,
+            resume_of,
+        },
         async move { run_delegate_followup(&task_shared, &task_sid, args).await },
     )
+}
+
+struct BackgroundJobBinding {
+    planner: bool,
+    claim: Option<crate::session::PlannerJobClaim>,
+    resume_of: Option<String>,
 }
 
 /// Register a background job, run `job` on its own tokio task, and return
@@ -1139,11 +1149,14 @@ fn start_background_job(
     router_sid: &str,
     job_id: String,
     summary: &str,
-    planner: bool,
-    claim: Option<crate::session::PlannerJobClaim>,
-    resume_of: Option<String>,
+    binding: BackgroundJobBinding,
     job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
 ) -> Result<String, String> {
+    let BackgroundJobBinding {
+        planner,
+        claim,
+        resume_of,
+    } = binding;
     if shared.with_session(router_sid, |_| ()).is_none() {
         return Err("parent session no longer exists".to_string());
     }

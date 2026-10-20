@@ -1519,6 +1519,15 @@ async fn operate_once(
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
             }
+            if existing.handoff.as_ref().is_some_and(|handoff| {
+                matches!(
+                    handoff.kind.as_str(),
+                    "ownership_requested" | "reassignment_required"
+                )
+            }) && work == existing.spec
+            {
+                return Err("resolve the ownership/reassignment request with a corrected scope or source ownership in WorkSpec; unchanged custody evidence cannot resolve it".into());
+            }
             // An allocator refusal can leave an admitted identity without a workspace.
             // Validate the corrected brief first, then retry its supported allocator;
             // existing allocations still require their original source to be restored.
@@ -2582,6 +2591,14 @@ pub fn record_handoff(
             .is_some_and(|attempt| attempt.id == actor.attempt_id && !attempt.ended)
         {
             work.handoff = Some(handoff.clone());
+            if matches!(
+                handoff.kind.as_str(),
+                "ownership_requested" | "reassignment_required"
+            ) {
+                // Replaying the same brief cannot resolve missing ownership.
+                // Use the existing parent reconciliation path before dispatch.
+                mark_reconciliation_required(work);
+            }
         }
         Ok(())
     })

@@ -78,6 +78,18 @@ and release checkpoints priority over ordinary WIP build observations, reviews a
 An unfinished release (including a failed deploy, corrective selection and owed disposition)
 selects `integrate-plan` for ordinary implementation wakes. Superseded, abandoned and disposed
 rounds do not. Explicit operator commands retain their normal selection/planning role.
+An unresolved failed staging/production build also selects integration on later wakes,
+even when its failure notification was acknowledged and no release record exists yet.
+Acknowledgment clears delivery, not the failed build or a stopped repair's ownership request;
+fresh environment build evidence clears that recovery priority. Ordinary WIP failures and
+advisory job notifications do not acquire this persistent environment priority.
+Host work summaries include `attempt_active`, derived from the current attempt rather
+than a stale work-status label, so a repository audit can identify a broken environment
+with no active repair workers. Missing metadata in older callers remains unknown.
+Finished source waiting for integration also selects the integration role before routine
+review, even before the parent records a release selection. The role still verifies exact
+qualification, corrective isolation and dependencies; role selection never selects a candidate
+or substitutes for a release gate. Accepted or review-pending work alone does not trigger it.
 The integration role advances the release first or reconciles its concrete prerequisite,
 then handles independent work while that prerequisite is pending. This changes only parent
 role selection and wake ordering: child execution, admission, holds and release gates remain
@@ -142,6 +154,10 @@ one reconciliation wake. Missing workspaces and unmet prerequisites suspend befo
 any model attempt. The fingerprint includes reason, prerequisite, artifact, workspace
 lease and review. Changed conditions rearm recovery; explicit parent retry remains
 possible. Paused work never auto-resumes. Accepted unchanged packets resume finish-work.
+An `ownership_requested` or `reassignment_required` handoff also fences the old brief through
+the existing reconciliation state. Once the attempt stops, the parent resolves its scope and
+source ownership with `planner_workflow reconcile` before dispatching again. Merely restarting
+the same assignment cannot satisfy the request or count as active failed-gate repair progress.
 
 A parent's background dispatch claims the work before returning its job id. Claim errors
 are synchronous tool failures, not orphaned background results. Later background failures

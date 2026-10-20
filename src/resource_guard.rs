@@ -209,7 +209,7 @@ pub fn start() -> io::Result<Option<Guard>> {
     let mut receipt = [0];
     if unsafe { libc::poll(&mut poll, 1, 5000) } <= 0
         || ready.read_exact(&mut receipt).is_err()
-        || receipt != [b'R']
+        || receipt != *b"R"
     {
         let _ = child.kill();
         let _ = child.wait();

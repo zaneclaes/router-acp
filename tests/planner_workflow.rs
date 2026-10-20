@@ -150,6 +150,37 @@ fn authorize(shared: &Arc<Shared>) {
 }
 
 #[test]
+fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    admit(&f.shared, work("release-repair"));
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let active = |run: &planner_workflow::PlannerRun| {
+        router_acp::planner_guard::works_json(run)[0]["attempt_active"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(!active(&run));
+    let work = run.works.get_mut("release-repair").unwrap();
+    work.status = WorkStatus::Interrupted;
+    work.attempt = Some(planner_workflow::Attempt {
+        id: "attempt".into(),
+        router_pid: std::process::id(),
+        router_started_at_ms: 0,
+        delegate_id: None,
+        ended: false,
+    });
+    assert!(active(&run));
+    let work = run.works.get_mut("release-repair").unwrap();
+    work.status = WorkStatus::Running;
+    work.attempt.as_mut().unwrap().ended = true;
+    assert!(
+        !active(&run),
+        "a stale running label hid the absence of an active repair attempt"
+    );
+}
+
+#[test]
 fn external_monitor_input_is_durable_agent_origin_and_idempotent_after_delivery() {
     let f = fixture(|_| {});
     authorize(&f.shared);
@@ -4573,6 +4604,102 @@ async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_p
         RunStore::load(&*store, "next").unwrap().unwrap().releases["round"].stage(),
         Stage::CandidatePassed
     );
+}
+
+#[tokio::test]
+async fn ownership_handoffs_require_reconciliation_before_restarting_the_same_brief() {
+    for kind in ["ownership_requested", "reassignment_required"] {
+        let f = fixture(|_| {});
+        admit(&f.shared, work("release-repair"));
+        let (old, workspace, _, _) = planner_workflow::begin_work(&f.shared, SID, "release-repair")
+            .await
+            .unwrap();
+        planner_workflow::record_handoff(
+            &f.shared,
+            SID,
+            &old,
+            router_acp::delegate_hook::Handoff {
+                kind: kind.into(),
+                message: "owned fixes pass; the suite blocker needs additional source ownership"
+                    .into(),
+            },
+        )
+        .unwrap();
+        planner_workflow::attempt_ended(
+            &f.shared,
+            SID,
+            &old,
+            None,
+            "requested parent ownership".into(),
+            false,
+        )
+        .unwrap();
+        let error = planner_workflow::begin_work(&f.shared, SID, "release-repair")
+            .await
+            .expect_err("the unchanged brief must not be replayed after an ownership request");
+        assert!(error.contains("reconcile"));
+        let mut corrected = work("release-repair");
+        corrected.scope = "fix the named suite blocker with the reconciled ownership".into();
+        corrected.owned_paths = vec!["suite-fixture.cs".into()];
+        let revision = git(&workspace.path, &["rev-parse", "HEAD"]);
+        let unchanged = planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Reconcile {
+                key: "custody-only".into(),
+                work: work("release-repair"),
+                source_revision: revision.clone(),
+                evidence: vec!["the same worktree is clean and pushed".into()],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            unchanged.contains("corrected scope"),
+            "custody-only reconciliation replayed the unresolved request"
+        );
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Reconcile {
+                key: "resolve-request".into(),
+                work: corrected,
+                source_revision: revision.clone(),
+                evidence: vec![
+                    "parent resolved the exact request and preserved its qualified source".into(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        let (current, _, _, prompt) =
+            planner_workflow::begin_work(&f.shared, SID, "release-repair")
+                .await
+                .unwrap();
+        assert_ne!(current.attempt_id, old.attempt_id);
+        assert!(prompt.contains("named suite blocker"));
+        assert_eq!(git(&workspace.path, &["rev-parse", "HEAD"]), revision);
+        planner_workflow::record_handoff(
+            &f.shared,
+            SID,
+            &old,
+            router_acp::delegate_hook::Handoff {
+                kind: kind.into(),
+                message: "stale request".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            !planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .works["release-repair"]
+                .reconciliation
+                .required
+        );
+    }
 }
 
 #[tokio::test]

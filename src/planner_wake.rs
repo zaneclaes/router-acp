@@ -560,6 +560,23 @@ fn environment_wake(id: &str) -> bool {
     )
 }
 
+fn integration_pending(
+    observations: &std::collections::BTreeMap<String, crate::planner_guard::Observation>,
+    mut work_states: impl Iterator<Item = planner_workflow::WorkStatus>,
+    ids: &[String],
+) -> bool {
+    work_states.any(|state| state == planner_workflow::WorkStatus::Finished)
+        || ids.iter().any(|id| environment_wake(id))
+        || ["staging", "production"].into_iter().any(|environment| {
+            observations
+                .get(&format!("ci:{environment}"))
+                .is_some_and(|observation| {
+                    observation.reference == environment
+                        && observation.state == crate::planner_guard::ObservationState::Failed
+                })
+        })
+}
+
 fn wake_priority(id: &str) -> u8 {
     if id.starts_with("input:") {
         0
@@ -664,7 +681,11 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         run.phase,
         input_ids.iter().any(|id| run.commands.contains(id)),
         run.releases.values(),
-        ids.iter().any(|id| environment_wake(id)),
+        integration_pending(
+            &run.observations,
+            run.works.values().map(|work| work.status),
+            &ids,
+        ),
     );
     let task = if role == PlannerRole::IntegratePlan {
         "First advance the open release or reconcile its concrete repair/build prerequisite. Failed staging/production recovery takes priority over routine review and bulk refill; independent WIP workers continue. Then reconcile the supplied work identities as that prerequisite permits, acknowledging wakes only after their own reconciliation. Preserve human authorization and all release gates."
@@ -942,6 +963,128 @@ mod steer_tests {
                 ),
                 PlannerRole::ReviewWork
             );
+        }
+    }
+
+    #[test]
+    fn acknowledged_environment_failure_keeps_repair_priority_on_later_wakes() {
+        use crate::config::PlannerPhase;
+        use crate::planner_guard::{Observation, ObservationState};
+        // The failed deploy predates any release record. Its notification was
+        // acknowledged; a stopped repair now asks the parent for ownership while
+        // unrelated branch results keep arriving. Acknowledgment is not recovery.
+        let ids = vec![
+            "done:repair-needs-ownership".into(),
+            "observation:ci:other-worker".into(),
+        ];
+        for environment in ["staging", "production"] {
+            let mut observations = BTreeMap::from([(
+                format!("ci:{environment}"),
+                Observation {
+                    revision: "a".repeat(40),
+                    reference: environment.into(),
+                    state: ObservationState::Failed,
+                    evidence: "exact required build failed; repair handoff pending".into(),
+                },
+            )]);
+            let role = |observations: &BTreeMap<String, Observation>| {
+                wake_role(
+                    PlannerPhase::Implementation,
+                    false,
+                    std::iter::empty(),
+                    integration_pending(observations, std::iter::empty(), &ids),
+                )
+            };
+            assert_eq!(
+                role(&observations),
+                PlannerRole::IntegratePlan,
+                "acknowledged {environment} failure was demoted to unrelated packet review"
+            );
+            for state in [
+                ObservationState::Passed,
+                ObservationState::Pending,
+                ObservationState::Unknown,
+            ] {
+                observations
+                    .get_mut(&format!("ci:{environment}"))
+                    .unwrap()
+                    .state = state;
+                assert_eq!(role(&observations), PlannerRole::ReviewWork);
+            }
+            observations
+                .get_mut(&format!("ci:{environment}"))
+                .unwrap()
+                .state = ObservationState::Failed;
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Implementation,
+                    true,
+                    std::iter::empty(),
+                    integration_pending(&observations, std::iter::empty(), &ids)
+                ),
+                PlannerRole::SelectPlan
+            );
+            assert_eq!(
+                wake_role(
+                    PlannerPhase::Planning,
+                    false,
+                    std::iter::empty(),
+                    integration_pending(&observations, std::iter::empty(), &ids)
+                ),
+                PlannerRole::ReviewWork
+            );
+            observations
+                .get_mut(&format!("ci:{environment}"))
+                .unwrap()
+                .reference = "wip/other-worker".into();
+            assert_eq!(role(&observations), PlannerRole::ReviewWork);
+        }
+        for key in ["ci:other-worker", "ci-job-failures:staging"] {
+            let observations = BTreeMap::from([(
+                key.into(),
+                Observation {
+                    revision: "a".repeat(40),
+                    reference: "staging".into(),
+                    state: ObservationState::Failed,
+                    evidence: "advisory or unrelated failure".into(),
+                },
+            )]);
+            assert!(!integration_pending(
+                &observations,
+                std::iter::empty(),
+                &ids
+            ));
+        }
+    }
+
+    #[test]
+    fn finished_source_advances_the_pipeline_before_unrelated_reviews() {
+        use crate::config::PlannerPhase;
+        use planner_workflow::WorkStatus;
+        let observations = BTreeMap::new();
+        let ids = vec!["observation:ci:unrelated-worker".into()];
+        let role = |state| {
+            wake_role(
+                PlannerPhase::Implementation,
+                false,
+                std::iter::empty(),
+                integration_pending(&observations, [state].into_iter(), &ids),
+            )
+        };
+        assert_eq!(
+            role(WorkStatus::Finished),
+            PlannerRole::IntegratePlan,
+            "ready source was left behind routine review because no release had been selected yet"
+        );
+        for state in [
+            WorkStatus::Running,
+            WorkStatus::ReviewPending,
+            WorkStatus::Accepted,
+            WorkStatus::Interrupted,
+            WorkStatus::Integrated,
+            WorkStatus::Watching,
+        ] {
+            assert_eq!(role(state), PlannerRole::ReviewWork);
         }
     }
 
