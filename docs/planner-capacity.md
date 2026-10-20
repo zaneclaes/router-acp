@@ -76,8 +76,11 @@ and expire on their own.
 Parent wake delivery gives staging/production build, failed-job and smoke observations
 and release checkpoints priority over ordinary WIP build observations, reviews and refill.
 An unfinished release (including a failed deploy, corrective selection and owed disposition)
-selects `integrate-plan` for ordinary implementation wakes. Superseded, abandoned and disposed
-rounds do not. Explicit operator commands retain their normal selection/planning role.
+selects `integrate-plan` for implementation wakes and explicit `implement` commands,
+including the first turn after adoption or a drained restart. Superseded, abandoned and
+disposed rounds do not. Command admission and wake delivery share the same role selector;
+the operator's arguments and scope are preserved. Explicit planning still selects
+`create-plan`, and implementation without integration work selects `select-plan`.
 An unresolved failed staging/production build also selects integration on later wakes,
 even when its failure notification was acknowledged and no release record exists yet.
 Acknowledgment clears delivery, not the failed build or a stopped repair's ownership request;

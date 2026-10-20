@@ -603,21 +603,38 @@ fn wake_role<'a>(
     mut releases: impl Iterator<Item = &'a crate::planner_release::Release>,
     environment_changed: bool,
 ) -> PlannerRole {
-    if explicit_command {
+    if phase == crate::config::PlannerPhase::Implementation
+        && (environment_changed || releases.any(crate::planner_release::Release::active))
+    {
+        // Implementation commands resume the deployment obligation too. Choosing
+        // SelectPlan unconditionally here or at command admission demotes an
+        // adopted failed release to general refill for the entire first turn.
+        PlannerRole::IntegratePlan
+    } else if explicit_command {
         match phase {
             crate::config::PlannerPhase::Planning => PlannerRole::CreatePlan,
             crate::config::PlannerPhase::Implementation => PlannerRole::SelectPlan,
         }
-    } else if phase == crate::config::PlannerPhase::Implementation
-        && (environment_changed || releases.any(crate::planner_release::Release::active))
-    {
-        // A failed deploy and its corrective candidate stay the parent's integration job.
-        // This selects a role only; independent child execution, ownership and admission
-        // remain unchanged. The role handles genuine release waits before routine review.
-        PlannerRole::IntegratePlan
     } else {
         PlannerRole::ReviewWork
     }
+}
+
+pub(crate) fn parent_role(
+    run: &planner_workflow::PlannerRun,
+    explicit_command: bool,
+    ids: &[String],
+) -> PlannerRole {
+    wake_role(
+        run.phase,
+        explicit_command,
+        run.releases.values(),
+        integration_pending(
+            &run.observations,
+            run.works.values().map(|work| work.status),
+            ids,
+        ),
+    )
 }
 
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
@@ -677,15 +694,10 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         .iter()
         .filter_map(|id| id.strip_prefix("input:").map(str::to_string))
         .collect::<Vec<_>>();
-    let role = wake_role(
-        run.phase,
+    let role = parent_role(
+        &run,
         input_ids.iter().any(|id| run.commands.contains(id)),
-        run.releases.values(),
-        integration_pending(
-            &run.observations,
-            run.works.values().map(|work| work.status),
-            &ids,
-        ),
+        &ids,
     );
     let task = if role == PlannerRole::IntegratePlan {
         "First advance the open release or reconcile its concrete repair/build prerequisite. Failed staging/production recovery takes priority over routine review and bulk refill; independent WIP workers continue. Then reconcile the supplied work identities as that prerequisite permits, acknowledging wakes only after their own reconciliation. Preserve human authorization and all release gates."
@@ -926,7 +938,7 @@ mod steer_tests {
                     [&release].into_iter(),
                     false
                 ),
-                PlannerRole::SelectPlan
+                PlannerRole::IntegratePlan
             );
             assert_eq!(
                 wake_role(PlannerPhase::Planning, false, [&release].into_iter(), false),
@@ -1022,7 +1034,7 @@ mod steer_tests {
                     std::iter::empty(),
                     integration_pending(&observations, std::iter::empty(), &ids)
                 ),
-                PlannerRole::SelectPlan
+                PlannerRole::IntegratePlan
             );
             assert_eq!(
                 wake_role(

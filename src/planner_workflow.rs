@@ -848,10 +848,7 @@ fn user_command_once(
         run.execution_request = Some(display_text(original));
         run.execution_input_id = Some(input_id.clone());
     }
-    let role = match phase {
-        PlannerPhase::Planning => PlannerRole::CreatePlan,
-        PlannerPhase::Implementation => PlannerRole::SelectPlan,
-    };
+    let role = crate::planner_wake::parent_role(&run, true, &[]);
     let entrypoint_name = match phase {
         PlannerPhase::Planning => "plan",
         PlannerPhase::Implementation => "implement",
@@ -872,7 +869,7 @@ fn user_command_once(
                 skill.name, skill.text
             ));
         } else {
-            instructions.push_str("\nThe explicit repository implementation entrypoint is retained for the selected implementation assignment. Selection must complete before invoking it.");
+            instructions.push_str("\nThe explicit repository implementation entrypoint is retained for worker assignments. Continue with the parent role above.");
             run.policy_entrypoint(&input_id, &skill);
         }
     }

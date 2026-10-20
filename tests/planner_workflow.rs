@@ -682,6 +682,60 @@ async fn return_to_planning_preserves_active_work_but_stops_new_dispatch() {
     assert_ne!(replacement.attempt_id, actor.attempt_id);
 }
 
+#[test]
+fn implementation_resume_keeps_failed_environment_priority_and_operator_arguments() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    for environment in ["staging", "production"] {
+        for failed in [true, false] {
+            let f = fixture(|_| {});
+            planner_workflow::ensure(&f.shared, SID).unwrap();
+            planner_workflow::mutate(&f.shared, SID, |run| {
+                run.status = RunStatus::Paused;
+                run.observations.insert(
+                    format!("ci:{environment}"),
+                    Observation {
+                        revision: "a".repeat(40),
+                        reference: environment.into(),
+                        state: if failed {
+                            ObservationState::Failed
+                        } else {
+                            ObservationState::Passed
+                        },
+                        evidence: "required environment gate".into(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+            let mut command =
+                input_request(Some("resume"), "/implement admitted scope only", false);
+            planner_workflow::user_command(&f.shared, SID, &mut command).unwrap();
+            let expected = if failed {
+                "integrate-plan"
+            } else {
+                "select-plan"
+            };
+            assert_eq!(
+                command.meta.as_ref().unwrap()["router_acp"]["planner_role"],
+                expected,
+                "resume demoted {environment} recovery to general selection"
+            );
+            assert!(command.prompt.iter().any(|block| matches!(block,
+                ContentBlock::Text(text) if text.text.contains("Arguments: admitted scope only"))));
+            let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Running);
+            assert_eq!(run.execution_input_id.as_deref(), Some("resume"));
+            // An explicit return to planning is still a change of authorization.
+            let mut planning = input_request(Some("plan-again"), "/plan refine scope", false);
+            planner_workflow::user_command(&f.shared, SID, &mut planning).unwrap();
+            assert_eq!(
+                planning.meta.as_ref().unwrap()["router_acp"]["planner_role"],
+                "create-plan"
+            );
+        }
+    }
+}
+
 /// Adoption moves every work into the adopting run and marks the old run
 /// superseded, but the workspace claims stay under the old session. The adopting
 /// run must take each claim over; a live run's claim on its own work is kept.
@@ -4604,6 +4658,21 @@ async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_p
         RunStore::load(&*store, "next").unwrap().unwrap().releases["round"].stage(),
         Stage::CandidatePassed
     );
+    drop(store);
+    let mut command = input_request(
+        Some("adopted-resume"),
+        "/implement continue admitted scope",
+        false,
+    );
+    command.session_id = "next".into();
+    planner_workflow::user_command(&f.shared, "next", &mut command).unwrap();
+    assert_eq!(
+        command.meta.as_ref().unwrap()["router_acp"]["planner_role"],
+        "integrate-plan"
+    );
+    let resumed = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert!(resumed.works["retry"].reconciliation.required);
+    assert_eq!(resumed.releases["round"].stage(), Stage::CandidatePassed);
 }
 
 #[tokio::test]
