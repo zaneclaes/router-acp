@@ -11804,6 +11804,82 @@ async fn model_at_capacity_reply_passes_through_when_disabled() {
 }
 
 #[tokio::test]
+async fn proxy_quota_refusal_fails_over_when_adapter_never_returns() {
+    use axum::{Router, http::StatusCode, routing::post};
+    let app = Router::new().route(
+        "/responses",
+        post(|| async {
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                "Grok Build usage balance exhausted",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = temp_state_file("proxy-quota-stall");
+    let log = temp_log("proxy-quota-stall");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\n\
+         llm_proxy: {{ enabled: true, listen: '127.0.0.1:0' }}\nagents:\n{}\
+         \x20   llm_proxy:\n      base_url_env: OPENAI_BASE_URL\n\
+         \x20     upstream_base_url: 'http://{address}'\n      protocol: openai\n{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("sonnet", 1)],
+            &[
+                ("MOCK_PROXY_REPLY", "1"),
+                ("MOCK_PROXY_STALL_ON_LIMIT", "1"),
+                ("MOCK_LOG", &log.display().to_string())
+            ]
+        ),
+        agent_yaml(
+            "b",
+            &[("sonnet", 2)],
+            &[("MOCK_LOG", &log.display().to_string())]
+        ),
+    );
+    run_test_shared(yaml, async move |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            prompt_text(
+                &cx,
+                &sid,
+                "[router: candidate=a/sonnet]\nTEXT:Preserved partial work.\ncontinue the existing work",
+            ),
+        )
+        .await
+        .expect("quota response must trigger failover without an ACP reply")?;
+        assert!(shared.headroom.lock().unwrap().cordon_active("a").is_some());
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("Account limit"), "{text}");
+        assert!(
+            text.contains("echo:sonnet:"),
+            "replacement answered: {text}"
+        );
+        let prompts: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|entry| entry["event"] == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 2, "one original and one replacement prompt");
+        assert!(
+            prompts[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Do not repeat completed actions")
+        );
+        Ok(())
+    })
+    .await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn transport_error_as_text_recovers_the_human_pick_with_hot_context() {
     use axum::http::StatusCode;
     use axum::{Router, routing::post};

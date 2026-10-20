@@ -2199,6 +2199,19 @@ fn complete_request(
     error: Option<String>,
 ) {
     context.response_status.store(status, Ordering::Release);
+    // Some adapters retain an unanswered ACP prompt after consuming a quota
+    // refusal. Feed the observed inference failure to the existing availability
+    // machinery now; its turn watcher owns cancellation and normal failover.
+    // Only a complete, attributed limit response is evidence. Successful prose,
+    // authentication errors and incomplete transports must not cordon a seat.
+    if matches!(status, 402 | 429) && error.is_none() {
+        let refusal = agent_client_protocol::Error::internal_error()
+            .data(String::from_utf8_lossy(captured).into_owned());
+        let class = crate::limits::classify_failure(&refusal);
+        if matches!(class, crate::limits::FailureClass::RateLimited { .. }) {
+            crate::session::apply_failure(shared, &context.model, &refusal, &class);
+        }
+    }
     let usage = parse_response_usage(captured, context.protocol);
     let cost = request_cost(
         shared,
@@ -3255,6 +3268,49 @@ agents:
             .map(|(_, value)| value.as_str())
             .collect();
         assert_eq!(values, vec!["false"]);
+    }
+
+    #[test]
+    fn proxy_quota_evidence_preserves_failure_scope_and_exclusions() {
+        for (status, body, incomplete, scope) in [
+            (402, "Grok Build usage balance exhausted", false, Some(true)),
+            (429, "usage limit; retry-after: 10", false, Some(true)),
+            (402, "monthly spend limit reached", false, Some(false)),
+            (200, "quoted usage limit", false, None),
+            (401, "usage limit", false, None),
+            (500, "usage limit", false, None),
+            (402, "unknown failure", false, None),
+            (429, "Selected model is at capacity", false, None),
+            (402, "usage limit", true, None),
+        ] {
+            let (_dir, shared) = policy_shared();
+            let candidate = CandidateId::new("mock", "sonnet");
+            complete_request(
+                &shared,
+                CompletionContext {
+                    request_id: "quota-evidence".into(),
+                    response_status: Arc::new(AtomicU16::new(0)),
+                    state_sid: "r1".into(),
+                    model: candidate.clone(),
+                    protocol: LlmWireProtocol::Openai,
+                    started: Instant::now(),
+                },
+                status,
+                body.as_bytes(),
+                incomplete.then(|| "incomplete response".into()),
+            );
+            let mut headroom = shared.headroom.lock().unwrap();
+            assert_eq!(
+                headroom.cordon_active("mock").is_some(),
+                scope == Some(true),
+                "{status} {body}"
+            );
+            assert_eq!(
+                headroom.usage_cordon(&candidate).is_some(),
+                scope == Some(false),
+                "{status} {body}"
+            );
+        }
     }
 
     #[test]
