@@ -2455,7 +2455,8 @@ struct TurnGate<'a> {
 /// A planner child is different: it is continued with no cap (immediately,
 /// then after 30 s, 2 min and every 5 min), a hook that cannot judge its turn
 /// continues it too, and a shutdown drain's message reaches it at its turn
-/// end. Only a stopped run, a paused work or a drain's cancel ends that.
+/// end. Repeated turns with no agent output or tools require parent reconciliation;
+/// adapter warnings alone cannot keep an unusable worker alive indefinitely.
 async fn gate_turns(
     shared: &Arc<Shared>,
     gate: &TurnGate<'_>,
@@ -2468,6 +2469,7 @@ async fn gate_turns(
         return Ok(resp);
     }
     let mut continued = 0u32;
+    let mut inactive_turns = 0u32;
     loop {
         if !matches!(
             resp.stop_reason,
@@ -2498,6 +2500,34 @@ async fn gate_turns(
                     crate::delegate_hook::TurnVerdict::Release => return Ok(resp),
                     crate::delegate_hook::TurnVerdict::Continue(message) => {
                         if let Some(identity) = gate.planner {
+                            inactive_turns = if crate::planner_watchdog::had_agent_activity(
+                                shared,
+                                gate.sub_sid,
+                            ) {
+                                0
+                            } else {
+                                inactive_turns + 1
+                            };
+                            if inactive_turns >= crate::planner_capacity::SAME_FAILURE_LIMIT {
+                                let reason = format!(
+                                    "worker hook returned {inactive_turns} consecutive turns without agent output or tool activity; reconcile the worker's runtime prerequisites before retrying"
+                                );
+                                crate::planner_workflow::mutate(shared, gate.parent_sid, |run| {
+                                    let work = run
+                                        .works
+                                        .get_mut(&identity.work_id)
+                                        .ok_or("work disappeared")?;
+                                    if work.attempt.as_ref().is_none_or(|attempt| {
+                                        attempt.id != identity.attempt_id || attempt.ended
+                                    }) {
+                                        return Err("worker attempt changed".into());
+                                    }
+                                    crate::planner_workflow::mark_reconciliation_required(work);
+                                    Ok(())
+                                })
+                                .map_err(|error| AcpError::internal_error().data(error))?;
+                                return Err(AcpError::internal_error().data(reason));
+                            }
                             match crate::planner_guard::child_continuation(
                                 shared,
                                 gate.parent_sid,

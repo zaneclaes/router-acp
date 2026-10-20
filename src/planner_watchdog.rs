@@ -41,6 +41,8 @@ use crate::session::Shared;
 #[derive(Debug, Clone, Copy)]
 pub struct TurnProgress {
     pub at: Instant,
+    /// Actual agent output or tool activity in this prompt, excluding adapter notices.
+    pub agent_activity: bool,
     /// When the adapter last reported a result frame attributed to an
     /// autonomous cycle, with nothing after it.
     pub autonomous_result_at: Option<Instant>,
@@ -49,10 +51,13 @@ pub struct TurnProgress {
 /// Any downstream progress for `sid` (a router or delegate session id).
 pub fn note_progress(shared: &Shared, sid: &str) {
     let now = Instant::now();
-    shared.turn_progress.lock().unwrap().insert(
+    let mut progress = shared.turn_progress.lock().unwrap();
+    let agent_activity = progress.get(sid).is_some_and(|p| p.agent_activity);
+    progress.insert(
         sid.to_string(),
         TurnProgress {
             at: now,
+            agent_activity,
             autonomous_result_at: None,
         },
     );
@@ -64,13 +69,41 @@ pub fn note_progress(shared: &Shared, sid: &str) {
 pub fn note_update(shared: &Shared, sid: &str, params: &Value) {
     let autonomous = is_autonomous_result(params);
     let now = Instant::now();
-    shared.turn_progress.lock().unwrap().insert(
+    let mut progress = shared.turn_progress.lock().unwrap();
+    let agent_activity =
+        progress.get(sid).is_some_and(|p| p.agent_activity) || is_agent_activity(params);
+    progress.insert(
         sid.to_string(),
         TurnProgress {
             at: now,
+            agent_activity,
             autonomous_result_at: autonomous.then_some(now),
         },
     );
+}
+
+fn is_agent_activity(params: &Value) -> bool {
+    params.get("update").is_some_and(|update| {
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("tool_call" | "tool_call_update") => true,
+            Some("agent_message_chunk" | "agent_thought_chunk") => {
+                update
+                    .pointer("/_meta/claudeCode/kind")
+                    .and_then(Value::as_str)
+                    != Some("informational")
+            }
+            _ => false,
+        }
+    })
+}
+
+pub fn had_agent_activity(shared: &Shared, sid: &str) -> bool {
+    shared
+        .turn_progress
+        .lock()
+        .unwrap()
+        .get(sid)
+        .is_some_and(|p| p.agent_activity)
 }
 
 fn is_autonomous_result(params: &Value) -> bool {
@@ -87,7 +120,14 @@ fn is_autonomous_result(params: &Value) -> bool {
 
 /// The turn for `sid` starts now: earlier frames belong to earlier turns.
 pub fn begin(shared: &Shared, sid: &str) {
-    note_progress(shared, sid);
+    shared.turn_progress.lock().unwrap().insert(
+        sid.to_string(),
+        TurnProgress {
+            at: Instant::now(),
+            agent_activity: false,
+            autonomous_result_at: None,
+        },
+    );
 }
 
 pub fn last_progress(shared: &Shared, sid: &str) -> Option<Instant> {
@@ -285,6 +325,27 @@ async fn restart_adapter(shared: &Arc<Shared>, sid: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_warnings_are_not_agent_work_but_tools_and_agent_chunks_are() {
+        let warning = serde_json::json!({"update": {"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hook failed"},
+            "_meta": {"claudeCode": {"kind": "informational", "level": "warning"}}}});
+        assert!(!is_agent_activity(&warning));
+        for kind in [
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk",
+            "agent_thought_chunk",
+        ] {
+            assert!(is_agent_activity(
+                &serde_json::json!({"update": {"sessionUpdate": kind}})
+            ));
+        }
+        assert!(!is_agent_activity(
+            &serde_json::json!({"update": {"sessionUpdate": "usage_update"}})
+        ));
+    }
 
     #[test]
     fn only_a_cost_bearing_autonomous_usage_update_is_a_folded_result() {

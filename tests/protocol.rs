@@ -14196,6 +14196,61 @@ async fn a_planner_child_is_continued_when_its_hook_fails_whatever_max_continuat
     .await;
 }
 
+#[tokio::test]
+async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
+    let state = temp_state_file("planner-child-hook-blocked");
+    let log = temp_log("planner-child-hook-blocked");
+    let repo = planner_wire_repository();
+    let script = "e=$(cat); case \"$e\" in *'\"event\":\"delegate_turn_end\"'*) echo HOOK_BLOCKED >&2; exit 2;; esac";
+    let hook = format!(
+        ", lifecycle_hook: {{ command: /bin/sh, args: [\"-c\", {}], max_continuations: 0 }}",
+        serde_json::to_string(script).unwrap()
+    );
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_gate_yaml(&state, &log, &hook),
+        async |cx, _, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+            let task = format!(
+                "{}MCP_CALL:router-delegate delegate_task {}",
+                planner_admit_wire_prompt(),
+                serde_json::json!({"work_id": "work-1", "task": "HOOK_BLOCKED", "background": true})
+            );
+            prompt_text(&cx, &sid, &task).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(40), async {
+                loop {
+                    let run = router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap();
+                    let work = &run.works["work-1"];
+                    if work.reconciliation.required
+                        && work.attempt.as_ref().is_some_and(|a| a.ended)
+                    {
+                        assert!(work.artifact.is_none() && work.finish.is_none());
+                        assert!(work.workspace.is_some(), "preserved source remains owned");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect(
+                "warning-only hook failures must leave the continuation loop for reconciliation",
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
 /// parent records its resume point, a mid-turn worker gets the shutdown
 /// message at its turn end and stops, and the run ends paused for the next
@@ -14745,6 +14800,67 @@ async fn queued_agent_input_does_not_preempt_an_operator_turn() {
     .await;
     let _ = std::fs::remove_file(&hold);
     let _ = std::fs::remove_file(&release);
+}
+
+#[tokio::test]
+async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_turn() {
+    use router_acp::planner_workflow::{self as workflow, Attempt, Wake, WorkStatus};
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    for operator_turn in [false, true] {
+        let state = temp_state_file("ownership-handoff-steer");
+        let log = temp_log("ownership-handoff-steer");
+        let release =
+            std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+        let hold = std::env::temp_dir().join(format!("hold-{}", uuid::Uuid::new_v4().simple()));
+        if operator_turn {
+            std::fs::write(&release, "").unwrap();
+        }
+        let repo = preempt_repository(&release);
+        run_test_shared(planner_gate_yaml(&state, &log, ""), async |cx, _, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            prompt_text(&cx, &sid, planner_admit_wire_prompt()).await?;
+            let operator = if operator_turn {
+                let cx = cx.clone();
+                let sid = sid.clone();
+                let prompt = format!("protected operator turn\nWAIT_FILE:{}", hold.display());
+                let task = tokio::spawn(async move { prompt_text(&cx, &sid, &prompt).await });
+                wait_for_mock_prompt(&log, "protected operator turn").await;
+                Some(task)
+            } else {
+                insert_wake(&shared, &sid, "audit:before-ownership");
+                wait_for_mock_prompt(&log, WAKE_MARKER).await;
+                None
+            };
+            workflow::mutate(&shared, &sid, |run| {
+                let work = run.works.get_mut("work-1").unwrap();
+                work.status = WorkStatus::Interrupted;
+                work.attempt = Some(Attempt { id: "attempt-1".into(), router_pid: 0,
+                    router_started_at_ms: 0, delegate_id: None, ended: true });
+                work.handoff = Some(router_acp::delegate_hook::Handoff {
+                    kind: "ownership_requested".into(), message: "specific paths required".into() });
+                run.wakes.insert("work-1:attempt-1".into(), Wake {
+                    work_id: "work-1".into(), reason: "DECLINED-STEER OWNERSHIP-FIX".into(), ..Default::default() });
+                Ok(())
+            }).unwrap();
+            if let Some(operator) = operator {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert!(mock_prompts(&log, "OWNERSHIP-FIX").is_empty());
+                assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
+                std::fs::write(&hold, "").unwrap();
+                operator.await.unwrap()?;
+            }
+            tokio::time::timeout(Duration::from_secs(8), wait_for_mock_prompt(&log, "OWNERSHIP-FIX"))
+                .await.expect("ownership handoff must reach the parent instead of waiting behind unrelated router work");
+            let events = read_log(&log);
+            assert_eq!(events.iter().any(|e| e["event"] == "cancel"), !operator_turn);
+            let run = workflow::load(&shared, &sid).unwrap().unwrap();
+            assert!(!run.wakes["work-1:attempt-1"].acknowledged, "delivery is not reconciliation");
+            std::fs::write(&release, "").unwrap();
+            Ok(())
+        }).await;
+        let _ = std::fs::remove_file(release);
+        let _ = std::fs::remove_file(hold);
+    }
 }
 
 /// A monitor correction is agent-owned even though it uses the durable input

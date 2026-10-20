@@ -654,6 +654,17 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   - `delegate_turn_end` — whenever a delegate turn ends, with `turn`, `last_message` and the worker's latest structured `handoff`. Exit 2 with a message on stderr sends that message back to the same delegate as its next prompt, at most `max_continuations` (default 3) times per turn — the router equivalent of a provider's subagent-stop hook keeping a worker going. Any other result releases the turn.
   - `delegate_stop` — `completed`, `cancelled` or `failed`, or `closed` when a `keep_open` delegate is closed.
   - `parent_repinned` — a session's pin moved to a new provider session (failover, including hot failover between accounts; an explicit switch; escalation; demotion), with `previous_downstream_session_id`/`previous_candidate`, the new `downstream_session_id`/`candidate`, and `reason`. It is delivered before the new session's first turn, so a host that bound work to the old provider session can follow the parent onto the new model.
+
+  Planner workers continue beyond `max_continuations` while making progress. Three consecutive
+  refused turns with no agent output or tool activity instead end the attempt and require the
+  parent's existing scope/source reconciliation. Adapter informational warnings alone are not
+  work: a broken prompt hook must not trap a worker in an endless continuation loop. Source and
+  outstanding checks remain preserved; no acceptance or completion is inferred.
+
+  An ended planner worker's current `ownership_requested` or `reassignment_required` handoff
+  reaches a busy router-owned parent through urgent steering. If the adapter declines steering,
+  the router ends its own turn and delivers the durable handoff next. Operator turns, approval
+  waits, acknowledged or already-claimed deliveries and superseded attempts stay protected.
   
   `delegate_stop` and `parent_repinned` go through a `hook_outbox` table in the state DB: an event the hook did not accept stays queued, and every router process sharing that DB retries it every 30 s and at startup. Delegate events carry `worker_id` (the `b-…` job id for a background delegate, else a `w-…` id), `parent_router_session_id`, `parent_downstream_session_id` (the id the provider's own hooks report for the parent), `parent_candidate`, `candidate`, `lineage`, `downstream_session_id`, `state_session_id`, `cwd`, `effort`, `background`, `keep_open` and `task_summary`; every event carries `router_pid` and `router_started_at_ms`, so a host can treat a dead router's workers as stopped even if no stop event arrives.
 - **Worker tools.** While a hook is configured, each delegate gets a `router-worker` MCP server: `worker_whoami` returns its worker id, model and parent session, and `worker_handoff {kind, message}` records a structured handoff (`commit_paths_ready`, `waiting`, `lease_requested`, `ownership_requested`, `staging_gate_request`, `round_verified`, `round_failed`, `reassignment_required`) that the turn-end event carries. The delegate's prompt also opens with `[router-acp delegate] worker id: … · model: … · parent session: …`, and the tool result names the worker (`[delegated to grok/grok-4.7, worker b-…]`).

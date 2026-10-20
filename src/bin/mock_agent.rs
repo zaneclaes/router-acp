@@ -407,6 +407,21 @@ async fn run_prompt(
         "blocks": serde_json::to_value(&req.prompt).unwrap_or_default(),
     }));
 
+    if text.lines().any(|line| line == "HOOK_BLOCKED") {
+        let frame = UntypedMessage::new(
+            "session/update",
+            json!({
+                "sessionId": session_id, "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "UserPromptSubmit hook could not compile its adapter"},
+                    "_meta": {"claudeCode": {"kind": "informational", "level": "warning"}}
+                }
+            }),
+        )?;
+        cx.send_notification(frame)?;
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
+
     if mock.exit_on_prompt {
         // Simulate a crash mid-turn.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

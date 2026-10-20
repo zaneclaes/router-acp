@@ -222,9 +222,14 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     }
     let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
-    let Some((key, text)) = pending_steer(&run.parent_queue, &run.wakes, &steered) else {
+    let Some((key, text)) = pending_steer(&run.parent_queue, &run.wakes, &steered, &run.works)
+    else {
         return;
     };
+    let ownership = run
+        .wakes
+        .get(&key)
+        .is_some_and(|wake| ownership_handoff(&key, wake, &run.works));
     let claimed = crate::planner_guard::with_runtime(shared, sid, |rt| {
         claim_steer(rt, std::time::Instant::now())
     });
@@ -253,32 +258,47 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     ..Default::default()
                 },
             );
-        } else if key.starts_with("input:")
+        } else if (key.starts_with("input:") || ownership)
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
             && planner_workflow::load(&shared, &sid)
                 .ok()
                 .flatten()
                 .filter(|current| {
-                    current.status == RunStatus::Running && current.approval_waits.is_empty()
+                    current.status == RunStatus::Running
+                        && current.approval_waits.is_empty()
+                        && current
+                            .parent_queue
+                            .first()
+                            .is_none_or(|input| !planner_workflow::human_prompt(&input.request))
                 })
                 .and_then(|current| {
-                    pending_steer(&current.parent_queue, &current.wakes, &Default::default())
+                    pending_steer(
+                        &current.parent_queue,
+                        &current.wakes,
+                        &Default::default(),
+                        &current.works,
+                    )
                 })
                 .is_some_and(|(pending, _)| pending == key)
         {
             // Native adapters need not implement `_session/steering`. Use the
             // existing cancellation/queued-delivery lifecycle instead of
-            // stranding a correction behind a long router-owned turn. Recheck
+            // stranding a correction or ownership handoff behind a router-owned turn. Recheck
             // after the request: withdrawal, acknowledgment, a live delivery or
             // queued operator input may have superseded this correction.
             let ended = crate::planner_preempt::preempt(&shared, &sid).await;
             shared.state.lock().unwrap().log(
                 &sid,
                 &crate::state::LogEntry {
-                    kind: "planner_input_preempt".into(),
+                    kind: if ownership {
+                        "planner_handoff_preempt"
+                    } else {
+                        "planner_input_preempt"
+                    }
+                    .into(),
                     role: "router".into(),
                     summary: format!(
-                        "Queued agent input {key}: steering declined; router turn ended={ended}"
+                        "Queued parent item {key}: steering declined; router turn ended={ended}"
                     ),
                     ..Default::default()
                 },
@@ -287,13 +307,33 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     });
 }
 
+fn ownership_handoff(
+    id: &str,
+    wake: &planner_workflow::Wake,
+    works: &std::collections::BTreeMap<String, planner_workflow::Work>,
+) -> bool {
+    works.get(&wake.work_id).is_some_and(|work| {
+        work.status == planner_workflow::WorkStatus::Interrupted
+            && work.attempt.as_ref().is_some_and(|attempt| {
+                attempt.ended && id == format!("{}:{}", wake.work_id, attempt.id)
+            })
+            && work.handoff.as_ref().is_some_and(|handoff| {
+                matches!(
+                    handoff.kind.as_str(),
+                    "ownership_requested" | "reassignment_required"
+                )
+            })
+    })
+}
+
 /// The one pending item to steer now: the queued agent correction first, then
-/// an urgent release/failed-job wake, then capacity, skipping anything already
+/// an urgent release/failed-job/ownership wake, then capacity, skipping anything already
 /// steered this turn or claimed by a live delivery. Pure, for tests.
 pub(crate) fn pending_steer(
     queue: &[planner_workflow::QueuedParentInput],
     wakes: &std::collections::BTreeMap<String, planner_workflow::Wake>,
     steered: &std::collections::HashSet<String>,
+    works: &std::collections::BTreeMap<String, planner_workflow::Work>,
 ) -> Option<(String, String)> {
     fn claimed(wake: &planner_workflow::Wake, id: &str) -> bool {
         wake.claim_pid != 0
@@ -345,16 +385,23 @@ pub(crate) fn pending_steer(
             !w.acknowledged
                 && (id.starts_with("release:")
                     || id.starts_with("observation:ci-job-failures")
-                    || id.starts_with("capacity:"))
+                    || id.starts_with("capacity:")
+                    || ownership_handoff(id, w, works))
                 && !steered.contains(*id)
                 && !claimed(w, id)
         })
-        .min_by_key(|(id, _)| wake_priority(id))?;
+        .min_by_key(|(id, wake)| {
+            if ownership_handoff(id, wake, works) {
+                1
+            } else {
+                wake_priority(id)
+            }
+        })?;
     Some((
         id.clone(),
         format!(
             "[Router steer] This is router text, not operator input. Pending wake `{id}` (work {}): {}. It is redelivered when this turn ends; a failed \
-             CI job, release transition or unfilled capacity is actionable now, in this turn.",
+             CI job, release transition, ownership handoff or unfilled capacity is actionable now, in this turn.",
             wake.work_id, wake.reason
         ),
     ))
@@ -885,6 +932,60 @@ async fn deliver_queued_input(
 mod steer_tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
+
+    fn pending_steer(
+        queue: &[planner_workflow::QueuedParentInput],
+        wakes: &BTreeMap<String, planner_workflow::Wake>,
+        steered: &HashSet<String>,
+    ) -> Option<(String, String)> {
+        super::pending_steer(queue, wakes, steered, &BTreeMap::new())
+    }
+
+    #[test]
+    fn ownership_steering_requires_current_ended_attempt_and_pending_delivery() {
+        let mut work: planner_workflow::Work = serde_json::from_value(json!({
+            "spec": {"work_id":"repair", "plan_id":"repair", "scope":"repair"},
+            "child_id":"child", "status":"interrupted",
+            "attempt":{"id":"a", "router_pid":0, "router_started_at_ms":0, "ended":true},
+            "handoff":{"kind":"ownership_requested", "message":"parent must grant source"}
+        }))
+        .unwrap();
+        let wakes = BTreeMap::from([(
+            "repair:a".into(),
+            planner_workflow::Wake {
+                work_id: "repair".into(),
+                ..Default::default()
+            },
+        )]);
+        let selected = |work: &planner_workflow::Work,
+                        wakes: &BTreeMap<String, planner_workflow::Wake>| {
+            super::pending_steer(
+                &[],
+                wakes,
+                &HashSet::new(),
+                &BTreeMap::from([("repair".into(), work.clone())]),
+            )
+        };
+        assert!(selected(&work, &wakes).is_some());
+        work.attempt.as_mut().unwrap().ended = false;
+        assert!(selected(&work, &wakes).is_none());
+        work.attempt.as_mut().unwrap().ended = true;
+        work.attempt.as_mut().unwrap().id = "replacement".into();
+        assert!(selected(&work, &wakes).is_none());
+        work.attempt.as_mut().unwrap().id = "a".into();
+        work.handoff.as_mut().unwrap().kind = "waiting".into();
+        assert!(selected(&work, &wakes).is_none());
+        work.handoff.as_mut().unwrap().kind = "reassignment_required".into();
+        assert!(selected(&work, &wakes).is_some());
+        let mut done = wakes.clone();
+        done.get_mut("repair:a").unwrap().acknowledged = true;
+        assert!(selected(&work, &done).is_none());
+        let mut claimed = wakes.clone();
+        let claim = claimed.get_mut("repair:a").unwrap();
+        claim.claim_pid = std::process::id();
+        claim.claim_started_at_ms = planner_workflow::process_identity().1;
+        assert!(selected(&work, &claimed).is_none());
+    }
 
     #[test]
     fn resolved_input_is_not_steered_even_if_a_stale_queue_entry_remains() {
