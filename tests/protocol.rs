@@ -15039,6 +15039,19 @@ async fn implement_resumes_an_ownerless_running_run_with_its_works_and_inputs() 
         async |cx, _observed, shared| {
             let old = open_planner_parent(&cx, &repo).await?;
             orphan_run(&shared, &old, "TEXT:old-operator-input");
+            router_acp::planner_workflow::mutate(&shared, &old, |run| {
+                run.observations.insert(
+                    "ci:production".into(),
+                    router_acp::planner_guard::Observation {
+                        revision: "a".repeat(40),
+                        reference: "production".into(),
+                        state: router_acp::planner_guard::ObservationState::Failed,
+                        evidence: "required deployment gate failed before restart".into(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
             let new = cx
                 .send_request(NewSessionRequest::new(repo.path().join("repo")))
                 .block_task()
@@ -15048,6 +15061,15 @@ async fn implement_resumes_an_ownerless_running_run_with_its_works_and_inputs() 
                 .to_string();
             prompt_text(&cx, &new, "/implement continue after the restart").await?;
             let resumed = wait_for_prompt_index(&log, "continue after the restart").await;
+            let resumed_text = read_log(&log)[resumed]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                resumed_text.contains("[router-acp planner role: integrate-plan]"),
+                "the first real ACP prompt selected its role before adopting the failed deployment"
+            );
+            assert!(!resumed_text.contains("[router-acp planner role: select-plan]"));
             assert!(
                 read_log(&log)[resumed]["text"]
                     .as_str()
@@ -15059,6 +15081,18 @@ async fn implement_resumes_an_ownerless_running_run_with_its_works_and_inputs() 
                 .unwrap()
                 .unwrap();
             assert!(run.works.contains_key("work-old"), "the work moved over");
+            let resume_inputs = run
+                .inputs
+                .iter()
+                .filter(|(_, input)| input.text == "/implement continue after the restart")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                resume_inputs.len(),
+                1,
+                "role refresh duplicated the operator command"
+            );
+            assert_eq!(run.execution_input_id.as_ref(), Some(resume_inputs[0].0));
+            assert!(resumed_text.contains("Arguments: continue after the restart"));
             let previous = router_acp::planner_workflow::load(&shared, &old)
                 .unwrap()
                 .unwrap();

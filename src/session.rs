@@ -10342,6 +10342,7 @@ fn prepare_parent_prompt_inner(
         let current = shared
             .with_session(&router_sid, |s| s.planner_phase)
             .flatten();
+        let mut admitted_command = req.clone();
         match crate::planner_workflow::user_command_from_original(
             &shared,
             &router_sid,
@@ -10369,12 +10370,39 @@ fn prepare_parent_prompt_inner(
                     && let Some(report) =
                         crate::planner_adopt::adopt_on_implement(shared.as_ref(), &router_sid)
                 {
+                    // The first shaping saw an empty destination. Replay only
+                    // that admitted command's shaping against the adopted state,
+                    // retaining its input identity and authentic scope. Otherwise
+                    // the first real turn still carries SelectPlan while every
+                    // later wake correctly prioritizes the failed deployment.
+                    let input_id = crate::planner_workflow::prompt_input_id(&req)
+                        .ok_or_else(|| {
+                            AcpError::internal_error()
+                                .data("admitted command has no input identity")
+                        })?
+                        .to_string();
+                    admitted_command
+                        .meta
+                        .get_or_insert_with(Default::default)
+                        .entry("router_acp")
+                        .or_insert_with(|| json!({}))["input_id"] = json!(input_id);
+                    crate::planner_workflow::user_command_from_original(
+                        &shared,
+                        &router_sid,
+                        &original_req,
+                        &mut admitted_command,
+                        true,
+                    )
+                    .map_err(|error| AcpError::internal_error().data(error))?;
+                    req = admitted_command;
                     let summary = report.summary();
                     tracing::warn!(session = router_sid, from = report.from, "{summary}");
                     notify_user(&shared, &router_sid, format!("router-acp · {summary}"));
                     req.prompt.push(ContentBlock::from(format!(
-                        "[router-acp · {summary}. Those works are now this run's: reconcile them \
-                         through planner_workflow. The earlier parent's unacknowledged operator \
+                        "[router-acp · {summary}. Those works are now this run's. Follow the selected \
+                         parent role's priority; reconcile each assignment through planner_workflow \
+                         before resuming that work. Unrelated assignment reconciliation is not a \
+                         prerequisite for the selected role's next action. The earlier parent's unacknowledged operator \
                          input is delivered to you right after this turn, before any other wake.]"
                     )));
                 }

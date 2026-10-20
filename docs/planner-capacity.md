@@ -81,6 +81,11 @@ including the first turn after adoption or a drained restart. Superseded, abando
 disposed rounds do not. Command admission and wake delivery share the same role selector;
 the operator's arguments and scope are preserved. Explicit planning still selects
 `create-plan`, and implementation without integration work selects `select-plan`.
+When a new session adopts the old run during command admission, it refreshes that
+same command's role before sending the first ACP prompt; this creates no second
+operator input and leaves transferred work reconciliation and queued inputs intact.
+Reconciliation gates each adopted worker's resumption, rather than imposing a
+whole-inventory prerequisite ahead of deployment recovery.
 An unresolved failed staging/production build also selects integration on later wakes,
 even when its failure notification was acknowledged and no release record exists yet.
 Acknowledgment clears delivery, not the failed build or a stopped repair's ownership request;
