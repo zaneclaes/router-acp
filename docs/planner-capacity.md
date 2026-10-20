@@ -395,6 +395,11 @@ transitions and `observation:ci-job-failures*`, at most once per session per 60
 seconds across turn boundaries. Routine `observation:ci:<work>` wakes wait for
 the boundary. Every injected block explicitly identifies itself as router text,
 not operator input; its durable wake still requires acknowledgment at delivery.
+If an adapter declines steering a queued agent correction, the existing preemption
+path cancels only the router-owned turn and delivers the correction from the queue;
+the interrupted wakes remain owed. The router rechecks withdrawal, acknowledgment,
+delivery claims and queued operator input before cancellation. Operator turns stay
+protected. Routine wakes do not acquire this cancellation fallback.
 
 Planner `delegate_task` and `planner_workflow` permission callbacks are answered
 with the adapter's allow option even on operator-owned turns. Other tools on

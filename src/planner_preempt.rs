@@ -90,13 +90,13 @@ pub async fn steer(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool 
     tracing::info!(
         session = sid,
         ?outcome,
-        "operator input steered at a router-owned planner turn"
+        "input steered at a router-owned planner turn"
     );
     // `startedNewTurn` (an adapter that ignored the opt-in) also delivered it.
     matches!(outcome.as_deref(), Some("injected" | "startedNewTurn"))
 }
 
-/// Cancel the router-owned turn for operator input and wait for it to end.
+/// Cancel the router-owned turn for queued input and wait for it to end.
 /// `false` when it did not end in time (the input must then queue).
 pub async fn preempt(shared: &Shared, sid: &str) -> bool {
     with_runtime(shared, sid, |rt| rt.preempted = true);
@@ -116,7 +116,7 @@ pub async fn preempt(shared: &Shared, sid: &str) -> bool {
     }
     tracing::warn!(
         session = sid,
-        "operator input preempts a router-owned planner turn: cancelled it; the operator's prompt runs next"
+        "queued input preempts a router-owned planner turn: cancelled it; pending input runs next"
     );
     let started = std::time::Instant::now();
     while router_turn_in_flight(shared, sid) {

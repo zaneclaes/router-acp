@@ -253,6 +253,36 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     ..Default::default()
                 },
             );
+        } else if key.starts_with("input:")
+            && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
+            && planner_workflow::load(&shared, &sid)
+                .ok()
+                .flatten()
+                .filter(|current| {
+                    current.status == RunStatus::Running && current.approval_waits.is_empty()
+                })
+                .and_then(|current| {
+                    pending_steer(&current.parent_queue, &current.wakes, &Default::default())
+                })
+                .is_some_and(|(pending, _)| pending == key)
+        {
+            // Native adapters need not implement `_session/steering`. Use the
+            // existing cancellation/queued-delivery lifecycle instead of
+            // stranding a correction behind a long router-owned turn. Recheck
+            // after the request: withdrawal, acknowledgment, a live delivery or
+            // queued operator input may have superseded this correction.
+            let ended = crate::planner_preempt::preempt(&shared, &sid).await;
+            shared.state.lock().unwrap().log(
+                &sid,
+                &crate::state::LogEntry {
+                    kind: "planner_input_preempt".into(),
+                    role: "router".into(),
+                    summary: format!(
+                        "Queued agent input {key}: steering declined; router turn ended={ended}"
+                    ),
+                    ..Default::default()
+                },
+            );
         }
     });
 }

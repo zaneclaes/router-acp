@@ -14550,6 +14550,134 @@ async fn operator_input_cancels_a_router_owned_turn_and_runs_next_when_steering_
     let _ = std::fs::remove_file(&release);
 }
 
+/// An adapter may not implement mid-turn steering. An already queued agent
+/// correction must still reach the parent without waiting for an unbounded wake.
+#[tokio::test]
+async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
+    let state = temp_state_file("agent-input-declined-steer");
+    let log = temp_log("agent-input-declined-steer");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            insert_wake(&shared, &sid, "audit:before-agent-correction");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            {
+                let store = shared.state.lock().unwrap();
+                router_acp::planner_input::send(
+                    &store,
+                    &sid,
+                    &repo.path().join("repo"),
+                    "agent-declined-steer",
+                    "DECLINED-STEER\nTEXT:queued-fix-activated",
+                )
+                .unwrap();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                wait_for_mock_prompt(&log, "queued-fix-activated"),
+            )
+            .await
+            .expect("declined steering must not strand the queued agent input");
+            let events = read_log(&log);
+            let wake = mock_prompts(&log, WAKE_MARKER)[0];
+            let correction = mock_prompts(&log, "queued-fix-activated")[0];
+            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
+            assert!(wake < cancel && cancel < correction);
+            assert!(!release.exists());
+            std::fs::write(&release, "").unwrap();
+            for _ in 0..100 {
+                let run = router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap();
+                if run.inputs["agent-declined-steer"]
+                    .delivered_to
+                    .contains(&sid)
+                    && mock_prompts(&log, WAKE_MARKER)
+                        .iter()
+                        .any(|i| *i > correction)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+            assert!(
+                run.inputs["agent-declined-steer"]
+                    .delivered_to
+                    .contains(&sid)
+            );
+            assert!(run.parent_queue.is_empty());
+            assert!(agent_text(&observed, &sid).contains("queued-fix-activated"));
+            assert!(
+                mock_prompts(&log, WAKE_MARKER)
+                    .iter()
+                    .any(|i| *i > correction)
+            );
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
+#[tokio::test]
+async fn queued_agent_input_does_not_preempt_an_operator_turn() {
+    let state = temp_state_file("agent-input-protected-operator");
+    let log = temp_log("agent-input-protected-operator");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let hold = std::env::temp_dir().join(format!("hold-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&release, "").unwrap();
+    let repo = preempt_repository(&release);
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let operator = {
+                let cx = cx.clone();
+                let sid = sid.clone();
+                let text = format!("protected operator turn\nWAIT_FILE:{}", hold.display());
+                tokio::spawn(async move { prompt_text(&cx, &sid, &text).await })
+            };
+            wait_for_mock_prompt(&log, "protected operator turn").await;
+            {
+                let store = shared.state.lock().unwrap();
+                router_acp::planner_input::send(
+                    &store,
+                    &sid,
+                    &repo.path().join("repo"),
+                    "agent-after-operator",
+                    "DECLINED-STEER\nTEXT:fix-after-operator",
+                )
+                .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(mock_prompts(&log, "fix-after-operator").is_empty());
+            assert!(
+                !read_log(&log)
+                    .iter()
+                    .any(|e| e["event"] == "cancel" || e["event"] == "steer")
+            );
+            std::fs::write(&hold, "").unwrap();
+            assert_eq!(operator.await.unwrap()?.stop_reason, StopReason::EndTurn);
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                wait_for_mock_prompt(&log, "fix-after-operator"),
+            )
+            .await
+            .expect("the queued correction follows the protected operator turn");
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&hold);
+    let _ = std::fs::remove_file(&release);
+}
+
 /// A monitor correction is agent-owned even though it uses the durable input
 /// queue. Live operator input can steer it or cancel it without losing it.
 #[tokio::test]
