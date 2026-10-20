@@ -1125,12 +1125,64 @@ async fn corrections_reuse_child_and_workspace_before_new_attempt() {
         false,
     )
     .unwrap();
+    let old_wake = format!("{}:{}", identity.work_id, identity.attempt_id);
+    let historical_wake = format!("work-1:{}", uuid::Uuid::new_v4());
+    let foreign_wake = format!("work-1:{}", uuid::Uuid::new_v4());
+    let non_stop_wake = format!("work-1:{}", uuid::Uuid::new_v4());
+    let unrelated = [
+        "input:operator",
+        "recovery:work-1",
+        "work-1:not-an-attempt",
+        &foreign_wake,
+        &non_stop_wake,
+    ];
+    planner_workflow::mutate(&fixture.shared, SID, |run| {
+        run.wakes.insert(
+            historical_wake.clone(),
+            planner_workflow::Wake {
+                work_id: "work-1".into(),
+                reason: "child state: Interrupted".into(),
+                ..Default::default()
+            },
+        );
+        for id in unrelated {
+            run.wakes.insert(
+                id.into(),
+                planner_workflow::Wake {
+                    work_id: if id == foreign_wake {
+                        "work-2"
+                    } else {
+                        "work-1"
+                    }
+                    .into(),
+                    reason: if id == non_stop_wake {
+                        "independent reconciliation still owed"
+                    } else {
+                        "child state: Interrupted"
+                    }
+                    .into(),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
     let followup = planner_workflow::begin_followup(&fixture.shared, SID, &identity).unwrap();
     assert!(followup.contains(&identity.attempt_id));
     let after_followup = planner_workflow::load(&fixture.shared, SID)
         .unwrap()
         .unwrap();
     assert_eq!(after_followup.works["work-1"].child_id, child);
+    for id in [&old_wake, &historical_wake] {
+        assert!(
+            after_followup.wakes[id].acknowledged,
+            "resuming ownership left a superseded stop notification pending: {id}"
+        );
+    }
+    for id in unrelated {
+        assert!(!after_followup.wakes[id].acknowledged);
+    }
     assert_eq!(
         after_followup.works["work-1"]
             .workspace
@@ -1149,6 +1201,22 @@ async fn corrections_reuse_child_and_workspace_before_new_attempt() {
         true,
     )
     .unwrap();
+    // A failed replacement must not dispose of the existing stop notification.
+    let unavailable = workspace.path.with_extension("unavailable");
+    std::fs::rename(&workspace.path, &unavailable).unwrap();
+    assert!(
+        planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+            .await
+            .is_err()
+    );
+    assert!(
+        !planner_workflow::load(&fixture.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes[&old_wake]
+            .acknowledged
+    );
+    std::fs::rename(&unavailable, &workspace.path).unwrap();
     let (new_attempt, new_workspace, new_child, _) =
         planner_workflow::begin_work(&fixture.shared, SID, "work-1")
             .await
@@ -1156,6 +1224,56 @@ async fn corrections_reuse_child_and_workspace_before_new_attempt() {
     assert_ne!(new_attempt.attempt_id, identity.attempt_id);
     assert_eq!(new_workspace.path, workspace.path);
     assert_eq!(new_child, child);
+    let replaced = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert!(replaced.wakes[&old_wake].acknowledged);
+    assert!(
+        replaced.wakes.contains_key(&historical_wake),
+        "retain notification history"
+    );
+    for id in unrelated {
+        assert!(!replaced.wakes[id].acknowledged);
+    }
+
+    // A fresh unreviewed artifact still needs the parent; neither resume path may
+    // consume its notification merely because the child has stopped.
+    let mut corrected_artifact = artifact(&revision);
+    corrected_artifact
+        .evidence
+        .push("corrected-check.txt".into());
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        Some(&new_attempt),
+        Operation::Artifact {
+            key: "corrected-artifact".into(),
+            work_id: "work-1".into(),
+            attempt_id: new_attempt.attempt_id.clone(),
+            artifact: corrected_artifact,
+        },
+    )
+    .await
+    .unwrap();
+    planner_workflow::attempt_ended(
+        &fixture.shared,
+        SID,
+        &new_attempt,
+        None,
+        "ready for review".into(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+            .await
+            .is_err()
+    );
+    assert!(planner_workflow::begin_followup(&fixture.shared, SID, &new_attempt).is_err());
+    let pending = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert!(!pending.wakes[&format!("work-1:{}", new_attempt.attempt_id)].acknowledged);
 }
 
 #[tokio::test]

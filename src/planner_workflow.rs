@@ -2434,6 +2434,7 @@ async fn begin_work_once(
             } else {
                 WorkStatus::Running
             };
+            acknowledge_attempt_notifications(run, work_id);
         }
         Ok(())
     })?;
@@ -2765,9 +2766,28 @@ pub fn begin_followup(
             work.spec,
             work.reconciliation
         );
+        acknowledge_attempt_notifications(run, &actor.work_id);
         Ok(())
     })?;
     Ok(context)
+}
+
+/// A successful resume/claim disposes of prior child-stop notifications. Keep the
+/// records and their evidence, but do not repeatedly wake the parent about an
+/// interruption whose ownership already advanced. Review, custody and allocation
+/// fences must pass before calling this; the next stop re-arms its own notice.
+fn acknowledge_attempt_notifications(run: &mut PlannerRun, work_id: &str) {
+    let prefix = format!("{work_id}:");
+    for (id, wake) in &mut run.wakes {
+        if wake.work_id == work_id
+            && wake.reason.starts_with("child state: ")
+            && id
+                .strip_prefix(&prefix)
+                .is_some_and(|attempt| uuid::Uuid::parse_str(attempt).is_ok())
+        {
+            wake.acknowledged = true;
+        }
+    }
 }
 
 #[cfg(test)]
