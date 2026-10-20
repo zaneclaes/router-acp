@@ -330,8 +330,8 @@ pub struct DelegateHints {
     pub effort: Option<String>,
 }
 
-fn tool_definition() -> Value {
-    json!({
+fn tool_definition(catalogs: &[crate::config::McpCatalogConfig]) -> Value {
+    let mut definition = json!({
         "name": DELEGATE_TOOL_NAME,
         "description": TOOL_DESCRIPTION,
         "inputSchema": {
@@ -367,7 +367,7 @@ fn tool_definition() -> Value {
                 "required_capabilities": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Host-defined capabilities needed by this bounded subtask. The router attaches matching registered MCP catalogs only to this delegate."
+                    "description": "Optional additional host-defined MCP catalogs, using only the configured capability names listed here. Omit for ordinary project MCP tools: delegates inherit those through the client and shared broker without a catalog request. Configured capabilities still require a registered catalog."
                 },
                 "keep_open": {
                     "type": "boolean",
@@ -382,7 +382,21 @@ fn tool_definition() -> Value {
             },
             "required": ["task"]
         }
-    })
+    });
+    let capabilities: std::collections::BTreeSet<_> = catalogs
+        .iter()
+        .flat_map(|catalog| catalog.capabilities.iter())
+        .collect();
+    let field = &mut definition["inputSchema"]["properties"]["required_capabilities"];
+    if capabilities.is_empty() {
+        field["maxItems"] = json!(0);
+        field["description"] = json!(
+            "No optional MCP catalog capabilities are configured. Omit this field. Ordinary project MCP tools are still attached through the client and shared broker; this field does not enable them."
+        );
+    } else {
+        field["items"]["enum"] = json!(capabilities);
+    }
+    definition
 }
 
 fn await_tool_definition() -> Value {
@@ -511,11 +525,15 @@ fn close_tool_definition() -> Value {
     })
 }
 
-fn listed_tools(delegation_enabled: bool, terminal_enabled: bool) -> Vec<Value> {
+fn listed_tools(
+    delegation_enabled: bool,
+    terminal_enabled: bool,
+    catalogs: &[crate::config::McpCatalogConfig],
+) -> Vec<Value> {
     let mut tools = Vec::new();
     if delegation_enabled {
         tools.extend([
-            tool_definition(),
+            tool_definition(catalogs),
             await_tool_definition(),
             followup_tool_definition(),
             close_tool_definition(),
@@ -752,6 +770,7 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
     let call_worker = worker.clone();
     let planner_worker = worker.as_ref().is_some_and(|w| w.planner.is_some());
     let terminal_enabled = shared.upstream_client_capabilities().terminal;
+    let catalogs = shared.cfg.delegation.mcp_catalogs.clone();
     UntypedRole
         .builder()
         .name("delegate-mcp")
@@ -781,16 +800,15 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
         .on_receive_request(
             move |_req: McpToolsListRequest,
                   responder: Responder<McpToolsListResult>,
-                  _cx| async move {
-                responder.respond(McpToolsListResult {
-                    tools: if worker_connection {
+                  _cx| {
+                let tools = if worker_connection {
                         let mut tools = worker_tools();
                         if planner_worker { tools.push(crate::planner_workflow::tool_definition()); }
                         tools
                     } else {
-                        listed_tools(delegation_enabled, terminal_enabled)
-                    },
-                })
+                        listed_tools(delegation_enabled, terminal_enabled, &catalogs)
+                    };
+                async move { responder.respond(McpToolsListResult { tools }) }
             },
             on_receive_request!(),
         )
@@ -1612,7 +1630,7 @@ async fn run_delegate_task_inner(
         dirs.clear();
     }
     if !args.required_capabilities.is_empty() && shared.cfg.delegation.mcp_catalogs.is_empty() {
-        return Err("delegate MCP catalogs are disabled by router configuration".to_string());
+        return Err("delegate MCP catalogs are disabled by router configuration: required_capabilities requests optional host-registered catalogs, not ordinary project MCP tools. Those tools are attached through the client and shared broker without a catalog request. Omit this field for ordinary project tools; do not invent capability names or credentials.".to_string());
     }
     let parent_cost = shared
         .candidate_runtime(&pin.candidate)
@@ -3530,11 +3548,46 @@ mod tests {
 
     #[test]
     fn tool_definition_shape() {
-        let def = tool_definition();
+        let def = tool_definition(&[]);
         assert_eq!(def["name"], DELEGATE_TOOL_NAME);
         assert_eq!(def["inputSchema"]["required"][0], "task");
         assert!(def["inputSchema"]["properties"]["hints"]["properties"]["candidate"].is_object());
         assert!(def["inputSchema"]["properties"]["background"].is_object());
+    }
+
+    #[test]
+    fn unconfigured_catalogs_do_not_advertise_arbitrary_capability_requests() {
+        let tools = listed_tools(true, true, &[]);
+        let delegate = tools
+            .iter()
+            .find(|tool| tool["name"] == DELEGATE_TOOL_NAME)
+            .unwrap();
+        assert_eq!(
+            delegate["inputSchema"]["properties"]["required_capabilities"]["maxItems"],
+            0
+        );
+    }
+
+    #[test]
+    fn configured_catalog_schema_lists_only_known_capabilities() {
+        let catalogs = vec![
+            crate::config::McpCatalogConfig {
+                catalog: "telemetry".into(),
+                capabilities: vec!["traces".into(), "metrics".into()],
+            },
+            crate::config::McpCatalogConfig {
+                catalog: "metrics-backup".into(),
+                capabilities: vec!["metrics".into()],
+            },
+        ];
+        let tools = listed_tools(true, true, &catalogs);
+        let delegate = tools
+            .iter()
+            .find(|tool| tool["name"] == DELEGATE_TOOL_NAME)
+            .unwrap();
+        let field = &delegate["inputSchema"]["properties"]["required_capabilities"];
+        assert_eq!(field["items"]["enum"], json!(["metrics", "traces"]));
+        assert!(field.get("maxItems").is_none());
     }
 
     #[test]
@@ -3556,7 +3609,7 @@ mod tests {
                 .filter_map(|tool| tool["name"].as_str().map(str::to_string))
                 .collect()
         };
-        let both = names(&listed_tools(true, true));
+        let both = names(&listed_tools(true, true, &[]));
         for required in [
             DELEGATE_TOOL_NAME,
             DELEGATE_AWAIT_TOOL_NAME,
@@ -3570,7 +3623,7 @@ mod tests {
             );
         }
         assert_eq!(
-            names(&listed_tools(true, false)),
+            names(&listed_tools(true, false, &[])),
             [
                 DELEGATE_TOOL_NAME,
                 DELEGATE_AWAIT_TOOL_NAME,
@@ -3581,7 +3634,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            names(&listed_tools(false, true)),
+            names(&listed_tools(false, true, &[])),
             [BACKGROUND_START_TOOL_NAME]
         );
     }
