@@ -218,7 +218,9 @@ fn claim_steer(rt: &mut crate::planner_guard::SessionRuntime, now: std::time::In
 }
 
 fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
-    if !crate::planner_preempt::router_turn_in_flight(shared, sid) {
+    if !crate::planner_preempt::router_turn_in_flight(shared, sid)
+        || crate::planner_watchdog::tools_in_flight(shared, sid)
+    {
         return;
     }
     let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
@@ -226,6 +228,10 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     else {
         return;
     };
+    let release_audit = key.starts_with("audit:release:");
+    if release_audit && !failed_environment(&run.observations) {
+        return;
+    }
     let ownership = run
         .wakes
         .get(&key)
@@ -239,6 +245,16 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let shared = shared.clone();
     let sid = sid.to_string();
     tokio::spawn(async move {
+        // Native priority steering can abort an edit and report it to the model
+        // as a user refusal. Automatic wakes wait for tool completion; direct
+        // operator input keeps its separate interruption authority.
+        if crate::planner_watchdog::tools_in_flight(&shared, &sid) {
+            crate::planner_guard::with_runtime(&shared, &sid, |rt| {
+                rt.steering = false;
+                rt.last_steer = None;
+            });
+            return;
+        }
         let blocks = vec![ContentBlock::from(text.clone())];
         let injected = crate::planner_preempt::steer(&shared, &sid, &blocks).await;
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
@@ -258,13 +274,15 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     ..Default::default()
                 },
             );
-        } else if (key.starts_with("input:") || ownership)
+        } else if (key.starts_with("input:") || ownership || release_audit)
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
+            && !crate::planner_watchdog::tools_in_flight(&shared, &sid)
             && planner_workflow::load(&shared, &sid)
                 .ok()
                 .flatten()
                 .filter(|current| {
                     current.status == RunStatus::Running
+                        && (!release_audit || failed_environment(&current.observations))
                         && current.approval_waits.is_empty()
                         && current
                             .parent_queue
@@ -283,14 +301,16 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         {
             // Native adapters need not implement `_session/steering`. Use the
             // existing cancellation/queued-delivery lifecycle instead of
-            // stranding a correction or ownership handoff behind a router-owned turn. Recheck
+            // stranding a correction, ownership handoff or release audit behind a router-owned turn. Recheck
             // after the request: withdrawal, acknowledgment, a live delivery or
             // queued operator input may have superseded this correction.
             let ended = crate::planner_preempt::preempt(&shared, &sid).await;
             shared.state.lock().unwrap().log(
                 &sid,
                 &crate::state::LogEntry {
-                    kind: if ownership {
+                    kind: if release_audit {
+                        "planner_audit_preempt"
+                    } else if ownership {
                         "planner_handoff_preempt"
                     } else {
                         "planner_input_preempt"
@@ -384,6 +404,7 @@ pub(crate) fn pending_steer(
         .filter(|(id, w)| {
             !w.acknowledged
                 && (id.starts_with("release:")
+                    || id.starts_with("audit:release:")
                     || id.starts_with("observation:ci-job-failures")
                     || id.starts_with("capacity:")
                     || ownership_handoff(id, w, works))
@@ -401,7 +422,7 @@ pub(crate) fn pending_steer(
         id.clone(),
         format!(
             "[Router steer] This is router text, not operator input. Pending wake `{id}` (work {}): {}. It is redelivered when this turn ends; a failed \
-             CI job, release transition, ownership handoff or unfilled capacity is actionable now, in this turn.",
+             CI job, release transition, release audit, ownership handoff or unfilled capacity is actionable now, in this turn.",
             wake.work_id, wake.reason
         ),
     ))
@@ -644,20 +665,27 @@ fn integration_pending(
 ) -> bool {
     work_states.any(|state| state == planner_workflow::WorkStatus::Finished)
         || ids.iter().any(|id| environment_wake(id))
-        || ["staging", "production"].into_iter().any(|environment| {
-            observations
-                .get(&format!("ci:{environment}"))
-                .is_some_and(|observation| {
-                    observation.reference == environment
-                        && observation.state == crate::planner_guard::ObservationState::Failed
-                })
-        })
+        || failed_environment(observations)
+}
+
+pub(crate) fn failed_environment(
+    observations: &std::collections::BTreeMap<String, crate::planner_guard::Observation>,
+) -> bool {
+    ["staging", "production"].into_iter().any(|environment| {
+        observations
+            .get(&format!("ci:{environment}"))
+            .is_some_and(|observation| {
+                observation.reference == environment
+                    && observation.state == crate::planner_guard::ObservationState::Failed
+            })
+    })
 }
 
 fn wake_priority(id: &str) -> u8 {
     if id.starts_with("input:") {
         0
-    } else if id.starts_with("release:") || environment_wake(id) {
+    } else if id.starts_with("release:") || id.starts_with("audit:release:") || environment_wake(id)
+    {
         1
     } else if id.starts_with("observation:") {
         2
@@ -1361,6 +1389,37 @@ mod steer_tests {
         wakes.remove("release:ready");
         wakes.get_mut("capacity:1").unwrap().acknowledged = true;
         assert!(pending_steer(&[], &wakes, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn release_audit_precedes_routine_work_without_steering_a_claimed_wake() {
+        let mut wakes = BTreeMap::from([
+            (
+                "audit:release:1".to_string(),
+                wake("missing release prerequisite"),
+            ),
+            ("capacity:1".to_string(), wake("refill")),
+            ("observation:ci:work".to_string(), wake("branch build")),
+        ]);
+        assert!(wake_priority("audit:release:1") < wake_priority("observation:ci:work"));
+        assert_eq!(
+            pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,
+            "audit:release:1"
+        );
+        let urgent = wakes.get_mut("audit:release:1").unwrap();
+        urgent.claim_pid = std::process::id();
+        urgent.claim_started_at_ms = planner_workflow::process_identity().1;
+        assert_eq!(
+            pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,
+            "capacity:1"
+        );
+        let urgent = wakes.get_mut("audit:release:1").unwrap();
+        urgent.claim_pid = 0;
+        urgent.acknowledged = true;
+        assert_eq!(
+            pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,
+            "capacity:1"
+        );
     }
 
     #[test]

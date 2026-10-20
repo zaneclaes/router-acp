@@ -581,6 +581,17 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if run.status != RunStatus::Running {
         return;
     }
+    // Failed environment findings must reach coordination even if ordinary
+    // worker wakes keep the parent busy continuously. This creates a wake only;
+    // operator turns and queued input retain their existing delivery protections.
+    if crate::planner_wake::failed_environment(&run.observations)
+        || run
+            .wakes
+            .iter()
+            .any(|(id, wake)| id.starts_with("audit:release:") && !wake.acknowledged)
+    {
+        crate::planner_guard::audit_wake(shared, sid, &run, now, now);
+    }
     // Custody fences the affected assignment, not the entire queue. Keep its
     // recovery wake without starving independent capacity or release/audit wakes.
     // Admission and dispatch still enforce source ownership and dependencies.

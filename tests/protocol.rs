@@ -14804,6 +14804,20 @@ async fn queued_agent_input_does_not_preempt_an_operator_turn() {
 
 #[tokio::test]
 async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_turn() {
+    urgent_parent_wake_respects_operator_turn(false, false).await;
+}
+
+#[tokio::test]
+async fn release_audit_reaches_busy_router_parent_but_preserves_operator_turn() {
+    urgent_parent_wake_respects_operator_turn(true, false).await;
+}
+
+#[tokio::test]
+async fn automatic_ownership_steering_waits_for_the_active_edit_to_finish() {
+    urgent_parent_wake_respects_operator_turn(false, true).await;
+}
+
+async fn urgent_parent_wake_respects_operator_turn(release_audit: bool, protect_tool: bool) {
     use router_acp::planner_workflow::{self as workflow, Attempt, Wake, WorkStatus};
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     for operator_turn in [false, true] {
@@ -14812,10 +14826,17 @@ async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_tur
         let release =
             std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
         let hold = std::env::temp_dir().join(format!("hold-{}", uuid::Uuid::new_v4().simple()));
+        let tool_release =
+            std::env::temp_dir().join(format!("edit-{}", uuid::Uuid::new_v4().simple()));
         if operator_turn {
             std::fs::write(&release, "").unwrap();
         }
         let repo = preempt_repository(&release);
+        if protect_tool && !operator_turn {
+            std::fs::write(repo.path().join("repo/.agents/skills/review-work/SKILL.md"), format!(
+                "---\nname: review-work\n---\nTOOL:pending-edit\nWAIT_FILE:{}\nTOOL:finish-edit\nWAIT_FILE:{}\n",
+                tool_release.display(), release.display())).unwrap();
+        }
         run_test_shared(planner_gate_yaml(&state, &log, ""), async |cx, _, shared| {
             let sid = open_planner_parent(&cx, &repo).await?;
             prompt_text(&cx, &sid, planner_admit_wire_prompt()).await?;
@@ -14829,19 +14850,37 @@ async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_tur
             } else {
                 insert_wake(&shared, &sid, "audit:before-ownership");
                 wait_for_mock_prompt(&log, WAKE_MARKER).await;
+                if protect_tool {
+                    wait_for_mock_event(&log, "pending_edit").await;
+                }
                 None
             };
+            let wake_id = if release_audit { "audit:release:fixture" } else { "work-1:attempt-1" };
             workflow::mutate(&shared, &sid, |run| {
+                if release_audit {
+                    run.observations.insert("ci:staging".into(), router_acp::planner_guard::Observation {
+                        revision: "a".repeat(40), reference: "staging".into(),
+                        state: router_acp::planner_guard::ObservationState::Failed,
+                        evidence: "fixture-build".into(),
+                    });
+                }
                 let work = run.works.get_mut("work-1").unwrap();
                 work.status = WorkStatus::Interrupted;
                 work.attempt = Some(Attempt { id: "attempt-1".into(), router_pid: 0,
                     router_started_at_ms: 0, delegate_id: None, ended: true });
                 work.handoff = Some(router_acp::delegate_hook::Handoff {
                     kind: "ownership_requested".into(), message: "specific paths required".into() });
-                run.wakes.insert("work-1:attempt-1".into(), Wake {
+                run.wakes.insert(wake_id.into(), Wake {
                     work_id: "work-1".into(), reason: "DECLINED-STEER OWNERSHIP-FIX".into(), ..Default::default() });
                 Ok(())
             }).unwrap();
+            if protect_tool && !operator_turn {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
+                    "automatic steering must not interrupt an in-flight edit");
+                std::fs::write(&tool_release, "").unwrap();
+                wait_for_mock_event(&log, "completed_edit").await;
+            }
             if let Some(operator) = operator {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 assert!(mock_prompts(&log, "OWNERSHIP-FIX").is_empty());
@@ -14854,12 +14893,17 @@ async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_tur
             let events = read_log(&log);
             assert_eq!(events.iter().any(|e| e["event"] == "cancel"), !operator_turn);
             let run = workflow::load(&shared, &sid).unwrap().unwrap();
-            assert!(!run.wakes["work-1:attempt-1"].acknowledged, "delivery is not reconciliation");
+            if !release_audit {
+                assert!(!run.wakes[wake_id].acknowledged, "delivery is not reconciliation");
+            }
+            assert_eq!(run.works["work-1"].status, WorkStatus::Interrupted,
+                "delivering an audit does not complete the repair");
             std::fs::write(&release, "").unwrap();
             Ok(())
         }).await;
         let _ = std::fs::remove_file(release);
         let _ = std::fs::remove_file(hold);
+        let _ = std::fs::remove_file(tool_release);
     }
 }
 

@@ -563,7 +563,15 @@ async fn run_prompt(
             // does. Forms: `read` | `exec:<cmd>` | `edit` | `fail` | `mcp:<name>`.
             tool_seq += 1;
             let id = format!("tc-{tool_seq}");
-            let tc = if spec == "read" {
+            let tc = if spec == "pending-edit" || spec == "finish-edit" {
+                ToolCall::new("guarded-edit", "Edit")
+                    .kind(ToolKind::Edit)
+                    .status(if spec == "pending-edit" {
+                        ToolCallStatus::InProgress
+                    } else {
+                        ToolCallStatus::Completed
+                    })
+            } else if spec == "read" {
                 ToolCall::new(id, "Read")
                     .kind(ToolKind::Read)
                     .status(ToolCallStatus::Completed)
@@ -591,6 +599,9 @@ async fn run_prompt(
                 session_id.clone(),
                 SessionUpdate::ToolCall(tc),
             ));
+            if spec == "pending-edit" || spec == "finish-edit" {
+                mock.log(json!({"event": if spec == "pending-edit" { "pending_edit" } else { "completed_edit" }}));
+            }
             reply.push(format!("tool:{spec}"));
         } else if line == "PERM" {
             let perm = RequestPermissionRequest::new(

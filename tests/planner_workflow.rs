@@ -5452,6 +5452,77 @@ fn set_status(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test]
+async fn failed_environment_audit_reaches_a_continuously_busy_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    pin_parent(&f.shared);
+    f.shared.with_session(SID, |s| s.prompt_activity = 1);
+    let response = |state: &str| {
+        json!({
+            "defects": [{"code":"CHECKPOINT_REGISTER_MISSING", "detail":"primary handoff absent"}],
+            "observations": {"ci:staging": {"revision":current_revision(&f.repo),
+                "reference":"staging", "state":state, "evidence":"ci-result.json"}}
+        })
+        .to_string()
+    };
+    std::fs::write(&reply, response("failed")).unwrap();
+    let start = parent_turn_ended(&f.shared);
+    router_acp::planner_guard::audit_tick(&f.shared, SID, start).await;
+    deliver_all(&f.shared); // The original environment notification was already handled.
+    for elapsed in [1, 30, 61] {
+        parent_tool_activity(&f.shared, start + elapsed);
+        tick(&f.shared, start + elapsed).await;
+    }
+    let wakes = wakes_with(&f.shared, "audit:release:");
+    assert_eq!(
+        wakes.len(),
+        1,
+        "busy coordination must not hide release audit defects"
+    );
+    assert!(wakes[0].1.reason.contains("CHECKPOINT_REGISTER_MISSING"));
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty(),
+        "an audit wake must not dispatch or select product work"
+    );
+    deliver_all(&f.shared);
+    parent_tool_activity(&f.shared, start + 122);
+    tick(&f.shared, start + 122).await;
+    assert_eq!(
+        wakes_with(&f.shared, "audit:release:").len(),
+        1,
+        "unchanged delivered findings must not repeatedly interrupt active repairs"
+    );
+    std::fs::write(
+        &reply,
+        response("failed").replace("primary handoff absent", "another prerequisite missing"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 183);
+    tick(&f.shared, start + 183).await;
+    assert_eq!(
+        wakes_with(&f.shared, "audit:release:").len(),
+        2,
+        "continued tool activity must not hide changed findings"
+    );
+    std::fs::write(&reply, response("passed")).unwrap();
+    parent_tool_activity(&f.shared, start + 244);
+    tick(&f.shared, start + 244).await;
+    assert!(
+        wakes_with(&f.shared, "audit:release:")
+            .iter()
+            .all(|(_, wake)| wake.acknowledged),
+        "a recovered environment must release urgent audit priority"
+    );
+}
+
+#[tokio::test]
 async fn audit_defects_wake_the_idle_parent_whatever_the_free_slots_and_never_give_up() {
     let tmp = tempfile::tempdir().unwrap();
     let (reply, log) = (

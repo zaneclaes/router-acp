@@ -474,10 +474,23 @@ fn insert_wake(run: &mut PlannerRun, prefix: &str, sid: &str, reason: String) {
 
 /// An idle parent with open audit findings gets an `audit:` wake after
 /// `wake_after_secs`, and another every `wake_after_secs` while they remain,
-/// with no limit. A pending turn-end gate already carries them.
+/// with no limit. Failed environments use the same path during busy coordination,
+/// with an independent repeat clock and release priority. Ordinary findings still
+/// wait for idleness; a pending turn-end gate already carries them.
 pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: i64) {
     if !audit_configured(shared) {
         return;
+    }
+    let release_audit = crate::planner_wake::failed_environment(&run.observations);
+    if !release_audit && pending_wake(run, "audit:release:") {
+        let _ = planner_workflow::mutate(shared, sid, |run| {
+            for (id, wake) in &mut run.wakes {
+                if id.starts_with("audit:release:") {
+                    wake.acknowledged = true;
+                }
+            }
+            Ok(())
+        });
     }
     let findings = audit_findings(run);
     if findings.is_empty() {
@@ -496,9 +509,19 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         return;
     }
     let wait = planner_capacity::timing(shared).wake_after_secs as i64;
-    if pending_wake(run, "audit:")
-        || pending_wake(run, "gate:")
-        || now - last.max(run.capacity.last_audit_wake_at) < wait
+    let prefix = if release_audit {
+        "audit:release:"
+    } else {
+        "audit:"
+    };
+    let last = if release_audit {
+        run.capacity.last_audit_wake_at
+    } else {
+        last.max(run.capacity.last_audit_wake_at)
+    };
+    if pending_wake(run, prefix)
+        || (!release_audit && pending_wake(run, "gate:"))
+        || now - last < wait
     {
         return;
     }
@@ -525,12 +548,25 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             findings.join("\n- ")
         )
     };
+    // An unchanged delivered audit must not repeatedly interrupt an active
+    // repair or release. Idle parents retain the existing repeat cadence.
+    if release_audit
+        && shared
+            .with_session(sid, |session| session.prompt_activity > 0)
+            .unwrap_or(false)
+        && run
+            .wakes
+            .iter()
+            .any(|(id, wake)| id.starts_with(prefix) && wake.reason == reason)
+    {
+        return;
+    }
     let _ = planner_workflow::mutate(shared, sid, |run| {
-        if pending_wake(run, "audit:") {
+        if pending_wake(run, prefix) {
             return Ok(());
         }
         run.capacity.last_audit_wake_at = now;
-        insert_wake(run, "audit:", sid, reason.clone());
+        insert_wake(run, prefix, sid, reason.clone());
         Ok(())
     });
 }

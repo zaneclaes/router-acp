@@ -28,6 +28,7 @@
 //!    tool call that keeps reporting is progress; one silent for the limit is
 //!    not.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,7 +39,7 @@ use serde_json::Value;
 
 use crate::session::Shared;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TurnProgress {
     pub at: Instant,
     /// Actual agent output or tool activity in this prompt, excluding adapter notices.
@@ -46,21 +47,55 @@ pub struct TurnProgress {
     /// When the adapter last reported a result frame attributed to an
     /// autonomous cycle, with nothing after it.
     pub autonomous_result_at: Option<Instant>,
+    /// Foreground ACP tool calls that have not reported a terminal status.
+    pub active_tools: BTreeSet<String>,
+}
+
+impl TurnProgress {
+    fn new(at: Instant) -> Self {
+        Self {
+            at,
+            agent_activity: false,
+            autonomous_result_at: None,
+            active_tools: BTreeSet::new(),
+        }
+    }
+
+    fn note_tool(&mut self, params: &Value) {
+        let Some(update) = params.get("update") else {
+            return;
+        };
+        let kind = update.get("sessionUpdate").and_then(Value::as_str);
+        if !matches!(kind, Some("tool_call" | "tool_call_update")) {
+            return;
+        }
+        let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+            return;
+        };
+        match update.get("status").and_then(Value::as_str) {
+            Some("completed" | "failed" | "cancelled") => {
+                self.active_tools.remove(id);
+            }
+            Some("pending" | "in_progress") => {
+                self.active_tools.insert(id.into());
+            }
+            None if kind == Some("tool_call") => {
+                self.active_tools.insert(id.into());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Any downstream progress for `sid` (a router or delegate session id).
 pub fn note_progress(shared: &Shared, sid: &str) {
     let now = Instant::now();
     let mut progress = shared.turn_progress.lock().unwrap();
-    let agent_activity = progress.get(sid).is_some_and(|p| p.agent_activity);
-    progress.insert(
-        sid.to_string(),
-        TurnProgress {
-            at: now,
-            agent_activity,
-            autonomous_result_at: None,
-        },
-    );
+    let current = progress
+        .entry(sid.to_string())
+        .or_insert_with(|| TurnProgress::new(now));
+    current.at = now;
+    current.autonomous_result_at = None;
 }
 
 /// A `session/update` from the downstream. A cost-bearing `usage_update`
@@ -70,16 +105,22 @@ pub fn note_update(shared: &Shared, sid: &str, params: &Value) {
     let autonomous = is_autonomous_result(params);
     let now = Instant::now();
     let mut progress = shared.turn_progress.lock().unwrap();
-    let agent_activity =
-        progress.get(sid).is_some_and(|p| p.agent_activity) || is_agent_activity(params);
-    progress.insert(
-        sid.to_string(),
-        TurnProgress {
-            at: now,
-            agent_activity,
-            autonomous_result_at: autonomous.then_some(now),
-        },
-    );
+    let current = progress
+        .entry(sid.to_string())
+        .or_insert_with(|| TurnProgress::new(now));
+    current.at = now;
+    current.agent_activity |= is_agent_activity(params);
+    current.autonomous_result_at = autonomous.then_some(now);
+    current.note_tool(params);
+}
+
+pub(crate) fn tools_in_flight(shared: &Shared, sid: &str) -> bool {
+    shared
+        .turn_progress
+        .lock()
+        .unwrap()
+        .get(sid)
+        .is_some_and(|p| !p.active_tools.is_empty())
 }
 
 fn is_agent_activity(params: &Value) -> bool {
@@ -120,14 +161,11 @@ fn is_autonomous_result(params: &Value) -> bool {
 
 /// The turn for `sid` starts now: earlier frames belong to earlier turns.
 pub fn begin(shared: &Shared, sid: &str) {
-    shared.turn_progress.lock().unwrap().insert(
-        sid.to_string(),
-        TurnProgress {
-            at: Instant::now(),
-            agent_activity: false,
-            autonomous_result_at: None,
-        },
-    );
+    shared
+        .turn_progress
+        .lock()
+        .unwrap()
+        .insert(sid.to_string(), TurnProgress::new(Instant::now()));
 }
 
 pub fn last_progress(shared: &Shared, sid: &str) -> Option<Instant> {
@@ -345,6 +383,24 @@ mod tests {
         assert!(!is_agent_activity(
             &serde_json::json!({"update": {"sessionUpdate": "usage_update"}})
         ));
+    }
+
+    #[test]
+    fn all_parallel_tools_must_finish_before_automatic_steering() {
+        let mut progress = TurnProgress::new(Instant::now());
+        let update = |id: &str, status: &str| {
+            serde_json::json!({"update": {
+            "sessionUpdate":"tool_call_update", "toolCallId":id, "status":status }})
+        };
+        progress.note_tool(&update("edit", "pending"));
+        progress.note_tool(&update("git", "in_progress"));
+        progress.note_tool(&serde_json::json!({"update": {
+            "sessionUpdate":"tool_call_update", "toolCallId":"edit", "content":[] }}));
+        progress.note_tool(&update("edit", "completed"));
+        assert_eq!(progress.active_tools, BTreeSet::from(["git".to_string()]));
+        progress.note_tool(&update("git", "failed"));
+        progress.note_tool(&update("already-finished", "completed"));
+        assert!(progress.active_tools.is_empty());
     }
 
     #[test]
