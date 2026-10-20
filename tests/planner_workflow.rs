@@ -6295,6 +6295,44 @@ async fn the_first_allocation_takes_over_an_active_native_run_and_reports_it() {
         .await
         .unwrap();
     assert_eq!(host_calls(&log).len(), 2, "asked once per run");
+
+    // Reconciliation can allocate a work that failed before it had a workspace.
+    // Rechecking completed native adoption must not invalidate that operation's
+    // revision on every one of its optimistic retries.
+    let mut corrected = work("work-3");
+    admit(&shared, corrected.clone());
+    corrected.scope = "corrected dependency and preserved source".into();
+    planner_workflow::operate(
+        &shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "allocate-corrected-work".into(),
+            work: corrected.clone(),
+            source_revision: current_revision(&repo),
+            evidence: vec!["reviewed original source and corrected dependency".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let run = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["work-3"].spec, corrected);
+    assert!(run.works["work-3"].workspace.is_some());
+    let revision = run.revision;
+    router_acp::planner_guard::adopt_native_once(
+        &shared,
+        SID,
+        shared.cfg.routers.planner.workspace.as_ref().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        planner_workflow::load(&shared, SID)
+            .unwrap()
+            .unwrap()
+            .revision,
+        revision,
+        "an already completed adoption check must not write planner state"
+    );
 }
 
 /// Wait until the run reaches `status`.

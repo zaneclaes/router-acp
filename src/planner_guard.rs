@@ -777,6 +777,15 @@ pub async fn integrate_check(shared: &Shared, sid: &str, operation: &Value) -> R
 /// an active native implement-all run (`{"event":"adopt-native"}`, retried on
 /// a non-zero exit), and report the answer to the parent in a wake.
 pub async fn adopt_native_once(shared: &Shared, sid: &str, allocator: &PlannerWorkspaceConfig) {
+    // A no-op check must not bump the revision held by an allocating
+    // reconciliation, or every bounded retry invalidates itself again.
+    if planner_workflow::load(shared, sid)
+        .ok()
+        .flatten()
+        .is_some_and(|run| run.capacity.native_adoption.is_some())
+    {
+        return;
+    }
     let mut first = false;
     let claimed = planner_workflow::mutate(shared, sid, |run| {
         first = run.capacity.native_adoption.is_none();
