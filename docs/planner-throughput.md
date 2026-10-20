@@ -34,6 +34,15 @@ receipt keys to release-owned recipes. Acceptance may precede these proofs; inte
 requires every key. `unresolved` blocks acceptance. Identical packet replay preserves
 review/receipts; changes invalidate them.
 
+Worker dispatch and follow-up context, and targeted `status` reads, expose
+`related_ready_sources`: other same-plan accepted or finished heads whose review
+matches the artifact revision and whose attempt has ended. Scope, changed paths
+and evidence let a repair discover already-qualified work before recreating it.
+The `selected` flag reflects the assignment's existing `ready_dependencies`;
+discovery never selects or merges a head. Unselected applicable source still needs
+parent reconciliation. Queue reads stay compact; unrelated, unreviewed, active and
+integrated work is excluded.
+
 Parent `finalize {key, work_id, receipt}` requires an ended accepted attempt and clean
 exact worktree. The configured integrate-check host receives the trusted assignment,
 verifies custody/resources and returns exit 0 with `{"verified_action":"finalize"}`.
