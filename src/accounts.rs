@@ -1520,16 +1520,15 @@ impl ConfigLock {
         // Computing the overlay against a concurrently changed base could
         // otherwise persist stale inherited values as project overrides.
         for path in crate::project_config::lock_paths(&path)? {
-            locks.push(Self::acquire_one(path)?);
+            Self::acquire_one(path, &mut locks)?;
         }
         Ok(Self(locks))
     }
 
-    fn acquire_one(path: PathBuf) -> Result<std::fs::File, String> {
-        crate::local_state::retire_lock(&path.with_extension("accounts.lock"))?;
+    fn acquire_one(path: PathBuf, locks: &mut Vec<std::fs::File>) -> Result<(), String> {
         let dir = crate::local_state::directory("config-locks", &path)?;
         crate::local_state::private_dir(&dir)?;
-        let path = dir.join("write.lock");
+        let local = dir.join("write.lock");
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)]
@@ -1537,14 +1536,21 @@ impl ConfigLock {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path).map_err(|e| e.to_string())?;
-        file.try_lock().map_err(|e| {
-            format!(
-                "Account configuration is locked at {}. Retry after the other write finishes: {e}",
-                path.display()
-            )
-        })?;
-        Ok(file)
+        let file = options.open(&local).map_err(|e| e.to_string())?;
+        // Older routers still write this configuration under the in-place lock.
+        let legacy_path = path.with_extension("accounts.lock");
+        let legacy = crate::local_state::legacy_lock(&legacy_path, false)?;
+        for (file, held) in std::iter::once((file, &local)).chain(legacy.map(|f| (f, &legacy_path)))
+        {
+            file.try_lock().map_err(|e| {
+                format!(
+                    "Account configuration is locked at {}. Retry after the other write finishes: {e}",
+                    held.display()
+                )
+            })?;
+            locks.push(file);
+        }
+        Ok(())
     }
 }
 impl Drop for ConfigLock {

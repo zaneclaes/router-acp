@@ -1095,12 +1095,12 @@ pub fn present(agent: &AgentConfig) -> bool {
 
 /// OS locks release on cancellation, crash and process exit. There is no
 /// stale-age lock breaking that could permit two live repair owners.
-pub(crate) async fn lock(agent: &AgentConfig) -> Result<File, String> {
+pub(crate) async fn lock(agent: &AgentConfig) -> Result<crate::local_state::HeldLocks, String> {
     let dir = directory(agent).ok_or("Credential directory unavailable")?;
     lock_at(&dir).await
 }
 
-async fn lock_at(dir: &Path) -> Result<File, String> {
+async fn lock_at(dir: &Path) -> Result<crate::local_state::HeldLocks, String> {
     std::fs::create_dir_all(dir).map_err(|_| "Credential directory unavailable")?;
     let local = crate::local_state::account(dir)?;
     crate::local_state::private_dir(&local)?;
@@ -1114,19 +1114,44 @@ async fn lock_at(dir: &Path) -> Result<File, String> {
     let file = options
         .open(local.join("auth.lock"))
         .map_err(|_| "Credential repair lock unavailable")?;
-    tokio::time::timeout(WAIT, async {
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(file),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    tokio::time::sleep(Duration::from_millis(25)).await
-                }
-                Err(_) => return Err("Credential repair lock unavailable".into()),
+    let mut files = vec![file];
+    // An older router refreshes under the in-place lock. A legacy runtime
+    // means one may be serving this account even if it has not locked yet.
+    let older_router = dir.join(".router-acp-runtime").exists();
+    if let Some(legacy) =
+        crate::local_state::legacy_lock(&dir.join(".router-acp-auth.lock"), older_router)?
+    {
+        files.push(legacy);
+    }
+    crate::local_state::hold(files, WAIT)
+        .await
+        .map_err(|failure| match failure {
+            crate::local_state::LockFailure::Unavailable => {
+                "Credential repair lock unavailable".to_string()
             }
-        }
-    })
-    .await
-    .map_err(|_| "Timed out waiting for this credential's repair".to_string())?
+            crate::local_state::LockFailure::TimedOut => {
+                "Timed out waiting for this credential's repair".to_string()
+            }
+        })
+}
+
+/// Fold an older router's in-place repair record into local state. Older
+/// routers can still write it after an upgrade, so a later attempt wins; a
+/// record copied in with portable configuration is older and never does.
+pub(crate) fn migrate_record(dir: &Path) -> Result<(), String> {
+    let legacy = dir.join(".router-acp-auth.json");
+    let parse = |path: &Path| -> Option<(Record, chrono::DateTime<chrono::FixedOffset>)> {
+        let record: Record = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let at = chrono::DateTime::parse_from_rfc3339(&record.attempted_at).ok()?;
+        Some((record, at))
+    };
+    let local = crate::local_state::account(dir)?.join("auth.json");
+    if let (Some((older_router, at)), Some((_, current))) = (parse(&legacy), parse(&local))
+        && at > current
+    {
+        write_record(dir, &older_router)?;
+    }
+    crate::local_state::move_file(&legacy, &local)
 }
 
 fn write_private(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -1737,6 +1762,24 @@ pub async fn repair_for_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn credential_repair_excludes_an_older_router_on_the_same_account() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("accounts/claude@test");
+        // An older router is serving this account but has not refreshed yet.
+        std::fs::create_dir_all(dir.join(".router-acp-runtime/session")).unwrap();
+        let held = lock_at(&dir).await.unwrap();
+        let older = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".router-acp-auth.lock"))
+            .unwrap();
+        assert!(older.try_lock().is_err());
+        drop(held);
+        assert!(older.try_lock().is_ok());
+    }
 
     #[test]
     fn concurrent_runtime_allocation_never_sweeps_a_live_directory() {

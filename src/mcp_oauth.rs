@@ -28,7 +28,7 @@
 //! is never logged, printed, or copied into an error string; error text names
 //! HTTP statuses and OAuth error codes only, never a response body.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -858,13 +858,13 @@ impl Store {
 
     /// The cross-process lock every token write takes: one refresh at a time
     /// across every router process, and waiters re-read the result.
-    pub async fn lock(&self) -> Result<File, String> {
+    pub async fn lock(&self) -> Result<crate::local_state::HeldLocks, String> {
         self.ensure_dir()?;
-        crate::local_state::retire_lock(&self.dir.join(".lock"))?;
         let local = crate::local_state::directory("mcp", &self.dir)?;
         crate::local_state::private_dir(&local)?;
         for name in [FLOW, HEALTH] {
-            crate::local_state::move_file(&self.dir.join(name), &local.join(name))?;
+            // Best effort: the files are hints, and a move retries next lock.
+            let _ = crate::local_state::move_file(&self.dir.join(name), &local.join(name));
         }
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -876,19 +876,21 @@ impl Store {
         let file = options
             .open(local.join("oauth.lock"))
             .map_err(|_| "MCP credential lock unavailable")?;
-        tokio::time::timeout(LOCK_WAIT, async {
-            loop {
-                match file.try_lock() {
-                    Ok(()) => return Ok(file),
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        tokio::time::sleep(Duration::from_millis(25)).await
-                    }
-                    Err(_) => return Err("MCP credential lock unavailable".to_string()),
+        let mut files = vec![file];
+        // Older routers refresh these tokens under the in-place lock.
+        if let Some(legacy) = crate::local_state::legacy_lock(&self.dir.join(".lock"), false)? {
+            files.push(legacy);
+        }
+        crate::local_state::hold(files, LOCK_WAIT)
+            .await
+            .map_err(|failure| match failure {
+                crate::local_state::LockFailure::Unavailable => {
+                    "MCP credential lock unavailable".to_string()
                 }
-            }
-        })
-        .await
-        .map_err(|_| "Timed out waiting for the MCP credential lock".to_string())?
+                crate::local_state::LockFailure::TimedOut => {
+                    "Timed out waiting for the MCP credential lock".to_string()
+                }
+            })
     }
 }
 
