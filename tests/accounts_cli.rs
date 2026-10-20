@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+mod support;
 
 struct Client {
     child: Child,
@@ -12,6 +13,11 @@ struct Client {
     events: Vec<Value>,
     next_id: u64,
     answers: std::collections::VecDeque<String>,
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        support::stop_router(&mut self.child);
+    }
 }
 impl Client {
     async fn request(&mut self, method: &str, params: Value) -> Value {
@@ -200,7 +206,7 @@ async fn wait_for_file(path: &Path) -> String {
 
 async fn wait_for_ambient_paths(path: &Path, account_dir: &Path) -> String {
     let path = path.to_path_buf();
-    let account_dir = account_dir.to_string_lossy().to_string();
+    let runtime_prefix = runtime_prefix(account_dir);
     let diagnostic_path = path.clone();
     let result = tokio::time::timeout(Duration::from_secs(3), async move {
         loop {
@@ -209,11 +215,9 @@ async fn wait_for_ambient_paths(path: &Path, account_dir: &Path) -> String {
                     value.lines().any(|line| {
                         let fields: Vec<_> = line.split('|').collect();
                         fields.first() == Some(label)
-                            && fields.get(1).is_some_and(|observed| {
-                                observed == &account_dir
-                                    || observed
-                                        .starts_with(&format!("{account_dir}/.router-acp-runtime/"))
-                            })
+                            && fields
+                                .get(1)
+                                .is_some_and(|observed| observed.starts_with(&runtime_prefix))
                     })
                 })
             {
@@ -238,7 +242,7 @@ async fn wait_for_ambient_observations(
     minimum: usize,
 ) {
     let path = path.to_path_buf();
-    let account_dir = account_dir.to_string_lossy().to_string();
+    let runtime_prefix = runtime_prefix(account_dir);
     tokio::time::timeout(Duration::from_secs(3), async move {
         loop {
             if std::fs::read_to_string(&path)
@@ -247,11 +251,9 @@ async fn wait_for_ambient_observations(
                 .filter(|line| {
                     let fields: Vec<_> = line.split('|').collect();
                     fields.first() == Some(&label)
-                        && fields.get(1).is_some_and(|observed| {
-                            *observed == account_dir.as_str()
-                                || observed
-                                    .starts_with(&format!("{account_dir}/.router-acp-runtime/"))
-                        })
+                        && fields
+                            .get(1)
+                            .is_some_and(|observed| observed.starts_with(&runtime_prefix))
                 })
                 .count()
                 >= minimum
@@ -263,6 +265,18 @@ async fn wait_for_ambient_observations(
     })
     .await
     .expect("account adapter did not restart after login management");
+}
+
+fn runtime_prefix(account_dir: &Path) -> String {
+    router_acp::local_state::root()
+        .unwrap()
+        .join("runtimes")
+        .join(format!(
+            "{}-",
+            account_dir.file_name().unwrap().to_string_lossy()
+        ))
+        .to_string_lossy()
+        .into_owned()
 }
 
 async fn wait_for_event_count(path: &Path, event: &str, minimum: usize) {
@@ -655,8 +669,8 @@ agents:
             payload: Some(json!({"limits":[{"kind":"weekly","percent":percent}]})),
         };
         // Each account's usage lives in its own directory.
-        let path = config_dir
-            .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+        let path = router_acp::usage_cache::account_usage_dir(&config_dir)
+            .unwrap()
             .join("anthropic-oauth.json");
         router_acp::usage_cache::write_snapshot(&path, &snapshot).unwrap();
     }
@@ -693,8 +707,8 @@ fn account_status_reports_router_owned_capacity_outcomes() {
             "resets_at":chrono::DateTime::from_timestamp((now + 3600) as i64, 0).unwrap().to_rfc3339()
         }]})),
     };
-    let snapshot_path = config_dir
-        .join(router_acp::usage_cache::ACCOUNT_USAGE_DIR)
+    let snapshot_path = router_acp::usage_cache::account_usage_dir(&config_dir)
+        .unwrap()
         .join("anthropic-oauth.json");
     router_acp::usage_cache::write_snapshot(&snapshot_path, &snapshot).unwrap();
 
@@ -702,6 +716,10 @@ fn account_status_reports_router_owned_capacity_outcomes() {
         .args(["account-status", "--config"])
         .arg(&config)
         .env("HOME", &home)
+        .env(
+            "XDG_STATE_HOME",
+            router_acp::local_state::root().unwrap().parent().unwrap(),
+        )
         .output()
         .unwrap();
     assert!(
@@ -929,7 +947,21 @@ async fn standalone_usage_reads_two_account_snapshots_without_spawning_provider_
         std::env::var("PATH").unwrap_or_default()
     );
     let home = home.to_string_lossy().to_string();
-    let mut client = spawn_with_env(&config, &[("HOME", &home), ("PATH", &path)]);
+    // The fixture wrote snapshots in this process's local state. Changing
+    // only the child's HOME would select a different cache and poll instead.
+    let state_home = router_acp::local_state::root()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut client = spawn_with_env(
+        &config,
+        &[
+            ("HOME", &home),
+            ("PATH", &path),
+            ("XDG_STATE_HOME", state_home.to_str().unwrap()),
+        ],
+    );
     client
         .request(
             "initialize",
@@ -978,7 +1010,7 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
         .await;
     let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
 
-    client.answers.extend(["2".into(), "2".into()]);
+    client.answers.extend(["2".into(), "2".into(), "1".into()]);
     let response = client.prompt(&sid, "/login").await;
     assert!(response["result"].is_object(), "{response}");
     let management = client.text();
@@ -1013,7 +1045,9 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
     );
     let recorded_dirs = wait_for_file(&fixture.login_state.join("dirs")).await;
     assert!(
-        recorded_dirs.lines().any(|line| line == added_dir),
+        recorded_dirs
+            .lines()
+            .any(|line| line.starts_with(&runtime_prefix(Path::new(&added_dir)))),
         "{recorded_dirs}"
     );
     assert!(
@@ -1052,7 +1086,7 @@ async fn standalone_add_uses_isolated_login_and_routes_current_and_restarted() {
         std::fs::read_to_string(&fixture.probe_log)
             .unwrap()
             .lines()
-            .any(|line| line.starts_with(&format!("{added_dir}/.router-acp-runtime/")))
+            .any(|line| line.starts_with(&runtime_prefix(Path::new(&added_dir))))
     );
     restarted.close().await;
 }
@@ -1124,7 +1158,7 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
     client
         .answers
-        .extend(["1".into(), "2".into(), "AUTH-CODE".into()]);
+        .extend(["1".into(), "2".into(), "1".into(), "AUTH-CODE".into()]);
     client.prompt(&sid, "/login").await;
 
     let cfg = router_acp::config::Config::from_file(&fixture.config).unwrap();
@@ -1149,7 +1183,7 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     let ambient = wait_for_file(&fixture.ambient_log).await;
     let added_lines: Vec<_> = ambient
         .lines()
-        .filter(|line| line.contains(added_dir.to_string_lossy().as_ref()))
+        .filter(|line| line.contains(&runtime_prefix(&added_dir)))
         .collect();
     assert!(!added_lines.is_empty(), "{ambient}");
     for label in ["login", "downstream"] {
@@ -1196,7 +1230,7 @@ async fn standalone_delete_isolated_claude_account_preserves_sibling_and_mcp_cre
     let ambient = wait_for_ambient_paths(&fixture.ambient_log, &added_dir).await;
     let added_lines: Vec<_> = ambient
         .lines()
-        .filter(|line| line.contains(added_dir.to_string_lossy().as_ref()))
+        .filter(|line| line.contains(&runtime_prefix(&added_dir)))
         .collect();
     for label in ["login", "probe", "downstream"] {
         assert!(
@@ -1311,7 +1345,7 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         wait_for_file(&fixture.login_state.join("dirs"))
             .await
             .lines()
-            .any(|line| line == existing_dir.to_string_lossy())
+            .any(|line| line.starts_with(&runtime_prefix(&existing_dir)))
     );
     assert_eq!(prompt_count(&fixture.original_log), 0);
     client.close().await;
@@ -1338,8 +1372,7 @@ async fn standalone_relogin_reuses_codex_directory_name_reserve_and_priority() {
         std::fs::read_to_string(&fixture.probe_log)
             .unwrap()
             .lines()
-            .any(|line| line
-                .starts_with(&format!("{}/.router-acp-runtime/", existing_dir.display())))
+            .any(|line| line.starts_with(&runtime_prefix(&existing_dir)))
     );
     restarted.close().await;
 }
@@ -1559,7 +1592,7 @@ async fn standalone_session_cancel_removes_pending_add_but_keeps_existing_member
         .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
         .await;
     let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
-    for choice in ["/login", "1", "2"] {
+    for choice in ["/login", "1", "2", "1"] {
         client.prompt(&sid, choice).await;
     }
     wait_for_file(&fixture.login_state.join("pid")).await;
@@ -1615,6 +1648,225 @@ async fn standalone_structured_login_has_provider_account_and_action_forms() {
     assert!(rendered.contains("Re-login"));
     assert!(!client.text().contains("echo:"));
     client.close().await;
+}
+
+#[tokio::test]
+async fn project_add_account_keeps_membership_local_and_credentials_in_the_user_store() {
+    let fixture = login_fixture("claude", Some("old"));
+    let user = fixture.home.join(".config/router-acp/router.yaml");
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::copy(&fixture.config, &user).unwrap();
+    let global = std::fs::read(&user).unwrap();
+    let project = fixture.home.join("project/.router-acp/router.yaml");
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(&project, "{}\n").unwrap();
+    let mut client = spawn_with_env(&project, &[("HOME", fixture.home.to_str().unwrap())]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    client
+        .answers
+        .extend(["1".into(), "2".into(), "2".into(), "AUTH-CODE".into()]);
+    client.prompt(&sid, "/login").await;
+    assert!(client.text().contains("Signed in"), "{}", client.text());
+    client.close().await;
+    assert_eq!(std::fs::read(&user).unwrap(), global);
+    let overlay: Value = serde_yaml::from_str(&std::fs::read_to_string(&project).unwrap()).unwrap();
+    let added = overlay["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"].as_str().is_some_and(|n| n.starts_with("claude@")))
+        .unwrap();
+    let id = added["name"].as_str().unwrap();
+    assert!(
+        fixture
+            .account_root
+            .join(id)
+            .join(".credentials.json")
+            .is_file()
+    );
+    assert!(!project.parent().unwrap().join("accounts").exists());
+}
+
+#[tokio::test]
+async fn system_reserves_for_a_project_only_account_preserve_project_membership() {
+    let fixture = login_fixture("codex", Some("old"));
+    let project = fixture.home.join("project/.router-acp/router.yaml");
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::copy(&fixture.config, &project).unwrap();
+    let user = fixture.home.join(".config/router-acp/router.yaml");
+    let mut client = spawn_with_env(&project, &[("HOME", fixture.home.to_str().unwrap())]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    let created = client
+        .request(
+            "session/new",
+            json!({"cwd":fixture.home.join("project"),"mcpServers":[]}),
+        )
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    for choice in ["/login", "2", "1", "4", "1", "4"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client.text().contains("weekly reserve set to 15%"),
+        "{}",
+        client.text()
+    );
+    let system = router_acp::config::Config::from_file(&user).unwrap();
+    assert!(system.agents[0].account_disabled);
+    assert_eq!(system.agents[0].reserve_capacity.weekly, 15.0);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        .args(["account-status", "--config"])
+        .arg(&project)
+        .env("HOME", &fixture.home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(status["accounts"][0]["reserveCapacity"]["weekly"], 12.0);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn account_scope_moves_and_independent_reserves_round_trip_through_native_menus() {
+    let fixture = login_fixture("codex", Some("old"));
+    let user = fixture.home.join(".config/router-acp/router.yaml");
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::copy(&fixture.config, &user).unwrap();
+    let project = fixture.home.join("project/.router-acp/router.yaml");
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(&project, "{}\n").unwrap();
+    let credential = fixture.existing_dir.as_ref().unwrap().join("auth.json");
+    let before = std::fs::read(&credential).unwrap();
+    let mut client = spawn_with_env(&project, &[("HOME", fixture.home.to_str().unwrap())]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    let created = client
+        .request(
+            "session/new",
+            json!({"cwd":fixture.home.join("project"),"mcpServers":[]}),
+        )
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    for choice in ["/login", "2", "1", "6", "2"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client.text().contains("Account moved to Project scope"),
+        "{}",
+        client.text()
+    );
+    assert!(router_acp::config::Config::from_file(&user).unwrap().agents[0].account_disabled);
+    // Set system weekly to 15%, then project weekly to 100% (disabled).
+    for choice in ["4", "1", "4", "3", "5", "1", "11"] {
+        client.prompt(&sid, choice).await;
+    }
+    let status = |path: &Path| -> Value {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+            .args(["account-status", "--config"])
+            .arg(path)
+            .env("HOME", &fixture.home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let account = &status(&project)["accounts"][0];
+    assert_eq!(
+        account["reserveCapacity"],
+        json!({"weekly":100.0,"session":34.0})
+    );
+    assert_eq!(account["routing"]["reason"], "disabled");
+    assert_eq!(
+        router_acp::config::Config::from_file(&user).unwrap().agents[0]
+            .reserve_capacity
+            .weekly,
+        15.0
+    );
+    assert!(client.text().contains("100% (disabled)"));
+    // Remove only the project weekly override, then promote membership again.
+    for choice in ["1", "12", "3", "6", "1"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client.text().contains("Account moved to System scope"),
+        "{}",
+        client.text()
+    );
+    assert_eq!(
+        status(&project)["accounts"][0]["reserveCapacity"]["weekly"],
+        15.0
+    );
+    assert_eq!(status(&user)["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read(credential).unwrap(), before);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn project_delete_retains_inherited_account_credentials_and_user_membership() {
+    let fixture = login_fixture("claude", Some("old"));
+    let user = fixture.home.join(".config/router-acp/router.yaml");
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::copy(&fixture.config, &user).unwrap();
+    let global = std::fs::read(&user).unwrap();
+    let project = fixture.home.join("project/.router-acp/router.yaml");
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(&project, "{}\n").unwrap();
+    let credential = fixture
+        .existing_dir
+        .as_ref()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::write(&credential, r#"{"mcpOAuth":{"fixture":"retained"}}"#).unwrap();
+    let before = std::fs::read(&credential).unwrap();
+    let mut client = spawn_with_env(&project, &[("HOME", fixture.home.to_str().unwrap())]);
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    for command in ["/login", "1", "1", "2", "2"] {
+        assert!(client.prompt(&sid, command).await.get("result").is_some());
+    }
+    assert!(
+        client
+            .text()
+            .contains("shared login credentials were retained"),
+        "{}",
+        client.text()
+    );
+    client.close().await;
+    assert_eq!(std::fs::read(&user).unwrap(), global);
+    assert_eq!(std::fs::read(&credential).unwrap(), before);
+    let overlay: Value = serde_yaml::from_str(&std::fs::read_to_string(project).unwrap()).unwrap();
+    assert_eq!(overlay["agents"][0]["accounts"][0]["disabled"], true);
 }
 
 #[tokio::test]
@@ -1683,6 +1935,141 @@ fn mcp_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
 }
 
 #[tokio::test]
+async fn mcp_scope_moves_keep_generated_server_definitions_and_credentials_intact() {
+    let (dir, config, project, root) = mcp_fixture();
+    let original = std::fs::read(project.join(".mcp.json")).unwrap();
+    let system = router_acp::mcp_oauth::RemoteServer::new("kory", "https://kory.example/mcp");
+    let store = system.store(Path::new(&root));
+    store
+        .write_tokens(&router_acp::mcp_oauth::Tokens {
+            access_token: "fixture-scope-access".into(),
+            refresh_token: Some("fixture-scope-refresh".into()),
+            expires_at: Some(4070908800000),
+            refresh_failed_at: None,
+        })
+        .unwrap();
+    let before = std::fs::read(store.dir().join("tokens.json")).unwrap();
+    let mut client = spawn_with_env(
+        &config,
+        &[
+            ("HOME", dir.path().to_str().unwrap()),
+            ("ROUTER_ACP_MCP_DIR", &root),
+        ],
+    );
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":project,"mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    for choice in ["/login", "5", "1", "3", "2"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client.text().contains("MCP account moved to Project scope"),
+        "{}",
+        client.text()
+    );
+    assert!(!store.dir().join("tokens.json").exists());
+    let selection: Value = serde_yaml::from_str(
+        &std::fs::read_to_string(project.join(".router-acp/router.yaml")).unwrap(),
+    )
+    .unwrap();
+    let mut scoped = system.clone();
+    scoped.account = Some(
+        selection["mcp_accounts"]["https://kory.example/mcp"]["account"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    assert_eq!(
+        std::fs::read(scoped.store(Path::new(&root)).dir().join("tokens.json")).unwrap(),
+        before
+    );
+    client.prompt(&sid, "/cancel").await;
+    for choice in ["/mcp", "1"] {
+        client.prompt(&sid, choice).await;
+    }
+    for choice in ["3", "1"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client.text().contains("MCP account moved to System scope"),
+        "{}",
+        client.text()
+    );
+    assert_eq!(
+        std::fs::read(store.dir().join("tokens.json")).unwrap(),
+        before
+    );
+    assert!(
+        !scoped
+            .store(Path::new(&root))
+            .dir()
+            .join("tokens.json")
+            .exists()
+    );
+    client.prompt(&sid, "/cancel").await;
+    for choice in ["/mcp", "1"] {
+        client.prompt(&sid, choice).await;
+    }
+    // A different existing system login can be selected without replacing
+    // either identity or starting another browser flow.
+    for choice in ["3", "2"] {
+        client.prompt(&sid, choice).await;
+    }
+    let selection: Value = serde_yaml::from_str(
+        &std::fs::read_to_string(project.join(".router-acp/router.yaml")).unwrap(),
+    )
+    .unwrap();
+    scoped.account = Some(
+        selection["mcp_accounts"]["https://kory.example/mcp"]["account"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    store
+        .write_tokens(&router_acp::mcp_oauth::Tokens {
+            access_token: "other-system-login".into(),
+            refresh_token: None,
+            expires_at: Some(4070908800000),
+            refresh_failed_at: None,
+        })
+        .unwrap();
+    let other = std::fs::read(store.dir().join("tokens.json")).unwrap();
+    for choice in ["3", "1"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client
+            .text()
+            .contains("target scope already has a saved login")
+    );
+    for choice in ["3", "3"] {
+        client.prompt(&sid, choice).await;
+    }
+    assert!(
+        client.text().contains("Using the existing system login"),
+        "{}",
+        client.text()
+    );
+    assert_eq!(
+        std::fs::read(store.dir().join("tokens.json")).unwrap(),
+        other
+    );
+    assert_eq!(
+        std::fs::read(scoped.store(Path::new(&root)).dir().join("tokens.json")).unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(project.join(".mcp.json")).unwrap(), original);
+    client.close().await;
+}
+
+#[tokio::test]
 async fn slash_mcp_lists_project_servers_with_their_sign_in_state() {
     let (_dir, config, project, store) = mcp_fixture();
     let mut client = spawn_with_env(&config, &[("ROUTER_ACP_MCP_DIR", &store)]);
@@ -1699,7 +2086,7 @@ async fn slash_mcp_lists_project_servers_with_their_sign_in_state() {
     // kory → Back → local → Back → Close.
     client
         .answers
-        .extend(["1", "2", "2", "1", "3"].map(String::from));
+        .extend(["1", "3", "2", "1", "3"].map(String::from));
     let response = client.prompt(&sid, "/mcp").await;
     assert!(response["result"].is_object(), "{response}");
     let forms: Vec<(String, Vec<String>)> = client
@@ -1736,7 +2123,7 @@ async fn slash_mcp_lists_project_servers_with_their_sign_in_state() {
         forms[1].0.contains("URL: https://kory.example/mcp"),
         "{forms:?}"
     );
-    assert_eq!(forms[1].1, vec!["Sign in", "Back"]);
+    assert_eq!(forms[1].1, vec!["Sign in", "Change account scope", "Back"]);
     assert!(
         forms[3].0.contains("does not sign in to this entry"),
         "{forms:?}"
@@ -1765,7 +2152,9 @@ async fn slash_mcp_works_as_a_numbered_menu_without_forms() {
     assert!(text.contains("2. local: pass-through (stdio)"), "{text}");
     client.prompt(&sid, "1").await;
     assert!(
-        client.text().contains("1. Sign in\n2. Back"),
+        client
+            .text()
+            .contains("1. Sign in\n2. Change account scope\n3. Back"),
         "{}",
         client.text()
     );

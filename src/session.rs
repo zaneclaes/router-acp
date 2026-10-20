@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
@@ -133,6 +133,9 @@ pub struct DelegateHandle {
 /// can send follow-up instructions to the same sub-agent (preserving its
 /// context) rather than re-briefing a fresh session each time.
 pub struct LiveDelegate {
+    /// Original routing/workspace inputs for an account handoff. Synthetic
+    /// lifecycle-only delegates may omit these.
+    pub resume_args: Option<crate::delegate_mcp::DelegateTaskArgs>,
     pub parent_sid: String,
     pub process_key: ProcessKey,
     pub downstream_sid: String,
@@ -147,24 +150,40 @@ pub struct LiveDelegate {
     /// Router worker id (`b-…`/`w-…`), also the `worker_handoffs` key.
     pub worker_id: String,
     pub planner: Option<crate::planner_workflow::WorkerIdentity>,
+    /// This delegate's `router-worker` token, revoked when it finishes.
+    pub worker_token: Option<String>,
     /// Turns completed so far, for `delegate_turn_end` events.
     pub turns: u32,
 }
 
 impl LiveDelegate {
-    /// Release per-delegate state and report the stop to the lifecycle hook.
-    pub fn finish(&self, shared: &Arc<Shared>, outcome: &str) {
+    /// Release transport-owned state without ending the logical worker.
+    pub(crate) fn release(&self, shared: &Arc<Shared>) {
         shared.delegate_effort.lock().unwrap().remove(&self.sub_sid);
         shared
             .worker_handoffs
             .lock()
             .unwrap()
             .remove(&self.worker_id);
-        crate::delegate_mcp::drop_worker_tokens(shared, &self.worker_id);
+        crate::delegate_mcp::drop_delegate_token(shared, self.worker_token.as_deref());
+    }
+
+    /// Release per-delegate state and report the stop to the lifecycle hook.
+    pub fn finish(&self, shared: &Arc<Shared>, outcome: &str) {
+        self.release(shared);
         if let Some(event) = &self.lifecycle {
             crate::delegate_hook::deliver(shared, &event.stopped(outcome, None));
         }
     }
+}
+
+/// The planner attempt a background job claimed before its child session
+/// row exists. A pending job id is not evidence that startup has no owner.
+#[derive(Clone)]
+pub struct PlannerJobClaim {
+    pub work_id: String,
+    pub attempt_id: String,
+    pub child_id: String,
 }
 
 /// A `delegate_task background: true` job. The subtask runs on its own tokio
@@ -177,6 +196,15 @@ pub struct BackgroundDelegate {
     pub summary: String,
     pub started: std::time::Instant,
     pub result: Option<Result<String, String>>,
+    /// A planner work delegate. It reports through router wakes, so
+    /// `delegate_await` never blocks the parent's turn on it.
+    pub planner: bool,
+    /// Set when this job claimed a planner attempt. Empty for an ordinary
+    /// delegate and for a job registered before the claim existed.
+    pub claim: Option<PlannerJobClaim>,
+    /// A follow-up job's original `d-…` delegate. Its session row keeps the
+    /// first job's id, so a result read must follow this link.
+    pub resume_of: Option<String>,
 }
 
 pub struct RouterSession {
@@ -656,6 +684,13 @@ pub struct Shared {
     /// parent session's effort while that delegate runs.
     pub delegate_effort: Mutex<HashMap<String, crate::candidate::EffortLevel>>,
     pub planner_deliveries: Mutex<HashMap<String, crate::planner_workflow::PendingDelivery>>,
+    /// In-process planner state by parent session: turn ends for the
+    /// turn-end gate, child sessions and an active shutdown drain.
+    pub planner_runtime: Mutex<HashMap<String, crate::planner_guard::SessionRuntime>>,
+    /// Last downstream progress per router or delegate session id, for the
+    /// stuck-turn watchdog and the folded-result settle
+    /// (`crate::planner_watchdog`).
+    pub turn_progress: Mutex<HashMap<String, crate::planner_watchdog::TurnProgress>>,
     pub planner_child_routes:
         Mutex<HashMap<(ProcessKey, String), crate::planner_client::ChildRoute>>,
     pub planner_child_targets: Mutex<HashSet<ProcessKey>>,
@@ -669,6 +704,7 @@ pub struct Shared {
     /// body)), so concurrent sessions share one fetch.
     pub ticket_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
     pub delegate_semaphore: Arc<tokio::sync::Semaphore>,
+    delegate_limit: AtomicUsize,
     pub delegate_socket: OnceLock<PathBuf>,
     upstream: OnceLock<ConnectionTo<ClientPeer>>,
     client_caps: OnceLock<ClientCapabilities>,
@@ -796,12 +832,15 @@ impl Shared {
             background_interrupts: Mutex::new(HashMap::new()),
             delegate_effort: Mutex::new(HashMap::new()),
             planner_deliveries: Mutex::default(),
+            planner_runtime: Mutex::default(),
+            turn_progress: Mutex::default(),
             planner_child_routes: Mutex::default(),
             planner_child_targets: Mutex::default(),
             agent_delegate_slots,
             worker_handoffs: Mutex::new(HashMap::new()),
             ticket_cache: Mutex::new(HashMap::new()),
             delegate_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            delegate_limit: AtomicUsize::new(max_concurrent),
             delegate_socket: OnceLock::new(),
             upstream: OnceLock::new(),
             client_caps: OnceLock::new(),
@@ -1352,9 +1391,9 @@ impl Shared {
         )
     }
 
-    /// `candidate_view` for a candidate that is already serving: a soft
-    /// (reserve) cordon or a model outage does not stop it finishing work
-    /// it holds — a running turn or a handoff summary.
+    /// `candidate_view` for a candidate already serving: a model outage
+    /// elsewhere does not interrupt its healthy request. Usage/reserve
+    /// cordons still exclude it, including from handoff summaries.
     pub fn candidate_view_serving(
         &self,
         id: &CandidateId,
@@ -1413,7 +1452,7 @@ impl Shared {
                 || cfg
                     .agents
                     .iter()
-                    .any(|a| a.name == c.id.agent && a.account_disabled)
+                    .any(|a| a.name == c.id.agent && crate::accounts::routing_disabled(a))
             {
                 continue;
             }
@@ -1443,14 +1482,9 @@ impl Shared {
             if headroom.cordon_active(&c.id.agent).is_some() {
                 continue;
             }
-            // Candidates proactively cordoned by the provider's usage API (cap
-            // exhausted, no overage headroom) sit out until their reset. A
-            // serving candidate finishes its work through a soft cordon.
+            // A usage/reserve cordon stops spending on this seat immediately.
             let serving_this = serving == Some(&c.id);
-            if headroom
-                .usage_cordon(&c.id)
-                .is_some_and(|cordon| !(serving_this && cordon.soft))
-            {
+            if headroom.usage_cordon(&c.id).is_some() {
                 continue;
             }
             // A provider outage takes the model down on every account.
@@ -1553,6 +1587,36 @@ impl Shared {
     // ------------------------------------------------------------------
     // Router-owned session config options
     // ------------------------------------------------------------------
+
+    pub fn delegate_limit(&self) -> usize {
+        self.delegate_limit.load(Ordering::Acquire)
+    }
+
+    /// Increasing capacity never disturbs live permits. Decreases take
+    /// effect through the configured limit at the next process start.
+    pub fn increase_delegate_limit(&self, requested: usize) -> Result<(), String> {
+        if requested == 0 || requested > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err("worker limit is outside the supported positive range".into());
+        }
+        let mut previous = self.delegate_limit();
+        loop {
+            if requested < previous {
+                return Err("lowering the worker limit requires a restart with the configured limit; running workers were not changed".into());
+            }
+            match self.delegate_limit.compare_exchange(
+                previous,
+                requested,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.delegate_semaphore.add_permits(requested - previous);
+                    return Ok(());
+                }
+                Err(current) => previous = current,
+            }
+        }
+    }
 
     pub fn router_config_options(&self, router_sid: &str) -> Vec<SessionConfigOption> {
         let (strategy, override_, effort) = self
@@ -1729,7 +1793,21 @@ impl Shared {
                 .to_string(),
         );
 
-        vec![strategy_option, candidate_option, effort_option]
+        let limit = self.delegate_limit();
+        let mut limits = vec![limit, 20, 32, 50, 64, 100];
+        limits.retain(|value| *value >= limit);
+        limits.sort_unstable();
+        limits.dedup();
+        let worker_option = SessionConfigOption::select(
+            "router.worker_limit", "Worker limit (this router process)", limit.to_string(),
+            limits.into_iter().map(|value| SessionConfigSelectOption::new(value.to_string(), value.to_string())).collect::<Vec<_>>()
+        ).description(format!("Effective limit: {limit}; configured at startup: {}. Increasing takes effect immediately. Saved configuration controls the next restart.", self.cfg.delegation.max_concurrent));
+        vec![
+            strategy_option,
+            candidate_option,
+            effort_option,
+            worker_option,
+        ]
     }
 }
 
@@ -2582,6 +2660,25 @@ pub(crate) fn auto_permission_answer(params: &Value) -> Value {
     }
 }
 
+/// These router-owned orchestration tools are authorized by selecting the
+/// planner strategy, including when the operator starts the parent turn.
+fn planner_tool_permission(params: &Value) -> bool {
+    let call = &params["toolCall"];
+    let name = call
+        .pointer("/_meta/claudeCode/toolName")
+        .and_then(Value::as_str)
+        .or_else(|| call.get("title").and_then(Value::as_str));
+    matches!(
+        name,
+        Some(
+            "delegate_task"
+                | "planner_workflow"
+                | "mcp__router-delegate__delegate_task"
+                | "mcp__router-delegate__planner_workflow"
+        )
+    )
+}
+
 fn track_approval(
     shared: &Arc<Shared>,
     sid: &str,
@@ -2600,21 +2697,12 @@ fn track_approval(
         .map_err(|e| AcpError::internal_error().data(e))?;
     let shared = shared.clone();
     let sid = sid.to_string();
+    // A client that fails the request has still answered it: the agent sees the
+    // error as a refusal and its turn goes on. Only a callback that never
+    // returns stays a wait; one tool's permission never stops the planner run.
     Ok(responder.wrap_params(move |_, result| {
-        if result.is_ok() {
-            crate::planner_wake::approval_answered(&shared, &sid, &id)
-                .map_err(|e| AcpError::internal_error().data(e))?;
-        } else if crate::planner_workflow::load(&shared, &sid)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            crate::planner_workflow::mutate(&shared, &sid, |run| {
-                run.status = crate::planner_workflow::RunStatus::Paused;
-                Ok(())
-            })
+        crate::planner_wake::approval_answered(&shared, &sid, &id)
             .map_err(|e| AcpError::internal_error().data(e))?;
-        }
         result
     }))
 }
@@ -2737,6 +2825,9 @@ pub fn handle_downstream_dispatch(
     match route {
         DownstreamRoute::Primary { router_sid } => match message {
             Dispatch::Notification(msg) => {
+                // Downstream progress for the stuck-turn watchdog, before any
+                // early return (a summary capture is progress too).
+                crate::planner_watchdog::note_update(shared, &router_sid, msg.params());
                 let msg = crate::accounts::merge_commands(msg)?;
                 // Claude's narration of its user-facing prose arrives as
                 // thinking; relay it as the message it is (see
@@ -2955,15 +3046,20 @@ pub fn handle_downstream_dispatch(
                 Ok(Handled::Yes)
             }
             Dispatch::Request(msg, responder) => {
+                crate::planner_watchdog::note_progress(shared, &router_sid);
                 // Log client-directed callbacks (permission, fs, terminal).
                 let method = msg.method().to_string();
-                // A planner wake is a router-owned turn: the client has no
-                // prompt in flight, so it cannot show the request (goose
-                // answers it with an internal error, which pauses the run).
-                // Answer as a delegate's turn is answered.
+                // Wakes have no client prompt to answer a permission callback.
+                // Planner orchestration also remains authorized when an
+                // operator prompt owns the turn; a missing terminal response
+                // must not become a refused worker start.
                 if method == "session/request_permission"
                     && shared
-                        .with_session(&router_sid, |s| s.planner_wake_active)
+                        .with_session(&router_sid, |s| {
+                            s.planner_wake_active
+                                || (s.strategy == StrategyKind::Planner
+                                    && planner_tool_permission(msg.params()))
+                        })
                         .unwrap_or(false)
                 {
                     let answer = auto_permission_answer(msg.params());
@@ -2973,7 +3069,7 @@ pub fn handle_downstream_dispatch(
                             kind: "auto_permission".to_string(),
                             role: "router".to_string(),
                             summary: format!(
-                                "planner wake answered a permission request: {answer}"
+                                "planner answered an authorized permission request: {answer}"
                             ),
                             tokens_estimated: true,
                             ..Default::default()
@@ -3025,6 +3121,11 @@ pub fn handle_downstream_dispatch(
             capture,
         } => match message {
             Dispatch::Notification(msg) => {
+                crate::planner_watchdog::note_update(
+                    shared,
+                    &format!("{parent_router_sid}::delegate-{down_sid}"),
+                    msg.params(),
+                );
                 // Sub-agent transcript streaming is not interleaved into the
                 // parent transcript; capture agent text for the tool result.
                 if msg.method() == "session/update" {
@@ -3080,6 +3181,10 @@ pub fn handle_downstream_dispatch(
                 Ok(Handled::Yes)
             }
             Dispatch::Request(msg, responder) => {
+                crate::planner_watchdog::note_progress(
+                    shared,
+                    &format!("{parent_router_sid}::delegate-{down_sid}"),
+                );
                 // Permission/fs/terminal callbacks go live to the client
                 // under the parent router session id.
                 let method = msg.method().to_string();
@@ -4511,28 +4616,13 @@ async fn pin_session(
     larger_context_than: Option<u64>,
 ) -> Result<PinOutcome, AcpError> {
     crate::auth::refresh_before_selection(shared).await;
-    let (
-        cwd,
-        dirs,
-        client_mcp,
-        strategy,
-        override_,
-        override_source,
-        effort_request,
-        run_label,
-        planner_phase,
-    ) = shared
+    let (cwd, dirs, client_mcp, run_label) = shared
         .with_session(router_sid, |s| {
             (
                 s.cwd.clone(),
                 s.additional_directories.clone(),
                 s.mcp_servers.clone(),
-                s.strategy,
-                s.candidate_override.clone(),
-                s.candidate_override_source.clone(),
-                s.effort_request,
                 s.run_label.clone(),
-                s.planner_phase,
             )
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
@@ -4556,12 +4646,85 @@ async fn pin_session(
         _ => classify(&shared.cfg.classifier, &shared.rules, &input).await,
     };
     let required = RequiredCaps::from_prompt(prompt);
+    let excluded: Vec<CandidateId> = exclude.into_iter().cloned().collect();
+    let RoutePlan {
+        mut ranked,
+        strategy_kind,
+        picked,
+        cordon_redirect,
+        cordons,
+    } = plan_route(
+        shared,
+        router_sid,
+        &profile,
+        required,
+        &excluded,
+        larger_context_than,
+    )?;
+
+    note_pinned_versions(shared, router_sid, &mut ranked);
+    pin_ranked(
+        shared,
+        router_sid,
+        ranked,
+        PinRun {
+            cancellation,
+            cwd,
+            dirs,
+            client_mcp,
+            run_label,
+            parent_session_id,
+            session_kind,
+            profile,
+            strategy_kind,
+            picked,
+            cordon_redirect,
+            cordons,
+            is_failover,
+            prompt,
+        },
+    )
+    .await
+}
+
+/// The session's routing decision, before any candidate is opened.
+struct RoutePlan {
+    ranked: Vec<crate::strategies::RankedCandidate>,
+    strategy_kind: StrategyKind,
+    picked: Option<CandidateId>,
+    cordon_redirect: Option<(CandidateId, String, Option<String>)>,
+    cordons: Vec<(String, std::time::Duration, String)>,
+}
+
+/// Rank this session's candidates the way its active router does: the
+/// session's strategy (or `Static` for a live override), account order,
+/// cordons, coordinator pool, exclusions and preferences. `exclude` names
+/// candidates that must not be chosen (a failed or cordoned pin); an
+/// override naming one of them is dropped, so the session's own strategy
+/// decides instead. The first prompt's pin, every failover re-pin and the
+/// usage-cordon escape all choose through here.
+fn plan_route(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    profile: &crate::classifier::TaskProfile,
+    required: RequiredCaps,
+    exclude: &[CandidateId],
+    larger_context_than: Option<u64>,
+) -> Result<RoutePlan, AcpError> {
+    let (strategy, override_, override_source, effort_request, planner_phase) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.strategy,
+                s.candidate_override.clone(),
+                s.candidate_override_source.clone(),
+                s.effort_request,
+                s.planner_phase,
+            )
+        })
+        .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
     // A failover must not keep re-selecting the failed candidate even when
     // it was explicitly pinned via router.candidate.
-    let override_ = match (&override_, exclude) {
-        (Some(o), Some(x)) if o == x => None,
-        _ => override_,
-    };
+    let override_ = override_.filter(|o| !exclude.contains(o));
     // A saved or explicit pin cannot keep an exhausted account selected.
     // Drop the override and disclose the redirect, even when paid-usage
     // permission exhausts the seat without installing a usage cordon.
@@ -4644,7 +4807,7 @@ async fn pin_session(
         .with_session(router_sid, |s| s.excluded.clone())
         .unwrap_or_default();
     let mut selection_exclusions = excluded_patterns.clone();
-    selection_exclusions.extend(exclude.map(ToString::to_string));
+    selection_exclusions.extend(exclude.iter().map(ToString::to_string));
     let agents = shared.agent_configs();
     let automatic_group = override_
         .as_ref()
@@ -4855,8 +5018,58 @@ async fn pin_session(
         ranked.insert(0, rc);
     }
 
-    note_pinned_versions(shared, router_sid, &mut ranked);
+    Ok(RoutePlan {
+        ranked,
+        strategy_kind,
+        picked,
+        cordon_redirect,
+        cordons,
+    })
+}
 
+/// What `pin_session` carries from routing into opening the pin.
+struct PinRun<'a> {
+    cancellation: Option<&'a RequestCancellation>,
+    cwd: PathBuf,
+    dirs: Vec<PathBuf>,
+    client_mcp: Vec<McpServer>,
+    run_label: Option<String>,
+    parent_session_id: Option<String>,
+    session_kind: &'static str,
+    profile: crate::classifier::TaskProfile,
+    strategy_kind: StrategyKind,
+    picked: Option<CandidateId>,
+    cordon_redirect: Option<(CandidateId, String, Option<String>)>,
+    cordons: Vec<(String, std::time::Duration, String)>,
+    is_failover: bool,
+    prompt: &'a [ContentBlock],
+}
+
+async fn pin_ranked(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    ranked: Vec<crate::strategies::RankedCandidate>,
+    run: PinRun<'_>,
+) -> Result<PinOutcome, AcpError> {
+    let PinRun {
+        cancellation,
+        cwd,
+        dirs,
+        client_mcp,
+        run_label,
+        parent_session_id,
+        session_kind,
+        profile,
+        strategy_kind,
+        picked,
+        cordon_redirect,
+        cordons,
+        is_failover,
+        prompt,
+    } = run;
+    let excluded_patterns = shared
+        .with_session(router_sid, |s| s.excluded.clone())
+        .unwrap_or_default();
     // 4. Walk the ranked list until a candidate opens and verifies,
     //    remembering why each earlier candidate was skipped.
     let mut skipped: Vec<(CandidateId, String)> = Vec::new();
@@ -5623,23 +5836,34 @@ fn build_question_instructions() -> String {
 /// candidate when the pinned model is rate-limited or down, unless the client
 /// cancelled. Partial work is handed off as a continuation.
 ///
-/// A soft (reserve) cordon never stops a send or a running turn: the pre-turn
-/// cordon escape moves the session at the next turn boundary instead. A model
+/// Every usage cordon stops new sends and running turns, including reserves. A model
 /// outage stops a new send, but not a turn already running (`mid_turn`).
-fn candidate_unavailable_reason(
+pub(crate) fn candidate_unavailable_reason(
     shared: &Arc<Shared>,
     candidate: &CandidateId,
     mid_turn: bool,
 ) -> Option<(crate::notice::Reason, String)> {
     use crate::notice::Reason;
+    if shared
+        .agent_configs()
+        .iter()
+        .any(|agent| agent.name == candidate.agent && crate::accounts::routing_disabled(agent))
+    {
+        return Some((
+            Reason::Reserve,
+            "account is disabled by configuration or 100% reserve".into(),
+        ));
+    }
     let lineage = shared.runtime_config().lineage_of(&candidate.agent);
     {
         let mut headroom = shared.headroom.lock().unwrap();
-        if let Some(cordon) = headroom.usage_cordon(candidate)
-            && !cordon.soft
-        {
+        if let Some(cordon) = headroom.usage_cordon(candidate) {
             return Some((
-                Reason::AccountLimit,
+                if cordon.soft {
+                    Reason::Reserve
+                } else {
+                    Reason::AccountLimit
+                },
                 format!("{} (resets {})", cordon.reason, cordon.resets_at_rfc3339),
             ));
         }
@@ -5709,6 +5933,7 @@ async fn send_primary_prompt(
         ));
     };
     let down_sid = fwd.session_id.clone();
+    let sent_at = std::time::Instant::now();
     let mut sent = conn.send_request(fwd);
     if let Some(cancellation) = &cancellation {
         sent = sent.forward_cancellation_from(cancellation.clone());
@@ -5723,6 +5948,19 @@ async fn send_primary_prompt(
                 if cancellation.as_ref().is_some_and(RequestCancellation::is_cancelled) || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
                     return (Ok(PromptResponse::new(StopReason::Cancelled)), None);
+                }
+                // The adapter closed this turn's last cycle under an
+                // autonomous origin and went quiet: it filed our result away
+                // and will never answer this prompt (`planner_watchdog`).
+                // Settle its orphaned turn and end ours with what streamed.
+                if crate::planner_watchdog::folded_result(shared, router_sid, sent_at) {
+                    tracing::warn!(
+                        session = router_sid,
+                        "the adapter ended this turn under an autonomous result and never answered the prompt; settling it"
+                    );
+                    let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut reply).await;
+                    return (Ok(PromptResponse::new(StopReason::EndTurn)), None);
                 }
                 if let Some(reason) = candidate_unavailable_reason(shared, candidate, true) {
                     let _ = conn.send_notification(CancelNotification::new(down_sid.clone()));
@@ -5891,6 +6129,70 @@ async fn stop_managed_background(
     }
 }
 
+/// Proactive re-route: if the pin became usage-cordoned mid-session (cap or
+/// reserve reached after the pin was chosen) and nothing else has queued a
+/// switch, queue a move to the best still-eligible candidate before this
+/// turn runs. Without this, a long session stuck on opus at 100% keeps
+/// burning failed turns until reactive rate-limit failover kicks in, and a
+/// soft (reserve) cordon, which the provider still serves, is never left.
+///
+/// Every primary turn passes here, client prompts and router-owned turns
+/// (planner wakes, queued parent input) alike. It used to run only for a
+/// client prompt dispatched to an idle parent, so a planner parent driven by
+/// wakes, whose human prompts queue behind those wakes, kept spending a
+/// cordoned seat for nine hours.
+fn queue_usage_cordon_escape(shared: &Arc<Shared>, router_sid: &str) {
+    let (class, excluded, current, has_pending) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+                s.pending_switch.is_some() || s.escalation_requested.is_some(),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None, true));
+    let Some(cur) = current.filter(|_| !has_pending) else {
+        return;
+    };
+    let Some(c) = shared.headroom.lock().unwrap().usage_cordon(&cur).cloned() else {
+        return;
+    };
+    // Escaping a dead seat is not a quality upgrade: the same model on the
+    // next account seat comes first, then the non-peer rule. Skill-elevated
+    // pins stay inside that skill's `candidates`.
+    let Some(target) = cordon_escape_target(shared, router_sid, &cur, class, &excluded) else {
+        return;
+    };
+    let reason = format!(
+        "usage cordon: {} (resets {}) — switching off {}",
+        c.reason, c.resets_at_rfc3339, cur
+    );
+    shared.with_session(router_sid, |s| {
+        s.pending_switch = Some(SwitchRequest {
+            target: target.clone(),
+            reason: reason.clone(),
+            handoff: HandoffStyle::Full,
+            user_pick: false,
+        });
+        s.pending_switch_notice = Some(if c.soft {
+            crate::notice::Reason::Reserve
+        } else {
+            crate::notice::Reason::AccountLimit
+        });
+        // Not an elevation: this is escaping a dead seat, not climbing the
+        // capability ladder.
+        s.quiet_turns = 0;
+    });
+    tracing::info!(
+        session = router_sid,
+        from = %cur,
+        %target,
+        cordon = %c.reason,
+        "proactive switch off usage-cordoned pin"
+    );
+}
+
 async fn send_prompt_with_failover(
     shared: Arc<Shared>,
     router_sid: String,
@@ -5901,7 +6203,28 @@ async fn send_prompt_with_failover(
     responder.respond_with_result(result)
 }
 
+/// One primary turn. A planner parent's turn runs under the stuck-turn
+/// watchdog (`crate::planner_watchdog`), so no turn can hold its
+/// `PromptActivity`, and with it every wake and operator prompt, forever.
 pub(crate) async fn run_primary_turn(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+    cancellation: Option<RequestCancellation>,
+) -> Result<PromptResponse, AcpError> {
+    let planner_parent = crate::planner_workflow::load(&shared, &router_sid)
+        .ok()
+        .flatten()
+        .is_some();
+    let turn = run_primary_turn_inner(shared.clone(), router_sid.clone(), req, cancellation);
+    if planner_parent {
+        crate::planner_watchdog::guard_parent_turn(&shared, &router_sid, turn).await
+    } else {
+        turn.await
+    }
+}
+
+async fn run_primary_turn_inner(
     shared: Arc<Shared>,
     router_sid: String,
     mut req: PromptRequest,
@@ -5922,6 +6245,8 @@ pub(crate) async fn run_primary_turn(
             apply_skill_route(&shared, &router_sid, route);
         }
     }
+
+    queue_usage_cordon_escape(&shared, &router_sid);
 
     // A requested/auto-detected model switch fires here, before this turn is
     // forwarded, so the prompt lands on the new model. The current model first
@@ -6006,7 +6331,7 @@ pub(crate) async fn run_primary_turn(
     // Managed watcher completions are continuations of the same provider
     // attempt. Give them their own bounded budget so repeated CI waits do not
     // consume failover attempts or hold an upstream prompt forever.
-    for _iteration in 1..=(max_iters + 20) {
+    'attempts: for _iteration in 1..=(max_iters + 20) {
         attempt += 1;
         let Some((process_key, down_sid, candidate)) = shared
             .with_session(&router_sid, |s| {
@@ -6733,34 +7058,43 @@ pub(crate) async fn run_primary_turn(
                             &router_sid,
                             format!("router-acp · no fallback candidate available — {pin_err}"),
                         );
-                        // Nothing else can serve. Keep the prompt open and
-                        // retry the old model when its cordon ends.
-                        if let Some(until) = retry_wait_until(&shared, &candidate) {
+                        // Keep the bounded wait, but retry routing when another
+                        // seat recovers. Availability is only a wake hint: the
+                        // ordinary selector still owns every pool/effort rule.
+                        let mut retry_error = pin_err;
+                        let mut seen_available = HashSet::new();
+                        let mut retry_mark = mark;
+                        while let Some(until) = retry_wait_until(&shared, &candidate) {
                             if !wait_for_retry(
                                 &shared,
                                 &router_sid,
                                 cancellation.clone(),
-                                mark,
+                                retry_mark,
                                 notice_reason,
                                 &candidate,
                                 until,
+                                &mut seen_available,
                             )
                             .await
                             {
                                 return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
+                            let retry_exclude =
+                                candidate_unavailable_reason(&shared, &candidate, false)
+                                    .is_some()
+                                    .then_some(&candidate);
                             match pin_session(
                                 &shared,
                                 &router_sid,
                                 &req.prompt,
                                 cancellation.as_ref(),
-                                None,
+                                retry_exclude,
                                 true,
                                 None,
                             )
                             .await
                             {
-                                Ok(PinOutcome::Pinned) => continue,
+                                Ok(PinOutcome::Pinned) => continue 'attempts,
                                 Ok(PinOutcome::Cancelled) => {
                                     return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
@@ -6771,12 +7105,13 @@ pub(crate) async fn run_primary_turn(
                                         format!("router-acp · retry failed — {retry_err}"),
                                     );
                                     flush_pending_disclosure(&shared, &router_sid);
-                                    return Err(retry_err);
+                                    retry_error = retry_err;
+                                    retry_mark = notice_mark(&shared, &router_sid);
                                 }
                             }
                         }
                         flush_pending_disclosure(&shared, &router_sid);
-                        return Err(pin_err);
+                        return Err(retry_error);
                     }
                 }
             }
@@ -6858,8 +7193,9 @@ fn retry_wait_until(
     (wait <= std::time::Duration::from_secs(shared.cfg.failover.max_wait_secs)).then_some(until)
 }
 
-/// Announce a cordon wait, keep the prompt open until `until`, and announce
-/// the retry. Returns false when the client cancelled during the wait.
+/// Keep the prompt open until the bounded reset or a newly available candidate
+/// warrants rerunning normal selection. Returns false on client cancellation.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_retry(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -6868,6 +7204,7 @@ async fn wait_for_retry(
     reason: crate::notice::Reason,
     candidate: &CandidateId,
     until: std::time::SystemTime,
+    seen_available: &mut HashSet<CandidateId>,
 ) -> bool {
     let cfg = shared.runtime_config();
     let model = crate::notice::display(&cfg, candidate);
@@ -6904,6 +7241,7 @@ async fn wait_for_retry(
     tracing::info!(session = router_sid, %candidate, wait_secs = wait.as_secs(), "no fallback; waiting for cordon to end");
     let deadline = tokio::time::Instant::now() + wait;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut availability_changed = false;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
@@ -6912,6 +7250,21 @@ async fn wait_for_retry(
                     || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true)
                 {
                     return false;
+                }
+                // The router owns this intentional, bounded wait; silence from
+                // an adapter is expected and must not trigger its stall recovery.
+                crate::planner_watchdog::note_progress(shared, router_sid);
+                let class = shared.with_session(router_sid, |s| s.task_class)
+                    .flatten().unwrap_or(TaskClass::CodingGeneral);
+                let available: HashSet<_> = shared
+                    .eligible_views(&RequiredCaps::default(), class)
+                    .into_iter().map(|view| view.id).collect();
+                let recovered = available.difference(seen_available).next().is_some();
+                availability_changed = available.difference(seen_available)
+                    .any(|id| id != candidate);
+                *seen_available = available;
+                if recovered {
+                    break;
                 }
             }
         }
@@ -6924,10 +7277,14 @@ async fn wait_for_retry(
         crate::notice::Notice {
             kind: "retry",
             reason,
-            headline: format!("{label}: retrying {model} now"),
+            headline: if availability_changed {
+                format!("{label}: model availability changed; retrying routing")
+            } else {
+                format!("{label}: retrying {model} now")
+            },
             label,
             from: Some(candidate.to_string()),
-            to: Some(candidate.to_string()),
+            to: (!availability_changed).then(|| candidate.to_string()),
             handoff: None,
             retry_at: None,
             detail: Vec::new(),
@@ -7158,16 +7515,17 @@ fn select_route_target(
 
 /// Pick a replacement when the current pin is usage-cordoned.
 ///
-/// This is an escape from a dead seat, not a quality upgrade. A glob of `*`
-/// fed to [`first_eligible_candidate`] crowned the fleet's highest-scoring
-/// model (Fable → Sol) after a pin-rewrite 400 cordoned the incumbent — two
-/// equal-quality models, a full summarize+re-pin, for no capability gain.
-///
-/// Skill-elevated pins stay inside that skill's `candidates` (same contract
-/// as demotion). Otherwise: drop quality-peers of the dead pin (normalized
-/// gap ≤ 0.05) when anything else is eligible, then pick max quality among
-/// what's left. If only peers remain, pick the cheapest so a lateral swap
-/// does not climb cost.
+/// The escape never chooses on its own: it asks the router that routes this
+/// session. A skill-elevated pin stays inside that skill's `candidates`
+/// (same contract as demotion) through [`select_route_target`]. Otherwise the
+/// session's active strategy ranks the pool through [`plan_route`], the path
+/// that chooses a first pin and every failover re-pin, with the dead pin
+/// excluded — so account order, usage cordons, the coordinator pool, planner
+/// `model_boosts` and preferences apply exactly as on a normal turn. A
+/// sibling account seat of the same model wins because that ranking puts it
+/// first. The hand-rolled rule this replaced (drop quality-peers, take the
+/// raw-quality max, else the cheapest) discarded the sibling Claude seat as a
+/// "peer" and escaped a capped seat to Codex while that sibling sat at 21%.
 fn cordon_escape_target(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -7175,46 +7533,48 @@ fn cordon_escape_target(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let (elevation_skill, current_q) = shared
-        .with_session(router_sid, |s| {
-            (s.elevation_skill.clone(), s.pinned_quality)
-        })
-        .unwrap_or((None, 0.0));
-    if let Some(pattern) = elevation_skill.as_deref()
-        && let Some(route) = shared
+    let elevation_skill = shared
+        .with_session(router_sid, |s| s.elevation_skill.clone())
+        .flatten();
+    let route = elevation_skill.as_deref().and_then(|pattern| {
+        shared
             .cfg
             .skill_routing
             .iter()
             .find(|r| r.pattern == pattern)
-    {
-        return select_route_target(shared, route, class, excluded).filter(|t| t != current);
+    });
+    // The dead pin is never its own escape, under a skill route or not.
+    let mut excluded = excluded.to_vec();
+    excluded.push(current.to_string());
+    if let Some(route) = route {
+        return select_route_target(shared, route, class, &excluded);
     }
-    let mut pool = shared.eligible_views(&RequiredCaps::default(), class);
-    pool.retain(|v| v.id != *current && !view_excluded(v, excluded));
-    if pool.is_empty() {
-        return None;
-    }
-    const PEER_MARGIN: f64 = 0.05;
-    let current_u = crate::candidate::quality_utility(current_q);
-    let non_peers: Vec<&CandidateView> = pool
-        .iter()
-        .filter(|v| (crate::candidate::quality_utility(v.quality) - current_u).abs() > PEER_MARGIN)
-        .collect();
-    let pick_max = |xs: &[&CandidateView]| {
-        xs.iter()
-            .max_by(|a, b| {
-                a.quality
-                    .partial_cmp(&b.quality)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|v| v.id.clone())
-    };
-    if !non_peers.is_empty() {
-        pick_max(&non_peers)
-    } else {
-        pool.iter()
-            .min_by_key(|v| v.cost_rank)
-            .map(|v| v.id.clone())
+    let (preclass, complexity, cwd) = shared.with_session(router_sid, |s| {
+        (s.preclass_profile.clone(), s.task_complexity, s.cwd.clone())
+    })?;
+    let profile = preclass.unwrap_or_else(|| crate::classifier::TaskProfile {
+        class,
+        complexity,
+        languages: cwd_language_fingerprint(&shared.rules, &cwd),
+        effort: None,
+    });
+    match plan_route(
+        shared,
+        router_sid,
+        &profile,
+        RequiredCaps::default(),
+        std::slice::from_ref(current),
+        None,
+    ) {
+        Ok(plan) => plan
+            .ranked
+            .into_iter()
+            .map(|r| r.candidate)
+            .find(|c| c != current),
+        Err(error) => {
+            tracing::info!(session = router_sid, %current, %error, "no routable escape off usage-cordoned pin");
+            None
+        }
     }
 }
 
@@ -8031,7 +8391,7 @@ fn frame_summary(from: &CandidateId, summary: &str) -> String {
 }
 
 /// Provide a SQLite history lookup when the previous model cannot summarize.
-fn frame_lookup(shared: &Arc<Shared>, router_sid: &str) -> String {
+pub(crate) fn frame_lookup(shared: &Arc<Shared>, router_sid: &str) -> String {
     crate::restoration::lookup_context(shared, router_sid)
         .into_iter()
         .filter_map(|block| match block {
@@ -8183,8 +8543,7 @@ async fn switch_pin(
         .with_session(router_sid, |session| session.task_class)
         .flatten()
         .unwrap_or(TaskClass::CodingGeneral);
-    // A soft (reserve) cordon still lets the outgoing model write the summary:
-    // the account has headroom, the router is only saving it.
+    // Usage/reserve cordons also exclude summary requests: use saved history.
     let live_conn = shared
         .candidate_view_serving(&old_candidate, class)
         .and_then(|_| shared.route_for(&old_process_key, &old_down_sid))
@@ -9262,7 +9621,16 @@ async fn on_set_config_option(
                         SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
                         _ => String::new(),
                     };
-                    if config_id == "router.effort" {
+                    if config_id == "router.worker_limit" {
+                        match value
+                            .parse::<usize>()
+                            .map_err(|_| "worker limit must be a positive integer".to_string())
+                            .and_then(|limit| shared.increase_delegate_limit(limit))
+                        {
+                            Ok(()) => Action::RouterUpdated,
+                            Err(error) => Action::BadValue(error),
+                        }
+                    } else if config_id == "router.effort" {
                         match EffortLevel::parse(&value) {
                             Some(EffortLevel::Auto) => {
                                 session.effort_request = None;
@@ -9401,7 +9769,7 @@ async fn on_set_config_option(
 
 fn on_prompt(
     shared: Arc<Shared>,
-    mut req: PromptRequest,
+    req: PromptRequest,
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
@@ -9411,29 +9779,88 @@ fn on_prompt(
         drop(activity);
         result
     });
+    // Operator input preempts a router-owned planner turn instead of queuing
+    // behind it (`planner_preempt`): steered into it, or it is cancelled and
+    // this prompt runs as the very next turn.
+    if crate::planner_workflow::human_prompt(&req)
+        && crate::planner_preempt::router_turn_in_flight(&shared, &router_sid)
+        && shared
+            .with_session(&router_sid, |s| s.prompt_activity > 1)
+            .unwrap_or(false)
+    {
+        let task_cx = cx.clone();
+        return cx.spawn(async move {
+            // A mode command must run as its own turn; anything else may be
+            // steered.
+            if crate::planner_workflow::command(&req).is_none()
+                && crate::planner_preempt::steer(&shared, &router_sid, &req.prompt).await
+            {
+                let recorded = crate::planner_workflow::record_steered_input(
+                    &shared,
+                    &router_sid,
+                    &req,
+                )
+                .and_then(|()| log_user_steer(&shared, &router_sid, &req.prompt));
+                if let Err(error) = recorded {
+                    tracing::warn!(session = router_sid, %error, "steered operator input not recorded");
+                }
+                notify_user(
+                    &shared,
+                    &router_sid,
+                    "router-acp · your message was steered into the running router-owned turn",
+                );
+                return responder.respond(PromptResponse::new(StopReason::EndTurn));
+            }
+            if crate::planner_preempt::preempt(&shared, &router_sid).await {
+                return continue_prompt(shared, router_sid, req, responder, task_cx);
+            }
+            // The router-owned turn ignored its cancel: keep the input safe.
+            queue_parent_prompt(&shared, &router_sid, req, responder)
+        });
+    }
     if shared
         .with_session(&router_sid, |s| {
             s.strategy == StrategyKind::Planner && s.prompt_activity > 1
         })
         .unwrap_or(false)
     {
-        let meta = req.meta.get_or_insert_with(Default::default);
-        let router = meta.entry("router_acp").or_insert_with(|| json!({}));
-        if router.get("input_id").is_none() {
-            router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
-        }
-        if let Err(error) =
-            crate::planner_workflow::enqueue_parent_input(&shared, &router_sid, &req)
-        {
-            return responder.respond_with_error(AcpError::invalid_params().data(error));
-        }
-        notify_user(
-            &shared,
-            &router_sid,
-            "router-acp · original input and controls retained for the next parent turn",
-        );
-        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        return queue_parent_prompt(&shared, &router_sid, req, responder);
     }
+    continue_prompt(shared, router_sid, req, responder, cx)
+}
+
+/// An operator prompt that arrives while an operator turn holds a planner
+/// parent waits, with its controls, for the next parent turn.
+fn queue_parent_prompt(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    mut req: PromptRequest,
+    responder: Responder<PromptResponse>,
+) -> Result<(), AcpError> {
+    let meta = req.meta.get_or_insert_with(Default::default);
+    let router = meta.entry("router_acp").or_insert_with(|| json!({}));
+    if router.get("input_id").is_none() {
+        router["input_id"] = json!(uuid::Uuid::new_v4().to_string());
+    }
+    if let Err(error) = crate::planner_workflow::enqueue_parent_input(shared, router_sid, &req) {
+        return responder.respond_with_error(AcpError::invalid_params().data(error));
+    }
+    notify_user(
+        shared,
+        router_sid,
+        "router-acp · original input and controls retained for the next parent turn",
+    );
+    responder.respond(PromptResponse::new(StopReason::EndTurn))
+}
+
+/// The ordinary prompt path, once the turn is this prompt's own.
+fn continue_prompt(
+    shared: Arc<Shared>,
+    router_sid: String,
+    req: PromptRequest,
+    responder: Responder<PromptResponse>,
+    cx: ConnectionTo<ClientPeer>,
+) -> Result<(), AcpError> {
     if crate::accounts::intercepts(&shared, &router_sid, &req.prompt) {
         return cx.spawn(async move {
             crate::accounts::handle_prompt(shared, router_sid, req, responder).await
@@ -9947,6 +10374,7 @@ fn prepare_parent_prompt_inner(
         let current = shared
             .with_session(&router_sid, |s| s.planner_phase)
             .flatten();
+        let mut admitted_command = req.clone();
         match crate::planner_workflow::user_command_from_original(
             &shared,
             &router_sid,
@@ -9967,6 +10395,49 @@ fn prepare_parent_prompt_inner(
                     &router_sid,
                     format!("router-acp · explicit workflow phase: {phase:?}"),
                 );
+                // A restarted client's `/implement` resumes the checkout's
+                // ownerless run instead of starting an empty one.
+                if phase == crate::config::PlannerPhase::Implementation
+                    && !queued
+                    && let Some(report) =
+                        crate::planner_adopt::adopt_on_implement(shared.as_ref(), &router_sid)
+                {
+                    // The first shaping saw an empty destination. Replay only
+                    // that admitted command's shaping against the adopted state,
+                    // retaining its input identity and authentic scope. Otherwise
+                    // the first real turn still carries SelectPlan while every
+                    // later wake correctly prioritizes the failed deployment.
+                    let input_id = crate::planner_workflow::prompt_input_id(&req)
+                        .ok_or_else(|| {
+                            AcpError::internal_error()
+                                .data("admitted command has no input identity")
+                        })?
+                        .to_string();
+                    admitted_command
+                        .meta
+                        .get_or_insert_with(Default::default)
+                        .entry("router_acp")
+                        .or_insert_with(|| json!({}))["input_id"] = json!(input_id);
+                    crate::planner_workflow::user_command_from_original(
+                        &shared,
+                        &router_sid,
+                        &original_req,
+                        &mut admitted_command,
+                        true,
+                    )
+                    .map_err(|error| AcpError::internal_error().data(error))?;
+                    req = admitted_command;
+                    let summary = report.summary();
+                    tracing::warn!(session = router_sid, from = report.from, "{summary}");
+                    notify_user(&shared, &router_sid, format!("router-acp · {summary}"));
+                    req.prompt.push(ContentBlock::from(format!(
+                        "[router-acp · {summary}. Those works are now this run's. Follow the selected \
+                         parent role's priority; reconcile each assignment through planner_workflow \
+                         before resuming that work. Unrelated assignment reconciliation is not a \
+                         prerequisite for the selected role's next action. The earlier parent's unacknowledged operator \
+                         input is delivered to you right after this turn, before any other wake.]"
+                    )));
+                }
             }
             Ok(None) => {}
             Err(err) => return Err(AcpError::invalid_params().data(err)),
@@ -10158,63 +10629,8 @@ async fn dispatch_prompt(
         apply_skill_route(&shared, &router_sid, route);
     }
 
-    // Proactive re-route: if the pin became usage-cordoned mid-session (cap
-    // hit after the pin was chosen) and nothing else has queued a switch,
-    // move to the best still-eligible candidate before this turn runs. Without
-    // this, a long session stuck on opus at 100% keeps burning failed turns
-    // until reactive rate-limit failover kicks in.
-    {
-        let (class, excluded, current, has_pending) = shared
-            .with_session(&router_sid, |s| {
-                (
-                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                    s.excluded.clone(),
-                    s.pin.as_ref().map(|p| p.candidate.clone()),
-                    s.pending_switch.is_some() || s.escalation_requested.is_some(),
-                )
-            })
-            .unwrap_or((TaskClass::CodingGeneral, Vec::new(), None, true));
-        if !has_pending && let Some(cur) = current.as_ref() {
-            let cordon = shared.headroom.lock().unwrap().usage_cordon(cur).cloned();
-            if let Some(c) = cordon {
-                // Escaping a dead seat is not a quality upgrade. The previous
-                // `*` + max-quality pick crowned the fleet champion (Fable →
-                // Sol) after a pin-rewrite 400 cordoned the incumbent — a
-                // lateral swap of two equal-quality models. Skill-elevated
-                // pins stay inside that skill's `candidates`.
-                let target = cordon_escape_target(&shared, &router_sid, cur, class, &excluded);
-                if let Some(target) = target {
-                    let reason = format!(
-                        "usage cordon: {} (resets {}) — switching off {}",
-                        c.reason, c.resets_at_rfc3339, cur
-                    );
-                    shared.with_session(&router_sid, |s| {
-                        s.pending_switch = Some(SwitchRequest {
-                            target: target.clone(),
-                            reason: reason.clone(),
-                            handoff: HandoffStyle::Full,
-                            user_pick: false,
-                        });
-                        s.pending_switch_notice = Some(if c.soft {
-                            crate::notice::Reason::Reserve
-                        } else {
-                            crate::notice::Reason::AccountLimit
-                        });
-                        // Not an elevation: this is escaping a dead seat, not
-                        // climbing the capability ladder.
-                        s.quiet_turns = 0;
-                    });
-                    tracing::info!(
-                        session = router_sid,
-                        from = %cur,
-                        %target,
-                        cordon = %c.reason,
-                        "proactive switch off usage-cordoned pin"
-                    );
-                }
-            }
-        }
-    }
+    // The proactive switch off a usage-cordoned pin runs in
+    // `run_primary_turn`, which router-owned turns enter too.
 
     enum Action {
         Relay,
@@ -10445,15 +10861,11 @@ fn apply_skill_route(shared: &Arc<Shared>, router_sid: &str, route: &SkillRoute)
 fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpError> {
     let router_sid = sid_str(&notif.session_id);
     crate::accounts::cancel_login(&shared, &router_sid);
+    // Cancelling a planner parent's turn stops that turn only. The run, its
+    // workers and their wakes go on; closing the session is what stops them.
     let planner = crate::planner_workflow::load(&shared, &router_sid)
-        .map_err(|e| AcpError::internal_error().data(e))?;
-    if planner.is_some() {
-        crate::planner_workflow::mutate(&shared, &router_sid, |run| {
-            run.status = crate::planner_workflow::RunStatus::Paused;
-            Ok(())
-        })
-        .map_err(|e| AcpError::internal_error().data(e))?;
-    }
+        .map_err(|e| AcpError::internal_error().data(e))?
+        .is_some();
     let (pin, delegates) = shared
         .with_session(&router_sid, |s| {
             s.cancelled = true;
@@ -10476,15 +10888,13 @@ fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpEr
             CancelNotification::new(pin.downstream_sid.clone()).meta(notif.meta.clone()),
         );
     }
-    // Parent cancel propagates to all active delegated sub-sessions.
+    if planner {
+        return Ok(());
+    }
+    // An ordinary parent's cancel propagates to its delegated sub-sessions.
     for d in delegates {
         if let Some(conn) = shared.target_conn(&d.process_key) {
             let _ = conn.send_notification(CancelNotification::new(d.downstream_sid.clone()));
-        }
-    }
-    if let Some(run) = planner {
-        for work in run.works.values() {
-            crate::planner_client::stop_child(&shared, &router_sid, &work.child_id);
         }
     }
     Ok(())
@@ -10543,6 +10953,20 @@ fn log_user_steer(
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
     if let Dispatch::Request(msg, responder) = message {
+        if msg.method() == crate::planner_shutdown::STATUS_METHOD {
+            let result = crate::planner_shutdown::status(&shared, msg.params())
+                .map_err(|e| AcpError::invalid_params().data(e));
+            let _ = responder.respond_with_result(result);
+            return Ok(Handled::Yes);
+        }
+        // kory's `/shutdown`: answered at once; the drain reports itself as
+        // `_router/shutdown_progress` notifications.
+        if msg.method() == crate::planner_shutdown::METHOD {
+            let result = crate::planner_shutdown::request(&shared, msg.params())
+                .map_err(|e| AcpError::invalid_params().data(e));
+            let _ = responder.respond_with_result(result);
+            return Ok(Handled::Yes);
+        }
         if msg.method() == "router-acp/planner-child" {
             let params = msg.params().clone();
             if let Some(upstream) = shared.upstream() {
@@ -10662,12 +11086,13 @@ fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dis
                             .forward_cancellation_from(responder.cancellation())
                             .block_task()
                             .await;
-                        if result
+                        let injected = result
                             .as_ref()
                             .ok()
                             .and_then(|v| v.get("outcome"))
                             .and_then(Value::as_str)
-                            == Some("injected")
+                            == Some("injected");
+                        if injected
                             && let Err(message) = log_user_steer(&task_shared, &router_sid, &prompt)
                         {
                             let _ = responder
@@ -10675,6 +11100,17 @@ fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dis
                             return Ok(());
                         }
                         let _ = responder.respond_with_result(result);
+                        // A steer the downstream would not take must not wait
+                        // behind router-owned work: cancel that turn, so the
+                        // client's follow-up prompt runs at once.
+                        if !injected
+                            && crate::planner_preempt::router_turn_in_flight(
+                                &task_shared,
+                                &router_sid,
+                            )
+                        {
+                            crate::planner_preempt::preempt(&task_shared, &router_sid).await;
+                        }
                         Ok(())
                     })?;
             } else {
@@ -10688,6 +11124,26 @@ fn relay_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dis
             Ok(Handled::Yes)
         }
         Dispatch::Response(..) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod planner_permission_tests {
+    use super::*;
+
+    #[test]
+    fn permission_uses_authoritative_tool_identity_not_a_title_substring() {
+        assert!(planner_tool_permission(&json!({"toolCall": {
+            "title": "Update planner run", "_meta": {"claudeCode": {
+                "toolName": "mcp__router-delegate__planner_workflow"
+            }}
+        }})));
+        assert!(!planner_tool_permission(&json!({"toolCall": {
+            "title": "planner_workflow", "_meta": {"claudeCode": {"toolName": "Bash"}}
+        }})));
+        assert!(!planner_tool_permission(
+            &json!({"toolCall": {"title": "echo delegate_task"}})
+        ));
     }
 }
 

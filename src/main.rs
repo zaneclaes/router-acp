@@ -19,11 +19,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Resolve explicit config, ROUTER_ACP_CONFIG, nearest project overlay,
+    /// or the user's default file. Prints the selected absolute path.
+    ConfigPath {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Serve the router as an ACP agent on stdio.
     Serve {
         /// Path to the YAML configuration file.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
     /// Keep router-owned account usage snapshots current for hosts that also
     /// run provider adapters directly, without an active router conversation.
@@ -265,6 +273,59 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Resume a planner run whose router exited: move its works, holds,
+    /// queued operator input and pending wakes into another session's run of
+    /// the same checkout and mark it superseded. Safe while the receiving
+    /// router runs (every write is revision-checked); refused while the old
+    /// run still has a live owner. Prints the result as JSON.
+    AdoptRun {
+        /// Path to the state DB (router.yaml's `state_file`).
+        #[arg(long, default_value = "~/.local/state/router-acp/sessions.db")]
+        state: PathBuf,
+        /// The router session id whose run is adopted.
+        #[arg(long)]
+        from: String,
+        /// The router session id that takes it over.
+        #[arg(long)]
+        into: String,
+    },
+    /// Send an agent-origin correction to a running planner's durable queue,
+    /// or inspect its delivery receipt. Does not start or take over a session.
+    PlannerInput {
+        #[arg(long, default_value = "~/.local/state/router-acp/sessions.db")]
+        state: PathBuf,
+        #[arg(long)]
+        session: String,
+        /// Stable caller-chosen id; retrying the same id never duplicates input.
+        #[arg(long, required_unless_present_any = ["list", "drain"])]
+        id: Option<String>,
+        /// Expected checkout. Required for sending; ignored for status.
+        #[arg(long, required_unless_present_any = ["status", "list"])]
+        cwd: Option<PathBuf>,
+        /// Read a UTF-8 message from this file (use - for stdin).
+        #[arg(long, required_unless_present_any = ["status", "list", "delete", "drain"], conflicts_with_all = ["status", "list", "delete", "drain"])]
+        message_file: Option<PathBuf>,
+        /// Read delivery/acknowledgment metadata without modifying state.
+        #[arg(long)]
+        status: bool,
+        /// List unresolved input metadata, including already-delivered input.
+        #[arg(long, conflicts_with_all = ["status", "delete", "drain"])]
+        list: bool,
+        /// Withdraw --id from delivery/reconciliation (preview unless --apply).
+        #[arg(long, conflicts_with_all = ["status", "drain"])]
+        delete: bool,
+        /// Withdraw unresolved agent inputs (preview unless --apply).
+        #[arg(long, conflicts_with_all = ["status", "id"])]
+        drain: bool,
+        /// Explicitly include human-origin inputs in a withdrawal.
+        #[arg(long)]
+        include_human: bool,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Apply --delete/--drain; requires --reason. Never interrupts a turn.
+        #[arg(long, requires = "reason")]
+        apply: bool,
+    },
     /// Read router-owned state through the versioned, read-only JSON boundary.
     /// Hosts must use this instead of opening the SQLite database themselves.
     StateQuery {
@@ -449,13 +510,20 @@ fn raise_open_file_limit() {
     }
 }
 
+fn main() -> anyhow::Result<()> {
+    run()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     raise_open_file_limit();
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => {
+            let config =
+                router_acp::project_config::select(config.as_deref(), &std::env::current_dir()?)
+                    .map_err(anyhow::Error::msg)?;
             // stdout carries the ACP protocol; all logging goes to stderr.
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -470,6 +538,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(err) => tracing::warn!("{err}"),
             }
             let cfg = Config::from_file(&config)?;
+            router_acp::local_state::migrate(&cfg);
             export_router_env(&config);
             // Downstream agents run with workspace write access; they must die
             // when the router does. On a signal (goose's Ctrl+C) neither
@@ -495,6 +564,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => Err(anyhow::anyhow!("router exited with error: {e}")),
             }
+        }
+        Command::ConfigPath { config, cwd } => {
+            let cwd = match cwd {
+                Some(cwd) => std::path::absolute(cwd)?,
+                None => std::env::current_dir()?,
+            };
+            let path = router_acp::project_config::select(config.as_deref(), &cwd)
+                .map_err(anyhow::Error::msg)?;
+            println!("{}", path.display());
+            Ok(())
         }
         Command::AccountStatus { config } => {
             let config = Config::from_file(&config)?;
@@ -684,6 +763,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(err) => tracing::warn!("{err}"),
             }
             let cfg = Config::from_file(&config)?;
+            router_acp::local_state::migrate(&cfg);
             export_router_env(&config);
             let cwd = match cwd {
                 Some(cwd) => cwd,
@@ -873,6 +953,105 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::PlannerInput {
+            state,
+            session,
+            id,
+            cwd,
+            message_file,
+            status,
+            list,
+            delete,
+            drain,
+            include_human,
+            reason,
+            apply,
+        } => {
+            let path = router_acp::config::expand_tilde(&state);
+            let retention = router_acp::state::Retention {
+                max_age: std::time::Duration::MAX,
+            };
+            anyhow::ensure!(
+                !(apply || include_human || reason.is_some()) || delete || drain,
+                "--apply, --include-human and --reason require --delete or --drain"
+            );
+            let report = if list || delete || drain {
+                let store = if apply {
+                    anyhow::ensure!(
+                        !router_acp::state::StateStore::state_absent(&path),
+                        "router state does not exist"
+                    );
+                    router_acp::state::StateStore::load(&path, retention)
+                } else {
+                    router_acp::state::StateStore::open_readonly(&path, retention)?
+                };
+                let rows = if list {
+                    router_acp::planner_input::list(&store, &session)
+                } else {
+                    router_acp::planner_input::withdraw(
+                        &store,
+                        &session,
+                        &cwd.expect("clap requires cwd"),
+                        id.as_deref(),
+                        include_human,
+                        reason.as_deref().unwrap_or(""),
+                        apply,
+                    )
+                }
+                .map_err(anyhow::Error::msg)?;
+                serde_json::to_value(rows)?
+            } else if status {
+                let store = router_acp::state::StateStore::open_readonly(&path, retention)?;
+                serde_json::to_value(
+                    router_acp::planner_input::status(
+                        &store,
+                        &session,
+                        id.as_deref().expect("clap requires id"),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                )?
+            } else {
+                use std::io::Read;
+                let file = message_file.expect("clap requires a message file");
+                let reader: Box<dyn Read> = if file.as_os_str() == "-" {
+                    Box::new(std::io::stdin())
+                } else {
+                    Box::new(std::fs::File::open(file)?)
+                };
+                let mut message = String::new();
+                reader.take(65537).read_to_string(&mut message)?;
+                anyhow::ensure!(
+                    !router_acp::state::StateStore::state_absent(&path),
+                    "router state does not exist"
+                );
+                let store = router_acp::state::StateStore::load(&path, retention);
+                serde_json::to_value(
+                    router_acp::planner_input::send(
+                        &store,
+                        &session,
+                        &cwd.expect("clap requires cwd"),
+                        id.as_deref().expect("clap requires id"),
+                        &message,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                )?
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::AdoptRun { state, from, into } => {
+            // Never prune from this command (see Transcript).
+            let never_prune = router_acp::state::Retention {
+                max_age: std::time::Duration::MAX,
+            };
+            let path = router_acp::config::expand_tilde(&state);
+            let store = router_acp::state::StateStore::load(&path, never_prune);
+            let report = router_acp::planner_adopt::adopt(&store, &from, &into)
+                .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            eprintln!("router-acp · {}", report.summary());
+            Ok(())
+        }
         Command::StateStats { state } => {
             let path = router_acp::config::expand_tilde(&state);
             let stats = router_acp::maintenance::stats(&path)?;
@@ -1044,7 +1223,8 @@ async fn main() -> anyhow::Result<()> {
 /// wake it again through `router-acp prompt --config <this config>`.
 fn export_router_env(config: &std::path::Path) {
     let mut env = Vec::new();
-    if let Ok(path) = std::fs::canonicalize(config) {
+    // Preserve the project marker when the selected file is a symlink.
+    if let Ok(path) = std::path::absolute(config) {
         env.push(("ROUTER_ACP_CONFIG".to_string(), path.display().to_string()));
     }
     if let Ok(exe) = std::env::current_exe() {

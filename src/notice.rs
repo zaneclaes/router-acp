@@ -44,8 +44,8 @@ impl Reason {
         }
     }
 
-    /// A soft cordon keeps the outgoing model usable for a handoff summary;
-    /// every other reason means it cannot serve.
+    /// Soft identifies a configured reserve; both kinds stop active requests
+    /// and use saved history rather than spending more on a summary.
     pub fn cordon(self) -> &'static str {
         match self {
             Reason::Reserve => "soft",

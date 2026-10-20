@@ -50,6 +50,10 @@
 //!   most 60 s), honoring `session/cancel`; a test releases the turn by
 //!   creating the file
 //! - `TEXT:<message>` — stream text before the remaining directives
+//! - `HANG_IGNORING_CANCEL` — go silent forever and ignore `session/cancel`
+//! - `FOLDED_RESULT` — send a cost-bearing `usage_update` stamped with an
+//!   autonomous `_claude/origin`, then never answer until cancelled (the
+//!   claude-agent-acp lost turn end)
 //! - `EXIT_NOW:<model>` — crash on this prompt if it reached `<model>` (a
 //!   respawned process is healthy; a failover replay to another model is not
 //!   killed)
@@ -403,6 +407,21 @@ async fn run_prompt(
         "blocks": serde_json::to_value(&req.prompt).unwrap_or_default(),
     }));
 
+    if text.lines().any(|line| line == "HOOK_BLOCKED") {
+        let frame = UntypedMessage::new(
+            "session/update",
+            json!({
+                "sessionId": session_id, "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "UserPromptSubmit hook could not compile its adapter"},
+                    "_meta": {"claudeCode": {"kind": "informational", "level": "warning"}}
+                }
+            }),
+        )?;
+        cx.send_notification(frame)?;
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
+
     if mock.exit_on_prompt {
         // Simulate a crash mid-turn.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -482,6 +501,11 @@ async fn run_prompt(
         return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }
 
+    // A `session/cancel` ends the turn it interrupted, not the session: like
+    // a real adapter, a new prompt starts uncancelled.
+    if let Some(s) = mock.state.lock().unwrap().sessions.get_mut(&session_id) {
+        s.cancelled = false;
+    }
     let mut reply = Vec::new();
     let mut tool_seq = 0u32;
 
@@ -500,14 +524,54 @@ async fn run_prompt(
         {
             return responder.respond(PromptResponse::new(StopReason::Cancelled));
         }
-        if let Some(message) = line.strip_prefix("TEXT:") {
+        if line == "HANG_IGNORING_CANCEL" {
+            // A wedged adapter: alive, silent, never answers, ignores cancel.
+            mock.log(json!({"event": "hang", "sessionId": session_id}));
+            std::future::pending::<()>().await;
+        } else if line == "FOLDED_RESULT" {
+            // claude-agent-acp's lost turn end: the last cycle's result frame
+            // carries an autonomous (task-notification) origin, and the
+            // session/prompt is never answered until a cancel settles it.
+            let frame = UntypedMessage::new(
+                "session/update",
+                json!({"sessionId": session_id, "update": {
+                    "sessionUpdate": "usage_update", "used": 1, "size": 100,
+                    "cost": {"amount": 0.01, "currency": "USD"},
+                    "_meta": {"_claude/origin": {"kind": "task-notification", "producer": "session-task"}}
+                }}),
+            )?;
+            let _ = cx.send_notification(frame);
+            mock.log(json!({"event": "folded_result", "sessionId": session_id}));
+            loop {
+                if mock
+                    .state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.cancelled)
+                    .unwrap_or(false)
+                {
+                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        } else if let Some(message) = line.strip_prefix("TEXT:") {
             let _ = cx.send_notification(chunk(&session_id, message.to_string()));
         } else if let Some(spec) = line.strip_prefix("TOOL:") {
             // Emit a real `session/update` tool_call, the way claude-agent-acp
             // does. Forms: `read` | `exec:<cmd>` | `edit` | `fail` | `mcp:<name>`.
             tool_seq += 1;
             let id = format!("tc-{tool_seq}");
-            let tc = if spec == "read" {
+            let tc = if spec == "pending-edit" || spec == "finish-edit" {
+                ToolCall::new("guarded-edit", "Edit")
+                    .kind(ToolKind::Edit)
+                    .status(if spec == "pending-edit" {
+                        ToolCallStatus::InProgress
+                    } else {
+                        ToolCallStatus::Completed
+                    })
+            } else if spec == "read" {
                 ToolCall::new(id, "Read")
                     .kind(ToolKind::Read)
                     .status(ToolCallStatus::Completed)
@@ -535,6 +599,9 @@ async fn run_prompt(
                 session_id.clone(),
                 SessionUpdate::ToolCall(tc),
             ));
+            if spec == "pending-edit" || spec == "finish-edit" {
+                mock.log(json!({"event": if spec == "pending-edit" { "pending_edit" } else { "completed_edit" }}));
+            }
             reply.push(format!("tool:{spec}"));
         } else if line == "PERM" {
             let perm = RequestPermissionRequest::new(
@@ -1160,6 +1227,7 @@ async fn main() {
                     // round-trip (elicitation is opt-in per client).
                     mock.log(json!({
                         "event": "initialize",
+                        "pid": std::process::id(),
                         "client_elicitation_form": req
                             .client_capabilities
                             .elicitation

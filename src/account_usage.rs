@@ -62,8 +62,8 @@ pub fn status(config: &crate::config::Config) -> Value {
     let revision = config
         .source_path
         .as_ref()
-        .and_then(|path| std::fs::read(path).ok())
-        .map(|raw| crate::config_admin::revision(&raw));
+        .and_then(|path| crate::project_config::read(path).ok().flatten())
+        .map(|raw| crate::config_admin::revision(raw.as_bytes()));
     let mut status = serde_json::json!({"revision":revision,"accounts":accounts});
     // MCP servers the router has signed in to (absent until the first one).
     let mcp = crate::mcp_oauth::status_json(&crate::mcp_oauth::store_root());
@@ -80,6 +80,9 @@ fn routing_status(
     cordon_enabled: bool,
     now: SystemTime,
 ) -> Value {
+    if crate::accounts::routing_disabled(agent) {
+        return serde_json::json!({"available":false,"reason":"disabled","resetsAt":null});
+    }
     if matches!(auth, AuthAvailability::Unauthenticated { .. }) {
         return serde_json::json!({"available":false,"reason":"authentication","resetsAt":null});
     }

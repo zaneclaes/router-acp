@@ -24,6 +24,8 @@ const SIGN_IN_TTL: Duration = Duration::from_secs(10 * 60);
 const SIGN_IN: &str = "Sign in";
 const SIGN_IN_AGAIN: &str = "Sign in again";
 const SIGN_OUT: &str = "Sign out";
+const CHANGE_SCOPE: &str = "Change account scope";
+const USE_SYSTEM: &str = "Use existing system login (keep project login)";
 const BACK: &str = "Back";
 const CLOSE: &str = "Close";
 
@@ -31,18 +33,30 @@ const CLOSE: &str = "Close";
 pub enum McpMenu {
     Servers,
     Server(String),
+    Scope(String, bool),
 }
 
 /// A started sign-in for one session: the server and its loopback listener.
 pub struct PendingMcpLogin {
     id: String,
     server: RemoteServer,
+    flow_state: Option<String>,
     cancel: CancellationToken,
 }
 
 impl PendingMcpLogin {
     pub fn cancel(&self) {
         self.cancel.cancel();
+        let store = self.server.store(&crate::mcp_oauth::store_root());
+        let state = self.flow_state.clone();
+        tokio::spawn(async move {
+            if let Ok(_lock) = store.lock().await
+                && let Some(flow) = store.flow()
+                && state.as_deref() == Some(flow.state.as_str())
+            {
+                store.clear_flow();
+            }
+        });
     }
 }
 
@@ -64,7 +78,7 @@ pub fn intercepts(shared: &Arc<Shared>, sid: &str, text: &str) -> bool {
 pub fn cancel(shared: &Arc<Shared>, sid: &str) {
     shared.mcp_menus.lock().unwrap().remove(sid);
     if let Some(pending) = shared.mcp_logins.lock().unwrap().remove(sid) {
-        pending.cancel.cancel();
+        pending.cancel();
     }
 }
 
@@ -90,6 +104,10 @@ async fn rows(shared: &Arc<Shared>, sid: &str) -> (Option<String>, Vec<Value>) {
 
 fn row_label(row: &Value) -> String {
     let name = row["name"].as_str().unwrap_or("?");
+    let name = match row["account"].as_str() {
+        Some(account) => format!("{name} [{account}]"),
+        None => name.to_string(),
+    };
     match row["label"].as_str() {
         Some(label) => format!("{name}: {label}"),
         None => format!(
@@ -110,6 +128,26 @@ fn remote(shared: &Arc<Shared>, sid: &str, name: &str) -> Option<RemoteServer> {
 fn router_signed_in(server: &RemoteServer) -> bool {
     crate::mcp_oauth::status(&server.store(&crate::mcp_oauth::store_root())).state
         != StatusState::SignedOut
+}
+
+fn refresh_session(shared: &Arc<Shared>, sid: &str) {
+    let pin = shared
+        .with_session(sid, |session| {
+            let pin = session.pin.as_ref()?;
+            session
+                .pending_switch
+                .get_or_insert(crate::session::SwitchRequest {
+                    target: pin.candidate.clone(),
+                    reason: "MCP account selection changed".into(),
+                    handoff: crate::session::HandoffStyle::Full,
+                    user_pick: false,
+                });
+            Some((pin.process_key.clone(), pin.downstream_sid.clone()))
+        })
+        .flatten();
+    if let Some((key, downstream)) = pin {
+        crate::session::close_downstream_session(shared, &key, &downstream);
+    }
 }
 
 async fn menu(shared: &Arc<Shared>, sid: &str, state: &McpMenu) -> (String, Vec<String>) {
@@ -143,6 +181,7 @@ async fn menu(shared: &Arc<Shared>, sid: &str, state: &McpMenu) -> (String, Vec<
                     if mine {
                         options.push(SIGN_OUT.into());
                     }
+                    options.push(CHANGE_SCOPE.into());
                     options.push(BACK.into());
                     options
                 }
@@ -154,6 +193,32 @@ async fn menu(shared: &Arc<Shared>, sid: &str, state: &McpMenu) -> (String, Vec<
                 }
             };
             (body, options)
+        }
+        McpMenu::Scope(name, moving) => {
+            let mut options = vec![
+                "System-level account".into(),
+                "Project-level account".into(),
+            ];
+            if *moving
+                && let Some(mut server) = remote(shared, sid, name)
+                && server.account.take().is_some()
+                && server.store(&crate::mcp_oauth::store_root()).configured()
+            {
+                options.push(USE_SYSTEM.into());
+            }
+            options.push(BACK.into());
+            (
+                format!(
+                    "{} {name}: choose the account scope. Project logins are independent of the system login.{}",
+                    if *moving { "Move" } else { "Sign in to" },
+                    if *moving {
+                        " Moving to Project removes the shared system login; other projects will need their own login."
+                    } else {
+                        ""
+                    }
+                ),
+                options,
+            )
         }
     }
 }
@@ -231,6 +296,8 @@ pub async fn handle(
                 }
             }
             (McpMenu::Server(_), Some(BACK)) => state = McpMenu::Servers,
+            (McpMenu::Scope(name, _), Some(BACK)) => state = McpMenu::Server(name),
+            (McpMenu::Server(name), Some(CHANGE_SCOPE)) => state = McpMenu::Scope(name, true),
             (McpMenu::Server(name), Some(SIGN_OUT)) => {
                 if let Some(server) = remote(shared, sid, &name) {
                     let message = crate::mcp_oauth::logout(&server)
@@ -238,12 +305,46 @@ pub async fn handle(
                     emit(shared, sid, &message);
                 }
             }
-            (McpMenu::Server(name), Some(_)) => {
+            (McpMenu::Server(name), Some(_)) => state = McpMenu::Scope(name, false),
+            (McpMenu::Scope(name, moving), Some(_)) => {
                 let server = remote(shared, sid, &name).ok_or_else(|| {
                     AcpError::invalid_params().data("Server is no longer brokered")
                 })?;
-                shared.mcp_menus.lock().unwrap().remove(sid);
-                return start_sign_in(shared, sid, server).await;
+                let select_existing = options.get(choice - 1).is_some_and(|s| s == USE_SYSTEM);
+                let scope = if choice == 1 || select_existing {
+                    crate::account_scope::Scope::System
+                } else {
+                    crate::account_scope::Scope::Project
+                };
+                match crate::mcp_oauth::set_account_scope(
+                    &session_dir(shared, sid),
+                    &server,
+                    scope,
+                    moving && !select_existing,
+                )
+                .await
+                .inspect(|target| {
+                    if target.account != server.account {
+                        refresh_session(shared, sid);
+                    }
+                }) {
+                    Ok(server) if !moving => {
+                        shared.mcp_menus.lock().unwrap().remove(sid);
+                        return start_sign_in(shared, sid, server).await;
+                    }
+                    Ok(_) if select_existing => emit(
+                        shared,
+                        sid,
+                        "Using the existing system login; the project login was retained.",
+                    ),
+                    Ok(_) => emit(
+                        shared,
+                        sid,
+                        &format!("MCP account moved to {} scope.", scope.label()),
+                    ),
+                    Err(error) => emit(shared, sid, &format!("Scope change failed: {error}")),
+                }
+                state = McpMenu::Server(name);
             }
         }
     }
@@ -264,6 +365,11 @@ async fn start_sign_in(
         .await
         .map_err(fail)?;
     let url = start["url"].as_str().unwrap_or_default().to_string();
+    let flow_state = reqwest::Url::parse(&url).ok().and_then(|url| {
+        url.query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+    });
     let cancel = CancellationToken::new();
     let id = uuid::Uuid::new_v4().to_string();
     if let Some(previous) = shared.mcp_logins.lock().unwrap().insert(
@@ -271,10 +377,11 @@ async fn start_sign_in(
         PendingMcpLogin {
             id: id.clone(),
             server: server.clone(),
+            flow_state,
             cancel: cancel.clone(),
         },
     ) {
-        previous.cancel.cancel();
+        previous.cancel();
     }
     emit(
         shared,

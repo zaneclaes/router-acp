@@ -153,14 +153,11 @@ pub fn measure(
     out
 }
 
-/// `<account dir>/.router-acp-usage/capacity.json`, beside the account's usage
+/// Local `capacity.json`, beside the account's usage
 /// snapshot; the shared state directory only for an account without one.
 fn path(agent: &AgentConfig) -> Option<PathBuf> {
     if let Some(dir) = crate::credentials::directory(agent) {
-        return Some(
-            dir.join(crate::usage_cache::ACCOUNT_USAGE_DIR)
-                .join("capacity.json"),
-        );
+        return Some(crate::usage_cache::account_usage_dir(&dir)?.join("capacity.json"));
     }
     let home = std::env::var_os("HOME")?;
     Some(

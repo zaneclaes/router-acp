@@ -103,6 +103,44 @@ updating Kory Code. Keep source builds for development and testing.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
+### Worker command resource protection
+
+Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
+watchdog. The router has no resource-guard authority over Kory/goose or the
+supervisor's process tree.
+
+`cargo install --path .` also installs `router-resource-run`. Explicitly wrap a
+worker build/tool with `router-resource-run -- <command> [arguments]` to contain
+that command and its descendants. Its detached watcher follows process birth
+identities and owned groups across reparenting; its root is always the runner
+itself, never its parent or the enclosing supervisor. Chordzy's worker wrapper
+combines this with cross-worker RAM reservations and per-job budgets.
+
+Every 250ms, native OS calls check the tree's footprint, host memory/pressure,
+swap and free space on the working, startup and temporary filesystems. Keep at
+least 8GiB memory headroom and 10GiB free disk; warning memory pressure, swap above
+8GiB, or tree footprint above physical RAM minus headroom stops the owned tree.
+macOS accounting includes compressed memory; Linux includes resident and swapped
+memory. Unknown telemetry fails closed. Diagnostics contain resource counters,
+never command arguments or credentials. Source/worktrees are never deleted.
+An ancestry chain of 32 processes also stops the tree before a recursive launcher
+can exhaust the host. This backstop covers legacy tools without their own call guard.
+This is sampled protection, not a kernel cgroup or a guarantee against allocations
+between samples. A process that escapes both ancestry and its group between
+samples cannot be attributed reliably; use a VM/cgroup for kernel containment.
+
+`--inherit-group -- <command>` preserves a verified enclosing reservation's group
+for nested worker commands; ordinary standalone callers use the default isolated group.
+
+Set **`AGENT_GUARD_RESOURCES=false`** in the launching environment when a container
+or VM owns resource containment. This skips watchdog creation, resource probes
+and polling entirely; the standalone runner directly execs the command. Chordzy's
+worker launcher likewise directly execs before looking up git, its guard cache,
+the .NET runtime or this helper. Its RAM admission and RouterHost disk checks are
+disabled too. Other repository checks still apply. Unset or any value other than
+the literal `false` keeps resource protection enabled. Existing processes need a
+new launch to inherit a changed environment or binary.
+
 ## How routing works
 
 1. **`session/new`** creates a router-owned session; no downstream session exists yet. The response includes router-owned config options (`router.strategy`, `router.candidate`) so a client with a model picker gets a useful control.
@@ -134,6 +172,53 @@ Four routers ("strategies") decide the initial pick. Whichever runs, candidates 
 
 Set the default with the top-level `router:` key, override per-session with the `router.strategy` config option, or steer any client with a prompt directive — see [Prompt routing directives](#prompt-routing-directives).
 
+### Project configuration
+
+`router-acp serve` and goose/Kory discover configuration from the session's
+working directory. Selection order is an explicit `--config` path (or the
+host's `ROUTER_ACP_CONFIG` setting), `ROUTER_ACP_CONFIG` in the environment,
+the nearest `.router-acp/router.yaml`, then `~/.config/router-acp/router.yaml`.
+Project discovery searches parents through the enclosing git root, inclusive.
+`router-acp config-path --cwd <directory>` prints the selected absolute path;
+hosts use this command rather than implementing their own discovery.
+Explicit paths support `$HOME`, `${HOME}` and `~`.
+
+A `.router-acp/router.yaml` overlays the user's default file. Mappings merge
+recursively; `agents` and nested `accounts` merge by `name`, appending new
+names. Other lists replace the inherited list. `null` removes an inherited
+setting, restoring the router's default. For example:
+
+```yaml
+# <project>/.router-acp/router.yaml
+router: auto
+agents:
+  - name: claude@existing-account-id
+    reserve_capacity: {weekly: 40, session: 20}
+  - name: codex@project-account-id
+```
+
+Use the actual IDs from `account-status`; the nested `accounts` form should
+use the same provider/account structure as the user file. An explicit path
+to another filename selects a standalone configuration. Explicitly selecting
+a `.router-acp/router.yaml` still loads it as an overlay.
+
+`config-show` returns the effective, uninterpolated configuration. Its revision
+changes when either layer changes the effective values. Project edits write
+only differences into the project file, preserving inherited user defaults.
+The `/login` menus explicitly select System or Project for account membership
+and reserves. Set `account_disabled: true` on an inherited agent
+(or `disabled: true` on a nested account) to exclude it from this project.
+
+Provider credentials stay in the user's existing account store. **Add Account**
+asks whether the new account belongs to System or Project before sign-in.
+**Change account scope** moves membership: moving to Project removes the
+account from the system account list, while keeping its login and independent
+reserve settings. Removing an account from a project disables its project
+membership and retains shared credentials; other
+projects remain signed in. Re-login repairs the selected shared account for
+every project using its ID. To use a different identity, add a separate account.
+Runtime files and locks stay in machine-local state, never in `.router-acp`.
+
 ### Multiple accounts
 
 Type `/login` in any router session to manage your provider accounts. The router handles this command itself.
@@ -144,13 +229,36 @@ Manage logins
 2. codex (2 accounts)
 3. grok (0 accounts)
 4. kimi (0 accounts)
+5. MCP accounts
 ```
 
-Choose a provider, then an existing account or **Add Account**. An account shows its status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order; the group is renumbered and saved) and, for an account with a usage source, **Set reserve capacity** (the weekly and session percentages kept unused). Hosts can read the same metadata with `router-acp account-status --config <path>`, which returns JSON without starting providers. Its `credentialPresent` field distinguishes a saved but unprobed credential from a configured account with no credential. Its `routing` object reports the router's read-only availability outcome: `available`, a machine-readable `reason` (`authentication` or `capacity`), and the capacity reset when known. Each account also carries its `priority`, `reserveCapacity`, `sharedDirectory` (still on the provider CLI's own directory), and `usage`: the normalized meters `/usage` shows, as `{plan, windows, credits, updatedAt, error}`. A window is `{id, label, percent, resetsAt, severity, active, scope, windowMinutes, reserveKind}`, plus `capacityDollars` when the router has measured the seat's window. `active` means the limit is reached. The top-level `revision` identifies the configuration that membership came from. Hosts display this outcome and never infer authentication, capacity, cordons, or route eligibility from provider usage. Browser sign-in uses native ACP `/login`. New accounts get router-owned canonical credentials and private access-only runtime stores. An expired login remains registered so **Re-login** can repair it.
+Choose a provider, then an existing account or **Add Account**. An account shows its scope and status, **Re-login**, **Delete account**, **Set priority** (its position in the provider's drain order), **Reserve Capacity (System)**, **Reserve Capacity (Project)** and **Change account scope**.
+
+Each reserve menu edits weekly and session percentages independently. Project
+values override only the selected window; **Use system reserve** removes that
+window's project override. Both menus offer **100% (disabled)**: either window
+at 100% prevents routing to the account, including explicit model picks and
+unknown usage. This works without a usage source or proactive cordoning.
+Intermediate percentages require both. A 100% project reserve therefore
+disables an inherited system account only in that project.
+
+Hosts read the same metadata with `router-acp account-status --config <path>`,
+which returns JSON without starting providers. `credentialPresent` distinguishes
+a saved but unprobed login from a configured account with no credential. The
+`routing` object reports `available`, a machine-readable `reason`
+(`authentication`, `capacity` or `disabled`), and the capacity reset when known.
+Each account includes `priority`, `reserveCapacity`, `sharedDirectory` and
+`usage`: `{plan, windows, credits, updatedAt, error}`. Each window reports
+`{id, label, percent, resetsAt, severity, active, scope, windowMinutes,
+reserveKind}`, plus `capacityDollars` when measured. `active` means the limit
+is reached. The top-level `revision` identifies the effective configuration.
+Hosts display these outcomes rather than inferring eligibility from usage.
+New accounts get router-owned canonical credentials and private access-only
+runtime stores. An expired login remains registered for **Re-login**.
 
 Clients with ACP form support show menus and Claude's code entry as forms. Other clients show numbered text menus. Reply with a number. For Claude, paste the browser code with `/login code <code>`. `/login cancel` stops a pending sign-in. Router or session closure cancels pending logins.
 
-The provider's ACP adapter must be configured. The router validates and atomically saves membership in the configuration passed to `serve --config`. It makes a new login available in the current router too. Deleting removes membership and the router-owned credential. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
+The provider's ACP adapter must be configured. The router validates and atomically saves membership in the selected configuration. It makes a new login available in the current router too. Deleting from a standalone configuration removes membership and the router-owned credential; deleting from a project overlay retains the shared credential. A deleted adapter template remains available for **Add Account**. Other router processes load configuration changes when they restart.
 
 A host that generates this configuration never opens the file. It uses router commands, which print JSON:
 
@@ -172,11 +280,71 @@ Accounts use lower `priority` numbers first. For example, `priority: 0`, `priori
 
 `reserve_capacity: {weekly: 10, session: 20}` keeps the last 10% weekly and 20% session capacity unused. The router switches at 90% weekly or 80% session usage. Each account keeps independent authentication, quota caches and reserves.
 
-Every seat is an account named `<agent>@<id>`, with a directory `~/.config/router-acp/accounts/<agent>@<id>`. That directory holds only what lets the router switch accounts: the login, and the usage cache (the session and weekly snapshot and the measured window size) in `.router-acp-usage/`. Hosts read the cache only through `account-status`. Skills, plugins and settings stay computer-wide. Every account's adapters read them from the CLI's own directory (`~/.claude`, `~/.codex`, `~/.grok` or `~/.kimi`), so switching accounts never changes them. A reference written without the account, such as `claude/opus[1m]` in a routing directive or a delegate hint, names that agent's account seats, and account priority decides among them.
+Every seat is an account named `<agent>@<id>`, with a directory `~/.config/router-acp/accounts/<agent>@<id>`. That directory holds its portable login and account identity. Usage snapshots, measured capacity, credential-repair records and locks live in the machine's local state directory. Hosts read the cache only through `account-status`. Skills, plugins and settings stay computer-wide. Every account's adapters read them from the CLI's own directory (`~/.claude`, `~/.codex`, `~/.grok` or `~/.kimi`), so switching accounts never changes them. A reference written without the account, such as `claude/opus[1m]` in a routing directive or a delegate hint, names that agent's account seats, and account priority decides among them.
 
 A seat configured with no directory of its own still shares its CLI's directory. The router's next start makes it an account once. It copies the login into the new directory (readable only by you), so the native CLI stays signed in, and renames the seat's exact references in the configuration. From then on each side refreshes its own copy. A provider that rotates refresh tokens may later ask one of them to sign in again. A seat that already names a directory, such as an added account or a mounted volume, stays where it is. A seat configured with a directory outside the accounts folder keeps using that directory for its configuration too.
 
 See [the advanced configuration example](examples/router-accounts.yaml) if you need to edit these values directly.
+
+**Moving accounts between machines.** For preset-backed accounts (`claude@…`, `codex@…`, `grok@…`),
+copying `~/.config/router-acp/` to the same location under another user's home preserves the
+logins, account identities, plan labels, priorities, reserves and router settings. Canonical
+credentials (including refresh tokens) are ordinary private files in `accounts/`, not macOS
+Keychain entries. Account paths derive from the destination's home, and preset executables
+resolve through its `PATH`. Install router-acp and the provider adapters on the destination.
+For example, once the destination directory exists:
+
+```sh
+rsync -a ~/.config/router-acp/ linux:~/.config/router-acp/
+```
+
+Stop source router sessions and its usage monitor while taking the copy so refresh/login writes
+cannot race it. The configuration tree needs no runtime or lock exclusions.
+`router-acp account-status --config ~/.config/router-acp/router.yaml` checks the copied
+accounts without spawning adapters or refreshing tokens. The transfer test runs with a different
+home and no provider executables or keychain, and compares all four accounts' status and settings.
+Local authentication evidence and usage caches are rebuilt on the destination; their absence
+means unknown, not logged out. A regression also copies the whole configuration tree with
+live provider sockets, credential locks, configuration locks and a login in progress.
+This is account portability: CLI-wide skills/plugins/settings in `~/.claude`, `~/.codex` and
+`~/.grok`, explicit external credential directories, and absolute project-hook or custom executable
+paths are separate machine configuration. OAuth expiry/revocation still belongs to the provider;
+two machines independently rotating copies of one refresh token can invalidate the older copy.
+An rsync is a snapshot, not distributed credential-refresh coordination.
+
+**Machine-local storage.** Adapter and login runtimes live in
+`$XDG_STATE_HOME/router-acp/runtimes/<account>-<uuid>/`, defaulting to
+`~/.local/state/router-acp/runtimes/<account>-<uuid>/` when `XDG_STATE_HOME` is unset or relative.
+Directories are private (`0700`) and runtimes are removed on exit; abandoned runtimes are
+reclaimed on the next launch without removing a live process's locked directory.
+The same state root holds `accounts/<path-hash>/` (repair records, usage caches and credential
+locks), `config-locks/<path-hash>/` (configuration write locks), and `mcp/<path-hash>/`
+(OAuth locks, pending sign-ins and connection health). Canonical paths identify owners so
+symlink aliases share a lock. Native login commands run in disposable local directories;
+only credentials and account identity are published back into configuration.
+MCP client registrations and tokens remain portable in `~/.config/router-acp/mcp/`.
+
+Legacy host helper scripts such as `pi-acp` and `repo-host` also belong outside
+configuration. Move an old `~/.config/router-acp/bin/` into
+`~/.local/state/router-acp/bin/` and update its command references and Goose's
+`GOOSE_SEARCH_PATHS`. In synchronized router YAML, use
+`command: $HOME/.local/state/router-acp/bin/repo-host` instead of a machine's
+absolute home path. Both `$HOME` and `${HOME}` expand when that machine loads
+the config; configuration saves preserve the variable reference. Install the
+referenced helper on each machine. Expansion uses environment values, never
+shell execution; unknown variables, model placeholders and `$$` stay intact.
+This applies to every file loaded with `--config`, including `router.yaml`
+and `implement-all.yaml`, and to all planner and delegation hook commands.
+Archive old YAML backups and abandoned temporary writes
+outside the configuration tree as well; only active settings and logins need syncing.
+
+Restart all older router sessions and usage monitors when upgrading this storage layout.
+Starting `serve`, `prompt` or `usage-monitor` migrates old account caches and repair records,
+MCP pending/health state and unused locks, and reclaims old account-local runtime directories.
+A live legacy runtime or held legacy lock refuses migration until its process exits.
+Legacy runtimes without locks are retained for six hours after their last change.
+Read-only commands such as `account-status` do not migrate files. Sync the configuration
+directory, not the local state directory.
 
 A saved account pin also yields when its included plan is exhausted and paid usage is unavailable or denied. The router announces the replacement and applies the session's normal strategy. An unavailable prompt pin cannot block an eligible sibling, even when static fallback is disabled. A configured static strategy retains its own fallback policy.
 
@@ -190,11 +358,13 @@ The router degrades gracefully when seats run dry or adapters fall over, and it 
 - The shared usage snapshots are safe to consume across credential changes: `account` identifies the seat, while the additive optional `access_generation` identifies the access credential used for that fetch. Missing or legacy generation data, malformed credentials, and cache contention are unknown. A 401 or probe result alone is unknown. Only a definitive current-generation refresh rejection is durable authentication evidence.
 - **Outage failover.** If the pinned model fails mid-session (process death, connection loss, provider overload) or hits a limit, the router fails the session over to the next best candidate: the failure and its reason are announced in the transcript, the strategy re-ranks the remaining pool, a fresh downstream session is opened (mode re-applied), and the prompt is retried there, given the same SQLite history lookup reference a switch falls back to (the failed model is in no state to summarize), so the replacement continues the work. Hot failover also works after partial output: the replacement looks up the partial response and tool statuses with continuation instructions to inspect uncertain effects and avoid repeating completed actions. Availability is watched during the turn, so an account or model cordon interrupts that session and triggers the same handoff. A model the provider reports at capacity is cordoned on its own and the session fails over to the eligible model nearest its quality; a human pick follows that substitute for the rest of the session, and a handoff never accepts the capacity notice as a summary (`failover.on_model_capacity`). Client cancellation never triggers failover. Configure with `failover.enabled` / `failover.max_attempts`.
 - **Outage cordons and waits.** A provider outage (HTTP 5xx, overloaded, transport failure) cordons that exact model on every account of its lineage for `failover.outage_cordon_secs`: the same model on another account is down too, so failover moves to a different model, across families when needed, and a human pick is no exception. A local adapter failure (process exited, connection closed) only respawns that process. When nothing else can serve, the prompt stays open: the router announces the wait, retries the old model when its cordon ends (within `failover.max_wait_secs`), and announces the retry. A completed turn resets the per-prompt `max_attempts` budget, so a long prompt that runs through background waits does not inherit the failures of turns it already recovered from.
-- **Hard and soft cordons.** A usage cordon is **soft** when only the configured `reserve_capacity` put the seat over the line and the plan or paid overage still has headroom; true exhaustion, a member limit, and every error-driven cordon are **hard**. A soft cordon never interrupts a running turn. The next turn moves to another model, and the outgoing model still writes the handoff summary. A hard cordon interrupts the turn and hands off through the SQLite history lookup, because the old model cannot serve.
+- **Hard and soft cordons.** A usage cordon is **soft** when the configured `reserve_capacity` is reached while plan or overage headroom remains; true exhaustion, a member limit, and error-driven cordons are **hard**. Both interrupt active parent and delegate requests as soon as the router observes the threshold, without waiting for a turn boundary. Each request continues on an eligible account with a SQLite history lookup, preserving partial work and checking uncertain tool effects. The reserved account is not asked for a summary. Idle delegates migrate before their next request. Worker identity, assignment, attempt, workspace and public `delegate_id` survive the handoff; cancellation never starts a replacement. Recovery honors `failover.enabled`, `failover.max_attempts`, model constraints and concurrency limits. `soft` describes the reason, not permission to consume the reserve.
 - **Labeled notices.** Every failover, cordon switch, per-request fallback and retry leads its `router-acp ·` block with a labeled headline (`GPT-6.1 Sol outage: switching to Claude Opus 5.5`, `Reserve reached: switching to …`, `GPT-6.1 Sol outage: no other model can serve; retrying GPT-6.1 Sol in 5m (at …)`). The block starts on a fresh paragraph, never glued to the model's sentence. The same chunk carries a typed copy in `_meta.router_acp.notices[]`: `{kind: failover|switch|retry|retry_wait, reason: outage|account_limit|reserve|capacity|context_overflow|auth|rejected, cordon: hard|soft, label, headline, from, to, handoff: summary|lookup|null, retry_at, detail}`. Each delivered block is logged as a `router_notice` row, and `session/load` replays it with its typed copy. A Codex transport error printed as reply text is held out of the prose and carried in the notice detail (`provider: …`) when the turn fails over on it.
 - **Automatic respawn.** A downstream process that died is respawned and re-probed at the next routing decision (subject to `failover.respawn_cooldown_secs`), so a recovered agent rejoins the pool without restarting the router. An explicit switch to a dead model revives it immediately, cooldown or not.
 
 Codex can report an exhausted HTTP 5xx connection failure as assistant text and still mark the turn complete. The router recognizes that terminal error only when its proxy observed the matching failed HTTP response in that turn. It starts normal outage recovery, preserving partial work and the human's model pick when that model remains eligible. Quoted errors in successful replies and errors from earlier turns do not trigger recovery. Recovery uses the existing `failover.max_attempts` budget and cordons the model like any provider outage. With failover disabled, the turn returns an error instead of false success.
+
+When all eligible models are unavailable, the bounded retry wait also watches for newly available candidates. A recovered seat reruns the normal selector immediately; model pools, exclusions, effort requirements and reserves still apply. An availability change outside those constraints leaves the existing wait in place. The router treats this deliberate wait as progress, so the planner's stalled-adapter timer does not cancel it or restart a healthy adapter; client cancellation remains effective.
 
 ### Headroom, quarantine, and availability-aware preference
 
@@ -454,6 +624,8 @@ Because ACP `mcpServers` entries must be concrete transports, the tool is a real
 
 An ACP host registers concrete named MCP bundles with `router-acp/delegate_mcp_catalogs`; config maps those catalog names to opaque capabilities. A configured pre-classifier extension dimension defines when a first prompt needs those capabilities; the base routing object cannot create capability requirements from prompt text. Before opening the primary downstream session, the router resolves the requirement and attaches the matching registered catalog. A later bounded `delegate_task` instead asks for `required_capabilities`; the router resolves and attaches them only to that delegate. Unknown capabilities, missing catalog registrations, and incomplete coverage fail closed — the router never defines capability meanings, endpoints, or credentials. When a required catalog is selected, its host-supplied entry replaces any same-named server forwarded by the client; the registration is the authoritative definition for that capability.
 
+`required_capabilities` selects optional additional catalogs; ordinary client and project-broker MCP servers are inherited without it. The delegate tool schema enumerates configured capability names, or permits only an empty array when no catalogs are configured. An empty catalog policy does not disable ordinary project tools. A catalog refusal keeps its capability checks intact and distinguishes that optional mechanism from normal MCP attachment.
+
 Some clients never hold a live post-`session/new` connection into the session they created — a client that spawns the router as a subprocess only to relay its stdout can never send that notification. For those, set `ROUTER_ACP_MCP_CATALOGS` to the same `catalogs` JSON shape (`{"<catalog>": [<McpServer>, ...]}`) before the router process starts; it seeds `delegate_mcp_catalogs` once at session creation. It's an additive fallback only: absent or malformed content fails open to no catalogs, and a later live notification still overwrites the seed as usual.
 
 `delegation.inject_prompt: true` also prepends a one-shot directive to each ordinary downstream session that actually received these tools, asking the parent to delegate only bounded, independent work whose briefing/verification overhead is worthwhile and to verify and integrate the result itself. A model switch creates a fresh downstream session, so the router re-injects there when a cheaper worker remains available. The opt-in defaults to `false`. When a session that received this directive uses its adapter's built-in sub-agent tool (Claude's `Task`) instead while `delegation.native_subagents` is `forbid` (the default), the router warns inline (`router-acp · delegation bypassed: …`) and counts it in `native_subagent_calls`; that work is invisible to router routing and cost telemetry. With `native_subagents: allow` it does not fire.
@@ -463,6 +635,12 @@ Concurrency is bounded by `delegation.max_concurrent`; `session/cancel` on the p
 For **review → fix → re-review** loops, a delegated sub-session can be kept alive: `delegate_task` with `keep_open: true` returns a `delegate_id`; send it more instructions with `delegate_followup` (context preserved), and release it with `delegate_close`. This lets a parent iterate on a subtask without re-briefing a fresh session each round.
 
 For **parallel** subtasks there is a background mode: MCP clients execute tool calls one at a time, so N plain `delegate_task` calls run the subtasks serially no matter what the router allows. `delegate_task` with `background: true` instead returns a `b-…` job id immediately and runs the subtask on its own task; `delegate_await` collects results — it waits up to `timeout_seconds` (default 600, clamped to 5–1500) for the given ids (default: all pending), returns every finished job's output exactly once, and lists the ones still running so the caller polls with short, idle-timeout-safe calls. `background` composes with `keep_open` (the collected result carries the `delegate_id`), and `delegation.max_concurrent` still bounds how many jobs execute at once.
+
+Planner background dispatch claims the admitted work and workspace before acknowledging
+startup; a refused claim returns directly to the caller. Live planner workers report through
+wakes and are never held in `delegate_await`, but a completed background failure can be
+collected and records a parent wake. `delegate_result` also reports failed or queued jobs
+before a child session exists. A queued job is not proof that a worker is making progress.
 
 ### Host-directed workers
 
@@ -478,10 +656,54 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   - `delegate_turn_end` — whenever a delegate turn ends, with `turn`, `last_message` and the worker's latest structured `handoff`. Exit 2 with a message on stderr sends that message back to the same delegate as its next prompt, at most `max_continuations` (default 3) times per turn — the router equivalent of a provider's subagent-stop hook keeping a worker going. Any other result releases the turn.
   - `delegate_stop` — `completed`, `cancelled` or `failed`, or `closed` when a `keep_open` delegate is closed.
   - `parent_repinned` — a session's pin moved to a new provider session (failover, including hot failover between accounts; an explicit switch; escalation; demotion), with `previous_downstream_session_id`/`previous_candidate`, the new `downstream_session_id`/`candidate`, and `reason`. It is delivered before the new session's first turn, so a host that bound work to the old provider session can follow the parent onto the new model.
+
+  Planner workers continue beyond `max_continuations` while making progress. Three consecutive
+  refused turns with no agent output or tool activity instead end the attempt and require the
+  parent's existing scope/source reconciliation. Adapter informational warnings alone are not
+  work: a broken prompt hook must not trap a worker in an endless continuation loop. Source and
+  outstanding checks remain preserved; no acceptance or completion is inferred.
+
+  An ended planner worker's current `ownership_requested` or `reassignment_required` handoff
+  reaches a busy router-owned parent through urgent steering. If the adapter declines steering,
+  the router ends its own turn and delivers the durable handoff next. Operator turns, approval
+  waits, acknowledged or already-claimed deliveries and superseded attempts stay protected.
+  While staging or production has a failed build, audit findings use that same urgent path.
+  Continuous parent activity cannot hide changed findings behind routine branch wakes.
+  Unchanged delivered findings do not repeatedly interrupt active work. Automatic steering waits
+  for in-flight tools to finish so adapter interruption cannot masquerade as a user refusing an edit;
+  direct operator input keeps its interruption authority. Recovery clears audit urgency;
+  ordinary audits retain their idle cadence.
+
+  The parent capacity census and host work snapshots use the same fresh exact-head CI wait
+  as automatic recovery. A parked owner is shown as waiting for CI, not awaiting retry;
+  `waiting_build_revision` exposes the verified pending revision for the host to recheck.
+  Failed, completed, stale or mismatched observations restore normal recovery. Pending CI
+  is neither a passed gate nor proof that an unrelated environment failure has an owner.
+
+  Reconciliation may allocate a work that failed before receiving a workspace. Rechecking
+  completed native adoption does not write planner state, so that allocation cannot invalidate
+  its own reconciliation revision on every retry. First adoption still uses the existing claim.
+
+  Parent delivery batches retain every recovery wake, but recovery notices for already
+  accepted or finished work follow stopped-work recovery and fresh artifact review. They
+  still precede capacity/refill reminders. A large adopted backlog therefore cannot fill
+  the 32-wake batch with old acknowledgments and hide a newly qualified repair; source
+  reconciliation and custody gates remain required.
+
+  A successful child resume or replacement resolves that work's previous child-stop
+  notifications. Their records remain available, and the next stop creates or re-arms
+  its notification. Failed claims and unreviewed artifacts retain their wakes; operator
+  input, recovery, release and other notices still require their own reconciliation.
   
   `delegate_stop` and `parent_repinned` go through a `hook_outbox` table in the state DB: an event the hook did not accept stays queued, and every router process sharing that DB retries it every 30 s and at startup. Delegate events carry `worker_id` (the `b-…` job id for a background delegate, else a `w-…` id), `parent_router_session_id`, `parent_downstream_session_id` (the id the provider's own hooks report for the parent), `parent_candidate`, `candidate`, `lineage`, `downstream_session_id`, `state_session_id`, `cwd`, `effort`, `background`, `keep_open` and `task_summary`; every event carries `router_pid` and `router_started_at_ms`, so a host can treat a dead router's workers as stopped even if no stop event arrives.
 - **Worker tools.** While a hook is configured, each delegate gets a `router-worker` MCP server: `worker_whoami` returns its worker id, model and parent session, and `worker_handoff {kind, message}` records a structured handoff (`commit_paths_ready`, `waiting`, `lease_requested`, `ownership_requested`, `staging_gate_request`, `round_verified`, `round_failed`, `reassignment_required`) that the turn-end event carries. The delegate's prompt also opens with `[router-acp delegate] worker id: … · model: … · parent session: …`, and the tool result names the worker (`[delegated to grok/grok-4.7, worker b-…]`).
 - **Resuming a parent without its client.** `router-acp prompt --config <file> --session <id> --mode auto --message <text>` reopens a router session (`session/resume`, else `session/load`) and sends one message with no ACP client attached, streaming the reply to stdout. `--session` takes a router id or the provider session id the router pinned it to — what the provider's own hooks recorded — so a supervisor can wake a parent whose goose is gone. A reloaded or resumed session gets its router tools back. Every adapter the router spawns inherits `ROUTER_ACP_CONFIG` and `ROUTER_ACP_BIN`, so a host's hooks can tell they run under the router and build that command.
+
+- **Correcting a live planner.** `router-acp planner-input --session <router-id> --cwd <checkout> --id <stable-id> --message-file <file>` sends an explicitly agent-origin message through the existing parent queue without interrupting or taking over the running session. Read delivery and acknowledgment with `planner-input --session <router-id> --id <stable-id> --status`. Same-id retries are idempotent; operator approval holds remain effective. See [monitor input](docs/planner-throughput.md#messages-from-a-local-monitor). Use this for a live parent; `prompt` is for a parent whose client has gone.
+
+  A parent turn ending with delivered but unacknowledged input creates an `input:` reconciliation wake, with its origin. Commands are excluded. Either `acknowledge-input` or `acknowledge-wake` for that input closes both records and removes its queue entry; acknowledgment records handling, not success of the requested work. Reconcile an action already taken without repeating it.
+
+  `planner-input --session <id> --list` lists unresolved metadata. To withdraw an obsolete message, use `planner-input --session <id> --cwd <checkout> --id <input-id> --delete --reason <reason>`; replace `--id … --delete` with `--drain` for all unresolved agent-origin inputs. Both preview by default; add `--apply` to write. Human-origin input requires `--include-human` explicitly, regardless of words in its text. Withdrawal retains the original input and a reason, closes its wake and queue entry, and is reported separately from acknowledgment. A live delivery must finish before withdrawal; this command never cancels a turn. Re-sending the same input id cannot reopen it.
 
 Delegates still end when their router exits: the router kills every adapter when its client disconnects or is interrupted, so a worker cannot outlive the goose session that started it. Committed work survives; a host recovers the rest through its stop events, the router-pid liveness check, `delegate_result` and `router-acp prompt`.
 
@@ -546,6 +768,7 @@ How each `.mcp.json` entry is handled:
 | --- | --- |
 | `type: http` (or a bare `url`), no `headers` / `headersHelper`, router signed in | **brokered**: replaced in every session by the router's loopback entry |
 | the same, not signed in | left as it is today (Claude reads it itself; the others never see it) |
+| `oauth.account` selected, not signed in | brokered; authentication required, with no default-account fallback |
 | `headers` or `headersHelper` (static credential) | left as it is today |
 | `type: sse` (legacy HTTP+SSE transport) | left as it is today |
 | stdio (`command`) | left as it is today |
@@ -553,6 +776,49 @@ How each `.mcp.json` entry is handled:
 `${VAR}` and `${VAR:-default}` in a URL are expanded as Claude Code does. An
 entry's `oauth.clientId` (a pre-registered public client) and
 `oauth.callbackPort` (a fixed redirect port) are honored.
+
+To use a different MCP account, open **/login → MCP accounts**, choose a
+server, then **Sign in** or **Sign in again**. Choose System or Project before
+browser sign-in. **Change account scope** moves an existing saved login;
+moving it to Project removes that login from the system scope. A destination
+with an existing login is retained; **Use existing system login** switches the
+project's selection without replacing either saved login.
+Finish or cancel a pending sign-in before moving its account.
+
+The menu saves a stable profile selection under `mcp_accounts` in
+`.router-acp/router.yaml`, leaving generated `.mcp.json` files untouched:
+
+```yaml
+mcp_accounts:
+  https://mcp.datadoghq.com/v1/mcp:
+    account: chordzy
+```
+
+Keys may also be server names; URL selections take precedence. `{account: null}`
+selects the system login. Selections inherit from the user router file and
+override `oauth.account` in `.mcp.json`. For manually managed MCP definitions,
+`oauth.account` is also supported:
+
+```json
+{
+  "mcpServers": {
+    "datadog": {
+      "type": "http",
+      "url": "https://mcp.datadoghq.com/v1/mcp",
+      "oauth": { "account": "chordzy" }
+    }
+  }
+}
+```
+
+Run `router-acp mcp-login datadog` from that project, or use its `/login`
+menu, to sign into that profile. The name is portable: two projects selecting
+`chordzy` share that login; a different name gets independent credentials.
+Omitting `oauth.account` keeps the existing user-wide login. Login, refresh,
+status, tool calls and logout all use the selected profile. Named profiles
+never fall back to the default account or the host's credential helper; before
+login they stay brokered and report authentication required. Tokens remain in
+the user's synced credential store, not in the project repository.
 
 **Sign-in** (`mcp-login <name>`, `--project <dir>` for another project,
 `--url <url>` for a server no project names yet) is OAuth 2.1 authorization
@@ -566,15 +832,16 @@ grant to the server with an RFC 8707 `resource` (the URL without its query).
 `--no-browser` only prints the sign-in URL. `mcp-logout <name>` forgets the
 sign-in locally.
 
-**Storage.** Sign-ins are keyed by the server's URL (scheme, host and path;
-the query is ignored, so `?toolsets=…` variants share one sign-in), in
+**Storage.** Sign-ins are keyed by the server's URL and optional `oauth.account`
+profile (scheme, host and path; the query is ignored, so `?toolsets=…` variants
+of the same profile share one sign-in), in
 `~/.config/router-acp/mcp/<host>-<hash>/` (`ROUTER_ACP_MCP_DIR` moves the
 root). The directory is 0700, every file 0600 and written atomically.
 `client.json` names the client that issued the current refresh token and is
 written only after a successful exchange; `tokens.json` holds the tokens;
 `configured` marks that a sign-in once succeeded, so a lost token file reads
 "reconnect needed" rather than "not signed in". One sign-in serves every
-project that names the same server. Only the router reads or refreshes these
+project that names the same server and profile. Only the router reads or refreshes these
 files, and it never touches Claude's own MCP sign-ins in the macOS Keychain.
 
 **The broker.** `serve` binds a loopback listener on `127.0.0.1` (random
@@ -847,7 +1114,7 @@ it would not.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `agents[].name` | – | Unique, no `/`. Candidate ids are `name/model-id`. |
-| `agents[].command` | – | `type: stdio` command/args/env for the adapter. `${VAR}` in the whole file interpolates from the environment (unknown names are left intact). |
+| `agents[].command` | – | `type: stdio` command/args/env for the adapter. `$VAR` and `${VAR}` in the whole file interpolate from the launching process's environment (unknown names are left intact). |
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
 | `agents[].models[]` | – | `id` (must match the downstream selector's value for `config-option`; a `[1m]` suffix difference is accepted), optional `display_name`, `api_model` (provider model id for proxy rewrites; defaults to `id`), `versions`, `cost_rank` (1 = cheapest/least scarce), `auto_eligible`, and optional `pricing`. |
@@ -924,6 +1191,13 @@ Do not launch a provider CLI against canonical credentials outside the router.
 - Unknown ids fail. SQLite write failures fail the ACP operation rather than creating an unresumable conversation.
 
 Planner Resume also restores the durable phase, coordinator role, and assignments.
+Adopted unfinished assignments require scope/source reconciliation before dispatch.
+That fence applies to each affected assignment: independent capacity checks and
+release reminders continue under the normal ownership and dependency gates.
+See [durable planner progress](docs/planner-throughput.md).
+An `implement` command that overlaps a previous router's drain records a pending
+handoff. The ordinary capacity cycle retries after owner exit before new work can
+start; see [recovery details](docs/planner-capacity.md).
 Restored effort preferences do not establish confirmed active effort.
 Planner close pauses running work while retaining assignments and repository artifacts.
 Planner delete refuses unfinished assignments, including their live attempts, pending inputs, wakes, and approval waits.

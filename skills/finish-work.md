@@ -8,3 +8,6 @@ the new artifact and return to parent review before integration.
 Keep review and recovery evidence. Confirm custody before permitted cleanup.
 Never delete the only artifact or a branch still required for integration.
 Do not claim merge, deployment, or publication without its required proof.
+
+Interrupted accepted work resumes this handoff role. Do not repeat unchanged implementation.
+Check status first: the parent may already have finalized a host-verified handoff.

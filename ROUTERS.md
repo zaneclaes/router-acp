@@ -429,6 +429,12 @@ An optional `workspace` command receives a JSON assignment on stdin and returns
 `path`, `lease`, optional `environment`, and optional ACP `mcp_servers`. Host
 rebindings cannot replace the router's lifecycle tools.
 
+If allocation refused an outdated assignment before creating a workspace, the parent
+can reconcile that same work identity with its corrected brief and preserved source
+revision. Reconciliation retries the normal allocator and verifies source custody
+before accepting the assignment. A work that already has a workspace must retain
+and restore that original workspace; reconciliation never replaces it.
+
 Pending input, original attachments, accepted revisions, finishing/integration
 receipts, and wake acknowledgements persist in SQLite. An idle-parent wake has
 bounded retries and cannot infer approval. Disconnecting or cancelling stops

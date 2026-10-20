@@ -1,6 +1,7 @@
 //! router-acp: an ACP session router over `(agent, model)` candidates,
 //! with bounded in-session delegation.
 
+pub mod account_scope;
 pub mod account_usage;
 pub mod accounts;
 pub mod auth;
@@ -18,17 +19,27 @@ pub mod headroom;
 pub mod lifecycle;
 pub mod limits;
 pub mod llm_proxy;
+pub mod local_state;
 pub mod maintenance;
 pub mod mcp_broker;
 pub mod mcp_menu;
 pub mod mcp_oauth;
 pub mod notice;
+pub mod planner_adopt;
+pub mod planner_capacity;
 pub mod planner_client;
+pub mod planner_guard;
+pub mod planner_input;
+pub mod planner_preempt;
+pub mod planner_release;
+pub mod planner_shutdown;
 pub mod planner_skills;
 pub mod planner_wake;
+pub mod planner_watchdog;
 pub mod planner_workflow;
 pub mod pre_classifier;
 pub mod presets;
+pub mod project_config;
 pub mod relay;
 pub mod restoration;
 pub mod session;

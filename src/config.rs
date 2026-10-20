@@ -1,6 +1,6 @@
 //! YAML configuration: parsing, defaults, env interpolation, validation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,11 @@ pub struct DelegationConfig {
     /// specific worker model (e.g. a Sol parent with a Grok worker).
     #[serde(default)]
     pub candidate_hints: CandidateHintMode,
+    /// Host-owned ceilings for automatic delegate effort, keyed by candidate
+    /// pattern. All matching ceilings apply; omitted candidates keep the
+    /// assignment baseline. This also covers router-initiated planner work.
+    #[serde(default)]
+    pub candidate_effort_caps: BTreeMap<String, crate::candidate::EffortLevel>,
     /// Whether the injected delegation directive forbids provider-native
     /// Task/spawn/subagent tools (`forbid`, default) or leaves them to the
     /// host's own workflow (`allow`).
@@ -210,8 +215,9 @@ pub struct EffortConfig {
 /// and before its prompt; a non-zero exit or timeout refuses the delegate.
 /// `delegate_turn_end` runs when each delegate turn ends; exit 2 sends the
 /// hook's stderr back to that delegate as its next prompt, at most
-/// `max_continuations` times per turn. `delegate_stop` and `parent_repinned`
-/// are delivered durably through the state DB's outbox.
+/// `max_continuations` times per turn. `delegate_stop`, `parent_repinned`,
+/// and a planner run's `planner_wake` and `work_finished` are delivered
+/// durably through the state DB's outbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegateLifecycleHook {
@@ -261,6 +267,7 @@ impl Default for DelegationConfig {
             socket_path: None,
             complexity_cap: default_delegate_complexity_cap(),
             candidate_hints: CandidateHintMode::default(),
+            candidate_effort_caps: BTreeMap::new(),
             native_subagents: NativeSubagentPolicy::default(),
             lifecycle_hook: None,
         }
@@ -958,6 +965,13 @@ pub struct AgentConfig {
     /// Deleted membership keeps an adapter template for adding a new login.
     #[serde(default)]
     pub account_disabled: bool,
+    /// Codex adapters only: run every enabled hook without Codex's persisted
+    /// hook-trust review, the same override as `codex --dangerously-bypass-hook-trust`.
+    /// Codex skips hooks it has not trusted, and a delegate's fresh worktree is
+    /// never a trusted path, so without this a repository's guard hooks do not
+    /// run for delegated work. Off unless set.
+    #[serde(default)]
+    pub bypass_hook_trust: bool,
     /// Most delegated sub-sessions this agent runs at once, beside the global
     /// `delegation.max_concurrent`. Each account seat gets its own limit, so
     /// adding accounts or agents adds delegate capacity. Unset: only the
@@ -1004,6 +1018,13 @@ pub struct ReserveCapacityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ReserveCapacityOverride {
+    pub weekly: Option<f64>,
+    pub session: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     pub name: String,
     #[serde(default)]
@@ -1013,7 +1034,7 @@ pub struct AccountConfig {
     #[serde(default)]
     pub env: Vec<EnvVarConfig>,
     #[serde(default)]
-    pub reserve_capacity: Option<ReserveCapacityConfig>,
+    pub reserve_capacity: Option<ReserveCapacityOverride>,
     #[serde(default)]
     pub account_plan: Option<String>,
 }
@@ -1299,6 +1320,14 @@ fn default_planner_floor_complexity() -> f64 {
     0.15
 }
 
+fn default_stuck_turn_secs() -> u64 {
+    600
+}
+
+fn default_stuck_turn_cancel_secs() -> u64 {
+    60
+}
+
 fn default_easy_planning_candidates() -> Vec<String> {
     vec!["*opus*".to_string(), "*sol*".to_string()]
 }
@@ -1339,6 +1368,27 @@ pub struct PlannerRouterConfig {
     /// Omitted allocation uses isolated local clones, never shared writes.
     #[serde(default)]
     pub workspace: Option<PlannerWorkspaceConfig>,
+    /// Repository-owned capacity host. While the parent is below
+    /// `delegation.max_concurrent`, the router asks it for admissible
+    /// candidates and wakes the parent even during coordination. If the idle
+    /// parent does not respond, it admits and starts them itself. Omitted keeps
+    /// only the 20-minute heartbeat.
+    #[serde(default)]
+    pub capacity: Option<PlannerCapacityConfig>,
+    /// Repository-owned run auditor (the native watcher's guarantees): its
+    /// defects wake the idle parent, gate the parent's turn end and refuse
+    /// `complete`; a `hold_check` verifies each `hold`. See
+    /// `crate::planner_guard`.
+    #[serde(default)]
+    pub audit: Option<PlannerAuditConfig>,
+    /// Repository-owned check of every `integrate`, and of a `disposition` to
+    /// blocked/watching: exit 0 accepts, exit 2 rejects with its stderr.
+    #[serde(default)]
+    pub integrate_check: Option<PlannerHostConfig>,
+    /// `_router/planner_shutdown`: the resume-state host and the per-worker
+    /// drain bound. See `crate::planner_shutdown`.
+    #[serde(default)]
+    pub shutdown: Option<PlannerShutdownConfig>,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1373,6 +1423,16 @@ pub struct PlannerRouterConfig {
     /// protocol, coordination rules) belongs to the host.
     #[serde(default)]
     pub planning_instructions: String,
+    /// A planner parent or child turn with no downstream progress (no
+    /// session update, tool call or LLM response) for this many seconds is
+    /// stalled: the router cancels it and, if it does not end within
+    /// `stuck_turn_cancel_secs`, releases it and restarts its adapter.
+    /// `0` disables the watchdog. See `crate::planner_watchdog`.
+    #[serde(default = "default_stuck_turn_secs")]
+    pub stuck_turn_secs: u64,
+    /// How long a stalled turn may take to end after its `session/cancel`.
+    #[serde(default = "default_stuck_turn_cancel_secs")]
+    pub stuck_turn_cancel_secs: u64,
 }
 
 impl Default for PlannerRouterConfig {
@@ -1387,6 +1447,10 @@ impl Default for PlannerRouterConfig {
             finish_work: PlannerSkillConfig::default(),
             integrate_plan: PlannerSkillConfig::default(),
             workspace: None,
+            capacity: None,
+            audit: None,
+            integrate_check: None,
+            shutdown: None,
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -1396,6 +1460,8 @@ impl Default for PlannerRouterConfig {
             easy_planning_candidates: default_easy_planning_candidates(),
             hard_planning_candidates: default_hard_planning_candidates(),
             planning_instructions: String::new(),
+            stuck_turn_secs: default_stuck_turn_secs(),
+            stuck_turn_cancel_secs: default_stuck_turn_cancel_secs(),
         }
     }
 }
@@ -1414,6 +1480,137 @@ pub struct PlannerWorkspaceConfig {
     pub args: Vec<String>,
     #[serde(default = "default_lifecycle_hook_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+/// `routers.planner.capacity`: launched like `workspace` (cwd = the session
+/// repository, JSON on stdin, JSON on stdout), plus the wake and
+/// auto-admission timing. See `crate::planner_capacity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerCapacityConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Seconds of parent idleness with a free slot and an unheld candidate
+    /// before a capacity wake, and between repeated wakes.
+    #[serde(default = "default_capacity_wake_after_secs")]
+    pub wake_after_secs: u64,
+    /// Capacity wakes for one unfilled condition after which the router
+    /// admits and starts the candidates itself.
+    #[serde(default = "default_capacity_auto_admit_after_wakes")]
+    pub auto_admit_after_wakes: u32,
+    /// Parent idleness with a free slot after which the router admits and
+    /// starts the candidates itself, whatever the wake count.
+    #[serde(default = "default_capacity_auto_admit_after_secs")]
+    pub auto_admit_after_secs: u64,
+    /// Minimum spacing of the in-flight wakes an idle parent gets while a
+    /// release or running work is mid-flight (the first comes after
+    /// `wake_after_secs` of idleness).
+    #[serde(default = "default_capacity_inflight_wake_secs")]
+    pub inflight_wake_secs: u64,
+}
+
+impl PlannerCapacityConfig {
+    /// Timing used when no capacity host is configured: worker resumption and
+    /// in-flight wakes still run on these defaults.
+    pub fn timing_defaults() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            timeout_ms: default_lifecycle_hook_timeout_ms(),
+            wake_after_secs: default_capacity_wake_after_secs(),
+            auto_admit_after_wakes: default_capacity_auto_admit_after_wakes(),
+            auto_admit_after_secs: default_capacity_auto_admit_after_secs(),
+            inflight_wake_secs: default_capacity_inflight_wake_secs(),
+        }
+    }
+}
+
+fn default_capacity_wake_after_secs() -> u64 {
+    60
+}
+
+fn default_capacity_auto_admit_after_wakes() -> u32 {
+    2
+}
+
+fn default_capacity_auto_admit_after_secs() -> u64 {
+    300
+}
+
+fn default_capacity_inflight_wake_secs() -> u64 {
+    300
+}
+
+/// A repository host launched like `workspace`: no shell, cwd = the session
+/// repository, one JSON object on stdin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerHostConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lifecycle_hook_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// `routers.planner.audit`. See `crate::planner_guard`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerAuditConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// One audit fetches; it can take 10–15 s.
+    #[serde(default = "default_planner_host_slow_timeout_ms")]
+    pub timeout_ms: u64,
+    /// The capacity tick audits at most this often (plus at every parent
+    /// turn end).
+    #[serde(default = "default_audit_interval_secs")]
+    pub interval_secs: u64,
+}
+
+/// `routers.planner.shutdown`. See `crate::planner_shutdown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerShutdownConfig {
+    /// The resume-state host; without one nothing is saved, and the drain
+    /// still runs.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_planner_host_slow_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How long one live worker gets to commit, push and stop before it is
+    /// cancelled.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for PlannerShutdownConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            timeout_ms: default_planner_host_slow_timeout_ms(),
+            drain_timeout_secs: default_drain_timeout_secs(),
+        }
+    }
+}
+
+fn default_planner_host_slow_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_audit_interval_secs() -> u64 {
+    60
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1510,6 +1707,16 @@ pub struct Config {
     /// for: a host helper that supplies a bearer (`mcp_broker::supply`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_credential_command: Option<McpCredentialCommand>,
+    /// Project-selected MCP identities, keyed by resource URL (or server name).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub mcp_accounts: std::collections::HashMap<String, McpAccountConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAccountConfig {
+    /// None explicitly selects the shared system login.
+    pub account: Option<String>,
 }
 
 /// A helper process that supplies a bearer for one MCP server. It reads
@@ -1691,39 +1898,52 @@ fn default_probe_timeout_ms() -> u64 {
     120_000
 }
 
-/// Interpolate `${VAR}` environment references in a string. Unknown
+/// Interpolate `$VAR` and `${VAR}` environment references in a string. Unknown
 /// variables are left intact so later per-model substitution (e.g.
 /// `${model_id}` in spawn-config process templates) still sees them.
 pub fn interpolate_env(input: &str) -> String {
     interpolate(input, &|name| std::env::var(name).ok())
 }
 
-/// Interpolate `${name}` references using the provided lookup. References
-/// the lookup does not resolve are left as-is.
+/// Interpolate `$name` and `${name}` references using the provided lookup.
+/// Bare names use shell identifier boundaries. Unknown references and `$$`
+/// stay intact; inserted values are never expanded again.
 pub fn interpolate(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(start) = rest.find("${") {
+    while let Some(start) = rest.find('$') {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let name = &after[..end];
-                match lookup(name) {
-                    Some(value) => out.push_str(&value),
-                    None => {
-                        out.push_str("${");
-                        out.push_str(name);
-                        out.push('}');
-                    }
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                out.push_str("${");
-                rest = after;
-            }
+        rest = &rest[start..];
+        if let Some(after) = rest.strip_prefix("$$") {
+            out.push_str("$$");
+            rest = after;
+            continue;
         }
+        let (name, end) = if let Some(after) = rest.strip_prefix("${") {
+            let Some(end) = after.find('}') else {
+                break;
+            };
+            (&after[..end], end + 3)
+        } else {
+            let len = rest.as_bytes()[1..]
+                .iter()
+                .enumerate()
+                .take_while(|(i, b)| {
+                    b.is_ascii_alphabetic() || **b == b'_' || (*i > 0 && b.is_ascii_digit())
+                })
+                .count();
+            if len == 0 {
+                out.push('$');
+                rest = &rest[1..];
+                continue;
+            }
+            (&rest[1..1 + len], 1 + len)
+        };
+        match lookup(name) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
     }
     out.push_str(rest);
     out
@@ -1859,7 +2079,12 @@ impl Config {
                 seat.lineage = Some(agent.lineage.clone().unwrap_or_else(|| agent.name.clone()));
                 seat.command.env.extend(account.env);
                 if let Some(reserve) = account.reserve_capacity {
-                    seat.reserve_capacity = reserve;
+                    if let Some(weekly) = reserve.weekly {
+                        seat.reserve_capacity.weekly = weekly;
+                    }
+                    if let Some(session) = reserve.session {
+                        seat.reserve_capacity.session = session;
+                    }
                 }
                 if account.account_plan.is_some() {
                     seat.account_plan = account.account_plan;
@@ -1947,10 +2172,17 @@ impl Config {
     }
 
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
-        let yaml = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
+        let yaml = crate::project_config::read(path)
+            .map_err(ConfigError)?
+            .ok_or_else(|| {
+                ConfigError(format!("Configuration does not exist: {}", path.display()))
+            })?;
         let mut cfg = Self::from_yaml(&yaml)?;
-        cfg.source_path = Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        cfg.source_path = Some(if crate::project_config::is_project(path) {
+            std::path::absolute(path).map_err(|e| ConfigError(e.to_string()))?
+        } else {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        });
         Ok(cfg)
     }
 
@@ -1972,7 +2204,10 @@ impl Config {
                         agent.name
                     )));
                 }
-                if reserve > 0.0 && (!self.cordon.enabled || agent.usage_source.is_none()) {
+                if reserve > 0.0
+                    && reserve < 100.0
+                    && (!self.cordon.enabled || agent.usage_source.is_none())
+                {
                     return Err(ConfigError(format!(
                         "agent `{}`: reserve_capacity requires cordon.enabled and a usage_source",
                         agent.name
@@ -2304,6 +2539,11 @@ impl Config {
                  router (`router: planner`, ROUTERS.md). Delete the `orchestration:` block."
                     .into(),
             ));
+        }
+        for (pattern, cap) in &self.delegation.candidate_effort_caps {
+            if pattern.trim().is_empty() || *cap == crate::candidate::EffortLevel::Auto {
+                return Err(ConfigError("delegation.candidate_effort_caps requires nonempty patterns and concrete effort levels".into()));
+            }
         }
         if let (Some(default), Some(cap)) = (self.effort.default, self.effort.max_automatic)
             && default > cap
@@ -2728,6 +2968,22 @@ agents:
 
     #[test]
     fn parses_effort_policy() {
+        for mapping in ["{ '*/gpt-6.1-sol': auto }", "{ '': low }"] {
+            let yaml = format!(
+                "delegation: {{ candidate_effort_caps: {mapping} }}\n{}",
+                minimal_yaml()
+            );
+            assert!(Config::from_yaml(&yaml).is_err());
+        }
+        let yaml = format!(
+            "delegation: {{ candidate_effort_caps: {{ '*/gpt-6.1-sol': low }} }}\n{}",
+            minimal_yaml()
+        );
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            cfg.delegation.candidate_effort_caps["*/gpt-6.1-sol"],
+            crate::candidate::EffortLevel::Low
+        );
         let yaml = format!(
             "effort: {{ default: medium, max_automatic: high }}\n{}",
             minimal_yaml()
@@ -2952,11 +3208,54 @@ agents:
     }
 
     #[test]
+    fn interpolates_bare_and_braced_variables_without_shell_evaluation() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some("/Users/Zane".into()),
+            "_BIN2" => Some("bin".into()),
+            "LITERAL" => Some("$HOME".into()),
+            _ => None,
+        };
+        assert_eq!(
+            interpolate("$HOME/$_BIN2 ${HOME}/hooks $HOME_suffix $LITERAL", &lookup),
+            "/Users/Zane/bin /Users/Zane/hooks $HOME_suffix $HOME"
+        );
+        let untouched = "$missing ${model_id} $0 $$HOME $(whoami) $ €$HOMELESS ${unfinished";
+        assert_eq!(interpolate(untouched, &lookup), untouched);
+        assert_eq!(interpolate("é$HOME/曲", &lookup), "é/Users/Zane/曲");
+    }
+
+    #[test]
+    fn home_variables_resolve_hook_paths_and_survive_minimization() {
+        let yaml = format!(
+            "state_file: $HOME/.local/state/router-acp/sessions.db\ndelegation:\n  lifecycle_hook:\n    command: $HOME/.local/state/router-acp/bin/repo-host\n    args: ['${{HOME}}/workspace', '${{model_id}}']\n{}",
+            minimal_yaml()
+        );
+        let home = std::env::var("HOME").unwrap();
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        let hook = cfg.delegation.lifecycle_hook.unwrap();
+        assert_eq!(
+            hook.command,
+            format!("{home}/.local/state/router-acp/bin/repo-host")
+        );
+        assert_eq!(
+            hook.args,
+            [format!("{home}/workspace"), "${model_id}".into()]
+        );
+        assert_eq!(
+            cfg.state_file,
+            PathBuf::from(format!("{home}/.local/state/router-acp/sessions.db"))
+        );
+        let minimized = Config::minimize_yaml(&yaml).unwrap();
+        assert!(minimized.contains("$HOME/.local/state/router-acp/bin/repo-host"));
+        assert!(minimized.contains("${HOME}/workspace"));
+    }
+
+    #[test]
     fn expand_tilde_str_only_touches_leading_home() {
-        // SAFETY: test-local env mutation.
-        unsafe { std::env::set_var("HOME", "/home/zane") };
-        assert_eq!(expand_tilde_str("~"), "/home/zane");
-        assert_eq!(expand_tilde_str("~/bin/x"), "/home/zane/bin/x");
+        // Other tests resolve machine-local state concurrently; never mutate HOME.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde_str("~"), home);
+        assert_eq!(expand_tilde_str("~/bin/x"), format!("{home}/bin/x"));
         // A bare ~word (another user's home) is not ours to resolve.
         assert_eq!(expand_tilde_str("~other/x"), "~other/x");
         // Non-leading tildes are untouched.
@@ -2966,8 +3265,7 @@ agents:
 
     #[test]
     fn expands_tilde_in_command_path_and_args() {
-        // SAFETY: test-local env mutation.
-        unsafe { std::env::set_var("HOME", "/home/zane") };
+        let home = std::env::var("HOME").unwrap();
         let yaml = r#"
 agents:
   - name: claude
@@ -2983,11 +3281,15 @@ agents:
         let cfg = Config::from_yaml(yaml).unwrap();
         assert_eq!(
             cfg.agents[0].command.command,
-            "/home/zane/nvm/bin/claude-agent-acp"
+            format!("{home}/nvm/bin/claude-agent-acp")
         );
         assert_eq!(
             cfg.agents[0].command.args,
-            vec!["--config", "/home/zane/cfg.yaml", "--flag"]
+            vec![
+                "--config".to_string(),
+                format!("{home}/cfg.yaml"),
+                "--flag".to_string()
+            ]
         );
     }
 
@@ -3036,7 +3338,7 @@ agents:
         assert_eq!(cfg.agents[0].lineage, cfg.agents[1].lineage);
         assert_eq!(cfg.agents[0].reserve_capacity.session, 20.0);
         assert_eq!(cfg.agents[1].reserve_capacity.weekly, 5.0);
-        assert_eq!(cfg.agents[1].reserve_capacity.session, 0.0);
+        assert_eq!(cfg.agents[1].reserve_capacity.session, 20.0);
         assert_ne!(
             cfg.agents[0].config_dir("CLAUDE_CONFIG_DIR", ".claude"),
             cfg.agents[1].config_dir("CLAUDE_CONFIG_DIR", ".claude")

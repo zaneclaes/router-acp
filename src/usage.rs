@@ -43,6 +43,7 @@ pub async fn monitor(config_path: PathBuf) -> anyhow::Result<()> {
 
 async fn monitor_once(config_path: &std::path::Path) -> anyhow::Result<Duration> {
     let cfg = crate::config::Config::from_file(config_path)?;
+    crate::local_state::migrate(&cfg);
     let interval = Duration::from_secs(cfg.cordon.poll_secs.max(30));
     let shared = crate::session::Shared::new(cfg)
         .map_err(|err| anyhow::anyhow!("invalid router runtime: {err:?}"))?;
@@ -1059,9 +1060,9 @@ pub fn codex_availability_with_spend(
             && let Some(il) = field(pool, "individual_limit", "individualLimit")
             && let Some(remaining) =
                 field(il, "remaining_percent", "remainingPercent").and_then(Value::as_f64)
-            && !field(il, "resets_at", "resetsAt")
+            && field(il, "resets_at", "resetsAt")
                 .and_then(Value::as_u64)
-                .is_some_and(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) <= now)
+                .is_none_or(|epoch| SystemTime::UNIX_EPOCH + Duration::from_secs(epoch) > now)
         {
             // The member limit already reports real dollars (`limit`/`used`)
             // — no estimation needed, unlike the plan windows above.
@@ -1740,11 +1741,12 @@ state_file: {}
 cordon: {{poll_secs: 1}}
 agents:
   - name: claude
-    command: {{type: stdio, command: /bin/true}}
+    command: {{type: stdio, command: /bin/true, env: [{{name: HOME, value: {}}}]}}
     model_selection: {{type: config-option}}
     models: [{{id: sonnet, cost_rank: 1}}]
 "#,
-                dir.path().join("state.db").display()
+                dir.path().join("state.db").display(),
+                dir.path().display()
             ),
         )
         .unwrap();

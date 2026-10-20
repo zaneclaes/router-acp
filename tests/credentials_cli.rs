@@ -48,7 +48,7 @@ async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair()
     std::fs::create_dir(&dir).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&dir, home.join(".grok")).unwrap();
-    let runtime = dir.join(".router-acp-runtime/test");
+    let runtime = root.path().join("state/runtimes/test");
     std::fs::create_dir_all(&runtime).unwrap();
     let credentials = dir.join("auth.json");
     std::fs::write(
@@ -78,6 +78,7 @@ async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair()
             .env("GROK_AUTH_EXPIRED", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
         command
     };
     let mut helper = command().spawn().unwrap();

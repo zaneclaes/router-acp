@@ -848,4 +848,25 @@ mod score_resolution_tests {
             base.quality(TaskClass::CodingGeneral)
         );
     }
+
+    #[test]
+    fn grok_47_exposes_native_reasoning_levels() {
+        let scores = ScoreTable::builtin().lookup(&CandidateId::new("grok@seat", "grok-4.7"));
+        assert_eq!(scores.context_window, Some(500_000));
+        for level in [
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Xhigh,
+        ] {
+            let resolution = scores.resolve_automatic_effort(level);
+            assert_eq!(resolution.resolved, Some(level));
+            assert_eq!(resolution.provider_value.as_deref(), Some(level.as_str()));
+            assert!(!resolution.confirmed, "mapping alone is not wire evidence");
+        }
+        assert_eq!(
+            scores.resolve_automatic_effort(EffortLevel::Max).resolved,
+            Some(EffortLevel::Xhigh)
+        );
+    }
 }

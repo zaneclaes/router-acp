@@ -59,11 +59,7 @@ pub fn revision(raw: &[u8]) -> String {
 }
 
 fn read(path: &Path) -> Result<Option<String>, AdminError> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => Ok(Some(raw)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(invalid(e)),
-    }
+    crate::project_config::read(path).map_err(invalid)
 }
 
 fn shown(raw: Option<&str>) -> Result<Value, AdminError> {
@@ -81,7 +77,7 @@ pub fn show(path: &Path) -> Result<Value, AdminError> {
 }
 
 fn lock(path: &Path) -> Result<ConfigLock, AdminError> {
-    ConfigLock::acquire(path.with_extension("accounts.lock")).map_err(AdminError::Conflict)
+    ConfigLock::acquire(path.to_path_buf()).map_err(AdminError::Conflict)
 }
 
 /// Replace the configuration with `proposed`, keeping the router's account
@@ -316,6 +312,25 @@ mod tests {
 
     fn doc(path: &Path) -> Value {
         show(path).unwrap()["config"].clone()
+    }
+
+    #[test]
+    fn an_unchanged_apply_keeps_the_file_identity_hosts_watch() {
+        let (_dir, path) = fixture(&agent("helper", ""));
+        // Normalize once, then reapply the same document.
+        apply(&path, doc(&path), None, false).unwrap();
+        let identity = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&m);
+            #[cfg(not(unix))]
+            let inode = 0;
+            (inode, m.modified().unwrap())
+        };
+        let before = identity(&path);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        apply(&path, doc(&path), None, false).unwrap();
+        assert_eq!(identity(&path), before);
     }
 
     #[test]

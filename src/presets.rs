@@ -399,6 +399,20 @@ mod tests {
     }
 
     #[test]
+    fn grok_frontier_versions_share_the_documented_cost_rank() {
+        let mut doc = yaml("agents:\n- name: grok@seat\n");
+        apply(&mut doc);
+        let models = doc["agents"][0]["models"].as_sequence().unwrap();
+        for id in ["grok-4.7", "grok-4.6"] {
+            let model = models.iter().find(|m| m["id"] == id).unwrap();
+            assert_eq!(
+                model["cost_rank"], 5,
+                "{id} must not become a cheaper demotion target"
+            );
+        }
+    }
+
+    #[test]
     fn an_entry_with_its_own_command_stays_as_written() {
         let text = "agents:\n- name: claude\n  command: { type: stdio, command: /opt/mock-agent }\n  model_selection: { type: config-option }\n  models: [{ id: m1, cost_rank: 1 }]\n";
         let mut doc = yaml(text);
