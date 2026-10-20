@@ -2470,6 +2470,158 @@ fn a_goose_expansion_becomes_the_role_invocation_with_its_typed_arguments() {
 }
 
 #[tokio::test]
+async fn repair_dispatch_discovers_related_accepted_source_without_selecting_it() {
+    let f = fixture(|_| {});
+    let sha = current_revision(&f.repo);
+    for id in [
+        "repair",
+        "ready",
+        "unreviewed",
+        "stale",
+        "other-plan",
+        "integrated",
+        "active",
+    ] {
+        let mut spec = work(id);
+        if id == "other-plan" {
+            spec.plan_id = "another-plan".into();
+        }
+        admit(&f.shared, spec);
+    }
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        for id in [
+            "ready",
+            "unreviewed",
+            "stale",
+            "other-plan",
+            "integrated",
+            "active",
+        ] {
+            let source = run.works.get_mut(id).unwrap();
+            source.status = if id == "integrated" {
+                WorkStatus::Integrated
+            } else {
+                WorkStatus::Finished
+            };
+            source.artifact = Some(artifact(&sha));
+            source.review = Some(planner_workflow::Review {
+                revision: if id == "stale" {
+                    "different-revision".into()
+                } else {
+                    sha.clone()
+                },
+                accepted: id != "unreviewed",
+                evidence: vec!["review.txt".into()],
+                corrections: None,
+            });
+            if id == "active" {
+                source.attempt = Some(planner_workflow::Attempt {
+                    id: "finishing".into(),
+                    router_pid: std::process::id(),
+                    router_started_at_ms: 0,
+                    delegate_id: None,
+                    ended: false,
+                });
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    let (actor, _, _, prompt) = planner_workflow::begin_work(&f.shared, SID, "repair")
+        .await
+        .unwrap();
+    let sources = |text: &str| -> serde_json::Value {
+        serde_json::from_str(
+            text.split("\n[Related accepted source]\n")
+                .nth(1)
+                .expect("dispatch omitted accepted same-plan source")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let discovered = sources(&prompt);
+    assert_eq!(discovered.as_array().unwrap().len(), 1);
+    assert_eq!(discovered[0]["work_id"], "ready");
+    assert_eq!(discovered[0]["revision"], sha);
+    assert_eq!(discovered[0]["changed_paths"], json!(["README.md"]));
+    assert_eq!(discovered[0]["selected"], false);
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works["repair"]
+            .spec
+            .ready_dependencies
+            .is_empty()
+    );
+
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            &f.shared,
+            SID,
+            Some(&actor),
+            Operation::Status {
+                offset: 0,
+                work_id: Some("repair".into()),
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["works"][0]["related_ready_sources"], discovered);
+    let queue: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        queue["works"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["related_ready_sources"].is_null())
+    );
+
+    planner_workflow::attempt_ended(&f.shared, SID, &actor, None, "retry".into(), false).unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .get_mut("repair")
+            .unwrap()
+            .spec
+            .ready_dependencies
+            .insert("ready".into(), sha.clone());
+        run.works
+            .get_mut("unreviewed")
+            .unwrap()
+            .review
+            .as_mut()
+            .unwrap()
+            .accepted = true;
+        Ok(())
+    })
+    .unwrap();
+    let followup = planner_workflow::begin_followup(&f.shared, SID, &actor).unwrap();
+    let refreshed = sources(&followup);
+    assert_eq!(refreshed.as_array().unwrap().len(), 2);
+    assert_eq!(refreshed[0]["work_id"], "ready");
+    assert_eq!(refreshed[0]["selected"], true);
+    assert_eq!(refreshed[1]["work_id"], "unreviewed");
+    assert_eq!(refreshed[1]["selected"], false);
+}
+
+#[tokio::test]
 async fn an_attempt_that_handed_off_reads_as_that_handoff() {
     let fixture = fixture(|_| {});
     let query = || Operation::Status {
