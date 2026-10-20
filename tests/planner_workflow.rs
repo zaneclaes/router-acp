@@ -4434,6 +4434,24 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     let mut repair = checkpoint(Stage::Selected, "selection");
     repair.works.insert("work-1".into(), revision.clone());
     repair.replaces = Some("round-1".into());
+    // Selection belongs to the operator/parent policy. A replacement may also
+    // explicitly select another qualified head; it still owes every release gate.
+    let mut scoped_repair = repair.clone();
+    scoped_repair
+        .works
+        .insert("work-2".into(), revision.clone());
+    let mut scoped_run = failed_overlap.clone();
+    planner_release::record(&mut scoped_run, "scoped-repair", &scoped_repair).unwrap();
+    assert_eq!(scoped_run.releases["scoped-repair"].works.len(), 2);
+    assert!(
+        planner_release::integration_allowed(&scoped_run, "work-2", &receipt(&revision, "merge"))
+            .is_err()
+    );
+    let mut unqualified_run = failed_overlap.clone();
+    unqualified_run.works.get_mut("work-2").unwrap().status = WorkStatus::Running;
+    assert!(
+        planner_release::record(&mut unqualified_run, "scoped-repair", &scoped_repair).is_err()
+    );
     planner_release::record(&mut failed_overlap, "repair", &repair).unwrap();
     assert_eq!(failed_overlap.works["work-2"].status, WorkStatus::Finished);
     assert!(
