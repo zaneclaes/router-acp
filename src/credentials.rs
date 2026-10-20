@@ -1863,9 +1863,15 @@ mod tests {
         );
         assert!(!abandoned.exists(), "an unheld runtime was kept");
         assert!(!old.exists(), "an idle unlocked runtime was kept");
+        // Model a descriptor retained during concurrent process creation. Closing
+        // one descriptor need not release its shared lock; explicitly release the
+        // fixture's ownership before asserting that the sweeper can reclaim it.
+        let inherited = holder.try_clone().unwrap();
+        holder.unlock().unwrap();
         drop(holder);
         assert_eq!(sweep_runtimes(parent.path()), 1);
         assert!(!held.exists(), "a released runtime was kept");
+        drop(inherited);
     }
 
     /// An account directory holds only its login; switching accounts must not

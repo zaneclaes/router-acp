@@ -713,6 +713,22 @@ fn wake_priority(id: &str) -> u8 {
     }
 }
 
+fn delivery_priority(id: &str, work_status: Option<planner_workflow::WorkStatus>) -> u8 {
+    // Adoption can leave many recovery notices for already-qualified work.
+    // Preserve those custody checks, but let stopped repairs and fresh artifacts
+    // reach the bounded delivery batch before historical acknowledgments.
+    if id.starts_with("recovery:")
+        && matches!(
+            work_status,
+            Some(planner_workflow::WorkStatus::Accepted | planner_workflow::WorkStatus::Finished)
+        )
+    {
+        9 // after ordinary review (8), before capacity/refill reminders (10)
+    } else {
+        wake_priority(id) * 2
+    }
+}
+
 fn wake_role<'a>(
     phase: crate::config::PlannerPhase,
     explicit_command: bool,
@@ -773,7 +789,14 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         // Keep every durable wake, but actionable release/review transitions
         // lead repetitive capacity reminders. Operator input always wins.
         let mut ordered = run.wakes.keys().cloned().collect::<Vec<_>>();
-        ordered.sort_by_key(|id| wake_priority(id));
+        ordered.sort_by_key(|id| {
+            delivery_priority(
+                id,
+                run.works
+                    .get(&run.wakes[id].work_id)
+                    .map(|work| work.status),
+            )
+        });
         for id in ordered {
             let wake = run.wakes.get_mut(&id).expect("listed above");
             if wake.acknowledged || wake.retry_after > now {
@@ -1313,6 +1336,52 @@ mod steer_tests {
                 "observation:ci-job-failures:staging",
                 "release:corrective"
             ]
+        );
+    }
+
+    #[test]
+    fn ready_review_enters_the_batch_before_historical_finished_recovery() {
+        use crate::planner_workflow::WorkStatus;
+        let mut wakes = (0..40)
+            .map(|n| (format!("recovery:old-{n:02}"), Some(WorkStatus::Finished)))
+            .collect::<Vec<_>>();
+        wakes.extend([
+            (
+                "qualified-repair:attempt".into(),
+                Some(WorkStatus::ReviewPending),
+            ),
+            ("recovery:accepted".into(), Some(WorkStatus::Accepted)),
+            (
+                "recovery:active-repair".into(),
+                Some(WorkStatus::Interrupted),
+            ),
+            ("observation:ci-job-failures:production".into(), None),
+            ("input:operator".into(), None),
+            ("capacity:refill".into(), None),
+        ]);
+        wakes.sort_by_key(|(id, status)| delivery_priority(id, *status));
+        let batch = wakes
+            .iter()
+            .take(32)
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &batch[..3],
+            &[
+                "input:operator",
+                "observation:ci-job-failures:production",
+                "recovery:active-repair"
+            ]
+        );
+        assert_eq!(
+            batch[3], "qualified-repair:attempt",
+            "old finished acknowledgments hid a fresh artifact from the delivery batch"
+        );
+        assert_eq!(wakes.len(), 46, "priority must preserve every durable wake");
+        assert_eq!(wakes.last().unwrap().0, "capacity:refill");
+        assert_eq!(
+            delivery_priority("recovery:unknown", None),
+            delivery_priority("recovery:active-repair", Some(WorkStatus::Interrupted))
         );
     }
 

@@ -683,6 +683,12 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   Reconciliation may allocate a work that failed before receiving a workspace. Rechecking
   completed native adoption does not write planner state, so that allocation cannot invalidate
   its own reconciliation revision on every retry. First adoption still uses the existing claim.
+
+  Parent delivery batches retain every recovery wake, but recovery notices for already
+  accepted or finished work follow stopped-work recovery and fresh artifact review. They
+  still precede capacity/refill reminders. A large adopted backlog therefore cannot fill
+  the 32-wake batch with old acknowledgments and hide a newly qualified repair; source
+  reconciliation and custody gates remain required.
   
   `delegate_stop` and `parent_repinned` go through a `hook_outbox` table in the state DB: an event the hook did not accept stays queued, and every router process sharing that DB retries it every 30 s and at startup. Delegate events carry `worker_id` (the `b-…` job id for a background delegate, else a `w-…` id), `parent_router_session_id`, `parent_downstream_session_id` (the id the provider's own hooks report for the parent), `parent_candidate`, `candidate`, `lineage`, `downstream_session_id`, `state_session_id`, `cwd`, `effort`, `background`, `keep_open` and `task_summary`; every event carries `router_pid` and `router_started_at_ms`, so a host can treat a dead router's workers as stopped even if no stop event arrives.
 - **Worker tools.** While a hook is configured, each delegate gets a `router-worker` MCP server: `worker_whoami` returns its worker id, model and parent session, and `worker_handoff {kind, message}` records a structured handoff (`commit_paths_ready`, `waiting`, `lease_requested`, `ownership_requested`, `staging_gate_request`, `round_verified`, `round_failed`, `reassignment_required`) that the turn-end event carries. The delegate's prompt also opens with `[router-acp delegate] worker id: … · model: … · parent session: …`, and the tool result names the worker (`[delegated to grok/grok-4.7, worker b-…]`).
