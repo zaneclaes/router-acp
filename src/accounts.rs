@@ -1490,6 +1490,11 @@ pub(crate) fn save_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     // Resolve existing file symlinks before atomic replacement.
     let destination = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // An unchanged write keeps the file's identity. Hosts stat it to detect a
+    // new configuration, and a same-content replace would restart them all.
+    if std::fs::read(&destination).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
     let tmp = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);

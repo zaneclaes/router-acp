@@ -315,6 +315,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_apply_keeps_the_file_identity_hosts_watch() {
+        let (_dir, path) = fixture(&agent("helper", ""));
+        // Normalize once, then reapply the same document.
+        apply(&path, doc(&path), None, false).unwrap();
+        let identity = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&m);
+            #[cfg(not(unix))]
+            let inode = 0;
+            (inode, m.modified().unwrap())
+        };
+        let before = identity(&path);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        apply(&path, doc(&path), None, false).unwrap();
+        assert_eq!(identity(&path), before);
+    }
+
+    #[test]
     fn apply_keeps_a_migrated_seat_and_takes_its_former_settings() {
         let seat = ", env: [{name: CLAUDE_CONFIG_DIR, value: /seats/claude@one}]";
         let (_dir, path) = fixture(&format!(
