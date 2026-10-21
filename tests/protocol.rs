@@ -11390,8 +11390,8 @@ async fn planner_phase_implementation_directive_switches_pinned_session() {
 #[tokio::test]
 async fn planner_ready_implementation_plan_picks_boosted_implementation_candidate() {
     // Live-shaped: router: planner, implementation pool terra/opus/grok with a
-    // +2 grok boost and planning on sol. An implementation-phase, plan_ready
-    // verdict must enter the implementation phase and route to grok, not sol.
+    // +2 grok boost and planning on sol. The accepted handoff enters the
+    // implementation phase and must route to grok, not sol.
     let state = temp_state_file("planner-impl-boost");
     let log = temp_log("planner-impl-boost");
     let preclass = r#"{"routing":{"task_class":"Architecture","task_classes":["Architecture"],"categories":["backend"],"complexity":0.55,"confidence":0.9,"reason":"implementation-ready ticket"},"planner_phase":{"phase":"implementation","confidence":0.95,"plan_ready":true,"reason":"ticket is ready to build"}}"#;
@@ -11428,9 +11428,12 @@ async fn planner_ready_implementation_plan_picks_boosted_implementation_candidat
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        // Exercise the classifier route. A leading `implement` explicitly
-        // enters select-plan instead, covered by the durable-work command test.
-        prompt_text(&cx, &sid, "Build the attached ticket").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\nBuild the attached ticket",
+        )
+        .await?;
 
         let phase = shared
             .with_session(&sid, |s| s.planner_phase)
@@ -11438,7 +11441,7 @@ async fn planner_ready_implementation_plan_picks_boosted_implementation_candidat
         assert_eq!(
             phase,
             Some(router_acp::config::PlannerPhase::Implementation),
-            "ready implementation plan must enter implementation phase"
+            "the accepted handoff must enter implementation phase"
         );
 
         let text = agent_text(&observed, &sid);
@@ -11599,7 +11602,7 @@ const IMPL_READY_PRECLASS: &str = r#"{"routing":{"task_class":"BugFix","complexi
 const PLANNING_PRECLASS: &str = r#"{"routing":{"task_class":"BugFix","complexity":0.5,"confidence":0.9,"reason":"plan"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"needs a plan"}}"#;
 
 #[tokio::test]
-async fn coordinator_ignores_implementation_preclass_directive_and_heuristic() {
+async fn coordinator_ignores_implementation_preclass_directive_and_prose() {
     // The live incident: an automated "Review Sub-tasks" nudge classified
     // implementation / plan_ready=true and re-pinned the parent onto the
     // workhorse. Automatic signals must not move a coordinator off a planning
@@ -11646,9 +11649,9 @@ async fn coordinator_ignores_implementation_preclass_directive_and_heuristic() {
 }
 
 #[tokio::test]
-async fn non_coordinator_control_upgrades_on_the_same_preclass() {
-    // Control for the test above: without the role, the same pre-class
-    // moves the session onto the implementation pool.
+async fn non_coordinator_stays_planning_on_an_implementation_preclass() {
+    // A pre-classifier guess is not a human handoff: even plan_ready=true
+    // keeps an ordinary session in planning until the human accepts.
     let yaml = coordinator_yaml("coord-control", IMPL_READY_PRECLASS, "", &[]);
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
@@ -11656,9 +11659,11 @@ async fn non_coordinator_control_upgrades_on_the_same_preclass() {
         prompt_text(&cx, &sid, "Review Sub-tasks: two children have PRs").await?;
         assert_eq!(
             shared.with_session(&sid, |s| s.planner_phase).flatten(),
-            Some(router_acp::config::PlannerPhase::Implementation)
+            Some(router_acp::config::PlannerPhase::Planning)
         );
-        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        let text = agent_text(&observed, &sid);
+        assert!(!text.contains("echo:opus:"), "pre-class handed off: {text}");
+        assert!(text.contains("echo:sol:"));
         Ok(())
     })
     .await;
@@ -11840,6 +11845,137 @@ async fn coordinator_keeps_a_human_pick_across_later_prompts() {
 }
 
 #[tokio::test]
+async fn planner_prose_never_hands_off_to_implementation() {
+    // The live incident: "We wish to build this as its own tooling." matched
+    // a hardcoded `build this` phrase and moved a planning session onto the
+    // workhorse. Prose and a bare leading verb are not a handoff.
+    let yaml = coordinator_yaml("prose-no-handoff", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "plan the tooling").await?;
+        prompt_text(&cx, &sid, "We wish to build this as its own tooling.").await?;
+        prompt_text(&cx, &sid, "implement the login fix").await?;
+        prompt_text(&cx, &sid, "ok, ship it").await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(!text.contains("echo:opus:"), "prose handed off: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn accepted_handoff_moves_an_unpicked_session_to_implementation() {
+    // Control: without a human model pick, the accepted handoff still
+    // re-pins onto the implementation pool.
+    let yaml = coordinator_yaml("handoff-unpicked", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "plan the tooling").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\nThe user accepted the plan.",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn accepted_handoff_keeps_a_human_picked_model() {
+    // A phase change updates the workflow, not model authority. A later
+    // explicit human switch still moves the session.
+    let yaml = coordinator_yaml("handoff-picked", PLANNING_PRECLASS, "", &[]);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=plan/sol]\nplan the tooling").await?;
+        assert!(shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+        prompt_text(&cx, &sid, "We wish to build this as its own tooling.").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\nThe user accepted the plan.",
+        )
+        .await?;
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Implementation)
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("echo:opus:"),
+            "phase change replaced the pick: {text}"
+        );
+        assert!(
+            text.contains("keeping your picked model plan/sol"),
+            "the disclosure names the authority that held: {text}"
+        );
+
+        prompt_text(&cx, &sid, "[router: switch=work/opus]\nyou take it").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:opus:"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_reloaded_human_pick_survives_the_accepted_handoff() {
+    let yaml = coordinator_yaml(
+        "handoff-picked-reload",
+        PLANNING_PRECLASS,
+        "",
+        &[("MOCK_SUPPORTS_LIFECYCLE", "1")],
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=plan/sol]\nplan the tooling").await?;
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+        cx.send_request(agent_client_protocol::schema::v1::LoadSessionRequest::new(
+            sid.clone(),
+            std::env::temp_dir(),
+        ))
+        .block_task()
+        .await?;
+        assert!(shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+        // Re-pin from the restored state first, so the handoff meets a live pin.
+        prompt_text(&cx, &sid, "back to the plan").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\nThe user accepted the plan.",
+        )
+        .await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            !text.contains("echo:opus:"),
+            "reloaded pick replaced: {text}"
+        );
+        assert!(
+            text.contains("keeping your picked model plan/sol"),
+            "the guard held the restored pick: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn coordinator_role_pulls_an_automatic_workhorse_pin_back_to_planning() {
     // The incident shape: an untagged turn auto-upgraded onto work/opus. The
     // next tagged prompt switches back to the planning pool.
@@ -11847,7 +11983,12 @@ async fn coordinator_role_pulls_an_automatic_workhorse_pin_back_to_planning() {
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
-        prompt_text(&cx, &sid, "Review Sub-tasks").await?;
+        prompt_text(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\nReview Sub-tasks",
+        )
+        .await?;
         assert!(agent_text(&observed, &sid).contains("echo:opus:"));
         coordinator_prompt(&cx, &sid, "Review Sub-tasks again").await?;
         let text = agent_text(&observed, &sid);
@@ -11986,7 +12127,7 @@ async fn session_manager_prompt(
     .await
 }
 
-const EPIC_COMMAND: &str = "Implement EPIC HAI-11556 — fan the planner fixes out to child tickets";
+const EPIC_COMMAND: &str = "/implement EPIC HAI-11556 — fan the planner fixes out to child tickets";
 
 fn assert_planner_parent(
     shared: &router_acp::session::Shared,
@@ -12035,8 +12176,8 @@ async fn epic_parent_implement_command_routes_through_the_planning_pool() {
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
         cordon_home_accounts(&shared, &[]);
-        // Independent concurrent sessions: the incident's bare `Implement`,
-        // the slash command, and a control that is not a durable parent.
+        // Independent concurrent sessions: the incident's epic command, a
+        // plan-file command, and a control that is not a durable parent.
         let epic = new_session(&cx).await?.session_id.0.to_string();
         let slash = new_session(&cx).await?.session_id.0.to_string();
         let control = new_session(&cx).await?.session_id.0.to_string();
@@ -13570,7 +13711,7 @@ async fn direct_human_roadmap_request_authorizes_durable_work() {
             .session_id
             .0
             .to_string();
-        let original = format!("Implement ROADMAP.md\n{}", planner_admit_wire_prompt());
+        let original = format!("/implement ROADMAP.md\n{}", planner_admit_wire_prompt());
         prompt_text(&cx, &sid, &original).await?;
         let run = router_acp::planner_workflow::load(&shared, &sid)
             .unwrap()
@@ -13589,6 +13730,7 @@ async fn direct_human_roadmap_request_authorizes_durable_work() {
                     .is_some_and(|text| text.contains("[router-acp planner role: select-plan]"))
         }));
         for text in [
+            "Implement ROADMAP.md",
             "`implement ROADMAP.md`",
             "Example: implement ROADMAP.md",
             "Do not implement ROADMAP.md",

@@ -1398,8 +1398,8 @@ pub struct PlannerRouterConfig {
     /// Per-model additive score boosts, applied only in the matching phase.
     #[serde(default)]
     pub model_boosts: Vec<PlannerModelBoost>,
-    /// Pre-classifier confidence bar to auto-upgrade from planning to
-    /// implementation.
+    /// Retired: the pre-classifier no longer changes the planner phase.
+    /// Accepted so existing configs still parse; the value is ignored.
     #[serde(default = "default_phase_upgrade_confidence")]
     pub phase_upgrade_confidence: f64,
     /// Complexity at or above which implementation-phase routing also admits
