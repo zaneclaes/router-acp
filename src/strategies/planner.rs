@@ -170,38 +170,6 @@ fn phase_label(phase: PlannerPhase) -> &'static str {
     }
 }
 
-/// High-precision keyword phrases that strongly signal the user wants
-/// execution, not further planning. Matched case-insensitively against the
-/// full prompt text. Only phrases that almost never appear in a planning
-/// discussion are included. Explicit workflow commands can reverse the phase.
-const IMPLEMENTATION_PHRASES: &[&str] = &[
-    "implement it",
-    "implement this",
-    "implement the plan",
-    "build it",
-    "build this",
-    "execute the plan",
-    "execute this plan",
-    "go ahead and build",
-    "start implementing",
-    "start building",
-    "proceed with implementation",
-    "let's implement",
-    "let's build",
-    "code it up",
-    "write the code",
-    "ship it",
-];
-
-/// Returns true when the prompt text contains a high-confidence signal that
-/// the user wants implementation, not planning. Case-insensitive substring.
-pub fn heuristic_signals_implementation(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    IMPLEMENTATION_PHRASES
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-}
-
 /// Stable labels for the planning-phase structured handoff question.
 /// The ACP client and Kory Code relay match these strings exactly.
 pub const HANDOFF_PROCEED: &str = "Proceed with implementation";
@@ -555,27 +523,6 @@ mod tests {
         let ranked = s.rank(&ctx, &pool()).unwrap();
         assert!(ranked[0].reason.contains("phase=implementation"));
         assert!(ranked[0].reason.contains("implementation_candidates"));
-    }
-
-    #[test]
-    fn heuristic_matches_common_phrases() {
-        assert!(heuristic_signals_implementation("implement it"));
-        assert!(heuristic_signals_implementation("OK, let's build this"));
-        assert!(heuristic_signals_implementation("Go ahead and BUILD it"));
-        assert!(heuristic_signals_implementation("start implementing now"));
-    }
-
-    #[test]
-    fn heuristic_does_not_match_planning_text() {
-        assert!(!heuristic_signals_implementation(
-            "draft a plan for the feature"
-        ));
-        assert!(!heuristic_signals_implementation(
-            "what should we implement?"
-        ));
-        assert!(!heuristic_signals_implementation(
-            "discuss the implementation approach"
-        ));
     }
 
     #[test]

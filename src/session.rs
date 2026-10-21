@@ -7845,28 +7845,23 @@ fn enter_planning_phase(shared: &Arc<Shared>, router_sid: &str) {
 
 /// Determine the automatic planner phase for this turn. Explicit commands
 /// are handled before expansion and can select either phase at any time.
-/// to the session when warranted. Called from `dispatch_prompt` right
-/// alongside skill routing.
+/// Called from `dispatch_prompt` right alongside skill routing.
 ///
-/// Sources (checked in order):
-///
-/// 1. Skill signal — `SkillRoute.marks_implementation_phase` on a matched
-///    route definitively upgrades.
-/// 2. Pre-classifier `planner_phase` dimension (first turn only).
-///    `implementation` + `plan_ready=false` stays in Planning and injects
-///    the plan-first protocol — never a "current plan" approval question.
-/// 3. Heuristic keyword phrases in the prompt text.
+/// Planning hands off to implementation only on a human's explicit choice:
+/// an accepted handoff question (`[router: phase=implementation]`), a typed
+/// `/implement`, or a skill route that declares `marks_implementation_phase`.
+/// Prompt prose and the pre-classifier's `planner_phase` guess never change
+/// the phase — static text cannot establish that a person approved a plan.
 ///
 /// Every path that remains in (or first enters) Planning goes through
 /// [`enter_planning_phase`] so the built-in protocol and host
 /// `planning_instructions` always land together.
 ///
-/// Automatic transitions remain monotonic. Returns `true` when a switch to a new
-/// implementation-phase model should be queued.
+/// Returns `true` when a switch to a new implementation-phase model should
+/// be queued.
 fn maybe_update_planner_phase(
     shared: &Arc<Shared>,
     router_sid: &str,
-    prompt: &[ContentBlock],
     skill_route: Option<&crate::config::SkillRoute>,
     preclass: Option<&crate::pre_classifier::PreClassResult>,
 ) -> bool {
@@ -7881,7 +7876,7 @@ fn maybe_update_planner_phase(
         return false;
     }
     // A coordinator retains its planner models. Explicit workflow phase is
-    // independent of that role, and heuristics cannot overwrite it.
+    // independent of that role, and automatic signals cannot overwrite it.
     if shared
         .with_session(router_sid, |s| s.coordinator)
         .unwrap_or(false)
@@ -7896,7 +7891,7 @@ fn maybe_update_planner_phase(
         return false;
     }
 
-    // 1. Skill signal (definitive).
+    // Skill signal: a typed skill command that declares an implementation phase.
     if let Some(route) = skill_route
         && route.marks_implementation_phase
     {
@@ -7916,59 +7911,19 @@ fn maybe_update_planner_phase(
         return !was_none;
     }
 
-    // 2. Pre-classifier decision (first turn, when available).
+    // The pre-classifier may judge the work implementation-shaped, but only
+    // the human's handoff answer or `/implement` leaves planning.
     if let Some(pre) = preclass
         && let Some(ref dec) = pre.planner_phase
+        && dec.phase == PlannerPhase::Implementation
     {
-        let cfg = &shared.cfg.routers.planner;
-        if dec.phase == PlannerPhase::Implementation
-            && dec.confidence >= cfg.phase_upgrade_confidence
-            && dec.plan_ready
-        {
-            shared.with_session(router_sid, |s| {
-                s.planner_phase = Some(PlannerPhase::Implementation);
-            });
-            notify_user(
-                shared,
-                router_sid,
-                format!(
-                    "router-acp · planner: pre-class → implementation phase \
-                         (confidence={:.2}, plan_ready=true). {}",
-                    dec.confidence, dec.reason
-                ),
-            );
-            return current.is_some(); // need switch if already pinned
-        }
-        if dec.phase == PlannerPhase::Implementation && !dec.plan_ready {
-            // Classified as implementation work, but no reviewable plan exists
-            // yet. Stay in planning and inject the plan-first protocol — do
-            // not ask whether to proceed with a plan that has not been
-            // presented.
-            enter_planning_phase(shared, router_sid);
-            notify_user(
-                shared,
-                router_sid,
-                "router-acp · planner: staying in planning — present a plan before handoff",
-            );
-            return false;
-        }
-        // Pre-class says planning — enter it (protocol + host instructions).
         enter_planning_phase(shared, router_sid);
-        return false;
-    }
-
-    // 3. Heuristic phrase match.
-    let text = prompt_display_text(prompt);
-    if crate::strategies::planner::heuristic_signals_implementation(&text) {
-        shared.with_session(router_sid, |s| {
-            s.planner_phase = Some(PlannerPhase::Implementation);
-        });
         notify_user(
             shared,
             router_sid,
-            "router-acp · planner: heuristic → implementation phase",
+            "router-acp · planner: staying in planning — present a plan before handoff",
         );
-        return current.is_some(); // need switch if already pinned
+        return false;
     }
 
     // Default: stay in / enter planning.
@@ -10008,6 +9963,20 @@ fn continue_prompt(
 }
 
 fn queue_planner_phase_switch(shared: &Arc<Shared>, router_sid: &str) {
+    // A phase changes the workflow, not model authority: a human-picked pin
+    // holds until the human picks again or availability forces a failover.
+    if let Some(Some(pin)) = shared.with_session(router_sid, |s| {
+        s.pin_user_pick
+            .then(|| s.pin.as_ref().map(|p| p.candidate.to_string()))
+            .flatten()
+    }) {
+        notify_user(
+            shared,
+            router_sid,
+            format!("router-acp · planner: phase changed · keeping your picked model {pin}"),
+        );
+        return;
+    }
     let (class, excluded) = shared
         .with_session(router_sid, |s| {
             (
@@ -10030,7 +9999,8 @@ fn queue_planner_phase_switch(shared: &Arc<Shared>, router_sid: &str) {
             if s.pending_switch.is_none() {
                 s.pending_switch = Some(SwitchRequest {
                     target,
-                    reason: "explicit or detected planner phase change".to_string(),
+                    reason: "planner phase change (handoff answer, /implement, or skill)"
+                        .to_string(),
                     handoff: HandoffStyle::Full,
                     user_pick: false,
                 });
@@ -10684,13 +10654,8 @@ async fn dispatch_prompt(
     // skip the classifier/heuristic pass so it cannot fight the directive,
     // but keep a directive-driven implementation upgrade on `planner_needs_switch`.
     if !explicit_routing {
-        planner_needs_switch |= maybe_update_planner_phase(
-            &shared,
-            &router_sid,
-            &req.prompt,
-            detected_skill,
-            preclass.as_ref(),
-        );
+        planner_needs_switch |=
+            maybe_update_planner_phase(&shared, &router_sid, detected_skill, preclass.as_ref());
     }
     if planner_needs_switch {
         queue_planner_phase_switch(&shared, &router_sid);

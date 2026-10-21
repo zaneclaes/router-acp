@@ -2406,8 +2406,8 @@ fn goose_skill_expansions_are_the_authentic_mode_commands() {
         )])),
         None
     );
-    // Slash commands behind a turn-context block are explicit; the bare verb is
-    // a command only for a session already on the planner strategy.
+    // Slash commands behind a turn-context block are explicit. Prose that
+    // merely starts with the verb is never a command.
     let behind_context = request(vec![
         ContentBlock::from("<turn-context>x</turn-context>".to_string()),
         ContentBlock::from("/implement".to_string()),
@@ -2416,10 +2416,7 @@ fn goose_skill_expansions_are_the_authentic_mode_commands() {
     let bare = request(vec![ContentBlock::from(
         "implement the login fix".to_string(),
     )]);
-    assert_eq!(
-        planner_workflow::command(&bare),
-        Some(router_acp::config::PlannerPhase::Implementation)
-    );
+    assert_eq!(planner_workflow::command(&bare), None);
     assert!(!planner_workflow::explicit_command(&bare));
     // An internal role invocation never re-selects a mode.
     let mut internal = request(goose_skill_expansion("implement", ""));

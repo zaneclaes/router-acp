@@ -367,18 +367,30 @@ and internal role invocations cannot change the phase. Arguments and attachments
 are retained as original input receipts. Commands do not grant arbitrary scope,
 merge, deployment, or publication authority.
 
-1. **Skill signal** — `marks_implementation_phase: true` on a
-   `skill_routing` entry definitively upgrades (e.g. `/ship-pr`).
-2. **Pre-classifier** — the `planner_phase` dimension returns `{phase,
-   confidence, plan_ready}`; upgrades when `phase=implementation`,
-   `confidence ≥ phase_upgrade_confidence`, and `plan_ready=true`.
-   `implementation` + `plan_ready=false` stays in Planning: the work looks
-   like a build, but no reviewable plan exists yet.
-3. **Heuristic** — high-precision keyword phrases ("implement it", "build
-   this", "ship it") in the prompt text.
-4. **Directive** — `[router: phase=implementation]` and
-   `[router: phase=planning]` select their requested routing phase. Repository
-   execution still requires an authentic implementation request and admission.
+Planning hands off to implementation only on an explicit human choice.
+Prompt prose never changes the phase: static text cannot tell a design
+discussion ("we wish to build this as its own tooling") from approval.
+
+1. **Directive** — `[router: phase=implementation]` and
+   `[router: phase=planning]` select their requested routing phase. Kory
+   Code sends the implementation directive when a person accepts the plan
+   handoff question. Repository execution still requires an authentic
+   implementation request and admission.
+2. **Command** — a typed `/implement` or `/plan`. A message that merely
+   starts with the word "implement" is prose, not a command.
+3. **Skill signal** — `marks_implementation_phase: true` on a
+   `skill_routing` entry upgrades when that skill is invoked (e.g. `/ship-pr`).
+
+The pre-classifier's `planner_phase` dimension is advisory. An
+implementation-shaped verdict keeps the session in Planning with a
+"present a plan before handoff" note. `phase_upgrade_confidence` is accepted
+for configuration compatibility and ignored.
+
+A phase change never overrides a human-picked model (picker selection,
+`[router: candidate=…]`, `[router: switch=…]`, or `model:` shorthand). The
+session keeps that pin across the handoff, Resume, and session/load until the
+human picks again or an availability failure forces failover. Sessions with
+no human pick switch to the new phase's pool.
 
 Planning uses a repository policy snapshot and six role skills. No ticket
 service is required by the default Markdown policy. A repository can select a
@@ -519,7 +531,6 @@ routers:
       - pattern: "*grok*"
         implementation: 2.0
         planning: 0.0
-    phase_upgrade_confidence: 0.7
     apex_complexity: 0.85
     floor_complexity: 0.15
 ```

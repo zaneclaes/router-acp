@@ -668,11 +668,11 @@ pub fn command(req: &PromptRequest) -> Option<PlannerPhase> {
 }
 
 /// A slash `/plan` or `/implement` (or a client's expansion of one) opts a
-/// session on any strategy into the planner workflow. The bare word
-/// `implement` selects implementation only in a session already on `planner`,
-/// so ordinary prose such as "implement the login fix" never starts a run.
+/// session on any strategy into the planner workflow. Prose such as
+/// "implement the login fix" is never a command: only the typed slash
+/// command states the intent.
 pub fn explicit_command(req: &PromptRequest) -> bool {
-    leading_command(req).is_some_and(|c| c.explicit)
+    leading_command(req).is_some()
 }
 
 /// The operator's leading mode command, the text block that carries it, and
@@ -681,7 +681,6 @@ struct LeadingCommand {
     phase: PlannerPhase,
     block: usize,
     args: String,
-    explicit: bool,
 }
 
 /// goose adds a `<turn-context>` span (its own block or inside the typed one),
@@ -718,27 +717,20 @@ fn leading_command(req: &PromptRequest) -> Option<LeadingCommand> {
             .rsplit_once("\nARGUMENTS:")
             .map(|(_, a)| a.lines().next().unwrap_or("").trim().to_string())
             .unwrap_or_default();
-        return Some(LeadingCommand {
-            phase,
-            block,
-            args,
-            explicit: true,
-        });
+        return Some(LeadingCommand { phase, block, args });
     }
     let (verb, args) = typed
         .split_once(char::is_whitespace)
         .map_or((typed, ""), |(v, a)| (v, a.trim_start()));
-    let (phase, explicit) = match verb {
-        "/plan" => (PlannerPhase::Planning, true),
-        "/implement" => (PlannerPhase::Implementation, true),
-        verb if verb.eq_ignore_ascii_case("implement") => (PlannerPhase::Implementation, false),
+    let phase = match verb {
+        "/plan" => PlannerPhase::Planning,
+        "/implement" => PlannerPhase::Implementation,
         _ => return None,
     };
     Some(LeadingCommand {
         phase,
         block,
         args: args.trim_end().to_string(),
-        explicit,
     })
 }
 
@@ -791,13 +783,7 @@ fn user_command_once(
     req: &mut PromptRequest,
     queued: bool,
 ) -> Result<Option<PlannerPhase>, String> {
-    let Some(LeadingCommand {
-        phase,
-        block,
-        args,
-        explicit,
-    }) = leading_command(req)
-    else {
+    let Some(LeadingCommand { phase, block, args }) = leading_command(req) else {
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
@@ -831,7 +817,6 @@ fn user_command_once(
     // retained for audit and all work/review/release records preserved.
     if first_admission
         && !queued
-        && explicit
         && resuming
         && phase == PlannerPhase::Implementation
         && run
@@ -914,13 +899,11 @@ fn user_command_once(
     router_meta["planner_input_id"] = json!(input_id);
     save(shared, sid, &mut run)?;
     shared.with_session(sid, |s| s.coordinator |= run.coordinator);
-    if explicit {
-        let typed = format!("{entrypoint_name} {args}");
-        shared.with_session(sid, |s| {
-            s.planner_command_text = Some(typed.trim_end().to_string());
-            s.planner_explicit_phase = Some(phase);
-        });
-    }
+    let typed = format!("{entrypoint_name} {args}");
+    shared.with_session(sid, |s| {
+        s.planner_command_text = Some(typed.trim_end().to_string());
+        s.planner_explicit_phase = Some(phase);
+    });
     Ok(Some(phase))
 }
 
