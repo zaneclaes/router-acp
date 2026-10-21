@@ -218,7 +218,9 @@ fn claim_steer(rt: &mut crate::planner_guard::SessionRuntime, now: std::time::In
 }
 
 fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
-    if !crate::planner_preempt::router_turn_in_flight(shared, sid)
+    let command_turn = !crate::planner_preempt::router_turn_in_flight(shared, sid)
+        && crate::planner_guard::with_runtime(shared, sid, |rt| rt.command_turn);
+    if !(crate::planner_preempt::router_turn_in_flight(shared, sid) || command_turn)
         || crate::planner_watchdog::tools_in_flight(shared, sid)
     {
         return;
@@ -228,6 +230,16 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     else {
         return;
     };
+    // Inside the operator's `/implement` turn only the deployment obligation
+    // is steered; the fallback below cancels router-owned turns only.
+    if command_turn
+        && !((environment_wake(&key)
+            || key.starts_with("release:")
+            || key.starts_with("audit:release:"))
+            && failed_environment(&run.observations))
+    {
+        return;
+    }
     let release_audit = key.starts_with("audit:release:");
     if release_audit && !failed_environment(&run.observations) {
         return;
@@ -259,7 +271,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         let injected = crate::planner_preempt::steer(&shared, &sid, &blocks).await;
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
             rt.steering = false;
-            if injected && rt.router_turn {
+            if injected && (rt.router_turn || rt.command_turn) {
                 rt.steered.insert(key.clone());
             }
         });
@@ -686,6 +698,40 @@ fn integration_pending(
         || failed_environment(observations)
 }
 
+/// Live 2026-10-21: an interrupted tool batch returned the adapter's stock
+/// "The user doesn't want to take this action right now. STOP…"; the parent
+/// called itself paused by the operator and answered fifteen wakes with no
+/// tool call while staging and production stayed failed, until the operator
+/// wrote twice. From the second such turn every wake says what the router
+/// knows: nothing in planner state stops this run.
+const INERT_TURN_LIMIT: u32 = 2;
+
+fn inert_line(
+    inert: u32,
+    observations: &std::collections::BTreeMap<String, crate::planner_guard::Observation>,
+) -> String {
+    if inert < INERT_TURN_LIMIT || !failed_environment(observations) {
+        return String::new();
+    }
+    let failed = ["staging", "production"]
+        .into_iter()
+        .filter(|environment| {
+            observations
+                .get(&format!("ci:{environment}"))
+                .is_some_and(|o| o.state == crate::planner_guard::ObservationState::Failed)
+        })
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "\n[Router check] This is router text, not operator input. Your last {inert} router-owned turns \
+         ended without a single tool call while {failed} is failed. This run never pauses to wait for \
+         the operator: only `/shutdown` or the operator cancelling a turn stops it, and neither has \
+         happened. A refused, cancelled or interrupted tool call (including \"The user doesn't want to \
+         take this action right now\") is tool evidence, and an operator question is answered in the \
+         same turn while the run continues. Take {failed}'s next repair or release action in this turn."
+    )
+}
+
 pub(crate) fn failed_environment(
     observations: &std::collections::BTreeMap<String, crate::planner_guard::Observation>,
 ) -> bool {
@@ -850,11 +896,13 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     } else {
         "Reconcile these exact work identities and their evidence. Acknowledge each wake through planner_workflow after reconciliation. Preserve human authorization. Continue independent authorized work, or report the concrete waiting reason."
     };
+    let inert = crate::planner_guard::with_runtime(shared, sid, |rt| rt.inert_turns);
     let text = format!(
-        "{}\n[Router-owned child wake]\n{}\n{}\n{task}",
+        "{}\n[Router-owned child wake]\n{}\n{}\n{task}{}",
         run.policy.instructions(role),
         serde_json::to_string(&wakes).map_err(|e| e.to_string())?,
-        capacity_line(shared, &run)
+        capacity_line(shared, &run),
+        inert_line(inert, &run.observations)
     );
     let mut blocks = vec![ContentBlock::from(text)];
     blocks.extend(planner_workflow::parent_input_blocks(
@@ -879,11 +927,25 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     );
     let result =
         crate::session::run_primary_turn(shared.clone(), sid.to_string(), prompt, None).await;
+    let acted = crate::planner_watchdog::tools_seen(shared, sid);
     // Cancelled for operator input, or by the stuck-turn watchdog: this turn
     // answered nothing, so its wakes stay pending and go again right after
     // the next turn (queued operator input first).
     let stalled = crate::planner_watchdog::take_stalled(shared, sid);
     let preempted = crate::planner_preempt::preempted(shared, sid) || stalled;
+    if !preempted {
+        let failed = planner_workflow::load(shared, sid)
+            .ok()
+            .flatten()
+            .is_some_and(|current| failed_environment(&current.observations));
+        crate::planner_guard::with_runtime(shared, sid, |rt| {
+            rt.inert_turns = if !acted && failed {
+                rt.inert_turns + 1
+            } else {
+                0
+            };
+        });
+    }
     planner_workflow::mutate(shared, sid, |run| {
         for id in &ids {
             if let Some(wake) = run.wakes.get_mut(id)

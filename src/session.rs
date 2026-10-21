@@ -10004,10 +10004,20 @@ fn on_prompt(
     {
         let task_cx = cx.clone();
         return cx.spawn(async move {
+            let mut req = req;
+            // Either delivery aborts running tools, which the adapter reports
+            // to the model as a user refusal (`planner_preempt`).
+            let note = crate::planner_preempt::settle_tools(&shared, &router_sid)
+                .await
+                .then(|| {
+                    ContentBlock::from(crate::planner_preempt::INTERRUPTED_TOOLS_NOTE.to_string())
+                });
+            let steered: Vec<ContentBlock> =
+                note.iter().cloned().chain(req.prompt.iter().cloned()).collect();
             // A mode command must run as its own turn; anything else may be
             // steered.
             if crate::planner_workflow::command(&req).is_none()
-                && crate::planner_preempt::steer(&shared, &router_sid, &req.prompt).await
+                && crate::planner_preempt::steer(&shared, &router_sid, &steered).await
             {
                 let recorded = crate::planner_workflow::record_steered_input(
                     &shared,
@@ -10026,6 +10036,11 @@ fn on_prompt(
                 return responder.respond(PromptResponse::new(StopReason::EndTurn));
             }
             if crate::planner_preempt::preempt(&shared, &router_sid).await {
+                // After the operator's words: a leading command must stay the
+                // first block.
+                if let Some(note) = note {
+                    req.prompt.push(note);
+                }
                 return continue_prompt(shared, router_sid, req, responder, task_cx);
             }
             // The router-owned turn ignored its cancel: keep the input safe.
@@ -10612,6 +10627,11 @@ fn prepare_parent_prompt_inner(
                     &router_sid,
                     format!("router-acp · explicit workflow phase: {phase:?}"),
                 );
+                if phase == crate::config::PlannerPhase::Implementation {
+                    crate::planner_guard::with_runtime(&shared, &router_sid, |rt| {
+                        rt.command_turn = true;
+                    });
+                }
                 // A restarted client's `/implement` resumes the checkout's
                 // ownerless run instead of starting an empty one.
                 if phase == crate::config::PlannerPhase::Implementation
