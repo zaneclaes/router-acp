@@ -19,9 +19,9 @@ use agent_client_protocol::schema::v1::{
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ReleaseTerminalRequest, ResumeSessionRequest, SessionCapabilities, SessionConfigId,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    StopReason, TerminalOutputRequest, WaitForTerminalExitRequest,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionInfoUpdate, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, StopReason, TerminalOutputRequest, WaitForTerminalExitRequest,
 };
 use agent_client_protocol::{
     Agent as AgentPeer, Client as ClientPeer, ConnectTo, ConnectionTo, Dispatch, Handled,
@@ -381,6 +381,11 @@ pub struct RouterSession {
     /// Consecutive turns without struggle signals since the last elevation —
     /// the demotion clock (reset by any struggle).
     pub quiet_turns: u32,
+    /// The model displaced by a usage-cordon escape. Once its account is
+    /// available again, the session returns to it automatically.
+    pub usage_recovery_target: Option<CandidateId>,
+    /// A primary turn is running; republished with the title on a pin change.
+    pub activity_busy: bool,
     /// True once the downstream adapter reported real cost via
     /// `usage_update.cost` — turn-end pricing synthesis then stays out of
     /// the way (synthesized and reported figures must not mix).
@@ -537,6 +542,8 @@ impl RouterSession {
             elevation: None,
             elevation_skill: None,
             quiet_turns: 0,
+            usage_recovery_target: None,
+            activity_busy: false,
             saw_adapter_cost: false,
             planner_phase: routing
                 .and_then(|r| r.get("planner_phase"))
@@ -619,6 +626,8 @@ impl RouterSession {
             elevation: None,
             elevation_skill: None,
             quiet_turns: 0,
+            usage_recovery_target: None,
+            activity_busy: false,
             saw_adapter_cost: false,
             planner_phase: None,
             planner_difficulty: None,
@@ -3038,6 +3047,23 @@ pub fn handle_downstream_dispatch(
                             update.and_then(|u| u.get("title")).and_then(|t| t.as_str())
                     {
                         shared.state.lock().unwrap().set_title(&router_sid, title);
+
+                        // The host uses session_info_update.title for the window
+                        // title. Keep the downstream title in router state for
+                        // diagnostics, but make the client-facing title identify
+                        // the model pinned by the parent router session.
+                        if let Some(title) = client_title(shared, &router_sid) {
+                            let mut params = fwd.params().clone();
+                            if let Some(update) =
+                                params.get_mut("update").and_then(Value::as_object_mut)
+                            {
+                                update.insert("title".to_string(), json!(title));
+                                fwd = agent_client_protocol::UntypedMessage::new(
+                                    fwd.method(),
+                                    params,
+                                )?;
+                            }
+                        }
                     }
                     // Log tool calls / usage updates for observability.
                     log_downstream_event(shared, &router_sid, msg.params());
@@ -4075,6 +4101,46 @@ pub fn router_block(lines: &[String]) -> String {
     }
     out.push('\n'); // paragraph break flushes the block before model text
     out
+}
+
+/// The client-facing session title: `<project> [<pinned model>]`, so the
+/// host's title bar names the model the parent is on right now.
+fn client_title(shared: &Arc<Shared>, router_sid: &str) -> Option<String> {
+    shared
+        .with_session(router_sid, |s| {
+            let model = s.pin.as_ref()?.candidate.model.clone();
+            let project = s
+                .cwd
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "router-acp".into());
+            Some(format!("{project} [{model}]"))
+        })
+        .flatten()
+}
+
+/// Publish the title and whether the parent is running a turn
+/// (`_meta.routerAcp.busy`), so the host can show activity while working —
+/// including router-initiated wake turns the host never prompted.
+fn publish_session_activity(shared: &Arc<Shared>, router_sid: &str, busy: bool) {
+    shared.with_session(router_sid, |s| s.activity_busy = busy);
+    republish_session_title(shared, router_sid);
+}
+
+/// Re-send the title with the current busy state, e.g. after the pin moved.
+fn republish_session_title(shared: &Arc<Shared>, router_sid: &str) {
+    let busy = shared
+        .with_session(router_sid, |s| s.activity_busy)
+        .unwrap_or(false);
+    let (Some(cx), Some(title)) = (shared.upstream(), client_title(shared, router_sid)) else {
+        return;
+    };
+    let mut meta = serde_json::Map::new();
+    meta.insert("routerAcp".into(), json!({ "busy": busy }));
+    let _ = cx.send_notification(SessionNotification::new(
+        router_sid.to_string(),
+        SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title).meta(meta)),
+    ));
 }
 
 /// Queue router notice line(s) to ride the model's next response chunk.
@@ -5210,6 +5276,7 @@ async fn pin_ranked(
                     })
                     .unwrap_or((None, None));
                 let (mode_to_apply, previous_pin) = mode_to_apply;
+                republish_session_title(shared, router_sid);
                 // A failover re-pin moved the parent to a new provider session.
                 if let Some(previous) = previous_pin {
                     report_repin(
@@ -6206,6 +6273,10 @@ fn queue_usage_cordon_escape(shared: &Arc<Shared>, router_sid: &str) {
         } else {
             crate::notice::Reason::AccountLimit
         });
+        // Remember the displaced model even when a human picked it: that is
+        // the pin they want back once the account recovers. A later human
+        // pick of a different model clears this in the recovery check.
+        s.usage_recovery_target = Some(cur.clone());
         // Not an elevation: this is escaping a dead seat, not climbing the
         // capability ladder.
         s.quiet_turns = 0;
@@ -6217,6 +6288,55 @@ fn queue_usage_cordon_escape(shared: &Arc<Shared>, router_sid: &str) {
         cordon = %c.reason,
         "proactive switch off usage-cordoned pin"
     );
+}
+
+/// Return to the model displaced by a usage-cordon escape once its account is
+/// routeable again. This is deliberately independent of confidence: the
+/// fallback was caused by availability, so recovery must not depend on the
+/// cheap model struggling first.
+fn queue_usage_cordon_recovery(shared: &Arc<Shared>, router_sid: &str) {
+    let (class, target, current, has_pending, human_pick) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.usage_recovery_target.clone(),
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+                s.pending_switch.is_some() || s.escalation_requested.is_some(),
+                s.pin_user_pick,
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, None, None, true, false));
+    // A pending switch (including the escape just queued this turn, while the
+    // pin still names the displaced model) settles first.
+    let Some(target) = target.filter(|_| !has_pending) else {
+        return;
+    };
+    if current.as_ref() == Some(&target) || human_pick {
+        shared.with_session(router_sid, |s| s.usage_recovery_target = None);
+        return;
+    }
+    // Revivable, not serving: the displaced adapter is usually idle-stopped by
+    // now, and switch_pin revives it before its own availability check.
+    if shared
+        .candidate_view_revivable(&target, &RequiredCaps::default(), class)
+        .is_none()
+    {
+        return;
+    }
+    let reason = format!(
+        "usage cordon cleared — returning to {} after temporary fallback",
+        target
+    );
+    shared.with_session(router_sid, |s| {
+        s.pending_switch = Some(SwitchRequest {
+            target: target.clone(),
+            reason: reason.clone(),
+            handoff: HandoffStyle::Full,
+            user_pick: false,
+        });
+    });
+    notify_user(shared, router_sid, format!("router-acp · {reason}"));
+    tracing::info!(session = router_sid, %target, "usage-cordon recovery queued");
 }
 
 async fn send_prompt_with_failover(
@@ -6242,12 +6362,15 @@ pub(crate) async fn run_primary_turn(
         .ok()
         .flatten()
         .is_some();
+    publish_session_activity(&shared, &router_sid, true);
     let turn = run_primary_turn_inner(shared.clone(), router_sid.clone(), req, cancellation);
-    if planner_parent {
+    let result = if planner_parent {
         crate::planner_watchdog::guard_parent_turn(&shared, &router_sid, turn).await
     } else {
         turn.await
-    }
+    };
+    publish_session_activity(&shared, &router_sid, false);
+    result
 }
 
 async fn run_primary_turn_inner(
@@ -6273,6 +6396,7 @@ async fn run_primary_turn_inner(
     }
 
     queue_usage_cordon_escape(&shared, &router_sid);
+    queue_usage_cordon_recovery(&shared, &router_sid);
 
     // A requested/auto-detected model switch fires here, before this turn is
     // forwarded, so the prompt lands on the new model. The current model first
@@ -6316,7 +6440,13 @@ async fn run_primary_turn_inner(
                     );
                 }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                shared.with_session(&router_sid, |s| {
+                    if s.usage_recovery_target.as_ref() == Some(&sw.target) {
+                        s.usage_recovery_target = None;
+                    }
+                });
+            }
             // The human named a model: running the turn on the model they
             // picked away from is never the answer. Fail it, naming why the
             // pick could not start.
@@ -7620,11 +7750,9 @@ fn resolve_candidate_ref(
     // selection, so it may name a pinned legacy version. The fuzzy matching
     // below stays on the automatic pool: `opus:` must not land on a legacy
     // version just because it scores a hair higher.
-    if let Some(id) = CandidateId::parse(reference).map(|id| shared.seat_for(&id))
+    if let Some(id) = CandidateId::parse(reference).map(|id| shared.restored_seat(&id))
         && !is_excluded(&id, excluded)
-        && shared
-            .candidate_view_revivable(&id, &RequiredCaps::default(), class)
-            .is_some()
+        && shared.candidate_runtime(&id).is_some()
     {
         return Some(id);
     }
@@ -7653,6 +7781,42 @@ fn resolve_candidate_ref(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|v| v.id.clone())
+        .or_else(|| {
+            // An explicit shorthand must remain a control command even while
+            // its target is cordoned or its adapter is down. switch_pin will
+            // revive the adapter and then fail loudly if the target is still
+            // unavailable; silently forwarding `opus:` as prose loses the
+            // user's request and makes recovery impossible.
+            let needle = reference.to_lowercase();
+            shared
+                .candidates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|candidate| !is_excluded(&candidate.id, excluded))
+                .filter(|candidate| {
+                    let full = candidate.id.to_string().to_lowercase();
+                    let model = candidate.id.model.to_lowercase();
+                    if has_slash {
+                        full == needle
+                            || crate::candidate::glob_match(&needle, &full)
+                            || crate::candidate::glob_match(&format!("{needle}*"), &full)
+                    } else {
+                        model == needle
+                            || full == needle
+                            || model.contains(&needle)
+                            || full.contains(&needle)
+                    }
+                })
+                .max_by(|a, b| {
+                    shared
+                        .scores
+                        .lookup_exact(&a.id)
+                        .quality(class)
+                        .total_cmp(&shared.scores.lookup_exact(&b.id).quality(class))
+                })
+                .map(|candidate| candidate.id.clone())
+        })
 }
 
 /// If the prompt begins (after any goose `<turn-context>` preamble) with a
@@ -8572,6 +8736,15 @@ async fn switch_pin(
     if let Some(key) = shared.candidate_runtime(target).map(|r| r.process_key) {
         ensure_target_ready(shared, target, &key).await?;
     }
+    if shared
+        .candidate_view_serving(target, TaskClass::CodingGeneral)
+        .is_none()
+    {
+        return Err(AcpError::internal_error().data(format!(
+            "cannot switch to {target}: the model is currently unavailable (cordoned, \
+             unauthenticated, or still starting)"
+        )));
+    }
 
     // 1. Build the handoff. Preferred path: ask the outgoing model to
     //    summarize (capturing its text instead of relaying it). If that model
@@ -8734,6 +8907,7 @@ async fn switch_pin(
             s.pending_delegation_directive = Some(target.clone());
         }
     });
+    republish_session_title(shared, router_sid);
     report_repin(
         shared,
         router_sid,
@@ -10205,6 +10379,7 @@ fn prepare_parent_prompt_inner(
                     if pinned {
                         let target = target.clone();
                         shared.with_session(&router_sid, |s| {
+                            s.usage_recovery_target = None;
                             s.pending_switch = Some(SwitchRequest {
                                 target: target.clone(),
                                 reason: format!("requested via `{ref_str}:` shorthand"),
@@ -10244,6 +10419,7 @@ fn prepare_parent_prompt_inner(
             if let Some(target) = directives.switch.clone() {
                 if pinned_now {
                     shared.with_session(&router_sid, |s| {
+                        s.usage_recovery_target = None;
                         s.pending_switch = Some(SwitchRequest {
                             target: target.clone(),
                             reason: "requested via [router: switch=…]".to_string(),

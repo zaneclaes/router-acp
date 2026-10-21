@@ -41,8 +41,22 @@ impl Client {
                     .expect("router closed stdout");
                 let frame: Value = serde_json::from_str(&line).unwrap();
                 if frame["method"] == "elicitation/create" {
+                    let properties = &frame["params"]["requestedSchema"]["properties"];
+                    let (name, field) = properties.as_object().unwrap().iter().next().unwrap();
                     let result = match self.answers.pop_front() {
-                        Some(answer) => json!({"action":"accept","content":{"choice":answer}}),
+                        Some(answer) if field["type"] == "integer" => answer
+                            .parse::<i64>()
+                            .map(|answer| {
+                                let mut content = serde_json::Map::new();
+                                content.insert(name.clone(), json!(answer));
+                                json!({"action":"accept","content":content})
+                            })
+                            .unwrap_or_else(|_| json!({"action":"cancel"})),
+                        Some(answer) => {
+                            let mut content = serde_json::Map::new();
+                            content.insert(name.clone(), json!(answer));
+                            json!({"action":"accept","content":content})
+                        }
                         None => json!({"action":"cancel"}),
                     };
                     let response = json!({"jsonrpc":"2.0","id":frame["id"],"result":result});
@@ -120,6 +134,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
             r#"
 state_file: {}
 delegation: {{enabled: false}}
+cordon: {{enabled: true}}
 agents:
   - name: claude
     command:
@@ -128,6 +143,7 @@ agents:
       env: [{{name: MOCK_MODELS, value: sonnet}}, {{name: HOME, value: {}}}]
     model_selection: {{type: config-option}}
     models: [{{id: sonnet, cost_rank: 2}}]
+    usage_source: {{type: anthropic-oauth}}
     auth_probe: {{command: /bin/sh, args: [-c, "echo not logged in; exit 1"]}}
     accounts: [{{name: expired, priority: 0}}]
 "#,
@@ -1394,7 +1410,7 @@ async fn standalone_menu_sets_listed_account_priority_and_reserve() {
     // codex → codex@old → Set priority → position 1; then Set reserve
     // capacity → Weekly → 10%, and Session → 0%.
     for command in [
-        "/login", "2", "1", "3", "1", "4", "1", "3", "2", "1", "/cancel",
+        "/login", "2", "1", "3", "1", "4", "1", "10", "2", "0", "/cancel",
     ] {
         assert!(
             client.prompt(&sid, command).await.get("result").is_some(),
@@ -1651,6 +1667,55 @@ async fn standalone_structured_login_has_provider_account_and_action_forms() {
 }
 
 #[tokio::test]
+async fn standalone_structured_reserve_uses_bounded_integer_input() {
+    let (_dir, config) = fixture();
+    let mut client = spawn(&config);
+    client
+        .answers
+        .extend(["1", "1", "4", "1", "37"].map(String::from));
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}}),
+        )
+        .await;
+    let created = client
+        .request("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap();
+    client.prompt(sid, "/login").await;
+
+    let reserve_form = client
+        .events
+        .iter()
+        .find(|event| {
+            event["method"] == "elicitation/create"
+                && event["params"]["requestedSchema"]["properties"]["value"]["type"] == "integer"
+        })
+        .unwrap();
+    let value = &reserve_form["params"]["requestedSchema"]["properties"]["value"];
+    assert_eq!(value["minimum"], 0);
+    assert_eq!(value["maximum"], 100);
+    assert!(
+        client.text().contains("weekly reserve set to 37%"),
+        "{}",
+        client.text()
+    );
+    assert_eq!(
+        router_acp::config::Config::from_file(&config)
+            .unwrap()
+            .agents
+            .iter()
+            .find(|agent| agent.name == "claude@expired")
+            .unwrap()
+            .reserve_capacity
+            .weekly,
+        37.0
+    );
+    client.close().await;
+}
+
+#[tokio::test]
 async fn project_add_account_keeps_membership_local_and_credentials_in_the_user_store() {
     let fixture = login_fixture("claude", Some("old"));
     let user = fixture.home.join(".config/router-acp/router.yaml");
@@ -1717,7 +1782,7 @@ async fn system_reserves_for_a_project_only_account_preserve_project_membership(
         )
         .await;
     let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
-    for choice in ["/login", "2", "1", "4", "1", "4"] {
+    for choice in ["/login", "2", "1", "4", "1", "15"] {
         client.prompt(&sid, choice).await;
     }
     assert!(
@@ -1776,7 +1841,7 @@ async fn account_scope_moves_and_independent_reserves_round_trip_through_native_
     );
     assert!(router_acp::config::Config::from_file(&user).unwrap().agents[0].account_disabled);
     // Set system weekly to 15%, then project weekly to 100% (disabled).
-    for choice in ["4", "1", "4", "3", "5", "1", "11"] {
+    for choice in ["4", "1", "15", "3", "5", "1", "100"] {
         client.prompt(&sid, choice).await;
     }
     let status = |path: &Path| -> Value {
@@ -1805,9 +1870,9 @@ async fn account_scope_moves_and_independent_reserves_round_trip_through_native_
             .weekly,
         15.0
     );
-    assert!(client.text().contains("100% (disabled)"));
+    assert!(client.text().contains("weekly reserve set to 100%"));
     // Remove only the project weekly override, then promote membership again.
-    for choice in ["1", "12", "3", "6", "1"] {
+    for choice in ["1", "/system", "3", "6", "1"] {
         client.prompt(&sid, choice).await;
     }
     assert!(

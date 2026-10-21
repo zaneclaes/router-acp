@@ -9,8 +9,9 @@ use agent_client_protocol::Responder;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk,
     CreateElicitationRequest, ElicitationAction, ElicitationContentValue, ElicitationFormMode,
-    ElicitationSchema, ElicitationSessionScope, EnumOption, Error as AcpError, PromptRequest,
-    PromptResponse, SessionNotification, SessionUpdate, StopReason, StringPropertySchema,
+    ElicitationSchema, ElicitationSessionScope, EnumOption, Error as AcpError,
+    IntegerPropertySchema, PromptRequest, PromptResponse, SessionNotification, SessionUpdate,
+    StopReason, StringPropertySchema,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,9 +24,6 @@ use crate::session::{CandidateRuntime, CandidateStatus, Shared, TargetRuntime};
 use crate::strategies::CandidateView;
 
 const PROVIDERS: [&str; 4] = ["claude", "codex", "grok", "kimi"];
-/// Reserve percentages offered by both account reserve menus.
-const RESERVE_STEPS: [u32; 11] = [0, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100];
-
 pub fn advertise(shared: &Arc<Shared>, sid: &str) {
     if let Some(cx) = shared.upstream() {
         let commands = vec![
@@ -433,7 +431,11 @@ pub fn intercepts(shared: &Arc<Shared>, sid: &str, prompt: &[ContentBlock]) -> b
     }
     let mut menus = shared.account_menus.lock().unwrap();
     if menus.contains_key(sid) {
-        if text.parse::<usize>().is_ok() || text == "/back" || text == "/cancel" {
+        if text.parse::<usize>().is_ok()
+            || text == "/back"
+            || text == "/cancel"
+            || text == "/system"
+        {
             return true;
         }
         menus.remove(sid);
@@ -607,31 +609,13 @@ fn menu(shared: &Arc<Shared>, sid: &str, state: &Menu) -> (String, Vec<String>) 
                     ReserveWindow::Session => reserve.session,
                 })
                 .unwrap_or_default();
-            let mut options: Vec<String> = RESERVE_STEPS
-                .iter()
-                .map(|&p| {
-                    let label = if p == 100 {
-                        "100% (disabled)".into()
-                    } else {
-                        format!("{p}%")
-                    };
-                    if f64::from(p) == current {
-                        format!("{label} (current)")
-                    } else {
-                        label
-                    }
-                })
-                .collect();
-            if *scope == Scope::Project {
-                options.push("Use system reserve".into());
-            }
-            options.push(BACK.into());
             (
                 format!(
-                    "Keep how much of {label}'s {} window unused?",
-                    window.label()
+                    "Keep how much of {label}'s {} window unused? Enter an integer from 0 to 100 (currently {}).",
+                    window.label(),
+                    current
                 ),
-                options,
+                Vec::new(),
             )
         }
         Menu::Delete(name) => (
@@ -674,6 +658,50 @@ pub(crate) async fn ask(
             .and_then(|v| v.get("choice").cloned())
             .and_then(|v| match v {
                 ElicitationContentValue::String(s) => Some(s),
+                _ => None,
+            })),
+        _ => Ok(None),
+    }
+}
+
+async fn ask_reserve(
+    shared: &Arc<Shared>,
+    sid: &str,
+    title: &str,
+    current: f64,
+) -> Result<Option<i64>, AcpError> {
+    let schema = ElicitationSchema::new().property(
+        "value",
+        IntegerPropertySchema::new()
+            .title(title.to_string())
+            .description("Enter a reserve percentage from 0 to 100.")
+            .minimum(0)
+            .maximum(100)
+            .default_value(current.clamp(0.0, 100.0).round() as i64),
+        true,
+    );
+    let request = CreateElicitationRequest::new(
+        ElicitationFormMode::new(ElicitationSessionScope::new(sid.to_string()), schema),
+        title.to_string(),
+    );
+    let response = shared
+        .upstream()
+        .ok_or_else(AcpError::internal_error)?
+        .send_request(request)
+        .block_task()
+        .await?;
+    match response.action {
+        ElicitationAction::Accept(answer) => Ok(answer
+            .content
+            .and_then(|v| v.get("value").cloned())
+            .and_then(|v| match v {
+                ElicitationContentValue::Integer(value) => Some(value),
+                ElicitationContentValue::Number(value)
+                    if value.is_finite() && value.fract() == 0.0 =>
+                {
+                    Some(value as i64)
+                }
+                ElicitationContentValue::String(value) => value.parse().ok(),
                 _ => None,
             })),
         _ => Ok(None),
@@ -790,6 +818,71 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
     }
     loop {
         let (body, options) = menu(shared, sid, &state);
+        if let Menu::ReserveWindow(name, scope, window) = state.clone() {
+            let current = Paths::for_session(shared, sid)
+                .and_then(|p| p.reserve(&name, scope))
+                .ok()
+                .map(|reserve| match window {
+                    ReserveWindow::Weekly => reserve.weekly,
+                    ReserveWindow::Session => reserve.session,
+                })
+                .unwrap_or_default();
+            if command == "/system" && scope == Scope::Project {
+                crate::account_scope::set_reserve(shared, sid, &name, scope, window, None)
+                    .await
+                    .map_err(|e| AcpError::invalid_params().data(e))?;
+                emit(
+                    shared,
+                    sid,
+                    "Project override removed; using system reserve.",
+                );
+                state = Menu::Reserve(name, scope);
+                continue;
+            }
+            let value = if let Some(value) = typed_choice.take() {
+                Some(value as i64)
+            } else if structured {
+                ask_reserve(shared, sid, &body, current).await?
+            } else {
+                emit(
+                    shared,
+                    sid,
+                    &format!(
+                        "{body}\nReply with an integer from 0 to 100. /back returns to the reserve menu."
+                    ),
+                );
+                shared
+                    .account_menus
+                    .lock()
+                    .unwrap()
+                    .insert(sid.to_string(), state);
+                return Ok(());
+            };
+            let Some(value) = value.filter(|value| (0..=100).contains(value)) else {
+                emit(shared, sid, "Reserve must be an integer from 0 to 100.");
+                state = Menu::Reserve(name, scope);
+                continue;
+            };
+            match crate::account_scope::set_reserve(
+                shared,
+                sid,
+                &name,
+                scope,
+                window,
+                Some(value as u32),
+            )
+            .await
+            {
+                Ok(()) => emit(
+                    shared,
+                    sid,
+                    &format!("{} reserve set to {value}%.", window.label()),
+                ),
+                Err(e) => emit(shared, sid, &format!("router-acp: {e}")),
+            }
+            state = Menu::Reserve(name, scope);
+            continue;
+        }
         let choice = match typed_choice.take() {
             Some(c) => c,
             None if structured => {
@@ -932,45 +1025,6 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
                 3 => state = Menu::Account(name),
                 _ => emit(shared, sid, "Choose a listed number."),
             },
-            Menu::ReserveWindow(name, scope, window) => {
-                if choice > 0 && choice <= RESERVE_STEPS.len() {
-                    let percent = RESERVE_STEPS[choice - 1];
-                    match crate::account_scope::set_reserve(
-                        shared,
-                        sid,
-                        &name,
-                        scope,
-                        window,
-                        Some(percent),
-                    )
-                    .await
-                    {
-                        Ok(()) => emit(
-                            shared,
-                            sid,
-                            &format!("{} reserve set to {percent}%.", window.label()),
-                        ),
-                        Err(e) => emit(shared, sid, &format!("router-acp: {e}")),
-                    }
-                    state = Menu::Reserve(name, scope);
-                } else if scope == Scope::Project && choice == RESERVE_STEPS.len() + 1 {
-                    match crate::account_scope::set_reserve(shared, sid, &name, scope, window, None)
-                        .await
-                    {
-                        Ok(()) => emit(
-                            shared,
-                            sid,
-                            "Project override removed; using system reserve.",
-                        ),
-                        Err(error) => emit(shared, sid, &format!("Reserve change failed: {error}")),
-                    }
-                    state = Menu::Reserve(name, scope);
-                } else if choice == options.len() {
-                    state = Menu::Reserve(name, scope);
-                } else {
-                    emit(shared, sid, "Choose a listed number.");
-                }
-            }
             Menu::Delete(name) if choice == 2 => {
                 let message = delete_account(shared, &name).await?;
                 emit(shared, sid, &message);
