@@ -11953,6 +11953,8 @@ async fn a_reloaded_human_pick_survives_the_accepted_handoff() {
         .block_task()
         .await?;
         assert!(shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+        // Re-pin from the restored state first, so the handoff meets a live pin.
+        prompt_text(&cx, &sid, "back to the plan").await?;
         prompt_text(
             &cx,
             &sid,
@@ -11963,6 +11965,10 @@ async fn a_reloaded_human_pick_survives_the_accepted_handoff() {
         assert!(
             !text.contains("echo:opus:"),
             "reloaded pick replaced: {text}"
+        );
+        assert!(
+            text.contains("keeping your picked model plan/sol"),
+            "the guard held the restored pick: {text}"
         );
         Ok(())
     })
