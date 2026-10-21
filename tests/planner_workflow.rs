@@ -6857,3 +6857,82 @@ async fn reconciliation_allocates_an_unallocated_identity_with_its_corrected_bri
     assert_eq!(resumed_child, child);
     assert!(prompt.contains(&corrected.scope));
 }
+
+/// A planning parent has no authorized work: the idle heartbeat must not tell
+/// it to fill worker slots, and its wake census carries no fill exhortation.
+#[tokio::test]
+async fn a_planning_parent_gets_no_slot_filling_heartbeat() {
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 3);
+    let shared = &fixture.shared;
+    let mut run = planner_workflow::ensure(shared, SID).unwrap();
+    run.phase = router_acp::config::PlannerPhase::Planning;
+    planner_workflow::save(shared, SID, &mut run).unwrap();
+    let last = parent_turn_ended(shared);
+
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 3 * 3600);
+    assert!(wakes_with(shared, "heartbeat:").is_empty());
+    let census = router_acp::planner_wake::capacity_line(shared, &run);
+    assert!(!census.contains("fill the free slots"), "{census}");
+
+    // The human's accept moves the run to implementation; then the free
+    // slots earn the heartbeat again.
+    authorize(shared);
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 3 * 3600);
+    assert_eq!(wakes_with(shared, "heartbeat:").len(), 1);
+    assert!(router_acp::planner_wake::capacity_line(shared, &run).contains("fill the free slots"));
+}
+
+/// The human said "Not yet": the parent records that as a run-wide hold that
+/// quotes them. No heartbeat, capacity wake or auto-admission fills slots
+/// until the human's next message clears it.
+#[tokio::test]
+async fn an_awaiting_human_hold_silences_slot_filling_until_the_human_speaks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let fixture = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 3;
+        capacity_host(cfg, script, 1_000, 1_000_000);
+    });
+    let shared = &fixture.shared;
+    authorize(shared);
+    let hold = |key: &str, detail: &str| {
+        planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Hold {
+                key: key.into(),
+                plan_id: "epic".into(),
+                reason: "awaiting-human".into(),
+                detail: detail.into(),
+            },
+        )
+    };
+    let error = hold("h0", "the human is not ready").await.unwrap_err();
+    assert!(error.contains("quote"), "{error}");
+    hold("h1", "human said \"Not yet\" to implementation")
+        .await
+        .unwrap();
+
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 3 * 3600).await;
+    assert!(wakes_with(shared, "capacity:").is_empty());
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    // It does not expire like a candidate hold.
+    assert!(router_acp::planner_capacity::human_hold(&run).is_some());
+    router_acp::planner_wake::heartbeat(shared, SID, &run, last + 3 * 3600);
+    assert!(wakes_with(shared, "heartbeat:").is_empty());
+    assert!(!router_acp::planner_wake::capacity_line(shared, &run).contains("fill the free slots"));
+    assert_eq!(router_acp::planner_wake::live_workers(&run), 0);
+
+    planner_workflow::observe_input(
+        shared,
+        SID,
+        &input_request(Some("go"), "Yes, start implementation.", false),
+    )
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(router_acp::planner_capacity::human_hold(&run).is_none());
+}

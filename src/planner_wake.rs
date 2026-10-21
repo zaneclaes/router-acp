@@ -571,7 +571,10 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
     {
         line.push_str(&format!(" Repository host confirms {} guides now in Completed on staging; {} new paths since this run's first audit.", current.len(), current.difference(initial).count()));
     }
-    if live < cap {
+    if live < cap
+        && run.phase == crate::config::PlannerPhase::Implementation
+        && crate::planner_capacity::human_hold(run).is_none()
+    {
         line.push_str(
             " Re-read the plan source for work that became runnable since your last turn (a \
              changed roadmap, a cleared blocker, recovered host memory or disk), retry \
@@ -595,6 +598,10 @@ pub fn capacity_line(shared: &Arc<Shared>, run: &planner_workflow::PlannerRun) -
 /// worker slot is free, wake it on a backed-off timer so it re-checks.
 pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun, now: i64) {
     if run.status != RunStatus::Running
+        // A planning parent has no authorized work to fill slots with: only
+        // the human's accept moves it to implementation.
+        || run.phase != crate::config::PlannerPhase::Implementation
+        || crate::planner_capacity::human_hold(run).is_some()
         || !run.approval_waits.is_empty()
         || !run.parent_queue.is_empty()
         || run.wakes.values().any(|w| !w.acknowledged)

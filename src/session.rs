@@ -3111,7 +3111,7 @@ pub fn handle_downstream_dispatch(
                 }
                 let fwd =
                     relay::normalize_terminal_create(&relay::with_session_id(&msg, &router_sid)?)?;
-                upstream.send_request(fwd).forward_response_to(responder)?;
+                forward_upstream_answer(upstream.send_request(fwd), responder, &router_sid)?;
                 Ok(Handled::Yes)
             }
             Dispatch::Response(..) => unreachable!("responses handled above"),
@@ -3249,7 +3249,7 @@ pub fn handle_downstream_dispatch(
                 }
                 let fwd =
                     relay::normalize_terminal_create(&relay::with_session_id(&msg, &client_sid)?)?;
-                upstream.send_request(fwd).forward_response_to(responder)?;
+                forward_upstream_answer(upstream.send_request(fwd), responder, &client_sid)?;
                 Ok(Handled::Yes)
             }
             Dispatch::Response(..) => unreachable!("responses handled above"),
@@ -3289,6 +3289,32 @@ pub fn handle_downstream_dispatch(
             Dispatch::Response(..) => unreachable!("responses handled above"),
         },
     }
+}
+
+/// Relay the client's answer to a downstream agent's callback.
+///
+/// This must NOT use `forward_response_to`: its consuming task returns the
+/// `respond` error, and a failed task ends the upstream connection. When a
+/// restart or failover kills the adapter while its callback (a question,
+/// a permission prompt, a terminal call) is open, the client's answer has no
+/// receiver; that is expected and must only be logged, never fatal.
+fn forward_upstream_answer(
+    sent: agent_client_protocol::SentRequest<Value>,
+    responder: Responder<Value>,
+    router_sid: &str,
+) -> Result<(), AcpError> {
+    let router_sid = router_sid.to_string();
+    sent.forward_cancellation_from(responder.cancellation())
+        .on_receiving_result(async move |result| {
+            if let Err(err) = responder.respond_with_result(result) {
+                tracing::warn!(
+                    session = router_sid,
+                    error = %err,
+                    "downstream agent gone before the client's answer arrived"
+                );
+            }
+            Ok(())
+        })
 }
 
 /// Relay a request to a downstream connection, answering the upstream

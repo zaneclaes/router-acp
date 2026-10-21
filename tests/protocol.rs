@@ -232,6 +232,9 @@ struct Observed {
     /// Hold `terminal/wait_for_exit` open until the terminal is killed, like
     /// a long-running watcher.
     hang_terminal_waits: bool,
+    /// Hold each elicitation answer until this file exists, like a person
+    /// who has not answered the question yet.
+    elicitation_gate: Option<PathBuf>,
     terminal_kills: Vec<String>,
     terminal_releases: Vec<String>,
 }
@@ -374,11 +377,16 @@ where
                             }
                             _ => String::new(),
                         };
-                        observed
-                            .lock()
-                            .unwrap()
-                            .elicitation_session_ids
-                            .push(session_id);
+                        let gate = {
+                            let mut observed = observed.lock().unwrap();
+                            observed.elicitation_session_ids.push(session_id);
+                            observed.elicitation_gate.clone()
+                        };
+                        if let Some(gate) = gate {
+                            while !gate.exists() {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        }
                         let mut content = std::collections::BTreeMap::new();
                         content.insert(
                             "question_0".to_string(),
@@ -1176,6 +1184,78 @@ async fn elicitation_capability_round_trips_and_request_forwards() {
         Ok(())
     })
     .await;
+}
+
+/// The live crash: an adapter restart (a stalled-turn watchdog, a failover)
+/// killed the agent while its question to the person was open. When the
+/// person answered, the answer had no receiver, and that error ended the
+/// whole router. The answer must be dropped with a log line instead.
+#[tokio::test]
+async fn an_answer_to_a_dead_adapters_question_does_not_end_the_router() {
+    let state = temp_state_file("elicit-dead");
+    let log = temp_log("elicit-dead");
+    let gate = std::env::temp_dir().join(format!("elicit-dead-{}", uuid::Uuid::new_v4()));
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1), ("m2", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        )
+    );
+    let gate_for_test = gate.clone();
+    run_test(yaml, async |cx, observed| {
+        observed.lock().unwrap().elicitation_gate = Some(gate_for_test.clone());
+        cx.send_request(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                ClientCapabilities::new().elicitation(
+                    ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+                ),
+            ),
+        )
+        .block_task()
+        .await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        let asking = {
+            let cx = cx.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move { prompt_text(&cx, &sid, "ELICIT:Merge it?").await })
+        };
+        for _ in 0..200 {
+            if !observed.lock().unwrap().elicitation_session_ids.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!observed.lock().unwrap().elicitation_session_ids.is_empty());
+        let pid = read_log(&log)
+            .iter()
+            .find(|e| e["event"] == "initialize")
+            .and_then(|e| e["pid"].as_u64())
+            .unwrap();
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), asking).await;
+        // The person answers after the adapter is gone.
+        std::fs::write(&gate_for_test, "").unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The router still serves the session.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            prompt_text(&cx, &sid, "TEXT:still-here"),
+        )
+        .await
+        .expect("the router answers after the dead adapter's question")?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert!(agent_text(&observed, &sid).contains("still-here"));
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_file(&gate);
 }
 
 #[tokio::test]
@@ -15816,6 +15896,54 @@ async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next()
         },
     )
     .await;
+}
+
+/// The live crash's trigger: the stall watchdog cancelled a quiet parent
+/// turn, and within the cancel grace the turn came back and asked the person
+/// a question. The watchdog restarted the adapter under the open question
+/// anyway. A turn that revives during the grace is watched afresh, and an
+/// open question is the operator's wait, not a stall.
+#[tokio::test]
+async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_restarted() {
+    let state = temp_state_file("stall-revived");
+    let log = temp_log("stall-revived");
+    let repo = planner_wire_repository();
+    let gate = std::env::temp_dir().join(format!("stall-revived-{}", uuid::Uuid::new_v4()));
+    let gate_for_test = gate.clone();
+    run_test_shared(
+        planner_watchdog_yaml(&state, &log, 1, 3),
+        async |cx, observed, _shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            observed.lock().unwrap().elicitation_gate = Some(gate_for_test.clone());
+            let asking = {
+                let cx = cx.clone();
+                let sid = sid.clone();
+                tokio::spawn(async move {
+                    prompt_text(
+                        &cx,
+                        &sid,
+                        "operator: ask\nSTALL_IGNORING_CANCEL:2000\nELICIT:Merge it?",
+                    )
+                    .await
+                })
+            };
+            // Past the stall limit plus the whole cancel grace.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            std::fs::write(&gate_for_test, "").unwrap();
+            let answered = tokio::time::timeout(Duration::from_secs(20), asking)
+                .await
+                .expect("the turn ends once the person answers")
+                .unwrap()?;
+            assert_eq!(answered.stop_reason, StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert!(text.contains("elicit:accept"), "{text}");
+            assert!(text.contains("parent turn stalled"), "{text}");
+            assert!(!text.contains("restarting its adapter"), "{text}");
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&gate);
 }
 
 fn dead_router() -> router_acp::planner_workflow::RunOwner {
