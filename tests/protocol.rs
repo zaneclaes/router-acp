@@ -5571,7 +5571,7 @@ async fn state_db_records_routing_diagnostics_title_and_tokens() {
         agent_yaml("mock", &[("m1", 1), ("m2", 2)], &[])
     );
     let state_path = state.clone();
-    run_test(yaml, async |cx, _observed| {
+    run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(
@@ -5621,6 +5621,41 @@ async fn state_db_records_routing_diagnostics_title_and_tokens() {
         assert_eq!(
             db.get(&sid).unwrap().title.as_deref(),
             Some("Login Bug Investigation")
+        );
+        // The client title names the pinned model, and every turn publishes
+        // busy at its start and idle at its end for the host's title bar.
+        let infos: Vec<(Option<String>, Option<bool>)> = observed
+            .lock()
+            .unwrap()
+            .updates
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::SessionInfoUpdate(update) => Some((
+                    update.title.value().cloned(),
+                    update
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("routerAcp"))
+                        .and_then(|router| router.get("busy"))
+                        .and_then(|busy| busy.as_bool()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            infos
+                .iter()
+                .all(|(title, _)| title.as_deref().is_some_and(|t| t.ends_with(" [m1]"))),
+            "{infos:?}"
+        );
+        assert!(
+            infos.iter().any(|(_, busy)| *busy == Some(true)),
+            "{infos:?}"
+        );
+        assert_eq!(
+            infos.last().and_then(|(_, busy)| *busy),
+            Some(false),
+            "{infos:?}"
         );
         Ok(())
     })
@@ -6257,6 +6292,59 @@ async fn model_shorthand_switches_mid_session_and_leaves_prose_alone() {
             text.contains("echo:m2:Note: this is just a note"),
             "prose passed through unchanged: {text}"
         );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn model_shorthand_names_a_cordoned_target_and_recovers_after_clear() {
+    let state = temp_state_file("shorthand-cordon");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("opus", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([(
+                CandidateId::new("b", "opus"),
+                router_acp::headroom::UsageCordon {
+                    reason: "weekly limit".into(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".into(),
+                    soft: false,
+                },
+            )]));
+
+        let failed = prompt_text(&cx, &sid, "opus: take over now").await;
+        assert!(
+            failed.is_err(),
+            "a cordoned explicit target must fail visibly"
+        );
+        assert!(
+            agent_text(&observed, &sid).contains("switch to b/opus failed"),
+            "the shorthand must not be forwarded as prose: {}",
+            agent_text(&observed, &sid)
+        );
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "opus: take over now").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("switched a/m1 → b/opus") && text.contains("echo:opus:"));
         Ok(())
     })
     .await;
@@ -7248,6 +7336,63 @@ async fn usage_cordoned_pin_switches_proactively() {
         assert!(
             text.contains("echo:m2:"),
             "turn must land on non-cordoned b/m2: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn usage_cordon_recovery_returns_a_session_to_its_displaced_model() {
+    let state = temp_state_file("proactive-cordon-recovery");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+
+        let displaced = CandidateId::new("a", "m1");
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([(
+                displaced.clone(),
+                router_acp::headroom::UsageCordon {
+                    reason: "weekly limit".into(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".into(),
+                    soft: false,
+                },
+            )]));
+        prompt_text(&cx, &sid, "temporarily use the fallback").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:m2:"));
+
+        // The account recovers before the next turn. The session must return
+        // to the model that the cordon displaced even with auto-upgrade off.
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "continue on the recovered account").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched b/m2 → a/m1") && text.contains("echo:m1:"),
+            "cordon recovery must re-pin the displaced model: {text}"
+        );
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+                .flatten(),
+            Some(displaced)
         );
         Ok(())
     })
