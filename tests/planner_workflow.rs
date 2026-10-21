@@ -5769,6 +5769,72 @@ async fn explicit_implement_adopts_a_cleanly_drained_run_without_losing_accepted
     );
 }
 
+#[tokio::test]
+async fn explicit_implement_skips_a_newer_plain_chat_run_in_the_same_checkout() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    finished_work(&f.shared).await;
+    let dead = planner_workflow::RunOwner {
+        pid: u32::MAX,
+        started_at_ms: 1,
+    };
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        run.owner = Some(dead);
+        Ok(())
+    })
+    .unwrap();
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    // An ordinary chat in the checkout, updated after the paused run: it has
+    // only the empty planning run every coordinator session gets.
+    let mut chat = persisted.clone();
+    chat.updated_at = Some(persisted.updated_at.unwrap_or(0) + 1_000);
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("chat".into(), chat.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "chat".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &chat, Vec::new()),
+    );
+    let plain = planner_workflow::ensure(&f.shared, "chat").unwrap();
+    assert!(plain.execution_request.is_none() && plain.works.is_empty());
+    f.shared.sessions.lock().unwrap().remove("chat");
+    planner_workflow::mutate(&f.shared, "chat", |run| {
+        run.owner = Some(dead);
+        Ok(())
+    })
+    .unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    {
+        let store = f.shared.state.lock().unwrap();
+        let report = planner_adopt::adopt_on_implement(&*store, "next").unwrap();
+        assert_eq!(report.from, SID);
+        assert_eq!(report.works.len(), 1);
+    }
+    let chat_run = planner_workflow::load(&f.shared, "chat").unwrap().unwrap();
+    assert_eq!(chat_run.status, RunStatus::Running);
+    assert!(chat_run.superseded_by.is_none());
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .as_deref(),
+        Some("next")
+    );
+}
+
 // The native implement-all watcher's guarantees (`planner_guard`) and the
 // `/shutdown` drain (`planner_shutdown`)
 // ---------------------------------------------------------------------------

@@ -542,16 +542,30 @@ pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<Ado
     ))
 }
 
-/// `/implement` in `into_sid`: resume the checkout's latest earlier planner
-/// run when it is running, draining or cleanly paused with no live owner. Older runs are what
-/// that latest one replaced and are left alone.
+/// Whether `run` is an implement run rather than the empty planning run every
+/// coordinator session gets. A plain chat in the same checkout must never
+/// stand in for the run it would otherwise shadow (live: a title-bar chat's
+/// empty `Planning` run was newer than a paused run with 266 works, so
+/// `/implement` adopted the chat and orphaned the real run).
+fn is_implement_run(run: &PlannerRun) -> bool {
+    run.execution_request.is_some() || !run.works.is_empty() || !run.releases.is_empty()
+}
+
+/// `/implement` in `into_sid`: resume the checkout's latest earlier implement
+/// run when it is running, draining or cleanly paused with no live owner. Older
+/// implement runs are what that latest one replaced and are left alone.
 pub fn adopt_on_implement(store: &dyn RunStore, into_sid: &str) -> Option<AdoptReport> {
-    let ids = store.run_ids_beside(into_sid).ok()?;
-    let latest = ids
+    let mut ids: Vec<String> = store
+        .run_ids_beside(into_sid)
+        .ok()?
         .into_iter()
         .filter(|id| id != into_sid && !id.contains("::"))
-        .max_by_key(|id| store.updated_at(id).unwrap_or(0))?;
-    let run = store.load(&latest).ok().flatten()?;
+        .collect();
+    ids.sort_by_key(|id| std::cmp::Reverse(store.updated_at(id).unwrap_or(0)));
+    let (latest, run) = ids.into_iter().find_map(|id| {
+        let run = store.load(&id).ok().flatten()?;
+        is_implement_run(&run).then_some((id, run))
+    })?;
     if run.superseded_by.is_some()
         || !matches!(
             run.status,
