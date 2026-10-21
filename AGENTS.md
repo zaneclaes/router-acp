@@ -173,7 +173,14 @@ SDK traps below, which were all discovered the hard way.
   cost → preference → config order.
 - **Coordinator sessions never leave the planning pool automatically.**
   `_meta.router_acp.session_role: "coordinator"` (sticky, `session/new` or
-  any `session/prompt`) sets `RouterSession.coordinator`. The chokepoints are
+  any `session/prompt`) sets `RouterSession.coordinator`, and so does an
+  admitted implementation command (`/implement`, bare `Implement …`) or a
+  human accepted-plan handoff (`[router: phase=implementation]` followed by
+  `[planner-handoff]`; `planner_workflow::parent_handoff`): the
+  durable planner parent only selects, assigns and reviews, so workflow
+  phase Implementation never makes it a worker. `PlannerRun.coordinator`
+  stores it; `PlannerRun::parent_role` restores it on resume/adoption (also
+  for runs saved before it was stored). The chokepoints are
   `Shared::coordinator_blocks` / `in_planning_pool` (planning_candidates),
   checked in `maybe_update_planner_phase`, the `phase=implementation`
   directive, `refuse_coordinator_switch` (every queued `pending_switch` and
@@ -183,7 +190,7 @@ SDK traps below, which were all discovered the hard way.
   `SwitchRequest.user_pick` / `OverrideSource::UserPick` pass, and
   `pin_user_pick` (persisted as `routing.user_pick`) keeps a human's pick in
   place. A new routing path that can move a pin must go through the same
-  check. Tests: `coordinator_*` in `tests/protocol.rs`.
+  check. Tests: `coordinator_*` and `epic_parent_*` in `tests/protocol.rs`.
 - **Proactive usage cordons** (`cordon.*` + per-agent `usage_source`;
   `src/usage.rs`): a periodic poll (`spawn_usage_poller` in `serve_shared`,
   aborted on return) reads the provider usage API and marks exhausted candidates

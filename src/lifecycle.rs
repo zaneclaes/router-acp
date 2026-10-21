@@ -36,7 +36,7 @@ fn restore(
     if let Some(run) = crate::planner_workflow::load(shared, sid)
         .map_err(|e| AcpError::internal_error().data(e))?
     {
-        session.coordinator |= run.coordinator;
+        session.coordinator |= run.parent_role();
         session.planner_phase = Some(run.phase);
     }
     session.pending_history = crate::restoration::lookup_context(shared, sid);

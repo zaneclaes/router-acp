@@ -272,6 +272,8 @@ fn merge(
             into.prior_policies.push(policy.clone());
         }
     }
+    // The adopting session continues the earlier parent's role.
+    into.coordinator |= from.parent_role();
     if into.completed_guides_at_start.is_none() {
         into.completed_guides_at_start = from.completed_guides_at_start.clone();
     }
