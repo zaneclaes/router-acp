@@ -11248,10 +11248,11 @@ async fn planner_planning_preclass_also_injects_protocol_and_host_instructions()
 
 #[tokio::test]
 async fn planner_phase_implementation_directive_switches_pinned_session() {
-    // The Kory handoff queues `[router: phase=implementation]` after the
-    // planning turn. That directive used to set the phase and then skip
-    // maybe_update_planner_phase (explicit_routing), so the pin stayed on
-    // the planning model. It must summarize-and-re-pin onto implementation.
+    // A `[router: phase=implementation]` directive used to set the phase and
+    // then skip maybe_update_planner_phase (explicit_routing), so the pin
+    // stayed on the planning model. It must summarize-and-re-pin onto
+    // implementation. Kory's accepted-plan handoff adds `[planner-handoff]`
+    // and makes a durable parent instead (`epic_parent_proceed_handoff_*`).
     let state = temp_state_file("planner-phase-directive-switch");
     let log = temp_log("planner-phase-directive-switch");
     let preclass = r#"{"routing":{"task_class":"BugFix","complexity":0.4,"confidence":0.9,"reason":"fix the bug"},"planner_phase":{"phase":"planning","confidence":0.9,"plan_ready":false,"reason":"needs a plan"}}"#;
@@ -11291,12 +11292,7 @@ async fn planner_phase_implementation_directive_switches_pinned_session() {
             "first turn on the planning candidate"
         );
 
-        prompt_text(
-            &cx,
-            &sid,
-            "[router: phase=implementation]\n[planner-handoff] start the work",
-        )
-        .await?;
+        prompt_text(&cx, &sid, "[router: phase=implementation]\nstart the work").await?;
         assert_eq!(
             shared.with_session(&sid, |s| s.planner_phase).flatten(),
             Some(router_acp::config::PlannerPhase::Implementation)
@@ -11795,6 +11791,479 @@ async fn coordinator_role_pulls_an_automatic_workhorse_pin_back_to_planning() {
     .await;
 }
 
+// ======================================================================
+// Durable orchestration parent: a leading `Implement …` / `/implement`
+// makes the session a planner-run parent that selects, assigns and
+// reviews work. Workflow phase is Implementation, but the parent's model
+// pool stays planning_candidates; only its children use the implementation
+// pool. Incident: `Implement EPIC …` pinned Grok (implementation pool, apex
+// ranking) while sibling Claude and Codex seats had 81% / 87% headroom.
+// ======================================================================
+
+/// The incident's fleet: cordoned home Claude/Codex accounts, healthy
+/// siblings, and an implementation-only Grok with the top raw quality.
+fn epic_parent_yaml(tag: &str, log: &std::path::Path) -> String {
+    let state = temp_state_file(tag);
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"claude@*\", default_quality: 2.90 }\n\
+         \x20 - { pattern: \"codex@*\", default_quality: 3.00 }\n\
+         \x20 - { pattern: \"grok@*\", default_quality: 3.10 }\n",
+    )
+    .unwrap();
+    let log = log.display().to_string();
+    let env = [("MOCK_LOG", log.as_str())];
+    format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         router: planner\nrouters:\n  planner:\n    \
+         planning_candidates: [\"*fable*\", \"*gpt-6.1-sol\"]\n    \
+         implementation_candidates: [\"*opus*\", \"*grok*\"]\n\
+         agents:\n{}{}{}{}{}",
+        state.display(),
+        scores.display(),
+        agent_yaml("claude@home", &[("fable", 3), ("opus", 2)], &env),
+        agent_yaml("claude@sibling", &[("fable", 3), ("opus", 2)], &env),
+        agent_yaml("codex@home", &[("gpt-6.1-sol", 3)], &env),
+        agent_yaml("codex@sibling", &[("gpt-6.1-sol", 3)], &env),
+        agent_yaml("grok@seat", &[("grok-4.7", 1)], &env),
+    )
+}
+
+fn epic_cordon(reason: &str) -> router_acp::headroom::UsageCordon {
+    router_acp::headroom::UsageCordon {
+        reason: reason.to_string(),
+        resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+        soft: true,
+    }
+}
+
+/// Home accounts past their reserve; siblings at the incident's headroom.
+fn cordon_home_accounts(shared: &router_acp::session::Shared, also: &[CandidateId]) {
+    let mut cordons: std::collections::HashMap<_, _> = [
+        CandidateId::new("claude@home", "fable"),
+        CandidateId::new("claude@home", "opus"),
+        CandidateId::new("codex@home", "gpt-6.1-sol"),
+    ]
+    .into_iter()
+    .chain(also.iter().cloned())
+    .map(|c| {
+        (
+            c,
+            epic_cordon("Weekly usage limit reached (10% capacity reserved)"),
+        )
+    })
+    .collect();
+    let mut headroom = shared.headroom.lock().unwrap();
+    headroom.set_usage_cordons(std::mem::take(&mut cordons));
+    headroom.set_polled_availability(
+        [
+            (
+                CandidateId::new("claude@sibling", "fable"),
+                plan_availability(0.81, false),
+            ),
+            (
+                CandidateId::new("codex@sibling", "gpt-6.1-sol"),
+                plan_availability(0.87, false),
+            ),
+        ]
+        .into(),
+    );
+}
+
+/// The exact `session/prompt` Kory Code's SessionManager sends: one text
+/// block, `_meta.router_acp.{input_id, agent_origin}`, plus the coordinator
+/// role only once the relay has latched Create EPIC.
+async fn session_manager_prompt(
+    cx: &ConnectionTo<AgentPeer>,
+    session_id: &str,
+    text: &str,
+    coordinator: bool,
+) -> Result<PromptResponse, AcpError> {
+    let mut router = serde_json::json!({
+        "input_id": uuid::Uuid::new_v4().to_string(),
+        "agent_origin": false,
+    });
+    if coordinator {
+        router["session_role"] = serde_json::json!("coordinator");
+    }
+    let meta: agent_client_protocol::schema::v1::Meta =
+        serde_json::from_value(serde_json::json!({ "router_acp": router })).unwrap();
+    cx.send_request(
+        PromptRequest::new(
+            session_id.to_string(),
+            vec![ContentBlock::from(text.to_string())],
+        )
+        .meta(meta),
+    )
+    .block_task()
+    .await
+}
+
+const EPIC_COMMAND: &str = "Implement EPIC HAI-11556 — fan the planner fixes out to child tickets";
+
+fn assert_planner_parent(
+    shared: &router_acp::session::Shared,
+    observed: &ObservedHandle,
+    sid: &str,
+) {
+    let text = agent_text(observed, sid);
+    let pin = pinned(shared, sid);
+    assert!(
+        shared.in_planning_pool(&pin),
+        "the parent left planning_candidates for {pin}: {text}"
+    );
+    assert!(
+        !pin.agent.ends_with("@home"),
+        "a cordoned home account was selected: {pin}"
+    );
+    assert!(
+        !text.contains("grok@seat") || text.contains("skipped"),
+        "an implementation-only model ran the parent: {text}"
+    );
+    assert!(
+        text.contains("planner parent: planning_candidates"),
+        "the parent role is disclosed: {text}"
+    );
+    assert!(
+        text.contains("planning_candidates"),
+        "the routing line names the planning pool: {text}"
+    );
+    assert!(shared.with_session(sid, |s| s.coordinator).unwrap());
+    assert_eq!(
+        shared.with_session(sid, |s| s.planner_phase).flatten(),
+        Some(router_acp::config::PlannerPhase::Implementation),
+        "workflow phase stays Implementation"
+    );
+    let run = router_acp::planner_workflow::load(shared, sid)
+        .unwrap()
+        .unwrap();
+    assert!(run.coordinator, "the durable run records the parent role");
+    assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+}
+
+#[tokio::test]
+async fn epic_parent_implement_command_routes_through_the_planning_pool() {
+    let log = temp_log("epic-parent-incident");
+    let yaml = epic_parent_yaml("epic-parent-incident", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(&shared, &[]);
+        // Independent concurrent sessions: the incident's bare `Implement`,
+        // the slash command, and a control that is not a durable parent.
+        let epic = new_session(&cx).await?.session_id.0.to_string();
+        let slash = new_session(&cx).await?.session_id.0.to_string();
+        let control = new_session(&cx).await?.session_id.0.to_string();
+        let (a, b, c) = tokio::join!(
+            session_manager_prompt(&cx, &epic, EPIC_COMMAND, false),
+            session_manager_prompt(&cx, &slash, "/implement plans/epic.md", false),
+            session_manager_prompt(
+                &cx,
+                &control,
+                "[router: phase=implementation]\nbuild the accepted change",
+                false
+            ),
+        );
+        a?;
+        b?;
+        c?;
+        assert_planner_parent(&shared, &observed, &epic);
+        assert_planner_parent(&shared, &observed, &slash);
+        assert!(
+            !shared.with_session(&control, |s| s.coordinator).unwrap(),
+            "a parent's role never leaks into another session"
+        );
+        assert!(
+            !shared.in_planning_pool(&pinned(&shared, &control)),
+            "a non-parent implementation session keeps implementation_candidates"
+        );
+
+        // An owned wake (agent-origin, untagged) keeps the parent in place.
+        let meta: agent_client_protocol::schema::v1::Meta =
+            serde_json::from_value(serde_json::json!({"router_acp":{"agent_origin":true}}))
+                .unwrap();
+        cx.send_request(
+            PromptRequest::new(epic.clone(), vec![ContentBlock::from("child report ready")])
+                .meta(meta),
+        )
+        .block_task()
+        .await?;
+        assert!(shared.in_planning_pool(&pinned(&shared, &epic)));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn epic_parent_create_epic_handoff_stays_on_the_planning_pool() {
+    let log = temp_log("epic-parent-handoff");
+    let yaml = epic_parent_yaml("epic-parent-handoff", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(&shared, &[]);
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        session_manager_prompt(&cx, &sid, "/plan split HAI-11556 into child tickets", false)
+            .await?;
+        // `plannerHandoffPrompt` after an accepted Create EPIC.
+        session_manager_prompt(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\n[planner-handoff] The user accepted the plan. \
+             Continue from the plan just presented; do not re-plan unless it is insufficient.\n\
+             https://linear.app/hickoryai/issue/HAI-11556",
+            true,
+        )
+        .await?;
+        session_manager_prompt(&cx, &sid, EPIC_COMMAND, true).await?;
+        assert_planner_parent(&shared, &observed, &sid);
+        Ok(())
+    })
+    .await;
+}
+
+/// Kory Code's "Proceed with implementation" answer sends `plannerHandoffPrompt`
+/// with no coordinator role. That session admits the work and delegates its
+/// children, so it is the durable parent and stays on `planning_candidates`.
+#[tokio::test]
+async fn epic_parent_proceed_handoff_stays_on_the_planning_pool() {
+    let log = temp_log("epic-parent-proceed");
+    let yaml = epic_parent_yaml("epic-parent-proceed", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(&shared, &[]);
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        session_manager_prompt(&cx, &sid, "/plan fix the planner parent pool", false).await?;
+        assert!(shared.in_planning_pool(&pinned(&shared, &sid)));
+        session_manager_prompt(
+            &cx,
+            &sid,
+            "[router: phase=implementation]\n[planner-handoff] The user accepted the plan. \
+             Continue from the plan just presented; do not re-plan unless it is insufficient.\n\
+             https://linear.app/hickoryai/issue/HAI-11584",
+            false,
+        )
+        .await?;
+        assert_planner_parent(&shared, &observed, &sid);
+        // A run saved before the role was stored is still the handoff's parent.
+        let mut run = router_acp::planner_workflow::load(&shared, &sid)
+            .unwrap()
+            .unwrap();
+        run.coordinator = false;
+        assert!(
+            run.parent_role(),
+            "the admitted handoff identifies the parent"
+        );
+
+        // An agent-origin wake after the handoff keeps the parent in place.
+        let meta: agent_client_protocol::schema::v1::Meta =
+            serde_json::from_value(serde_json::json!({"router_acp":{"agent_origin":true}}))
+                .unwrap();
+        cx.send_request(
+            PromptRequest::new(sid.clone(), vec![ContentBlock::from("child report ready")])
+                .meta(meta),
+        )
+        .block_task()
+        .await?;
+        assert!(shared.in_planning_pool(&pinned(&shared, &sid)));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn epic_parent_reports_when_no_planner_is_eligible() {
+    let log = temp_log("epic-parent-no-planner");
+    let yaml = epic_parent_yaml("epic-parent-no-planner", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(
+            &shared,
+            &[
+                CandidateId::new("claude@sibling", "fable"),
+                CandidateId::new("codex@sibling", "gpt-6.1-sol"),
+            ],
+        );
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let err = session_manager_prompt(&cx, &sid, EPIC_COMMAND, false)
+            .await
+            .expect_err("no planner → the parent reports it instead of routing");
+        assert!(
+            format!("{err:?}").contains("no planning candidate is routeable"),
+            "{err:?}"
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(!text.contains("echo:"), "a model answered anyway: {text}");
+        assert!(shared.with_session(&sid, |s| s.pin.is_none()).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn epic_parent_fails_over_inside_the_planning_pool() {
+    let log = temp_log("epic-parent-failover");
+    let yaml = epic_parent_yaml("epic-parent-failover", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(&shared, &[]);
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        session_manager_prompt(&cx, &sid, EPIC_COMMAND, false).await?;
+        let first = pinned(&shared, &sid);
+        // The parent's model becomes unavailable between turns.
+        cordon_home_accounts(&shared, std::slice::from_ref(&first));
+        session_manager_prompt(&cx, &sid, "continue reviewing the children", false).await?;
+        let next = pinned(&shared, &sid);
+        let text = agent_text(&observed, &sid);
+        assert_ne!(next, first, "{text}");
+        assert!(
+            shared.in_planning_pool(&next),
+            "failover left the planning pool for {next}: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn epic_parent_honors_an_explicit_human_pick() {
+    let log = temp_log("epic-parent-user-pick");
+    let yaml = epic_parent_yaml("epic-parent-user-pick", &log);
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(&shared, &[]);
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        session_manager_prompt(
+            &cx,
+            &sid,
+            &format!("[router: candidate=grok@seat/grok-4.7]\n{EPIC_COMMAND}"),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("grok@seat", "grok-4.7")
+        );
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+        session_manager_prompt(&cx, &sid, "keep going", false).await?;
+        assert_eq!(
+            pinned(&shared, &sid),
+            CandidateId::new("grok@seat", "grok-4.7"),
+            "a human pick survives later parent turns"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn epic_parent_role_survives_native_resume_of_a_pre_fix_run() {
+    let log = temp_log("epic-parent-resume");
+    let yaml = epic_parent_yaml("epic-parent-resume", &log);
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        cordon_home_accounts(&shared, &[]);
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        session_manager_prompt(&cx, &sid, EPIC_COMMAND, false).await?;
+        // A run written before the parent role was recorded, and snapshots
+        // that do not carry it either.
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.coordinator = false;
+            Ok(())
+        })
+        .unwrap();
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+        let mut persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        for snapshot in [&mut persisted.routing, &mut persisted.session_config] {
+            let snapshot = snapshot.as_mut().expect("planner session checkpoint");
+            snapshot["coordinator"] = serde_json::Value::Bool(false);
+            snapshot["candidate"] = serde_json::Value::Null;
+        }
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(sid.clone(), persisted)
+            .unwrap();
+        cx.send_request(
+            agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(),
+                std::env::temp_dir(),
+            ),
+        )
+        .block_task()
+        .await?;
+        assert!(
+            shared.with_session(&sid, |s| s.coordinator).unwrap(),
+            "the restored parent keeps its role"
+        );
+        session_manager_prompt(&cx, &sid, "child report ready", false).await?;
+        assert!(
+            shared.in_planning_pool(&pinned(&shared, &sid)),
+            "{}",
+            agent_text(&observed, &sid)
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn epic_parent_children_keep_the_implementation_pool() {
+    let state = temp_state_file("epic-parent-child-pool");
+    let log = temp_log("epic-parent-child-pool");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let env = [("MOCK_LOG", log.to_str().unwrap())];
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\nauto_upgrade: {{enabled: false}}\n\
+         delegation: {{enabled: true}}\nrouters:\n  planner:\n    \
+         planning_candidates: ['plan/sol']\n    implementation_candidates: ['work/opus']\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("plan", &[("sol", 3)], &env),
+        agent_yaml("work", &[("opus", 3)], &env),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        session_manager_prompt(&cx, &sid, EPIC_COMMAND, false).await?;
+        assert_eq!(pinned(&shared, &sid), CandidateId::new("plan", "sol"));
+        let task = format!(
+            "{}MCP_CALL:router-delegate delegate_task {{\"work_id\":\"work-1\",\"task\":\"child-pool-wire\"}}",
+            planner_admit_wire_prompt(),
+        );
+        prompt_text(&cx, &sid, &task).await?;
+        let events = wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+        let child = events
+            .iter()
+            .find(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[Assignment briefing]"))
+            })
+            .unwrap();
+        assert_eq!(child["agent"], "work", "the child runs on implementation_candidates");
+        assert_eq!(pinned(&shared, &sid), CandidateId::new("plan", "sol"));
+        Ok(())
+    })
+    .await;
+}
+
 fn capacity_failover_yaml(label: &str, failover: &str) -> String {
     let state = temp_state_file(label);
     let scores = std::env::temp_dir().join(format!(
@@ -12150,11 +12619,12 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
     .await;
 }
 
-/// An explicit `/implement` routes its parent from `implementation_candidates`
-/// alone: the inlined role skill must not raise complexity into the apex
-/// crossover that admits the planning pool.
+/// An explicit `/implement` makes its session the durable planner parent, so
+/// it pins from `planning_candidates` even when `implementation_candidates`
+/// would win on boosts; only its `work_id` children use the implementation
+/// pool (`epic_parent_children_keep_the_implementation_pool`).
 #[tokio::test]
-async fn an_explicit_implement_command_pins_from_the_implementation_pool() {
+async fn an_explicit_implement_command_pins_its_parent_from_the_planning_pool() {
     let repo = tempfile::tempdir().unwrap();
     let dir = repo.path().join(".agents/skills/implement");
     std::fs::create_dir_all(&dir).unwrap();
@@ -12193,7 +12663,8 @@ async fn an_explicit_implement_command_pins_from_the_implementation_pool() {
         let pinned = shared
             .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
             .unwrap();
-        assert_eq!(pinned, "work");
+        assert_eq!(pinned, "plan");
+        assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
         Ok(())
     })
     .await;
@@ -12267,11 +12738,13 @@ async fn planner_commands_reverse_phase_and_preserve_repository_guidance_once() 
             shared.with_session(&sid, |s| s.planner_phase).flatten(),
             Some(router_acp::config::PlannerPhase::Implementation)
         );
+        // The `/implement` session is the durable parent: it stays on the
+        // planning pool while the workflow phase is Implementation.
         assert_eq!(
             shared
                 .with_session(&sid, |s| s.pin.as_ref().unwrap().candidate.agent.clone())
                 .unwrap(),
-            "work"
+            "plan"
         );
         assert!(
             planner_user_prompts(&log)

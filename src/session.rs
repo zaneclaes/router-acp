@@ -8468,6 +8468,65 @@ fn static_unrouteable_message(
     }
 }
 
+/// Queue the switch that returns a coordinator's automatic off-pool pin to
+/// `planning_candidates`. A human pick stays where it is.
+fn queue_coordinator_return(shared: &Arc<Shared>, router_sid: &str) {
+    let (pin, user_pick, class, excluded) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.pin.as_ref().map(|p| p.candidate.clone()),
+                s.pin_user_pick,
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+            )
+        })
+        .unwrap_or((None, false, TaskClass::CodingGeneral, Vec::new()));
+    if let Some(pin) = pin
+        && !user_pick
+        && !shared.in_planning_pool(&pin)
+        && let Some(target) = select_planner_target(
+            shared,
+            crate::config::PlannerPhase::Planning,
+            class,
+            &excluded,
+            None,
+        )
+        .filter(|t| shared.in_planning_pool(t))
+    {
+        shared.with_session(router_sid, |s| {
+            s.pending_switch = Some(SwitchRequest {
+                target,
+                reason: format!("coordinator returns from {pin} to planning_candidates"),
+                handoff: HandoffStyle::Full,
+                user_pick: false,
+            });
+        });
+    }
+}
+
+/// The session became a planner run's durable parent: it selects, assigns and
+/// reviews work on `planning_candidates`, and only its children use
+/// `implementation_candidates`. Disclosed on every admission.
+fn enter_planner_parent(shared: &Arc<Shared>, router_sid: &str, coordinator: &mut bool) {
+    shared.with_session(router_sid, |s| s.coordinator = true);
+    if !*coordinator {
+        *coordinator = true;
+        // A directive parsed earlier in the prompt already chose the switch.
+        if shared
+            .with_session(router_sid, |s| s.pending_switch.is_none())
+            .unwrap_or(false)
+        {
+            queue_coordinator_return(shared, router_sid);
+        }
+    }
+    notify_user(
+        shared,
+        router_sid,
+        "router-acp · planner parent: planning_candidates — this session selects, \
+         assigns and reviews work; its children use implementation_candidates",
+    );
+}
+
 /// A coordinator only leaves `planning_candidates` on a human pick. Anything
 /// else (planner upgrade, skill route, escalation, demotion) is
 /// refused and disclosed; the session stays on its current model.
@@ -10037,7 +10096,7 @@ fn prepare_parent_prompt_inner(
     // Coordinator role is sticky: a tagged prompt sets it, an untagged one
     // never clears it. A coordinator found in Implementation (tagged late, or
     // upgraded before this guard existed) is pulled back to Planning.
-    let (coordinator, planner_session) = shared
+    let (mut coordinator, planner_session) = shared
         .with_session(&router_sid, |s| {
             s.coordinator |= meta_marks_coordinator(req.meta.as_ref());
             (s.coordinator, s.strategy == StrategyKind::Planner)
@@ -10055,37 +10114,7 @@ fn prepare_parent_prompt_inner(
     // role arrived, or a pre-guard session) goes back to the planning pool.
     // A directive or shorthand parsed below replaces this queued switch.
     if coordinator {
-        let (pin, user_pick, class, excluded) = shared
-            .with_session(&router_sid, |s| {
-                (
-                    s.pin.as_ref().map(|p| p.candidate.clone()),
-                    s.pin_user_pick,
-                    s.task_class.unwrap_or(TaskClass::CodingGeneral),
-                    s.excluded.clone(),
-                )
-            })
-            .unwrap_or((None, false, TaskClass::CodingGeneral, Vec::new()));
-        if let Some(pin) = pin
-            && !user_pick
-            && !shared.in_planning_pool(&pin)
-            && let Some(target) = select_planner_target(
-                &shared,
-                crate::config::PlannerPhase::Planning,
-                class,
-                &excluded,
-                None,
-            )
-            .filter(|t| shared.in_planning_pool(t))
-        {
-            shared.with_session(&router_sid, |s| {
-                s.pending_switch = Some(SwitchRequest {
-                    target,
-                    reason: format!("coordinator returns from {pin} to planning_candidates"),
-                    handoff: HandoffStyle::Full,
-                    user_pick: false,
-                });
-            });
-        }
+        queue_coordinator_return(&shared, &router_sid);
     }
     // Set when a `[router: phase=implementation]` directive upgrades a pinned
     // planning session — the same summarize-and-re-pin as a detected upgrade.
@@ -10259,6 +10288,12 @@ fn prepare_parent_prompt_inner(
                         shared.with_session(&router_sid, |s| {
                             s.planner_phase = Some(PlannerPhase::Implementation);
                         });
+                        // The accepted-plan handoff makes this session the
+                        // run's durable parent, like an implementation command.
+                        if planner_session && crate::planner_workflow::parent_handoff(&original_req)
+                        {
+                            enter_planner_parent(&shared, &router_sid, &mut coordinator);
+                        }
                         if pinned && current != Some(PlannerPhase::Implementation) && !coordinator {
                             planner_needs_switch = true;
                             notify_user(
@@ -10384,6 +10419,16 @@ fn prepare_parent_prompt_inner(
         ) {
             Ok(Some(phase)) => {
                 explicit_routing = true;
+                // An implementation command makes this session a durable
+                // parent: it selects, assigns and reviews work on the planning
+                // pool, and only its children use implementation_candidates.
+                if phase == crate::config::PlannerPhase::Implementation
+                    && shared
+                        .with_session(&router_sid, |s| s.coordinator)
+                        .unwrap_or(false)
+                {
+                    enter_planner_parent(&shared, &router_sid, &mut coordinator);
+                }
                 planner_needs_switch |= already_pinned && current != Some(phase) && !coordinator;
                 shared.with_session(&router_sid, |s| {
                     s.planner_phase = Some(phase);

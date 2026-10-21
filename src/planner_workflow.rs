@@ -101,6 +101,27 @@ pub enum RunStatus {
     Superseded,
 }
 
+impl PlannerRun {
+    /// The session is this run's durable parent and keeps the planning pool.
+    /// Runs recorded before the parent role was stored are recognized by an
+    /// execution request that an implementation command or the accepted-plan
+    /// handoff admitted.
+    pub fn parent_role(&self) -> bool {
+        self.coordinator
+            || (self.phase == PlannerPhase::Implementation
+                && self.execution_input_id.as_ref().is_some_and(|id| {
+                    self.commands.contains(id)
+                        || self.inputs.get(id).is_some_and(|input| {
+                            input.origin == "human"
+                                && parent_handoff(&PromptRequest::new(
+                                    id.clone(),
+                                    vec![ContentBlock::from(input.text.clone())],
+                                ))
+                        })
+                }))
+    }
+}
+
 /// A run's stored `draining` that no drain in this router owns: the router
 /// that drained it died, so it resumes like `paused`.
 fn stale_drain(shared: &Shared, sid: &str, status: RunStatus) -> bool {
@@ -831,7 +852,11 @@ fn user_command_once(
         }
     }
     run.phase = phase;
-    run.coordinator |= shared.with_session(sid, |s| s.coordinator).unwrap_or(false);
+    // An implementation command makes this session the run's durable parent.
+    // The parent selects, assigns and reviews work, so its model pool is the
+    // planning pool whatever the workflow phase; children keep theirs.
+    run.coordinator |= phase == PlannerPhase::Implementation
+        || shared.with_session(sid, |s| s.coordinator).unwrap_or(false);
     if phase == PlannerPhase::Implementation || run.status == RunStatus::Complete {
         if resuming {
             run.approval_waits.clear();
@@ -888,6 +913,7 @@ fn user_command_once(
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
     save(shared, sid, &mut run)?;
+    shared.with_session(sid, |s| s.coordinator |= run.coordinator);
     if explicit {
         let typed = format!("{entrypoint_name} {args}");
         shared.with_session(sid, |s| {
@@ -971,6 +997,36 @@ fn directed_phase(req: &PromptRequest) -> Option<PlannerPhase> {
         .and_then(|(directives, _)| directives.phase)
 }
 
+/// Kory Code's accepted-plan handoff ("Proceed with implementation" and
+/// Create EPIC): a human `[router: phase=implementation]` directive followed
+/// by the `[planner-handoff]` tag. The session it reaches admits the work and
+/// delegates children, so it becomes the run's durable parent.
+pub(crate) fn parent_handoff(req: &PromptRequest) -> bool {
+    if directed_phase(req) != Some(PlannerPhase::Implementation) {
+        return false;
+    }
+    let Ok(Some((_, stripped))) = crate::session::parse_prompt_directives(&req.prompt) else {
+        return false;
+    };
+    stripped
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Text(t) => {
+                let typed = crate::accounts::without_turn_context(&t.text);
+                (!typed.trim().is_empty()).then(|| {
+                    typed
+                        .trim_start()
+                        .get(..PLANNER_HANDOFF_TAG.len())
+                        .is_some_and(|tag| tag.eq_ignore_ascii_case(PLANNER_HANDOFF_TAG))
+                })
+            }
+            _ => Some(false),
+        })
+        .unwrap_or(false)
+}
+
+const PLANNER_HANDOFF_TAG: &str = "[planner-handoff]";
+
 pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Result<(), String> {
     if load(shared, sid)?.is_none() {
         return Ok(());
@@ -1017,6 +1073,7 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
                 run.status = RunStatus::Running;
                 run.execution_request = Some(display_text(req));
                 run.execution_input_id = input_id;
+                run.coordinator |= parent_handoff(req);
             }
         }
         if let Some(wake) = req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_wake_ack")).and_then(Value::as_str) {

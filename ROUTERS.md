@@ -469,7 +469,13 @@ A host marks a session that must only plan (an epic's parent that spawns
 and supervises implementation sessions) with
 `_meta.router_acp.session_role: "coordinator"` on `session/new` or any
 `session/prompt`. The role is sticky: a later prompt without it does not
-clear it. A coordinator:
+clear it. An authentic leading `/implement` or bare `Implement …`, or a human
+accepted-plan handoff (`[router: phase=implementation]` followed by
+`[planner-handoff]`), sets the same role: that session becomes the planner run's durable parent, which selects,
+assigns and reviews work while its `work_id` children use
+`implementation_candidates`. The run stores the role, so native resume and
+adoption restore it (`router-acp · planner parent: planning_candidates` is
+disclosed on each admitted command). A coordinator:
 
 - keeps workflow phase separate from its coordinator role. `/implement` can
   select child execution and `/plan` can select refinement. Neither changes
