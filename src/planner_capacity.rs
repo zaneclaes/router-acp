@@ -11,7 +11,10 @@
 //! 2. A candidate may stay unadmitted only behind a 30-minute `hold` with one
 //!    of exactly three reasons ([`HOLD_REASONS`]). A fourth, `production-failure`,
 //!    holds no candidate: it declares a known production failure under repair,
-//!    which the audit host verifies against preserved evidence.
+//!    which the audit host verifies against preserved evidence. A fifth,
+//!    `awaiting-human`, holds the whole run: the human has not authorized
+//!    the work, so no wake or auto-admission fills slots until their next
+//!    message clears it.
 //! 3. A parent below `delegation.max_concurrent` with an unheld
 //!    candidate gets a capacity wake every `wake_after_secs`, with no give-up.
 //! 4. After `auto_admit_after_wakes` such wakes, or `auto_admit_after_secs`
@@ -35,12 +38,16 @@ use crate::planner_workflow::{self, Operation, PlannerRun, RunStatus, Wake, Work
 use crate::session::Shared;
 
 /// The only reasons a capacity-host candidate may stay out of a free slot.
-pub const HOLD_REASONS: [&str; 4] = [
+pub const HOLD_REASONS: [&str; 5] = [
     "source-conflict",
     "dependency",
     "disk-floor",
     "production-failure",
+    AWAITING_HUMAN,
 ];
+/// The run-wide hold for work the human has not authorized. It never
+/// expires; the human's next message clears it.
+pub const AWAITING_HUMAN: &str = "awaiting-human";
 /// How long a hold keeps its candidate unadmitted.
 pub const HOLD_MS: i64 = 30 * 60 * 1000;
 /// Delay before each successive resumption of a worker that stopped early.
@@ -296,27 +303,58 @@ pub fn record_hold(
                 );
             }
         }
+        // The human declined or has not yet authorized the work. Their own
+        // words are the evidence; only their next message lifts the hold.
+        AWAITING_HUMAN => {
+            if !detail.contains('"') {
+                return Err(
+                    "an awaiting-human hold must quote, in detail, the human's own words that \
+                     withhold authorization (for example: human said \"Not yet\")"
+                        .into(),
+                );
+            }
+        }
         other => {
             return Err(format!(
                 "hold reason `{other}` is not allowed. A candidate may stay unadmitted only for \
                  exactly one of three reasons: `source-conflict` (detail names the live work_id \
                  it conflicts with), `dependency` (detail names the unmet work or plan), or \
                  `disk-floor` (detail carries the measured free bytes). Anything else is no \
-                 reason to leave a worker slot empty: admit the candidate."
+                 reason to leave a worker slot empty: admit the candidate. When the human has \
+                 not authorized the work at all, record `awaiting-human` with their quoted \
+                 words in detail: it holds the whole run until their next message."
             ));
         }
     }
     run.capacity.holds.retain(|_, h| h.expires_at_ms > now_ms);
+    let expires_at_ms = if reason == AWAITING_HUMAN {
+        i64::MAX
+    } else {
+        now_ms + HOLD_MS
+    };
     run.capacity.holds.insert(
         plan_id.to_string(),
         Hold {
             plan_id: plan_id.to_string(),
             reason: reason.to_string(),
             detail: detail.to_string(),
-            expires_at_ms: now_ms + HOLD_MS,
+            expires_at_ms,
         },
     );
     Ok(())
+}
+
+/// The run-wide hold the human's withheld authorization placed, if any.
+pub fn human_hold(run: &PlannerRun) -> Option<&Hold> {
+    run.capacity
+        .holds
+        .values()
+        .find(|h| h.reason == AWAITING_HUMAN)
+}
+
+/// The human spoke: a hold that waited on them is answered.
+pub fn clear_human_hold(run: &mut PlannerRun) {
+    run.capacity.holds.retain(|_, h| h.reason != AWAITING_HUMAN);
 }
 
 /// Ask the capacity host for candidates. `None` when no host is configured.
@@ -550,6 +588,7 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if run.status != RunStatus::Running
         || run.phase != PlannerPhase::Implementation
         || run.execution_request.is_none()
+        || human_hold(&run).is_some()
     {
         return;
     }

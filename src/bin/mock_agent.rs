@@ -51,6 +51,9 @@
 //!   creating the file
 //! - `TEXT:<message>` — stream text before the remaining directives
 //! - `HANG_IGNORING_CANCEL` — go silent forever and ignore `session/cancel`
+//! - `STALL_IGNORING_CANCEL:<ms>` — go silent for `<ms>`, then run the
+//!   remaining directives as if no `session/cancel` had arrived (a turn the
+//!   stall watchdog cancels that later comes back, e.g. to ask a question)
 //! - `FOLDED_RESULT` — send a cost-bearing `usage_update` stamped with an
 //!   autonomous `_claude/origin`, then never answer until cancelled (the
 //!   claude-agent-acp lost turn end)
@@ -511,6 +514,14 @@ async fn run_prompt(
 
     for line in text.lines() {
         let line = line.trim();
+        if let Some(ms) = line.strip_prefix("STALL_IGNORING_CANCEL:") {
+            let ms: u64 = ms.parse().unwrap_or(100);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            if let Some(s) = mock.state.lock().unwrap().sessions.get_mut(&session_id) {
+                s.cancelled = false;
+            }
+            continue;
+        }
         // Cancel-aware between steps (so a mid-turn escalation's session/cancel
         // stops the investigation promptly, like a real adapter would).
         if mock

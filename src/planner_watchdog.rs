@@ -242,64 +242,113 @@ where
     let Some(limit) = stuck_limit(shared) else {
         return turn.await;
     };
-    let started = Instant::now();
+    let mut started = Instant::now();
     begin(shared, sid);
     crate::planner_guard::with_runtime(shared, sid, |rt| rt.stalled = false);
     tokio::pin!(turn);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let quiet = loop {
-        tokio::select! {
-            result = &mut turn => return result,
-            _ = tick.tick() => {}
+    loop {
+        let quiet = loop {
+            tokio::select! {
+                result = &mut turn => return result,
+                _ = tick.tick() => {}
+            }
+            let quiet = quiet_for(shared, sid, started);
+            // A turn parked on its router-managed background terminals waits on
+            // the router, not the adapter: that wait has its own completion.
+            let parked = shared
+                .background_interrupts
+                .lock()
+                .unwrap()
+                .contains_key(sid);
+            if quiet >= limit && !parked && !awaiting_operator(shared, sid) {
+                break quiet;
+            }
+        };
+        let minutes = quiet.as_secs() / 60;
+        let span = if minutes > 0 {
+            format!("{minutes} min")
+        } else {
+            format!("{} s", quiet.as_secs())
+        };
+        tracing::error!(
+            session = sid,
+            quiet_secs = quiet.as_secs(),
+            "planner parent turn stalled: no downstream progress; cancelling it"
+        );
+        log_notice(
+            shared,
+            sid,
+            &format!("router-acp · parent turn stalled {span}: cancelling"),
+        );
+        with_runtime_stalled(shared, sid);
+        let cancelled_at = Instant::now();
+        let cancelled_pin = current_pin(shared, sid);
+        cancel_downstream(shared, sid);
+        let deadline = tokio::time::Instant::now() + cancel_grace(shared);
+        let revived = loop {
+            tokio::select! {
+                result = &mut turn => return result,
+                _ = tokio::time::sleep_until(deadline) => break false,
+                _ = tick.tick() => {}
+            }
+            if turn_revived(shared, sid, cancelled_at, cancelled_pin.as_deref()) {
+                break true;
+            }
+        };
+        if revived {
+            // A failover reopened the turn on a new adapter, or the turn now
+            // waits on the operator (an open question): it is live again, so
+            // watch it afresh instead of restarting the adapter under it.
+            tracing::warn!(
+                session = sid,
+                "stalled planner parent turn revived during its cancel grace"
+            );
+            log_notice(
+                shared,
+                sid,
+                "router-acp · stalled parent turn came back: watching it again",
+            );
+            crate::planner_guard::with_runtime(shared, sid, |rt| rt.stalled = false);
+            started = Instant::now();
+            continue;
         }
-        let quiet = quiet_for(shared, sid, started);
-        // A turn parked on its router-managed background terminals waits on
-        // the router, not the adapter: that wait has its own completion.
-        let parked = shared
-            .background_interrupts
-            .lock()
-            .unwrap()
-            .contains_key(sid);
-        if quiet >= limit && !parked && !awaiting_operator(shared, sid) {
-            break quiet;
-        }
-    };
-    let minutes = quiet.as_secs() / 60;
-    let span = if minutes > 0 {
-        format!("{minutes} min")
-    } else {
-        format!("{} s", quiet.as_secs())
-    };
-    tracing::error!(
-        session = sid,
-        quiet_secs = quiet.as_secs(),
-        "planner parent turn stalled: no downstream progress; cancelling it"
-    );
-    log_notice(
-        shared,
-        sid,
-        &format!("router-acp · parent turn stalled {span}: cancelling"),
-    );
-    with_runtime_stalled(shared, sid);
-    cancel_downstream(shared, sid);
-    if let Ok(result) = tokio::time::timeout(cancel_grace(shared), &mut turn).await {
-        return result;
+        tracing::error!(
+            session = sid,
+            "stalled planner parent turn ignored its cancel: releasing it and restarting its adapter"
+        );
+        log_notice(
+            shared,
+            sid,
+            "router-acp · stalled parent turn ignored its cancel: released; restarting its adapter",
+        );
+        // The turn future is dropped on return; clear what it would have.
+        shared.with_session(sid, |s| s.cancelled = true);
+        shared.planner_deliveries.lock().unwrap().remove(sid);
+        shared.background_interrupts.lock().unwrap().remove(sid);
+        restart_adapter(shared, sid).await;
+        return Ok(PromptResponse::new(StopReason::Cancelled));
     }
-    tracing::error!(
-        session = sid,
-        "stalled planner parent turn ignored its cancel: releasing it and restarting its adapter"
-    );
-    log_notice(
-        shared,
-        sid,
-        "router-acp · stalled parent turn ignored its cancel: released; restarting its adapter",
-    );
-    // The turn future is dropped on return; clear what it would have.
-    shared.with_session(sid, |s| s.cancelled = true);
-    shared.planner_deliveries.lock().unwrap().remove(sid);
-    shared.background_interrupts.lock().unwrap().remove(sid);
-    restart_adapter(shared, sid).await;
-    Ok(PromptResponse::new(StopReason::Cancelled))
+}
+
+fn current_pin(shared: &Shared, sid: &str) -> Option<String> {
+    shared
+        .with_session(sid, |s| s.pin.as_ref().map(|p| p.downstream_sid.clone()))
+        .flatten()
+}
+
+/// After the stall cancel went out at `cancelled_at`, the turn came back to
+/// life: it now waits on the operator, it moved to another adapter session,
+/// or that adapter streamed fresh progress.
+fn turn_revived(
+    shared: &Shared,
+    sid: &str,
+    cancelled_at: Instant,
+    cancelled_pin: Option<&str>,
+) -> bool {
+    awaiting_operator(shared, sid)
+        || current_pin(shared, sid).as_deref() != cancelled_pin
+        || last_progress(shared, sid).is_some_and(|at| at > cancelled_at)
 }
 
 fn with_runtime_stalled(shared: &Shared, sid: &str) {

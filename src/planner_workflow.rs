@@ -1044,6 +1044,9 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         // A person's follow-up continues a finished or paused run in its last
         // phase: a question or an interrupted turn never ends the run. A live
         // drain keeps its run until it is drained.
+        if human {
+            crate::planner_capacity::clear_human_hold(run);
+        }
         if human
             && (matches!(run.status, RunStatus::Complete | RunStatus::Paused)
                 || stale_drain(shared, sid, run.status))
@@ -1299,7 +1302,7 @@ pub fn input_blocks(
 }
 
 pub fn tool_definition() -> Value {
-    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. WorkSpec owned_paths declares literal source ownership; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
+    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. WorkSpec owned_paths declares literal source ownership; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
             "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
@@ -1991,8 +1994,12 @@ async fn operate_once(
                 &detail,
                 chrono::Utc::now().timestamp_millis(),
             )?;
-            crate::planner_guard::verify_hold(shared, sid, &run, &plan_id, &reason, &detail)
-                .await?;
+            // The audit host verifies candidate evidence; a human's withheld
+            // authorization is the human's to lift, not the host's to check.
+            if reason != crate::planner_capacity::AWAITING_HUMAN {
+                crate::planner_guard::verify_hold(shared, sid, &run, &plan_id, &reason, &detail)
+                    .await?;
+            }
             crate::planner_capacity::record_hold(
                 &mut run,
                 &plan_id,
