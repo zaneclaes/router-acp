@@ -11,6 +11,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
+mod support;
 
 #[tokio::test]
 async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair() {
@@ -61,15 +62,16 @@ async fn a_killed_grok_hook_cannot_cancel_rotation_or_repeat_a_siblings_repair()
     )
     .unwrap();
     let config = router_acp::config::Config::from_yaml(&format!(
-        "agents:\n  - name: grok\n    command: {{type: stdio, command: grok, env: [{{name: HOME, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: grok, cost_rank: 1}}]\n",
-        home.display()
+        "agents:\n  - name: grok\n    command: {{type: stdio, command: grok, env: [{{name: HOME, value: {}}}, {{name: GROK_HOME, value: {}}}]}}\n    model_selection: {{type: config-option}}\n    models: [{{id: grok, cost_rank: 1}}]\n",
+        home.display(),
+        home.join(".grok").display()
     )).unwrap();
     let agent = &config.agents[0];
     let observed = router_acp::credentials::request_generation(agent).unwrap();
     let receipt = runtime.join(".router-acp-token.json");
     std::fs::write(&receipt, json!({"generation":observed}).to_string()).unwrap();
     let command = || {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_router-acp"));
+        let mut command = tokio::process::Command::from(support::router_command());
         command
             .args(["credential-token", "--provider", "grok", "--directory"])
             .arg(&dir)
@@ -162,7 +164,7 @@ async fn separate_router_processes_wait_for_one_kimi_rotation() {
     let agent = &config.agents[0];
     let observed = router_acp::credentials::request_generation(agent).unwrap();
     let spawn = || {
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        tokio::process::Command::from(support::router_command())
             .args(["credential-repair", "--provider", "kimi", "--directory"])
             .arg(&dir)
             .args(["--observed", &observed])
