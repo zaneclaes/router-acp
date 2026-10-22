@@ -1114,18 +1114,19 @@ pub(crate) const AUTH_ENV: [&str; 6] = [
     "KIMI_API_KEY",
 ];
 
+/// Variables that point an adapter at a provider credential store.
+pub(crate) const PROVIDER_DIRECTORY_ENV: [&str; 6] = [
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "GROK_AUTH_PROVIDER_COMMAND",
+    "KIMI_SHARE_DIR",
+    "KIMI_CODE_HOME",
+];
+
 pub(crate) fn isolated_environment(env: &[(String, String)]) -> bool {
-    env.iter().any(|(name, _)| {
-        matches!(
-            name.as_str(),
-            "CLAUDE_CONFIG_DIR"
-                | "CODEX_HOME"
-                | "GROK_HOME"
-                | "GROK_AUTH_PROVIDER_COMMAND"
-                | "KIMI_SHARE_DIR"
-                | "KIMI_CODE_HOME"
-        )
-    })
+    env.iter()
+        .any(|(name, _)| PROVIDER_DIRECTORY_ENV.contains(&name.as_str()))
 }
 
 fn start_login(

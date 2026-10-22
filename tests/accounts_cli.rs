@@ -160,7 +160,7 @@ fn spawn(config: &std::path::Path) -> Client {
 }
 
 fn spawn_with_env(config: &std::path::Path, env: &[(&str, &str)]) -> Client {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_router-acp"));
+    let mut command = tokio::process::Command::from(support::router_command());
     command
         .args(["serve", "--config", config.to_str().unwrap()])
         .stdin(std::process::Stdio::piped())
@@ -728,7 +728,7 @@ fn account_status_reports_router_owned_capacity_outcomes() {
         .join("anthropic-oauth.json");
     router_acp::usage_cache::write_snapshot(&snapshot_path, &snapshot).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+    let output = support::router_command()
         .args(["account-status", "--config"])
         .arg(&config)
         .env("HOME", &home)
@@ -774,7 +774,7 @@ fn account_status_reports_router_owned_capacity_outcomes() {
 
 fn router(args: &[&str], config: &Path, stdin: Option<&Value>) -> std::process::Output {
     use std::io::Write;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+    let mut child = support::router_command()
         .args(args)
         .arg("--config")
         .arg(config)
@@ -1793,7 +1793,7 @@ async fn system_reserves_for_a_project_only_account_preserve_project_membership(
     let system = router_acp::config::Config::from_file(&user).unwrap();
     assert!(system.agents[0].account_disabled);
     assert_eq!(system.agents[0].reserve_capacity.weekly, 15.0);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+    let output = support::router_command()
         .args(["account-status", "--config"])
         .arg(&project)
         .env("HOME", &fixture.home)
@@ -1845,7 +1845,7 @@ async fn account_scope_moves_and_independent_reserves_round_trip_through_native_
         client.prompt(&sid, choice).await;
     }
     let status = |path: &Path| -> Value {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        let output = support::router_command()
             .args(["account-status", "--config"])
             .arg(path)
             .env("HOME", &fixture.home)
