@@ -4674,6 +4674,75 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     );
 }
 
+// Staging 2026-10-21: six corrective rounds in a row each carried one repair
+// while 50 accepted heads waited, so the "clean round after a corrective"
+// never came and nothing reached production.
+#[tokio::test]
+async fn chained_corrective_rounds_carry_the_heads_already_waiting() {
+    use router_acp::planner_release::{self, Checkpoint, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let add = |run: &mut planner_workflow::PlannerRun, id: &str| {
+        let mut work = run.works["work-1"].clone();
+        work.spec.work_id = id.into();
+        run.works.insert(id.into(), work);
+    };
+    for id in ["product-1", "product-2", "conflicted"] {
+        add(&mut run, id);
+    }
+    let select = |works: &[&str], replaces: Option<&str>| Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: works
+            .iter()
+            .map(|id| (id.to_string(), revision.clone()))
+            .collect(),
+        replaces: replaces.map(Into::into),
+        evidence: BTreeMap::from([("selection".into(), "round.md".into())]),
+    };
+    let failed = Checkpoint {
+        works: BTreeMap::new(),
+        evidence: BTreeMap::from([("failure".into(), "round.md".into())]),
+        stage: Stage::Failed,
+        ..select(&[], None)
+    };
+    let clean =
+        planner_release::record(&mut run.clone(), "lone", &select(&["work-1"], None)).unwrap_err();
+    assert!(clean.contains("under-batches"), "{clean}");
+    let all = ["work-1", "product-1", "product-2", "conflicted"];
+    planner_release::record(&mut run, "round-1", &select(&all, None)).unwrap();
+    planner_release::record(&mut run, "round-1", &failed).unwrap();
+    add(&mut run, "repair-a");
+    add(&mut run, "repair-b");
+    // The first corrective round may isolate the failed candidate's repair;
+    // round-1's heads go back to waiting once it is replaced.
+    planner_release::record(&mut run, "round-2", &select(&["repair-a"], Some("round-1"))).unwrap();
+    planner_release::record(&mut run, "round-2", &failed).unwrap();
+    let chained = planner_release::record(
+        &mut run.clone(),
+        "round-3",
+        &select(&["repair-b"], Some("round-2")),
+    )
+    .unwrap_err();
+    assert!(
+        chained.contains("under-batches") && chained.contains("product-1"),
+        "{chained}"
+    );
+    let mut deferred = select(
+        &["repair-b", "work-1", "product-1", "product-2"],
+        Some("round-2"),
+    );
+    let partial = planner_release::record(&mut run.clone(), "round-3", &deferred).unwrap_err();
+    assert!(partial.contains("conflicted"), "{partial}");
+    deferred.evidence.insert(
+        "deferred:conflicted".into(),
+        "merge conflict in TuneCore/Song.cs; back to its worker".into(),
+    );
+    planner_release::record(&mut run, "round-3", &deferred).unwrap();
+    assert_eq!(run.releases["round-3"].works.len(), 4);
+}
+
 #[tokio::test]
 async fn parent_finalization_is_host_verified_and_release_proofs_remain_required() {
     let tmp = tempfile::tempdir().unwrap();
