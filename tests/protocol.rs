@@ -13748,6 +13748,80 @@ async fn direct_human_roadmap_request_authorizes_durable_work() {
     .await;
 }
 
+/// Kory Code's coordinator `/approve-plan` reaches a checkpointed child as an
+/// agent-origin `[router: phase=implementation]` prompt. Only the client's
+/// `delegated_approval` attestation makes it the child's authentic
+/// implementation request; it never makes the child a parent.
+#[tokio::test]
+async fn delegated_coordinator_approval_authorizes_child_implementation() {
+    let state = temp_state_file("planner-delegated-approval");
+    let log = temp_log("planner-delegated-approval");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/plan back the Daily Huddle measures").await?;
+        let send = async |text: &str, router: serde_json::Value| {
+            let meta: agent_client_protocol::schema::v1::Meta =
+                serde_json::from_value(serde_json::json!({ "router_acp": router })).unwrap();
+            cx.send_request(
+                PromptRequest::new(sid.clone(), vec![ContentBlock::from(text.to_string())])
+                    .meta(meta),
+            )
+            .block_task()
+            .await
+        };
+        let load = || {
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+        };
+        let approval = "[router: phase=implementation]\n[kory-code] Your plan is approved. \
+                        Implement it now, as reported.";
+
+        // An unattested agent directive, and an attested planning directive,
+        // leave the run where it was.
+        send(approval, serde_json::json!({"agent_origin": true})).await?;
+        send(
+            "[router: phase=planning]\nrevise",
+            serde_json::json!({"agent_origin": true, "delegated_approval": {"by": "coordinator"}}),
+        )
+        .await?;
+        let run = load();
+        assert_eq!(run.phase, router_acp::config::PlannerPhase::Planning);
+        assert!(run.execution_request.is_none());
+
+        send(
+            approval,
+            serde_json::json!({"agent_origin": true, "delegated_approval": {"by": "coordinator"}}),
+        )
+        .await?;
+        let run = load();
+        assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+        assert!(
+            run.execution_request
+                .as_deref()
+                .is_some_and(|r| r.contains("Your plan is approved"))
+        );
+        let input = &run.inputs[run.execution_input_id.as_ref().unwrap()];
+        assert_eq!(input.origin, "coordinator");
+        assert!(
+            !run.coordinator,
+            "a delegated approval never makes a parent"
+        );
+        assert!(!shared.with_session(&sid, |s| s.coordinator).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn planner_parent_cancel_stops_only_the_parent_turn() {
     let state = temp_state_file("planner-cancel-idle");

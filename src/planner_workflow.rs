@@ -931,7 +931,14 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let receipt = InputReceipt {
-        origin: if human_prompt(req) { "human" } else { "agent" }.into(),
+        origin: if human_prompt(req) {
+            "human"
+        } else if delegated_approval(req) {
+            "coordinator"
+        } else {
+            "agent"
+        }
+        .into(),
         replayed_from: None,
         text: display_text(req),
         attachments: req
@@ -969,15 +976,34 @@ impl PlannerRun {
 }
 
 /// A human `[router: phase=…]` directive is the same explicit phase choice as
-/// `/plan` or `/implement`. Kory Code's accepted-plan handoff sends one.
+/// `/plan` or `/implement`. Kory Code's accepted-plan handoff sends one. A
+/// client-attested delegated approval carries the same authority for the
+/// implementation phase only.
 fn directed_phase(req: &PromptRequest) -> Option<PlannerPhase> {
-    if !human_prompt(req) {
+    let human = human_prompt(req);
+    if !human && !delegated_approval(req) {
         return None;
     }
     crate::session::parse_prompt_directives(&req.prompt)
         .ok()
         .flatten()
         .and_then(|(directives, _)| directives.phase)
+        .filter(|phase| human || *phase == PlannerPhase::Implementation)
+}
+
+/// A coordinator's plan approval for its checkpointed child, attested by the
+/// client under a human coordinator grant
+/// (`_meta.router_acp.delegated_approval.by == "coordinator"`). The prompt is
+/// agent-origin, but its `[router: phase=implementation]` directive is the
+/// authentic implementation request the child's run needs to admit work.
+fn delegated_approval(req: &PromptRequest) -> bool {
+    req.meta
+        .as_ref()
+        .and_then(|m| m.get("router_acp"))
+        .and_then(|m| m.get("delegated_approval"))
+        .and_then(|a| a.get("by"))
+        .and_then(Value::as_str)
+        == Some("coordinator")
 }
 
 /// Kory Code's accepted-plan handoff ("Proceed with implementation" and
@@ -985,7 +1011,8 @@ fn directed_phase(req: &PromptRequest) -> Option<PlannerPhase> {
 /// by the `[planner-handoff]` tag. The session it reaches admits the work and
 /// delegates children, so it becomes the run's durable parent.
 pub(crate) fn parent_handoff(req: &PromptRequest) -> bool {
-    if directed_phase(req) != Some(PlannerPhase::Implementation) {
+    // A delegated approval reaches a child; only a person's handoff makes a parent.
+    if !human_prompt(req) || directed_phase(req) != Some(PlannerPhase::Implementation) {
         return false;
     }
     let Ok(Some((_, stripped))) = crate::session::parse_prompt_directives(&req.prompt) else {
