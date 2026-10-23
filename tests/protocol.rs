@@ -13822,6 +13822,52 @@ async fn delegated_coordinator_approval_authorizes_child_implementation() {
     .await;
 }
 
+/// A coordinator-spawned plan-checkpoint child sends its first prompt as
+/// agent-origin. Its leading planning directive must choose the planning pool
+/// even when the ticket brief itself starts with "Implement".
+#[tokio::test]
+async fn agent_origin_plan_checkpoint_child_starts_on_the_planning_pool() {
+    let state = temp_state_file("checkpoint-child-planning-pool");
+    let log = temp_log("checkpoint-child-planning-pool");
+    let yaml = format!(
+        "state_file: {}\nrouter: planner\ndelegation: {{ enabled: false }}\nrouters:\n  planner:\n    planning_candidates: ['plan/sol']\n    implementation_candidates: ['work/grok']\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "plan",
+            &[("sol", 2)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+        agent_yaml(
+            "work",
+            &[("grok", 1)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let prompt = "[router: phase=planning]\nImplement the ticket from the approved brief.\n\n\
+                      [kory-code] This ticket has a plan checkpoint. Stay in the planning phase.";
+        let meta: agent_client_protocol::schema::v1::Meta = serde_json::from_value(
+            serde_json::json!({"router_acp":{"input_id":"checkpoint-child-first","agent_origin":true}}),
+        )
+        .unwrap();
+        cx.send_request(
+            PromptRequest::new(sid.clone(), vec![ContentBlock::from(prompt)]).meta(meta),
+        )
+        .block_task()
+        .await?;
+
+        assert_eq!(
+            shared.with_session(&sid, |s| s.planner_phase).flatten(),
+            Some(router_acp::config::PlannerPhase::Planning)
+        );
+        assert_eq!(pinned(&shared, &sid), CandidateId::new("plan", "sol"));
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn planner_parent_cancel_stops_only_the_parent_turn() {
     let state = temp_state_file("planner-cancel-idle");

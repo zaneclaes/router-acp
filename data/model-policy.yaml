@@ -61,6 +61,12 @@ benchmark_scoring:
       # globs prefer); cost_rank (4 vs 5) routes everyday hard codex work to
       # Terra.
       - { ahead: "*sol*", behind: "*terra*" }
+      # Opus and Grok 4.7 have directly comparable DeepSWE v1.1 results.
+      # Opus leads 73.6 to 71.0. Grok's single observation otherwise maps to
+      # a flat score above models with broader evidence, reversing that result.
+      # Keep Grok available as the next frontier fallback while preserving the
+      # measured order. Depending on task class, Opus or Sol then leads Grok.
+      - { ahead: "*opus*", behind: "*grok-4.7*" }
   benchmarks:
     AA-Coding-Agent-v1.1:
       task_classes: [Algorithms, CodingGeneral]
@@ -293,8 +299,10 @@ witnesses:
 invariants:
   # Strictly decreasing quality, every TaskClass, left to right.
   strict_desc:
-    - chain: [grok_4_7, grok]
-      why: Grok 4.7's published same-harness DeepSWE result exceeds Grok 4.6
+    - chain: [opus, grok_4_7, grok]
+      why: >-
+        shared DeepSWE v1.1 evidence places Opus above Grok 4.7, and Grok
+        4.7's published result exceeds Grok 4.6
     - chain: [fable, opus, sonnet, haiku]
       why: >-
         the claude ladder every golden routing case depends on. Fable-ahead is

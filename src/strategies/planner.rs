@@ -293,6 +293,49 @@ mod tests {
     }
 
     #[test]
+    fn implementation_apex_prefers_opus_or_sol_over_grok_4_7() {
+        let cfg = PlannerRouterConfig {
+            planning_candidates: vec!["*fable*".into()],
+            implementation_candidates: vec!["*sol*".into(), "*opus*".into(), "*grok*".into()],
+            ..planner_cfg()
+        };
+        let acfg = AutoRouterConfig {
+            apex_complexity: 0.9,
+            ..auto_cfg()
+        };
+        let s = PlannerStrategy::new(cfg, acfg, 0.1);
+
+        for (class, sol_quality, opus_quality, expected) in [
+            (TaskClass::Ops, 2.81, 2.62, "codex/gpt-6.1-sol"),
+            (TaskClass::Feature, 2.39, 2.97, "claude/opus"),
+        ] {
+            let mut ctx = ctx_with_phase(PlannerPhase::Implementation, 1.0);
+            ctx.profile.class = class;
+            ctx.planner_explicit = true;
+            let candidates = vec![
+                view(
+                    "codex",
+                    "gpt-6.1-sol",
+                    4,
+                    0,
+                    sol_quality,
+                    CodingTier::High,
+                    0.8,
+                ),
+                view("claude", "opus", 4, 1, opus_quality, CodingTier::High, 0.8),
+                view("grok", "grok-4.7", 5, 2, 2.60, CodingTier::High, 1.0),
+            ];
+
+            let ranked = s.rank(&ctx, &candidates).unwrap();
+            assert_eq!(ranked[0].candidate.to_string(), expected, "{class:?}");
+            assert!(ranked[0].reason.contains("pure quality"));
+
+            let ranked = s.rank(&ctx, &candidates[2..]).unwrap();
+            assert_eq!(ranked[0].candidate.to_string(), "grok/grok-4.7");
+        }
+    }
+
+    #[test]
     fn explicit_implement_command_never_crosses_into_planning_pool() {
         let mut acfg = auto_cfg();
         acfg.complexity_floor = 2.0;
