@@ -16,7 +16,8 @@ use super::{
 
 pub struct PlannerStrategy {
     planner_cfg: PlannerRouterConfig,
-    auto: AutoStrategy,
+    planning_auto: AutoStrategy,
+    implementation_auto: AutoStrategy,
 }
 
 impl PlannerStrategy {
@@ -25,9 +26,18 @@ impl PlannerStrategy {
         auto_cfg: AutoRouterConfig,
         cost_aversion: f64,
     ) -> Self {
+        let mut implementation_auto_cfg = auto_cfg.clone();
+        // The apex carve-out exists to keep the strongest planning model
+        // reachable for the hardest design work. Implementation still needs
+        // the configured minimum cost weight so plan headroom has a vote.
+        implementation_auto_cfg.apex_complexity = 1.1;
         Self {
             planner_cfg,
-            auto: AutoStrategy::with_cost_aversion(auto_cfg, cost_aversion),
+            planning_auto: AutoStrategy::with_cost_aversion(auto_cfg, cost_aversion),
+            implementation_auto: AutoStrategy::with_cost_aversion(
+                implementation_auto_cfg,
+                cost_aversion,
+            ),
         }
     }
 }
@@ -47,6 +57,10 @@ impl RouterStrategy for PlannerStrategy {
         let phase = ctx.planner_phase.unwrap_or(PlannerPhase::Planning);
         let complexity = ctx.profile.complexity.clamp(0.0, 1.0);
         let cfg = &self.planner_cfg;
+        let auto = match phase {
+            PlannerPhase::Planning => &self.planning_auto,
+            PlannerPhase::Implementation => &self.implementation_auto,
+        };
 
         // 1. Assemble the pool for this phase. A `hard:` / `easy:` prefix
         //    subsets the planning pool and skips floor crossover — the
@@ -114,7 +128,7 @@ impl RouterStrategy for PlannerStrategy {
         // 3. Graceful fallback: if the filtered pool is empty, rank the
         //    full candidate set via AutoStrategy and note the degradation.
         if pool.is_empty() {
-            let mut result = self.auto.rank(ctx, candidates)?;
+            let mut result = auto.rank(ctx, candidates)?;
             let note = format!(
                 "planner: no {} candidates available; full-pool fallback",
                 phase_label(phase)
@@ -126,7 +140,7 @@ impl RouterStrategy for PlannerStrategy {
         }
 
         // 4. Delegate ranking to AutoStrategy.
-        let mut result = self.auto.rank(ctx, &pool)?;
+        let mut result = auto.rank(ctx, &pool)?;
         let phase_str = phase_label(phase);
         let crossover_tag = if crossover_ok {
             match phase {
@@ -290,6 +304,47 @@ mod tests {
         let ctx = ctx_with_phase(PlannerPhase::Implementation, 0.90);
         let ranked = s.rank(&ctx, &pool()).unwrap();
         assert_eq!(ranked.len(), 4, "all candidates should be in the pool");
+    }
+
+    #[test]
+    fn implementation_apex_keeps_headroom_in_the_decision() {
+        let acfg = AutoRouterConfig {
+            cost_quality_tradeoff: 3.0,
+            complexity_floor: 0.7,
+            allowed_candidates: vec!["*".into()],
+            complexity_scales_tradeoff: true,
+            min_cost_weight: 0.25,
+            apex_complexity: 0.9,
+        };
+        let s = PlannerStrategy::new(planner_cfg(), acfg, 0.1);
+        let mut ctx = ctx_with_phase(PlannerPhase::Implementation, 1.0);
+        ctx.profile.class = TaskClass::Ops;
+        let candidates = vec![
+            view(
+                "claude",
+                "claude-fable-5",
+                5,
+                0,
+                2.62,
+                CodingTier::High,
+                0.8,
+            ),
+            view("codex", "gpt-6.1-sol", 4, 1, 2.81, CodingTier::High, 0.8),
+            view("claude", "opus", 4, 2, 2.62, CodingTier::High, 0.8),
+            view("grok", "grok-4.7", 5, 3, 3.10, CodingTier::High, 0.83),
+        ];
+
+        let ranked = s.rank(&ctx, &candidates).unwrap();
+        assert_ne!(ranked[0].candidate.agent, "grok", "{}", ranked[0].reason);
+        assert!(
+            !ranked[0].reason.contains("pure quality"),
+            "implementation must retain the configured minimum cost weight: {}",
+            ranked[0].reason
+        );
+
+        let grok_only = vec![candidates.last().unwrap().clone()];
+        let ranked = s.rank(&ctx, &grok_only).unwrap();
+        assert_eq!(ranked[0].candidate.agent, "grok");
     }
 
     #[test]
