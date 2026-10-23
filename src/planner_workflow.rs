@@ -1362,6 +1362,42 @@ fn accepted_revision(work: &Work, revision: &str) -> Result<(), String> {
     Ok(())
 }
 
+// A manual repair admission may omit ready_dependencies. Preserve the parent's
+// explicit selection, but do not hide already-reviewed source from its new worker.
+fn related_ready_sources(run: &PlannerRun, work: &Work) -> Vec<Value> {
+    run.works.values().filter_map(|source| {
+        if source.spec.work_id == work.spec.work_id
+            || work.spec.plan_id.trim().is_empty()
+            || source.spec.plan_id != work.spec.plan_id
+            || !matches!(source.status, WorkStatus::Accepted | WorkStatus::Finished)
+            || source.attempt.as_ref().is_some_and(|a| !a.ended)
+        {
+            return None;
+        }
+        let artifact = source.artifact.as_ref()?;
+        accepted_revision(source, &artifact.revision).ok()?;
+        Some(json!({
+            "work_id": source.spec.work_id,
+            "revision": artifact.revision,
+            "scope": source.spec.scope,
+            "changed_paths": artifact.changed_paths,
+            "evidence": artifact.evidence,
+            "selected": work.spec.ready_dependencies.get(&source.spec.work_id) == Some(&artifact.revision),
+        }))
+    }).collect()
+}
+
+fn related_source_context(run: &PlannerRun, work: &Work) -> String {
+    let sources = related_ready_sources(run, work);
+    if sources.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n[Related accepted source]\n{}\nCompare these same-plan accepted heads with your scope before recreating work. Discovery does not select dependencies or authorize merging unselected source; ask the parent to reconcile applicable sources through ready_dependencies.\n",
+        Value::Array(sources)
+    )
+}
+
 pub(crate) fn valid_evidence(value: &str) -> bool {
     !value.trim().is_empty()
         && !["unknown", "pending", "unverified"]
@@ -1409,6 +1445,7 @@ async fn operate_once(
                 "paused":work.paused,"recovery":run.capacity.resumes.get(id),"reconciliation":work.reconciliation,
                 "spec":work_id.as_ref().map(|_| &work.spec),
                 "handoff":work_id.as_ref().and(work.handoff.as_ref()),
+                "related_ready_sources":work_id.as_ref().map(|_| related_ready_sources(&run, work)),
                 "ready_at_ms":work.ready_at_ms,"ready_age_secs":work.ready_at_ms.map(|at| (chrono::Utc::now().timestamp_millis() - at).max(0) / 1000),
                 "required_checks":work.spec.required_checks,"required_integration_evidence":work.spec.required_integration_evidence,
                 "unresolved":work.artifact.as_ref().map(|a| &a.unresolved),
@@ -2534,6 +2571,9 @@ async fn begin_work_once(
     }
     instructions.push_str(&format!("\n[Durable assignment]\nwork_id: {work_id}\nattempt_id: {attempt_id}\nchild_id: {}\nplan_id: {}\nAssigned scope: {}\nRequired checks: {:?}\nPrior evidence: {:?}\nPrior corrections: {:?}\nPrior output: {:?}\n", snapshot.child_id, snapshot.spec.plan_id, snapshot.spec.scope, snapshot.spec.required_checks, snapshot.artifact, snapshot.review, snapshot.last_output));
     instructions.push_str(&format!("\n[Current source custody]\n{}\nThis current assignment supersedes older briefs. Preserve and carry its source revision; do not reset transferred changes as foreign work.\n", serde_json::to_string(&snapshot.reconciliation).map_err(|e| e.to_string())?));
+    if role == PlannerRole::ImplementWork {
+        instructions.push_str(&related_source_context(&run, &snapshot));
+    }
     Ok((
         WorkerIdentity {
             work_id: work_id.into(),
@@ -2841,6 +2881,9 @@ pub fn begin_followup(
             work.spec,
             work.reconciliation
         );
+        if role == PlannerRole::ImplementWork {
+            context.push_str(&related_source_context(run, &run.works[&actor.work_id]));
+        }
         acknowledge_attempt_notifications(run, &actor.work_id);
         Ok(())
     })?;

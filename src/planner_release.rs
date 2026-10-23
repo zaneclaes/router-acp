@@ -240,6 +240,23 @@ pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result
             ));
         }
     }
+    let waiting = waiting_heads(run, checkpoint);
+    if checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
+        let oldest = waiting
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "release selection under-batches: {} accepted finished heads would wait another round \
+             (oldest: {oldest}). A ready head waits at most one round, and only the first corrective \
+             round after a failure may isolate its repair. Carry them oldest first, up to \
+             {ROUND_LIMIT} works, or record `deferred:<work>` selection evidence naming the merge \
+             conflict that sends one back to its worker",
+            waiting.len()
+        ));
+    }
     if let Some(previous) = &checkpoint.replaces {
         run.releases.get_mut(previous).unwrap().superseded_by = Some(id.into());
     }
@@ -253,6 +270,69 @@ pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result
         },
     );
     Ok(())
+}
+
+/// A clean round carries every releasable head, up to this many works.
+const ROUND_LIMIT: usize = 12;
+
+/// Releasable heads a new selection leaves out, oldest first. Only the first
+/// corrective round after a failure (it replaces a release that was not
+/// itself a replacement) may isolate its repair; otherwise consecutive
+/// failures would keep every finished head out of staging indefinitely.
+fn waiting_heads(run: &PlannerRun, checkpoint: &Checkpoint) -> Vec<String> {
+    let replaced = checkpoint
+        .replaces
+        .as_ref()
+        .and_then(|id| run.releases.get_key_value(id));
+    if replaced.is_some_and(|(_, release)| {
+        release
+            .checkpoints
+            .first()
+            .is_none_or(|first| first.replaces.is_none())
+    }) {
+        return Vec::new();
+    }
+    let ready = |id: &str, revision: &str| {
+        run.works.get(id).is_some_and(|work| {
+            work.status == WorkStatus::Integrated
+                && work
+                    .integration
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.revision == revision)
+        }) || checkpoint
+            .works
+            .get(id)
+            .is_some_and(|selected| selected == revision)
+    };
+    let mut waiting = run
+        .works
+        .iter()
+        .filter(|(id, work)| {
+            let Some(revision) = work.finish.as_ref().map(|finish| &finish.revision) else {
+                return false;
+            };
+            work.status == WorkStatus::Finished
+                && work
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.accepted && &review.revision == revision)
+                && work.attempt.as_ref().is_none_or(|attempt| attempt.ended)
+                && !checkpoint.works.contains_key(*id)
+                && !checkpoint.evidence.contains_key(&format!("deferred:{id}"))
+                && !run.releases.iter().any(|(other_id, other)| {
+                    (other.active() || replaced.is_some_and(|(r, _)| r == other_id))
+                        && other.works.contains_key(*id)
+                })
+                && work
+                    .spec
+                    .ready_dependencies
+                    .iter()
+                    .all(|(dependency, source)| ready(dependency, source))
+        })
+        .map(|(id, work)| (work.ready_at_ms.unwrap_or(0), id.clone()))
+        .collect::<Vec<_>>();
+    waiting.sort();
+    waiting.into_iter().map(|(_, id)| id).collect()
 }
 
 pub fn integration_allowed(

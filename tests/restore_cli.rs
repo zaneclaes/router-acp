@@ -283,11 +283,11 @@ fn mock_prompts(path: &Path) -> Vec<String> {
 fn meta_for(events: &[Value], session_id: &str) -> Value {
     events
         .iter()
-        .find_map(|frame| {
-            (frame["method"] == "session/update" && frame["params"]["sessionId"] == session_id)
-                .then(|| frame["params"]["_meta"]["router_acp"].clone())
+        .filter(|frame| {
+            frame["method"] == "session/update" && frame["params"]["sessionId"] == session_id
         })
-        .filter(|value| !value.is_null())
+        .map(|frame| frame["params"]["_meta"]["router_acp"].clone())
+        .find(|value| !value.is_null())
         .unwrap_or_else(|| panic!("no router metadata for {session_id}: {events:?}"))
 }
 
