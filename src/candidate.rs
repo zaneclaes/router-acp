@@ -688,7 +688,7 @@ mod score_resolution_tests {
         );
     }
 
-    /// The Fable/Opus and Sol/Terra pairs are COMPRESSED (see
+    /// The Fable/Opus, Sol/Terra, and Opus/Grok 4.7 pairs are COMPRESSED (see
     /// `benchmark_scoring.compression` in data/model-policy.yaml): the
     /// preferred member keeps its calibrated scores and the cheaper sibling
     /// is pinned a deliberate hair below on every class, so cost_rank routes
@@ -704,6 +704,7 @@ mod score_resolution_tests {
         let pairs = [
             ("claude/claude-fable-5[1m]", "claude/opus[1m]"),
             ("codex/gpt-5.6-sol", "codex/gpt-5.6-terra"),
+            ("claude/opus[1m]", "grok/grok-4.7"),
         ];
         for (ahead_id, behind_id) in pairs {
             let ahead = t.lookup(&CandidateId::parse(ahead_id).unwrap());

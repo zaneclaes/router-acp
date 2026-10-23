@@ -438,18 +438,18 @@ candidates:
     # https://docs.x.ai/developers/grok-4-7
     effort_levels: [low, medium, high, xhigh]
     effort_mapping: { low: low, medium: medium, high: high, xhigh: xhigh }
-    default_quality: 3.10
+    default_quality: 2.60
     quality:
-      UiTweak: 3.10
-      BugFix: 3.10
-      Feature: 3.10
-      Refactor: 3.10
-      Algorithms: 3.10
-      Architecture: 3.10
-      Research: 3.10
-      Writing: 3.10
-      Ops: 3.10
-      CodingGeneral: 3.10
+      UiTweak: 2.60
+      BugFix: 2.95
+      Feature: 2.95
+      Refactor: 2.95
+      Algorithms: 2.60
+      Architecture: 2.60
+      Research: 2.60
+      Writing: 2.60
+      Ops: 2.60
+      CodingGeneral: 2.86
 
   - pattern: "*grok*"                # Grok 4.6 and earlier frontier Grok
     coding_tier: high
