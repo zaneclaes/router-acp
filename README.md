@@ -686,6 +686,10 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   completed native adoption does not write planner state, so that allocation cannot invalidate
   its own reconciliation revision on every retry. First adoption still uses the existing claim.
 
+  A workspace claimed before its worker attempt starts can pass to a new coordinator
+  after the old run is paused and its recorded process identity is verified dead.
+  Missing owner evidence, malformed attempts, a live owner or a running run keep the claim fenced.
+
   Parent delivery batches retain every recovery wake, but recovery notices for already
   accepted or finished work follow stopped-work recovery and fresh artifact review. They
   still precede capacity/refill reminders. A large adopted backlog therefore cannot fill

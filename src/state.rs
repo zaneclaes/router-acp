@@ -798,12 +798,28 @@ impl StateStore {
         if status == Some("superseded") {
             return true;
         }
-        let attempt = document
-            .pointer(&format!("{work_pointer}/attempt"))
+        let attempt_value = document.pointer(&format!("{work_pointer}/attempt"));
+        let attempt = attempt_value
             .cloned()
             .and_then(|a| serde_json::from_value::<crate::planner_workflow::Attempt>(a).ok());
         match attempt {
-            None => false,
+            // Allocation can claim a tree before a worker attempt exists. A
+            // cleanly paused coordinator that has exited cannot use that claim
+            // again; requiring an attempt strands it forever. Unknown owners,
+            // malformed attempts and still-running coordinators remain fenced.
+            None => {
+                status == Some("paused")
+                    && attempt_value.is_none_or(serde_json::Value::is_null)
+                    && document
+                        .get("owner")
+                        .cloned()
+                        .and_then(|owner| {
+                            serde_json::from_value::<crate::planner_workflow::RunOwner>(owner).ok()
+                        })
+                        .is_some_and(|owner| {
+                            owner.pid != 0 && owner.started_at_ms != 0 && !owner.alive()
+                        })
+            }
             Some(attempt) => {
                 !crate::planner_workflow::owner_alive(&attempt) || (attempt.ended && !running)
             }
@@ -4467,6 +4483,76 @@ mod tests {
             .claim_planner_workspace(&a, &old, "plan-a", "lease-old")
             .unwrap_err();
         assert!(error.contains("held by another"), "{error}");
+    }
+
+    #[test]
+    fn paused_workspace_without_an_attempt_requires_a_verified_dead_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::load(&dir.path().join("state.db"), Retention::default());
+        let next = store.new_session_id(&dir.path().join("repo")).unwrap();
+        store.upsert(next.clone(), session("claude"));
+        for (label, status, owner, transfers) in [
+            (
+                "dead",
+                "paused",
+                Some(crate::planner_workflow::RunOwner {
+                    pid: std::process::id(),
+                    started_at_ms: 1,
+                }),
+                true,
+            ),
+            (
+                "live",
+                "paused",
+                Some(crate::planner_workflow::RunOwner::current()),
+                false,
+            ),
+            ("unknown", "paused", None, false),
+            (
+                "running",
+                "running",
+                Some(crate::planner_workflow::RunOwner {
+                    pid: std::process::id(),
+                    started_at_ms: 1,
+                }),
+                false,
+            ),
+            (
+                "malformed",
+                "paused",
+                Some(crate::planner_workflow::RunOwner {
+                    pid: std::process::id(),
+                    started_at_ms: 1,
+                }),
+                false,
+            ),
+        ] {
+            let holder = store.new_session_id(&dir.path().join("repo")).unwrap();
+            store.upsert(holder.clone(), session("claude"));
+            let mut document = serde_json::json!({"status":status,"owner":owner,
+                "works":{"work":{"status":"admitted","attempt":null}}});
+            if label == "malformed" {
+                document["works"]["work"]["attempt"] = serde_json::json!({"ended": false});
+            }
+            store.save_planner_run(&holder, 0, &document).unwrap();
+            let path = dir.path().join(label);
+            store
+                .claim_planner_workspace(&path, &holder, "work", "old")
+                .unwrap();
+            let result = store.claim_planner_workspace(&path, &next, "work", "new");
+            assert_eq!(result.is_ok(), transfers, "{label}: {result:?}");
+            if transfers {
+                assert!(
+                    store
+                        .claim_planner_workspace(&path, &holder, "work", "old")
+                        .is_err()
+                );
+            } else {
+                store
+                    .claim_planner_workspace(&path, &holder, "work", "old")
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
