@@ -149,6 +149,72 @@ fn authorize(shared: &Arc<Shared>) {
     planner_workflow::save(shared, SID, &mut run).unwrap();
 }
 
+#[tokio::test]
+async fn status_execution_context_is_unpaginated_and_requires_human_admission() {
+    let f = fixture(|_| {});
+    let mut request = PromptRequest::new(
+        SID,
+        vec![ContentBlock::from(
+            "# Loaded Skill: implement (skill)\n\nExpanded contract\nARGUMENTS: Docs/Plans/ONE.md\n## Supporting Files\nignored",
+        )],
+    );
+    planner_workflow::user_command(&f.shared, SID, &mut request).unwrap();
+    let id = planner_workflow::load(&f.shared, SID)
+        .unwrap()
+        .unwrap()
+        .execution_input_id
+        .unwrap();
+    for control in ["human", "agent", "unadmitted", "missing", "withdrawn"] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            let input = run.inputs.get_mut(&id).unwrap();
+            input.acknowledged = true;
+            input.origin = if control == "agent" { "agent" } else { "human" }.into();
+            if control == "unadmitted" {
+                run.commands.remove(&id);
+            } else {
+                run.commands.insert(id.clone());
+            }
+            run.execution_input_id = Some(if control == "missing" {
+                "absent".into()
+            } else {
+                id.clone()
+            });
+            if control == "withdrawn" {
+                run.receipts.insert(
+                    format!("input-withdrawal:{id}"),
+                    serde_json::to_string(&planner_workflow::InputWithdrawal {
+                        at_ms: 1,
+                        reason: "operator withdrew".into(),
+                    })
+                    .unwrap(),
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        let result = planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 1000,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        if control == "human" {
+            assert_eq!(value["execution"]["input_id"], id);
+            assert_eq!(value["execution"]["command"], "implement");
+            assert_eq!(value["execution"]["arguments"], "Docs/Plans/ONE.md");
+            assert!(value["inputs"].as_array().unwrap().is_empty());
+        } else {
+            assert!(value["execution"].is_null(), "invalid source: {control}");
+        }
+    }
+}
+
 #[test]
 fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
     let f = fixture(|_| {});

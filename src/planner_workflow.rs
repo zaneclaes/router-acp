@@ -1217,6 +1217,31 @@ pub fn prompt_input_id(req: &PromptRequest) -> Option<&str> {
         .as_str()
 }
 
+/// Persistent provenance for an admitted run, independent of paginated inputs
+/// and receipt acknowledgment. This reports the human request, not a new grant:
+/// later restrictions and the run's normal holds still apply.
+pub(crate) fn execution_context(run: &PlannerRun) -> Option<Value> {
+    let id = run.execution_input_id.as_ref()?;
+    let input = run.inputs.get(id)?;
+    if input.origin != "human" || crate::planner_input::withdrawal(run, id).is_some() {
+        return None;
+    }
+    let request = PromptRequest::new(id.clone(), vec![ContentBlock::from(input.text.clone())]);
+    if let Some(command) = leading_command(&request)
+        && command.phase == PlannerPhase::Implementation
+        && run.commands.contains(id)
+    {
+        // Keep typed scope, without replaying an entire expanded skill on each wake.
+        return Some(json!({"input_id":id,"origin":input.origin,
+            "command":"implement","arguments":command.args}));
+    }
+    if parent_handoff(&request) {
+        return Some(json!({"input_id":id,"origin":input.origin,
+            "request":input.text}));
+    }
+    None
+}
+
 pub fn parent_input_blocks(
     shared: &Shared,
     sid: &str,
@@ -1483,6 +1508,7 @@ async fn operate_once(
         }
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
+            "execution":actor.is_none().then(|| execution_context(&run)).flatten(),
             "capacity":capacity,
             "progress":progress(&run),"releases":crate::planner_release::status(&run, actor.map(|a| a.work_id.as_str()).or(work_id.as_deref())),
             "offset":offset,"next_offset":offset+32,"matched_works":matched_works,"counts":{"works":run.works.len(),"inputs":run.inputs.len(),"wakes":run.wakes.len()}})).map_err(|e| e.to_string());

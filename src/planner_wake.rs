@@ -905,6 +905,11 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         inert_line(inert, &run.observations)
     );
     let mut blocks = vec![ContentBlock::from(text)];
+    if let Some(execution) = planner_workflow::execution_context(&run) {
+        blocks.push(ContentBlock::from(format!(
+            "[Recorded human execution request]\n{execution}\nThis router-owned wake continues that admitted request; it is not a new operator instruction. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it."
+        )));
+    }
     blocks.extend(planner_workflow::parent_input_blocks(
         shared, sid, &input_ids,
     )?);

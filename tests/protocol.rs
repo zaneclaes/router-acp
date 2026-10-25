@@ -15509,6 +15509,56 @@ async fn open_planner_parent(
     Ok(sid)
 }
 
+#[tokio::test]
+async fn planner_wake_carries_the_recorded_human_execution_request() {
+    use router_acp::planner_workflow as workflow;
+    let state = temp_state_file("wake-execution");
+    let log = temp_log("wake-execution");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let input_id = workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .execution_input_id
+                .unwrap();
+            // Acknowledgment is receipt handling, not revocation of the run.
+            workflow::mutate(&shared, &sid, |run| {
+                run.inputs.get_mut(&input_id).unwrap().acknowledged = true;
+                Ok(())
+            })
+            .unwrap();
+            prompt_text(&cx, &sid, "Do not deploy production until I approve it.").await?;
+            insert_wake(&shared, &sid, "audit:execution-context");
+            wait_for_mock_prompt(&log, "audit:execution-context").await;
+            let events = read_log(&log);
+            let wake = &events[mock_prompts(&log, "audit:execution-context")[0]];
+            let text = wake["text"].as_str().unwrap();
+            assert!(
+                text.contains(&input_id),
+                "wake lost the admitted input identity"
+            );
+            assert!(
+                text.contains("prepare the assignment"),
+                "wake lost the original scope"
+            );
+            assert!(text.contains("\"origin\":\"human\""));
+            assert!(text.contains("later human restrictions"));
+            let run = workflow::load(&shared, &sid).unwrap().unwrap();
+            assert!(run.inputs[&input_id].acknowledged);
+            assert!(
+                run.inputs
+                    .values()
+                    .any(|input| input.text == "Do not deploy production until I approve it.")
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
 /// Operator input reaches the parent inside a running router-owned wake
 /// turn: steered, never queued behind it.
 #[tokio::test]
