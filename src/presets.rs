@@ -19,6 +19,7 @@ use std::path::Path;
 const CLAUDE: &str = include_str!("presets/claude.yaml");
 const CODEX: &str = include_str!("presets/codex.yaml");
 const GROK: &str = include_str!("presets/grok.yaml");
+const KIMI: &str = include_str!("presets/kimi.yaml");
 
 /// The preset for `provider`, when router-acp ships one.
 pub fn preset(provider: &str) -> Option<Value> {
@@ -26,6 +27,7 @@ pub fn preset(provider: &str) -> Option<Value> {
         "claude" => CLAUDE,
         "codex" => CODEX,
         "grok" => GROK,
+        "kimi" => KIMI,
         _ => return None,
     };
     Some(serde_yaml::from_str(text).expect("built-in preset is valid YAML"))
@@ -413,6 +415,18 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_kimi_agent_inherits_the_builtin_preset() {
+        let mut doc = yaml("agents:\n- name: kimi\n");
+        apply(&mut doc);
+        let agent = &doc["agents"][0];
+        assert_eq!(agent["command"]["command"], "kimi");
+        assert_eq!(agent["command"]["type"], "stdio");
+        assert_eq!(agent["lineage"], "moonshot");
+        assert_eq!(agent["models"][0]["id"], "kimi-k2");
+        assert_eq!(agent["model_selection"]["type"], "spawn-config");
+    }
+
+    #[test]
     fn an_entry_with_its_own_command_stays_as_written() {
         let text = "agents:\n- name: claude\n  command: { type: stdio, command: /opt/mock-agent }\n  model_selection: { type: config-option }\n  models: [{ id: m1, cost_rank: 1 }]\n";
         let mut doc = yaml(text);
@@ -456,6 +470,14 @@ mod tests {
             small,
             yaml("agents:\n- name: claude@abc\n  preference: 0.1\n")
         );
+    }
+
+    #[test]
+    fn minimize_drops_the_kimi_preset_and_keeps_project_overrides() {
+        let mut full = yaml("agents:\n- name: kimi\n  preference: 0.2\n");
+        apply(&mut full);
+        let small = minimize(&full, &yaml("{}"), &yaml("{}"));
+        assert_eq!(small, yaml("agents:\n- name: kimi\n  preference: 0.2\n"));
     }
 
     #[test]
