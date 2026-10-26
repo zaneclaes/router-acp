@@ -13330,6 +13330,19 @@ async fn wait_for_mock_prompt(log: &PathBuf, marker: &str) -> Vec<serde_json::Va
     panic!("mock agent did not receive prompt containing {marker:?}");
 }
 
+async fn wait_for_mock_prompt_count(log: &PathBuf, marker: &str, count: usize) {
+    for _ in 0..150 {
+        if mock_prompts(log, marker).len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "mock agent did not receive {count} prompts containing {marker:?}: {:?}",
+        read_log(log)
+    );
+}
+
 fn planner_admit_wire_prompt() -> &'static str {
     r#"MCP_CALL:router-delegate planner_workflow {"action":"admit","key":"admit-wire","work":{"work_id":"work-1","plan_id":"plan-1","scope":"implement the admitted wire test","dependencies":[],"required_checks":[],"required_integration_evidence":[],"external_id":"external-work"}}
 "#
@@ -15614,6 +15627,88 @@ async fn operator_input_is_steered_into_a_running_router_owned_turn() {
     )
     .await;
     let _ = std::fs::remove_file(&release);
+}
+
+async fn assert_model_control_preempts_router_owned_turn(control: &str, marker: &str) {
+    let state = temp_state_file(marker);
+    let log = temp_log(marker);
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    let control = control.to_string();
+    let marker = marker.to_string();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            insert_wake(&shared, &sid, "audit:model-control-preempt");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+
+            let answer = prompt_text(&cx, &sid, &control).await?;
+            assert_eq!(answer.stop_reason, StopReason::EndTurn);
+            wait_for_mock_prompt_count(&log, WAKE_MARKER, 2).await;
+
+            let events = read_log(&log);
+            let first_wake = mock_prompts(&log, WAKE_MARKER)[0];
+            let cancel = events
+                .iter()
+                .position(|event| event["event"] == "cancel")
+                .expect("the model control cancelled the router-owned turn");
+            let control_prompt = events
+                .iter()
+                .position(|event| {
+                    event["event"] == "prompt"
+                        && event["model"] == "haiku"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&marker))
+                })
+                .expect("the selected model received the control's task");
+            let resumed_wake = mock_prompts(&log, WAKE_MARKER)[1];
+            assert!(
+                first_wake < cancel && cancel < control_prompt && control_prompt < resumed_wake
+            );
+            assert_eq!(events[first_wake]["model"], "sol");
+            assert_eq!(events[resumed_wake]["model"], "haiku");
+            assert!(
+                !events.iter().any(|event| {
+                    event["event"] == "steer" && event["params"].to_string().contains(&marker)
+                }),
+                "the old model must not receive the control as steering"
+            );
+            assert!(
+                !events.iter().any(|event| {
+                    event["event"] == "prompt"
+                        && event["model"] == "sol"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&marker))
+                }),
+                "the old model must not receive the control as a prompt"
+            );
+            std::fs::write(&release, "").unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
+#[tokio::test]
+async fn model_picker_preempts_router_owned_turn_and_resumes_its_wake_on_the_new_model() {
+    assert_model_control_preempts_router_owned_turn(
+        "[router: switch=planner/haiku]\nTEXT:picker-control-ran",
+        "picker-control-ran",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn model_shorthand_preempts_router_owned_turn_and_resumes_its_wake_on_the_new_model() {
+    assert_model_control_preempts_router_owned_turn(
+        "haiku: TEXT:shorthand-control-ran",
+        "shorthand-control-ran",
+    )
+    .await;
 }
 
 /// The operator's `/implement` is one long turn (live: 43 minutes admitting 50

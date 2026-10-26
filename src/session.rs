@@ -9988,6 +9988,7 @@ fn on_prompt(
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
     let router_sid = sid_str(&req.session_id);
+    let routing_control = prompt_requests_model_switch(&shared, &router_sid, &req.prompt);
     let activity = crate::planner_wake::PromptActivity::client(&shared, &router_sid);
     let responder = responder.wrap_params(move |_, result| {
         drop(activity);
@@ -10016,7 +10017,8 @@ fn on_prompt(
                 note.iter().cloned().chain(req.prompt.iter().cloned()).collect();
             // A mode command must run as its own turn; anything else may be
             // steered.
-            if crate::planner_workflow::command(&req).is_none()
+            if !routing_control
+                && crate::planner_workflow::command(&req).is_none()
                 && crate::planner_preempt::steer(&shared, &router_sid, &steered).await
             {
                 let recorded = crate::planner_workflow::record_steered_input(
@@ -10056,6 +10058,33 @@ fn on_prompt(
         return queue_parent_prompt(&shared, &router_sid, req, responder);
     }
     continue_prompt(shared, router_sid, req, responder, cx)
+}
+
+/// A model control must reach the router even while a router-owned planner
+/// turn is active. Ordinary prose remains eligible for native steering.
+fn prompt_requests_model_switch(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    prompt: &[ContentBlock],
+) -> bool {
+    if let Ok(Some((directives, _))) = parse_prompt_directives(prompt) {
+        return directives.switch.is_some();
+    }
+    let Some((reference, _)) = split_model_shorthand(prompt) else {
+        return false;
+    };
+    if matches!(reference.to_lowercase().as_str(), "hard" | "easy") {
+        return true;
+    }
+    let (class, excluded) = shared
+        .with_session(router_sid, |session| {
+            (
+                session.task_class.unwrap_or(TaskClass::CodingGeneral),
+                session.excluded.clone(),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new()));
+    resolve_candidate_ref(shared, &reference, class, &excluded).is_some()
 }
 
 /// An operator prompt that arrives while an operator turn holds a planner
