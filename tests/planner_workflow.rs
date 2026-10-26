@@ -4554,6 +4554,20 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     use router_acp::planner_release::{self, Checkpoint, Stage};
     let f = fixture(|_| {});
     let revision = finished_work(&f.shared).await;
+    // A host-verified proof wait retains finished source, not guide completion.
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Disposition {
+            key: "proof-wait".into(),
+            work_id: "work-1".into(),
+            status: WorkStatus::Watching,
+            reason: "future population and operator gates remain owed".into(),
+        },
+    )
+    .await
+    .unwrap();
     let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
     let checkpoint = |stage, key: &str| Checkpoint {
         stage,
@@ -4564,6 +4578,46 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     };
     let mut selected = checkpoint(Stage::Selected, "selection");
     selected.works.insert("work-1".into(), revision.clone());
+    for control in [
+        "unaccepted",
+        "artifact-revision",
+        "finish-revision",
+        "review-revision",
+        "unfinished",
+        "running",
+        "unqualified",
+        "unresolved",
+        "custody",
+        "reason",
+        "blocked",
+    ] {
+        let mut invalid = run.clone();
+        let source = invalid.works.get_mut("work-1").unwrap();
+        match control {
+            "unaccepted" => source.review.as_mut().unwrap().accepted = false,
+            "artifact-revision" => source.artifact.as_mut().unwrap().revision = "wrong".into(),
+            "finish-revision" => source.finish.as_mut().unwrap().revision = "wrong".into(),
+            "review-revision" => source.review.as_mut().unwrap().revision = "wrong".into(),
+            "unfinished" => source.finish = None,
+            "running" => source.attempt.as_mut().unwrap().ended = false,
+            "unqualified" => source.spec.required_checks.push("qualification".into()),
+            "unresolved" => source
+                .artifact
+                .as_mut()
+                .unwrap()
+                .unresolved
+                .push("owed coding".into()),
+            "custody" => source.workspace = None,
+            "reason" => source.reason = None,
+            "blocked" => source.status = WorkStatus::Blocked,
+            _ => unreachable!(),
+        }
+        assert!(
+            planner_release::record(&mut invalid, "invalid", &selected).is_err(),
+            "{control}"
+        );
+    }
+    let before = run.works["work-1"].clone();
     run.works
         .get_mut("work-1")
         .unwrap()
@@ -4582,6 +4636,14 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
         .ready_dependencies
         .clear();
     planner_release::record(&mut run, "round-1", &selected).unwrap();
+    assert_eq!(run.works["work-1"].status, WorkStatus::Watching);
+    assert_eq!(run.works["work-1"].reason, before.reason);
+    assert!(run.works["work-1"].integration.is_none());
+    assert_eq!(
+        run.works["work-1"].spec.required_integration_evidence,
+        before.spec.required_integration_evidence
+    );
+    assert_eq!(run.works["work-1"].artifact, before.artifact);
     planner_release::record(&mut run, "round-1", &selected).unwrap();
     assert_eq!(run.releases["round-1"].checkpoints.len(), 1);
     assert!(
@@ -4668,7 +4730,7 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
         planner_release::record(&mut unqualified_run, "scoped-repair", &scoped_repair).is_err()
     );
     planner_release::record(&mut failed_overlap, "repair", &repair).unwrap();
-    assert_eq!(failed_overlap.works["work-2"].status, WorkStatus::Finished);
+    assert_eq!(failed_overlap.works["work-2"].status, WorkStatus::Watching);
     assert!(
         planner_release::integration_allowed(
             &failed_overlap,
@@ -4757,6 +4819,9 @@ async fn chained_corrective_rounds_carry_the_heads_already_waiting() {
     for id in ["product-1", "product-2", "conflicted"] {
         add(&mut run, id);
     }
+    let watched = run.works.get_mut("product-1").unwrap();
+    watched.status = WorkStatus::Watching;
+    watched.reason = Some("await population without losing finished source".into());
     let select = |works: &[&str], replaces: Option<&str>| Checkpoint {
         stage: Stage::Selected,
         revision: revision.clone(),
@@ -4873,6 +4938,19 @@ async fn parent_finalization_is_host_verified_and_release_proofs_remain_required
     );
     std::fs::write(&verdict, "ok").unwrap();
     finalize().await.unwrap();
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Disposition {
+            key: "watch".into(),
+            work_id: "work-1".into(),
+            status: WorkStatus::Watching,
+            reason: "population gate remains in owning guide".into(),
+        },
+    )
+    .await
+    .unwrap();
     let mut evidence = receipt(&revision, "merge");
     let missing = planner_workflow::operate(
         &f.shared,
@@ -4902,6 +4980,12 @@ async fn parent_finalization_is_host_verified_and_release_proofs_remain_required
     )
     .await
     .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["work-1"].status, WorkStatus::Integrated);
+    assert_eq!(
+        run.works["work-1"].reason.as_deref(),
+        Some("population gate remains in owning guide")
+    );
 }
 
 #[tokio::test]
@@ -6647,6 +6731,20 @@ async fn integration_and_blocked_dispositions_pass_the_integrate_check_host() {
     });
     let shared = &fixture.shared;
     let revision = finished_work(shared).await;
+    std::fs::write(&verdict, "ok").unwrap();
+    planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Disposition {
+            key: "watch".into(),
+            work_id: "work-1".into(),
+            status: WorkStatus::Watching,
+            reason: "future operator and population gates remain".into(),
+        },
+    )
+    .await
+    .unwrap();
     let integrate = || {
         planner_workflow::operate(
             shared,
@@ -6675,7 +6773,7 @@ async fn integration_and_blocked_dispositions_pass_the_integrate_check_host() {
     assert_eq!(asked()["receipt"]["revision"], revision.as_str());
     assert_eq!(asked()["receipt"]["evidence"]["merge"], "verified-log.txt");
     let status = |id: &str| planner_workflow::load(shared, SID).unwrap().unwrap().works[id].status;
-    assert_eq!(status("work-1"), WorkStatus::Finished);
+    assert_eq!(status("work-1"), WorkStatus::Watching);
 
     std::fs::write(&verdict, "crash").unwrap();
     let error = integrate().await.unwrap_err();
@@ -6685,7 +6783,7 @@ async fn integration_and_blocked_dispositions_pass_the_integrate_check_host() {
             && error.contains("host-crashed"),
         "{error}"
     );
-    assert_eq!(status("work-1"), WorkStatus::Finished);
+    assert_eq!(status("work-1"), WorkStatus::Watching);
 
     std::fs::write(&verdict, "ok").unwrap();
     integrate().await.unwrap();

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::planner_workflow::{PlannerRun, Receipt, WorkStatus};
+use crate::planner_workflow::{PlannerRun, Receipt, WorkStatus, finished_revision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -227,14 +227,7 @@ pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result
                 ));
             }
         }
-        if work.status != WorkStatus::Finished
-            || work.finish.as_ref().is_none_or(|r| &r.revision != revision)
-            || !work
-                .review
-                .as_ref()
-                .is_some_and(|r| r.accepted && &r.revision == revision)
-            || work.attempt.as_ref().is_some_and(|a| !a.ended)
-        {
+        if !finished_revision(work, revision) {
             return Err(format!(
                 "release work {work_id} must have an ended, accepted and finished exact revision"
             ));
@@ -311,12 +304,7 @@ fn waiting_heads(run: &PlannerRun, checkpoint: &Checkpoint) -> Vec<String> {
             let Some(revision) = work.finish.as_ref().map(|finish| &finish.revision) else {
                 return false;
             };
-            work.status == WorkStatus::Finished
-                && work
-                    .review
-                    .as_ref()
-                    .is_some_and(|review| review.accepted && &review.revision == revision)
-                && work.attempt.as_ref().is_none_or(|attempt| attempt.ended)
+            finished_revision(work, revision)
                 && !checkpoint.works.contains_key(*id)
                 && !checkpoint.evidence.contains_key(&format!("deferred:{id}"))
                 && !run.releases.iter().any(|(other_id, other)| {

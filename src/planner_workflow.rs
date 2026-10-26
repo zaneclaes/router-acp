@@ -1387,6 +1387,26 @@ fn accepted_revision(work: &Work, revision: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A proof wait changes the remaining plan's disposition, not finished source
+/// custody. Selection and integration must agree on that same source contract.
+pub(crate) fn finished_revision(work: &Work, revision: &str) -> bool {
+    (work.status == WorkStatus::Finished
+        || (work.status == WorkStatus::Watching
+            && work.reason.as_ref().is_some_and(|r| !r.trim().is_empty())))
+        && work.finish.as_ref().is_some_and(|r| r.revision == revision)
+        && accepted_revision(work, revision).is_ok()
+        && work.workspace.is_some()
+        && work.attempt.as_ref().is_none_or(|a| a.ended)
+        && work.artifact.as_ref().is_some_and(|a| {
+            a.unresolved.is_empty()
+                && work
+                    .spec
+                    .required_checks
+                    .iter()
+                    .all(|check| a.checks.get(check).is_some_and(|result| result == "pass"))
+        })
+}
+
 // A manual repair admission may omit ready_dependencies. Preserve the parent's
 // explicit selection, but do not hide already-reviewed source from its new worker.
 fn related_ready_sources(run: &PlannerRun, work: &Work) -> Vec<Value> {
@@ -1933,12 +1953,7 @@ async fn operate_once(
             crate::planner_release::integration_allowed(&run, &work_id, &receipt)?;
             let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             accepted_revision(work, &receipt.revision)?;
-            if work.status != WorkStatus::Finished
-                || work
-                    .finish
-                    .as_ref()
-                    .is_none_or(|r| r.revision != receipt.revision)
-            {
+            if !finished_revision(work, &receipt.revision) {
                 return Err("integration requires the finished accepted revision".into());
             }
             if work.attempt.as_ref().is_some_and(|a| !a.ended) {
