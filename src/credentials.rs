@@ -396,6 +396,7 @@ pub(crate) async fn runtime(
             env.push(("CLAUDE_CODE_OAUTH_TOKEN".into(), token.into()));
         }
     } else if provider == "codex" && value.get("tokens").is_some() {
+        value["auth_mode"] = "chatgptAuthTokens".into();
         value["tokens"]["refresh_token"] = "".into();
     }
     if provider == "kimi" {
@@ -2824,6 +2825,11 @@ flag = 7
                 let private = view.root.join(original.path.file_name().unwrap());
                 let text = std::fs::read_to_string(&private).unwrap();
                 assert!(!text.contains("synthetic-refresh"));
+                if provider == "codex" {
+                    let runtime: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(runtime["auth_mode"], "chatgptAuthTokens");
+                    assert_eq!(runtime["tokens"]["refresh_token"], "");
+                }
                 write_private(&private, &json!({})).unwrap();
             }
             assert_eq!(std::fs::read(&original.path).unwrap(), before);
@@ -2831,6 +2837,36 @@ flag = 7
             drop(view);
             assert!(!path.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_marks_expiring_access_token_as_externally_managed() {
+        let (_root, agent) = fixture("codex");
+        let canonical = read(&agent).unwrap();
+        let expiring = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature",
+                "refresh_token": "canonical-refresh",
+                "id_token": "id",
+                "account_id": "account"
+            },
+            "last_refresh": "2020-01-01T00:00:00Z"
+        });
+        write_private(&canonical.path, &expiring).unwrap();
+        let before = std::fs::read(&canonical.path).unwrap();
+
+        let view = runtime(&agent, &mut vec![]).await.unwrap().unwrap();
+        let projected: Value =
+            serde_json::from_slice(&std::fs::read(view.root.join("auth.json")).unwrap()).unwrap();
+
+        assert_eq!(projected["auth_mode"], "chatgptAuthTokens");
+        assert_eq!(
+            projected["tokens"]["access_token"],
+            expiring["tokens"]["access_token"]
+        );
+        assert_eq!(projected["tokens"]["refresh_token"], "");
+        assert_eq!(std::fs::read(&canonical.path).unwrap(), before);
     }
 
     #[tokio::test]
