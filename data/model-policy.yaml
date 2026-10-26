@@ -374,6 +374,11 @@ invariants:
       why: current published benchmark aggregate places Grok 4.6 just under Opus
   # Concrete id -> the score-table pattern that must win the first-match race.
   resolves_to:
+    "claude/opus": "*opus*"
+    "claude/claude-haiku-4-5": "*haiku*"
+    "claude/claude-sonnet-5": "*sonnet*"
+    "claude/claude-opus-5-5": "*opus*"
+    "claude/claude-fable-5": "*fable*"
     "codex/gpt-5.4-mini": "*mini*"
     "codex/gpt-5.5": "*gpt-5*"
     "codex/gpt-5.5-codex": "*gpt-5*codex*"
@@ -421,6 +426,11 @@ invariants:
 published_pricing:
   as_of: "2026-09-29"
   models:
+    "claude/opus": { input_per_mtok: 4.00, output_per_mtok: 20.00 }
+    "claude/claude-haiku-4-5": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
+    "claude/claude-sonnet-5": { input_per_mtok: 2.00, output_per_mtok: 10.00 }
+    "claude/claude-opus-5-5": { input_per_mtok: 4.00, output_per_mtok: 20.00 }
+    "claude/claude-fable-5": { input_per_mtok: 10.00, output_per_mtok: 50.00 }
     "claude/haiku": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
     # Sonnet 5 is PERMANENTLY $2/$10: the increase to $3/$15 scheduled for
     # 2026-09-01 was cancelled (note on Anthropic's pricing page). Sonnet 4.6
