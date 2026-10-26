@@ -430,6 +430,10 @@ request retains its first delivery instead of becoming an acknowledgment-only re
   acknowledged, including router-owned ones, and go again right after the
   operator's turn. If the cancelled turn does not end within 60 s, the prompt
   is queued as before.
+- An explicit `switch=` or a resolvable model shorthand bypasses downstream
+  steering. The router cancels the router-owned turn, applies the control on
+  the ordinary prompt path, and redelivers the still-pending wake on the
+  selected model.
 - A client `_session/steering` the downstream declines during a router-owned
   turn also cancels that turn, so the client's follow-up prompt runs at once.
 - An operator turn in flight keeps the queue: the next prompt is retained for

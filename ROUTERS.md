@@ -605,6 +605,10 @@ Three ways it happens:
 
    A leading `word:` that names no candidate (e.g. `Note:`) is left as ordinary
    prose. Pre-pin, the shorthand steers the initial pin instead of switching.
+   During an active router-owned planner turn, an explicit `switch=` or a
+   resolvable shorthand cancels that turn and follows this routing path. The
+   control never reaches the old model as steering. The interrupted planner
+   wake remains pending and resumes on the selected model after the switch.
 
 2. **Auto-upgrade.** After each turn the router estimates the session's
    **confidence** — the fraction of the classified task's capability demand
