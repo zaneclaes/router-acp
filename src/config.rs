@@ -1048,7 +1048,7 @@ impl AgentConfig {
             .rev()
             .find(|v| v.name == name)
             .map(|v| v.value.clone())
-            .or_else(|| std::env::var(name).ok())
+            .or_else(|| inherited_var(name))
     }
 
     pub fn config_dir(&self, variable: &str, default: &str) -> Option<PathBuf> {
@@ -1060,6 +1060,16 @@ impl AgentConfig {
                     .map(|home| PathBuf::from(home).join(default))
             })
     }
+}
+
+/// Unit tests give each agent its whole environment in config. A provider
+/// directory inherited from the test process (`cargo test` run by a
+/// router-spawned agent) would point them at a live credential store.
+fn inherited_var(name: &str) -> Option<String> {
+    if cfg!(test) && crate::accounts::PROVIDER_DIRECTORY_ENV.contains(&name) {
+        return None;
+    }
+    std::env::var(name).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

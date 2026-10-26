@@ -49,6 +49,8 @@ pub struct TurnProgress {
     pub autonomous_result_at: Option<Instant>,
     /// Foreground ACP tool calls that have not reported a terminal status.
     pub active_tools: BTreeSet<String>,
+    /// The turn started at least one tool call.
+    pub tools_seen: bool,
 }
 
 impl TurnProgress {
@@ -58,6 +60,7 @@ impl TurnProgress {
             agent_activity: false,
             autonomous_result_at: None,
             active_tools: BTreeSet::new(),
+            tools_seen: false,
         }
     }
 
@@ -72,6 +75,7 @@ impl TurnProgress {
         let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
             return;
         };
+        self.tools_seen = true;
         match update.get("status").and_then(Value::as_str) {
             Some("completed" | "failed" | "cancelled") => {
                 self.active_tools.remove(id);
@@ -112,6 +116,16 @@ pub fn note_update(shared: &Shared, sid: &str, params: &Value) {
     current.agent_activity |= is_agent_activity(params);
     current.autonomous_result_at = autonomous.then_some(now);
     current.note_tool(params);
+}
+
+/// The current (or just-ended) turn for `sid` started a tool call.
+pub(crate) fn tools_seen(shared: &Shared, sid: &str) -> bool {
+    shared
+        .turn_progress
+        .lock()
+        .unwrap()
+        .get(sid)
+        .is_some_and(|p| p.tools_seen)
 }
 
 pub(crate) fn tools_in_flight(shared: &Shared, sid: &str) -> bool {

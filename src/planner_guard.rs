@@ -178,6 +178,14 @@ pub struct SessionRuntime {
     /// A router-owned turn (wake delivery) holds the parent now; operator
     /// input preempts it (`crate::planner_preempt`).
     pub router_turn: bool,
+    /// The operator's explicit `/implement` is the running turn. It is the
+    /// run's own work, not a conversation, so failed-environment wakes may be
+    /// steered into it (never cancelled): one such turn spent 43 minutes
+    /// admitting 50 workers while staging and production stayed failed.
+    pub command_turn: bool,
+    /// Consecutive router-owned turns that ended without one tool call while
+    /// staging or production was failed (`crate::planner_wake::deliver`).
+    pub inert_turns: u32,
     /// That router-owned turn was cancelled for operator input: its wakes
     /// stay pending and are redelivered after the operator's turn.
     pub preempted: bool,
@@ -217,6 +225,10 @@ pub fn parent_turn_ended(shared: &Shared, sid: &str, at: i64) {
     with_runtime(shared, sid, |rt| {
         rt.turn_ends += 1;
         rt.turn_ended_at = at;
+        if rt.command_turn {
+            rt.command_turn = false;
+            rt.steered.clear();
+        }
     });
 }
 

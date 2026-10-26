@@ -5571,7 +5571,7 @@ async fn state_db_records_routing_diagnostics_title_and_tokens() {
         agent_yaml("mock", &[("m1", 1), ("m2", 2)], &[])
     );
     let state_path = state.clone();
-    run_test(yaml, async |cx, _observed| {
+    run_test(yaml, async |cx, observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(
@@ -5621,6 +5621,41 @@ async fn state_db_records_routing_diagnostics_title_and_tokens() {
         assert_eq!(
             db.get(&sid).unwrap().title.as_deref(),
             Some("Login Bug Investigation")
+        );
+        // The client title names the pinned model, and every turn publishes
+        // busy at its start and idle at its end for the host's title bar.
+        let infos: Vec<(Option<String>, Option<bool>)> = observed
+            .lock()
+            .unwrap()
+            .updates
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::SessionInfoUpdate(update) => Some((
+                    update.title.value().cloned(),
+                    update
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("routerAcp"))
+                        .and_then(|router| router.get("busy"))
+                        .and_then(|busy| busy.as_bool()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            infos
+                .iter()
+                .all(|(title, _)| title.as_deref().is_some_and(|t| t.ends_with(" [m1]"))),
+            "{infos:?}"
+        );
+        assert!(
+            infos.iter().any(|(_, busy)| *busy == Some(true)),
+            "{infos:?}"
+        );
+        assert_eq!(
+            infos.last().and_then(|(_, busy)| *busy),
+            Some(false),
+            "{infos:?}"
         );
         Ok(())
     })
@@ -6257,6 +6292,59 @@ async fn model_shorthand_switches_mid_session_and_leaves_prose_alone() {
             text.contains("echo:m2:Note: this is just a note"),
             "prose passed through unchanged: {text}"
         );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn model_shorthand_names_a_cordoned_target_and_recovers_after_clear() {
+    let state = temp_state_file("shorthand-cordon");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("opus", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart").await?;
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([(
+                CandidateId::new("b", "opus"),
+                router_acp::headroom::UsageCordon {
+                    reason: "weekly limit".into(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".into(),
+                    soft: false,
+                },
+            )]));
+
+        let failed = prompt_text(&cx, &sid, "opus: take over now").await;
+        assert!(
+            failed.is_err(),
+            "a cordoned explicit target must fail visibly"
+        );
+        assert!(
+            agent_text(&observed, &sid).contains("switch to b/opus failed"),
+            "the shorthand must not be forwarded as prose: {}",
+            agent_text(&observed, &sid)
+        );
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "opus: take over now").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("switched a/m1 → b/opus") && text.contains("echo:opus:"));
         Ok(())
     })
     .await;
@@ -7248,6 +7336,63 @@ async fn usage_cordoned_pin_switches_proactively() {
         assert!(
             text.contains("echo:m2:"),
             "turn must land on non-cordoned b/m2: {text}"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn usage_cordon_recovery_returns_a_session_to_its_displaced_model() {
+    let state = temp_state_file("proactive-cordon-recovery");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         agents:\n{}{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=a/m1]\nwarm up").await?;
+
+        let displaced = CandidateId::new("a", "m1");
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([(
+                displaced.clone(),
+                router_acp::headroom::UsageCordon {
+                    reason: "weekly limit".into(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".into(),
+                    soft: false,
+                },
+            )]));
+        prompt_text(&cx, &sid, "temporarily use the fallback").await?;
+        assert!(agent_text(&observed, &sid).contains("echo:m2:"));
+
+        // The account recovers before the next turn. The session must return
+        // to the model that the cordon displaced even with auto-upgrade off.
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "continue on the recovered account").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("switched b/m2 → a/m1") && text.contains("echo:m1:"),
+            "cordon recovery must re-pin the displaced model: {text}"
+        );
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+                .flatten(),
+            Some(displaced)
         );
         Ok(())
     })
@@ -15364,6 +15509,56 @@ async fn open_planner_parent(
     Ok(sid)
 }
 
+#[tokio::test]
+async fn planner_wake_carries_the_recorded_human_execution_request() {
+    use router_acp::planner_workflow as workflow;
+    let state = temp_state_file("wake-execution");
+    let log = temp_log("wake-execution");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let input_id = workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .execution_input_id
+                .unwrap();
+            // Acknowledgment is receipt handling, not revocation of the run.
+            workflow::mutate(&shared, &sid, |run| {
+                run.inputs.get_mut(&input_id).unwrap().acknowledged = true;
+                Ok(())
+            })
+            .unwrap();
+            prompt_text(&cx, &sid, "Do not deploy production until I approve it.").await?;
+            insert_wake(&shared, &sid, "audit:execution-context");
+            wait_for_mock_prompt(&log, "audit:execution-context").await;
+            let events = read_log(&log);
+            let wake = &events[mock_prompts(&log, "audit:execution-context")[0]];
+            let text = wake["text"].as_str().unwrap();
+            assert!(
+                text.contains(&input_id),
+                "wake lost the admitted input identity"
+            );
+            assert!(
+                text.contains("prepare the assignment"),
+                "wake lost the original scope"
+            );
+            assert!(text.contains("\"origin\":\"human\""));
+            assert!(text.contains("later human restrictions"));
+            let run = workflow::load(&shared, &sid).unwrap().unwrap();
+            assert!(run.inputs[&input_id].acknowledged);
+            assert!(
+                run.inputs
+                    .values()
+                    .any(|input| input.text == "Do not deploy production until I approve it.")
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
 /// Operator input reaches the parent inside a running router-owned wake
 /// turn: steered, never queued behind it.
 #[tokio::test]
@@ -15419,6 +15614,321 @@ async fn operator_input_is_steered_into_a_running_router_owned_turn() {
     )
     .await;
     let _ = std::fs::remove_file(&release);
+}
+
+/// The operator's `/implement` is one long turn (live: 43 minutes admitting 50
+/// workers). A failed staging build observed during it reaches the parent in
+/// that turn; ordinary wakes still wait for its end and nothing cancels it.
+#[tokio::test]
+async fn failed_environment_is_steered_into_the_running_implement_command_turn() {
+    use router_acp::planner_workflow::{self as workflow, Wake};
+    let state = temp_state_file("command-turn-steer");
+    let log = temp_log("command-turn-steer");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    let skill = repo.path().join("repo/.agents/skills/select-plan/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        format!(
+            "---\nname: select-plan\n---\nCOMMAND-TURN-MARKER\nWAIT_FILE:{}\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            let (answer, ()) = tokio::join!(
+                prompt_text(&cx, &sid, "/implement drain the roadmap"),
+                async {
+                    wait_for_mock_prompt(&log, "COMMAND-TURN-MARKER").await;
+                    workflow::mutate(&shared, &sid, |run| {
+                        run.wakes.insert(
+                            "work-1:attempt-1".into(),
+                            Wake {
+                                work_id: "work-1".into(),
+                                reason: "ROUTINE-CHILD-WAKE".into(),
+                                ..Default::default()
+                            },
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    assert!(
+                        !read_log(&log)
+                            .iter()
+                            .any(|e| e["event"] == "steer" || e["event"] == "cancel"),
+                        "a routine wake must not interrupt the operator's command turn"
+                    );
+                    workflow::mutate(&shared, &sid, |run| {
+                        run.observations.insert(
+                            "ci:staging".into(),
+                            router_acp::planner_guard::Observation {
+                                revision: "a".repeat(40),
+                                reference: "staging".into(),
+                                state: router_acp::planner_guard::ObservationState::Failed,
+                                evidence: "fixture-build".into(),
+                            },
+                        );
+                        run.wakes.insert(
+                            "observation:ci-job-failures:staging".into(),
+                            Wake {
+                                work_id: sid.clone(),
+                                reason: "STAGING-FAILED-FIXTURE".into(),
+                                ..Default::default()
+                            },
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                    for _ in 0..200 {
+                        if read_log(&log).iter().any(|e| e["event"] == "steer") {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let events = read_log(&log);
+                    let steer = events
+                        .iter()
+                        .find(|e| e["event"] == "steer")
+                        .expect("the failed environment reached the running command turn");
+                    let params = steer["params"].to_string();
+                    assert!(params.contains("STAGING-FAILED-FIXTURE"), "{params}");
+                    assert!(!params.contains("ROUTINE-CHILD-WAKE"));
+                    assert!(
+                        !events.iter().any(|e| e["event"] == "cancel"),
+                        "never cancelled"
+                    );
+                    std::fs::write(&release, "").unwrap();
+                }
+            );
+            answer?;
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
+/// A parent that answers wake after wake with prose and no tool call while
+/// staging is failed (live: fifteen "still paused" turns) is told, from the
+/// second such turn, that nothing stops the run.
+#[tokio::test]
+async fn inert_wake_turns_on_a_failed_environment_get_the_router_check() {
+    use router_acp::planner_workflow::{self as workflow, Wake};
+    let state = temp_state_file("inert-turns");
+    let log = temp_log("inert-turns");
+    let repo = planner_wire_repository();
+    let skill = repo
+        .path()
+        .join("repo/.agents/skills/integrate-plan/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: integrate-plan\n---\nTEXT:still paused\n",
+    )
+    .unwrap();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            workflow::mutate(&shared, &sid, |run| {
+                run.observations.insert(
+                    "ci:staging".into(),
+                    router_acp::planner_guard::Observation {
+                        revision: "a".repeat(40),
+                        reference: "staging".into(),
+                        state: router_acp::planner_guard::ObservationState::Failed,
+                        evidence: "fixture-build".into(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+            let mut seen = 0;
+            for round in 0..4 {
+                let marker = format!("inert-round-{round}");
+                workflow::mutate(&shared, &sid, |run| {
+                    run.wakes.insert(
+                        format!("audit:{marker}"),
+                        Wake {
+                            work_id: sid.clone(),
+                            reason: marker.clone(),
+                            ..Default::default()
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+                wait_for_mock_prompt(&log, &marker).await;
+                let prompts = mock_prompts(&log, &marker);
+                let text = read_log(&log)[prompts[0]]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                if text.contains("[Router check]") {
+                    assert!(text.contains("staging is failed") && text.contains("never pauses"));
+                    seen += 1;
+                    assert!(round >= 2, "round {round} is not yet the second inert turn");
+                } else {
+                    assert!(round < 2, "round {round} lacks the router check");
+                }
+                // Let the turn end and its wake be acknowledged before the next.
+                for _ in 0..100 {
+                    if workflow::load(&shared, &sid).unwrap().unwrap().wakes
+                        [&format!("audit:{marker}")]
+                        .claim_pid
+                        == 0
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                workflow::mutate(&shared, &sid, |run| {
+                    run.wakes
+                        .get_mut(&format!("audit:{marker}"))
+                        .unwrap()
+                        .acknowledged = true;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            assert_eq!(seen, 2);
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// Operator input aborts any tool still running in the turn it is steered
+/// into, and the adapter tells the model "The user doesn't want to take this
+/// action right now. STOP…" for each one (live: a parent took that as an
+/// operator stop and paused). The steer waits for the running edit; past the
+/// bound it still goes, labelled with the router's interruption note.
+#[tokio::test]
+async fn operator_steer_waits_for_running_tools_and_labels_an_interruption() {
+    let state = temp_state_file("preempt-tools");
+    let log = temp_log("preempt-tools");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let tool_release = std::env::temp_dir().join(format!("edit-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    std::fs::write(
+        repo.path().join("repo/.agents/skills/review-work/SKILL.md"),
+        format!(
+            "---\nname: review-work\n---\nTOOL:pending-edit\nWAIT_FILE:{}\nTOOL:finish-edit\nWAIT_FILE:{}\n",
+            tool_release.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            insert_wake(&shared, &sid, "audit:tool-steer");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            wait_for_mock_event(&log, "pending_edit").await;
+            let (answer, ()) = tokio::join!(
+                prompt_text(&cx, &sid, "operator: why is staging stuck?"),
+                async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    assert!(
+                        !read_log(&log)
+                            .iter()
+                            .any(|e| e["event"] == "cancel" || e["event"] == "steer"),
+                        "operator input must not abort a running edit"
+                    );
+                    std::fs::write(&tool_release, "").unwrap();
+                }
+            );
+            assert_eq!(answer?.stop_reason, StopReason::EndTurn);
+            let events = read_log(&log);
+            let edit = events
+                .iter()
+                .position(|e| e["event"] == "completed_edit")
+                .expect("the edit finished");
+            let steer = events
+                .iter()
+                .position(|e| e["event"] == "steer")
+                .expect("the operator's words were steered");
+            assert!(edit < steer, "{events:?}");
+            let params = events[steer]["params"].to_string();
+            assert!(params.contains("why is staging stuck"));
+            assert!(
+                !params.contains("[Router note]"),
+                "no interruption, so no note"
+            );
+            std::fs::write(&release, "").unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&tool_release);
+
+    // Past the bound: delivered anyway, with the note ahead of the operator's words.
+    let state = temp_state_file("preempt-tools-bound");
+    let log = temp_log("preempt-tools-bound");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let tool_release = std::env::temp_dir().join(format!("edit-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    std::fs::write(
+        repo.path().join("repo/.agents/skills/review-work/SKILL.md"),
+        format!(
+            "---\nname: review-work\n---\nTOOL:pending-edit\nWAIT_FILE:{}\nTOOL:finish-edit\nWAIT_FILE:{}\n",
+            tool_release.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    unsafe { std::env::set_var("ROUTER_ACP_OPERATOR_TOOL_WAIT_MS", "500") };
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            insert_wake(&shared, &sid, "audit:tool-steer-bound");
+            wait_for_mock_prompt(&log, WAKE_MARKER).await;
+            wait_for_mock_event(&log, "pending_edit").await;
+            let answer = prompt_text(&cx, &sid, "operator: still there?").await?;
+            assert_eq!(answer.stop_reason, StopReason::EndTurn);
+            let events = read_log(&log);
+            let steer = events
+                .iter()
+                .find(|e| e["event"] == "steer")
+                .expect("delivered past the bound");
+            let params = steer["params"].to_string();
+            let note = params.find("[Router note]").expect("interruption labelled");
+            assert!(note < params.find("still there?").unwrap());
+            assert!(params.contains("not an operator refusal"));
+            let run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+            assert!(
+                run.inputs
+                    .values()
+                    .any(|input| input.text.contains("still there?")
+                        && !input.text.contains("[Router note]")),
+                "the recorded operator input stays the operator's own words"
+            );
+            std::fs::write(&tool_release, "").unwrap();
+            std::fs::write(&release, "").unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    unsafe { std::env::remove_var("ROUTER_ACP_OPERATOR_TOOL_WAIT_MS") };
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&tool_release);
 }
 
 /// An adapter that will not take a steer: the router-owned turn is
