@@ -1,0 +1,26 @@
+# Built-in defaults for a `kimi` agent (the Kimi CLI's ACP mode). An agent entry
+# inherits every key it does not set; mappings merge, lists and scalars replace.
+command:
+  type: stdio
+  command: kimi
+lineage: moonshot
+budget_prompts_5h: 400
+llm_proxy:
+  protocol: openai
+  base_url_env: KIMI_BASE_URL
+  upstream_base_url: https://api.kimi.com/coding/v1
+model_selection:
+  type: spawn-config
+  process_template:
+    args:
+    - --model
+    - ${model_id}
+    - acp
+models:
+- id: kimi-k2
+  display_name: Kimi K2
+  cost_rank: 2
+  pricing:
+    input_per_mtok: 0.95
+    output_per_mtok: 4
+    cache_read_per_mtok: 0.16
