@@ -289,9 +289,13 @@ enum Command {
         #[arg(long)]
         into: String,
     },
-    /// Send an agent-origin correction to a running planner's durable queue,
-    /// or inspect its delivery receipt. Does not start or take over a session.
-    PlannerInput {
+    /// Send an agent-origin message to any active router session, or inspect
+    /// its delivery receipt. A planner parent takes it through its durable run
+    /// queue; any other session gets a router-owned turn at its next idle
+    /// boundary (or one steer into a running turn). Does not start or take
+    /// over a session. `planner-input` remains an alias.
+    #[command(name = "send-input", alias = "planner-input")]
+    SendInput {
         #[arg(long, default_value = "~/.local/state/router-acp/sessions.db")]
         state: PathBuf,
         #[arg(long)]
@@ -953,7 +957,7 @@ async fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::PlannerInput {
+        Command::SendInput {
             state,
             session,
             id,
@@ -967,6 +971,7 @@ async fn run() -> anyhow::Result<()> {
             reason,
             apply,
         } => {
+            use router_acp::{planner_input, session_input};
             let path = router_acp::config::expand_tilde(&state);
             let retention = router_acp::state::Retention {
                 max_age: std::time::Duration::MAX,
@@ -975,6 +980,12 @@ async fn run() -> anyhow::Result<()> {
                 !(apply || include_human || reason.is_some()) || delete || drain,
                 "--apply, --include-human and --reason require --delete or --drain"
             );
+            // The session decides the queue: a planner run owns its input,
+            // every other session uses the per-session documents.
+            let planner = |store: &router_acp::state::StateStore| {
+                anyhow::ensure!(store.get(&session).is_some(), "router session missing");
+                session_input::planner_session(store, &session).map_err(anyhow::Error::msg)
+            };
             let report = if list || delete || drain {
                 let store = if apply {
                     anyhow::ensure!(
@@ -985,31 +996,60 @@ async fn run() -> anyhow::Result<()> {
                 } else {
                     router_acp::state::StateStore::open_readonly(&path, retention)?
                 };
-                let rows = if list {
-                    router_acp::planner_input::list(&store, &session)
+                let planner = planner(&store)?;
+                if list {
+                    if planner {
+                        serde_json::to_value(
+                            planner_input::list(&store, &session).map_err(anyhow::Error::msg)?,
+                        )?
+                    } else {
+                        serde_json::to_value(
+                            session_input::list(&store, &session).map_err(anyhow::Error::msg)?,
+                        )?
+                    }
                 } else {
-                    router_acp::planner_input::withdraw(
-                        &store,
-                        &session,
-                        &cwd.expect("clap requires cwd"),
-                        id.as_deref(),
-                        include_human,
-                        reason.as_deref().unwrap_or(""),
-                        apply,
-                    )
+                    let cwd = cwd.expect("clap requires cwd");
+                    let reason = reason.as_deref().unwrap_or("");
+                    if planner {
+                        serde_json::to_value(
+                            planner_input::withdraw(
+                                &store,
+                                &session,
+                                &cwd,
+                                id.as_deref(),
+                                include_human,
+                                reason,
+                                apply,
+                            )
+                            .map_err(anyhow::Error::msg)?,
+                        )?
+                    } else {
+                        serde_json::to_value(
+                            session_input::withdraw(
+                                &store,
+                                &session,
+                                &cwd,
+                                id.as_deref(),
+                                include_human,
+                                reason,
+                                apply,
+                            )
+                            .map_err(anyhow::Error::msg)?,
+                        )?
+                    }
                 }
-                .map_err(anyhow::Error::msg)?;
-                serde_json::to_value(rows)?
             } else if status {
                 let store = router_acp::state::StateStore::open_readonly(&path, retention)?;
-                serde_json::to_value(
-                    router_acp::planner_input::status(
-                        &store,
-                        &session,
-                        id.as_deref().expect("clap requires id"),
-                    )
-                    .map_err(anyhow::Error::msg)?,
-                )?
+                let id = id.as_deref().expect("clap requires id");
+                if planner(&store)? {
+                    serde_json::to_value(
+                        planner_input::status(&store, &session, id).map_err(anyhow::Error::msg)?,
+                    )?
+                } else {
+                    serde_json::to_value(
+                        session_input::status(&store, &session, id).map_err(anyhow::Error::msg)?,
+                    )?
+                }
             } else {
                 use std::io::Read;
                 let file = message_file.expect("clap requires a message file");
@@ -1025,16 +1065,19 @@ async fn run() -> anyhow::Result<()> {
                     "router state does not exist"
                 );
                 let store = router_acp::state::StateStore::load(&path, retention);
-                serde_json::to_value(
-                    router_acp::planner_input::send(
-                        &store,
-                        &session,
-                        &cwd.expect("clap requires cwd"),
-                        id.as_deref().expect("clap requires id"),
-                        &message,
-                    )
-                    .map_err(anyhow::Error::msg)?,
-                )?
+                let cwd = cwd.expect("clap requires cwd");
+                let id = id.as_deref().expect("clap requires id");
+                if planner(&store)? {
+                    serde_json::to_value(
+                        planner_input::send(&store, &session, &cwd, id, &message)
+                            .map_err(anyhow::Error::msg)?,
+                    )?
+                } else {
+                    serde_json::to_value(
+                        session_input::send(&store, &session, &cwd, id, &message)
+                            .map_err(anyhow::Error::msg)?,
+                    )?
+                }
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())

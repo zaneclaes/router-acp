@@ -111,6 +111,9 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 .collect::<Vec<_>>();
             for sid in ids {
                 let Some(run) = planner_workflow::load(&shared, &sid).ok().flatten() else {
+                    // No planner run: the only router-owned delivery this
+                    // session takes is `send-input` (`crate::session_input`).
+                    crate::session_input::tick(&shared, &sid);
                     continue;
                 };
                 // This router has the parent loaded: it owns the run and

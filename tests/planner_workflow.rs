@@ -8183,3 +8183,102 @@ async fn pending_adoption_audits_and_gates_describe_recovery_instead_of_demandin
         json!(handoff)
     );
 }
+
+#[test]
+fn send_input_to_a_session_without_a_planner_run_is_durable_idempotent_and_withdrawable() {
+    use router_acp::session_input;
+    let f = fixture(|_| {});
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    assert!(planner_workflow::load(&f.shared, SID).unwrap().is_none());
+    assert!(!session_input::planner_session(&store, SID).unwrap());
+    let send = |id: &str, message: &str| session_input::send(&store, SID, &f.repo, id, message);
+    assert!(
+        send("bad id!", "text")
+            .unwrap_err()
+            .contains("input id must be")
+    );
+    assert!(
+        session_input::send(&store, SID, Path::new("/"), "review-1", "text")
+            .unwrap_err()
+            .contains("does not match --cwd")
+    );
+    let first = send("review-1", "Real fixtures must gate again").unwrap();
+    assert!(!first.planner && first.queued && !first.delivered && !first.acknowledged);
+    assert_eq!(first.origin, "agent");
+    // The same id with the same text is a receipt, not a second message.
+    let retry = send("review-1", "Real fixtures must gate again").unwrap();
+    assert!(retry.queued && retry.delivery.is_none());
+    assert!(
+        send("review-1", "different text")
+            .unwrap_err()
+            .contains("different original message")
+    );
+    send("review-2", "Second correction").unwrap();
+    let readonly = StateStore::open_readonly(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    )
+    .unwrap();
+    assert!(
+        session_input::status(&readonly, SID, "review-1")
+            .unwrap()
+            .queued
+    );
+    assert!(
+        session_input::status(&readonly, SID, "missing")
+            .unwrap_err()
+            .contains("unknown session input")
+    );
+    let listed = session_input::list(&readonly, SID).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|s| s.input_id.as_str())
+            .collect::<Vec<_>>(),
+        ["review-1", "review-2"]
+    );
+    // Preview selects without writing; apply needs a reason and keeps the text.
+    let preview =
+        session_input::withdraw(&store, SID, &f.repo, Some("review-1"), false, "", false).unwrap();
+    assert_eq!(preview.len(), 1);
+    assert!(preview[0].withdrawn.is_none());
+    assert!(
+        session_input::withdraw(&store, SID, &f.repo, Some("review-1"), false, "", true)
+            .unwrap_err()
+            .contains("requires a reason")
+    );
+    let withdrawn = session_input::withdraw(
+        &store,
+        SID,
+        &f.repo,
+        Some("review-1"),
+        false,
+        "obsolete",
+        true,
+    )
+    .unwrap();
+    assert_eq!(withdrawn[0].withdrawn.as_ref().unwrap().reason, "obsolete");
+    assert!(!withdrawn[0].queued && !withdrawn[0].acknowledged);
+    assert_eq!(session_input::list(&store, SID).unwrap().len(), 1);
+    // A withdrawn id cannot be reopened by resending it.
+    assert!(
+        !send("review-1", "Real fixtures must gate again")
+            .unwrap()
+            .queued
+    );
+    let drained =
+        session_input::withdraw(&store, SID, &f.repo, None, false, "superseded", true).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].input_id, "review-2");
+    assert!(session_input::list(&store, SID).unwrap().is_empty());
+    // Once the session has a planner run, the command routes to the run's queue.
+    authorize(&f.shared);
+    assert!(session_input::planner_session(&store, SID).unwrap());
+}

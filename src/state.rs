@@ -651,6 +651,43 @@ impl StateStore {
             .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
     }
 
+    /// One `send-input` document of a session without a planner run
+    /// (`crate::session_input`), with its revision.
+    pub fn session_input(
+        &self,
+        sid: &str,
+        input_id: &str,
+    ) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.with_file(sid, |file| file.session_input(sid, input_id))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Every `send-input` document of a session, oldest first.
+    pub fn session_inputs(
+        &self,
+        sid: &str,
+    ) -> Result<Vec<(String, u64, serde_json::Value)>, String> {
+        self.with_file(sid, |file| file.session_inputs(sid))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// Optimistically save one `send-input` document in the session's shard.
+    pub fn save_session_input(
+        &self,
+        sid: &str,
+        input_id: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        self.with_file(sid, |file| {
+            file.save_session_input(sid, input_id, expected, document)
+        })
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
     /// Every planner run stored beside `sid`'s: the same checkout's shard
     /// (or the legacy file for a legacy id).
     pub fn planner_run_ids_beside(&self, sid: &str) -> Result<Vec<String>, String> {
@@ -1555,6 +1592,17 @@ impl StateFile {
             save_id    TEXT NOT NULL,
             PRIMARY KEY (session_id, save_id)
         );
+        -- `send-input` to a session with no planner run: one durable,
+        -- revision-checked document per (session, input id). See
+        -- `crate::session_input`. Planner sessions keep using their run's
+        -- own input queue.
+        CREATE TABLE IF NOT EXISTS session_inputs (
+            session_id TEXT NOT NULL,
+            input_id   TEXT NOT NULL,
+            revision   INTEGER NOT NULL,
+            document   TEXT NOT NULL,
+            PRIMARY KEY (session_id, input_id)
+        );
         "#;
         let file_sql = match kind {
             FileKind::Legacy => LEGACY_SCHEMA,
@@ -1757,6 +1805,88 @@ impl StateFile {
                 .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
+        Ok(expected + 1)
+    }
+
+    fn session_input(
+        &self,
+        sid: &str,
+        input_id: &str,
+    ) -> Result<Option<(u64, serde_json::Value)>, String> {
+        self.conn
+            .query_row(
+                "SELECT revision, document FROM session_inputs WHERE session_id = ?1 AND input_id = ?2",
+                params![sid, input_id],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|(revision, document)| {
+                serde_json::from_str(&document)
+                    .map(|document| (revision, document))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    /// Every input ever sent to `sid`, oldest first (insertion order, which
+    /// the rowid preserves). Callers filter resolved rows.
+    fn session_inputs(&self, sid: &str) -> Result<Vec<(String, u64, serde_json::Value)>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT input_id, revision, document FROM session_inputs \
+                 WHERE session_id = ?1 ORDER BY rowid",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([sid], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(|(id, revision, document)| {
+                serde_json::from_str(&document)
+                    .map(|document| (id, revision, document))
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
+    /// The planner-run save rule, per input: `expected == 0` inserts a new
+    /// row and never replaces an existing one; otherwise the update must
+    /// match the revision the caller read.
+    fn save_session_input(
+        &self,
+        sid: &str,
+        input_id: &str,
+        expected: u64,
+        document: &serde_json::Value,
+    ) -> Result<u64, String> {
+        let document = serde_json::to_string(document).map_err(|error| error.to_string())?;
+        let changed = if expected == 0 {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_inputs (session_id, input_id, revision, document) \
+                 VALUES (?1, ?2, 1, ?3)",
+                params![sid, input_id, document],
+            )
+        } else {
+            self.conn.execute(
+                "UPDATE session_inputs SET revision = revision + 1, document = ?1 \
+                 WHERE session_id = ?2 AND input_id = ?3 AND revision = ?4",
+                params![document, sid, input_id, expected as i64],
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("session input changed concurrently; reload before retrying".into());
+        }
         Ok(expected + 1)
     }
 
