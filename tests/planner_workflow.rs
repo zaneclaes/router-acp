@@ -624,8 +624,21 @@ fn work(work_id: &str) -> WorkSpec {
         owned_paths: Vec::new(),
         required_checks: Vec::new(),
         required_integration_evidence: Vec::new(),
+        repository: None,
         external_id: Some("external-1".into()),
     }
+}
+
+#[test]
+fn work_spec_without_repository_deserializes_for_saved_runs() {
+    let work: WorkSpec = serde_json::from_value(json!({
+        "work_id": "work-1",
+        "plan_id": "plan-1",
+        "scope": "preserve old saved work"
+    }))
+    .unwrap();
+
+    assert_eq!(work.repository, None);
 }
 
 fn artifact(revision: &str) -> Artifact {
@@ -2063,6 +2076,60 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         saved.works["work-1"].workspace.as_ref().unwrap().lease,
         "stable"
     );
+}
+
+#[tokio::test]
+async fn allocator_receives_repository_and_resume_keeps_the_allocated_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repository(&tmp);
+    let state_path = tmp.path().join("state.db");
+    let workspace = tmp.path().join("worker");
+    let request = tmp.path().join("allocation.json");
+    assert!(
+        std::process::Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&repo)
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let shared = shared_for(&repo, &state_path, |cfg| {
+        cfg.routers.planner.workspace = Some(PlannerWorkspaceConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "input=$(cat); case \"$input\" in *adopt-native*) echo '{\"adopted\":null}';; *) printf '%s' \"$input\" >\"$1\"; printf '{\"path\":\"%s\",\"lease\":\"stable\"}' \"$2\";; esac".into(),
+                "allocator".into(),
+                request.display().to_string(),
+                workspace.display().to_string(),
+            ],
+            timeout_ms: 5_000,
+        });
+    });
+    let mut allocated_work = work("work-1");
+    allocated_work.repository = Some("router-acp".into());
+    admit(&shared, allocated_work);
+
+    let first = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap();
+    let allocation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&request).unwrap()).unwrap();
+    assert_eq!(allocation["event"], "planner_allocate");
+    assert_eq!(allocation["work"]["repository"], "router-acp");
+
+    let mut run = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    let work = run.works.get_mut("work-1").unwrap();
+    work.attempt.as_mut().unwrap().ended = true;
+    work.status = WorkStatus::Interrupted;
+    planner_workflow::save(&shared, SID, &mut run).unwrap();
+
+    let resumed = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap();
+    assert_eq!(resumed.1.path, first.1.path);
+    assert_eq!(resumed.1.lease, first.1.lease);
 }
 
 #[tokio::test]

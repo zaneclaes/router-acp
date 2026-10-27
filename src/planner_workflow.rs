@@ -147,6 +147,10 @@ pub struct WorkSpec {
     pub required_checks: Vec<String>,
     #[serde(default)]
     pub required_integration_evidence: Vec<String>,
+    /// Optional repository pool the host should allocate from. Older saved
+    /// work specs omit this and continue to use the host's default pool.
+    #[serde(default)]
+    pub repository: Option<String>,
     /// Repository-defined ticket or artifact identity. The core treats it as
     /// opaque; a host lifecycle gate enforces service-specific constraints.
     pub external_id: Option<String>,
