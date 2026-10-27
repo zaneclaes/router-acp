@@ -1047,8 +1047,11 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
     if let Some(phase) = directed {
         shared.with_session(sid, |s| s.planner_explicit_phase = Some(phase));
     }
+    // A coordinator's attested implementation directive reopens a finished
+    // child, as a person's does; other agent input never does.
+    let reopens = human || directed == Some(PlannerPhase::Implementation);
     mutate(shared, sid, |run| {
-        if run.status == RunStatus::Complete && !human {
+        if run.status == RunStatus::Complete && !reopens {
             return Err("planner run is complete; use an explicit /plan or /implement command to start new scope".into());
         }
         // A person's follow-up continues a finished or paused run in its last
@@ -1079,7 +1082,7 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
             if phase == PlannerPhase::Implementation {
                 if matches!(
                     run.status,
-                    RunStatus::Paused | RunStatus::Cancelled | RunStatus::Draining
+                    RunStatus::Complete | RunStatus::Paused | RunStatus::Cancelled | RunStatus::Draining
                 ) {
                     run.approval_waits.clear();
                 }
@@ -1112,7 +1115,10 @@ pub(crate) fn enqueue_parent_input(
     ensure(shared, sid)?;
     mutate(shared, sid, |run| {
         if run.status == RunStatus::Complete {
-            if phase.is_none() && !human_prompt(req) {
+            if phase.is_none()
+                && directed_phase(req) != Some(PlannerPhase::Implementation)
+                && !human_prompt(req)
+            {
                 return Err(
                     "planner run is complete; use /plan or /implement for new scope".into(),
                 );
