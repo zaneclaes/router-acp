@@ -419,7 +419,15 @@ mod tests {
         let mut doc = yaml("agents:\n- name: kimi\n");
         apply(&mut doc);
         let agent = &doc["agents"][0];
-        assert_eq!(agent["command"]["command"], "kimi");
+        // The bare preset name, or the PATH entry it resolves to on this
+        // machine (`resolve_programs`).
+        assert!(
+            agent["command"]["command"]
+                .as_str()
+                .is_some_and(|command| command == "kimi" || command.ends_with("/kimi")),
+            "{:?}",
+            agent["command"]["command"]
+        );
         assert_eq!(agent["command"]["type"], "stdio");
         assert_eq!(agent["lineage"], "moonshot");
         assert_eq!(agent["models"][0]["id"], "kimi-k2");

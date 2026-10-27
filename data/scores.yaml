@@ -37,6 +37,32 @@ candidates:
       Ops: 2.64
       CodingGeneral: 2.90
 
+  # GPT-6 Astra: OpenAI's flagship above the Sol family ($10/$50, 1.05M
+  # context, 128k output, native xhigh/max). Scored from its own calibrated
+  # evidence (`*gpt-6-astra*` in model-policy.yaml: DeepSWE v1.1 74.1, the
+  # only Astra row published on a benchmark with anchors here), so every class
+  # carries the aggregate. Whole-id pattern per docs/model-updater.md; it does
+  # not collide with the sol/terra/luna substrings.
+  - pattern: "*gpt-6-astra*"
+    coding_tier: high
+    coding_percentile: 0.97
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }
+    default_quality: 3.41
+    quality:
+      UiTweak: 3.41
+      BugFix: 3.41
+      Feature: 3.41
+      Refactor: 3.41
+      Algorithms: 3.41
+      Architecture: 3.41
+      Research: 3.41
+      Writing: 3.41
+      Ops: 3.41
+      CodingGeneral: 3.41
+
   # GPT-6 Sol / Luna version bumps of the 5.6 lines. Quality is copied from
   # the family entries below (no score churn — the `opus[1m]` → `opus-next[1m]`
   # case): OpenAI has not published a same-harness four-benchmark card for

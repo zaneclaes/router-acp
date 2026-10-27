@@ -57,6 +57,12 @@ pub struct PlannerRun {
     /// in the same checkout (`crate::planner_adopt`).
     #[serde(default)]
     pub owner: Option<RunOwner>,
+    /// Unix second at which `owner` last confirmed it still has the parent
+    /// session loaded and drives this run (`crate::planner_adopt::heartbeat`,
+    /// refreshed by the wake loop). `0` is a run saved by a router that
+    /// predates heartbeats: its owner is trusted while that process exists.
+    #[serde(default)]
+    pub owner_heartbeat_at: i64,
     /// The session that adopted this run's works, holds, queue and wakes.
     #[serde(default)]
     pub superseded_by: Option<String>,
@@ -639,6 +645,7 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         idle_heartbeats: 0,
         capacity: Default::default(),
         owner: Some(RunOwner::current()),
+        owner_heartbeat_at: chrono::Utc::now().timestamp(),
         superseded_by: None,
     };
     if let Err(e) = save(shared, sid, &mut run) {
@@ -930,8 +937,9 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let human = human_prompt(req);
     let receipt = InputReceipt {
-        origin: if human_prompt(req) {
+        origin: if human {
             "human"
         } else if delegated_approval(req) {
             "coordinator"
@@ -960,6 +968,14 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         }
     } else {
         run.inputs.insert(id.clone(), receipt);
+    }
+    // The human spoke: an `awaiting-human` hold waits for exactly this, on
+    // whichever path their words arrive (their own turn, a steer into a
+    // router-owned turn, or the durable queue). LESSON (2026-10-27): only the
+    // own-turn path cleared it, so a steered "continue" left a run parked for
+    // ten hours with every wake, heartbeat and capacity tick silenced.
+    if human {
+        crate::planner_capacity::clear_human_hold(run);
     }
     Ok(id)
 }
@@ -1473,6 +1489,15 @@ async fn operate_once(
     operation: Operation,
 ) -> Result<String, String> {
     let mut run = ensure(shared, sid)?;
+    // Another session adopted this run (its owner's heartbeat went stale or
+    // its router exited). A coordinator that resumes here afterwards must not
+    // keep mutating the superseded record beside the live one.
+    if run.status == RunStatus::Superseded && !matches!(operation, Operation::Status { .. }) {
+        return Err(format!(
+            "this planner run was resumed by session {}; it is coordinated there now and takes no further mutations here",
+            run.superseded_by.as_deref().unwrap_or("(unknown)")
+        ));
+    }
     if let Operation::Status {
         offset,
         ref work_id,
@@ -1553,9 +1578,7 @@ async fn operate_once(
     if let Some(source) = &run.capacity.pending_adoption
         && matches!(operation, Operation::Admit { .. })
     {
-        return Err(format!(
-            "planner adoption of {source} is pending; the capacity cycle retries the handoff before new admissions"
-        ));
+        return Err(crate::planner_adopt::admission_refusal(&run, source));
     }
     if actor.is_some() && !worker_operation {
         return Err(
@@ -2452,11 +2475,10 @@ async fn begin_work_once(
     {
         return Err("planner execution is not authorized or is suspended".into());
     }
-    let snapshot = run
-        .works
-        .get(work_id)
-        .ok_or("admit this work identity before dispatch")?
-        .clone();
+    let snapshot = match run.works.get(work_id) {
+        Some(work) => work.clone(),
+        None => return Err(crate::planner_adopt::dispatch_refusal(&run, work_id)),
+    };
     if snapshot.reconciliation.required {
         return Err("parent reconciliation required: record current scope and preserved source with planner_workflow reconcile before resuming".into());
     }

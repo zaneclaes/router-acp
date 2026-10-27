@@ -2800,6 +2800,9 @@ agents:
         let codex = &cfg.agents[0];
         assert!(codex.command.command.ends_with("codex-acp"));
         assert!(codex.models.iter().any(|m| m.id == "gpt-6.1-sol"));
+        // Astra is part of the shipped codex preset: a `provider: codex` agent
+        // must route to it without declaring it by hand.
+        assert!(codex.models.iter().any(|m| m.id == "gpt-6-astra"));
         assert!(matches!(
             codex.usage_source,
             Some(UsageSourceConfig::CodexRollout)

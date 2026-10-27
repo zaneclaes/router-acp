@@ -296,13 +296,15 @@ fn every_shipped_model_has_the_complete_cross_file_contract() {
 
 #[test]
 fn an_enabled_model_cannot_omit_any_companion_configuration() {
+    // A model no shipped file knows: every companion check must fire. (GPT-6
+    // Astra used to be this fixture, until it got its full contract.)
     let incomplete = vec![(
         "fixture.yaml".to_string(),
         vec![Agent {
             name: "codex".to_string(),
             provider: None,
             models: vec![Model {
-                id: "gpt-6-astra".to_string(),
+                id: "gpt-7-nova".to_string(),
                 api_model: None,
                 cost_rank: None,
                 pricing: None,

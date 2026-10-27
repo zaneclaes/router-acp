@@ -128,6 +128,9 @@ struct Mock {
     name: String,
     supports_lifecycle: bool,
     session_modes: Vec<String>,
+    /// `MOCK_MODE_UPDATE=1`: `session/set_mode` streams a `current_mode_update`
+    /// before it answers, as codex-acp does.
+    mode_update: bool,
     models: Vec<String>,
     auth_required: bool,
     auth_hang: bool,
@@ -168,6 +171,7 @@ impl Mock {
                 })
                 .unwrap_or_default(),
             models,
+            mode_update: std::env::var("MOCK_MODE_UPDATE").is_ok(),
             auth_required: std::env::var("MOCK_AUTH_REQUIRED").is_ok(),
             auth_hang: std::env::var("MOCK_AUTH_HANG").is_ok(),
             fail_new_after: std::env::var("MOCK_FAIL_NEW_AFTER")
@@ -1590,7 +1594,7 @@ async fn main() {
                   responder: Responder<
                 agent_client_protocol::schema::v1::SetSessionModeResponse,
             >,
-                  _cx| {
+                  cx: ConnectionTo<ClientRole>| {
                 let mock = m_setmode.clone();
                 async move {
                     let sid = req.session_id.0.to_string();
@@ -1599,6 +1603,15 @@ async fn main() {
                     if !mock.session_modes.contains(&mode) {
                         return responder
                             .respond_with_error(AcpError::invalid_params().data("unknown mode"));
+                    }
+                    if mock.mode_update {
+                        let frame = UntypedMessage::new(
+                            "session/update",
+                            json!({"sessionId": sid, "update": {
+                                "sessionUpdate": "current_mode_update", "currentModeId": mode
+                            }}),
+                        )?;
+                        let _ = cx.send_notification(frame);
                     }
                     responder
                         .respond(agent_client_protocol::schema::v1::SetSessionModeResponse::new())

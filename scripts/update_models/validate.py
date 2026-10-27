@@ -330,6 +330,19 @@ class Validator:
         return self.findings
 
 
+def validate_catalog(policy: Policy, scores: ScoresFile, catalog: Catalog) -> list[Finding]:
+    """Only the catalog checks, for a second catalog (a shipped preset) beside
+    the primary one: the table-wide pattern, ordering and benchmark checks are
+    the same for every catalog and are reported once by `validate`."""
+    validator = Validator(policy, scores, catalog)
+    validator.check_catalog()
+    source = catalog.path.name
+    return [
+        Finding(f.severity, f.code, f"{f.message} (in {source})", f.detail)
+        for f in validator.findings
+    ]
+
+
 def validate(policy: Policy, scores: ScoresFile, catalog: Catalog | None) -> list[Finding]:
     return Validator(policy, scores, catalog).run()
 

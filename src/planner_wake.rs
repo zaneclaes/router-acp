@@ -113,15 +113,21 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let Some(run) = planner_workflow::load(&shared, &sid).ok().flatten() else {
                     continue;
                 };
-                // This router has the parent loaded: it owns the run. A run
-                // whose owner died is what a new `/implement` resumes
-                // (`crate::planner_adopt`).
-                let me = planner_workflow::RunOwner::current();
-                if run.owner != Some(me) && run.status != RunStatus::Superseded {
-                    let _ = planner_workflow::mutate(&shared, &sid, |run| {
-                        run.owner = Some(me);
-                        Ok(())
-                    });
+                // This router has the parent loaded: it owns the run and
+                // confirms so on a heartbeat. A run whose owner died, or whose
+                // owner stopped confirming it, is what a new `/implement`
+                // resumes (`crate::planner_adopt`).
+                if run.status == RunStatus::Superseded {
+                    superseded_notice(&shared, &sid, &run);
+                    continue;
+                }
+                if let Err(error) = crate::planner_adopt::heartbeat(
+                    shared.as_ref(),
+                    &sid,
+                    &run,
+                    chrono::Utc::now().timestamp(),
+                ) {
+                    tracing::warn!(session = sid, %error, "planner ownership heartbeat not saved");
                 }
                 // A missed stop caused by router death is reconciled before
                 // parent work resumes. Never infer that the child survived.
@@ -142,6 +148,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let now = chrono::Utc::now().timestamp();
                 heartbeat(&shared, &sid, &run, now);
                 crate::planner_capacity::spawn_tick(&shared, &sid, now);
+                parked_notice(&shared, &sid, &run, now);
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
@@ -185,6 +192,26 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// A loaded parent whose run another session adopted: say so once. The run
+/// takes no further mutations here (`planner_workflow::operate`), so the
+/// coordinator must continue in the adopting session.
+fn superseded_notice(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
+    let notice = format!(
+        "router-acp · this planner run was resumed by session {}; it is coordinated there now",
+        run.superseded_by.as_deref().unwrap_or("(unknown)")
+    );
+    let fresh = crate::planner_guard::with_runtime(shared, sid, |rt| {
+        if rt.adoption_notice.as_deref() == Some(&notice) {
+            return false;
+        }
+        rt.adoption_notice = Some(notice.clone());
+        true
+    });
+    if fresh {
+        crate::session::notify_user(shared, sid, notice);
+    }
 }
 
 /// A router-owned turn is in flight and something actionable is pending. A
@@ -674,6 +701,110 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         );
         Ok(())
     });
+}
+
+/// Idle this long on a parked gate before the operator is told.
+pub const PARKED_NOTICE_SECS: i64 = 10 * 60;
+/// And again this often while it stays parked.
+pub const PARKED_REPEAT_SECS: i64 = 30 * 60;
+
+/// Why no wake, heartbeat, capacity wake or auto-admission reaches an idle
+/// parent: each of these gates silences the loop by design, and each waits on
+/// a person. None of them may stay invisible. LESSON (2026-10-27): an
+/// `awaiting-human` hold that a steered "continue" never lifted parked a run
+/// for ten hours with nothing in the log, the client or the status block
+/// saying so.
+pub fn parked_reason(run: &planner_workflow::PlannerRun) -> Option<String> {
+    if run.status != RunStatus::Running || run.phase != crate::config::PlannerPhase::Implementation
+    {
+        return None;
+    }
+    if let Some(hold) = crate::planner_capacity::human_hold(run) {
+        return Some(format!(
+            "an awaiting-human hold on `{}` quoting {}. Your next message lifts it; until then \
+             nothing new is admitted, while audits, in-flight wakes and other admitted work \
+             continue.",
+            hold.plan_id, hold.detail
+        ));
+    }
+    if !run.approval_waits.is_empty() {
+        let mut ids = run.approval_waits.iter().cloned().collect::<Vec<_>>();
+        ids.truncate(3);
+        return Some(format!(
+            "{} unanswered permission or question request(s) ({}). The run continues once the \
+             client answers them.",
+            run.approval_waits.len(),
+            ids.join(", ")
+        ));
+    }
+    if let Some(input) = run.parent_queue.first() {
+        return Some(format!(
+            "queued operator input {} that has not been delivered yet.",
+            input.input_id
+        ));
+    }
+    None
+}
+
+/// Tell the operator, in the client and in the log, that their idle parent is
+/// parked and why: once after `PARKED_NOTICE_SECS` of idleness, then every
+/// `PARKED_REPEAT_SECS`, and again whenever the reason changes. The notice is
+/// flushed at once because no turn is coming to carry it.
+pub fn parked_notice(
+    shared: &Arc<Shared>,
+    sid: &str,
+    run: &planner_workflow::PlannerRun,
+    now: i64,
+) {
+    let Some(reason) = parked_reason(run) else {
+        crate::planner_guard::with_runtime(shared, sid, |rt| rt.parked = None);
+        return;
+    };
+    if shared
+        .with_session(sid, |s| s.prompt_activity != 0 || s.pin.is_none())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let Some((last, _)) = shared.state.lock().unwrap().last_activity(sid) else {
+        return;
+    };
+    let parked = crate::planner_guard::with_runtime(shared, sid, |rt| match &mut rt.parked {
+        Some(parked) if parked.reason == reason => {
+            if now - parked.last_notice < PARKED_REPEAT_SECS {
+                return None;
+            }
+            parked.last_notice = now;
+            Some(parked.clone())
+        }
+        _ => {
+            if now - last < PARKED_NOTICE_SECS {
+                return None;
+            }
+            let parked = crate::planner_guard::Parked {
+                reason: reason.clone(),
+                since: last,
+                last_notice: now,
+            };
+            rt.parked = Some(parked.clone());
+            Some(parked)
+        }
+    });
+    let Some(parked) = parked else {
+        return;
+    };
+    let minutes = (now - parked.since) / 60;
+    tracing::warn!(
+        session = sid,
+        parked_minutes = minutes,
+        "planner parent parked, no wake can reach it: {reason}"
+    );
+    crate::session::notify_user(
+        shared,
+        sid,
+        format!("router-acp · planner run parked for {minutes} min on {reason}"),
+    );
+    crate::session::flush_pending_disclosure(shared, sid);
 }
 
 fn environment_wake(id: &str) -> bool {

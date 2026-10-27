@@ -205,6 +205,19 @@ pub struct SessionRuntime {
     pub drain: Option<crate::planner_shutdown::Drain>,
     /// Every `_router/shutdown_progress` this session sent, in order.
     pub progress: Vec<Value>,
+    /// The idle parent is parked on a gate that waits for a person
+    /// (`crate::planner_wake::parked_reason`): the reason, when it was first
+    /// seen and when the operator was last told.
+    pub parked: Option<Parked>,
+}
+
+/// An idle planner parent that no wake can reach, and why (see
+/// `crate::planner_wake::parked_reason`).
+#[derive(Debug, Clone)]
+pub struct Parked {
+    pub reason: String,
+    pub since: i64,
+    pub last_notice: i64,
 }
 
 pub fn with_runtime<T>(shared: &Shared, sid: &str, f: impl FnOnce(&mut SessionRuntime) -> T) -> T {
@@ -563,6 +576,13 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             findings.join("\n- ")
         )
     };
+    // While ownership recovery is pending, the parent cannot admit or dispatch
+    // the inventory that answers these findings; say so instead of demanding
+    // actions the run refuses.
+    let reason = match crate::planner_adopt::pending_notice(run) {
+        Some(notice) => format!("{reason}\n{notice}"),
+        None => reason,
+    };
     // An unchanged delivered audit must not repeatedly interrupt an active
     // repair or release. Idle parents retain the existing repeat cadence.
     if release_audit
@@ -609,7 +629,10 @@ pub fn gate_tick(shared: &Shared, sid: &str, run: &PlannerRun, now: i64) {
     }
     let findings = audit_findings(run);
     let (live, max, free) = planner_capacity::slots(shared, run);
-    let unheld = if free > 0 {
+    let pending = crate::planner_adopt::pending_notice(run);
+    // Pending adoption refuses admission, and an awaiting-human hold covers
+    // every candidate: neither is the gate's to demand.
+    let unheld = if free > 0 && pending.is_none() && planner_capacity::human_hold(run).is_none() {
         planner_capacity::unheld_candidates(run, now * 1000)
     } else {
         Vec::new()
@@ -635,6 +658,10 @@ pub fn gate_tick(shared: &Shared, sid: &str, run: &PlannerRun, now: i64) {
     );
     if !findings.is_empty() {
         text.push_str(&format!("Audit defects:\n- {}\n", findings.join("\n- ")));
+    }
+    if let Some(notice) = &pending {
+        text.push_str(notice);
+        text.push('\n');
     }
     if !unheld.is_empty() {
         text.push_str(&format!(

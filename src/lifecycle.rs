@@ -226,6 +226,12 @@ fn close(shared: &Arc<Shared>, sid: &str) {
     // is never needed to reopen it.
     crate::session::close_live_delegates_for(shared, sid);
     let session = shared.sessions.lock().unwrap().remove(sid);
+    // The parent is no longer driven here: hand the planner run's ownership
+    // back now, so a replacement `/implement` in this checkout need not wait
+    // for this process to exit (a surviving host is not a living coordinator).
+    if let Err(error) = crate::planner_adopt::release(shared.as_ref(), sid) {
+        tracing::warn!(session = sid, %error, "planner ownership not released on close");
+    }
     crate::accounts::cancel_login(shared, sid);
     if let Some(pin) = session.and_then(|s| s.pin) {
         close_downstream_session(shared, &pin.process_key, &pin.downstream_sid);

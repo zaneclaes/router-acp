@@ -19,7 +19,7 @@ from . import discover as discovery
 from . import goose as goose_bridge
 from . import patterns as pat
 from . import provenance, score, validate
-from .catalog import Catalog, parse_catalog, render_disabled_model
+from .catalog import Catalog, parse_catalog, parse_preset, render_disabled_model
 from .policy import Policy, PolicyError, load_policy
 from .report import PendingWrite, Report
 from .scores_file import ScoresFile, parse_scores, parse_scores_text
@@ -104,6 +104,12 @@ def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     scores = args.scores or repo / "data" / "scores.yaml"
     config = args.config or repo / "examples" / "router-preferred.yaml"
     return repo, policy, scores, config
+
+
+def shipped_presets(repo: Path) -> list[Path]:
+    """`src/presets/*.yaml`, when this repo ships them (a sandbox copy may not)."""
+    preset_dir = repo / "src" / "presets"
+    return sorted(preset_dir.glob("*.yaml")) if preset_dir.is_dir() else []
 
 
 def configured_by_agent(catalog: Catalog) -> dict[str, list[str]]:
@@ -374,6 +380,14 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
     # -- validate the state that would ship -------------------------------
     validated_scores = parse_scores_text(scores_after, scores_path)
     report.findings = validate.validate(policy, validated_scores, catalog)
+    # The shipped provider presets are catalogs too: a `provider: codex` agent
+    # routes on `src/presets/codex.yaml`, so a model enabled there without its
+    # score, evidence, rank and published pricing is the same defect as one in
+    # an example config (GPT-6 Astra once sat parked there for exactly this).
+    for preset_path in shipped_presets(repo):
+        report.findings.extend(
+            validate.validate_catalog(policy, validated_scores, parse_preset(preset_path))
+        )
 
     report.writes = [PendingWrite(path=scores_path, before=scores_before, after=scores_after)]
     if catalog is not None:

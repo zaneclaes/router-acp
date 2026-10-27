@@ -229,6 +229,36 @@ def parse_catalog(path: Path) -> Catalog:
     return Catalog(path=path, lines=lines, agents=agents, trailing_newline=trailing_newline)
 
 
+def parse_preset(path: Path) -> Catalog:
+    """A shipped provider preset (`src/presets/<provider>.yaml`) as a read-only
+    catalog of one agent named after the provider.
+
+    Presets are flat (`models:` at the top level, block style) and are what a
+    `provider: codex` agent routes on, so an enabled model there needs the same
+    cross-file contract as one in an example config. This reader exists for
+    validation only: it never edits, and `render()` is not byte-faithful.
+    """
+    text = path.read_text()
+    raw = yaml.safe_load(text) or {}
+    provider = path.stem
+    agent = CatalogAgent(name=provider)
+    for model_spec in raw.get("models") or []:
+        model_id = model_spec.get("id")
+        if not model_id:
+            raise CatalogError(f"{path}: preset model entry has no `id:`")
+        agent.models.append(
+            CatalogModel(
+                agent=provider,
+                model_id=str(model_id),
+                enabled=True,
+                start=0,
+                end=0,
+                fields=dict(model_spec),
+            )
+        )
+    return Catalog(path=path, lines=text.split("\n"), agents=[agent])
+
+
 def render_disabled_model(
     indent: str, model_id: str, display_name: str, cost_rank: int, note: str
 ) -> list[str]:
