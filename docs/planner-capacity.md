@@ -39,11 +39,14 @@ every `complete`), the router writes one JSON object to its stdin:
 The host answers on stdout with the admissible candidates, in priority order:
 
 ```json
-{"candidates":[{"work":{"work_id":"…","plan_id":"…","scope":"…","external_id":"…"},
+{"candidates":[{"work":{"work_id":"…","plan_id":"…","scope":"…","repository":"…","external_id":"…"},
                 "task":"<the worker brief>"}]}
 ```
 
 `work` is exactly the `WorkSpec` that `planner_workflow` `admit` takes. A
+work item can set optional `repository` to select a host-defined checkout pool.
+The router forwards it unchanged to `planner_allocate`. Saved work without it
+uses the host's default pool.
 non-zero exit, a timeout or invalid JSON is logged as an error and recorded as
 **unknown**, never as "no work": the parent is woken with the host error, no
 candidate is auto-admitted, and `complete` is refused until the host answers.

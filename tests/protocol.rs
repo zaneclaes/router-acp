@@ -14643,6 +14643,7 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
                     owned_paths: Vec::new(),
                     required_checks: Vec::new(),
                     required_integration_evidence: Vec::new(),
+                    repository: None,
                     external_id: Some("external-work".into()),
                 },
             },
