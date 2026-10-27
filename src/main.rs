@@ -118,7 +118,7 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Print the router configuration as JSON: `{revision, config}`.
+    /// Print the router configuration as JSON: `{revision, config, effective}`.
     ConfigShow {
         #[arg(long)]
         config: PathBuf,

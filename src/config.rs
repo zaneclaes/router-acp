@@ -2045,6 +2045,19 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
+    /// The configuration a host presents as editable defaults: provider
+    /// presets and serde defaults applied, without environment interpolation.
+    /// The uninterpolated form is deliberate because this value may cross a
+    /// process or HTTP boundary.
+    pub fn effective_document(yaml: &str) -> Result<serde_json::Value, ConfigError> {
+        let invalid = |e: serde_yaml::Error| ConfigError(format!("invalid YAML: {e}"));
+        let mut document: serde_yaml::Value = serde_yaml::from_str(yaml).map_err(invalid)?;
+        crate::presets::apply(&mut document);
+        let config: Config = serde_yaml::from_value(document).map_err(invalid)?;
+        serde_json::to_value(config)
+            .map_err(|e| ConfigError(format!("could not serialize effective configuration: {e}")))
+    }
+
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {
         let interpolated = interpolate_env(yaml);
         let mut document: serde_yaml::Value = serde_yaml::from_str(&interpolated)
