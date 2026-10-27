@@ -74,6 +74,22 @@ Anything else is rejected with an error that lists the three. A hold is the
 only way a candidate may stay out of a free slot. Holds are passed to the host
 and expire on their own.
 
+Two further reasons hold no candidate of their own. `production-failure`
+declares a known production failure under repair (detail names the production
+SHA and the preserved evidence; the audit host verifies it). `awaiting-human`
+records that the human has not authorized the work (detail quotes their own
+words). It never expires, and it parks **admission** run-wide: no capacity
+wake, heartbeat, auto-admission or gate demand fills a slot, and the held
+plan's own workers are not resumed. Everything else keeps running under it:
+audits, in-flight wakes, child wakes and the resumption of other admitted work
+that stopped early. The human's next message lifts it on whichever path it
+arrives by (their own turn, a steer into a router-owned turn, or the durable
+queue); an agent-origin monitor message does not. An idle parent parked on an
+awaiting-human hold, an unanswered permission/question request or undelivered
+queued input is disclosed to the operator in the client and the log
+(`router-acp · planner run parked for N min on …`) after 10 idle minutes and
+every 30 minutes after, so a parked run is never silent.
+
 ## Capacity wakes
 
 Parent wake delivery gives staging/production build, failed-job and smoke observations
@@ -374,7 +390,7 @@ command (or a person's follow-up) resumes it exactly like `paused`. While a
 drain is live in this router, the `implement` command is refused until the
 drain reports `drained`.
 
-If a replacement router receives `implement` before the previous owner exits,
+If a replacement router receives `implement` before the previous owner lets go,
 it records `capacity.pending_adoption` and an `adoption:handoff` wake. The normal
 capacity cycle retries that exact handoff at most every 15 seconds; no second
 command or monitor prompt is needed. Only new admissions wait: worker resumption,
@@ -384,6 +400,38 @@ changed reason. If the source becomes terminal, is superseded by another session
 or its run/session disappears, the handoff clears with that reason and admission
 continues in the same tick. Successful adoption wakes the parent to reconcile the
 transferred assignments. Merely loading a session does not create an adoption request.
+
+**Ownership is a lease, not a process.** A run's `owner` is the router that has
+its parent session loaded; the wake loop renews the lease every 30 seconds
+(`owner_heartbeat_at`), and `session/close` or `session/delete` releases it at
+once. A run counts as owned while its session is loaded in the asking router,
+while the owner's process exists *and* its lease is under 180 seconds old (or
+the session itself logged activity that recently), while any work has a live
+attempt, or while a wake is claimed by a live router. A process that merely
+exists after its lease and the session went quiet is a surviving host, not a
+living coordinator, and the run is adoptable; a lease stamped by a router from
+before heartbeats (`owner_heartbeat_at: 0`) is trusted while that process exists,
+because unknown activity never authorizes a takeover (such a run is adopted once
+that router exits or closes the session).
+
+Adoption itself runs in three revision-checked phases: **claim** (re-check
+liveness on the exact revision written and mark the source `superseded` by the
+adopter while it still holds everything — from then on the old router's
+heartbeat skips it, `planner_workflow` refuses every mutation but `status`
+there, and its wake loop tells the parent where the run went), **merge** (move
+works, releases, holds, queued and unacknowledged operator input and pending
+wakes into the adopter; content the adopter already holds is reported, not
+duplicated) and **retire** (strip the moved content from the source). An owner
+whose lease lands between the check and the claim conflicts the claim, and the
+retry sees it alive and refuses. A router that dies between phases leaves the
+source claimed with its content; the next retry (or `adopt-run`) resumes from
+the claim rather than reporting an empty adoption.
+
+While adoption is pending, `audit:` and `gate:` wakes carry the recovery state
+(source run and the current blocker) instead of demanding admissions, the gate
+lists no capacity-host candidates, `admit` and dispatch of an identity still
+held by the source say why they are refused, and `status` exposes
+`capacity.pending_adoption_reason`.
 
 # Operator input preempts router-owned turns
 

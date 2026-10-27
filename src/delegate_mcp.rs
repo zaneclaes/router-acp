@@ -1911,6 +1911,49 @@ async fn run_delegate_task_inner(
                     continue;
                 }
                 let effective_effort = resolution.as_ref().and_then(|r| r.resolved);
+                let sub_sid = format!("{router_sid}::delegate-{}", opened.downstream_sid);
+                let mut task_summary = args.task.replace('\n', " ");
+                if task_summary.len() > 60 {
+                    task_summary.truncate(57);
+                    task_summary.push_str("...");
+                }
+                // Record the sub-agent as its own state-DB row, linked to the
+                // parent, so the delegation tree is observable. It shares the
+                // parent's run_label for grouping. The row exists BEFORE the
+                // mode is applied and the start hook runs: the opened session
+                // already streams updates (codex sends its mode and command
+                // lists at once), and `session_log` rows for a session without
+                // a row fail their foreign key and are dropped. LESSON
+                // (2026-10-27): every delegate lost its first 4-5 rows that way.
+                let parent_label = shared
+                    .with_session(router_sid, |s| s.run_label.clone())
+                    .flatten();
+                shared.state.lock().unwrap().upsert(
+                    sub_sid.clone(),
+                    crate::state::PersistedSession {
+                        agent: candidate.agent.clone(),
+                        model: candidate.model.clone(),
+                        downstream_session_id: opened.downstream_sid.clone(),
+                        cwd: cwd.clone(),
+                        additional_directories: dirs.clone(),
+                        title: Some(task_summary.clone()),
+                        routing: Some(serde_json::json!({
+                            "strategy": "delegate",
+                            "candidate": candidate.to_string(),
+                            "class": profile.class.as_str(),
+                            "reason": rc.reason,
+                            "parent": router_sid,
+                            "worker_id": worker_id,
+                            "background_id": args.background_id,
+                            "continued_from": args.resume.history,
+                            "effort": resolution.as_ref().map(|r| json!({"requested":r.requested.as_str(),"resolved":r.resolved.map(EffortLevel::as_str),"provider_value":r.provider_value,"confirmed":r.confirmed})),
+                        })),
+                        parent_session_id: Some(router_sid.to_string()),
+                        kind: "delegate".to_string(),
+                        run_label: parent_label,
+                        ..Default::default()
+                    },
+                );
                 // Delegates have no upstream client to send the set_mode that
                 // primary sessions receive. Apply the same configured `auto`
                 // mapping explicitly so Claude/Codex delegates inherit the
@@ -1961,6 +2004,7 @@ async fn run_delegate_task_inner(
                                     &opened.downstream_sid,
                                 );
                                 drop_delegate_token(shared, worker_token.as_deref());
+                                shared.state.lock().unwrap().remove(&sub_sid);
                                 continue;
                             } else {
                                 tracing::info!(
@@ -1987,15 +2031,10 @@ async fn run_delegate_task_inner(
                                 &opened.downstream_sid,
                             );
                             drop_delegate_token(shared, worker_token.as_deref());
+                            shared.state.lock().unwrap().remove(&sub_sid);
                             continue;
                         }
                     }
-                }
-                let sub_sid = format!("{router_sid}::delegate-{}", opened.downstream_sid);
-                let mut task_summary = args.task.replace('\n', " ");
-                if task_summary.len() > 60 {
-                    task_summary.truncate(57);
-                    task_summary.push_str("...");
                 }
                 // A host that accounts for its workers registers this one
                 // before it runs; a refusal fails the delegation outright
@@ -2039,6 +2078,7 @@ async fn run_delegate_task_inner(
                     );
                     close_downstream_session(shared, &opened.process_key, &opened.downstream_sid);
                     drop_delegate_token(shared, worker_token.as_deref());
+                    shared.state.lock().unwrap().remove(&sub_sid);
                     // A start that timed out may still have registered the
                     // worker on the host's side; tell it the worker never ran.
                     crate::delegate_hook::deliver(
@@ -2080,38 +2120,6 @@ async fn run_delegate_task_inner(
                 };
                 shared.with_session(router_sid, |s| s.delegates.push(handle.clone()));
 
-                // Record the sub-agent as its own state-DB row, linked to the
-                // parent, so the delegation tree is observable. It shares the
-                // parent's run_label for grouping.
-                let parent_label = shared
-                    .with_session(router_sid, |s| s.run_label.clone())
-                    .flatten();
-                shared.state.lock().unwrap().upsert(
-                    sub_sid.clone(),
-                    crate::state::PersistedSession {
-                        agent: candidate.agent.clone(),
-                        model: candidate.model.clone(),
-                        downstream_session_id: opened.downstream_sid.clone(),
-                        cwd: cwd.clone(),
-                        additional_directories: dirs.clone(),
-                        title: Some(task_summary.clone()),
-                        routing: Some(serde_json::json!({
-                            "strategy": "delegate",
-                            "candidate": candidate.to_string(),
-                            "class": profile.class.as_str(),
-                            "reason": rc.reason,
-                            "parent": router_sid,
-                            "worker_id": worker_id,
-                            "background_id": args.background_id,
-                            "continued_from": args.resume.history,
-                            "effort": resolution.as_ref().map(|r| json!({"requested":r.requested.as_str(),"resolved":r.resolved.map(EffortLevel::as_str),"provider_value":r.provider_value,"confirmed":r.confirmed})),
-                        })),
-                        parent_session_id: Some(router_sid.to_string()),
-                        kind: "delegate".to_string(),
-                        run_label: parent_label,
-                        ..Default::default()
-                    },
-                );
                 shared.state.lock().unwrap().log(
                     &sub_sid,
                     &crate::state::LogEntry {

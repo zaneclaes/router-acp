@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 from update_models import benchmarks, cli  # noqa: E402
 from update_models import patterns as pat  # noqa: E402
 from update_models import discover, goose, provenance, score, validate  # noqa: E402
-from update_models.catalog import parse_catalog  # noqa: E402
+from update_models.catalog import parse_catalog, parse_preset  # noqa: E402
 from update_models.policy import TASK_CLASSES, PolicyError, load_policy  # noqa: E402
 from update_models.scores_file import parse_scores, parse_scores_text  # noqa: E402
 
@@ -165,6 +165,41 @@ class CatalogTest(unittest.TestCase):
         # Still parseable, and the model is now disabled rather than deleted.
         reparsed = parse_catalog(_temp_copy(catalog.render(), suffix=".yaml"))
         self.assertFalse(reparsed.model("codex/gpt-5.6-luna").enabled)
+
+
+class PresetCatalogTest(unittest.TestCase):
+    def test_shipped_presets_read_as_enabled_catalogs(self):
+        codex = parse_preset(REPO / "src" / "presets" / "codex.yaml")
+        self.assertEqual([agent.name for agent in codex.agents], ["codex"])
+        astra = codex.model("codex/gpt-6-astra")
+        self.assertIsNotNone(astra, "GPT-6 Astra ships enabled in the codex preset")
+        self.assertTrue(astra.enabled)
+        self.assertEqual(astra.cost_rank, 5)
+        self.assertEqual(astra.pricing["input_per_mtok"], 10.0)
+
+    def test_shipped_presets_meet_the_catalog_contract(self):
+        policy = load_policy(POLICY_PATH)
+        scores = parse_scores(SCORES_PATH)
+        for path in sorted((REPO / "src" / "presets").glob("*.yaml")):
+            findings = validate.validate_catalog(policy, scores, parse_preset(path))
+            self.assertEqual(
+                [str(f) for f in validate.errors(findings)], [], f"{path.name} has errors"
+            )
+
+    def test_an_unscored_model_enabled_in_a_preset_is_an_error(self):
+        policy = load_policy(POLICY_PATH)
+        scores = parse_scores(SCORES_PATH)
+        preset = Path(tempfile.mkdtemp(prefix="preset-")) / "codex.yaml"
+        preset.write_text(
+            (REPO / "src" / "presets" / "codex.yaml").read_text()
+            + "- id: gpt-7-nova\n  display_name: Nova\n  cost_rank: 5\n"
+            + "  pricing:\n    input_per_mtok: 1.0\n    output_per_mtok: 2.0\n"
+        )
+        codes = {f.code for f in validate.errors(validate.validate_catalog(policy, scores, parse_preset(preset)))}
+        self.assertIn("unscored-model", codes)
+        self.assertIn("model-without-benchmarks", codes)
+        messages = "\n".join(str(f) for f in validate.validate_catalog(policy, scores, parse_preset(preset)))
+        self.assertIn("(in codex.yaml)", messages)
 
 
 class DiscoveryTest(unittest.TestCase):
@@ -544,16 +579,12 @@ class CliTest(unittest.TestCase):
         # The existing ladder is untouched — nothing was rewritten to chase quality.
         self.assertNotIn("-      - { id:", catalog_diff)
         catalog = parse_catalog(CATALOG_PATH)
-        # The trailing 4, 5, 5, 4 are the pin-only `claude-opus-5`,
-        # `claude-fable-5-1`, and `claude-opus-4-6` entries plus Fable's
-        # family default. Pin-only rows share their family default's rank
-        # (Opus 5 is same-rank as 5.5 even though 5.5 is cheaper — weakly
-        # monotonic). They are enabled (and so on the ladder) but
-        # `auto_eligible: false`, so they are reachable only by explicit
-        # selection.
+        # The shipped example enables the four family defaults (haiku, sonnet,
+        # opus[1m], claude-fable-5[1m]); the pin-only legacy ids are documented
+        # in the policy's witnesses/pricing but not enabled here.
         self.assertEqual(
             [model.cost_rank for model in catalog.agent("claude").enabled_models],
-            [1, 2, 4, 4, 5, 5, 4],
+            [1, 2, 4, 5],
         )
 
     def test_new_family_without_benchmarks_is_parked_unscored(self):
@@ -575,7 +606,7 @@ class CliTest(unittest.TestCase):
         catalog = parse_catalog(CATALOG_PATH)
         self.assertEqual(
             [model.cost_rank for model in catalog.agent("codex").enabled_models],
-            [1, 3, 2, 4, 5, 2, 5, 5],
+            [1, 3, 2, 4, 5, 2, 5, 5, 5],
         )
 
     def test_unauthed_probe_produces_no_retirement_diff(self):
@@ -588,6 +619,42 @@ class CliTest(unittest.TestCase):
             "a failed probe must not retire anything",
         )
         self.assertIn("last-known-good", (out_dir / "report.md").read_text())
+
+    def test_validate_only_covers_the_shipped_presets(self):
+        # A `provider: codex` agent routes on src/presets/codex.yaml, so a model
+        # enabled there without its score/evidence must fail the audit exactly
+        # like one enabled in the example catalog (GPT-6 Astra sat parked in
+        # the preset while the example-only audit stayed green).
+        sandbox = Path(tempfile.mkdtemp(prefix="model-update-presets-"))
+        for relative in ["data", "examples", "src/presets"]:
+            (sandbox / relative).mkdir(parents=True)
+        (sandbox / "data" / "scores.yaml").write_text(SCORES_PATH.read_text())
+        (sandbox / "data" / "model-policy.yaml").write_text(POLICY_PATH.read_text())
+        (sandbox / "examples" / "router-preferred.yaml").write_text(CATALOG_PATH.read_text())
+        for preset in (REPO / "src" / "presets").glob("*.yaml"):
+            (sandbox / "src" / "presets" / preset.name).write_text(preset.read_text())
+        out_dir = Path(tempfile.mkdtemp(prefix="model-update-test-"))
+        self.assertEqual(
+            cli.main(["--repo", str(sandbox), "--out-dir", str(out_dir), "--validate-only"]),
+            cli.EXIT_OK,
+        )
+        codex = sandbox / "src" / "presets" / "codex.yaml"
+        codex.write_text(
+            codex.read_text()
+            + "- id: gpt-7-nova\n  display_name: Nova\n  cost_rank: 5\n"
+            + "  pricing:\n    input_per_mtok: 1.0\n    output_per_mtok: 2.0\n"
+        )
+        import io
+
+        captured = io.StringIO()
+        code = cli.main(
+            ["--repo", str(sandbox), "--out-dir", str(out_dir), "--validate-only"],
+            stdout=captured,
+        )
+        self.assertEqual(code, cli.EXIT_VALIDATION)
+        self.assertIn("unscored-model", captured.getvalue())
+        self.assertIn("codex/gpt-7-nova", captured.getvalue())
+        self.assertIn("(in codex.yaml)", captured.getvalue())
 
     def test_missing_explicit_config_is_an_error_not_a_silent_pass(self):
         # Without a catalog every catalog check trivially passes, which reads as

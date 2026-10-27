@@ -14,9 +14,11 @@ agents:
       - id: opus
         display_name: Claude Opus
         cost_rank: 3
+        pricing: { input_per_mtok: 4.00, output_per_mtok: 20.00 }
       - id: sonnet
         display_name: Claude Sonnet
         cost_rank: 2
+        pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00 }
     auth_probe:
       command: claude
       args: [auth, status]

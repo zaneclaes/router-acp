@@ -12,9 +12,13 @@
 //!    of exactly three reasons ([`HOLD_REASONS`]). A fourth, `production-failure`,
 //!    holds no candidate: it declares a known production failure under repair,
 //!    which the audit host verifies against preserved evidence. A fifth,
-//!    `awaiting-human`, holds the whole run: the human has not authorized
-//!    the work, so no wake or auto-admission fills slots until their next
-//!    message clears it.
+//!    `awaiting-human`, holds the whole run's admission: the human has not
+//!    authorized the work, so no capacity wake, heartbeat or auto-admission
+//!    fills slots, and the held plan's own workers are not resumed, until
+//!    their next message (on any path, a steer included) clears it. Audits,
+//!    in-flight wakes and the resumption of other admitted work continue, and
+//!    an idle parent parked on it is disclosed to the operator
+//!    (`planner_wake::parked_reason`).
 //! 3. A parent below `delegation.max_concurrent` with an unheld
 //!    candidate gets a capacity wake every `wake_after_secs`, with no give-up.
 //! 4. After `auto_admit_after_wakes` such wakes, or `auto_admit_after_secs`
@@ -352,6 +356,12 @@ pub fn human_hold(run: &PlannerRun) -> Option<&Hold> {
         .find(|h| h.reason == AWAITING_HUMAN)
 }
 
+/// Whether the run-wide human hold names this work's plan (or the work
+/// itself): its workers are not resumed until the human speaks.
+pub fn held_by_human(run: &PlannerRun, spec: &WorkSpec) -> bool {
+    human_hold(run).is_some_and(|h| h.plan_id == spec.plan_id || h.plan_id == spec.work_id)
+}
+
 /// The human spoke: a hold that waited on them is answered.
 pub fn clear_human_hold(run: &mut PlannerRun) {
     run.capacity.holds.retain(|_, h| h.reason != AWAITING_HUMAN);
@@ -494,7 +504,9 @@ pub fn status_block(shared: &Shared, run: &PlannerRun, now_ms: i64) -> Value {
         "holds":run.capacity.holds.values().filter(|h| h.expires_at_ms > now_ms).collect::<Vec<_>>(),
         "unfilled_wakes":run.capacity.unfilled_wakes,
         "last_auto_admission":run.capacity.last_auto_admission,
-        "resumes":run.capacity.resumes,"pending_adoption":run.capacity.pending_adoption});
+        "resumes":run.capacity.resumes,"pending_adoption":run.capacity.pending_adoption,
+        "pending_adoption_reason":run.capacity.pending_adoption.as_ref()
+            .and_then(|_| run.wakes.get("adoption:handoff")).map(|w| &w.reason)});
     for (key, value) in crate::planner_guard::status_fields(shared, run) {
         block[key] = value;
     }
@@ -585,10 +597,14 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
         return;
     };
+    // An `awaiting-human` hold is not an early return: it suppresses
+    // admission below (slot filling, auto-admission, the gate's demand for
+    // candidates), never audits, in-flight wakes or the resumption of work
+    // outside the held plan. LESSON (2026-10-27): returning here parked a run
+    // for ten hours once its child wakes ran dry.
     if run.status != RunStatus::Running
         || run.phase != PlannerPhase::Implementation
         || run.execution_request.is_none()
-        || human_hold(&run).is_some()
     {
         return;
     }
@@ -662,7 +678,7 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
         return;
     };
     let idle = now - last;
-    let filled = if run.capacity.pending_adoption.is_none() {
+    let filled = if run.capacity.pending_adoption.is_none() && human_hold(&run).is_none() {
         fill_slots(shared, sid, run, now, last, parent_idle, &timing).await
     } else {
         false
@@ -1017,6 +1033,11 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
         let Some(attempt) = &work.attempt else {
             continue;
         };
+        // The plan the human has not authorized waits with them; every other
+        // admitted work keeps its recovery.
+        if held_by_human(run, &work.spec) {
+            continue;
+        }
         let state = run.capacity.resumes.get(id);
         if !stopped_early(work) {
             if state.is_some()

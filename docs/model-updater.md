@@ -25,6 +25,7 @@ It never writes without `--apply`, and it never re-bakes the routing goldens.
 | --- | --- |
 | `data/scores.yaml` | The quality table the router loads (`include_str!`). Authoritative, hand-editable, first-match glob on `agent/model`. |
 | `examples/router-preferred.yaml` | The canonical catalog: which models each agent exposes, `cost_rank`, `pricing`. |
+| `src/presets/<provider>.yaml` | The shipped provider presets a `provider: codex` (etc.) agent inherits (`include_str!`). Validated as catalogs too: a model enabled there needs the same score, evidence, rank and published price as one in the example. |
 | `data/model-policy.yaml` | The *procedure*: benchmark calibrations/evidence, invariants, documented rank exceptions, published-price reference. Rust never reads it. |
 
 The split matters: raw benchmark results and their fixed calibrations are the
@@ -227,7 +228,11 @@ on the current catalog requires **zero changes**.
 
 The updater is a safety net, not a gate. To add a model yourself:
 
-1. Add it to the agent's `models:` list with a `cost_rank` and `pricing`.
+1. Add it to the agent's `models:` list — in the shipped provider preset
+   (`src/presets/<provider>.yaml`) and the example catalogs — with a
+   `cost_rank` and `pricing`. Never park it as a comment with its facts
+   alone: `--validate-only` and `tests/model_contract.rs` reject an enabled
+   model without its companions, and a commented-out one routes nowhere.
 2. Add a score entry, placing it **above** any broader pattern that matches it.
 3. Add its published rates to `published_pricing` in the policy file.
 4. Add a witness + a `resolves_to` line if it should be covered by an invariant.

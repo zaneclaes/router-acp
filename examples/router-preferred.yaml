@@ -188,6 +188,13 @@ agents:
       - { id: gpt-6.1-sol, display_name: GPT-6.1 Sol, cost_rank: 5,
           pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
                      cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 } }
+      # GPT-6 Astra (2026-09-03): $10/$50, standard 0.1x cache read ($1.00),
+      # 1.05M, native xhigh/max. OpenAI's flagship above the Sol family; the
+      # `hard:` planning pool and apex complexity reach it. Scored from its own
+      # DeepSWE v1.1 evidence (`*gpt-6-astra*` in data/model-policy.yaml).
+      - { id: gpt-6-astra, display_name: GPT-6 Astra, cost_rank: 5,
+          pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
+                     cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 } }
 
   # xAI Grok. The official CLI (`npm i -g @xai-official/grok`) is itself an ACP
   # agent — `grok agent stdio` — so no separate adapter is needed. Its own

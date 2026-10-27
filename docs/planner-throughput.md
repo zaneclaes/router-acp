@@ -81,8 +81,10 @@ Replays are idempotent; selected work integration names its passing release-roun
 
 ### Messages from a local monitor
 
-`router-acp planner-input --session <router-id> --cwd <checkout> --id <stable-id>
---message-file <UTF-8-file>` queues a correction for a running parent. Use `-` for
+`router-acp send-input --session <router-id> --cwd <checkout> --id <stable-id>
+--message-file <UTF-8-file>` queues a correction for a running parent (`planner-input`
+is its older name; a session without a planner run takes the same command through
+its own per-session queue instead, see the README). Use `-` for
 stdin, or `--status` instead of `--cwd`/`--message-file` to read its receipt. The
 optional `--state` points to the normal state-layout root, not a shard. The command
 uses StateStore and revision-checked writes to the existing FIFO input queue; it

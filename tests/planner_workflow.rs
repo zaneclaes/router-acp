@@ -7512,4 +7512,902 @@ async fn an_awaiting_human_hold_silences_slot_filling_until_the_human_speaks() {
     .unwrap();
     let run = planner_workflow::load(shared, SID).unwrap().unwrap();
     assert!(router_acp::planner_capacity::human_hold(&run).is_none());
+
+    // The human's words lift the hold on every path they arrive by. A steer
+    // into a router-owned turn is the common one while workers keep the
+    // parent busy, and the one that once left a run parked overnight: the
+    // human's "continue" was steered, the hold stayed, and once the child
+    // wakes ran dry nothing could reach the idle parent for ten hours.
+    hold("h2", "human said \"Not yet\" to the next plan")
+        .await
+        .unwrap();
+    planner_workflow::record_steered_input(
+        shared,
+        SID,
+        &input_request(Some("steer-1"), "continue", false),
+    )
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(router_acp::planner_capacity::human_hold(&run).is_none());
+    // A monitor's agent-origin message is not the human speaking.
+    hold("h3", "human said \"Not yet\" once more")
+        .await
+        .unwrap();
+    let mut monitor = input_request(Some("monitor-1"), "External monitor message", false);
+    monitor.meta = serde_json::from_value(json!({
+        "router_acp": {"input_id": "monitor-1", "origin": "monitor"}
+    }))
+    .ok();
+    planner_workflow::record_steered_input(shared, SID, &monitor).unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(router_acp::planner_capacity::human_hold(&run).is_some());
+}
+
+/// An awaiting-human hold parks admission only. The parent still learns of
+/// an in-flight release, and admitted work outside the held plan still
+/// recovers when it stops early; the held plan's own workers wait with the
+/// human. (Before this, the hold returned the whole capacity tick early.)
+#[tokio::test(flavor = "multi_thread")]
+async fn an_awaiting_human_hold_parks_only_admission() {
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 4);
+    let shared = &fixture.shared;
+    let mut release = work("release-1");
+    release.plan_id = "release".into();
+    admit(shared, release);
+    admit(shared, work("work-1"));
+    let mut held = work("held-1");
+    held.plan_id = "epic".into();
+    admit(shared, held);
+    pin_parent(shared);
+    planner_workflow::begin_work(shared, SID, "release-1")
+        .await
+        .unwrap();
+    for id in ["work-1", "held-1"] {
+        let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, id).await.unwrap();
+        planner_workflow::attempt_ended(
+            shared,
+            SID,
+            &identity,
+            None,
+            "stopped to wait".into(),
+            false,
+        )
+        .unwrap();
+    }
+    planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Hold {
+            key: "h1".into(),
+            plan_id: "epic".into(),
+            reason: "awaiting-human".into(),
+            detail: "human said \"Not yet\" to the epic".into(),
+        },
+    )
+    .await
+    .unwrap();
+    deliver_all(shared);
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 61).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(router_acp::planner_capacity::human_hold(&run).is_some());
+    assert!(wakes_with(shared, "capacity:").is_empty());
+    assert_eq!(
+        wakes_with(shared, "inflight:").len(),
+        1,
+        "the in-flight release still wakes the idle parent"
+    );
+    assert!(
+        run.capacity.resumes.contains_key("work-1"),
+        "recovery of admitted work outside the held plan proceeds"
+    );
+    assert!(
+        !run.capacity.resumes.contains_key("held-1"),
+        "the held plan's worker waits with the human"
+    );
+}
+
+/// An idle parent that no wake can reach is disclosed to the operator with
+/// the gate that parks it, after ten idle minutes and then every thirty,
+/// and the disclosure clears with the gate.
+#[tokio::test]
+async fn a_parked_idle_parent_is_disclosed_with_its_reason() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let notices = || {
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .log_for(SID, 50)
+            .into_iter()
+            .filter(|e| e.kind == "router_notice" && e.summary.contains("parked"))
+            .map(|e| e.summary)
+            .collect::<Vec<_>>()
+    };
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(router_acp::planner_wake::parked_reason(&run).is_none());
+    planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Hold {
+            key: "h1".into(),
+            plan_id: "epic".into(),
+            reason: "awaiting-human".into(),
+            detail: "human said \"Not yet\"".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let reason = router_acp::planner_wake::parked_reason(&run).unwrap();
+    assert!(
+        reason.contains("awaiting-human") && reason.contains("`epic`"),
+        "{reason}"
+    );
+    assert!(reason.contains("\"Not yet\""), "{reason}");
+
+    let last = parent_turn_ended(shared);
+    let first = last + router_acp::planner_wake::PARKED_NOTICE_SECS;
+    router_acp::planner_wake::parked_notice(shared, SID, &run, first - 1);
+    assert!(notices().is_empty(), "not yet idle long enough");
+    router_acp::planner_wake::parked_notice(shared, SID, &run, first + 1);
+    let seen = notices();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].contains("parked for 10 min") && seen[0].contains("`epic`"),
+        "{}",
+        seen[0]
+    );
+    router_acp::planner_wake::parked_notice(shared, SID, &run, first + 600);
+    assert_eq!(notices().len(), 1, "repeats are throttled");
+    router_acp::planner_wake::parked_notice(
+        shared,
+        SID,
+        &run,
+        first + 1 + router_acp::planner_wake::PARKED_REPEAT_SECS,
+    );
+    let seen = notices();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[1].contains("parked for 40 min"), "{}", seen[1]);
+
+    // A busy parent is not parked, whatever the gate.
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    router_acp::planner_wake::parked_notice(shared, SID, &run, first + 2 * 3600);
+    assert_eq!(notices().len(), 2);
+    shared.with_session(SID, |s| s.prompt_activity = 0);
+
+    // The human's words clear the gate and the disclosure with it.
+    planner_workflow::observe_input(shared, SID, &input_request(Some("go"), "continue", false))
+        .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(router_acp::planner_wake::parked_reason(&run).is_none());
+    router_acp::planner_wake::parked_notice(shared, SID, &run, first + 3 * 3600);
+    assert_eq!(notices().len(), 2);
+
+    // An unanswered permission request parks the run the same way.
+    planner_workflow::mutate(shared, SID, |run| {
+        run.approval_waits.insert("downstream:7".into());
+        Ok(())
+    })
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let reason = router_acp::planner_wake::parked_reason(&run).unwrap();
+    assert!(
+        reason.contains("1 unanswered permission") && reason.contains("downstream:7"),
+        "{reason}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ownership is a lease, not a process (`planner_adopt::live_owner`).
+// ---------------------------------------------------------------------------
+
+/// A second session of the same checkout with an authorized implement run and
+/// `pending_adoption` of `SID`, as a replacement `/implement` records it.
+fn receiving_run(shared: &Arc<Shared>, into: &str) {
+    let persisted = shared.state.lock().unwrap().get(SID).unwrap();
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert(into.to_string(), persisted.clone());
+    shared.sessions.lock().unwrap().insert(
+        into.to_string(),
+        RouterSession::rehydrated(&shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(shared, into).unwrap();
+    planner_workflow::mutate(shared, into, |run| {
+        run.phase = router_acp::config::PlannerPhase::Implementation;
+        run.execution_request = Some("implement".into());
+        run.capacity.pending_adoption = Some(SID.into());
+        run.wakes.insert(
+            "adoption:handoff".into(),
+            planner_workflow::Wake {
+                work_id: into.into(),
+                reason: format!("Awaiting adoption of planner run {SID}"),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// `SID` is no longer loaded in this router (the operator closed it) while
+/// this process keeps running: the surviving host of an ended coordinator.
+fn unload_parent(shared: &Arc<Shared>) {
+    shared.sessions.lock().unwrap().remove(SID);
+}
+
+fn lease(shared: &Arc<Shared>, owner: Option<planner_workflow::RunOwner>, heartbeat_at: i64) {
+    planner_workflow::mutate(shared, SID, |run| {
+        run.owner = owner;
+        run.owner_heartbeat_at = heartbeat_at;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn live_owner_of(shared: &Arc<Shared>, now: i64) -> Option<String> {
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_adopt::live_owner(shared.as_ref(), SID, &run, now)
+}
+
+/// A unix second after which `SID`'s lease and session activity both count as
+/// stale.
+fn quiet_after(shared: &Arc<Shared>) -> i64 {
+    let last = shared
+        .state
+        .lock()
+        .unwrap()
+        .last_activity(SID)
+        .map_or(0, |(at, _)| at);
+    last.max(chrono::Utc::now().timestamp()) + router_acp::planner_adopt::OWNER_STALE_SECS + 1
+}
+
+/// Everything adoption must carry over besides works: a hold, a release, an
+/// undelivered operator input in the parent queue and an unacknowledged wake.
+fn seed_transferable_state(shared: &Arc<Shared>, revision: &str) {
+    planner_workflow::mutate(shared, SID, |run| {
+        run.capacity.holds.insert(
+            "plan-held".into(),
+            serde_json::from_value(json!({"plan_id":"plan-held","reason":"dependency",
+                "detail":"waits for work-1","expires_at_ms": i64::MAX / 2}))
+            .unwrap(),
+        );
+        run.releases.insert(
+            "release-1".into(),
+            serde_json::from_value(json!({"candidate": "a".repeat(40),
+                "works": {"work-1": revision},
+                "checkpoints": [{"stage":"selected","revision":"a".repeat(40),"works":{},
+                    "replaces":null,"evidence":{}}],
+                "superseded_by": null}))
+            .unwrap(),
+        );
+        run.inputs.insert(
+            "queued-input".into(),
+            planner_workflow::InputReceipt {
+                origin: "human".into(),
+                replayed_from: None,
+                text: "operator follow-up".into(),
+                attachments: vec![],
+                owner: None,
+                acknowledged: false,
+                delivered_to: Default::default(),
+            },
+        );
+        run.parent_queue.push(planner_workflow::QueuedParentInput {
+            input_id: "queued-input".into(),
+            request: PromptRequest::new(
+                SID.to_string(),
+                vec![ContentBlock::from("operator follow-up".to_string())],
+            )
+            .meta(serde_json::from_value(json!({"router_acp": {"input_id": "queued-input"}})).ok()),
+        });
+        run.wakes.insert(
+            "ci:work-1".into(),
+            planner_workflow::Wake {
+                reason: "CI finished for work-1".into(),
+                work_id: "work-1".into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn assert_lossless_transfer(shared: &Arc<Shared>, into: &str, revision: &str) {
+    let adopted = planner_workflow::load(shared, into).unwrap().unwrap();
+    assert_eq!(
+        adopted
+            .works
+            .get("work-1")
+            .and_then(|w| w.artifact.as_ref())
+            .map(|a| &a.revision),
+        Some(&revision.to_string())
+    );
+    assert!(adopted.works.contains_key("admitted-later"));
+    assert!(adopted.capacity.holds.contains_key("plan-held"));
+    assert_eq!(
+        adopted.releases["release-1"]
+            .works
+            .get("work-1")
+            .map(String::as_str),
+        Some(revision)
+    );
+    assert_eq!(
+        adopted
+            .parent_queue
+            .iter()
+            .map(|q| q.input_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued-input"],
+        "the undelivered operator input leads the new parent's queue"
+    );
+    assert!(adopted.inputs.contains_key("queued-input"));
+    assert!(adopted.wakes.contains_key("input:queued-input"));
+    assert!(!adopted.wakes["ci:work-1"].acknowledged);
+    assert!(adopted.capacity.pending_adoption.is_none());
+    let old = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(old.status, RunStatus::Superseded);
+    assert_eq!(old.superseded_by.as_deref(), Some(into));
+    assert!(old.works.is_empty() && old.releases.is_empty());
+    assert!(old.capacity.holds.is_empty() && old.parent_queue.is_empty());
+    assert!(old.wakes["ci:work-1"].acknowledged);
+}
+
+#[tokio::test]
+async fn a_surviving_host_whose_coordinator_ended_no_longer_owns_the_run() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    admit(&f.shared, work("admitted-later"));
+    seed_transferable_state(&f.shared, &revision);
+    let now = chrono::Utc::now().timestamp();
+    // Loaded here: owned, whatever the lease says.
+    lease(
+        &f.shared,
+        Some(planner_workflow::RunOwner::current()),
+        now - 100_000,
+    );
+    assert!(
+        live_owner_of(&f.shared, now)
+            .unwrap()
+            .contains("loaded in this router")
+    );
+    // Unloaded, but this process (the owner) survives with a fresh lease: the
+    // wake loop may simply not have run yet; still owned.
+    unload_parent(&f.shared);
+    lease(
+        &f.shared,
+        Some(planner_workflow::RunOwner::current()),
+        now - 5,
+    );
+    let reason = live_owner_of(&f.shared, now).unwrap();
+    assert!(
+        reason.contains("confirmed it drives this run 5 s ago"),
+        "{reason}"
+    );
+    // The lease went stale and the session has been quiet as long: the host
+    // survives, the coordinator ended. The run is adoptable, losslessly.
+    let quiet = quiet_after(&f.shared);
+    assert_eq!(live_owner_of(&f.shared, quiet), None);
+    receiving_run(&f.shared, "next");
+    let report = planner_adopt::retry_pending_at(f.shared.as_ref(), "next", quiet)
+        .unwrap()
+        .expect("adopted");
+    assert_eq!(report.works.len(), 2, "{}", report.summary());
+    assert_eq!(report.holds, vec!["plan-held".to_string()]);
+    assert_eq!(report.releases, vec!["release-1".to_string()]);
+    assert_eq!(report.operator_inputs, vec!["queued-input".to_string()]);
+    assert!(report.wakes.contains(&"ci:work-1".to_string()));
+    assert_lossless_transfer(&f.shared, "next", &revision);
+}
+
+#[tokio::test]
+async fn closing_the_parent_releases_ownership_at_once() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    finished_work(&f.shared).await;
+    // The coordinator just answered: its session is active.
+    let now = parent_turn_ended(&f.shared);
+    lease(&f.shared, Some(planner_workflow::RunOwner::current()), now);
+    // What `session/close` and `session/delete` do (`lifecycle::close`).
+    unload_parent(&f.shared);
+    planner_adopt::release(f.shared.as_ref(), SID).unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.owner, None);
+    assert_eq!(run.owner_heartbeat_at, 0);
+    // No owner: only the legacy quiet period stands between the run and a
+    // replacement, because the session was active moments ago.
+    let reason = live_owner_of(&f.shared, now).unwrap();
+    assert!(reason.contains("legacy quiet period"), "{reason}");
+    assert_eq!(live_owner_of(&f.shared, now + 601), None);
+    // Releasing someone else's lease is not this router's to do.
+    let other = planner_workflow::RunOwner {
+        pid: u32::MAX,
+        started_at_ms: 1,
+    };
+    lease(&f.shared, Some(other), now);
+    planner_adopt::release(f.shared.as_ref(), SID).unwrap();
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .owner,
+        Some(other)
+    );
+}
+
+#[tokio::test]
+async fn the_wake_loop_heartbeat_writes_only_when_due_and_never_on_a_superseded_run() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let now = chrono::Utc::now().timestamp();
+    let me = planner_workflow::RunOwner::current();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    // `ensure` stamped this router; a fresh lease is not rewritten.
+    assert_eq!(run.owner, Some(me));
+    planner_adopt::heartbeat(f.shared.as_ref(), SID, &run, now).unwrap();
+    let same = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        same.revision, run.revision,
+        "no write while the lease is fresh"
+    );
+    // Due: renewed with the current second.
+    let due = now + planner_adopt::OWNER_HEARTBEAT_SECS;
+    planner_adopt::heartbeat(f.shared.as_ref(), SID, &same, due).unwrap();
+    let renewed = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(renewed.owner_heartbeat_at, due);
+    assert!(renewed.revision > same.revision);
+    // Another router's stamp is taken over outright: this router has it loaded.
+    lease(
+        &f.shared,
+        Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        }),
+        0,
+    );
+    let foreign = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    planner_adopt::heartbeat(f.shared.as_ref(), SID, &foreign, due + 1).unwrap();
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .owner,
+        Some(me)
+    );
+    // Superseded: adopted elsewhere, never re-stamped.
+    let before = planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Superseded;
+        run.superseded_by = Some("next".into());
+        run.owner = None;
+        Ok(())
+    })
+    .unwrap();
+    planner_adopt::heartbeat(f.shared.as_ref(), SID, &before, due + 100).unwrap();
+    let after = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(after.owner, None);
+    assert_eq!(after.revision, before.revision);
+}
+
+#[tokio::test]
+async fn a_living_coordinator_or_worker_keeps_the_run_whatever_its_host_pid_says() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    admit(&f.shared, work("stopped"));
+    let (worker, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "stopped")
+        .await
+        .unwrap();
+    unload_parent(&f.shared);
+    let me = planner_workflow::RunOwner::current();
+
+    // A live worker attempt fences the run even with a stale parent lease.
+    let quiet = quiet_after(&f.shared);
+    lease(&f.shared, Some(me), 1);
+    let reason = live_owner_of(&f.shared, quiet).unwrap();
+    assert!(reason.contains("live attempt owner"), "{reason}");
+    planner_workflow::attempt_ended(&f.shared, SID, &worker, None, "interrupted".into(), true)
+        .unwrap();
+
+    // A stale lease but recent session activity (the coordinator is mid-turn
+    // and the wake loop merely late): still owned.
+    let last = parent_turn_ended(&f.shared);
+    lease(&f.shared, Some(me), 1);
+    let reason = live_owner_of(&f.shared, last + 10).unwrap();
+    assert!(reason.contains("session was active"), "{reason}");
+
+    // A lease a pre-heartbeat router stamped: trusted while its process exists.
+    let quiet = quiet_after(&f.shared);
+    lease(&f.shared, Some(me), 0);
+    let reason = live_owner_of(&f.shared, quiet).unwrap();
+    assert!(reason.contains("predates ownership heartbeats"), "{reason}");
+    receiving_run(&f.shared, "next");
+    assert!(
+        planner_adopt::retry_pending_at(f.shared.as_ref(), "next", quiet)
+            .unwrap()
+            .is_none()
+    );
+    let next = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert_eq!(next.capacity.pending_adoption.as_deref(), Some(SID));
+    assert!(
+        next.wakes["adoption:handoff"]
+            .reason
+            .contains("predates ownership heartbeats"),
+        "{}",
+        next.wakes["adoption:handoff"].reason
+    );
+    assert!(next.works.is_empty());
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Running
+    );
+
+    // A dead process holds nothing, legacy stamp or not.
+    lease(
+        &f.shared,
+        Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        }),
+        0,
+    );
+    assert_eq!(live_owner_of(&f.shared, quiet), None);
+}
+
+/// When the source's owner comes back during adoption.
+#[derive(Clone, Copy, PartialEq)]
+enum Race {
+    /// Before the adopter's first write: the retry claim on the destination.
+    BeforeRetryClaim,
+    /// Between the liveness check and the claim write on the source.
+    OnSourceClaim,
+}
+
+/// A store that renews the source's lease at the chosen moment, as the old
+/// router's wake loop would, then performs the adopter's write.
+struct RacingStore<'a> {
+    shared: &'a Shared,
+    race: Race,
+    raced: std::sync::atomic::AtomicBool,
+}
+
+impl RacingStore<'_> {
+    fn renew_source_lease(&self) {
+        let source = planner_workflow::load(self.shared, SID).unwrap().unwrap();
+        router_acp::planner_adopt::heartbeat(
+            self.shared,
+            SID,
+            &source,
+            chrono::Utc::now().timestamp() + 1_000_000,
+        )
+        .unwrap();
+    }
+}
+
+impl router_acp::planner_adopt::RunStore for RacingStore<'_> {
+    fn load(&self, sid: &str) -> Result<Option<planner_workflow::PlannerRun>, String> {
+        self.shared.load(sid)
+    }
+    fn save(&self, sid: &str, run: &mut planner_workflow::PlannerRun) -> Result<(), String> {
+        let trigger = match self.race {
+            Race::BeforeRetryClaim => sid != SID,
+            Race::OnSourceClaim => sid == SID,
+        };
+        if trigger && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.renew_source_lease();
+        }
+        self.shared.save(sid, run)
+    }
+    fn last_activity(&self, sid: &str) -> Option<i64> {
+        self.shared.last_activity(sid)
+    }
+    fn updated_at(&self, sid: &str) -> Option<u64> {
+        self.shared.updated_at(sid)
+    }
+    fn run_ids_beside(&self, sid: &str) -> Result<Vec<String>, String> {
+        self.shared.run_ids_beside(sid)
+    }
+    fn loaded_here(&self, _sid: &str) -> bool {
+        false
+    }
+    fn session_exists(&self, sid: &str) -> bool {
+        self.shared.session_exists(sid)
+    }
+}
+
+#[tokio::test]
+async fn an_owner_renewing_its_lease_during_adoption_keeps_the_run() {
+    use router_acp::planner_adopt::{self, RunStore};
+    for race in [Race::BeforeRetryClaim, Race::OnSourceClaim] {
+        let f = fixture(|_| {});
+        let revision = finished_work(&f.shared).await;
+        unload_parent(&f.shared);
+        let quiet = quiet_after(&f.shared);
+        lease(&f.shared, Some(planner_workflow::RunOwner::current()), 1);
+        receiving_run(&f.shared, "next");
+        let store = RacingStore {
+            shared: &f.shared,
+            race,
+            raced: Default::default(),
+        };
+        // Without the race the run is adoptable at `quiet`.
+        assert_eq!(
+            planner_adopt::live_owner(&store, SID, &store.load(SID).unwrap().unwrap(), quiet),
+            None
+        );
+        let outcome = planner_adopt::retry_pending_at(&store, "next", quiet);
+        assert!(store.raced.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            matches!(outcome, Ok(None) | Err(_)),
+            "a renewed lease must refuse the takeover: {outcome:?}"
+        );
+        let source = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+        assert_eq!(source.status, RunStatus::Running, "{race:?}");
+        assert_eq!(
+            source
+                .works
+                .get("work-1")
+                .and_then(|w| w.artifact.as_ref())
+                .map(|a| &a.revision),
+            Some(&revision)
+        );
+        let next = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+        assert!(next.works.is_empty(), "no partial takeover ({race:?})");
+        assert_eq!(next.capacity.pending_adoption.as_deref(), Some(SID));
+        assert!(
+            next.wakes["adoption:handoff"]
+                .reason
+                .contains("confirmed it drives this run"),
+            "{}",
+            next.wakes["adoption:handoff"].reason
+        );
+    }
+}
+
+impl std::fmt::Debug for Race {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Race::BeforeRetryClaim => "before the retry claim",
+            Race::OnSourceClaim => "on the source claim",
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_adoption_interrupted_after_its_claim_resumes_losslessly() {
+    use router_acp::planner_adopt;
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    admit(&f.shared, work("admitted-later"));
+    seed_transferable_state(&f.shared, &revision);
+    unload_parent(&f.shared);
+    // Phase 1 happened, the adopter died before phases 2 and 3.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Superseded;
+        run.superseded_by = Some("next".into());
+        Ok(())
+    })
+    .unwrap();
+    receiving_run(&f.shared, "next");
+    // The claimed run is fenced for its old coordinator meanwhile.
+    let refused = planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "late-admit".into(),
+            work: work("late"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("resumed by session next"), "{refused}");
+    let report = planner_adopt::retry_pending_at(f.shared.as_ref(), "next", quiet_after(&f.shared))
+        .unwrap()
+        .expect("resumed adoption");
+    assert_eq!(report.works.len(), 2, "{}", report.summary());
+    assert_lossless_transfer(&f.shared, "next", &revision);
+    // Status still answers on the superseded record.
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Status {
+            offset: 0,
+            work_id: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pending_adoption_audits_and_gates_describe_recovery_instead_of_demanding_admission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capacity = tmp.path().join("capacity.json");
+    let log = tmp.path().join("audit.jsonl");
+    let reply = tmp.path().join("audit.json");
+    std::fs::write(&reply, defects(&["RELEASE_BUILD_FAILED"])).unwrap();
+    let f = fixture(|cfg| {
+        capacity_host(cfg, host_script(&["a"], &capacity), 1000, 1000000);
+        audit_host(cfg, audit_script(&reply, &log));
+    });
+    authorize(&f.shared);
+    pending_source(&f.shared, RunStatus::Draining, None);
+    // An idle parent with open findings: the audit wake carries the notice.
+    let now = parent_turn_ended(&f.shared) + 61;
+    tick(&f.shared, now).await;
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.capacity.pending_adoption.as_deref(), Some("source"));
+    let handoff = run.wakes["adoption:handoff"].reason.clone();
+    assert!(handoff.contains("source"), "{handoff}");
+    // The audit keeps its findings but tells the parent what the router refuses.
+    let audits = wakes_with(&f.shared, "audit:");
+    assert!(!audits.is_empty());
+    for (_, wake) in &audits {
+        assert!(
+            wake.reason.contains("RELEASE_BUILD_FAILED"),
+            "{}",
+            wake.reason
+        );
+        assert!(
+            wake.reason.contains("Ownership recovery is pending"),
+            "{}",
+            wake.reason
+        );
+        assert!(wake.reason.contains(&handoff), "{}", wake.reason);
+    }
+    // A turn that ends on those findings: the gate never lists the capacity
+    // host's candidates for admission.
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, now + 1);
+    tick(&f.shared, now + 1).await;
+    let gates = wakes_with(&f.shared, "gate:");
+    assert_eq!(gates.len(), 1);
+    let gate = &gates[0].1.reason;
+    assert!(gate.contains("Ownership recovery is pending"), "{gate}");
+    assert!(!gate.contains("Admit up to"), "{gate}");
+    assert!(!gate.contains("work_id work-a"), "{gate}");
+    // Admission and dispatch of the not-yet-transferred identity say why.
+    let admit_error = planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "premature".into(),
+            work: work("premature"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        admit_error.contains("adoption of source is pending"),
+        "{admit_error}"
+    );
+    assert!(admit_error.contains(&handoff), "{admit_error}");
+    let dispatch_error = planner_workflow::begin_work(&f.shared, SID, "work-from-source")
+        .await
+        .unwrap_err();
+    assert!(
+        dispatch_error.contains("adoption of source is pending")
+            && dispatch_error.contains("do not re-admit"),
+        "{dispatch_error}"
+    );
+    // Hosts read the same state.
+    let status = status_json(&f.shared).await;
+    assert_eq!(status["capacity"]["pending_adoption"], json!("source"));
+    assert_eq!(
+        status["capacity"]["pending_adoption_reason"],
+        json!(handoff)
+    );
+}
+
+#[test]
+fn send_input_to_a_session_without_a_planner_run_is_durable_idempotent_and_withdrawable() {
+    use router_acp::session_input;
+    let f = fixture(|_| {});
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    assert!(planner_workflow::load(&f.shared, SID).unwrap().is_none());
+    assert!(!session_input::planner_session(&store, SID).unwrap());
+    let send = |id: &str, message: &str| session_input::send(&store, SID, &f.repo, id, message);
+    assert!(
+        send("bad id!", "text")
+            .unwrap_err()
+            .contains("input id must be")
+    );
+    assert!(
+        session_input::send(&store, SID, Path::new("/"), "review-1", "text")
+            .unwrap_err()
+            .contains("does not match --cwd")
+    );
+    let first = send("review-1", "Real fixtures must gate again").unwrap();
+    assert!(!first.planner && first.queued && !first.delivered && !first.acknowledged);
+    assert_eq!(first.origin, "agent");
+    // The same id with the same text is a receipt, not a second message.
+    let retry = send("review-1", "Real fixtures must gate again").unwrap();
+    assert!(retry.queued && retry.delivery.is_none());
+    assert!(
+        send("review-1", "different text")
+            .unwrap_err()
+            .contains("different original message")
+    );
+    send("review-2", "Second correction").unwrap();
+    let readonly = StateStore::open_readonly(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    )
+    .unwrap();
+    assert!(
+        session_input::status(&readonly, SID, "review-1")
+            .unwrap()
+            .queued
+    );
+    assert!(
+        session_input::status(&readonly, SID, "missing")
+            .unwrap_err()
+            .contains("unknown session input")
+    );
+    let listed = session_input::list(&readonly, SID).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|s| s.input_id.as_str())
+            .collect::<Vec<_>>(),
+        ["review-1", "review-2"]
+    );
+    // Preview selects without writing; apply needs a reason and keeps the text.
+    let preview =
+        session_input::withdraw(&store, SID, &f.repo, Some("review-1"), false, "", false).unwrap();
+    assert_eq!(preview.len(), 1);
+    assert!(preview[0].withdrawn.is_none());
+    assert!(
+        session_input::withdraw(&store, SID, &f.repo, Some("review-1"), false, "", true)
+            .unwrap_err()
+            .contains("requires a reason")
+    );
+    let withdrawn = session_input::withdraw(
+        &store,
+        SID,
+        &f.repo,
+        Some("review-1"),
+        false,
+        "obsolete",
+        true,
+    )
+    .unwrap();
+    assert_eq!(withdrawn[0].withdrawn.as_ref().unwrap().reason, "obsolete");
+    assert!(!withdrawn[0].queued && !withdrawn[0].acknowledged);
+    assert_eq!(session_input::list(&store, SID).unwrap().len(), 1);
+    // A withdrawn id cannot be reopened by resending it.
+    assert!(
+        !send("review-1", "Real fixtures must gate again")
+            .unwrap()
+            .queued
+    );
+    let drained =
+        session_input::withdraw(&store, SID, &f.repo, None, false, "superseded", true).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].input_id, "review-2");
+    assert!(session_input::list(&store, SID).unwrap().is_empty());
+    // Once the session has a planner run, the command routes to the run's queue.
+    authorize(&f.shared);
+    assert!(session_input::planner_session(&store, SID).unwrap());
 }

@@ -5739,7 +5739,25 @@ async fn delegate_subagent_gets_linked_state_row() {
     let log = temp_log("delegtree");
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     let state_path = state.clone();
-    run_test(delegation_yaml(&state, &log, 3), async |cx, _observed| {
+    // The delegate streams a mode update the moment its mode is set, before
+    // the router has finished setting it up (codex does exactly this), and a
+    // start hook that takes a while leaves the log flusher time to write that
+    // update before the delegate's task is recorded.
+    let yaml = delegation_yaml(&state, &log, 3)
+        .replace(
+            "        - { name: MOCK_SESSION_MODES,",
+            "        - { name: MOCK_MODE_UPDATE, value: \"1\" }\n        - { name: MOCK_SESSION_MODES,",
+        )
+        .replace(
+            "delegation: { enabled: true, max_concurrent: 3 }",
+            "delegation: { enabled: true, max_concurrent: 3, lifecycle_hook: { command: /bin/sh, \
+             args: [\"-c\", \"cat >/dev/null; sleep 1.5\"] } }",
+        );
+    assert!(
+        yaml.contains("MOCK_MODE_UPDATE") && yaml.contains("sleep 1.5"),
+        "{yaml}"
+    );
+    run_test(yaml, async |cx, _observed| {
         init(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "big work\nDELEGATE:tweak the css").await?;
@@ -5763,6 +5781,38 @@ async fn delegate_subagent_gets_linked_state_row() {
                 .as_deref()
                 .unwrap_or("")
                 .contains("tweak the css")
+        );
+        // Every update the delegate streamed landed under its row, including
+        // the mode update that arrived before the delegate was fully set up.
+        // Those first rows used to fail their foreign key and be dropped.
+        let (child_sid, _) = &children[0];
+        let rows = db.log_for(child_sid, 200);
+        let mode_rows = rows
+            .iter()
+            .filter(|row| {
+                row.kind == "session_update"
+                    && row
+                        .detail
+                        .as_ref()
+                        .is_some_and(|d| d.to_string().contains("current_mode_update"))
+            })
+            .count();
+        assert_eq!(mode_rows, 1, "{rows:#?}");
+        let task_at = rows
+            .iter()
+            .position(|row| row.kind == "delegate_task")
+            .expect("task row");
+        let mode_at = rows
+            .iter()
+            .position(|row| {
+                row.detail
+                    .as_ref()
+                    .is_some_and(|d| d.to_string().contains("current_mode_update"))
+            })
+            .unwrap();
+        assert!(
+            mode_at < task_at,
+            "the mode update preceded the task: {rows:#?}"
         );
         Ok(())
     })
@@ -16967,6 +17017,57 @@ async fn implement_resumes_an_ownerless_running_run_with_its_works_and_inputs() 
 /// `router-acp adopt-run` moves an ownerless run into a running router's
 /// session from outside it, and refuses while the old run's owner lives.
 #[tokio::test]
+async fn closing_a_planner_parent_releases_its_run_for_adoption() {
+    use router_acp::planner_workflow as workflow;
+    let state = temp_state_file("close-releases-owner");
+    let log = temp_log("close-releases-owner");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let old = open_planner_parent(&cx, &repo).await?;
+            let run = workflow::load(&shared, &old).unwrap().unwrap();
+            // Loaded here: this router stamped and renewed its lease.
+            assert_eq!(run.owner, Some(workflow::RunOwner::current()));
+            assert!(run.owner_heartbeat_at > 0);
+            assert!(
+                router_acp::planner_adopt::live_owner(
+                    shared.as_ref(),
+                    &old,
+                    &run,
+                    chrono::Utc::now().timestamp()
+                )
+                .is_some_and(|reason| reason.contains("loaded in this router"))
+            );
+            // The operator closes the coordinator pane: the surviving router
+            // process no longer owns the run.
+            cx.send_request(CloseSessionRequest::new(old.clone()))
+                .block_task()
+                .await?;
+            let run = workflow::load(&shared, &old).unwrap().unwrap();
+            assert_eq!(run.owner, None, "session/close releases the lease");
+            assert_eq!(run.owner_heartbeat_at, 0);
+            // Only the legacy quiet period remains, because the session was
+            // active moments ago; it is no longer this host's pid that blocks.
+            let now = chrono::Utc::now().timestamp();
+            let reason = router_acp::planner_adopt::live_owner(shared.as_ref(), &old, &run, now);
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("legacy quiet period")),
+                "{reason:?}"
+            );
+            assert_eq!(
+                router_acp::planner_adopt::live_owner(shared.as_ref(), &old, &run, now + 601),
+                None
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn adopt_run_moves_an_ownerless_run_into_a_live_session() {
     let state = temp_state_file("adopt-run-cli");
     let log = temp_log("adopt-run-cli");
@@ -17025,4 +17126,143 @@ async fn adopt_run_moves_an_ownerless_run_into_a_live_session() {
         },
     )
     .await;
+}
+
+/// `send-input` reaches a session that has no planner run. A busy turn is
+/// steered when the adapter accepts it; a declined steer waits for the turn
+/// to end and then gets its own router-owned turn, exactly once.
+#[tokio::test]
+async fn send_input_cli_reaches_a_session_without_a_planner_run() {
+    let state = temp_state_file("send-input-cli");
+    let log = temp_log("send-input-cli");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&release, "").unwrap();
+    let hold = std::env::temp_dir().join(format!("hold-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    let declined = repo.path().join("declined.txt");
+    std::fs::write(&declined, "TEXT:send-input-boundary DECLINED-STEER").unwrap();
+    let steered = repo.path().join("steered.txt");
+    std::fs::write(&steered, "TEXT:send-input-steered").unwrap();
+    // An ordinary routed session: no `router: planner`, so no planner run is
+    // ever created for it.
+    let yaml = format!(
+        "state_file: {}\nrouters:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "plain",
+            &[("sol", 3)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        ),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "TEXT:plain-session-first-turn").await?;
+        assert!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .is_none()
+        );
+        let busy = {
+            let cx = cx.clone();
+            let sid = sid.clone();
+            let text = format!("busy operator turn\nWAIT_FILE:{}", hold.display());
+            tokio::spawn(async move { prompt_text(&cx, &sid, &text).await })
+        };
+        wait_for_mock_prompt(&log, "busy operator turn").await;
+        let call = |id: &str, message: Option<&std::path::Path>| {
+            let mut cmd = std::process::Command::new(router_exe());
+            cmd.args(["send-input", "--state"])
+                .arg(&state)
+                .args(["--session", &sid, "--id", id]);
+            match message {
+                Some(file) => {
+                    cmd.arg("--cwd")
+                        .arg(repo.path().join("repo"))
+                        .arg("--message-file")
+                        .arg(file);
+                }
+                None => {
+                    cmd.arg("--status");
+                }
+            }
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                !stdout.contains("send-input-boundary") && !stdout.contains("send-input-steered")
+            );
+            serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        };
+        // Declined steer: the message waits for the boundary.
+        let first = call("boundary", Some(&declined));
+        assert_eq!(first["planner"], false);
+        assert_eq!(first["queued"], true);
+        assert_eq!(call("boundary", Some(&declined))["queued"], true);
+        for _ in 0..100 {
+            if read_log(&log).iter().any(|e| e["event"] == "steer") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            read_log(&log).iter().any(|e| {
+                e["event"] == "steer" && e["params"].to_string().contains("send-input-boundary")
+            }),
+            "the busy session was offered the message once by steering"
+        );
+        assert!(
+            !busy.is_finished(),
+            "send-input did not interrupt the active turn"
+        );
+        assert!(mock_prompts(&log, "send-input-boundary").is_empty());
+        // Accepted steer: delivered inside the running turn, no new turn.
+        assert_eq!(call("steered", Some(&steered))["queued"], true);
+        for _ in 0..100 {
+            if call("steered", None)["acknowledged"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let receipt = call("steered", None);
+        assert_eq!(receipt["delivered"], true);
+        assert_eq!(receipt["acknowledged"], true);
+        assert_eq!(receipt["delivery"], "steered");
+        assert!(!busy.is_finished());
+        std::fs::write(&hold, "").unwrap();
+        busy.await.unwrap()?;
+        wait_for_prompt_index(&log, "send-input-boundary").await;
+        for _ in 0..150 {
+            if call("boundary", None)["acknowledged"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let receipt = call("boundary", None);
+        assert_eq!(receipt["queued"], false);
+        assert_eq!(receipt["delivered"], true);
+        assert_eq!(receipt["acknowledged"], true);
+        assert_eq!(receipt["delivery"], "turn");
+        assert_eq!(mock_prompts(&log, "send-input-boundary").len(), 1);
+        assert!(mock_prompts(&log, "send-input-steered").is_empty());
+        assert!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .is_none()
+        );
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&hold);
 }

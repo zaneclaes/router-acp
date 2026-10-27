@@ -104,6 +104,22 @@ benchmark_scoring:
       - { benchmark: SWE-Bench-Pro, result: 80.0, source: "https://openai.com/index/gpt-5-6/" }
       - { benchmark: DeepSWE-v1.1, result: 69.7, source: "https://openai.com/index/gpt-5-6/" }
       - { benchmark: Terminal-Bench-2.1, result: 83.1, source: "https://openai.com/index/gpt-5-6/" }
+    "*gpt-6-astra*":
+      # GPT-6 Astra (released 2026-09-03; $10/$50, 1.05M context, 128k
+      # output, native xhigh/max; Codex advertises `gpt-6-astra`). OpenAI's
+      # launch table puts it at 74.1% on DeepSWE v1.1 (GPT-5.6 Sol 72.7,
+      # Claude Opus 5 73.7), and the public v1.1 leaderboard
+      # (deepswe.datacurve.ai, 2026-09-22) records the same xhigh run at
+      # 74% ±3. That is the only published Astra row with anchors here:
+      # OpenAI and Artificial Analysis report Terminal-Bench 4.0 (57.7-59%),
+      # not 2.1, Scale's SWE-Bench Pro leaderboard carries no Astra row, and
+      # Artificial Analysis's Coding Agent Index (Astra 67.0, Fable 5.1 67.2 —
+      # a tie) is on the points scale that does not map onto the v1.1
+      # anchors. One observation means every class carries the aggregate;
+      # add rows (or a calibrated Terminal-Bench 4.0 definition) as they are
+      # published. Enabling Astra from catalog facts alone was what the
+      # cross-file contract test rejected; this row is what makes it whole.
+      - { benchmark: DeepSWE-v1.1, result: 74.1, source: "https://openai.com/index/gpt-6-astra/" }
     "*sol*":
       - { benchmark: AA-Coding-Agent-v1.1, result: 80.0, source: "https://openai.com/index/gpt-5-6/" }
       - { benchmark: SWE-Bench-Pro, result: 64.6, source: "https://openai.com/index/gpt-5-6/" }
@@ -278,6 +294,8 @@ witnesses:
   gpt5: "codex/gpt-5.5"
   gpt5_codex: "codex/gpt-5.5-codex"
   sol: "codex/gpt-5.6-sol"
+  # GPT-6 Astra: OpenAI's flagship above the Sol family (own evidence row).
+  astra: "codex/gpt-6-astra"
   sol_6: "codex/gpt-6-sol"
   sol_6_1: "codex/gpt-6.1-sol"
   terra: "codex/gpt-5.6-terra"
@@ -311,8 +329,12 @@ invariants:
         noise, and the 0.02 residual exists so cost_rank routes everyday work
         to Opus while ordering-sensitive paths (apex complexity, escalation,
         planner globs) still resolve to Fable.
-    - chain: [sol, terra, luna]
-      why: provisional GPT sol/terra/luna tiering
+    - chain: [astra, sol, terra, luna]
+      why: >-
+        GPT-6 Astra is OpenAI's flagship above the Sol family: its own
+        DeepSWE v1.1 row (74.1) leads Sol's (72.7) in OpenAI's launch table,
+        and the catalog must never route a `hard:` or apex task to Sol when
+        Astra is configured. The rest is the provisional sol/terra/luna tiering.
     - chain: [sol, gpt5]
       why: sol must not fall through to the generic *gpt-5* entry
     - chain: [terra, gpt5]
@@ -374,6 +396,11 @@ invariants:
       why: current published benchmark aggregate places Grok 4.6 just under Opus
   # Concrete id -> the score-table pattern that must win the first-match race.
   resolves_to:
+    "claude/opus": "*opus*"
+    "claude/claude-haiku-4-5": "*haiku*"
+    "claude/claude-sonnet-5": "*sonnet*"
+    "claude/claude-opus-5-5": "*opus*"
+    "claude/claude-fable-5": "*fable*"
     "codex/gpt-5.4-mini": "*mini*"
     "codex/gpt-5.5": "*gpt-5*"
     "codex/gpt-5.5-codex": "*gpt-5*codex*"
@@ -382,6 +409,7 @@ invariants:
     "codex/gpt-5.6-luna": "*luna*"
     "codex/gpt-6-sol": "*gpt-6-sol*"
     "codex/gpt-6.1-sol": "*gpt-6.1-sol*"
+    "codex/gpt-6-astra": "*gpt-6-astra*"
     "codex/gpt-6-luna": "*gpt-6-luna*"
     "claude/claude-fable-5[1m]": "*fable*"
     # Fable 5.1 inherits Fable's calibrated scores: `*fable*` already matches
@@ -421,6 +449,11 @@ invariants:
 published_pricing:
   as_of: "2026-09-29"
   models:
+    "claude/opus": { input_per_mtok: 4.00, output_per_mtok: 20.00 }
+    "claude/claude-haiku-4-5": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
+    "claude/claude-sonnet-5": { input_per_mtok: 2.00, output_per_mtok: 10.00 }
+    "claude/claude-opus-5-5": { input_per_mtok: 4.00, output_per_mtok: 20.00 }
+    "claude/claude-fable-5": { input_per_mtok: 10.00, output_per_mtok: 50.00 }
     "claude/haiku": { input_per_mtok: 1.00, output_per_mtok: 5.00 }
     # Sonnet 5 is PERMANENTLY $2/$10: the increase to $3/$15 scheduled for
     # 2026-09-01 was cancelled (note on Anthropic's pricing page). Sonnet 4.6
@@ -460,6 +493,11 @@ published_pricing:
       { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.20 }
     "codex/gpt-6.1-sol":
       { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.10 }
+    # GPT-6 Astra (2026-09-03): $10/$50, standard 0.1x cache read ($1.00) and
+    # 1.25x write ($12.50). The most expensive codex model, so rank 5 needs
+    # no exception.
+    "codex/gpt-6-astra":
+      { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 1.00 }
     "grok/grok-4.6":
       { input_per_mtok: 2.00, output_per_mtok: 6.00, cache_read_per_mtok: 0.50 }
     "grok/grok-4.7":

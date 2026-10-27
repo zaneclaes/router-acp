@@ -43,6 +43,7 @@ pub mod project_config;
 pub mod relay;
 pub mod restoration;
 pub mod session;
+pub mod session_input;
 pub mod state;
 pub mod state_bench;
 pub mod state_layout;

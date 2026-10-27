@@ -20,6 +20,25 @@
 //! `input:` wakes (delivered ahead of other wakes), and marks the old run
 //! `superseded` with `superseded_by`. Every save is revision-checked, so a
 //! router writing the same run concurrently only makes the step retry.
+//!
+//! # Ownership is a lease, not a process
+//!
+//! A run's `owner` is the router process that has its parent session loaded.
+//! That process existing proves host liveness, not coordinator activity: the
+//! same router serves many sessions and keeps running after the operator
+//! closes one, and the stamp used to outlive the session (`lifecycle::close`
+//! never cleared it), so a replacement `/implement` could wait forever on a
+//! host that drove nothing (live, 2026-10-26: `rtr-…-56d975bf` sat with zero
+//! works on "its owning router (pid 90176) is alive" while its release audits
+//! kept demanding admissions the pending adoption refused). So ownership is a
+//! lease the wake loop renews ([`heartbeat`], every [`OWNER_HEARTBEAT_SECS`])
+//! and `session/close` or `session/delete` hands back at once ([`release`]).
+//! [`live_owner`] treats an owner as living only while its process exists
+//! AND its lease is fresh (or the session itself was active within
+//! [`OWNER_STALE_SECS`]); a lease a pre-heartbeat router stamped (`0`) is
+//! trusted while that process exists, because unknown activity never
+//! authorizes a takeover. Live worker attempts and wake claims fence the run
+//! on their own, whatever the parent's lease says.
 
 use std::collections::BTreeSet;
 
@@ -32,6 +51,16 @@ use crate::planner_workflow::{PlannerRun, RunStatus, Wake};
 /// live attempt or wake claim and no session activity for this long, the
 /// run's router is gone.
 const LEGACY_QUIET_SECS: i64 = 600;
+
+/// The owning router renews its lease on a run this often (the wake loop
+/// calls [`heartbeat`] on its one-second tick; it writes only when due).
+pub const OWNER_HEARTBEAT_SECS: i64 = 30;
+
+/// An owner whose process exists but whose lease is this old, with no session
+/// activity for as long, no longer drives the run: its parent session was
+/// unloaded (or its wake loop is gone). A surviving host is not a living
+/// coordinator, and `/implement` elsewhere may adopt the run.
+pub const OWNER_STALE_SECS: i64 = 180;
 
 /// Where planner runs are read and written: the router (`Shared`) or the
 /// state database alone (the `adopt-run` command).
@@ -172,15 +201,147 @@ fn concurrent(error: &str) -> bool {
     error.starts_with("planner state changed concurrently")
 }
 
+/// This router has `sid` loaded: take or renew the run's ownership lease.
+/// `run` is the document the caller already loaded; nothing is written while
+/// the lease is this router's and younger than [`OWNER_HEARTBEAT_SECS`]. A run
+/// another session adopted meanwhile is left alone.
+pub fn heartbeat(
+    store: &dyn RunStore,
+    sid: &str,
+    run: &PlannerRun,
+    now: i64,
+) -> Result<(), String> {
+    let me = crate::planner_workflow::RunOwner::current();
+    if run.status == RunStatus::Superseded
+        || (run.owner == Some(me)
+            && run.owner_heartbeat_at != 0
+            && now - run.owner_heartbeat_at < OWNER_HEARTBEAT_SECS)
+    {
+        return Ok(());
+    }
+    for _ in 0..16 {
+        let Some(mut run) = store.load(sid)? else {
+            return Ok(());
+        };
+        if run.status == RunStatus::Superseded {
+            return Ok(());
+        }
+        run.owner = Some(me);
+        run.owner_heartbeat_at = now;
+        match store.save(sid, &mut run) {
+            Ok(()) => return Ok(()),
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("planner ownership heartbeat remained contended".into())
+}
+
+/// This router no longer has `sid` loaded (`session/close`, `session/delete`):
+/// hand the run's ownership back so a replacement `/implement` in the same
+/// checkout can adopt it now rather than after this process exits. Only this
+/// router's own lease is released; live attempts and wake claims keep
+/// fencing the run on their own.
+pub fn release(store: &dyn RunStore, sid: &str) -> Result<(), String> {
+    let me = crate::planner_workflow::RunOwner::current();
+    for _ in 0..16 {
+        let Some(mut run) = store.load(sid)? else {
+            return Ok(());
+        };
+        if run.owner != Some(me) {
+            return Ok(());
+        }
+        run.owner = None;
+        run.owner_heartbeat_at = 0;
+        match store.save(sid, &mut run) {
+            Ok(()) => return Ok(()),
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("planner ownership release remained contended".into())
+}
+
+/// What a pending ownership recovery means for the parent, for audits, the
+/// turn-end gate and refused operations: the source run, why the handoff is
+/// waiting, and what the run refuses meanwhile. `None` when nothing is pending.
+pub fn pending_notice(run: &PlannerRun) -> Option<String> {
+    let source = run.capacity.pending_adoption.as_ref()?;
+    let waiting = run
+        .wakes
+        .get("adoption:handoff")
+        .map(|wake| format!(" Current state: {}", wake.reason))
+        .unwrap_or_default();
+    Some(format!(
+        "Ownership recovery is pending: this run is adopting planner run {source}, whose          assignments are not transferred yet.{waiting} Until the handoff completes the router          refuses new admissions and dispatch of work identities that still belong to that run;          the capacity cycle retries the handoff every 15 seconds. This is router state, not a          defect you can act on: record the dispositions, holds and release evidence you can,          and do not re-admit or duplicate that run's work."
+    ))
+}
+
+/// The `Admit` refusal while adoption of `source` is pending.
+pub fn admission_refusal(run: &PlannerRun, source: &str) -> String {
+    let mut text = format!(
+        "planner adoption of {source} is pending; the capacity cycle retries the handoff before new admissions"
+    );
+    if let Some(wake) = run.wakes.get("adoption:handoff") {
+        text.push_str(&format!(" ({})", wake.reason));
+    }
+    text
+}
+
+/// The dispatch refusal for a work identity this run does not hold.
+pub fn dispatch_refusal(run: &PlannerRun, work_id: &str) -> String {
+    match &run.capacity.pending_adoption {
+        None => "admit this work identity before dispatch".into(),
+        Some(source) => {
+            let mut text = format!(
+                "work {work_id} is not in this run: planner adoption of {source} is pending and                  its assignments are not transferred yet; dispatch it after the handoff                  completes and do not re-admit it here"
+            );
+            if let Some(wake) = run.wakes.get("adoption:handoff") {
+                text.push_str(&format!(" ({})", wake.reason));
+            }
+            text
+        }
+    }
+}
+
 /// Why `sid`'s run still has a live owner, if it does.
+///
+/// A living owner is a router that has the parent loaded *and* drives it: its
+/// process exists and its lease is fresh, or the session itself was active
+/// within [`OWNER_STALE_SECS`]. A process that merely exists is a surviving
+/// host; after its lease and the session go quiet it blocks nothing. A lease a
+/// pre-heartbeat router stamped (`owner_heartbeat_at == 0`) stays live while
+/// that process exists, because unknown activity never authorizes a takeover.
 pub fn live_owner(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Option<String> {
     if store.loaded_here(sid) {
         return Some("its session is loaded in this router".into());
     }
-    if let Some(owner) = &run.owner {
-        return owner
-            .alive()
-            .then(|| format!("its owning router (pid {}) is alive", owner.pid));
+    let last_activity = store.last_activity(sid);
+    if let Some(owner) = &run.owner
+        && owner.alive()
+    {
+        if run.owner_heartbeat_at == 0 {
+            return Some(format!(
+                "its owning router (pid {}) is alive and predates ownership heartbeats; adoption waits for that process to exit or close the session",
+                owner.pid
+            ));
+        }
+        let lease_age = now - run.owner_heartbeat_at;
+        if lease_age < OWNER_STALE_SECS {
+            return Some(format!(
+                "its owning router (pid {}) confirmed it drives this run {lease_age} s ago",
+                owner.pid
+            ));
+        }
+        if let Some(last) = last_activity
+            && now - last < OWNER_STALE_SECS
+        {
+            return Some(format!(
+                "its owning router (pid {}) last confirmed this run {lease_age} s ago but the session was active {} s ago",
+                owner.pid,
+                now - last
+            ));
+        }
     }
     if let Some((id, attempt)) = run.works.iter().find_map(|(id, w)| {
         w.attempt
@@ -208,7 +369,8 @@ pub fn live_owner(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -
             wake.claim_pid
         ));
     }
-    if let Some(last) = store.last_activity(sid)
+    if run.owner.is_none()
+        && let Some(last) = last_activity
         && now - last < LEGACY_QUIET_SECS
     {
         return Some(format!(
@@ -496,22 +658,81 @@ fn retire(from: &mut PlannerRun, report: &AdoptReport) {
 
 /// Adopt `from_sid`'s run into `into_sid`'s. Both runs must exist; `from`
 /// must be running, draining or cleanly paused with no live owner.
+///
+/// Three revision-checked phases, so an owner that comes back mid-flight can
+/// never end up coordinating beside the adopter:
+///
+/// 1. **claim** — re-check liveness on the exact revision being written and
+///    mark `from` `superseded` by `into_sid` while it still holds everything.
+///    From this save on the old router is fenced: its heartbeat skips the run,
+///    `planner_workflow::operate` refuses mutations and its wake loop says so.
+///    A lease renewed between the check and the save conflicts the save, and
+///    the retry sees the live owner and refuses.
+/// 2. **merge** — move the claimed content into `into` (idempotent: content
+///    the destination already holds is reported, not duplicated).
+/// 3. **retire** — strip the moved content from `from`.
+///
+/// A crash between phases leaves `from` claimed with its content intact;
+/// rerunning (the capacity cycle's `retry_pending`, or `adopt-run` again)
+/// resumes from the claim instead of declaring an empty adoption complete.
 pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<AdoptReport, String> {
+    adopt_at(store, from_sid, into_sid, chrono::Utc::now().timestamp())
+}
+
+/// [`adopt`] judging liveness at unix second `now` (the capacity cycle passes
+/// its tick time so one clock governs the whole retry).
+pub fn adopt_at(
+    store: &dyn RunStore,
+    from_sid: &str,
+    into_sid: &str,
+    now: i64,
+) -> Result<AdoptReport, String> {
     if from_sid == into_sid {
         return Err("a run cannot adopt itself".into());
     }
-    let mut report = None;
+    let mut claimed = None;
     for _ in 0..16 {
-        let from = store
+        let mut from = store
             .load(from_sid)?
             .ok_or_else(|| format!("no planner run for session {from_sid}"))?;
-        let mut into = store.load(into_sid)?.ok_or_else(|| {
+        let into = store.load(into_sid)?.ok_or_else(|| {
             format!("no planner run for session {into_sid}; run /implement there first")
         })?;
         if into.status == RunStatus::Superseded {
             return Err(format!("planner run {into_sid} is itself superseded"));
         }
-        adoptable(store, from_sid, &from, chrono::Utc::now().timestamp())?;
+        if from.status == RunStatus::Superseded && from.superseded_by.as_deref() == Some(into_sid) {
+            // Claimed by this destination earlier (a router died between the
+            // claim and the retire): finish that adoption.
+            claimed = Some(from);
+            break;
+        }
+        adoptable(store, from_sid, &from, now)?;
+        // Prove the merge before anything is written: a release conflict must
+        // surface while `from` is still its owner's to drive.
+        merge(&mut into.clone(), &from, from_sid, into_sid)?;
+        from.status = RunStatus::Superseded;
+        from.superseded_by = Some(into_sid.to_string());
+        match store.save(from_sid, &mut from) {
+            Ok(()) => {
+                claimed = Some(from);
+                break;
+            }
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let from = claimed.ok_or("the earlier run stayed contended; retry adopt-run")?;
+    let mut report = None;
+    for _ in 0..16 {
+        let mut into = store
+            .load(into_sid)?
+            .ok_or_else(|| format!("planner run {into_sid} disappeared"))?;
+        if into.status == RunStatus::Superseded {
+            return Err(format!(
+                "planner run {into_sid} became superseded while adopting {from_sid}; rerun adopt-run from {from_sid} into its successor"
+            ));
+        }
         let merged = merge(&mut into, &from, from_sid, into_sid)?;
         match store.save(into_sid, &mut into) {
             Ok(()) => {
@@ -522,7 +743,7 @@ pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<Ado
             Err(e) => return Err(e),
         }
     }
-    let report = report.ok_or("the new run stayed contended; retry adopt-run")?;
+    let report = report.ok_or("the new run stayed contended; rerun adopt-run to finish")?;
     for _ in 0..16 {
         let mut from = store
             .load(from_sid)?
@@ -538,8 +759,17 @@ pub fn adopt(store: &dyn RunStore, from_sid: &str, into_sid: &str) -> Result<Ado
         }
     }
     Err(format!(
-        "adopted into {into_sid}, but marking {from_sid} superseded stayed contended; rerun adopt-run to finish"
+        "adopted into {into_sid}, but retiring {from_sid} stayed contended; rerun adopt-run to finish"
     ))
+}
+
+/// Content a claimed source still holds for its adopter: the claim happened,
+/// the merge and retire did not (yet).
+fn holds_claimed_content(from: &PlannerRun) -> bool {
+    !from.works.is_empty()
+        || !from.releases.is_empty()
+        || !from.capacity.holds.is_empty()
+        || !from.parent_queue.is_empty()
 }
 
 /// Whether `run` is an implement run rather than the empty planning run every
@@ -706,6 +936,10 @@ fn retry_source(
         return Ok(None);
     };
     if from.superseded_by.as_deref() == Some(into_sid) {
+        if from.status == RunStatus::Superseded && holds_claimed_content(&from) {
+            // Claimed but never merged: the adopter died between phases. Finish.
+            return adopt_at(store, source, into_sid, now).map(Some);
+        }
         adoption_pending(
             store,
             into_sid,
@@ -749,5 +983,5 @@ fn retry_source(
         )?;
         return Ok(None);
     }
-    adopt(store, source, into_sid).map(Some)
+    adopt_at(store, source, into_sid, now).map(Some)
 }
