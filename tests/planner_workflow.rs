@@ -2342,6 +2342,68 @@ async fn human_phase_directive_reopens_a_complete_run_for_implementation() {
     .unwrap();
 }
 
+/// A child that completed its own run must still take its coordinator's
+/// correction. The client-attested implementation directive reopens it, as
+/// a person's does; plain agent input and an attested planning directive
+/// stay refused, and the child never becomes a parent.
+#[tokio::test]
+async fn delegated_implementation_directive_reopens_a_complete_child_run() {
+    let fixture = fixture(|_| {});
+    authorize(&fixture.shared);
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Complete {
+            key: "child-closed-own-run".into(),
+            queue_evidence: "queue verified".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let agent = |id: &str, text: &str, router: serde_json::Value| {
+        let mut req = input_request(Some(id), text, false);
+        req.meta = serde_json::from_value(json!({ "router_acp": router })).ok();
+        req
+    };
+    let attested = |id: &str| json!({"input_id": id, "agent_origin": true, "delegated_approval": {"by": "coordinator"}});
+    let correction = "[router: phase=implementation]\nRebase and fix the rounding.";
+
+    for refused in [
+        agent(
+            "plain",
+            correction,
+            json!({"input_id": "plain", "agent_origin": true}),
+        ),
+        agent(
+            "planning",
+            "[router: phase=planning]\nrevise",
+            attested("planning"),
+        ),
+    ] {
+        let error = planner_workflow::observe_input(&fixture.shared, SID, &refused).unwrap_err();
+        assert!(error.contains("complete"), "{error}");
+    }
+
+    planner_workflow::observe_input(
+        &fixture.shared,
+        SID,
+        &agent("fix", correction, attested("fix")),
+    )
+    .unwrap();
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+    assert_eq!(run.execution_input_id.as_deref(), Some("fix"));
+    assert_eq!(run.inputs["fix"].origin, "coordinator");
+    assert!(
+        !run.coordinator,
+        "a coordinator's correction never makes a parent"
+    );
+}
+
 #[tokio::test]
 async fn post_completion_agent_input_is_rejected_without_new_unresolved_input() {
     let fixture = fixture(|_| {});
