@@ -64,13 +64,19 @@ fn read(path: &Path) -> Result<Option<String>, AdminError> {
 
 fn shown(raw: Option<&str>) -> Result<Value, AdminError> {
     let config: Option<Value> = raw.map(serde_yaml::from_str).transpose().map_err(invalid)?;
+    let effective: Option<Value> = raw
+        .map(Config::effective_document)
+        .transpose()
+        .map_err(invalid)?;
     Ok(serde_json::json!({
         "revision": raw.map(|r| revision(r.as_bytes())),
         "config": config,
+        "effective": effective,
     }))
 }
 
-/// `{revision, config}`: the uninterpolated document, or nulls when no
+/// `{revision, config, effective}`: the uninterpolated document plus provider
+/// presets and section defaults for host settings surfaces, or nulls when no
 /// configuration exists yet.
 pub fn show(path: &Path) -> Result<Value, AdminError> {
     shown(read(path)?.as_deref())
@@ -312,6 +318,28 @@ mod tests {
 
     fn doc(path: &Path) -> Value {
         show(path).unwrap()["config"].clone()
+    }
+
+    #[test]
+    fn show_includes_effective_defaults_without_expanding_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.yaml");
+        std::fs::write(
+            &path,
+            "state_file: ${ROUTER_STATE_FILE}\nagents:\n  - name: claude\n    preference: 0.1\n",
+        )
+        .unwrap();
+
+        let shown = show(&path).unwrap();
+        assert!(shown["config"]["agents"][0].get("models").is_none());
+        assert!(
+            !shown["effective"]["agents"][0]["models"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(shown["effective"]["state_file"], "${ROUTER_STATE_FILE}");
+        assert!(shown["effective"]["routers"].get("escalation").is_some());
     }
 
     #[test]
