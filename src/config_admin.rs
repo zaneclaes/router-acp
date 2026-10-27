@@ -114,7 +114,12 @@ pub fn apply(
     if dry_run {
         let yaml = serde_yaml::to_string(&proposed).map_err(invalid)?;
         Config::from_yaml(&yaml).map_err(invalid)?;
-        return Ok(serde_json::json!({"revision": null, "config": proposed}));
+        let effective = Config::effective_document(&yaml).map_err(invalid)?;
+        return Ok(serde_json::json!({
+            "revision": null,
+            "config": proposed,
+            "effective": effective,
+        }));
     }
     save_document(path, &proposed).map_err(invalid)?;
     drop(_lock);
@@ -430,7 +435,9 @@ mod tests {
             apply(&path, invalid_doc, None, true),
             Err(AdminError::Invalid(_))
         ));
-        apply(&path, proposed, None, true).unwrap();
+        let preview = apply(&path, proposed, None, true).unwrap();
+        assert!(preview["config"]["agents"][0].get("models").is_some());
+        assert!(preview["effective"]["routers"].get("escalation").is_some());
         assert_eq!(std::fs::read(&path).unwrap(), raw);
     }
 
