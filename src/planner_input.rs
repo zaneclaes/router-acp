@@ -154,7 +154,9 @@ pub fn withdraw(
 }
 
 /// The caller has the same local state-file access as the operator. Messages
-/// are nevertheless agent-origin: they cannot authorize scope or change phase.
+/// stay agent-origin for the run's own bookkeeping (no phase change, no human
+/// hold cleared), but the delivered text asks the session to act on them as a
+/// valid instruction ranked below the operator's typed words (ruling 2026-10-28).
 /// A caller-supplied id makes uncertain delivery safely retryable.
 pub fn send(
     store: &StateStore,
@@ -183,10 +185,11 @@ pub fn send(
     let req: PromptRequest = serde_json::from_value(json!({
         "sessionId": sid,
         "prompt": [{"type": "text", "text": format!(
-            "External monitor message (agent-origin; does not grant operator approval or expand authorized scope):\n\n{message}"
+            "{}\n\n{message}", crate::session_input::delivery_preamble(id)
         )}],
         "_meta": {"router_acp": {"agent_origin": true, "input_id": id}}
-    })).map_err(|e| e.to_string())?;
+    }))
+    .map_err(|e| e.to_string())?;
     for _ in 0..16 {
         let mut run = store.load(sid)?.ok_or("planner run missing")?;
         // Validate identity even after delivery. Retrying must never requeue

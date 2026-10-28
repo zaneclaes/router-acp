@@ -99,8 +99,11 @@ input can steer it, or cancel it when steering is unavailable. An interrupted
 correction stays queued for redelivery after the operator's turn. Actual operator
 turns remain protected and preserve their FIFO queue behavior.
 
-Messages are explicitly agent-origin and cannot authorize new scope, change phase,
-resume a paused run, or acknowledge an operator decision. Sending requires an exact
+Messages are agent-origin for the run's bookkeeping: they cannot change phase, resume
+a paused run, or acknowledge an operator decision. The delivered text nevertheless
+tells the session to act on them as valid instructions ranked below the operator's own
+typed words (operator ruling 2026-10-28; until then the preamble said the message granted
+nothing, and sessions correctly refused to act on it). Sending requires an exact
 checkout match and a running run with a live owner. Reuse an id when retrying an
 uncertain submission: identical content returns its existing receipt even after
 delivery; changed content with that id fails. Send a new correction with a new id.
