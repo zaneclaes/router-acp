@@ -5639,7 +5639,9 @@ pub(crate) fn mcp_servers_for_pin(
     // The project's signed-in remote servers, through the router's broker.
     crate::mcp_broker::merge_authoritative(
         &mut servers,
-        shared.mcp_broker.session_servers(&cwd, Some(router_sid)),
+        shared
+            .mcp_broker
+            .session_servers(&cwd, Some(router_sid), Some(&candidate.model)),
     );
     let delegate_attached = crate::delegate_mcp::delegation_available(shared, candidate);
     if let Some(entry) = crate::delegate_mcp::delegate_server_entry(shared, router_sid, candidate) {

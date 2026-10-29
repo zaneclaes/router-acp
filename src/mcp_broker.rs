@@ -23,6 +23,11 @@
 //! the upstream also refuses is marked "reconnect needed". `<entry>` names an
 //! upstream URL the router itself read from a project file, so the process
 //! secret cannot be used to send the token anywhere else.
+//!
+//! An entry issued to a pinned candidate also carries that candidate's model,
+//! sent upstream as `X-Kory-Agent-Model` so a server can attribute the call.
+//! Only the router sets it: request headers outside `FORWARD_HEADERS` are
+//! dropped, so a session cannot name a different model.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -56,6 +61,8 @@ const FORWARD_HEADERS: [&str; 4] = [
 /// `www-authenticate` is deliberately not relayed: it would invite an adapter
 /// to start its own OAuth against the upstream, which only the router may do.
 const RESPONSE_HEADERS: [&str; 3] = ["content-type", "mcp-session-id", "mcp-protocol-version"];
+/// The pinned candidate's model, set by the router on every upstream request.
+const AGENT_MODEL_HEADER: &str = "x-kory-agent-model";
 
 /// One proxied upstream: the URL a project file named, and its sign-in.
 struct Entry {
@@ -65,6 +72,8 @@ struct Entry {
     /// The router session the entry was issued to (none for `mcp-call` and
     /// delegate workers): its tool results may fill that session's updates.
     session: Option<String>,
+    /// The model of the candidate the entry was issued to (none for `mcp-call`).
+    model: Option<String>,
 }
 
 /// A tool result the broker carried for a session, kept briefly so a
@@ -176,6 +185,7 @@ impl Broker {
             upstream: server.url.clone(),
             source: self.source_for(server),
             session: None,
+            model: None,
         }
     }
 
@@ -238,8 +248,14 @@ impl Broker {
 
     /// The broker entries for a session in `cwd`: each brokered project server
     /// the router is signed in to, plus explicit account profiles. Unsigned
-    /// default-profile servers are left to adapters as before.
-    pub fn session_servers(&self, cwd: &FsPath, session: Option<&str>) -> Vec<McpServer> {
+    /// default-profile servers are left to adapters as before. `model` is the
+    /// pinned candidate's model, sent upstream on every request.
+    pub fn session_servers(
+        &self,
+        cwd: &FsPath,
+        session: Option<&str>,
+        model: Option<&str>,
+    ) -> Vec<McpServer> {
         let Some(addr) = self.addr.get() else {
             return Vec::new();
         };
@@ -256,11 +272,12 @@ impl Broker {
             }
             let id: String = Sha256::digest(
                 format!(
-                    "{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}",
                     remote.name,
                     remote.url,
                     remote.store_key(),
-                    session.unwrap_or_default()
+                    session.unwrap_or_default(),
+                    model.unwrap_or_default()
                 )
                 .as_bytes(),
             )[..8]
@@ -274,6 +291,7 @@ impl Broker {
                     upstream: remote.url.clone(),
                     source,
                     session: session.map(String::from),
+                    model: model.map(String::from),
                 }),
             );
             out.push(McpServer::Http(
@@ -706,6 +724,13 @@ async fn forward(
             request = request.header(name, value);
         }
     }
+    if let Some(model) = entry
+        .model
+        .as_deref()
+        .and_then(|m| HeaderValue::from_str(m).ok())
+    {
+        request = request.header(AGENT_MODEL_HEADER, model);
+    }
     if !body.is_empty() {
         request = request.body(body.clone());
     }
@@ -1127,8 +1152,8 @@ mod tests {
         }
         let broker = Broker::new(root.path().into(), None);
         let listener = broker.bind().await.unwrap();
-        let a = broker.session_servers(first.path(), None);
-        let b = broker.session_servers(second.path(), None);
+        let a = broker.session_servers(first.path(), None, None);
+        let b = broker.session_servers(second.path(), None, None);
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
         let (McpServer::Http(a), McpServer::Http(b)) = (&a[0], &b[0]) else {
@@ -1163,6 +1188,8 @@ mod tests {
         seen: Seen,
         /// Bearers the fake upstream refuses.
         refuse: Arc<Mutex<Vec<String>>>,
+        /// `X-Kory-Agent-Model` per request.
+        models: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     /// Port of Kory's fake MCP server, over streamable HTTP: records the
@@ -1183,6 +1210,12 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .map(String::from);
                         state.seen.lock().unwrap().push((body.clone(), auth.clone(), sid));
+                        state.models.lock().unwrap().push(
+                            headers
+                                .get(AGENT_MODEL_HEADER)
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from),
+                        );
                         let refused = auth.as_deref().is_some_and(|a| {
                             state.refuse.lock().unwrap().iter().any(|r| a == format!("Bearer {r}"))
                         });
@@ -1255,7 +1288,7 @@ mod tests {
     }
 
     fn entry(broker: &Broker, project: &tempfile::TempDir) -> (String, String) {
-        let servers = broker.session_servers(project.path(), None);
+        let servers = broker.session_servers(project.path(), None, None);
         let [McpServer::Http(http)] = servers.as_slice() else {
             panic!("one http entry: {servers:?}");
         };
@@ -1281,12 +1314,12 @@ mod tests {
         let broker = Broker::new(root.path().to_path_buf(), None);
         let dir = project(&upstream_url);
         assert!(
-            broker.session_servers(dir.path(), None).is_empty(),
+            broker.session_servers(dir.path(), None, None).is_empty(),
             "unbound: nothing"
         );
         broker.bind().await.unwrap();
         assert!(
-            broker.session_servers(dir.path(), None).is_empty(),
+            broker.session_servers(dir.path(), None, None).is_empty(),
             "not signed in: left to adapters"
         );
         signed_in(
@@ -1295,11 +1328,13 @@ mod tests {
             "http://127.0.0.1:1/token",
             &tokens("t", 3_600_000),
         );
-        assert_eq!(broker.session_servers(dir.path(), None).len(), 1);
+        assert_eq!(broker.session_servers(dir.path(), None, None).len(), 1);
         let elsewhere = tempfile::tempdir().unwrap();
         std::fs::create_dir(elsewhere.path().join(".git")).unwrap();
         assert!(
-            broker.session_servers(elsewhere.path(), None).is_empty(),
+            broker
+                .session_servers(elsewhere.path(), None, None)
+                .is_empty(),
             "no project file: nothing"
         );
     }
@@ -1397,6 +1432,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_pinned_model_is_sent_upstream_and_a_session_cannot_name_another() {
+        let (upstream_url, upstream) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let (broker, dir) = broker_for(
+            &upstream_url,
+            "http://127.0.0.1:1/token",
+            root.path(),
+            tokens("stored-access", 3_600_000),
+        )
+        .await;
+        let http = reqwest::Client::new();
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+        for model in [Some("claude-opus-5-5"), None] {
+            let servers = broker.session_servers(dir.path(), Some("s"), model);
+            let [McpServer::Http(entry)] = servers.as_slice() else {
+                panic!("one http entry: {servers:?}");
+            };
+            let ok = http
+                .post(&entry.url)
+                .header("authorization", &entry.headers[0].value)
+                .header(AGENT_MODEL_HEADER, "forged-by-the-agent")
+                .json(&init)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), 200);
+        }
+        assert_eq!(
+            *upstream.models.lock().unwrap(),
+            vec![Some("claude-opus-5-5".to_string()), None]
+        );
+    }
+
     /// One `tools/call` through the broker's entry for `session`.
     async fn call_through(
         broker: &Broker,
@@ -1404,7 +1473,7 @@ mod tests {
         session: &str,
         tool: &str,
     ) -> Value {
-        let servers = broker.session_servers(dir.path(), Some(session));
+        let servers = broker.session_servers(dir.path(), Some(session), None);
         let [McpServer::Http(http)] = servers.as_slice() else {
             panic!("one http entry: {servers:?}");
         };
@@ -1599,7 +1668,7 @@ mod tests {
             .unwrap();
         assert_eq!(refused.status(), 401);
         assert_eq!(source.status().state, StatusState::SignedOut);
-        assert!(broker.session_servers(dir.path(), None).is_empty());
+        assert!(broker.session_servers(dir.path(), None, None).is_empty());
         let after = http
             .post(&url)
             .header("authorization", &bearer)
@@ -2029,7 +2098,7 @@ mod tests {
         let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
         broker.bind().await.unwrap();
         let names: Vec<String> = broker
-            .session_servers(project.path(), None)
+            .session_servers(project.path(), None, None)
             .iter()
             .map(|s| match s {
                 McpServer::Http(h) => h.name.clone(),
@@ -2067,7 +2136,7 @@ mod tests {
         let supplied = helper(scripts.path(), r#"echo '{"token":"box-jwt"}'"#);
         let broker = Broker::new(root.path().to_path_buf(), Some(supplied.clone()));
         broker.bind().await.unwrap();
-        assert_eq!(broker.session_servers(project.path(), None).len(), 1);
+        assert_eq!(broker.session_servers(project.path(), None, None).len(), 1);
         let status =
             crate::mcp_oauth::project_status_json(project.path(), root.path(), Some(&supplied))
                 .await;

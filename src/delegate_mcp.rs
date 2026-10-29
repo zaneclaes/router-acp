@@ -1782,12 +1782,6 @@ async fn run_delegate_task_inner(
         };
         sub_mcp.extend(servers.iter().cloned());
     }
-    // Workers get their own project's signed-in servers through the same
-    // broker as the parent (one sign-in, every agent family).
-    crate::mcp_broker::merge_authoritative(
-        &mut sub_mcp,
-        shared.mcp_broker.session_servers(&cwd, None),
-    );
     let capture = Arc::new(Mutex::new(String::new()));
     // One worker id per delegation, whichever candidate ends up running it:
     // the background job id when there is one, so the parent and the host
@@ -1837,6 +1831,15 @@ async fn run_delegate_task_inner(
         // Host-directed workers get the router's worker tools (identity and
         // structured handoffs), bound to this worker id.
         let mut session_mcp = sub_mcp.clone();
+        // Workers get their own project's signed-in servers through the same
+        // broker as the parent (one sign-in, every agent family), naming this
+        // candidate's model upstream.
+        crate::mcp_broker::merge_authoritative(
+            &mut session_mcp,
+            shared
+                .mcp_broker
+                .session_servers(&cwd, None, Some(&candidate.model)),
+        );
         // This delegate's own token. A planner child keeps one worker id across
         // attempts, so tearing this delegate down revokes this token only, never
         // the token a newer attempt of the same child is still connecting with.
