@@ -95,12 +95,17 @@ pub fn valid_skill_name(name: &str) -> bool {
 }
 
 pub fn repository_skill(cwd: &Path, name: &str) -> Result<Option<ResolvedSkill>, String> {
+    let roots = [".agents/skills", ".claude/skills", ".codex/skills"].map(|root| cwd.join(root));
+    skill_in(&roots, name)
+}
+
+fn skill_in(roots: &[PathBuf], name: &str) -> Result<Option<ResolvedSkill>, String> {
     if !valid_skill_name(name) {
         return Err(format!("invalid planner skill name `{name}`"));
     }
     let mut files = BTreeSet::new();
-    for root in [".agents/skills", ".claude/skills", ".codex/skills"] {
-        let file = cwd.join(root).join(name).join("SKILL.md");
+    for root in roots {
+        let file = root.join(name).join("SKILL.md");
         match std::fs::symlink_metadata(&file) {
             Ok(_) => {
                 files.insert(std::fs::canonicalize(&file).map_err(|e| {
@@ -158,11 +163,16 @@ pub fn resolve(cfg: &PlannerRouterConfig, cwd: &Path) -> Result<ResolvedPlanner,
                 text,
             }
         }
+        Some(path) if Path::new(path).is_absolute() => {
+            let file = std::fs::canonicalize(path).map_err(|e| {
+                format!("cannot resolve host-installed planner profile `{path}`: {e}")
+            })?;
+            read_skill("repository-policy", &file)?
+        }
         Some(path) => {
-            if Path::new(path).is_absolute()
-                || Path::new(path)
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            if Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
             {
                 return Err("planner profile must be a repository-relative path".into());
             }
@@ -179,11 +189,15 @@ pub fn resolve(cfg: &PlannerRouterConfig, cwd: &Path) -> Result<ResolvedPlanner,
     for role in PlannerRole::ALL {
         let mapped = role.mapping(cfg).skill.as_deref();
         let name = mapped.unwrap_or(role.name());
-        let skill = match repository_skill(cwd, name)? {
+        let installed = || match &cfg.skills {
+            Some(root) => skill_in(std::slice::from_ref(root), name),
+            None => Ok(None),
+        };
+        let skill = match repository_skill(cwd, name)?.map_or_else(installed, |s| Ok(Some(s)))? {
             Some(skill) => skill,
             None if mapped.is_some() => {
                 return Err(format!(
-                    "explicit planner mapping {}.skill: `{name}` was not found in the session repository",
+                    "explicit planner mapping {}.skill: `{name}` was not found in the session repository or host-installed skills",
                     role.name()
                 ));
             }
@@ -299,5 +313,48 @@ mod tests {
         assert_ne!(first.identity, resolve(&cfg, tmp.path()).unwrap().identity);
         assert!(first.policy.text.contains("one"));
         assert!(repository_skill(tmp.path(), "../escape").is_err());
+    }
+
+    #[test]
+    fn host_installed_policy_and_skills_serve_a_repository_without_them() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("policy.md"), "Host policy").unwrap();
+        write(host.path(), "skills", "ship-pr", "installed ship");
+        write(host.path(), "skills", "review-work", "installed review");
+        let mut cfg = PlannerRouterConfig {
+            profile: Some(host.path().join("policy.md").display().to_string()),
+            finish_work: PlannerSkillConfig {
+                skill: Some("ship-pr".into()),
+            },
+            ..Default::default()
+        };
+        assert!(
+            resolve(&cfg, repo.path())
+                .unwrap_err()
+                .contains("explicit planner mapping")
+        );
+        cfg.skills = Some(host.path().join("skills"));
+        let resolved = resolve(&cfg, repo.path()).unwrap();
+        assert_eq!(resolved.policy.text, "Host policy");
+        assert_eq!(
+            resolved.roles[&PlannerRole::FinishWork].text,
+            "installed ship"
+        );
+        assert_eq!(
+            resolved.roles[&PlannerRole::ReviewWork].text,
+            "installed review"
+        );
+        assert!(
+            resolved.roles[&PlannerRole::CreatePlan]
+                .source
+                .starts_with("bundled:")
+        );
+        // The session repository's own skill wins over the installed copy.
+        write(repo.path(), ".claude/skills", "ship-pr", "repository ship");
+        assert_eq!(
+            resolve(&cfg, repo.path()).unwrap().roles[&PlannerRole::FinishWork].text,
+            "repository ship"
+        );
     }
 }

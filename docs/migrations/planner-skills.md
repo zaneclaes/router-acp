@@ -49,8 +49,12 @@ routers:
   planner: {}
 ```
 
-`profile` accepts `markdown` or a repository-relative Markdown path.
+`profile` accepts `markdown`, a repository-relative Markdown path, or an absolute host-installed Markdown path.
 The default is `markdown`.
+A host-installed profile serves sessions in every repository, including repositories that do not carry the policy file.
+
+`skills` is an optional absolute host-installed directory of `<name>/SKILL.md` files.
+A role skill the session repository lacks resolves there before the bundled fallback.
 
 Do not copy role mappings into a generic repository unless those exact repository skills exist.
 An explicit mapping is an assertion that the named repository skill is present.
@@ -71,10 +75,11 @@ The resolver applies these steps for every role.
 2. If the YAML role has no mapping, use the exact role name as the lookup name.
 3. Search `.agents/skills/<name>/SKILL.md`, `.claude/skills/<name>/SKILL.md`, and `.codex/skills/<name>/SKILL.md`.
 4. Canonical aliases count as one file. Distinct files with the same name are ambiguous and fail.
-5. If no repository skill exists for the lookup name, use the bundled generic Markdown asset for the role.
+5. If no repository skill exists for the lookup name, search the host-installed `skills/<name>/SKILL.md` when `skills` is set.
+6. If no skill exists in either place, an explicit mapping fails. An unmapped role uses the bundled generic Markdown asset.
 
 Skill names contain only ASCII letters, digits, hyphens, and underscores.
-The explicit profile path is joined to the session repository and canonicalized.
+A relative profile path is joined to the session repository and canonicalized. An absolute profile path is canonicalized as is.
 
 Each resolved skill stores `name`, `source`, `hash`, and full `text`.
 The resolved planner stores `schema`, `identity`, `policy`, all six `roles`, `roadmap`, `host_instructions`, and `workspace`.
@@ -521,7 +526,8 @@ Hickory uses an explicit repository policy file and keeps Linear and ticket bind
 ```yaml
 routers:
   planner:
-    profile: kory-code/profiles/hickory.md
+    profile: <installed release>/profiles/hickory.md
+    skills: <installed release>/skills
     create-plan: { skill: create-plan }
     select-plan: { skill: select-plan }
     implement-work: { skill: implement-work }
@@ -533,6 +539,8 @@ routers:
       args: [kory-code/relay/planner-allocator.mjs]
       timeout_ms: 120000
 ```
+
+The Kory Code relay writes both paths into the installed release, so sessions in other repository pools resolve the same policy and role skills.
 
 The Hickory workspace adapter must allocate pool checkouts only.
 It must return the checkout path and a durable lease.

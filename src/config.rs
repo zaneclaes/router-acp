@@ -1353,10 +1353,17 @@ fn default_hard_planning_candidates() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 pub struct PlannerRouterConfig {
     /// `markdown` uses the bundled repository-neutral workflow. Any other
-    /// value is a repository-relative Markdown policy file, never an inferred
-    /// organization or an implicitly selected ticket service.
+    /// value is a Markdown policy file, never an inferred organization or an
+    /// implicitly selected ticket service: an absolute path is host-installed
+    /// and serves every session repository; a relative path resolves inside
+    /// the session repository.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional absolute host-installed skill root of `<name>/SKILL.md`
+    /// files. A role skill the session repository lacks resolves here before
+    /// the bundled fallback, so explicit mappings work in every repository.
+    #[serde(default)]
+    pub skills: Option<PathBuf>,
     /// Optional repository-relative roadmap path. No path means selection
     /// must resolve the repository's convention before admitting work.
     #[serde(default)]
@@ -1449,6 +1456,7 @@ impl Default for PlannerRouterConfig {
     fn default() -> Self {
         Self {
             profile: None,
+            skills: None,
             roadmap: None,
             create_plan: PlannerSkillConfig::default(),
             select_plan: PlannerSkillConfig::default(),
@@ -2602,6 +2610,17 @@ impl Config {
         {
             return Err(ConfigError(
                 "routers.planner.profile must be markdown or a readable policy path".into(),
+            ));
+        }
+        if self
+            .routers
+            .planner
+            .skills
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute())
+        {
+            return Err(ConfigError(
+                "routers.planner.skills must be an absolute host-installed directory".into(),
             ));
         }
         if self
