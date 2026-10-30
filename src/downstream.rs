@@ -586,17 +586,35 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
     ProbeOutcome::Routeable
 }
 
-/// Selector spellings a catalog `id` may be offered as.
-/// Claude dropped the `[1m]` suffix from natively-1M families (`opus[1m]` → `opus`).
-pub fn selector_aliases(id: &str) -> [String; 2] {
-    let alt = match id.strip_suffix("[1m]") {
-        Some(stripped) => stripped.to_string(),
-        None => format!("{id}[1m]"),
+/// Claude model families the adapter's selector may list by bare family name.
+const CLAUDE_SELECTOR_FAMILIES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+/// Selector spellings a catalog `id` may be offered as, in preference order.
+/// Claude dropped the `[1m]` suffix from natively-1M families (`opus[1m]` → `opus`),
+/// and lists a full id by its family alias (`claude-fable-5-1[1m]` → `fable`).
+/// The alias names no version; the LLM proxy still sends the pin's `api_model`.
+pub fn selector_aliases(id: &str) -> Vec<String> {
+    let base = id.strip_suffix("[1m]").unwrap_or(id);
+    let mut aliases = vec![id.to_string()];
+    let toggled = if base == id {
+        format!("{id}[1m]")
+    } else {
+        base.to_string()
     };
-    [id.to_string(), alt]
+    aliases.push(toggled);
+    if let Some(family) = base.strip_prefix("claude-").and_then(|rest| {
+        CLAUDE_SELECTOR_FAMILIES
+            .into_iter()
+            .find(|family| rest.starts_with(&format!("{family}-")))
+    }) {
+        aliases.push(family.to_string());
+        aliases.push(format!("{family}[1m]"));
+    }
+    aliases
 }
 
-/// First value in `values` that names `wanted` (exact match, then `[1m]` synonym).
+/// First value in `values` that names `wanted` (exact match, then `[1m]` and
+/// family synonyms).
 pub fn offered_selector_value<'a>(values: &'a [String], wanted: &str) -> Option<&'a str> {
     for alias in selector_aliases(wanted) {
         if let Some(v) = values.iter().find(|v| v.as_str() == alias) {
@@ -858,9 +876,33 @@ agents:
             selector_aliases("claude-fable-5-1[1m]"),
             [
                 "claude-fable-5-1[1m]".to_string(),
-                "claude-fable-5-1".to_string()
+                "claude-fable-5-1".to_string(),
+                "fable".to_string(),
+                "fable[1m]".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn full_claude_ids_match_the_selector_family_alias() {
+        // claude-agent-acp 0.99.1 lists Fable as `fable`, like `opus`/`sonnet`.
+        let family = vec!["default".into(), "opus".into(), "fable".into()];
+        assert_eq!(
+            offered_selector_value(&family, "claude-fable-5-1[1m]"),
+            Some("fable")
+        );
+        assert_eq!(
+            selector_value_to_send(&family, "claude-fable-5-1[1m]"),
+            "fable"
+        );
+        let full = vec!["claude-fable-5-1".into(), "fable".into()];
+        assert_eq!(
+            offered_selector_value(&full, "claude-fable-5-1[1m]"),
+            Some("claude-fable-5-1")
+        );
+        assert_eq!(offered_selector_value(&family, "claude-sonnet-5"), None);
+        assert_eq!(offered_selector_value(&family, "claude-fablet-1"), None);
+        assert_eq!(offered_selector_value(&family, "fable-5"), None);
     }
 
     #[test]
