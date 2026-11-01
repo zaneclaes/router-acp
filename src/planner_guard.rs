@@ -755,8 +755,18 @@ pub async fn verify_hold(
 /// integrate-check host first: exit 0 accepts, exit 2 rejects with its
 /// stderr, and anything else is a retryable refusal.
 pub async fn integrate_check(shared: &Shared, sid: &str, operation: &Value) -> Result<(), String> {
+    integrate_reply(shared, sid, operation).await.map(|_| ())
+}
+
+/// Structured data is trusted only when returned by the configured repository
+/// enforcement process, never when supplied in a planner operation's evidence.
+pub(crate) async fn integrate_reply(
+    shared: &Shared,
+    sid: &str,
+    operation: &Value,
+) -> Result<Value, String> {
     let Some(cfg) = shared.cfg.routers.planner.integrate_check.clone() else {
-        return Ok(());
+        return Ok(Value::Null);
     };
     let action = operation
         .get("action")
@@ -782,22 +792,24 @@ pub async fn integrate_check(shared: &Shared, sid: &str, operation: &Value) -> R
     .await
     {
         Ok(out) if out.code == Some(0) => {
-            if matches!(action.as_str(), "finalize" | "release" | "retire")
-                && serde_json::from_slice::<Value>(&out.stdout)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("verified_action")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .as_deref()
-                    != Some(&action)
+            if matches!(
+                action.as_str(),
+                "finalize" | "release" | "retire" | "release-selection-check"
+            ) && serde_json::from_slice::<Value>(&out.stdout)
+                .ok()
+                .and_then(|v| {
+                    v.get("verified_action")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                != Some(&action)
             {
                 return Err(format!(
                     "{action} not recorded: integrate-check host did not explicitly acknowledge this action; update the repository host before using it"
                 ));
             }
-            Ok(())
+            Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
         }
         Ok(out) if out.code == Some(2) => Err(format!(
             "{action} rejected by the integrate-check host: {}",

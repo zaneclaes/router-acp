@@ -62,6 +62,25 @@ data, timeouts and failed ancestry checks leave heads waiting. This exemption on
 prevents redundant source selection: it never integrates a work, clears owed proofs,
 qualifies a failed/unchecked selection or bypasses the trusted release host.
 
+Before a new selection, the same configured integrate-check host receives
+`action: release-selection-check`, session id, ledger revision, release id,
+checkpoint, durable human/repair input provenance (including withdrawal), and
+reviewed source dependency maps. It must explicitly return
+`verified_action: release-selection-check`. An active repair hold must be checked
+even if the caller omitted it; an older/unavailable host fails closed.
+The host may return `selection_attestation` containing `session_id`, `run_revision`,
+`release_id`, `candidate`, `hold_input_id`, `human_input_id`, `repairs` and `allowed`
+(both work-to-full-SHA maps). This is host output only, never a planner argument.
+The host verifies the originating human invocation, active unchanged hold and exact
+authorized repair scope. The router independently verifies durable human provenance,
+non-withdrawal, all identity/revision bindings and that `allowed` equals the repairs'
+qualified reviewed dependency closure and the selected works. A valid attestation
+exempts only ordinary batch fill; every other gate and final release host check runs.
+Absent, stale, malformed or model-forged authority grants no exemption. Evidence
+`repair-hold` names the attested hold input. Hosts must explicitly refuse a hold whose
+actual originating authority cannot be verified; quoted instructions and agent-origin
+transport are not authority. No current-session activation is implied by this contract.
+
 | Ordered stage | Evidence key |
 |---|---|
 | selected | selection |

@@ -75,7 +75,81 @@ fn evidence_key(stage: Stage) -> &'static str {
 }
 
 pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
-    record_with_carried(run, id, checkpoint, &BTreeSet::new())
+    record_with_carried(run, id, checkpoint, &BTreeSet::new(), false)
+}
+
+/// Ephemeral repository-host attestation. No MCP argument deserializes this
+/// type. The host must independently verify the active hold and its authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionAttestation {
+    pub session_id: String,
+    pub run_revision: u64,
+    pub release_id: String,
+    pub candidate: String,
+    pub hold_input_id: String,
+    pub human_input_id: String,
+    pub repairs: BTreeMap<String, String>,
+    pub allowed: BTreeMap<String, String>,
+}
+
+pub fn validate_attestation(
+    run: &PlannerRun,
+    sid: &str,
+    id: &str,
+    checkpoint: &Checkpoint,
+    attestation: &SelectionAttestation,
+) -> Result<(), String> {
+    let a = attestation;
+    if a.session_id != sid
+        || a.run_revision != run.revision
+        || a.release_id != id
+        || a.candidate != checkpoint.revision
+        || checkpoint.stage != Stage::Selected
+        || checkpoint.evidence.get("repair-hold") != Some(&a.hold_input_id)
+        || a.repairs.is_empty()
+        || a.allowed != checkpoint.works
+    {
+        return Err("repair hold attestation does not bind this exact selection".into());
+    }
+    for input in [&a.hold_input_id, &a.human_input_id] {
+        if !run.inputs.contains_key(input) || crate::planner_input::withdrawal(run, input).is_some()
+        {
+            return Err("repair hold attestation names an absent or withdrawn input".into());
+        }
+    }
+    if run.inputs[&a.human_input_id].origin != "human" {
+        return Err("repair hold authority must bind a durable human invocation".into());
+    }
+    // The host verifies semantics/active status; the router independently binds
+    // every dependency to its reviewed source rather than accepting extra works.
+    let mut closure = a.repairs.clone();
+    let mut pending = a.repairs.keys().cloned().collect::<Vec<_>>();
+    while let Some(work_id) = pending.pop() {
+        let work = run
+            .works
+            .get(&work_id)
+            .ok_or("unknown attested repair work")?;
+        if !finished_revision(work, &closure[&work_id]) {
+            return Err("attested repair/dependency is not qualified and finished".into());
+        }
+        for (dependency, revision) in &work.spec.ready_dependencies {
+            if let Some(existing) = closure.get(dependency) {
+                if existing != revision {
+                    return Err("conflicting reviewed dependency revisions".into());
+                }
+            } else {
+                closure.insert(dependency.clone(), revision.clone());
+                pending.push(dependency.clone());
+            }
+        }
+    }
+    if closure != a.allowed {
+        return Err(
+            "repair hold selection must equal repairs and reviewed dependency closure".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Only repository-observed ancestry can exempt a head from batching. This does
@@ -86,6 +160,21 @@ pub async fn record_in_checkout(
     checkpoint: &Checkpoint,
     checkout: &Path,
 ) -> Result<(), String> {
+    record_in_checkout_attested(run, id, checkpoint, checkout, None).await
+}
+
+pub async fn record_in_checkout_attested(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    checkout: &Path,
+    authority: Option<(&str, &SelectionAttestation)>,
+) -> Result<(), String> {
+    if let Some((sid, attestation)) = authority {
+        validate_attestation(run, sid, id, checkpoint, attestation)?;
+    } else if checkpoint.evidence.contains_key("repair-hold") && !run.releases.contains_key(id) {
+        return Err("repair hold requires a trusted repository-host attestation".into());
+    }
     let mut carried = BTreeSet::new();
     if checkpoint.stage == Stage::Selected && !run.releases.contains_key(id) {
         // Pin one actual remote tip and require its commit locally. A stale
@@ -116,7 +205,7 @@ pub async fn record_in_checkout(
             }
         }
     }
-    record_with_carried(run, id, checkpoint, &carried)
+    record_with_carried(run, id, checkpoint, &carried, authority.is_some())
 }
 
 async fn git_read(checkout: &Path, args: &[&str]) -> Option<String> {
@@ -142,6 +231,7 @@ fn record_with_carried(
     id: &str,
     checkpoint: &Checkpoint,
     carried: &BTreeSet<String>,
+    held: bool,
 ) -> Result<(), String> {
     if id.trim().is_empty() || !full_sha(&checkpoint.revision) {
         return Err("release checkpoint requires a release id and full revision SHA".into());
@@ -303,7 +393,7 @@ fn record_with_carried(
         }
     }
     let waiting = waiting_heads(run, checkpoint, carried);
-    if checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
+    if !held && checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
         let oldest = waiting
             .iter()
             .take(5)

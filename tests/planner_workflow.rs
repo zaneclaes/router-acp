@@ -4969,6 +4969,122 @@ async fn release_batching_excludes_only_verified_staging_ancestors() {
             .unwrap_err()
             .contains("under-batches")
     );
+    // A repository-host attestation can isolate a repair even with uncarried
+    // ready heads. It cannot qualify work or discharge release proof.
+    use router_acp::planner_release::{SelectionAttestation, record_in_checkout_attested};
+    let mut held = selected.clone();
+    held.evidence
+        .insert("repair-hold".into(), "repair-hold:fixture:date".into());
+    let input = planner_workflow::InputReceipt {
+        origin: "human".into(),
+        replayed_from: None,
+        text: "explicit repair scope".into(),
+        attachments: vec![],
+        owner: None,
+        acknowledged: true,
+        delivered_to: Default::default(),
+    };
+    run.inputs.insert("human".into(), input.clone());
+    run.inputs.insert(
+        "repair-hold:fixture:date".into(),
+        planner_workflow::InputReceipt {
+            origin: "agent".into(),
+            ..input
+        },
+    );
+    let authority = SelectionAttestation {
+        session_id: SID.into(),
+        run_revision: run.revision,
+        release_id: "held".into(),
+        candidate: revision.clone(),
+        hold_input_id: "repair-hold:fixture:date".into(),
+        human_input_id: "human".into(),
+        repairs: held.works.clone(),
+        allowed: held.works.clone(),
+    };
+    record_in_checkout_attested(
+        &mut run.clone(),
+        "held",
+        &held,
+        &f.repo,
+        Some((SID, &authority)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        record_in_checkout(&mut run.clone(), "held", &held, &f.repo)
+            .await
+            .is_err()
+    );
+    for control in [
+        "stale",
+        "session",
+        "candidate",
+        "hold",
+        "human",
+        "scope",
+        "unchecked",
+        "unaccepted",
+        "unended",
+        "dependency",
+        "forged-origin",
+    ] {
+        let mut invalid = run.clone();
+        let mut forged = authority.clone();
+        match control {
+            "stale" => forged.run_revision += 1,
+            "session" => forged.session_id = "other".into(),
+            "candidate" => forged.candidate = "e".repeat(40),
+            "hold" => forged.hold_input_id = "absent".into(),
+            "human" => forged.human_input_id = "absent".into(),
+            "scope" => {
+                forged.allowed.insert("historical".into(), revision.clone());
+            }
+            "unchecked" => invalid
+                .works
+                .get_mut("work-1")
+                .unwrap()
+                .spec
+                .required_checks
+                .push("missing".into()),
+            "unaccepted" => {
+                invalid
+                    .works
+                    .get_mut("work-1")
+                    .unwrap()
+                    .review
+                    .as_mut()
+                    .unwrap()
+                    .accepted = false
+            }
+            "unended" => {
+                invalid
+                    .works
+                    .get_mut("work-1")
+                    .unwrap()
+                    .attempt
+                    .as_mut()
+                    .unwrap()
+                    .ended = false
+            }
+            "dependency" => {
+                invalid
+                    .works
+                    .get_mut("work-1")
+                    .unwrap()
+                    .spec
+                    .ready_dependencies
+                    .insert("historical".into(), revision.clone());
+            }
+            _ => invalid.inputs.get_mut("human").unwrap().origin = "agent".into(),
+        }
+        assert!(
+            record_in_checkout_attested(&mut invalid, "held", &held, &f.repo, Some((SID, &forged)))
+                .await
+                .is_err(),
+            "{control}"
+        );
+    }
     git(
         &f.repo,
         &["push", "origin", &format!("{revision}:refs/heads/staging")],
@@ -5041,6 +5157,107 @@ async fn release_batching_excludes_only_verified_staging_ancestors() {
             "{control}"
         );
     }
+}
+
+#[tokio::test]
+async fn release_attestation_is_taken_only_from_the_configured_host() {
+    use router_acp::planner_release::{Checkpoint, SelectionAttestation, Stage};
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(),
+            "read -r request; case \"$request\" in *release-selection-check*) cat \"$1\";; *) echo '{\"verified_action\":\"release\"}';; esac".into(),
+            "fixture".into(), reply.display().to_string()], timeout_ms: 5000,
+    })
+    });
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .insert("waiting".into(), run.works["work-1"].clone());
+        run.inputs.insert(
+            "human".into(),
+            planner_workflow::InputReceipt {
+                origin: "human".into(),
+                replayed_from: None,
+                text: "repair scope".into(),
+                attachments: vec![],
+                owner: None,
+                acknowledged: true,
+                delivered_to: Default::default(),
+            },
+        );
+        let mut hold = run.inputs["human"].clone();
+        hold.origin = "agent".into();
+        run.inputs.insert("repair-hold:fixture:date".into(), hold);
+        Ok(())
+    })
+    .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let checkpoint = Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: BTreeMap::from([("work-1".into(), revision.clone())]),
+        replaces: None,
+        evidence: BTreeMap::from([
+            ("selection".into(), "round.md".into()),
+            ("repair-hold".into(), "repair-hold:fixture:date".into()),
+            (
+                "selection_attestation".into(),
+                "forged model evidence".into(),
+            ),
+        ]),
+    };
+    let authority = SelectionAttestation {
+        session_id: SID.into(),
+        run_revision: run.revision,
+        release_id: "held".into(),
+        candidate: revision,
+        hold_input_id: "repair-hold:fixture:date".into(),
+        human_input_id: "human".into(),
+        repairs: checkpoint.works.clone(),
+        allowed: checkpoint.works.clone(),
+    };
+    let select = || {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Release {
+                key: "selection".into(),
+                release_id: "held".into(),
+                checkpoint: checkpoint.clone(),
+            },
+        )
+    };
+    for invalid in [
+        json!({}),
+        json!({"verified_action":"release-selection-check"}),
+        json!({"verified_action":"release-selection-check", "selection_attestation":{"forged":true}}),
+    ] {
+        std::fs::write(&reply, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(select().await.is_err());
+        assert!(
+            planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .releases
+                .is_empty()
+        );
+    }
+    std::fs::write(
+        &reply,
+        serde_json::to_vec(&json!({"verified_action":"release-selection-check",
+        "selection_attestation":authority}))
+        .unwrap(),
+    )
+    .unwrap();
+    select().await.unwrap();
+    let saved = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(saved.releases["held"].stage(), Stage::Selected);
+    assert!(saved.works["work-1"].integration.is_none());
+    select().await.unwrap(); // identical operation replay needs no new authority
 }
 
 // Staging 2026-10-21: six corrective rounds in a row each carried one repair
@@ -5178,6 +5395,17 @@ async fn parent_finalization_is_host_verified_and_release_proofs_remain_required
             .contains("explicitly acknowledge")
     );
     std::fs::write(&verdict, "ok").unwrap();
+    // A generic legacy action acknowledgment cannot mint selection authority.
+    assert!(
+        router_acp::planner_guard::integrate_check(
+            &f.shared,
+            SID,
+            &json!({"action":"release-selection-check"})
+        )
+        .await
+        .unwrap_err()
+        .contains("explicitly acknowledge")
+    );
     finalize().await.unwrap();
     planner_workflow::operate(
         &f.shared,
