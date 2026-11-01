@@ -14,6 +14,7 @@ pub mod credentials;
 pub mod delegate_hook;
 pub mod delegate_mcp;
 pub mod downstream;
+pub mod external_message;
 pub mod headless;
 pub mod headroom;
 pub mod lifecycle;

@@ -433,6 +433,10 @@ pub struct Wake {
     pub claim_pid: u32,
     #[serde(default)]
     pub claim_started_at_ms: u64,
+    /// An external message's body was already shown to the operator
+    /// (`external_message::announce`); later deliveries repeat the headline.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announced: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2040,7 +2044,64 @@ async fn operate_once(
             if shared.cfg.routers.planner.integrate_check.is_none() {
                 return Err("release checkpoints require a trusted integrate-check host".into());
             }
-            crate::planner_release::record(&mut run, &release_id, &checkpoint)?;
+            let cwd = shared
+                .with_session(sid, |session| session.cwd.clone())
+                .ok_or("unknown planner session")?;
+            let attestation = if checkpoint.stage == crate::planner_release::Stage::Selected
+                && !run.releases.contains_key(&release_id)
+            {
+                // Construct the authority request from durable state, not caller
+                // fields. The host must fail closed on an active unbound hold.
+                let inputs = run
+                    .inputs
+                    .iter()
+                    .filter(|(id, input)| id.starts_with("repair-") || input.origin == "human")
+                    .map(|(id, input)| {
+                        (
+                            id,
+                            json!({"origin":input.origin,"text":input.text,
+                        "withdrawn":crate::planner_input::withdrawal(&run, id).is_some()}),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let reply = crate::planner_guard::integrate_reply(
+                    shared,
+                    sid,
+                    &json!({
+                        "action":"release-selection-check", "session_id":sid,
+                        "run_revision":run.revision, "release_id":release_id,
+                        "checkpoint":checkpoint, "inputs":inputs,
+                        "execution_context":execution_context(&run),
+                        "admitted_plans":run.works.iter().filter_map(|(id, work)|
+                            work.spec.external_id.as_ref().map(|plan| (id, plan))).collect::<BTreeMap<_, _>>(),
+                        "artifact_revisions":run.works.iter().filter_map(|(id, work)|
+                            work.artifact.as_ref().map(|artifact| (id, &artifact.revision))).collect::<BTreeMap<_, _>>(),
+                        "source_dependencies":run.works.iter().map(|(id, work)|
+                            (id, &work.spec.ready_dependencies)).collect::<BTreeMap<_, _>>()
+                    }),
+                )
+                .await?;
+                reply
+                    .get("selection_attestation")
+                    .filter(|v| !v.is_null())
+                    .map(|v| {
+                        serde_json::from_value::<crate::planner_release::SelectionAttestation>(
+                            v.clone(),
+                        )
+                        .map_err(|e| format!("invalid host selection attestation: {e}"))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            crate::planner_release::record_in_checkout_attested(
+                &mut run,
+                &release_id,
+                &checkpoint,
+                &cwd,
+                attestation.as_ref().map(|a| (sid, a)),
+            )
+            .await?;
             let mut check = value.clone();
             check["release_record"] =
                 serde_json::to_value(&run.releases[&release_id]).map_err(|e| e.to_string())?;
@@ -2795,6 +2856,7 @@ pub fn attempt_ended(
             retry_after: 0,
             claim_pid: 0,
             claim_started_at_ms: 0,
+            announced: false,
         });
         if new_completion {
             wake.reason = format!("child state: {:?}", work.status);

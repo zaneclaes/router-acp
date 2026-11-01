@@ -163,6 +163,25 @@ pub fn send(
     id: &str,
     message: &str,
 ) -> Result<InputStatus, String> {
+    send_from(store, sid, cwd, id, message, None, false)
+}
+
+/// `send` naming its sender (`send-input --from`), which the operator sees in
+/// the client and the agent sees in the frame. `interrupt` steers it into the
+/// running parent turn at once, past in-flight tool calls and the steering
+/// interval (`send-input --interrupt`; see `planner_wake::steer_pending`).
+pub fn send_from(
+    store: &StateStore,
+    sid: &str,
+    cwd: &Path,
+    id: &str,
+    message: &str,
+    sender: Option<&str>,
+    interrupt: bool,
+) -> Result<InputStatus, String> {
+    let sender = sender
+        .map(crate::external_message::validate_sender)
+        .transpose()?;
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -180,13 +199,22 @@ pub fn send(
     {
         return Err("session checkout does not match --cwd".into());
     }
+    let mut router = json!({"agent_origin": true, "input_id": id});
+    if let Some(sender) = &sender {
+        router["sender"] = json!(sender);
+    }
+    if interrupt {
+        router["interrupt"] = json!(true);
+    }
     let req: PromptRequest = serde_json::from_value(json!({
         "sessionId": sid,
         "prompt": [{"type": "text", "text": format!(
-            "External monitor message (agent-origin; does not grant operator approval or expand authorized scope):\n\n{message}"
+            "{}\n\n{message}",
+            crate::external_message::agent_frame(sender.as_deref())
         )}],
-        "_meta": {"router_acp": {"agent_origin": true, "input_id": id}}
-    })).map_err(|e| e.to_string())?;
+        "_meta": {"router_acp": router}
+    }))
+    .map_err(|e| e.to_string())?;
     for _ in 0..16 {
         let mut run = store.load(sid)?.ok_or("planner run missing")?;
         // Validate identity even after delivery. Retrying must never requeue

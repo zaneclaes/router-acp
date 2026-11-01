@@ -4946,6 +4946,340 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     );
 }
 
+// Historical finished heads already on staging must not crowd out new source.
+#[tokio::test]
+async fn release_batching_excludes_only_verified_staging_ancestors() {
+    use router_acp::planner_release::{Checkpoint, Stage, record_in_checkout};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let historical = run.works["work-1"].clone();
+    run.works.insert("historical".into(), historical.clone());
+    let selected = Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: BTreeMap::from([("work-1".into(), revision.clone())]),
+        replaces: None,
+        evidence: BTreeMap::from([("selection".into(), "round.md".into())]),
+    };
+    // A missing remote branch is unknown, even if both heads equal HEAD.
+    assert!(
+        record_in_checkout(&mut run.clone(), "round", &selected, &f.repo)
+            .await
+            .unwrap_err()
+            .contains("under-batches")
+    );
+    // A repository-host attestation can isolate a repair even with uncarried
+    // ready heads. It cannot qualify work or discharge release proof.
+    use router_acp::planner_release::{SelectionAttestation, record_in_checkout_attested};
+    let mut held = selected.clone();
+    held.evidence
+        .insert("repair-authority".into(), "human".into());
+    held.evidence
+        .insert("repair-hold".into(), "repair-hold:fixture:date".into());
+    let input = planner_workflow::InputReceipt {
+        origin: "human".into(),
+        replayed_from: None,
+        text: "explicit repair scope".into(),
+        attachments: vec![],
+        owner: None,
+        acknowledged: true,
+        delivered_to: Default::default(),
+    };
+    run.inputs.insert("human".into(), input.clone());
+    run.inputs.insert(
+        "repair-hold:fixture:date".into(),
+        planner_workflow::InputReceipt {
+            origin: "agent".into(),
+            ..input
+        },
+    );
+    let authority = SelectionAttestation {
+        session_id: SID.into(),
+        run_revision: run.revision,
+        release_id: "held".into(),
+        candidate: revision.clone(),
+        hold_input_id: "repair-hold:fixture:date".into(),
+        human_input_id: "human".into(),
+        repairs: held.works.clone(),
+        allowed: held.works.clone(),
+    };
+    record_in_checkout_attested(
+        &mut run.clone(),
+        "held",
+        &held,
+        &f.repo,
+        Some((SID, &authority)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        record_in_checkout(&mut run.clone(), "held", &held, &f.repo)
+            .await
+            .is_err()
+    );
+    for control in [
+        "stale",
+        "session",
+        "candidate",
+        "hold",
+        "human",
+        "scope",
+        "unchecked",
+        "unaccepted",
+        "unended",
+        "dependency",
+        "forged-origin",
+    ] {
+        let mut invalid = run.clone();
+        let mut forged = authority.clone();
+        match control {
+            "stale" => forged.run_revision += 1,
+            "session" => forged.session_id = "other".into(),
+            "candidate" => forged.candidate = "e".repeat(40),
+            "hold" => forged.hold_input_id = "absent".into(),
+            "human" => forged.human_input_id = "absent".into(),
+            "scope" => {
+                forged.allowed.insert("historical".into(), revision.clone());
+            }
+            "unchecked" => invalid
+                .works
+                .get_mut("work-1")
+                .unwrap()
+                .spec
+                .required_checks
+                .push("missing".into()),
+            "unaccepted" => {
+                invalid
+                    .works
+                    .get_mut("work-1")
+                    .unwrap()
+                    .review
+                    .as_mut()
+                    .unwrap()
+                    .accepted = false
+            }
+            "unended" => {
+                invalid
+                    .works
+                    .get_mut("work-1")
+                    .unwrap()
+                    .attempt
+                    .as_mut()
+                    .unwrap()
+                    .ended = false
+            }
+            "dependency" => {
+                invalid
+                    .works
+                    .get_mut("work-1")
+                    .unwrap()
+                    .spec
+                    .ready_dependencies
+                    .insert("historical".into(), revision.clone());
+            }
+            _ => invalid.inputs.get_mut("human").unwrap().origin = "agent".into(),
+        }
+        assert!(
+            record_in_checkout_attested(&mut invalid, "held", &held, &f.repo, Some((SID, &forged)))
+                .await
+                .is_err(),
+            "{control}"
+        );
+    }
+    git(
+        &f.repo,
+        &["push", "origin", &format!("{revision}:refs/heads/staging")],
+    );
+    record_in_checkout(&mut run, "round", &selected, &f.repo)
+        .await
+        .unwrap();
+    assert_eq!(run.works["historical"].status, historical.status);
+    assert!(run.works["historical"].integration.is_none());
+    assert_eq!(run.works["historical"].artifact, historical.artifact);
+    run.releases.clear();
+
+    // A genuinely uncarried descendant still demands a place in the batch.
+    git(&f.repo, &["commit", "--allow-empty", "-m", "uncarried"]);
+    let uncarried = git(&f.repo, &["rev-parse", "HEAD"]);
+    for candidate in [&uncarried, &"f".repeat(40)] {
+        let work = run.works.get_mut("historical").unwrap();
+        work.artifact.as_mut().unwrap().revision = candidate.clone();
+        work.review.as_mut().unwrap().revision = candidate.clone();
+        work.finish.as_mut().unwrap().revision = candidate.clone();
+        assert!(
+            record_in_checkout(&mut run.clone(), "round", &selected, &f.repo)
+                .await
+                .unwrap_err()
+                .contains("historical")
+        );
+    }
+    run.works.insert("historical".into(), historical);
+    git(
+        &f.repo,
+        &["push", "origin", &format!("{uncarried}:refs/heads/staging")],
+    );
+    record_in_checkout(&mut run.clone(), "descendant", &selected, &f.repo)
+        .await
+        .unwrap();
+    // A stale tracking ref is not remote custody after the branch disappears.
+    git(&f.repo, &["push", "origin", ":refs/heads/staging"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/staging", &revision],
+    );
+    assert!(
+        record_in_checkout(&mut run.clone(), "round", &selected, &f.repo)
+            .await
+            .unwrap_err()
+            .contains("under-batches")
+    );
+    git(
+        &f.repo,
+        &["push", "origin", &format!("{revision}:refs/heads/staging")],
+    );
+    // Ancestry never qualifies an unchecked or failed selected artifact.
+    for control in ["unaccepted", "unchecked", "unresolved"] {
+        let mut invalid = run.clone();
+        let work = invalid.works.get_mut("work-1").unwrap();
+        match control {
+            "unaccepted" => work.review.as_mut().unwrap().accepted = false,
+            "unchecked" => work.spec.required_checks.push("missing-gate".into()),
+            _ => work
+                .artifact
+                .as_mut()
+                .unwrap()
+                .unresolved
+                .push("failed-gate".into()),
+        }
+        assert!(
+            record_in_checkout(&mut invalid, "round", &selected, &f.repo)
+                .await
+                .is_err(),
+            "{control}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn release_attestation_is_taken_only_from_the_configured_host() {
+    use router_acp::planner_release::{Checkpoint, SelectionAttestation, Stage};
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let request_file = tmp.path().join("request");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(),
+            "read -r request; case \"$request\" in *release-selection-check*) printf '%s\\n' \"$request\" > \"$2\"; cat \"$1\";; *) echo '{\"verified_action\":\"release\"}';; esac".into(),
+            "fixture".into(), reply.display().to_string(), request_file.display().to_string()], timeout_ms: 5000,
+    })
+    });
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works
+            .insert("waiting".into(), run.works["work-1"].clone());
+        run.inputs.insert(
+            "human".into(),
+            planner_workflow::InputReceipt {
+                origin: "human".into(),
+                replayed_from: None,
+                text: "/implement Docs/Plans/REPAIR.md".into(),
+                attachments: vec![],
+                owner: None,
+                acknowledged: true,
+                delivered_to: Default::default(),
+            },
+        );
+        let mut hold = run.inputs["human"].clone();
+        hold.origin = "agent".into();
+        run.execution_input_id = Some("human".into());
+        run.commands.insert("human".into());
+        run.works.get_mut("work-1").unwrap().spec.external_id = Some("Docs/Plans/REPAIR.md".into());
+        run.inputs.insert("repair-hold:fixture:date".into(), hold);
+        Ok(())
+    })
+    .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let checkpoint = Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: BTreeMap::from([("work-1".into(), revision.clone())]),
+        replaces: None,
+        evidence: BTreeMap::from([
+            ("selection".into(), "round.md".into()),
+            ("repair-authority".into(), "human".into()),
+            ("repair-hold".into(), "repair-hold:fixture:date".into()),
+            (
+                "selection_attestation".into(),
+                "forged model evidence".into(),
+            ),
+        ]),
+    };
+    let authority = SelectionAttestation {
+        session_id: SID.into(),
+        run_revision: run.revision,
+        release_id: "held".into(),
+        candidate: revision,
+        hold_input_id: "repair-hold:fixture:date".into(),
+        human_input_id: "human".into(),
+        repairs: checkpoint.works.clone(),
+        allowed: checkpoint.works.clone(),
+    };
+    let select = || {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Release {
+                key: "selection".into(),
+                release_id: "held".into(),
+                checkpoint: checkpoint.clone(),
+            },
+        )
+    };
+    for invalid in [
+        json!({}),
+        json!({"verified_action":"release-selection-check"}),
+        json!({"verified_action":"release-selection-check", "selection_attestation":{"forged":true}}),
+    ] {
+        std::fs::write(&reply, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(select().await.is_err());
+        assert!(
+            planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .releases
+                .is_empty()
+        );
+    }
+    std::fs::write(
+        &reply,
+        serde_json::to_vec(&json!({"verified_action":"release-selection-check",
+        "selection_attestation":authority}))
+        .unwrap(),
+    )
+    .unwrap();
+    select().await.unwrap();
+    let sent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&request_file).unwrap()).unwrap();
+    assert_eq!(sent["execution_context"]["input_id"], "human");
+    assert_eq!(sent["execution_context"]["command"], "implement");
+    assert_eq!(
+        sent["execution_context"]["arguments"],
+        "Docs/Plans/REPAIR.md"
+    );
+    assert_eq!(sent["admitted_plans"]["work-1"], "Docs/Plans/REPAIR.md");
+    assert_eq!(
+        sent["artifact_revisions"]["work-1"],
+        checkpoint.works["work-1"]
+    );
+    let saved = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(saved.releases["held"].stage(), Stage::Selected);
+    assert!(saved.works["work-1"].integration.is_none());
+    select().await.unwrap(); // identical operation replay needs no new authority
+}
+
 // Staging 2026-10-21: six corrective rounds in a row each carried one repair
 // while 50 accepted heads waited, so the "clean round after a corrective"
 // never came and nothing reached production.
@@ -5081,6 +5415,17 @@ async fn parent_finalization_is_host_verified_and_release_proofs_remain_required
             .contains("explicitly acknowledge")
     );
     std::fs::write(&verdict, "ok").unwrap();
+    // A generic legacy action acknowledgment cannot mint selection authority.
+    assert!(
+        router_acp::planner_guard::integrate_check(
+            &f.shared,
+            SID,
+            &json!({"action":"release-selection-check"})
+        )
+        .await
+        .unwrap_err()
+        .contains("explicitly acknowledge")
+    );
     finalize().await.unwrap();
     planner_workflow::operate(
         &f.shared,
