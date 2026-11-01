@@ -4974,6 +4974,8 @@ async fn release_batching_excludes_only_verified_staging_ancestors() {
     use router_acp::planner_release::{SelectionAttestation, record_in_checkout_attested};
     let mut held = selected.clone();
     held.evidence
+        .insert("repair-authority".into(), "human".into());
+    held.evidence
         .insert("repair-hold".into(), "repair-hold:fixture:date".into());
     let input = planner_workflow::InputReceipt {
         origin: "human".into(),
@@ -5202,6 +5204,7 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
         replaces: None,
         evidence: BTreeMap::from([
             ("selection".into(), "round.md".into()),
+            ("repair-authority".into(), "human".into()),
             ("repair-hold".into(), "repair-hold:fixture:date".into()),
             (
                 "selection_attestation".into(),

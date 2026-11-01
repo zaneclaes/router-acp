@@ -107,6 +107,7 @@ pub fn validate_attestation(
         || a.candidate != checkpoint.revision
         || checkpoint.stage != Stage::Selected
         || checkpoint.evidence.get("repair-hold") != Some(&a.hold_input_id)
+        || checkpoint.evidence.get("repair-authority") != Some(&a.human_input_id)
         || a.repairs.is_empty()
         || a.allowed != checkpoint.works
     {
