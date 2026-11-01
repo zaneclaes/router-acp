@@ -164,6 +164,55 @@ pub fn set_reserve(
         )
         .map_err(invalid)
     })
+    .map(|mut shown| {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(shadow) = reserve_shadowed_here(path, account, &cwd) {
+            shown["shadowedBy"] = shadow;
+        }
+        shown
+    })
+}
+
+/// The project overlay a router started in `cwd` reads, when it is not
+/// `path` and sets `account`'s reserve itself. An edit to `path` (normally the
+/// user layer) then changes nothing such a router sees: on 2026-11-01 an
+/// operator lowered reserves in `~/.config/router-acp/router.yaml` while
+/// `.router-acp/router.yaml` kept every seat cordoned, and the planner stayed
+/// unroutable. `None` when no overlay applies or it leaves the reserve alone.
+pub fn reserve_shadowed_here(path: &Path, account: &str, cwd: &Path) -> Option<Value> {
+    let overlay = crate::project_config::select(None, cwd).ok()?;
+    if !crate::project_config::is_project(&overlay) {
+        return None;
+    }
+    reserve_shadow(path, account, &overlay)
+}
+
+/// `overlay`'s own reserve for `account`, with the overlay path, when the
+/// overlay is a different file from `path` and sets that reserve.
+pub fn reserve_shadow(path: &Path, account: &str, overlay: &Path) -> Option<Value> {
+    let same = path == overlay
+        || path
+            .canonicalize()
+            .ok()
+            .zip(overlay.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b);
+    if same {
+        return None;
+    }
+    let raw = read(overlay).ok()??;
+    let doc: Value = serde_yaml::from_str(&raw).ok()?;
+    let reserve = doc
+        .get("agents")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(account))?
+        .get("reserve_capacity")
+        .filter(|reserve| reserve.as_object().is_some_and(|r| !r.is_empty()))?
+        .clone();
+    Some(serde_json::json!({
+        "path": overlay.display().to_string(),
+        "reserveCapacity": reserve,
+    }))
 }
 
 /// Order one provider's accounts, first drained first. `accounts` must name
@@ -323,6 +372,25 @@ mod tests {
 
     fn doc(path: &Path) -> Value {
         show(path).unwrap()["config"].clone()
+    }
+
+    #[test]
+    fn a_reserve_edit_reports_the_overlay_that_keeps_its_own_value() {
+        let (dir, user) = fixture(&agent("claude@a", ""));
+        let overlay = dir.path().join("project/.router-acp/router.yaml");
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(
+            &overlay,
+            "agents:\n  - name: claude@a\n    reserve_capacity: {weekly: 10.0, session: 10.0}\n  - name: claude@b\n",
+        )
+        .unwrap();
+        let shadow = reserve_shadow(&user, "claude@a", &overlay).expect("overlay keeps its own");
+        assert_eq!(shadow["reserveCapacity"]["weekly"], 10.0);
+        assert_eq!(shadow["path"], overlay.display().to_string());
+        // The same file, an account the overlay leaves alone, or no overlay: no warning.
+        assert!(reserve_shadow(&overlay, "claude@a", &overlay).is_none());
+        assert!(reserve_shadow(&user, "claude@b", &overlay).is_none());
+        assert!(reserve_shadow(&user, "claude@a", &dir.path().join("absent.yaml")).is_none());
     }
 
     #[test]
