@@ -55,6 +55,41 @@ Parent `release {key, release_id, checkpoint}` records stage, full revision and 
 Selection also contains nonempty works (work IDs → finished accepted SHAs); a repair
 selection may name replaces (an unreplaced failed release). Later stages omit those fields.
 
+Batching excludes finished revisions already contained in the repository's actual
+`origin` staging branch. Selection reads its remote tip once and verifies ancestry
+using local Git objects; it neither fetches nor writes refs. Missing remote/object
+data, timeouts and failed ancestry checks leave heads waiting. This exemption only
+prevents redundant source selection: it never integrates a work, clears owed proofs,
+qualifies a failed/unchecked selection or bypasses the trusted release host.
+
+Before a new selection, the same configured integrate-check host receives
+`action: release-selection-check`, session id, ledger revision, release id,
+checkpoint, durable human/repair input provenance (including withdrawal), and
+reviewed source dependency maps, admitted plan paths, artifact revisions and the
+existing verified `execution_context`. The latter is derived from the original
+human implementation command and durable command ledger, never caller evidence.
+It must explicitly return
+`verified_action: release-selection-check`. An active repair hold must be checked
+even if the caller omitted it; an older/unavailable host fails closed.
+The host may return `selection_attestation` containing `session_id`, `run_revision`,
+`release_id`, `candidate`, `hold_input_id`, `human_input_id`, `repairs` and `allowed`
+(both work-to-full-SHA maps). This is host output only, never a planner argument.
+The host verifies the originating human invocation, active unchanged hold and exact
+authorized repair scope. The router independently verifies durable human provenance,
+non-withdrawal, all identity/revision bindings and that `allowed` equals the repairs'
+qualified reviewed dependency closure and the selected works. A valid attestation
+exempts only ordinary batch fill; every other gate and final release host check runs.
+Absent, stale, malformed or model-forged authority grants no exemption. Evidence
+`repair-hold` names the attested hold input. Hosts must explicitly refuse a hold whose
+actual originating authority cannot be verified; quoted instructions and agent-origin
+transport are not authority. No current-session activation is implied by this contract.
+Repository enforcement policy may use the already admitted human implementation
+scope to restrict selection to a hold's owning guide and reviewed dependencies;
+this does not require a new human command naming exact revisions. The host must
+refuse absent execution provenance, out-of-scope or unadmitted work and mismatched
+revisions. Repeated receipts for the same unchanged hold are one restriction, not
+independent authorizations. Such policy cannot admit work or waive qualification.
+
 | Ordered stage | Evidence key |
 |---|---|
 | selected | selection |

@@ -2,7 +2,8 @@
 //! deployment authority; these records prevent a restart from losing the
 //! frozen candidate, outstanding evidence, or disposition step.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,6 +75,165 @@ fn evidence_key(stage: Stage) -> &'static str {
 }
 
 pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
+    record_with_carried(run, id, checkpoint, &BTreeSet::new(), false)
+}
+
+/// Ephemeral repository-host attestation. No MCP argument deserializes this
+/// type. The host must independently verify the active hold and its authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionAttestation {
+    pub session_id: String,
+    pub run_revision: u64,
+    pub release_id: String,
+    pub candidate: String,
+    pub hold_input_id: String,
+    pub human_input_id: String,
+    pub repairs: BTreeMap<String, String>,
+    pub allowed: BTreeMap<String, String>,
+}
+
+pub fn validate_attestation(
+    run: &PlannerRun,
+    sid: &str,
+    id: &str,
+    checkpoint: &Checkpoint,
+    attestation: &SelectionAttestation,
+) -> Result<(), String> {
+    let a = attestation;
+    if a.session_id != sid
+        || a.run_revision != run.revision
+        || a.release_id != id
+        || a.candidate != checkpoint.revision
+        || checkpoint.stage != Stage::Selected
+        || checkpoint.evidence.get("repair-hold") != Some(&a.hold_input_id)
+        || checkpoint.evidence.get("repair-authority") != Some(&a.human_input_id)
+        || a.repairs.is_empty()
+        || a.allowed != checkpoint.works
+    {
+        return Err("repair hold attestation does not bind this exact selection".into());
+    }
+    for input in [&a.hold_input_id, &a.human_input_id] {
+        if !run.inputs.contains_key(input) || crate::planner_input::withdrawal(run, input).is_some()
+        {
+            return Err("repair hold attestation names an absent or withdrawn input".into());
+        }
+    }
+    if run.inputs[&a.human_input_id].origin != "human" {
+        return Err("repair hold authority must bind a durable human invocation".into());
+    }
+    // The host verifies semantics/active status; the router independently binds
+    // every dependency to its reviewed source rather than accepting extra works.
+    let mut closure = a.repairs.clone();
+    let mut pending = a.repairs.keys().cloned().collect::<Vec<_>>();
+    while let Some(work_id) = pending.pop() {
+        let work = run
+            .works
+            .get(&work_id)
+            .ok_or("unknown attested repair work")?;
+        if !finished_revision(work, &closure[&work_id]) {
+            return Err("attested repair/dependency is not qualified and finished".into());
+        }
+        for (dependency, revision) in &work.spec.ready_dependencies {
+            if let Some(existing) = closure.get(dependency) {
+                if existing != revision {
+                    return Err("conflicting reviewed dependency revisions".into());
+                }
+            } else {
+                closure.insert(dependency.clone(), revision.clone());
+                pending.push(dependency.clone());
+            }
+        }
+    }
+    if closure != a.allowed {
+        return Err(
+            "repair hold selection must equal repairs and reviewed dependency closure".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Only repository-observed ancestry can exempt a head from batching. This does
+/// not integrate the work, discharge its proofs, or qualify a selected head.
+pub async fn record_in_checkout(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    checkout: &Path,
+) -> Result<(), String> {
+    record_in_checkout_attested(run, id, checkpoint, checkout, None).await
+}
+
+pub async fn record_in_checkout_attested(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    checkout: &Path,
+    authority: Option<(&str, &SelectionAttestation)>,
+) -> Result<(), String> {
+    if let Some((sid, attestation)) = authority {
+        validate_attestation(run, sid, id, checkpoint, attestation)?;
+    } else if checkpoint.evidence.contains_key("repair-hold") && !run.releases.contains_key(id) {
+        return Err("repair hold requires a trusted repository-host attestation".into());
+    }
+    let mut carried = BTreeSet::new();
+    if checkpoint.stage == Stage::Selected && !run.releases.contains_key(id) {
+        // Pin one actual remote tip and require its commit locally. A stale
+        // tracking ref, missing object, failed read or unknown ancestry grants
+        // no exemption. Never fetch or mutate repository refs here.
+        if let Some(remote) = git_read(
+            checkout,
+            &["ls-remote", "--exit-code", "origin", "refs/heads/staging"],
+        )
+        .await
+            && let Some(tip) = remote.split_whitespace().next().filter(|tip| full_sha(tip))
+        {
+            let revisions = run
+                .works
+                .values()
+                .filter_map(|work| work.finish.as_ref().map(|finish| (work, &finish.revision)))
+                .filter(|(work, revision)| finished_revision(work, revision))
+                .map(|(_, revision)| revision.clone())
+                .collect::<BTreeSet<_>>();
+            for revision in revisions {
+                if full_sha(&revision)
+                    && git_read(checkout, &["merge-base", "--is-ancestor", &revision, tip])
+                        .await
+                        .is_some()
+                {
+                    carried.insert(revision);
+                }
+            }
+        }
+    }
+    record_with_carried(run, id, checkpoint, &carried, authority.is_some())
+}
+
+async fn git_read(checkout: &Path, args: &[&str]) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .kill_on_drop(true)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn record_with_carried(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    carried: &BTreeSet<String>,
+    held: bool,
+) -> Result<(), String> {
     if id.trim().is_empty() || !full_sha(&checkpoint.revision) {
         return Err("release checkpoint requires a release id and full revision SHA".into());
     }
@@ -233,8 +393,8 @@ pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result
             ));
         }
     }
-    let waiting = waiting_heads(run, checkpoint);
-    if checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
+    let waiting = waiting_heads(run, checkpoint, carried);
+    if !held && checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
         let oldest = waiting
             .iter()
             .take(5)
@@ -272,7 +432,11 @@ const ROUND_LIMIT: usize = 12;
 /// corrective round after a failure (it replaces a release that was not
 /// itself a replacement) may isolate its repair; otherwise consecutive
 /// failures would keep every finished head out of staging indefinitely.
-fn waiting_heads(run: &PlannerRun, checkpoint: &Checkpoint) -> Vec<String> {
+fn waiting_heads(
+    run: &PlannerRun,
+    checkpoint: &Checkpoint,
+    carried: &BTreeSet<String>,
+) -> Vec<String> {
     let replaced = checkpoint
         .replaces
         .as_ref()
@@ -305,6 +469,7 @@ fn waiting_heads(run: &PlannerRun, checkpoint: &Checkpoint) -> Vec<String> {
                 return false;
             };
             finished_revision(work, revision)
+                && !carried.contains(revision)
                 && !checkpoint.works.contains_key(*id)
                 && !checkpoint.evidence.contains_key(&format!("deferred:{id}"))
                 && !run.releases.iter().any(|(other_id, other)| {
