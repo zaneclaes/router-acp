@@ -12509,13 +12509,43 @@ async fn epic_parent_reports_when_no_planner_is_eligible() {
         let err = session_manager_prompt(&cx, &sid, EPIC_COMMAND, false)
             .await
             .expect_err("no planner → the parent reports it instead of routing");
+        let message = format!("{err:?}");
         assert!(
-            format!("{err:?}").contains("no planning candidate is routeable"),
-            "{err:?}"
+            message.contains("no planning candidate is routeable"),
+            "{message}"
+        );
+        // The refusal names each planning seat and why it is out, so the
+        // operator can see which reserve (and which file) governs.
+        for seat in ["claude@home", "claude@sibling", "codex@sibling"] {
+            assert!(message.contains(seat), "{seat} unnamed: {message}");
+        }
+        assert!(
+            message.contains("Weekly usage limit reached (10% capacity reserved)"),
+            "cordon cause unnamed: {message}"
         );
         let text = agent_text(&observed, &sid);
         assert!(!text.contains("echo:"), "a model answered anyway: {text}");
         assert!(shared.with_session(&sid, |s| s.pin.is_none()).unwrap());
+
+        // A router-owned wake retried against the same cause records it once;
+        // a new cause, or the same cause after a turn started, records again.
+        for cause in ["no planner: A", "no planner: A", "no planner: B"] {
+            router_acp::session::record_delivery_failure(&shared, &sid, cause);
+        }
+        router_acp::session::clear_delivery_failure(&shared, &sid);
+        router_acp::session::record_delivery_failure(&shared, &sid, "no planner: B");
+        shared.state.lock().unwrap().flush_log_or_warn();
+        let recorded: Vec<String> = shared
+            .state
+            .lock()
+            .unwrap()
+            .log_for_all(&sid)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "router_notice" && e.summary.contains("could not start"))
+            .map(|e| e.summary)
+            .collect();
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
         Ok(())
     })
     .await;
