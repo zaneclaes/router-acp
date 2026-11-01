@@ -325,6 +325,53 @@ impl ReserveWindow {
     }
 }
 
+/// After a System-scope reserve write, the warning to show when this router
+/// reads a project overlay that keeps its own value for that window, so the
+/// write changed nothing the router uses. `None` when the edit took effect.
+fn shadowed_system_reserve(
+    shared: &Arc<Shared>,
+    name: &str,
+    scope: Scope,
+    window: ReserveWindow,
+    written: i64,
+) -> Option<String> {
+    if scope != Scope::System {
+        return None;
+    }
+    let active = shared.runtime_config();
+    let path = active.source_path.clone()?;
+    if !crate::project_config::is_project(&path) {
+        return None;
+    }
+    let reserve = &active
+        .agents
+        .iter()
+        .find(|a| a.name == name)?
+        .reserve_capacity;
+    let effective = match window {
+        ReserveWindow::Weekly => reserve.weekly,
+        ReserveWindow::Session => reserve.session,
+    };
+    shadowed_note(effective, written, window, &path)
+}
+
+fn shadowed_note(
+    effective: f64,
+    written: i64,
+    window: ReserveWindow,
+    path: &Path,
+) -> Option<String> {
+    ((effective - written as f64).abs() > f64::EPSILON).then(|| {
+        format!(
+            "This router reads the project overlay {}, which keeps a {} reserve of {effective}%; \
+             that value still governs here. Set it under {PROJECT_RESERVE}, or choose /system \
+             there to drop the override.",
+            path.display(),
+            window.label()
+        )
+    })
+}
+
 const RELOGIN: &str = "Re-login";
 const SET_PRIORITY: &str = "Set priority";
 const SYSTEM_RESERVE: &str = "Reserve Capacity (System)";
@@ -873,11 +920,15 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
             )
             .await
             {
-                Ok(()) => emit(
-                    shared,
-                    sid,
-                    &format!("{} reserve set to {value}%.", window.label()),
-                ),
+                Ok(()) => {
+                    let mut message = format!("{} reserve set to {value}%.", window.label());
+                    if let Some(note) = shadowed_system_reserve(shared, &name, scope, window, value)
+                    {
+                        message.push(' ');
+                        message.push_str(&note);
+                    }
+                    emit(shared, sid, &message)
+                }
                 Err(e) => emit(shared, sid, &format!("router-acp: {e}")),
             }
             state = Menu::Reserve(name, scope);
@@ -2302,6 +2353,17 @@ fn remove_json_field(path: &Path, field: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_system_reserve_kept_by_the_project_overlay_is_called_out() {
+        let overlay = Path::new("/repo/.router-acp/router.yaml");
+        let note = shadowed_note(10.0, 3, ReserveWindow::Weekly, overlay)
+            .expect("the overlay's 10% still governs");
+        assert!(note.contains("/repo/.router-acp/router.yaml"), "{note}");
+        assert!(note.contains("weekly reserve of 10%"), "{note}");
+        assert!(note.contains(PROJECT_RESERVE), "{note}");
+        assert!(shadowed_note(3.0, 3, ReserveWindow::Weekly, overlay).is_none());
+    }
 
     /// A router config whose `claude` seat uses `<home>/.claude` (shared with
     /// the CLI) and whose `claude@work` seat already has its own directory.

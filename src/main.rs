@@ -686,9 +686,20 @@ async fn run() -> anyhow::Result<()> {
             account,
             weekly,
             session,
-        } => admin_output(router_acp::config_admin::set_reserve(
-            &config, &account, weekly, session,
-        )),
+        } => {
+            let result = router_acp::config_admin::set_reserve(&config, &account, weekly, session);
+            if let Ok(shown) = &result
+                && let Some(shadow) = shown.get("shadowedBy")
+            {
+                eprintln!(
+                    "warning: {} sets {account}'s reserve_capacity to {}; a router started in \
+                     this directory reads that file, so this change does not apply there",
+                    shadow["path"].as_str().unwrap_or("a project overlay"),
+                    shadow["reserveCapacity"]
+                );
+            }
+            admin_output(result)
+        }
         Command::AccountOrder {
             config,
             provider,
