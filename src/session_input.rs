@@ -371,8 +371,12 @@ pub(crate) fn tick(shared: &Arc<Shared>, sid: &str) {
         let _activity = activity;
         let result = deliver(&shared, &sid, &id, &input).await;
         crate::planner_preempt::end_router_turn(&shared, &sid);
-        if let Err(error) = result {
-            tracing::warn!(session = sid, %error, "session input remains pending for bounded retry");
+        match result {
+            Ok(()) => crate::session::clear_delivery_failure(&shared, &sid),
+            Err(error) => {
+                crate::session::record_delivery_failure(&shared, &sid, &error);
+                tracing::warn!(session = sid, %error, "session input remains pending for bounded retry");
+            }
         }
     });
 }

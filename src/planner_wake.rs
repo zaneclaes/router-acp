@@ -185,8 +185,12 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 let shared = shared.clone();
                 tokio::spawn(async move {
                     let _activity = activity;
-                    if let Err(error) = deliver(&shared, &sid).await {
-                        tracing::warn!(session = sid, %error, "planner wake remains pending for bounded retry or explicit resume");
+                    match deliver(&shared, &sid).await {
+                        Ok(()) => crate::session::clear_delivery_failure(&shared, &sid),
+                        Err(error) => {
+                            crate::session::record_delivery_failure(&shared, &sid, &error);
+                            tracing::warn!(session = sid, %error, "planner wake remains pending for bounded retry or explicit resume");
+                        }
                     }
                     if router_owned {
                         crate::planner_preempt::end_router_turn(&shared, &sid);

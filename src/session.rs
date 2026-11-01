@@ -250,6 +250,10 @@ pub struct RouterSession {
     /// Typed notices (`notice::Notice::to_json`) for the queued lines; they
     /// ride `_meta.router_acp.notices` on the chunk that carries the text.
     pub pending_notices: Vec<serde_json::Value>,
+    /// The last router-owned delivery failure recorded as a `router_notice`
+    /// row, so a wake retried every few minutes against the same cause logs
+    /// it once per change instead of failing silently or flooding the log.
+    pub last_delivery_failure: Option<String>,
     /// The reason a queued `pending_switch` was a cordon escape, so the switch
     /// is announced with its label.
     pub pending_switch_notice: Option<crate::notice::Reason>,
@@ -493,6 +497,7 @@ impl RouterSession {
             pending_meta_disclosure: None,
             pending_disclosure: Vec::new(),
             pending_notices: Vec::new(),
+            last_delivery_failure: None,
             pending_switch_notice: None,
             held_transport_text: None,
             pending_mode: None,
@@ -586,6 +591,7 @@ impl RouterSession {
             pending_meta_disclosure: None,
             pending_disclosure: Vec::new(),
             pending_notices: Vec::new(),
+            last_delivery_failure: None,
             pending_switch_notice: None,
             held_transport_text: None,
             pending_mode: None,
@@ -4081,6 +4087,94 @@ fn is_excluded(candidate: &CandidateId, patterns: &[String]) -> bool {
         .any(|p| p.eq_ignore_ascii_case(&candidate.agent) || crate::candidate::glob_match(p, &full))
 }
 
+/// Why each planning-pool candidate is out of an empty coordinator pool, one
+/// line per account and cause with the models it covers. Without it the
+/// operator saw only "no planning candidate is routeable" while every seat sat
+/// behind a reserve cordon, and could not tell which file or reset governed.
+pub(crate) fn planning_pool_exclusions(shared: &Arc<Shared>, excluded: &[String]) -> Vec<String> {
+    let candidates: Vec<CandidateRuntime> = shared.candidates.lock().unwrap().clone();
+    let mut causes: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for candidate in candidates.iter().filter(|c| shared.in_planning_pool(&c.id)) {
+        let cause = if is_excluded(&candidate.id, excluded) {
+            "excluded for this session".to_string()
+        } else {
+            match &candidate.status {
+                CandidateStatus::Routeable => candidate_unavailable_reason(shared, &candidate.id, false)
+                    .map(|(_, why)| why)
+                    .unwrap_or_else(|| {
+                        "routeable, but filtered by the requested effort, capabilities or provider group"
+                            .to_string()
+                    }),
+                CandidateStatus::Unverified => "not yet probed".to_string(),
+                CandidateStatus::AuthPending => "waiting for sign-in".to_string(),
+                CandidateStatus::Invalid(error) => format!("invalid: {error}"),
+                CandidateStatus::Down(error) => format!("process down: {error}"),
+            }
+        };
+        causes
+            .entry((candidate.id.agent.clone(), cause))
+            .or_default()
+            .push(candidate.id.model.clone());
+    }
+    if causes.is_empty() {
+        return vec![format!(
+            "no configured model matches routers.planner.planning_candidates ({})",
+            shared.cfg.routers.planner.planning_candidates.join(", ")
+        )];
+    }
+    let mut lines: Vec<String> = causes
+        .into_iter()
+        .map(|((agent, cause), models)| format!("{agent}: {cause} [{}]", models.join(", ")))
+        .collect();
+    if let Some(path) = shared.runtime_config().source_path {
+        lines.push(format!(
+            "reserves and accounts are read from {}",
+            path.display()
+        ));
+    }
+    lines
+}
+
+/// Record a router-owned delivery failure (a planner wake or queued input the
+/// router could not route) as a `router_notice` row, once per distinct cause.
+/// These turns have no client waiting on the error, so before this the cause
+/// reached only the tracing log while the router retried for hours.
+pub fn record_delivery_failure(shared: &Arc<Shared>, router_sid: &str, error: &str) {
+    let changed = shared
+        .with_session(router_sid, |s| {
+            let changed = s.last_delivery_failure.as_deref() != Some(error);
+            s.last_delivery_failure = Some(error.to_string());
+            changed
+        })
+        .unwrap_or(false);
+    if !changed {
+        return;
+    }
+    tracing::error!(session = router_sid, %error, "router-owned delivery cannot be routed");
+    shared.state.lock().unwrap().log_buffered(
+        router_sid,
+        crate::state::LogEntry {
+            kind: "router_notice".into(),
+            role: "router".into(),
+            summary: format!("router-acp · Router-owned turn could not start: {error}"),
+            detail: Some(serde_json::json!({ "notices": [{
+                "kind": "delivery_failed",
+                "reason": "unroutable",
+                "headline": "Router-owned turn could not start",
+                "detail": error,
+            }]})),
+            ..Default::default()
+        },
+    );
+}
+
+/// Clear the recorded delivery failure after a router-owned turn starts, so a
+/// recurrence of the same cause is recorded again.
+pub fn clear_delivery_failure(shared: &Arc<Shared>, router_sid: &str) {
+    shared.with_session(router_sid, |s| s.last_delivery_failure = None);
+}
+
 enum PinOutcome {
     Pinned,
     Cancelled,
@@ -4940,10 +5034,11 @@ fn plan_route(
     }
     if pool.is_empty() {
         return Err(if coordinator {
-            AcpError::internal_error().data(
+            AcpError::internal_error().data(format!(
                 "coordinator session: no planning candidate is routeable; refusing to fall back \
-                 to an implementation model",
-            )
+                 to an implementation model — {}",
+                planning_pool_exclusions(shared, &selection_exclusions).join("; ")
+            ))
         } else if let Some(effort) = auto_effort {
             AcpError::invalid_params().data(format!(
                 "no routeable candidates support the explicitly requested effort `{}` while Model=Auto",
