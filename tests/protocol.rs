@@ -4198,14 +4198,15 @@ async fn mid_session_rate_limit_fails_over_on_later_prompt() {
             text.contains("failover: auto → cheap/haiku"),
             "mid-session failover disclosed: {text}"
         );
-        // The replacement is seeded with the transcript, then the turn.
+        // The replacement is seeded with the recent records and the transcript
+        // command for the rest, then the turn.
         let answer = text.rsplit("echo:haiku:").next().unwrap_or_default();
         assert!(
             answer.contains("transcript --state")
                 && answer.contains(&sid)
-                && !answer.contains("turn one")
+                && answer.contains("user/user_prompt] turn one")
                 && answer.contains("turn two"),
-            "answer arrived with prior context: {text}"
+            "answer arrived without prior context: {text}"
         );
         Ok(())
     })
@@ -4265,12 +4266,15 @@ async fn resume_of_oversized_history_provides_only_sqlite_lookup() {
             .collect();
         assert_eq!(prompts.len(), 2);
         let replacement = prompts.last().unwrap()["text"].as_str().unwrap();
+        // Only the bounded digest of user and agent records is copied; the
+        // 1.6 MB tool output stays behind the transcript command.
         assert!(
-            replacement.len() < 4_000,
+            replacement.len() < 24_000,
             "overflowing history was replayed: {}",
             replacement.len()
         );
-        assert!(!replacement.contains("turn one") && !replacement.contains("saved tool output"));
+        assert!(replacement.contains("user/user_prompt] turn one"));
+        assert!(!replacement.contains("saved tool output"));
         assert!(replacement.contains(&sid) && replacement.contains("transcript --state"));
         assert!(replacement.contains("continue the work"));
         let stored = shared.state.lock().unwrap().log_for_all(&sid).unwrap();
@@ -4431,8 +4435,8 @@ async fn hot_failover_after_output_provides_history_lookup_and_continuation() {
             handoff.contains("Hot failover:")
                 && handoff.contains("Do not repeat completed actions")
                 && handoff.contains(&sid)
-                && !handoff.contains("partial output before crash"),
-            "successor receives partial text and continuation instructions: {handoff}"
+                && handoff.contains("agent/agent_response (interrupted)] partial output before crash"),
+            "successor receives the partial text marked interrupted and continuation instructions: {handoff}"
         );
         assert!(
             handoff.contains("transcript --state") && handoff.contains("write-file"),
@@ -4534,7 +4538,7 @@ async fn downstream_death_between_turns_fails_over_with_prior_context() {
         assert!(
             handoff.contains("transcript --state")
                 && handoff.contains(&sid)
-                && !handoff.contains("remember 4271")
+                && handoff.contains("remember 4271")
                 && handoff.contains("second task"),
             "replacement receives both turns: {handoff}"
         );
@@ -4582,7 +4586,12 @@ async fn outage_after_a_human_switch_respawns_the_pick_before_failing_over() {
             assert_eq!(result?.stop_reason, StopReason::EndTurn);
             if revives {
                 assert!(text.contains("echo:m2:"), "respawned b/m2: {text}");
-                assert!(!text.contains("echo:m1:"), "never routed to a/m1: {text}");
+                // The resume digest quotes a/m1's earlier replies inside the
+                // echoed prompt; a reply from a/m1 itself starts its own line.
+                assert!(
+                    !text.lines().any(|line| line.starts_with("echo:m1:")),
+                    "never routed to a/m1: {text}"
+                );
             } else {
                 assert!(
                     text.contains("failover:"),
@@ -6477,7 +6486,7 @@ async fn switch_falls_back_to_sqlite_lookup_when_summary_fails() {
         assert!(
             answer.contains("transcript --state")
                 && answer.contains(&sid)
-                && !answer.contains("4271"),
+                && answer.contains("code is 4271"),
             "log transcript carried prior context: {text}"
         );
         // The disclosure explains that the fallback (not a model summary) was used.
@@ -6593,7 +6602,7 @@ async fn spend_capped_model_is_cordoned_and_handoff_provides_sqlite_lookup() {
         assert!(
             answer.contains("transcript --state")
                 && answer.contains(&sid)
-                && !answer.contains("4271")
+                && answer.contains("code is 4271")
         );
         let a = CandidateId::parse("a/m1").unwrap();
         assert!(
@@ -6638,7 +6647,7 @@ async fn spend_cap_failover_provides_sqlite_lookup_to_the_new_model() {
         assert!(
             answer.contains("transcript --state")
                 && answer.contains(&sid)
-                && !answer.contains("4271"),
+                && answer.contains("code is 4271"),
             "replacement got the transcript: {text}"
         );
         Ok(())
