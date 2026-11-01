@@ -309,6 +309,15 @@ enum Command {
         /// Read a UTF-8 message from this file (use - for stdin).
         #[arg(long, required_unless_present_any = ["status", "list", "delete", "drain"], conflicts_with_all = ["status", "list", "delete", "drain"])]
         message_file: Option<PathBuf>,
+        /// Who is sending (e.g. "repair agent"). The operator sees it on the
+        /// delivered message in the client, and the agent sees it in the frame.
+        #[arg(long = "from", requires = "message_file")]
+        sender: Option<String>,
+        /// Steer into a planner parent's running turn at once, even while its
+        /// tool calls run (a native steer may abort an edit) and inside the
+        /// operator's `/implement` turn. Use only when the parent must act now.
+        #[arg(long, requires = "message_file")]
+        interrupt: bool,
         /// Read delivery/acknowledgment metadata without modifying state.
         #[arg(long)]
         status: bool,
@@ -985,6 +994,8 @@ async fn run() -> anyhow::Result<()> {
             id,
             cwd,
             message_file,
+            sender,
+            interrupt,
             status,
             list,
             delete,
@@ -1091,13 +1102,29 @@ async fn run() -> anyhow::Result<()> {
                 let id = id.as_deref().expect("clap requires id");
                 if planner(&store)? {
                     serde_json::to_value(
-                        planner_input::send(&store, &session, &cwd, id, &message)
-                            .map_err(anyhow::Error::msg)?,
+                        planner_input::send_from(
+                            &store,
+                            &session,
+                            &cwd,
+                            id,
+                            &message,
+                            sender.as_deref(),
+                            interrupt,
+                        )
+                        .map_err(anyhow::Error::msg)?,
                     )?
                 } else {
                     serde_json::to_value(
-                        session_input::send(&store, &session, &cwd, id, &message)
-                            .map_err(anyhow::Error::msg)?,
+                        session_input::send_from(
+                            &store,
+                            &session,
+                            &cwd,
+                            id,
+                            &message,
+                            sender.as_deref(),
+                            interrupt,
+                        )
+                        .map_err(anyhow::Error::msg)?,
                     )?
                 }
             };

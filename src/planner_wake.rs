@@ -254,9 +254,7 @@ fn claim_steer(rt: &mut crate::planner_guard::SessionRuntime, now: std::time::In
 fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
     let command_turn = !crate::planner_preempt::router_turn_in_flight(shared, sid)
         && crate::planner_guard::with_runtime(shared, sid, |rt| rt.command_turn);
-    if !(crate::planner_preempt::router_turn_in_flight(shared, sid) || command_turn)
-        || crate::planner_watchdog::tools_in_flight(shared, sid)
-    {
+    if !(crate::planner_preempt::router_turn_in_flight(shared, sid) || command_turn) {
         return;
     }
     let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
@@ -264,9 +262,22 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     else {
         return;
     };
+    let queued = key
+        .strip_prefix("input:")
+        .and_then(|id| run.parent_queue.iter().find(|input| input.input_id == id));
+    // `send-input --interrupt`: the sender judged that the parent must read
+    // this now. It skips the wait for in-flight tool calls (a native steer may
+    // then abort an edit, which the sender accepted), the steering interval
+    // and the `/implement`-turn restriction. Everything else waits for tools.
+    let interrupt =
+        queued.is_some_and(|input| crate::external_message::interrupt_of(&input.request));
+    if !interrupt && crate::planner_watchdog::tools_in_flight(shared, sid) {
+        return;
+    }
     // Inside the operator's `/implement` turn only the deployment obligation
     // is steered; the fallback below cancels router-owned turns only.
     if command_turn
+        && !interrupt
         && !((environment_wake(&key)
             || key.starts_with("release:")
             || key.starts_with("audit:release:"))
@@ -283,18 +294,31 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         .get(&key)
         .is_some_and(|wake| ownership_handoff(&key, wake, &run.works));
     let claimed = crate::planner_guard::with_runtime(shared, sid, |rt| {
+        if interrupt && !rt.steering {
+            rt.steering = true;
+            rt.last_steer = Some(std::time::Instant::now());
+            return true;
+        }
         claim_steer(rt, std::time::Instant::now())
     });
     if !claimed {
         return;
     }
+    let announced = queued.map(|input| {
+        (
+            input.input_id.clone(),
+            crate::external_message::sender_of(&input.request),
+            crate::external_message::message_of(&input.request),
+            run.wakes.get(&key).map_or(0, |w| w.deliveries),
+        )
+    });
     let shared = shared.clone();
     let sid = sid.to_string();
     tokio::spawn(async move {
         // Native priority steering can abort an edit and report it to the model
         // as a user refusal. Automatic wakes wait for tool completion; direct
-        // operator input keeps its separate interruption authority.
-        if crate::planner_watchdog::tools_in_flight(&shared, &sid) {
+        // operator input and `--interrupt` keep their interruption authority.
+        if !interrupt && crate::planner_watchdog::tools_in_flight(&shared, &sid) {
             crate::planner_guard::with_runtime(&shared, &sid, |rt| {
                 rt.steering = false;
                 rt.last_steer = None;
@@ -320,9 +344,30 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     ..Default::default()
                 },
             );
+            if let Some((input_id, sender, message, deliveries)) = &announced {
+                let mut first = false;
+                let _ = planner_workflow::mutate(&shared, &sid, |run| {
+                    if let Some(wake) = run.wakes.get_mut(&key) {
+                        first = !wake.announced;
+                        wake.announced = true;
+                    }
+                    Ok(())
+                });
+                let how = if interrupt { "interrupt" } else { "steered" };
+                crate::external_message::announce(
+                    &shared,
+                    &sid,
+                    input_id,
+                    sender.as_deref(),
+                    message,
+                    how,
+                    (*deliveries).max(1),
+                    first,
+                );
+            }
         } else if (key.starts_with("input:") || ownership || release_audit)
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
-            && !crate::planner_watchdog::tools_in_flight(&shared, &sid)
+            && (interrupt || !crate::planner_watchdog::tools_in_flight(&shared, &sid))
             && planner_workflow::load(&shared, &sid)
                 .ok()
                 .flatten()
@@ -411,11 +456,18 @@ pub(crate) fn pending_steer(
                 ended: false,
             })
     }
-    if let Some(input) = queue.iter().find(|input| {
+    let unacknowledged = |input: &&planner_workflow::QueuedParentInput| {
         !wakes
             .get(&format!("input:{}", input.input_id))
             .is_some_and(|w| w.acknowledged)
-    }) {
+    };
+    // An interrupting input (`send-input --interrupt`) is steered ahead of
+    // older queued corrections; each still reaches its boundary in order.
+    let interrupting = queue.iter().filter(unacknowledged).find(|input| {
+        crate::external_message::interrupt_of(&input.request)
+            && !steered.contains(&format!("input:{}", input.input_id))
+    });
+    if let Some(input) = interrupting.or_else(|| queue.iter().find(unacknowledged)) {
         let key = format!("input:{}", input.input_id);
         let live_delivery = wakes.get(&key).is_some_and(|w| claimed(w, &key));
         if !steered.contains(&key)
@@ -432,15 +484,22 @@ pub(crate) fn pending_steer(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Some((
-                key,
+            let text = if crate::external_message::interrupt_of(&input.request) {
+                format!(
+                    "[Router steer — interrupt] This is router text, not operator input. Agent correction `{}` was sent as an \
+                     interrupt: its sender judged it cannot wait for your current tool calls or this turn to end. Stop, read it \
+                     now and act on it before continuing. It is redelivered for acknowledgment when this turn ends:\n{body}",
+                    input.input_id
+                )
+            } else {
                 format!(
                     "[Router steer] This is router text, not operator input. Agent correction `{}` is queued for this parent. It is redelivered for \
                      acknowledgment when this turn ends; read it now and act on it in this turn if it changes \
                      what you are doing:\n{body}",
                     input.input_id
-                ),
-            ));
+                )
+            };
+            return Some((key, text));
         }
     }
     // Capacity starvation, release transitions and failed CI jobs can affect
@@ -1123,7 +1182,8 @@ async fn deliver_queued_input(
     let agent_input = !planner_workflow::human_prompt(&input.request);
     let wake_id = format!("input:{}", input.input_id);
     let (pid, started) = planner_workflow::process_identity();
-    planner_workflow::mutate(shared, sid, |run| {
+    let mut first_announcement = false;
+    let claimed = planner_workflow::mutate(shared, sid, |run| {
         if run
             .inputs
             .get(&input.input_id)
@@ -1154,8 +1214,23 @@ async fn deliver_queued_input(
         wake.deliveries += 1;
         wake.retry_after =
             chrono::Utc::now().timestamp() + crate::planner_guard::wake_retry_secs(wake.deliveries);
+        first_announcement = agent_input && !wake.announced;
+        wake.announced |= agent_input;
         Ok(())
     })?;
+    if agent_input {
+        let attempt = claimed.wakes.get(&wake_id).map_or(1, |w| w.deliveries);
+        crate::external_message::announce(
+            shared,
+            sid,
+            &input.input_id,
+            crate::external_message::sender_of(&input.request).as_deref(),
+            &crate::external_message::message_of(&input.request),
+            "turn",
+            attempt,
+            first_announcement,
+        );
+    }
     let result = match crate::session::prepare_queued_parent_prompt(
         shared.clone(),
         sid.into(),
@@ -1275,6 +1350,40 @@ mod steer_tests {
         assert_eq!(
             pending_steer(&queue, &wakes, &HashSet::new()).unwrap().0,
             "input:pending"
+        );
+    }
+
+    /// `send-input --interrupt`: steered ahead of an older queued correction,
+    /// worded so the parent stops and acts, and skipped once steered.
+    #[test]
+    fn interrupting_input_is_steered_first_and_says_so() {
+        let mut urgent = input("urgent", true);
+        urgent.request = PromptRequest::new(
+            "s".to_string(),
+            vec![ContentBlock::from("stop the run".to_string())],
+        )
+        .meta(
+            serde_json::from_value(json!({"router_acp": {
+                "agent_origin": true, "input_id": "urgent", "interrupt": true, "sender": "repair agent"
+            }}))
+            .ok(),
+        );
+        let queue = vec![input("older", true), urgent];
+        let (key, text) = pending_steer(&queue, &BTreeMap::new(), &HashSet::new()).unwrap();
+        assert_eq!(key, "input:urgent");
+        assert!(
+            text.contains("interrupt") && text.contains("Stop, read it now"),
+            "{text}"
+        );
+        assert!(text.contains("stop the run"));
+        let steered = HashSet::from(["input:urgent".to_string()]);
+        assert_eq!(
+            pending_steer(&queue, &BTreeMap::new(), &steered).unwrap().0,
+            "input:older"
+        );
+        assert_eq!(
+            crate::external_message::sender_of(&queue[1].request).as_deref(),
+            Some("repair agent")
         );
     }
 

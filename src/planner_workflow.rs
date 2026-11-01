@@ -433,6 +433,10 @@ pub struct Wake {
     pub claim_pid: u32,
     #[serde(default)]
     pub claim_started_at_ms: u64,
+    /// An external message's body was already shown to the operator
+    /// (`external_message::announce`); later deliveries repeat the headline.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announced: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2795,6 +2799,7 @@ pub fn attempt_ended(
             retry_after: 0,
             claim_pid: 0,
             claim_started_at_ms: 0,
+            announced: false,
         });
         if new_completion {
             wake.reason = format!("child state: {:?}", work.status);
