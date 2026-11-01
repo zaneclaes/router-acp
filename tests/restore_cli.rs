@@ -1026,7 +1026,9 @@ async fn accepted_mid_turn_messages_survive_restart_without_recording_declined_s
     let entries = state(&fixture).log_for_all(&sid).unwrap();
     assert_eq!(entries.iter().filter(|e| e.kind == "user_steer").count(), 1);
     let delivered = resume_and_prompt(&fixture, &sid, "after steering restart").await;
-    assert!(!delivered.contains("accepted steering message"));
+    // The resume digest carries the accepted steer and never the declined one.
+    assert!(delivered.contains("user/user_steer] accepted steering message"));
+    assert!(!delivered.contains("DECLINED-STEER"));
     let retrieved = lookup_from_prompt(&delivered);
     assert!(retrieved.contains("accepted steering message"));
     assert!(!retrieved.contains("DECLINED-STEER"));

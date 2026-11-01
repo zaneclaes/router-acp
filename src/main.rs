@@ -919,21 +919,32 @@ async fn run() -> anyhow::Result<()> {
         } => {
             // No `--config` here by design (see the subcommand's doc comment):
             // this must run standalone from a bare state-file path, without a
-            // resolved router.yaml. That means the configured retention
-            // window is unknown — passing the library default would prune
-            // this DB against the WRONG window on open if the real config
-            // set something longer, silently deleting sessions this
-            // inspection-only command has no business touching. Load with an
-            // effectively-infinite retention instead: `prune_at` computes its
-            // cutoff via `now.saturating_sub(max_age.as_secs())`, so
-            // `Duration::MAX` saturates to a cutoff of 0 and nothing is ever
-            // pruned by this path.
+            // resolved router.yaml. It opens the files read-only, so it never
+            // prunes, migrates or writes, and it runs inside an agent sandbox
+            // that denies writes to the state directory. A read-write open
+            // there failed silently and printed "no log entries" for a live
+            // session (Chordzy, 2026-11-01: a codex parent lost its history
+            // on failover).
             let never_prune = router_acp::state::Retention {
                 max_age: std::time::Duration::MAX,
             };
             let path = router_acp::config::expand_tilde(&state);
-            let state = router_acp::state::StateStore::load(&path, never_prune);
-            let entries = state.log_for(&session, limit.max(1));
+            let state =
+                router_acp::state::StateStore::open_readonly(&path, never_prune).map_err(|e| {
+                    anyhow::anyhow!("cannot open router state {} read-only: {e}", path.display())
+                })?;
+            let file = state.file_for(&session);
+            let entries = match state.try_log_for(&session, limit.max(1), &[]) {
+                Ok(Some(entries)) => entries,
+                Ok(None) => anyhow::bail!(
+                    "no state file for session {session}: {} does not exist (wrong --state \
+                     path, or the session never existed)",
+                    file.display()
+                ),
+                Err(e) => {
+                    anyhow::bail!("cannot read session {session} from {}: {e}", file.display())
+                }
+            };
             if entries.is_empty() {
                 println!(
                     "no log entries for session {session} in {} (wrong --state path, or the \

@@ -1488,7 +1488,8 @@ async fn standalone_relogin_cancel_keeps_membership_and_kills_login() {
         .unwrap()
         .to_string();
     assert!(delivered.contains(&sid) && delivered.contains("after cancelled re-login"));
-    assert!(!delivered.contains("context before cancelled re-login"));
+    // The resume digest carries the earlier turn; the command covers the rest.
+    assert!(delivered.contains("context before cancelled re-login"));
     let command = delivered
         .lines()
         .find(|line| line.contains(" transcript --state "))
@@ -1561,7 +1562,8 @@ async fn standalone_failed_relogin_preserves_credentials_and_hands_off_pinned_se
         .unwrap()
         .to_string();
     assert!(delivered.contains(&sid) && delivered.contains("after failed re-login"));
-    assert!(!delivered.contains("context before failed re-login"));
+    // The resume digest carries the earlier turn; the command covers the rest.
+    assert!(delivered.contains("context before failed re-login"));
     let command = delivered
         .lines()
         .find(|line| line.contains(" transcript --state "))

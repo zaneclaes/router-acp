@@ -574,3 +574,84 @@ fn v1_health_still_fails_when_the_state_directory_is_unreadable() {
     }
     assert!(!output.status.success(), "{output:?}");
 }
+
+fn transcript(state: &Path, session: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_router-acp"))
+        .args(["transcript", "--state", state.to_str().unwrap()])
+        .args(["--session", session, "--limit", "5"])
+        .output()
+        .unwrap()
+}
+
+/// The handoff's `transcript` command runs inside an agent sandbox that can
+/// deny writes to the state directory. It opens read-only, so a live session
+/// whose files it may not write is still read, and every failure is stated
+/// instead of printed as "no log entries" (Chordzy, 2026-11-01).
+#[cfg(unix)]
+#[test]
+fn transcript_reads_unwritable_live_state_and_names_every_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.db");
+    let store = StateStore::load(
+        &state,
+        Retention {
+            max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        },
+    );
+    let parent = store.new_session_id(&dir.path().join("checkout")).unwrap();
+    populate(&store, &parent);
+    store.flush_log_or_warn();
+    // The writer stays open, as a running router does, so -wal and -shm exist.
+    let layout = StateLayout::new(&state);
+    let shard = layout.shard_path(&tag_for_cwd(&dir.path().join("checkout")));
+    let mode =
+        |path: &Path, bits| std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits));
+    let files: Vec<_> = std::fs::read_dir(&layout.shards_dir)
+        .unwrap()
+        .chain(std::fs::read_dir(dir.path()).unwrap())
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
+        .collect();
+    for file in &files {
+        mode(file, 0o444).unwrap();
+    }
+    mode(&layout.shards_dir, 0o555).unwrap();
+    mode(dir.path(), 0o555).unwrap();
+    let read_only = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&shard)
+        .is_err();
+    let readable = transcript(&state, &parent);
+    let missing = transcript(&state, "rtr-00000000000000000000000000000000-absent");
+    mode(dir.path(), 0o755).unwrap();
+    mode(&layout.shards_dir, 0o755).unwrap();
+    for file in &files {
+        mode(file, 0o644).unwrap();
+    }
+    drop(store);
+    if !read_only {
+        return; // running as root: permissions are not enforced
+    }
+    let out = String::from_utf8_lossy(&readable.stdout);
+    assert!(readable.status.success(), "{readable:?}");
+    assert!(
+        out.contains("(1 entries)") && out.contains("user_prompt"),
+        "{out}"
+    );
+    assert!(!missing.status.success(), "{missing:?}");
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(!err.contains("no log entries"), "{err}");
+
+    // An unreadable shard is an error naming the file, never an empty transcript.
+    mode(&shard, 0o000).unwrap();
+    let unreadable = transcript(&state, &parent);
+    mode(&shard, 0o644).unwrap();
+    assert!(!unreadable.status.success(), "{unreadable:?}");
+    let err = String::from_utf8_lossy(&unreadable.stderr);
+    assert!(
+        err.contains("cannot read session") && err.contains(shard.to_str().unwrap()),
+        "{err}"
+    );
+}

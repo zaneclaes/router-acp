@@ -1057,6 +1057,29 @@ impl StateStore {
         .flatten()
     }
 
+    /// `log_for` that reports why nothing could be read: `Err` when the
+    /// session's file cannot be opened or queried, `Ok(None)` when its shard
+    /// does not exist. `kinds` filters as in `StateFile::try_log_for`.
+    pub fn try_log_for(
+        &self,
+        router_session_id: &str,
+        limit: usize,
+        kinds: &[&str],
+    ) -> rusqlite::Result<Option<Vec<LogEntry>>> {
+        self.with_file(router_session_id, |file| {
+            file.try_log_for(router_session_id, limit, kinds)
+        })?
+        .transpose()
+    }
+
+    /// Where `router_session_id`'s rows live: the legacy file or its shard.
+    pub fn file_for(&self, router_session_id: &str) -> PathBuf {
+        match home_of(router_session_id) {
+            SessionHome::Legacy => self.layout.legacy_path.clone(),
+            SessionHome::Shard(tag) => self.layout.shard_path(&tag),
+        }
+    }
+
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
         self.with_file(router_session_id, |file| {
             file.log_for(router_session_id, limit)
@@ -2942,26 +2965,38 @@ impl StateFile {
 
     /// Recent log entries for a session (chronological).
     pub fn log_for(&self, router_session_id: &str, limit: usize) -> Vec<LogEntry> {
-        let mut out = Vec::new();
+        self.try_log_for(router_session_id, limit, &[])
+            .unwrap_or_default()
+    }
+
+    /// The newest `limit` log entries for a session (chronological), or the
+    /// error that kept the file from being read. A non-empty `kinds` keeps
+    /// only those record kinds, so streaming noise cannot fill the limit. A
+    /// single undecodable row is skipped, as `log_for` always did.
+    pub fn try_log_for(
+        &self,
+        router_session_id: &str,
+        limit: usize,
+        kinds: &[&str],
+    ) -> rusqlite::Result<Vec<LogEntry>> {
         self.flush_log_or_warn();
-        let Ok(mut stmt) = self.conn.prepare(
+        let kinds = (!kinds.is_empty()).then(|| serde_json::json!(kinds).to_string());
+        let mut stmt = self.conn.prepare(
             "SELECT ts, kind, role, summary, detail, tokens_input, tokens_output,
                     tokens_cache_read, tokens_cache_write, tokens_estimated, model
-             FROM session_log WHERE router_session_id=?1 ORDER BY id DESC LIMIT ?2",
-        ) else {
-            return out;
-        };
-        let rows = stmt.query_map(
-            params![router_session_id, limit as i64],
-            Self::row_to_log_entry,
-        );
-        if let Ok(rows) = rows {
-            for r in rows.flatten() {
-                out.push(r);
-            }
-        }
+             FROM session_log WHERE router_session_id=?1
+               AND (?3 IS NULL OR kind IN (SELECT value FROM json_each(?3)))
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut out: Vec<LogEntry> = stmt
+            .query_map(
+                params![router_session_id, limit as i64, kinds],
+                Self::row_to_log_entry,
+            )?
+            .flatten()
+            .collect();
         out.reverse();
-        out
+        Ok(out)
     }
 
     /// Queue a lifecycle-hook event; returns its outbox id.
