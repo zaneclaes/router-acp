@@ -14720,7 +14720,7 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
                     scope: "restore the child presentation".into(),
                     dependencies: Vec::new(),
                     ready_dependencies: Default::default(),
-                    owned_paths: Vec::new(),
+                    legacy_owned_paths: (),
                     required_checks: Vec::new(),
                     required_integration_evidence: Vec::new(),
                     repository: None,

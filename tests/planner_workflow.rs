@@ -621,7 +621,7 @@ fn work(work_id: &str) -> WorkSpec {
         scope: "change README.md and run the checks".into(),
         dependencies: Vec::new(),
         ready_dependencies: BTreeMap::new(),
-        owned_paths: Vec::new(),
+        legacy_owned_paths: (),
         required_checks: Vec::new(),
         required_integration_evidence: Vec::new(),
         repository: None,
@@ -3934,8 +3934,8 @@ async fn adopted_custody_recovery_does_not_starve_independent_capacity_wakes() {
 }
 
 #[tokio::test]
-async fn adopted_custody_allows_independent_auto_admission_but_keeps_conflict_and_dependency_gates()
-{
+async fn adopted_custody_auto_admits_work_on_the_same_files_but_keeps_dependency_gates() {
+    // Works never own files: a candidate naming the recovery work's file is admitted.
     let mut independent = candidate_json("independent");
     independent["work"]["owned_paths"] = json!(["independent"]);
     let mut conflict = candidate_json("conflict");
@@ -3952,9 +3952,7 @@ async fn adopted_custody_allows_independent_auto_admission_but_keeps_conflict_an
             300,
         );
     });
-    let mut spec = work("recovery");
-    spec.owned_paths = vec!["shared".into()];
-    admit(&f.shared, spec);
+    admit(&f.shared, work("recovery"));
     pin_parent(&f.shared);
     let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "recovery")
         .await
@@ -3973,12 +3971,12 @@ async fn adopted_custody_allows_independent_auto_admission_but_keeps_conflict_an
     let last = parent_turn_ended(&f.shared);
     tick(&f.shared, last + 301).await;
     let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
-    assert_eq!(
-        run.capacity.last_auto_admission.as_ref().unwrap().admitted,
-        vec!["work-independent"]
-    );
+    let admitted = &run.capacity.last_auto_admission.as_ref().unwrap().admitted;
+    assert_eq!(admitted.len(), 2, "{admitted:?}");
+    assert!(admitted.iter().any(|w| w == "work-independent"));
+    assert!(admitted.iter().any(|w| w == "work-conflict"));
     assert!(run.works["work-independent"].attempt.is_some());
-    assert!(!run.works.contains_key("work-conflict"));
+    assert!(run.works["work-conflict"].attempt.is_some());
     assert!(run.works["work-dependent"].attempt.is_none());
     assert_eq!(
         run.works["recovery"].attempt.as_ref().unwrap().id,
@@ -4627,7 +4625,6 @@ async fn source_dependencies_can_start_before_deployment_but_not_before_acceptan
     dependent
         .ready_dependencies
         .insert("work-1".into(), revision);
-    dependent.owned_paths = vec!["src/client".into()];
     admit(&f.shared, dependent);
     let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, "dependent")
         .await
@@ -4656,26 +4653,44 @@ async fn source_dependencies_can_start_before_deployment_but_not_before_acceptan
             .unwrap_err()
             .contains("source dependency")
     );
-    let mut overlapping = work("overlap");
-    overlapping.owned_paths = vec!["src/client/page.rs".into()];
-    let error = planner_workflow::operate(
-        &f.shared,
-        SID,
-        None,
-        Operation::Admit {
-            key: "overlap".into(),
-            work: overlapping,
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(error.contains("source ownership conflict"));
-    let mut disjoint = work("disjoint");
-    disjoint.owned_paths = vec!["src/server".into()];
-    admit(&f.shared, disjoint);
-    planner_workflow::begin_work(&f.shared, SID, "disjoint")
+    admit(&f.shared, work("independent"));
+    planner_workflow::begin_work(&f.shared, SID, "independent")
         .await
         .unwrap();
+}
+
+/// Works never own files: two live works that both name the same file, a
+/// migration directory and a submodule pointer in a legacy `owned_paths` key
+/// are both admitted and started, and the key is not kept in the saved spec.
+#[tokio::test]
+async fn works_never_own_files() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    for id in ["first", "second"] {
+        let mut spec = serde_json::to_value(work(id)).unwrap();
+        spec["owned_paths"] = json!([
+            "Smokescreen/AppHost.cs",
+            "TuneWeb/Server/Migrations",
+            "inzania-engine"
+        ]);
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Admit {
+                key: format!("admit-{id}"),
+                work: serde_json::from_value(spec).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        planner_workflow::begin_work(&f.shared, SID, id)
+            .await
+            .unwrap();
+    }
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let saved = serde_json::to_value(&run.works["second"].spec).unwrap();
+    assert!(saved.get("owned_paths").is_none());
 }
 
 #[tokio::test]
@@ -5439,8 +5454,7 @@ async fn ownership_handoffs_require_reconciliation_before_restarting_the_same_br
             .expect_err("the unchanged brief must not be replayed after an ownership request");
         assert!(error.contains("reconcile"));
         let mut corrected = work("release-repair");
-        corrected.scope = "fix the named suite blocker with the reconciled ownership".into();
-        corrected.owned_paths = vec!["suite-fixture.cs".into()];
+        corrected.scope = "fix the named suite blocker in suite-fixture.cs".into();
         let revision = git(&workspace.path, &["rev-parse", "HEAD"]);
         let unchanged = planner_workflow::operate(
             &f.shared,
@@ -5511,7 +5525,6 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
         .unwrap();
     let mut updated = work("handoff");
     updated.scope = "carry the combined transferred repair, not the old three-file patch".into();
-    updated.owned_paths = vec!["transfer.txt".into()];
     std::fs::write(workspace.path.join("transfer.txt"), "preserved source\n").unwrap();
     git(&workspace.path, &["add", "transfer.txt"]);
     git(&workspace.path, &["commit", "--quiet", "-m", "transfer"]);

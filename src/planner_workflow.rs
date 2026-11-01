@@ -134,6 +134,11 @@ fn stale_drain(shared: &Shared, sid: &str, status: RunStatus) -> bool {
     status == RunStatus::Draining && !crate::planner_shutdown::draining(shared, sid)
 }
 
+/// Reads and discards a removed field's value.
+fn drop_legacy_field<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| ())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkSpec {
@@ -146,9 +151,18 @@ pub struct WorkSpec {
     /// never satisfy the existing integrated dependencies or release gates.
     #[serde(default)]
     pub ready_dependencies: BTreeMap<String, String>,
-    /// Explicit file or directory ownership for coordinated parallel tracks.
-    #[serde(default)]
-    pub owned_paths: Vec<String>,
+    /// Removed: works never own files. Workers change the same files at once and
+    /// each reconciles its own branch with its base. A saved run or a caller
+    /// that still sends `owned_paths` has it accepted and dropped, so
+    /// `deny_unknown_fields` does not turn the removal into refused admissions.
+    #[serde(
+        default,
+        rename = "owned_paths",
+        skip_serializing,
+        deserialize_with = "drop_legacy_field"
+    )]
+    #[doc(hidden)]
+    pub legacy_owned_paths: (),
     #[serde(default)]
     pub required_checks: Vec<String>,
     #[serde(default)]
@@ -1363,7 +1377,7 @@ pub fn input_blocks(
 }
 
 pub fn tool_definition() -> Value {
-    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. WorkSpec owned_paths declares literal source ownership; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
+    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
             "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
@@ -1715,9 +1729,6 @@ async fn operate_once(
             // An allocator refusal can leave an admitted identity without a workspace.
             // Validate the corrected brief first, then retry its supported allocator;
             // existing allocations still require their original source to be restored.
-            let mut validation = run.clone();
-            validation.works.remove(&work.work_id);
-            validate_owned_paths(&validation, &work)?;
             if work.dependencies.contains(&work.work_id)
                 || work.ready_dependencies.contains_key(&work.work_id)
             {
@@ -1792,7 +1803,6 @@ async fn operate_once(
                 {
                     return Err("work cannot depend on itself".into());
                 }
-                validate_owned_paths(&run, &work)?;
                 let child_id = format!(
                     "child-{}",
                     &content_hash(&format!("{sid}/{}", work.work_id))[..24]
@@ -2330,79 +2340,7 @@ async fn verify_source_revision(path: &Path, revision: &str) -> Result<(), Strin
     Ok(())
 }
 
-fn validate_owned_paths(run: &PlannerRun, work: &WorkSpec) -> Result<(), String> {
-    for path in &work.owned_paths {
-        if path.trim().is_empty()
-            || Path::new(path).is_absolute()
-            || path
-                .trim_end_matches('/')
-                .split('/')
-                .any(|p| matches!(p, "" | "." | ".."))
-            || path.contains(['\\', '*', '?', '[', ']'])
-        {
-            return Err(
-                "owned_paths must name relative files or directories without traversal".into(),
-            );
-        }
-        for other in run.works.values().filter(|w| {
-            matches!(
-                w.status,
-                WorkStatus::Admitted
-                    | WorkStatus::Allocating
-                    | WorkStatus::Running
-                    | WorkStatus::Corrections
-                    | WorkStatus::Interrupted
-            )
-        }) {
-            if other
-                .spec
-                .owned_paths
-                .iter()
-                .any(|owned| paths_overlap(path, owned))
-            {
-                return Err(format!(
-                    "source ownership conflict: {path} is owned by {}",
-                    other.spec.work_id
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn paths_overlap(left: &str, right: &str) -> bool {
-    let left = left.trim_end_matches('/');
-    let right = right.trim_end_matches('/');
-    left == right
-        || left.starts_with(&format!("{right}/"))
-        || right.starts_with(&format!("{left}/"))
-}
-
 pub(crate) fn dependencies_ready(run: &PlannerRun, work: &Work) -> Result<(), String> {
-    for other in run.works.values().filter(|other| {
-        other.spec.work_id != work.spec.work_id
-            && matches!(
-                other.status,
-                WorkStatus::Admitted
-                    | WorkStatus::Allocating
-                    | WorkStatus::Running
-                    | WorkStatus::Corrections
-                    | WorkStatus::Interrupted
-            )
-    }) {
-        if let Some(path) = work.spec.owned_paths.iter().find(|path| {
-            other
-                .spec
-                .owned_paths
-                .iter()
-                .any(|owned| paths_overlap(path, owned))
-        }) {
-            return Err(format!(
-                "source ownership conflict: {path} is owned by {}",
-                other.spec.work_id
-            ));
-        }
-    }
     for id in &work.spec.dependencies {
         if !run
             .works

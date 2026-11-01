@@ -26,8 +26,9 @@ takeover evidence. Chordzy permits only obsolete release/prod-smoke workers. The
 source/evidence, clears retry/recovery wakes and never creates an integration receipt or deletes
 the worktree. Release proof obligations remain with the parent.
 
-WorkSpec `owned_paths` accepts literal relative files/directories without globs or
-traversal; active overlaps are refused at admission/retry. `dependencies` requires
+Works never own files. Live works may change the same files at once, and each
+worker reconciles its own branch with its base before handing back; a legacy
+`owned_paths` key is accepted and ignored. `dependencies` requires
 integration. `ready_dependencies` maps work IDs to exact accepted SHAs, which callers
 merge, qualify and carry in the release. Artifact `integration_requirements` maps
 receipt keys to release-owned recipes. Acceptance may precede these proofs; integration
