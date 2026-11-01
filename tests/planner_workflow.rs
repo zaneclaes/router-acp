@@ -5166,12 +5166,13 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
     use router_acp::planner_release::{Checkpoint, SelectionAttestation, Stage};
     let tmp = tempfile::tempdir().unwrap();
     let reply = tmp.path().join("reply");
+    let request_file = tmp.path().join("request");
     let f = fixture(|cfg| {
         cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
         command: "/bin/sh".into(),
         args: vec!["-c".into(),
-            "read -r request; case \"$request\" in *release-selection-check*) cat \"$1\";; *) echo '{\"verified_action\":\"release\"}';; esac".into(),
-            "fixture".into(), reply.display().to_string()], timeout_ms: 5000,
+            "read -r request; case \"$request\" in *release-selection-check*) printf '%s\\n' \"$request\" > \"$2\"; cat \"$1\";; *) echo '{\"verified_action\":\"release\"}';; esac".into(),
+            "fixture".into(), reply.display().to_string(), request_file.display().to_string()], timeout_ms: 5000,
     })
     });
     let revision = finished_work(&f.shared).await;
@@ -5183,7 +5184,7 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
             planner_workflow::InputReceipt {
                 origin: "human".into(),
                 replayed_from: None,
-                text: "repair scope".into(),
+                text: "/implement Docs/Plans/REPAIR.md".into(),
                 attachments: vec![],
                 owner: None,
                 acknowledged: true,
@@ -5192,6 +5193,9 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
         );
         let mut hold = run.inputs["human"].clone();
         hold.origin = "agent".into();
+        run.execution_input_id = Some("human".into());
+        run.commands.insert("human".into());
+        run.works.get_mut("work-1").unwrap().spec.external_id = Some("Docs/Plans/REPAIR.md".into());
         run.inputs.insert("repair-hold:fixture:date".into(), hold);
         Ok(())
     })
@@ -5257,6 +5261,19 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
     )
     .unwrap();
     select().await.unwrap();
+    let sent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&request_file).unwrap()).unwrap();
+    assert_eq!(sent["execution_context"]["input_id"], "human");
+    assert_eq!(sent["execution_context"]["command"], "implement");
+    assert_eq!(
+        sent["execution_context"]["arguments"],
+        "Docs/Plans/REPAIR.md"
+    );
+    assert_eq!(sent["admitted_plans"]["work-1"], "Docs/Plans/REPAIR.md");
+    assert_eq!(
+        sent["artifact_revisions"]["work-1"],
+        checkpoint.works["work-1"]
+    );
     let saved = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
     assert_eq!(saved.releases["held"].stage(), Stage::Selected);
     assert!(saved.works["work-1"].integration.is_none());

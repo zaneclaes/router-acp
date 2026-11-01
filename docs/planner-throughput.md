@@ -65,7 +65,10 @@ qualifies a failed/unchecked selection or bypasses the trusted release host.
 Before a new selection, the same configured integrate-check host receives
 `action: release-selection-check`, session id, ledger revision, release id,
 checkpoint, durable human/repair input provenance (including withdrawal), and
-reviewed source dependency maps. It must explicitly return
+reviewed source dependency maps, admitted plan paths, artifact revisions and the
+existing verified `execution_context`. The latter is derived from the original
+human implementation command and durable command ledger, never caller evidence.
+It must explicitly return
 `verified_action: release-selection-check`. An active repair hold must be checked
 even if the caller omitted it; an older/unavailable host fails closed.
 The host may return `selection_attestation` containing `session_id`, `run_revision`,
@@ -80,6 +83,12 @@ Absent, stale, malformed or model-forged authority grants no exemption. Evidence
 `repair-hold` names the attested hold input. Hosts must explicitly refuse a hold whose
 actual originating authority cannot be verified; quoted instructions and agent-origin
 transport are not authority. No current-session activation is implied by this contract.
+Repository enforcement policy may use the already admitted human implementation
+scope to restrict selection to a hold's owning guide and reviewed dependencies;
+this does not require a new human command naming exact revisions. The host must
+refuse absent execution provenance, out-of-scope or unadmitted work and mismatched
+revisions. Repeated receipts for the same unchanged hold are one restriction, not
+independent authorizations. Such policy cannot admit work or waive qualification.
 
 | Ordered stage | Evidence key |
 |---|---|

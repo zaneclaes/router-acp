@@ -2067,6 +2067,11 @@ async fn operate_once(
                         "action":"release-selection-check", "session_id":sid,
                         "run_revision":run.revision, "release_id":release_id,
                         "checkpoint":checkpoint, "inputs":inputs,
+                        "execution_context":execution_context(&run),
+                        "admitted_plans":run.works.iter().filter_map(|(id, work)|
+                            work.spec.external_id.as_ref().map(|plan| (id, plan))).collect::<BTreeMap<_, _>>(),
+                        "artifact_revisions":run.works.iter().filter_map(|(id, work)|
+                            work.artifact.as_ref().map(|artifact| (id, &artifact.revision))).collect::<BTreeMap<_, _>>(),
                         "source_dependencies":run.works.iter().map(|(id, work)|
                             (id, &work.spec.ready_dependencies)).collect::<BTreeMap<_, _>>()
                     }),
