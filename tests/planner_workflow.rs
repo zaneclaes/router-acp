@@ -356,6 +356,59 @@ async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
     );
 }
 
+/// A standing agent instruction that is no longer in force (a lifted repair
+/// hold, a served correction) is retired by id after its acknowledgment, so
+/// a host that counts unwithdrawn holds as active stops counting it. A bulk
+/// drain still takes only unresolved input, and a retired input stays retired.
+#[test]
+fn an_acknowledged_agent_input_is_retired_only_by_id() {
+    use router_acp::planner_input;
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    let hold = "repair-hold:play-alignment:2026-10-31";
+    planner_input::send(&store, SID, &f.repo, hold, "hold until staging passes").unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.inputs.get_mut(hold).unwrap().acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_input::withdraw(&store, SID, &f.repo, None, false, "drain", false)
+            .unwrap()
+            .is_empty(),
+        "a bulk drain took an acknowledged input"
+    );
+    let retired = planner_input::withdraw(
+        &store,
+        SID,
+        &f.repo,
+        Some(hold),
+        false,
+        "lifted on 7101",
+        true,
+    )
+    .unwrap();
+    assert_eq!(retired.len(), 1);
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        planner_input::withdrawal(&run, hold).unwrap().reason,
+        "lifted on 7101"
+    );
+    assert!(run.inputs[hold].acknowledged);
+    assert!(
+        planner_input::withdraw(&store, SID, &f.repo, Some(hold), false, "again", true)
+            .unwrap()
+            .is_empty(),
+        "a retired input was withdrawn twice"
+    );
+}
+
 #[test]
 fn queue_withdrawal_is_explicit_atomic_and_survives_adoption() {
     use router_acp::planner_input;

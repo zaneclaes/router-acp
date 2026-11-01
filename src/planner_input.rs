@@ -68,6 +68,9 @@ pub fn list(store: &StateStore, sid: &str) -> Result<Vec<InputStatus>, String> {
 /// Remove selected pending delivery/reconciliation work, retaining the original
 /// input and an explicit withdrawal reason. Preview and apply use the same
 /// selection; agent-only is the default. Never fake the parent's acknowledgment.
+/// With `id`, an already acknowledged input is retired too: it keeps its
+/// acknowledgment and gains the withdrawal receipt that marks it no longer in
+/// force.
 pub fn withdraw(
     store: &StateStore,
     sid: &str,
@@ -97,12 +100,18 @@ pub fn withdraw(
                 return Err("human-origin input requires --include-human; origin is never inferred from its text".into());
             }
         }
+        // A bulk drain takes only unresolved input. An input named by id may
+        // also be retired after its acknowledgment, so a standing instruction
+        // that is no longer in force (a lifted repair hold, a served
+        // correction) stops counting as active. On 2026-11-01 Chordzy's host
+        // refused every release selection because a hold lifted on 10-31 and
+        // a served correction could not be withdrawn once acknowledged.
         let ids = run
             .inputs
             .iter()
             .filter(|(key, input)| {
                 id.is_none_or(|id| id == key.as_str())
-                    && !input.resolved()
+                    && (!input.resolved() || (id.is_some() && withdrawal(&run, key).is_none()))
                     && (include_human || input.origin == "agent")
             })
             .map(|(id, _)| id.clone())
