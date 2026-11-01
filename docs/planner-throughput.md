@@ -55,6 +55,13 @@ Parent `release {key, release_id, checkpoint}` records stage, full revision and 
 Selection also contains nonempty works (work IDs → finished accepted SHAs); a repair
 selection may name replaces (an unreplaced failed release). Later stages omit those fields.
 
+Batching excludes finished revisions already contained in the repository's actual
+`origin` staging branch. Selection reads its remote tip once and verifies ancestry
+using local Git objects; it neither fetches nor writes refs. Missing remote/object
+data, timeouts and failed ancestry checks leave heads waiting. This exemption only
+prevents redundant source selection: it never integrates a work, clears owed proofs,
+qualifies a failed/unchecked selection or bypasses the trusted release host.
+
 | Ordered stage | Evidence key |
 |---|---|
 | selected | selection |

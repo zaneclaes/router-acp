@@ -2,7 +2,8 @@
 //! deployment authority; these records prevent a restart from losing the
 //! frozen candidate, outstanding evidence, or disposition step.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,6 +75,74 @@ fn evidence_key(stage: Stage) -> &'static str {
 }
 
 pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
+    record_with_carried(run, id, checkpoint, &BTreeSet::new())
+}
+
+/// Only repository-observed ancestry can exempt a head from batching. This does
+/// not integrate the work, discharge its proofs, or qualify a selected head.
+pub async fn record_in_checkout(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    checkout: &Path,
+) -> Result<(), String> {
+    let mut carried = BTreeSet::new();
+    if checkpoint.stage == Stage::Selected && !run.releases.contains_key(id) {
+        // Pin one actual remote tip and require its commit locally. A stale
+        // tracking ref, missing object, failed read or unknown ancestry grants
+        // no exemption. Never fetch or mutate repository refs here.
+        if let Some(remote) = git_read(
+            checkout,
+            &["ls-remote", "--exit-code", "origin", "refs/heads/staging"],
+        )
+        .await
+            && let Some(tip) = remote.split_whitespace().next().filter(|tip| full_sha(tip))
+        {
+            let revisions = run
+                .works
+                .values()
+                .filter_map(|work| work.finish.as_ref().map(|finish| (work, &finish.revision)))
+                .filter(|(work, revision)| finished_revision(work, revision))
+                .map(|(_, revision)| revision.clone())
+                .collect::<BTreeSet<_>>();
+            for revision in revisions {
+                if full_sha(&revision)
+                    && git_read(checkout, &["merge-base", "--is-ancestor", &revision, tip])
+                        .await
+                        .is_some()
+                {
+                    carried.insert(revision);
+                }
+            }
+        }
+    }
+    record_with_carried(run, id, checkpoint, &carried)
+}
+
+async fn git_read(checkout: &Path, args: &[&str]) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .kill_on_drop(true)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn record_with_carried(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    carried: &BTreeSet<String>,
+) -> Result<(), String> {
     if id.trim().is_empty() || !full_sha(&checkpoint.revision) {
         return Err("release checkpoint requires a release id and full revision SHA".into());
     }
@@ -233,7 +302,7 @@ pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result
             ));
         }
     }
-    let waiting = waiting_heads(run, checkpoint);
+    let waiting = waiting_heads(run, checkpoint, carried);
     if checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
         let oldest = waiting
             .iter()
@@ -272,7 +341,11 @@ const ROUND_LIMIT: usize = 12;
 /// corrective round after a failure (it replaces a release that was not
 /// itself a replacement) may isolate its repair; otherwise consecutive
 /// failures would keep every finished head out of staging indefinitely.
-fn waiting_heads(run: &PlannerRun, checkpoint: &Checkpoint) -> Vec<String> {
+fn waiting_heads(
+    run: &PlannerRun,
+    checkpoint: &Checkpoint,
+    carried: &BTreeSet<String>,
+) -> Vec<String> {
     let replaced = checkpoint
         .replaces
         .as_ref()
@@ -305,6 +378,7 @@ fn waiting_heads(run: &PlannerRun, checkpoint: &Checkpoint) -> Vec<String> {
                 return false;
             };
             finished_revision(work, revision)
+                && !carried.contains(revision)
                 && !checkpoint.works.contains_key(*id)
                 && !checkpoint.evidence.contains_key(&format!("deferred:{id}"))
                 && !run.releases.iter().any(|(other_id, other)| {

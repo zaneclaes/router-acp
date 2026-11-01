@@ -2040,7 +2040,11 @@ async fn operate_once(
             if shared.cfg.routers.planner.integrate_check.is_none() {
                 return Err("release checkpoints require a trusted integrate-check host".into());
             }
-            crate::planner_release::record(&mut run, &release_id, &checkpoint)?;
+            let cwd = shared
+                .with_session(sid, |session| session.cwd.clone())
+                .ok_or("unknown planner session")?;
+            crate::planner_release::record_in_checkout(&mut run, &release_id, &checkpoint, &cwd)
+                .await?;
             let mut check = value.clone();
             check["release_record"] =
                 serde_json::to_value(&run.releases[&release_id]).map_err(|e| e.to_string())?;

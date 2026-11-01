@@ -4946,6 +4946,103 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     );
 }
 
+// Historical finished heads already on staging must not crowd out new source.
+#[tokio::test]
+async fn release_batching_excludes_only_verified_staging_ancestors() {
+    use router_acp::planner_release::{Checkpoint, Stage, record_in_checkout};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let historical = run.works["work-1"].clone();
+    run.works.insert("historical".into(), historical.clone());
+    let selected = Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: BTreeMap::from([("work-1".into(), revision.clone())]),
+        replaces: None,
+        evidence: BTreeMap::from([("selection".into(), "round.md".into())]),
+    };
+    // A missing remote branch is unknown, even if both heads equal HEAD.
+    assert!(
+        record_in_checkout(&mut run.clone(), "round", &selected, &f.repo)
+            .await
+            .unwrap_err()
+            .contains("under-batches")
+    );
+    git(
+        &f.repo,
+        &["push", "origin", &format!("{revision}:refs/heads/staging")],
+    );
+    record_in_checkout(&mut run, "round", &selected, &f.repo)
+        .await
+        .unwrap();
+    assert_eq!(run.works["historical"].status, historical.status);
+    assert!(run.works["historical"].integration.is_none());
+    assert_eq!(run.works["historical"].artifact, historical.artifact);
+    run.releases.clear();
+
+    // A genuinely uncarried descendant still demands a place in the batch.
+    git(&f.repo, &["commit", "--allow-empty", "-m", "uncarried"]);
+    let uncarried = git(&f.repo, &["rev-parse", "HEAD"]);
+    for candidate in [&uncarried, &"f".repeat(40)] {
+        let work = run.works.get_mut("historical").unwrap();
+        work.artifact.as_mut().unwrap().revision = candidate.clone();
+        work.review.as_mut().unwrap().revision = candidate.clone();
+        work.finish.as_mut().unwrap().revision = candidate.clone();
+        assert!(
+            record_in_checkout(&mut run.clone(), "round", &selected, &f.repo)
+                .await
+                .unwrap_err()
+                .contains("historical")
+        );
+    }
+    run.works.insert("historical".into(), historical);
+    git(
+        &f.repo,
+        &["push", "origin", &format!("{uncarried}:refs/heads/staging")],
+    );
+    record_in_checkout(&mut run.clone(), "descendant", &selected, &f.repo)
+        .await
+        .unwrap();
+    // A stale tracking ref is not remote custody after the branch disappears.
+    git(&f.repo, &["push", "origin", ":refs/heads/staging"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/staging", &revision],
+    );
+    assert!(
+        record_in_checkout(&mut run.clone(), "round", &selected, &f.repo)
+            .await
+            .unwrap_err()
+            .contains("under-batches")
+    );
+    git(
+        &f.repo,
+        &["push", "origin", &format!("{revision}:refs/heads/staging")],
+    );
+    // Ancestry never qualifies an unchecked or failed selected artifact.
+    for control in ["unaccepted", "unchecked", "unresolved"] {
+        let mut invalid = run.clone();
+        let work = invalid.works.get_mut("work-1").unwrap();
+        match control {
+            "unaccepted" => work.review.as_mut().unwrap().accepted = false,
+            "unchecked" => work.spec.required_checks.push("missing-gate".into()),
+            _ => work
+                .artifact
+                .as_mut()
+                .unwrap()
+                .unresolved
+                .push("failed-gate".into()),
+        }
+        assert!(
+            record_in_checkout(&mut invalid, "round", &selected, &f.repo)
+                .await
+                .is_err(),
+            "{control}"
+        );
+    }
+}
+
 // Staging 2026-10-21: six corrective rounds in a row each carried one repair
 // while 50 accepted heads waited, so the "clean round after a corrective"
 // never came and nothing reached production.
