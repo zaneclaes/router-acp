@@ -322,11 +322,31 @@ fn record_with_carried(
                     .into(),
             );
         }
+        // A repair hold lifts on its candidate's staging pass. Retire it here, in the same
+        // ledger revision, so the run never depends on anyone remembering to clear it.
+        let bound_hold = (checkpoint.stage == Stage::StagingPassed)
+            .then(|| {
+                release
+                    .checkpoints
+                    .first()
+                    .and_then(|selected| selected.evidence.get("repair-hold").cloned())
+            })
+            .flatten();
         run.releases
             .get_mut(id)
             .unwrap()
             .checkpoints
             .push(checkpoint.clone());
+        if let Some(hold) = bound_hold {
+            crate::planner_input::retire_lifted_hold(
+                run,
+                &hold,
+                &format!(
+                    "lifted: release {id} recorded STAGING FULL PASS at {}",
+                    checkpoint.revision
+                ),
+            );
+        }
         return Ok(());
     }
     if checkpoint.stage != Stage::Selected || checkpoint.works.is_empty() {

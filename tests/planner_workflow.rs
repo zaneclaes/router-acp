@@ -356,6 +356,59 @@ async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
     );
 }
 
+/// A standing agent instruction that is no longer in force (a lifted repair
+/// hold, a served correction) is retired by id after its acknowledgment, so
+/// a host that counts unwithdrawn holds as active stops counting it. A bulk
+/// drain still takes only unresolved input, and a retired input stays retired.
+#[test]
+fn an_acknowledged_agent_input_is_retired_only_by_id() {
+    use router_acp::planner_input;
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    let hold = "repair-hold:play-alignment:2026-10-31";
+    planner_input::send(&store, SID, &f.repo, hold, "hold until staging passes").unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.inputs.get_mut(hold).unwrap().acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_input::withdraw(&store, SID, &f.repo, None, false, "drain", false)
+            .unwrap()
+            .is_empty(),
+        "a bulk drain took an acknowledged input"
+    );
+    let retired = planner_input::withdraw(
+        &store,
+        SID,
+        &f.repo,
+        Some(hold),
+        false,
+        "lifted on 7101",
+        true,
+    )
+    .unwrap();
+    assert_eq!(retired.len(), 1);
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        planner_input::withdrawal(&run, hold).unwrap().reason,
+        "lifted on 7101"
+    );
+    assert!(run.inputs[hold].acknowledged);
+    assert!(
+        planner_input::withdraw(&store, SID, &f.repo, Some(hold), false, "again", true)
+            .unwrap()
+            .is_empty(),
+        "a retired input was withdrawn twice"
+    );
+}
+
 #[test]
 fn queue_withdrawal_is_explicit_atomic_and_survives_adoption() {
     use router_acp::planner_input;
@@ -4691,6 +4744,78 @@ async fn works_never_own_files() {
     let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
     let saved = serde_json::to_value(&run.works["second"].spec).unwrap();
     assert!(saved.get("owned_paths").is_none());
+}
+
+/// A repair hold lifts on its candidate's staging pass, and the ledger retires every receipt of
+/// that hold in the same revision. No agent, and no later reminder, is needed to clear it; an
+/// unrelated hold stays in force. (Chordzy, 2026-11-01: a hold lifted on 10-31 stayed in force.)
+#[tokio::test]
+async fn a_staging_pass_retires_the_repair_hold_its_selection_bound() {
+    use router_acp::planner_input;
+    use router_acp::planner_release::{self, Checkpoint, Release, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let receipt = |text: &str| planner_workflow::InputReceipt {
+        origin: "agent".into(),
+        replayed_from: None,
+        text: text.into(),
+        attachments: vec![],
+        owner: None,
+        acknowledged: true,
+        delivered_to: Default::default(),
+    };
+    for id in [
+        "repair-hold:resize:2026-11-01",
+        "repair-hold:resize:2026-11-01:v2",
+        "repair-hold:other:2026-11-01",
+    ] {
+        run.inputs.insert(id.into(), receipt("Repair hold"));
+    }
+    let checkpoint = |stage, key: &str| Checkpoint {
+        stage,
+        revision: revision.clone(),
+        works: BTreeMap::new(),
+        replaces: None,
+        evidence: BTreeMap::from([(key.into(), "preserved-evidence.md".into())]),
+    };
+    let mut selected = checkpoint(Stage::Selected, "selection");
+    selected.works.insert("work-1".into(), revision.clone());
+    selected.evidence.insert(
+        "repair-hold".into(),
+        "repair-hold:resize:2026-11-01:v2".into(),
+    );
+    run.releases.insert(
+        "held".into(),
+        Release {
+            candidate: revision.clone(),
+            works: selected.works.clone(),
+            checkpoints: vec![
+                selected,
+                checkpoint(Stage::CandidatePassed, "candidate-build"),
+                checkpoint(Stage::StagingDeployed, "staging-rollout"),
+            ],
+            superseded_by: None,
+        },
+    );
+    planner_release::record(
+        &mut run,
+        "held",
+        &checkpoint(Stage::StagingPassed, "staging-smoke"),
+    )
+    .unwrap();
+    for id in [
+        "repair-hold:resize:2026-11-01",
+        "repair-hold:resize:2026-11-01:v2",
+    ] {
+        let retired = planner_input::withdrawal(&run, id).expect("lifted hold stayed in force");
+        assert!(
+            retired
+                .reason
+                .contains("release held recorded STAGING FULL PASS")
+        );
+    }
+    assert!(planner_input::withdrawal(&run, "repair-hold:other:2026-11-01").is_none());
 }
 
 #[tokio::test]
