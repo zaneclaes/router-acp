@@ -55,6 +55,47 @@ pub fn withdrawal(run: &PlannerRun, id: &str) -> Option<planner_workflow::InputW
         .and_then(|value| serde_json::from_str(value).ok())
 }
 
+/// Retire every receipt of the repair hold `hold` (`repair-hold:<slug>:…`) that is still in force,
+/// with `reason` as its withdrawal. The release ledger calls this when a release bound to that
+/// hold records its staging pass, so a lifted hold never outlives its lift and nothing outside
+/// the run has to clear it (Chordzy, 2026-11-01: a hold lifted on 10-31 blocked every later
+/// selection until another agent intervened). Returns the retired input ids.
+pub(crate) fn retire_lifted_hold(run: &mut PlannerRun, hold: &str, reason: &str) -> Vec<String> {
+    let Some(slug) = hold
+        .strip_prefix("repair-hold:")
+        .and_then(|rest| rest.split(':').next())
+        .filter(|slug| !slug.is_empty())
+    else {
+        return Vec::new();
+    };
+    let prefix = format!("repair-hold:{slug}:");
+    let ids = run
+        .inputs
+        .keys()
+        .filter(|key| key.starts_with(&prefix) && withdrawal(run, key).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in &ids {
+        let receipt = planner_workflow::InputWithdrawal {
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            reason: reason.into(),
+        };
+        if let Ok(value) = serde_json::to_string(&receipt) {
+            run.receipts.insert(format!("input-withdrawal:{id}"), value);
+        }
+        if let Some(input) = run.inputs.get_mut(id) {
+            input.acknowledged = true;
+        }
+        if let Some(wake) = run.wakes.get_mut(&format!("input:{id}")) {
+            wake.acknowledged = true;
+            wake.claim_pid = 0;
+        }
+    }
+    run.parent_queue
+        .retain(|queued| !ids.contains(&queued.input_id));
+    ids
+}
+
 /// Metadata only: no historical prompt text or attachments in a queue census.
 pub fn list(store: &StateStore, sid: &str) -> Result<Vec<InputStatus>, String> {
     let run = store.load(sid)?.ok_or("planner run missing")?;

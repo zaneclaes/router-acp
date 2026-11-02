@@ -4746,6 +4746,78 @@ async fn works_never_own_files() {
     assert!(saved.get("owned_paths").is_none());
 }
 
+/// A repair hold lifts on its candidate's staging pass, and the ledger retires every receipt of
+/// that hold in the same revision. No agent, and no later reminder, is needed to clear it; an
+/// unrelated hold stays in force. (Chordzy, 2026-11-01: a hold lifted on 10-31 stayed in force.)
+#[tokio::test]
+async fn a_staging_pass_retires_the_repair_hold_its_selection_bound() {
+    use router_acp::planner_input;
+    use router_acp::planner_release::{self, Checkpoint, Release, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let receipt = |text: &str| planner_workflow::InputReceipt {
+        origin: "agent".into(),
+        replayed_from: None,
+        text: text.into(),
+        attachments: vec![],
+        owner: None,
+        acknowledged: true,
+        delivered_to: Default::default(),
+    };
+    for id in [
+        "repair-hold:resize:2026-11-01",
+        "repair-hold:resize:2026-11-01:v2",
+        "repair-hold:other:2026-11-01",
+    ] {
+        run.inputs.insert(id.into(), receipt("Repair hold"));
+    }
+    let checkpoint = |stage, key: &str| Checkpoint {
+        stage,
+        revision: revision.clone(),
+        works: BTreeMap::new(),
+        replaces: None,
+        evidence: BTreeMap::from([(key.into(), "preserved-evidence.md".into())]),
+    };
+    let mut selected = checkpoint(Stage::Selected, "selection");
+    selected.works.insert("work-1".into(), revision.clone());
+    selected.evidence.insert(
+        "repair-hold".into(),
+        "repair-hold:resize:2026-11-01:v2".into(),
+    );
+    run.releases.insert(
+        "held".into(),
+        Release {
+            candidate: revision.clone(),
+            works: selected.works.clone(),
+            checkpoints: vec![
+                selected,
+                checkpoint(Stage::CandidatePassed, "candidate-build"),
+                checkpoint(Stage::StagingDeployed, "staging-rollout"),
+            ],
+            superseded_by: None,
+        },
+    );
+    planner_release::record(
+        &mut run,
+        "held",
+        &checkpoint(Stage::StagingPassed, "staging-smoke"),
+    )
+    .unwrap();
+    for id in [
+        "repair-hold:resize:2026-11-01",
+        "repair-hold:resize:2026-11-01:v2",
+    ] {
+        let retired = planner_input::withdrawal(&run, id).expect("lifted hold stayed in force");
+        assert!(
+            retired
+                .reason
+                .contains("release held recorded STAGING FULL PASS")
+        );
+    }
+    assert!(planner_input::withdrawal(&run, "repair-hold:other:2026-11-01").is_none());
+}
+
 #[tokio::test]
 async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     use router_acp::planner_release::{self, Checkpoint, Stage};
