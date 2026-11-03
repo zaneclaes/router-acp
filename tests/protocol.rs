@@ -16858,8 +16858,10 @@ async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next()
 /// The live crash's trigger: the stall watchdog cancelled a quiet parent
 /// turn, and within the cancel grace the turn came back and asked the person
 /// a question. The watchdog restarted the adapter under the open question
-/// anyway. A turn that revives during the grace is watched afresh, and an
-/// open question is the operator's wait, not a stall.
+/// anyway. A turn that revives during the grace is watched afresh. A planner
+/// run never puts a question to the operator (operator 2026-11-03: the run
+/// unblocks itself and records only human-only actions), so the question is
+/// refused at once with that instruction instead of waiting on anyone.
 #[tokio::test]
 async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_restarted() {
     let state = temp_state_file("stall-revived");
@@ -16889,11 +16891,18 @@ async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_rest
             std::fs::write(&gate_for_test, "").unwrap();
             let answered = tokio::time::timeout(Duration::from_secs(20), asking)
                 .await
-                .expect("the turn ends once the person answers")
+                .expect("the turn ends without anyone answering")
                 .unwrap()?;
             assert_eq!(answered.stop_reason, StopReason::EndTurn);
             let text = agent_text(&observed, &sid);
-            assert!(text.contains("elicit:accept"), "{text}");
+            assert!(
+                !text.contains("elicit:accept"),
+                "the operator was asked: {text}"
+            );
+            assert!(
+                text.contains("elicit-error") && text.contains("autonomous planner run"),
+                "the agent is told to unblock itself: {text}"
+            );
             assert!(text.contains("parent turn stalled"), "{text}");
             assert!(!text.contains("restarting its adapter"), "{text}");
             Ok(())
