@@ -6539,6 +6539,13 @@ pub(crate) async fn run_primary_turn(
         .flatten()
         .is_some();
     publish_session_activity(&shared, &router_sid, true);
+    // A client attached to a restored session learns its goal with the first turn.
+    if let Some(goal) = shared
+        .with_session(&router_sid, |s| s.goal.clone())
+        .flatten()
+    {
+        crate::goals::publish(&shared, &router_sid, Some(&goal));
+    }
     let mut req = req;
     let result = loop {
         let turn = run_primary_turn_inner(
