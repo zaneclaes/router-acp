@@ -2906,6 +2906,9 @@ pub fn handle_downstream_dispatch(
                             .and_then(|k| k.as_str())
                             .unwrap_or("");
                         if su == "tool_call" || su == "tool_call_update" {
+                            // Work the agent starts with its own background tools
+                            // reaches the client as `_router/background`.
+                            crate::native_backgrounds::observe(shared, &router_sid, update);
                             let tool_id = update
                                 .get("toolCallId")
                                 .and_then(|v| v.as_str())
