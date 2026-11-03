@@ -11511,6 +11511,16 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
             let _ = responder.respond_with_result(result);
             return Ok(Handled::Yes);
         }
+        // A goal edited or removed from the client's goal row, also mid-turn.
+        if msg.method() == crate::goals::METHOD {
+            let result = crate::goals::control(&shared, msg.params())
+                .map_err(|e| AcpError::invalid_params().data(e));
+            if let Some(sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) {
+                let _ = persist_runtime_context(&shared, sid);
+            }
+            let _ = responder.respond_with_result(result);
+            return Ok(Handled::Yes);
+        }
         // kory's `/shutdown`: answered at once; the drain reports itself as
         // `_router/shutdown_progress` notifications.
         if msg.method() == crate::planner_shutdown::METHOD {

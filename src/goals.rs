@@ -156,7 +156,8 @@ fn affirmation(line: &str) -> Option<bool> {
         .trim()
         .trim_matches('*')
         .trim();
-    let word = rest.split(|c: char| !c.is_ascii_alphabetic()).next()?;
+    // Only the word: a line quoting these terms ("`GOAL: MET` on its own line…") says nothing.
+    let word = rest.trim_end_matches(['.', '!', '*', '`', ' ']);
     match word.to_ascii_uppercase().as_str() {
         "MET" => Some(true),
         "UNMEETABLE" => Some(false),
@@ -341,6 +342,48 @@ pub fn send_control(shared: &Arc<Shared>, router_sid: &str, objective: Option<&s
         }
         Ok(())
     });
+}
+
+/// `_router/goal` from the client: edit or remove the goal without a prompt, as while a
+/// turn runs. `{sessionId, action: "set" | "clear", objective}`. An edited goal reaches the
+/// agent with its next turn, and a removed one ends enforcement when this turn ends.
+pub fn control(shared: &Arc<Shared>, params: &Value) -> Result<Value, String> {
+    let sid = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or("_router/goal requires sessionId")?;
+    let family = shared
+        .with_session(sid, |s| s.pin.as_ref().map(|p| family(&p.candidate.agent)))
+        .ok_or("no such session")?;
+    let goal = match params.get("action").and_then(Value::as_str) {
+        Some("set") => {
+            let objective = params
+                .get("objective")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|objective| !objective.is_empty())
+                .ok_or("_router/goal set requires an objective")?;
+            let goal = Goal::new(objective);
+            shared.with_session(sid, |s| s.goal = Some(goal.clone()));
+            if family == Some(Family::ControlRequest) {
+                send_control(shared, sid, Some(objective));
+            }
+            Some(goal)
+        }
+        Some("clear") => {
+            shared.with_session(sid, |s| {
+                s.goal_clear_pending =
+                    s.goal.take().is_some() && family == Some(Family::SlashCommand);
+            });
+            if family == Some(Family::ControlRequest) {
+                send_control(shared, sid, None);
+            }
+            None
+        }
+        _ => return Err("_router/goal action must be set or clear".to_string()),
+    };
+    publish(shared, sid, goal.as_ref());
+    Ok(notification(sid, goal.as_ref()))
 }
 
 /// After a turn: whether the goal sends the agent back to work, and with what.
