@@ -5071,6 +5071,99 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
     );
 }
 
+// A failed production rollout may overlap a staging failure. The latter must
+// keep its failure history while freeing the staging lane for the former's repair.
+#[tokio::test]
+async fn two_failed_release_lanes_require_exact_staging_abandonment_before_repair() {
+    use router_acp::planner_release::{self, Checkpoint, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let checkpoint = |stage, key: &str| Checkpoint {
+        stage,
+        revision: revision.clone(),
+        works: BTreeMap::new(),
+        replaces: None,
+        evidence: BTreeMap::from([(key.into(), "preserved-evidence.md".into())]),
+    };
+    let mut production = checkpoint(Stage::Selected, "selection");
+    production.works.insert("work-1".into(), revision.clone());
+    planner_release::record(&mut run, "production", &production).unwrap();
+    for (stage, key) in [
+        (Stage::CandidatePassed, "candidate-build"),
+        (Stage::StagingDeployed, "staging-rollout"),
+        (Stage::StagingPassed, "staging-smoke"),
+        (Stage::ProductionMerged, "production-pr"),
+    ] {
+        planner_release::record(&mut run, "production", &checkpoint(stage, key)).unwrap();
+    }
+    let mut second = run.works["work-1"].clone();
+    second.spec.work_id = "work-2".into();
+    run.works.insert("work-2".into(), second);
+    let mut staging = checkpoint(Stage::Selected, "selection");
+    staging.works.insert("work-2".into(), revision.clone());
+    planner_release::record(&mut run, "staging", &staging).unwrap();
+    planner_release::record(
+        &mut run,
+        "production",
+        &checkpoint(Stage::Failed, "failure"),
+    )
+    .unwrap();
+    planner_release::record(&mut run, "staging", &checkpoint(Stage::Failed, "failure")).unwrap();
+
+    let mut repair = checkpoint(Stage::Selected, "selection");
+    repair.works = BTreeMap::from([
+        ("work-1".into(), revision.clone()),
+        ("work-2".into(), revision.clone()),
+    ]);
+    repair.replaces = Some("production".into());
+    assert!(planner_release::record(&mut run, "repair", &repair).is_err());
+    assert!(
+        planner_release::record(
+            &mut run,
+            "production",
+            &checkpoint(Stage::Abandoned, "abandonment")
+        )
+        .is_err()
+    );
+    let mut foreign = checkpoint(Stage::Abandoned, "abandonment");
+    foreign.revision = "f".repeat(40);
+    assert!(planner_release::record(&mut run, "staging", &foreign).is_err());
+    planner_release::record(
+        &mut run,
+        "staging",
+        &checkpoint(Stage::Abandoned, "abandonment"),
+    )
+    .unwrap();
+    assert_eq!(run.releases["staging"].checkpoints.len(), 3);
+    assert_eq!(run.releases["staging"].checkpoints[1].stage, Stage::Failed);
+    assert!(
+        planner_release::record(
+            &mut run,
+            "staging",
+            &checkpoint(Stage::Abandoned, "abandonment")
+        )
+        .is_ok()
+    );
+    assert!(planner_release::record(&mut run, "unreplaced", &staging).is_err());
+    planner_release::record(&mut run, "repair", &repair).unwrap();
+    assert!(
+        planner_release::record(
+            &mut run,
+            "repair",
+            &checkpoint(Stage::ProductionPassed, "production-smoke")
+        )
+        .is_err()
+    );
+    assert!(
+        planner_release::integration_allowed(&run, "work-1", &receipt(&revision, "merge")).is_err()
+    );
+    assert_eq!(
+        run.releases["production"].superseded_by.as_deref(),
+        Some("repair")
+    );
+}
+
 // Historical finished heads already on staging must not crowd out new source.
 #[tokio::test]
 async fn release_batching_excludes_only_verified_staging_ancestors() {
