@@ -11512,10 +11512,29 @@ fn log_user_steer(
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
     if let Dispatch::Request(msg, responder) = message {
-        if msg.method() == crate::planner_shutdown::STATUS_METHOD {
-            let result = crate::planner_shutdown::status(&shared, msg.params())
+        // kory's run census and `/shutdown`. Both read the whole planner document under the
+        // state lock, and this handler runs on the task that also reads and answers everything
+        // else on the client connection, so the wait happens on a blocking thread. `/shutdown`
+        // answers at once otherwise; its drain reports itself as `_router/shutdown_progress`.
+        let method = msg.method();
+        if method == crate::planner_shutdown::STATUS_METHOD
+            || method == crate::planner_shutdown::METHOD
+        {
+            let is_status = method == crate::planner_shutdown::STATUS_METHOD;
+            let params = msg.params().clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    if is_status {
+                        crate::planner_shutdown::status(&shared, &params)
+                    } else {
+                        crate::planner_shutdown::request(&shared, &params)
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
                 .map_err(|e| AcpError::invalid_params().data(e));
-            let _ = responder.respond_with_result(result);
+                let _ = responder.respond_with_result(result);
+            });
             return Ok(Handled::Yes);
         }
         // A goal edited or removed from the client's goal row, also mid-turn.
@@ -11525,14 +11544,6 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
             if let Some(sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) {
                 let _ = persist_runtime_context(&shared, sid);
             }
-            let _ = responder.respond_with_result(result);
-            return Ok(Handled::Yes);
-        }
-        // kory's `/shutdown`: answered at once; the drain reports itself as
-        // `_router/shutdown_progress` notifications.
-        if msg.method() == crate::planner_shutdown::METHOD {
-            let result = crate::planner_shutdown::request(&shared, msg.params())
-                .map_err(|e| AcpError::invalid_params().data(e));
             let _ = responder.respond_with_result(result);
             return Ok(Handled::Yes);
         }
