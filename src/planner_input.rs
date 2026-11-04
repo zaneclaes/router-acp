@@ -96,6 +96,22 @@ pub(crate) fn retire_lifted_hold(run: &mut PlannerRun, hold: &str, reason: &str)
     ids
 }
 
+/// Whether a release bound to repair hold `id` at selection recorded its staging pass at
+/// that same candidate. The release ledger is the only proof of a lift: a withdrawal
+/// reason, an agent's lift message or a same-slug prefix is not.
+fn recorded_hold_lift(run: &PlannerRun, id: &str) -> bool {
+    use crate::planner_release::Stage;
+    run.releases.values().any(|release| {
+        release.checkpoints.first().is_some_and(|selected| {
+            selected.stage == Stage::Selected
+                && selected.revision == release.candidate
+                && selected.evidence.get("repair-hold").map(String::as_str) == Some(id)
+        }) && release.checkpoints.iter().any(|checkpoint| {
+            checkpoint.stage == Stage::StagingPassed && checkpoint.revision == release.candidate
+        })
+    })
+}
+
 /// Metadata only: no historical prompt text or attachments in a queue census.
 pub fn list(store: &StateStore, sid: &str) -> Result<Vec<InputStatus>, String> {
     let run = store.load(sid)?.ok_or("planner run missing")?;
@@ -162,6 +178,14 @@ pub fn withdraw(
         }
         // Validate the entire batch before changing any record.
         for id in &ids {
+            // A repair hold lifts only on its bound release's recorded staging pass
+            // (RWC 2026-11-02: an explicit withdrawal with a "lifted" reason dropped a
+            // hold no release had passed).
+            if id.starts_with("repair-hold:") && !recorded_hold_lift(&run, id) {
+                return Err(format!(
+                    "input {id} has no recorded staging pass bound to its hold; it lifts when the release it bound records STAGING FULL PASS"
+                ));
+            }
             if let Some(wake) = run.wakes.get(&format!("input:{id}"))
                 && wake.claim_pid != 0
                 && planner_workflow::owner_alive(&planner_workflow::Attempt {

@@ -217,6 +217,23 @@ pub struct Work {
     /// so its end reads as that handoff rather than as a lost attempt.
     #[serde(default)]
     pub handoff: Option<crate::delegate_hook::Handoff>,
+    /// Bounded diagnoses the parent reviewed, by diagnosis key. Delivery
+    /// only: never completion, acceptance or release eligibility.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub diagnoses: BTreeMap<String, DiagnosisDelivery>,
+}
+
+/// One reviewed diagnosis, bound to the attempt, source and scope it came from
+/// and to the SHA-256 of each evidence file. The router records who reviewed
+/// it and when; a caller cannot supply that identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosisDelivery {
+    pub attempt_id: String,
+    pub revision: String,
+    pub scope: String,
+    pub evidence: BTreeMap<String, String>,
+    pub reviewed_by: String,
+    pub reviewed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -507,6 +524,19 @@ pub enum Operation {
         work_id: String,
         status: WorkStatus,
         reason: String,
+    },
+    /// Parent records a bounded diagnosis a reassigned attempt delivered, after
+    /// the trusted host verifies its source and evidence bytes. It changes no
+    /// status, handoff or reconciliation: the work still needs `reconcile`.
+    Diagnosis {
+        key: String,
+        work_id: String,
+        attempt_id: String,
+        revision: String,
+        diagnosis_key: String,
+        scope: String,
+        accepted: bool,
+        evidence: BTreeMap<String, String>,
     },
     AcknowledgeInput {
         key: String,
@@ -1383,7 +1413,9 @@ pub fn input_blocks(
 pub fn tool_definition() -> Value {
     json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
-            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","diagnosis","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "diagnosis_key":{"type":"string", "description":"Diagnosis: records a reviewed bounded diagnosis a reassignment_required attempt delivered (work_id, attempt_id, revision, scope, accepted, evidence path→sha256). Delivery only; reconcile still follows."},
+            "scope":{"type":"string"},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
             "release_id":{"type":"string"}, "checkpoint":{"type":"object"},
             "plan_id":{"type":"string"}, "detail":{"type":"string"},
@@ -1543,6 +1575,7 @@ async fn operate_once(
                 "paused":work.paused,"recovery":run.capacity.resumes.get(id),"reconciliation":work.reconciliation,
                 "spec":work_id.as_ref().map(|_| &work.spec),
                 "handoff":work_id.as_ref().and(work.handoff.as_ref()),
+                "diagnoses":work_id.as_ref().map(|_| &work.diagnoses),
                 "related_ready_sources":work_id.as_ref().map(|_| related_ready_sources(&run, work)),
                 "ready_at_ms":work.ready_at_ms,"ready_age_secs":work.ready_at_ms.map(|at| (chrono::Utc::now().timestamp_millis() - at).max(0) / 1000),
                 "required_checks":work.spec.required_checks,"required_integration_evidence":work.spec.required_integration_evidence,
@@ -1759,6 +1792,8 @@ async fn operate_once(
                     .prior_specs
                     .push(current.spec.clone());
             }
+            // Diagnoses stay: they are historical evidence bound to their source, not
+            // part of the assignment a reconciliation replaces.
             current.spec = work;
             current.workspace = Some(workspace);
             current.reconciliation.required = false;
@@ -1829,6 +1864,7 @@ async fn operate_once(
                         last_output: None,
                         paused: false,
                         handoff: None,
+                        diagnoses: BTreeMap::new(),
                     },
                 );
             }
@@ -2150,6 +2186,98 @@ async fn operate_once(
             let work = run.works.get_mut(&work_id).ok_or("unknown work identity")?;
             work.status = status;
             work.reason = Some(reason);
+        }
+        Operation::Diagnosis {
+            work_id,
+            attempt_id,
+            revision,
+            diagnosis_key,
+            scope,
+            accepted,
+            evidence,
+            ..
+        } => {
+            if shared.cfg.routers.planner.integrate_check.is_none() {
+                return Err(
+                    "diagnosis requires a configured host to verify its source and evidence".into(),
+                );
+            }
+            let work = run.works.get(&work_id).ok_or("unknown work identity")?;
+            // The same shape the repository host accepts for diagnosis_key.
+            let key_ok = (1..=80).contains(&diagnosis_key.len())
+                && diagnosis_key.bytes().enumerate().all(|(i, byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || (i > 0 && byte == b'-')
+                });
+            if !accepted
+                || !key_ok
+                || evidence.is_empty()
+                || evidence
+                    .values()
+                    .any(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err("diagnosis requires the parent's acceptance, a key and a SHA-256 for each evidence file".into());
+            }
+            if work.status != WorkStatus::Interrupted
+                || work
+                    .attempt
+                    .as_ref()
+                    .is_none_or(|a| !a.ended || a.id != attempt_id)
+                || work
+                    .handoff
+                    .as_ref()
+                    .is_none_or(|h| h.kind != "reassignment_required")
+                || !work.reconciliation.required
+            {
+                return Err("diagnosis is recorded only for the ended attempt that handed off reassignment_required and still awaits reconciliation".into());
+            }
+            if work.artifact.is_some() || work.finish.is_some() || work.integration.is_some() {
+                return Err(
+                    "work with an artifact, finish or integration is not a bounded diagnosis"
+                        .into(),
+                );
+            }
+            if scope != work.spec.scope {
+                return Err("diagnosis scope differs from the assignment's current scope".into());
+            }
+            if run
+                .releases
+                .values()
+                .any(|release| release.works.contains_key(&work_id))
+            {
+                return Err("work in a frozen release cannot record a diagnosis".into());
+            }
+            if let Some(existing) = work.diagnoses.get(&diagnosis_key) {
+                if existing.attempt_id == attempt_id
+                    && existing.revision == revision
+                    && existing.scope == scope
+                    && existing.evidence == evidence
+                {
+                    return Ok(json!({"replayed":true,"revision":run.revision}).to_string());
+                }
+                return Err("this diagnosis key already records a different delivery; a new diagnosis needs a new key".into());
+            }
+            let mut check = value.clone();
+            check["action"] = json!("diagnosis-check");
+            check["assignment"] = serde_json::to_value(work).map_err(|e| e.to_string())?;
+            crate::planner_guard::integrate_check(shared, sid, &check).await?;
+            // Review identity comes from this session, never from the operation.
+            run.works
+                .get_mut(&work_id)
+                .ok_or("unknown work identity")?
+                .diagnoses
+                .insert(
+                    diagnosis_key,
+                    DiagnosisDelivery {
+                        attempt_id,
+                        revision,
+                        scope,
+                        evidence,
+                        reviewed_by: sid.to_string(),
+                        reviewed_at_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                );
         }
         Operation::AcknowledgeInput {
             input_id, owner, ..

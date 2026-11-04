@@ -356,6 +356,35 @@ async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
     );
 }
 
+fn release_for(
+    candidate: &str,
+    selected_evidence: BTreeMap<String, String>,
+    staging_revision: Option<&str>,
+) -> router_acp::planner_release::Release {
+    let mut checkpoints = vec![router_acp::planner_release::Checkpoint {
+        stage: router_acp::planner_release::Stage::Selected,
+        revision: candidate.into(),
+        works: BTreeMap::new(),
+        replaces: None,
+        evidence: selected_evidence,
+    }];
+    if let Some(revision) = staging_revision {
+        checkpoints.push(router_acp::planner_release::Checkpoint {
+            stage: router_acp::planner_release::Stage::StagingPassed,
+            revision: revision.into(),
+            works: BTreeMap::new(),
+            replaces: None,
+            evidence: BTreeMap::new(),
+        });
+    }
+    router_acp::planner_release::Release {
+        candidate: candidate.into(),
+        works: BTreeMap::new(),
+        checkpoints,
+        superseded_by: None,
+    }
+}
+
 /// A standing agent instruction that is no longer in force (a lifted repair
 /// hold, a served correction) is retired by id after its acknowledgment, so
 /// a host that counts unwithdrawn holds as active stops counting it. A bulk
@@ -384,6 +413,109 @@ fn an_acknowledged_agent_input_is_retired_only_by_id() {
             .is_empty(),
         "a bulk drain took an acknowledged input"
     );
+    // A bulk apply that includes an unlifted hold withdraws nothing, including
+    // an ordinary unresolved input in the same batch.
+    planner_input::send(&store, SID, &f.repo, "side-note", "unrelated").unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.inputs.get_mut(hold).unwrap().acknowledged = false;
+        Ok(())
+    })
+    .unwrap();
+    let mixed = planner_input::withdraw(&store, SID, &f.repo, None, false, "drain", true);
+    assert!(
+        mixed.as_ref().is_err_and(|error| error.contains("no recorded staging pass")),
+        "{mixed:?}"
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(planner_input::withdrawal(&run, hold).is_none());
+    assert!(planner_input::withdrawal(&run, "side-note").is_none());
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.inputs.get_mut(hold).unwrap().acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    let preview = planner_input::withdraw(
+        &store,
+        SID,
+        &f.repo,
+        Some(hold),
+        false,
+        "lifted on 7101",
+        false,
+    )
+    .unwrap();
+    assert_eq!(preview.len(), 1);
+    assert!(
+        planner_input::withdrawal(
+            &planner_workflow::load(&f.shared, SID).unwrap().unwrap(),
+            hold
+        )
+        .is_none(),
+        "a preview withdrew a repair hold"
+    );
+    let candidate = "e".repeat(40);
+    let refuse = |detail: &str| {
+        let error = planner_input::withdraw(
+            &store,
+            SID,
+            &f.repo,
+            Some(hold),
+            false,
+            "lifted on 7101",
+            true,
+        );
+        assert!(
+            error.as_ref().is_err_and(|text| text.contains("no recorded staging pass")),
+            "{detail}: {error:?}"
+        );
+        assert!(
+            planner_input::withdrawal(
+                &planner_workflow::load(&f.shared, SID).unwrap().unwrap(),
+                hold
+            )
+            .is_none(),
+            "{detail} withdrew the hold"
+        );
+    };
+    refuse("no release");
+    let mut other_hold = BTreeMap::new();
+    other_hold.insert(
+        "repair-hold".into(),
+        "repair-hold:other:2026-10-31".into(),
+    );
+    let mut other_candidate = BTreeMap::new();
+    other_candidate.insert("repair-hold".into(), hold.into());
+    for (detail, release) in [
+        (
+            "another hold",
+            release_for(&candidate, other_hold, Some(&candidate)),
+        ),
+        (
+            "another candidate",
+            release_for(&candidate, other_candidate.clone(), Some(&"f".repeat(40))),
+        ),
+        (
+            "selected only",
+            release_for(&candidate, other_candidate, None),
+        ),
+    ] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.releases.clear();
+            run.releases.insert("rel".into(), release.clone());
+            Ok(())
+        })
+        .unwrap();
+        refuse(detail);
+    }
+    let mut bound = BTreeMap::new();
+    bound.insert("repair-hold".into(), hold.into());
+    let bound_release = release_for(&candidate, bound, Some(&candidate));
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases.clear();
+        run.releases.insert("rel".into(), bound_release.clone());
+        Ok(())
+    })
+    .unwrap();
     let retired = planner_input::withdraw(
         &store,
         SID,
@@ -3612,6 +3744,15 @@ fn host_script(ids: &[&str], stdin_copy: &Path) -> String {
     format!("cat > '{}'; printf '%s' '{}'", stdin_copy.display(), reply)
 }
 
+/// A capacity host that copies stdin, then answers with whatever `reply` currently contains.
+fn host_reply_script(reply: &Path, stdin_copy: &Path) -> String {
+    format!(
+        "cat > '{}'; cat '{}'",
+        stdin_copy.display(),
+        reply.display()
+    )
+}
+
 fn capacity_host(
     cfg: &mut Config,
     script: String,
@@ -3747,6 +3888,400 @@ async fn busy_parent_capacity_queries_and_wakes_survive_continuous_tool_activity
         run.works.contains_key("work-a"),
         "existing idle auto-admission remains available"
     );
+}
+
+#[tokio::test]
+async fn works_another_session_leases_fill_the_shared_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (reply_path, stdin_path) = (tmp.path().join("reply.json"), tmp.path().join("stdin.json"));
+    std::fs::write(
+        &reply_path,
+        json!({
+            "candidates": [candidate_json("a")],
+            "host_live": ["other-session-1", "other-session-2"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 2;
+        capacity_host(cfg, host_reply_script(&reply_path, &stdin_path), 1, 1_000_000);
+    });
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let start = parent_turn_ended(shared);
+    for elapsed in [61, 122, 183] {
+        tick(shared, start + elapsed).await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        let block = router_acp::planner_capacity::status_block(shared, &run, (start + elapsed) * 1000);
+        assert_eq!(block["live"], 2, "{block}");
+        assert_eq!(block["free"], 0, "{block}");
+        assert!(run.works.is_empty(), "another session's leases were admitted here");
+        assert!(wakes_with(shared, "capacity:").is_empty());
+        assert!(wakes_with(shared, "auto-admit:").is_empty());
+    }
+    std::fs::write(
+        &reply_path,
+        json!({"candidates": [candidate_json("a")], "host_live": []}).to_string(),
+    )
+    .unwrap();
+    tick(shared, start + 300).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert!(
+        wakes[0].1.reason.contains("0 of 2 worker slots"),
+        "{}",
+        wakes[0].1.reason
+    );
+    assert!(wakes_with(shared, "auto-admit:").is_empty());
+    assert!(
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn an_admission_the_parent_never_started_is_started_by_the_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&[], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 4;
+        capacity_host(cfg, script, 1000, 1_000_000);
+    });
+    let shared = &f.shared;
+    let spec = |id: &str| {
+        let mut work = work(id);
+        work.plan_id = format!("plan-{id}");
+        work
+    };
+    for id in ["ready", "paused", "handed", "reconciling"] {
+        admit(shared, spec(id));
+    }
+    let mut dependent = spec("dependent");
+    dependent.dependencies = vec!["ready".into()];
+    admit(shared, dependent);
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("paused").unwrap().paused = true;
+        run.works.get_mut("handed").unwrap().handoff = Some(router_acp::delegate_hook::Handoff {
+            kind: "reassignment_required".into(),
+            message: "handed back".into(),
+        });
+        run.works.get_mut("reconciling").unwrap().reconciliation.required = true;
+        Ok(())
+    })
+    .unwrap();
+    let flags = |run: &router_acp::planner_workflow::PlannerRun| {
+        router_acp::planner_guard::works_json(run)
+            .into_iter()
+            .map(|row| {
+                (
+                    row["work_id"].as_str().unwrap().to_string(),
+                    row["dispatch_ready"].as_bool().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        flags(&run),
+        BTreeMap::from([
+            ("dependent".into(), false),
+            ("handed".into(), false),
+            ("paused".into(), false),
+            ("ready".into(), true),
+            ("reconciling".into(), false),
+        ])
+    );
+    planner_workflow::mutate(shared, SID, |run| {
+        run.phase = router_acp::config::PlannerPhase::Planning;
+        Ok(())
+    })
+    .unwrap();
+    let planned = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(flags(&planned).values().all(|ready| !ready));
+    planner_workflow::mutate(shared, SID, |run| {
+        run.phase = router_acp::config::PlannerPhase::Implementation;
+        Ok(())
+    })
+    .unwrap();
+    pin_parent(shared);
+    let start = parent_turn_ended(shared);
+    parent_tool_activity(shared, start + 20);
+    tick(shared, start + 20).await;
+    let armed = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(armed.works.values().all(|work| work.attempt.is_none()));
+    assert_eq!(armed.capacity.resumes["ready"].due_at, Some(start + 80));
+    tick(shared, start + 81).await;
+    let started = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(started.works.len(), 5);
+    let ready = &started.works["ready"];
+    assert_eq!(ready.spec.plan_id, "plan-ready");
+    assert!(
+        ready.attempt.is_some() && ready.workspace.is_some(),
+        "the due tick did not start the unstarted admission: {:?}",
+        ready.status
+    );
+    for id in ["paused", "handed", "reconciling", "dependent"] {
+        let work = &started.works[id];
+        assert!(work.attempt.is_none(), "{id} was started");
+        assert_eq!(work.status, WorkStatus::Admitted, "{id}");
+    }
+    attempt_settled(shared, "ready").await;
+}
+
+#[tokio::test]
+async fn a_reviewed_diagnosis_is_recorded_without_completing_or_releasing_the_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (verdict, stdin) = (tmp.path().join("verdict"), tmp.path().join("stdin.json"));
+    let script = format!(
+        "cat > '{stdin}'; [ \"$(cat '{verdict}')\" = ok ] && exit 0; echo 'evidence bytes changed' >&2; exit 2",
+        stdin = stdin.display(),
+        verdict = verdict.display()
+    );
+    let bare = fixture(|_| {});
+    admit(&bare.shared, work("account"));
+    let prepare = |shared: &Arc<Shared>| {
+        planner_workflow::mutate(shared, SID, |run| {
+            let work = run.works.get_mut("account").unwrap();
+            work.status = WorkStatus::Interrupted;
+            work.attempt = Some(router_acp::planner_workflow::Attempt {
+                id: "attempt-1".into(),
+                router_pid: 0,
+                router_started_at_ms: 1,
+                delegate_id: None,
+                ended: true,
+            });
+            work.handoff = Some(router_acp::delegate_hook::Handoff {
+                kind: "reassignment_required".into(),
+                message: "the attempt ended on a custody contradiction".into(),
+            });
+            work.reconciliation.required = true;
+            Ok(())
+        })
+        .unwrap();
+    };
+    prepare(&bare.shared);
+    let evidence_path =
+        "Docs/Plans/data/implementation/2026-10-27-account-auth-inspection-diagnosis.md";
+    let hash = "6217abe3f57043b46932fa52b900e65b8f7e0172e0ed17c4119b4991c37f2512";
+    let revision = "a".repeat(40);
+    let diagnose = |shared: &Arc<Shared>, key: &str, accepted: bool, attempt: &str, scope: &str, digest: &str| {
+        let shared = shared.clone();
+        let key = key.to_string();
+        let attempt = attempt.to_string();
+        let scope = scope.to_string();
+        let digest = digest.to_string();
+        let revision = revision.clone();
+        let evidence_path = evidence_path.to_string();
+        async move {
+            planner_workflow::operate(
+                &shared,
+                SID,
+                None,
+                Operation::Diagnosis {
+                    key,
+                    work_id: "account".into(),
+                    attempt_id: attempt,
+                    revision,
+                    diagnosis_key: "account-auth".into(),
+                    scope,
+                    accepted,
+                    evidence: BTreeMap::from([(evidence_path, digest)]),
+                },
+            )
+            .await
+        }
+    };
+    let missing = diagnose(
+        &bare.shared,
+        "diag-missing-host",
+        true,
+        "attempt-1",
+        "change README.md and run the checks",
+        hash,
+    )
+    .await;
+    assert!(
+        missing.as_ref().is_err_and(|error| error.contains("configured host")),
+        "{missing:?}"
+    );
+
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            timeout_ms: 5_000,
+        });
+    });
+    let shared = &f.shared;
+    admit(shared, work("account"));
+    prepare(shared);
+    let scope = "change README.md and run the checks";
+    let before = serde_json::to_value(&planner_workflow::load(shared, SID).unwrap().unwrap().works["account"]).unwrap();
+    let blocked = planner_workflow::begin_work(shared, SID, "account").await;
+    assert!(
+        blocked.as_ref().is_err_and(|error| error.contains("reconciliation required")),
+        "{blocked:?}"
+    );
+    let actor = router_acp::planner_workflow::WorkerIdentity {
+        work_id: "account".into(),
+        attempt_id: "attempt-1".into(),
+    };
+    let child = planner_workflow::operate(
+        shared,
+        SID,
+        Some(&actor),
+        Operation::Diagnosis {
+            key: "diag-child".into(),
+            work_id: "account".into(),
+            attempt_id: "attempt-1".into(),
+            revision: revision.clone(),
+            diagnosis_key: "account-auth".into(),
+            scope: scope.into(),
+            accepted: true,
+            evidence: BTreeMap::from([(evidence_path.into(), hash.into())]),
+        },
+    )
+    .await;
+    assert!(
+        child.as_ref().is_err_and(|error| error.contains("implementation children cannot")),
+        "{child:?}"
+    );
+    for (key, accepted, attempt, diagnosis_scope, digest, marker) in [
+        ("diag-unaccepted", false, "attempt-1", scope, hash, "parent's acceptance"),
+        ("diag-attempt", true, "attempt-other", scope, hash, "reassignment_required"),
+        ("diag-scope", true, "attempt-1", "a wider scope", hash, "scope differs"),
+        ("diag-hash", true, "attempt-1", scope, "not-a-hash", "SHA-256"),
+    ] {
+        let error = diagnose(shared, key, accepted, attempt, diagnosis_scope, digest)
+            .await
+            .unwrap_err();
+        assert!(error.contains(marker), "{key}: {error}");
+    }
+    planner_workflow::mutate(shared, SID, |run| {
+        run.releases.insert(
+            "frozen".into(),
+            router_acp::planner_release::Release {
+                candidate: revision.clone(),
+                works: BTreeMap::from([("account".into(), revision.clone())]),
+                checkpoints: Vec::new(),
+                superseded_by: None,
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    let frozen = diagnose(shared, "diag-frozen", true, "attempt-1", scope, hash)
+        .await
+        .unwrap_err();
+    assert!(frozen.contains("frozen release"), "{frozen}");
+    planner_workflow::mutate(shared, SID, |run| {
+        run.releases.remove("frozen");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&planner_workflow::load(shared, SID).unwrap().unwrap().works["account"]).unwrap(),
+        before
+    );
+    std::fs::write(&verdict, "reject").unwrap();
+    let rejected = diagnose(shared, "diag-reject", true, "attempt-1", scope, hash)
+        .await
+        .unwrap_err();
+    assert!(rejected.contains("evidence bytes changed"), "{rejected}");
+    assert_eq!(
+        serde_json::to_value(&planner_workflow::load(shared, SID).unwrap().unwrap().works["account"]).unwrap(),
+        before
+    );
+    std::fs::write(&verdict, "ok").unwrap();
+    diagnose(shared, "diag-ok", true, "attempt-1", scope, hash)
+        .await
+        .unwrap();
+    let asked: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
+    assert_eq!(asked["action"], "diagnosis-check");
+    assert_eq!(asked["assignment"]["status"], "interrupted");
+    assert_eq!(asked["diagnosis_key"], "account-auth");
+    let recorded = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let saved = &recorded.works["account"];
+    let delivery = &saved.diagnoses["account-auth"];
+    assert_eq!(delivery.reviewed_by, SID);
+    assert!(delivery.reviewed_at_ms > 0);
+    assert_eq!(delivery.attempt_id, "attempt-1");
+    assert_eq!(delivery.scope, scope);
+    assert_eq!(delivery.evidence[evidence_path], hash);
+    assert!(saved.artifact.is_none() && saved.finish.is_none() && saved.integration.is_none());
+    assert!(recorded.releases.is_empty());
+    assert_eq!(saved.status, WorkStatus::Interrupted);
+    assert!(saved.reconciliation.required);
+    let mut after = serde_json::to_value(saved).unwrap();
+    after.as_object_mut().unwrap().remove("diagnoses");
+    let mut expected = before.clone();
+    expected.as_object_mut().unwrap().remove("diagnoses");
+    assert_eq!(after, expected);
+    let reviewed_at = delivery.reviewed_at_ms;
+    let replay = diagnose(shared, "diag-replay", true, "attempt-1", scope, hash)
+        .await
+        .unwrap();
+    assert!(replay.contains("replayed"), "{replay}");
+    let again = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        again.works["account"].diagnoses["account-auth"].reviewed_at_ms,
+        reviewed_at
+    );
+    let changed = diagnose(
+        shared,
+        "diag-changed",
+        true,
+        "attempt-1",
+        scope,
+        &"b".repeat(64),
+    )
+    .await
+    .unwrap_err();
+    assert!(changed.contains("different delivery"), "{changed}");
+    assert_eq!(
+        planner_workflow::load(shared, SID).unwrap().unwrap().works["account"].diagnoses["account-auth"].evidence[evidence_path],
+        hash
+    );
+    let page = planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Status {
+            offset: 0,
+            work_id: Some("account".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+    assert_eq!(page["works"][0]["diagnoses"]["account-auth"]["reviewed_by"], SID);
+    let head = git(&f.repo, &["rev-parse", "HEAD"]);
+    let mut corrected = work("account");
+    corrected.scope = format!("{scope} and keep the diagnosis");
+    planner_workflow::operate(
+        shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "reconcile-diagnosis".into(),
+            work: corrected,
+            source_revision: head,
+            evidence: vec!["diagnosis retained".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let reconciled = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let reconciled = &reconciled.works["account"];
+    assert!(!reconciled.reconciliation.required);
+    assert_eq!(reconciled.diagnoses["account-auth"].evidence[evidence_path], hash);
+    assert_eq!(reconciled.diagnoses["account-auth"].scope, scope);
+    assert_eq!(reconciled.status, WorkStatus::Admitted);
 }
 
 #[tokio::test]

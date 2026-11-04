@@ -343,6 +343,7 @@ pub fn works_json(run: &PlannerRun) -> Vec<Value> {
                 "attempt_active":w.attempt.as_ref().is_some_and(|attempt| !attempt.ended),
                 "waiting_build_revision":planner_capacity::waiting_on_build(run, w, now)
                     .then(|| &run.observations[&format!("ci:{id}")].revision),
+                "dispatch_ready":planner_capacity::dispatch_ready(run, w, now),
                 "revision":w.artifact.as_ref().map(|a| &a.revision)})
         })
         .collect()

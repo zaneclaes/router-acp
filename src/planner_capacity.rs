@@ -144,6 +144,10 @@ pub struct HostSnapshot {
     pub error: Option<String>,
     #[serde(default)]
     pub candidates: Vec<Candidate>,
+    /// Live works on this checkout that another router session leases: they
+    /// fill the shared limit although this run does not list them.
+    #[serde(default)]
+    pub host_live: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +189,9 @@ pub struct Resume {
 #[derive(Deserialize)]
 struct HostReply {
     candidates: Vec<Candidate>,
+    /// Absent from older hosts: they count no other session's work.
+    #[serde(default)]
+    host_live: Vec<String>,
 }
 
 /// The configured capacity timing, or its defaults when no host is set.
@@ -202,9 +209,19 @@ fn host_configured(shared: &Shared) -> bool {
     shared.cfg.routers.planner.capacity.is_some()
 }
 
+/// Live workers count this run's and, from the host's last good answer, the
+/// works another router session leases on the same checkout (Chordzy
+/// 2026-11-03: a wake said 0 live while two such works ran, so auto-admission
+/// could exceed the shared limit).
 pub(crate) fn slots(shared: &Shared, run: &PlannerRun) -> (usize, usize, usize) {
     let max = shared.delegate_limit();
-    let live = crate::planner_wake::live_workers(run);
+    let elsewhere = run.capacity.host.as_ref().filter(|h| h.ok).map_or(0, |h| {
+        h.host_live
+            .iter()
+            .filter(|id| !run.works.contains_key(id.as_str()))
+            .count()
+    });
+    let live = crate::planner_wake::live_workers(run) + elsewhere;
     (live, max, max.saturating_sub(live))
 }
 
@@ -388,11 +405,12 @@ pub async fn query_host(
         None => Err("the parent session is not loaded".into()),
     };
     Some(match answer {
-        Ok(candidates) => HostSnapshot {
+        Ok(reply) => HostSnapshot {
             at_ms: now_ms,
             ok: true,
             error: None,
-            candidates,
+            candidates: reply.candidates,
+            host_live: reply.host_live,
         },
         Err(error) => {
             tracing::error!(
@@ -405,6 +423,7 @@ pub async fn query_host(
                 ok: false,
                 error: Some(error),
                 candidates: Vec::new(),
+                host_live: Vec::new(),
             }
         }
     })
@@ -414,7 +433,7 @@ async fn run_host(
     cfg: &PlannerCapacityConfig,
     cwd: &Path,
     input: &Value,
-) -> Result<Vec<Candidate>, String> {
+) -> Result<HostReply, String> {
     let output = crate::planner_guard::run_host(
         "capacity host",
         &cfg.command,
@@ -428,7 +447,6 @@ async fn run_host(
         return Err(format!("capacity host exited with {}", output.describe()));
     }
     serde_json::from_slice::<HostReply>(&output.stdout)
-        .map(|reply| reply.candidates)
         .map_err(|e| format!("capacity host returned invalid JSON: {e}"))
 }
 
@@ -715,8 +733,9 @@ async fn fill_slots(
         return false;
     }
     let now_ms = now * 1000;
-    let (live, max, free) = slots(shared, &run);
-    if free == 0 {
+    // This run's own workers only: an old answer's other-session count must not
+    // stop the re-query that sees those works end.
+    if crate::planner_wake::live_workers(&run) >= shared.delegate_limit() {
         reset_unfilled(shared, sid, &run);
         return false;
     }
@@ -744,6 +763,12 @@ async fn fill_slots(
         }
     }
     let host = run.capacity.host.clone().expect("snapshot present");
+    // The fresh answer may count another session's live works.
+    let (live, max, free) = slots(shared, &run);
+    if free == 0 {
+        reset_unfilled(shared, sid, &run);
+        return false;
+    }
     let unheld = unheld_candidates(&run, now_ms);
     if host.ok && unheld.is_empty() {
         reset_unfilled(shared, sid, &run);
@@ -1001,6 +1026,58 @@ fn stopped_early(work: &planner_workflow::Work) -> bool {
             .is_none_or(|h| !PARENT_HANDOFFS.contains(&h.kind.as_str()))
 }
 
+/// An admitted work no attempt ever started, that nothing but a free slot keeps
+/// from starting. The capacity host leaves an owned plan out of its candidates,
+/// so without this an admission the parent never started sat idle for good
+/// (Chordzy 2026-11-02: seven admitted works, no attempts, 49 of 50 slots free).
+/// A handed-off, reconciled, held, paused or suspended work is never one.
+fn admitted_unstarted(run: &PlannerRun, work: &planner_workflow::Work, now: i64) -> bool {
+    work.status == WorkStatus::Admitted
+        && work.attempt.is_none()
+        && !work.paused
+        && work.artifact.is_none()
+        && work.finish.is_none()
+        && work.handoff.is_none()
+        && !work.reconciliation.required
+        && run.capacity.pending_adoption.is_none()
+        && !held_by_human(run, &work.spec)
+        && [&work.spec.plan_id, &work.spec.work_id]
+            .iter()
+            .filter_map(|id| run.capacity.holds.get(id.as_str()))
+            .all(|h| h.expires_at_ms <= now * 1000)
+        && run
+            .capacity
+            .resumes
+            .get(&work.spec.work_id)
+            .is_none_or(|s| s.suspended.is_none())
+        && planner_workflow::dependencies_ready(run, work).is_ok()
+}
+
+/// What the capacity tick would start for this work given a free slot: an
+/// unstarted admission, or an early stop whose recovery has no prerequisite,
+/// suspension or exact-head CI wait. An observation for the hosts, never an
+/// authority: every dispatch rechecks on fresh state. A run that is not in
+/// authorized implementation, or that still has an adoption to finish, has
+/// nothing to dispatch.
+pub(crate) fn dispatch_ready(run: &PlannerRun, work: &planner_workflow::Work, now: i64) -> bool {
+    if run.status != RunStatus::Running
+        || run.phase != PlannerPhase::Implementation
+        || run.capacity.pending_adoption.is_some()
+    {
+        return false;
+    }
+    admitted_unstarted(run, work, now)
+        || (stopped_early(work)
+            && !held_by_human(run, &work.spec)
+            && recovery_prerequisite(run, work).is_none()
+            && !waiting_on_build(run, work, now)
+            && run
+                .capacity
+                .resumes
+                .get(&work.spec.work_id)
+                .is_none_or(|s| s.suspended.is_none()))
+}
+
 /// Opt-in exact observation identity in a waiting handoff. A stale or failed
 /// observer never parks work indefinitely; normal reconciliation resumes.
 pub(crate) fn waiting_on_build(run: &PlannerRun, work: &planner_workflow::Work, now: i64) -> bool {
@@ -1031,6 +1108,11 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
         .unwrap_or(false);
     for (id, work) in &run.works {
         let Some(attempt) = &work.attempt else {
+            if admitted_unstarted(run, work, now)
+                && start_admitted(shared, sid, run, id, now, pinned && live < max).await
+            {
+                live += 1;
+            }
             continue;
         };
         // The plan the human has not authorized waits with them; every other
@@ -1172,6 +1254,110 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
             Err(error) => {
                 tracing::warn!(session = sid, work_id = id, %error, "worker resumption failed; reconciliation applies before another retry")
             }
+        }
+    }
+}
+
+/// Start an admission the parent left unstarted for one capacity wake interval.
+/// The first sighting only arms its due time, so a parent that starts the work
+/// itself is never raced. A refused start backs off, and the same refusal
+/// [`SAME_FAILURE_LIMIT`] times suspends it behind a recovery wake rather than
+/// retrying every tick. Returns whether a worker started.
+async fn start_admitted(
+    shared: &Arc<Shared>,
+    sid: &str,
+    run: &PlannerRun,
+    id: &str,
+    now: i64,
+    slot: bool,
+) -> bool {
+    let Some(due) = run.capacity.resumes.get(id).and_then(|s| s.due_at) else {
+        let grace = timing(shared).wake_after_secs as i64;
+        let _ = planner_workflow::mutate(shared, sid, |current| {
+            let work = current.works.get(id).ok_or("work disappeared")?;
+            if !admitted_unstarted(current, work, now) {
+                return Err("dispatch observation changed".into());
+            }
+            let state = current.capacity.resumes.entry(id.to_string()).or_default();
+            state.due_at.get_or_insert(now + grace);
+            Ok(())
+        });
+        return false;
+    };
+    if !slot || due > now {
+        return false;
+    }
+    let claimed = planner_workflow::mutate(shared, sid, |current| {
+        let work = current.works.get(id).ok_or("work disappeared")?;
+        if current.status != RunStatus::Running
+            || current.phase != PlannerPhase::Implementation
+            || !admitted_unstarted(current, work, now)
+        {
+            return Err("dispatch observation changed".into());
+        }
+        let state = current
+            .capacity
+            .resumes
+            .get_mut(id)
+            .ok_or("dispatch state disappeared")?;
+        if state.due_at.is_none_or(|at| at > now) {
+            return Err("dispatch already claimed".into());
+        }
+        state.count += 1;
+        state.due_at = None;
+        Ok(())
+    });
+    if claimed.is_err() {
+        return false;
+    }
+    let task = format!(
+        "The parent admitted this work and did not start it, so the router starts it on a \
+         free slot. Complete the assignment.\nAssigned scope: {}",
+        run.works[id].spec.scope
+    );
+    match crate::delegate_mcp::start_planner_worker(shared, sid, id, task).await {
+        Ok(_) => {
+            let _ = planner_workflow::mutate(shared, sid, |current| {
+                current.capacity.resumes.remove(id);
+                Ok(())
+            });
+            tracing::info!(
+                session = sid,
+                work_id = id,
+                "started an admitted work the parent left unstarted"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(session = sid, work_id = id, %error, "starting an admitted work failed");
+            let fingerprint = crate::planner_skills::content_hash(&error);
+            let _ = planner_workflow::mutate(shared, sid, |current| {
+                let state = current.capacity.resumes.entry(id.to_string()).or_default();
+                state.same_failure_count =
+                    if state.failure_fingerprint.as_ref() == Some(&fingerprint) {
+                        state.same_failure_count.saturating_add(1)
+                    } else {
+                        1
+                    };
+                state.failure_fingerprint = Some(fingerprint.clone());
+                if state.same_failure_count >= SAME_FAILURE_LIMIT {
+                    state.suspended = Some(format!(
+                        "{} consecutive refusals to start this admission: {error}",
+                        state.same_failure_count
+                    ));
+                    current.wakes.insert(format!("recovery:{id}"), Wake {
+                        work_id: id.to_string(),
+                        reason: format!("recovery required: the router could not start admitted work {id}: {error}. Automatic starts are suspended for this unchanged refusal; other work continues."),
+                        ..Default::default()
+                    });
+                } else {
+                    let step = RESUME_BACKOFF_SECS[(state.same_failure_count as usize - 1)
+                        .min(RESUME_BACKOFF_SECS.len() - 1)];
+                    state.due_at = Some(now + step);
+                }
+                Ok(())
+            });
+            false
         }
     }
 }
