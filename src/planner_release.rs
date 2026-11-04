@@ -255,9 +255,21 @@ fn record_with_carried(
         if release.checkpoints.last() == Some(checkpoint) {
             return Ok(());
         }
+        // A failed staging candidate may be retired after a concurrent
+        // production failure. Otherwise each failed round blocks replacing
+        // the other, and neither release can make progress. Preserve the
+        // failure checkpoint and require an explicit abandonment receipt.
+        let failed_staging_abandonment = release.stage() == Stage::Failed
+            && checkpoint.stage == Stage::Abandoned
+            && !release.checkpoints.iter().any(|prior| {
+                matches!(
+                    prior.stage,
+                    Stage::ProductionMerged | Stage::ProductionDeployed | Stage::ProductionPassed
+                )
+            });
         if release.superseded_by.is_some()
             || release.stage() == Stage::Disposed
-            || release.stage() == Stage::Failed
+            || (release.stage() == Stage::Failed && !failed_staging_abandonment)
             || release.stage() == Stage::Abandoned
         {
             return Err(
@@ -277,6 +289,7 @@ fn record_with_carried(
             Stage::ProductionMerged => Stage::ProductionDeployed,
             Stage::ProductionDeployed => Stage::ProductionPassed,
             Stage::ProductionPassed => Stage::Disposed,
+            Stage::Failed if failed_staging_abandonment => Stage::Abandoned,
             _ => unreachable!(),
         };
         let abandoning =

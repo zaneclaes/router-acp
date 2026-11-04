@@ -16856,11 +16856,91 @@ async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next()
     .await;
 }
 
+fn goal_yaml(tag: &str) -> (String, PathBuf) {
+    let state = temp_state_file(tag);
+    let log = temp_log(tag);
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nfailover: {{enabled: false}}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 50)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        )
+    );
+    (yaml, log)
+}
+
+fn prompts_logged(log: &PathBuf) -> usize {
+    read_log(log)
+        .iter()
+        .filter(|event| event["event"] == "prompt")
+        .count()
+}
+
+/// An agent that never affirms its goal does not end the client's turn: the router sends it
+/// back to work until the limit, then says the goal stalled.
+#[tokio::test]
+async fn an_unaffirmed_goal_keeps_the_turn_working_until_it_stalls() {
+    let (yaml, log) = goal_yaml("goal-stalls");
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let done = prompt_text(&cx, &sid, "/goal finish the work").await?;
+        assert_eq!(done.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            prompts_logged(&log),
+            1 + router_acp::goals::MAX_CONTINUATIONS as usize,
+            "the first turn and every continuation"
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("Start working toward this goal now"),
+            "{text}"
+        );
+        assert!(text.contains("continuation 12 of 12"), "{text}");
+        // A stalled goal rests until the person speaks, and their words resume it.
+        prompt_text(&cx, &sid, "/goal clear").await?;
+        let before = prompts_logged(&log);
+        prompt_text(&cx, &sid, "something else").await?;
+        assert_eq!(prompts_logged(&log), before + 1, "no goal, no continuation");
+        Ok(())
+    })
+    .await;
+}
+
+/// An affirmation with its proof ends the goal, and later turns run normally.
+#[tokio::test]
+async fn an_affirmed_goal_ends_and_later_turns_are_ordinary() {
+    let (yaml, log) = goal_yaml("goal-met");
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // The mock echoes its prompt, so the objective carries the reply it must give.
+        prompt_text(
+            &cx,
+            &sid,
+            "/goal finish\nGOAL: MET\nProof: the suite ran green on build 7650 and production rolled out.\nend",
+        )
+        .await?;
+        let affirmed = prompts_logged(&log);
+        prompt_text(&cx, &sid, "/goal").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("Current goal (met)"), "{text}");
+        prompt_text(&cx, &sid, "an ordinary question").await?;
+        assert_eq!(prompts_logged(&log), affirmed + 1, "one prompt, no continuation");
+        Ok(())
+    })
+    .await;
+}
+
 /// The live crash's trigger: the stall watchdog cancelled a quiet parent
 /// turn, and within the cancel grace the turn came back and asked the person
 /// a question. The watchdog restarted the adapter under the open question
-/// anyway. A turn that revives during the grace is watched afresh, and an
-/// open question is the operator's wait, not a stall.
+/// anyway. A turn that revives during the grace is watched afresh. A planner
+/// run never puts a question to the operator (operator 2026-11-03: the run
+/// unblocks itself and records only human-only actions), so the question is
+/// refused at once with that instruction instead of waiting on anyone.
 #[tokio::test]
 async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_restarted() {
     let state = temp_state_file("stall-revived");
@@ -16890,11 +16970,18 @@ async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_rest
             std::fs::write(&gate_for_test, "").unwrap();
             let answered = tokio::time::timeout(Duration::from_secs(20), asking)
                 .await
-                .expect("the turn ends once the person answers")
+                .expect("the turn ends without anyone answering")
                 .unwrap()?;
             assert_eq!(answered.stop_reason, StopReason::EndTurn);
             let text = agent_text(&observed, &sid);
-            assert!(text.contains("elicit:accept"), "{text}");
+            assert!(
+                !text.contains("elicit:accept"),
+                "the operator was asked: {text}"
+            );
+            assert!(
+                text.contains("elicit-error") && text.contains("autonomous planner run"),
+                "the agent is told to unblock itself: {text}"
+            );
             assert!(text.contains("parent turn stalled"), "{text}");
             assert!(!text.contains("restarting its adapter"), "{text}");
             Ok(())

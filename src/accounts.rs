@@ -449,6 +449,12 @@ fn text(prompt: &[ContentBlock]) -> Option<String> {
 }
 
 pub(crate) fn without_turn_context(text: &str) -> String {
+    // goose's history memo, sent as its own block ahead of what was typed.
+    if text.starts_with(
+        "Conversation context from goose before this ACP provider session was created:",
+    ) {
+        return String::new();
+    }
     const OPEN: &str = "<turn-context>";
     const CLOSE: &str = "</turn-context>";
     let mut out = String::new();
@@ -2572,6 +2578,8 @@ mod tests {
             Some("/login code abc")
         );
         assert_eq!(text(&blocks(&[&format!("2\n{ctx}")])).as_deref(), Some("2"));
+        let memo = "Conversation context from goose before this ACP provider session was created:\n\n[user]: /login\n\nCurrent user request follows.";
+        assert_eq!(text(&blocks(&[memo, "/login"])).as_deref(), Some("/login"));
         assert_eq!(
             text(&blocks(&["/usage", "and explain it"])).as_deref(),
             Some("/usage\nand explain it")
