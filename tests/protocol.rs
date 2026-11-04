@@ -14734,6 +14734,7 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
                     required_integration_evidence: Vec::new(),
                     repository: None,
                     external_id: Some("external-work".into()),
+                    completion_contract_version: None,
                 },
             },
         )

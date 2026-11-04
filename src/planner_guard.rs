@@ -794,7 +794,7 @@ pub(crate) async fn integrate_reply(
         Ok(out) if out.code == Some(0) => {
             if matches!(
                 action.as_str(),
-                "finalize" | "release" | "retire" | "release-selection-check"
+                "finished" | "finalize" | "release" | "retire" | "release-selection-check"
             ) && serde_json::from_slice::<Value>(&out.stdout)
                 .ok()
                 .and_then(|v| {
