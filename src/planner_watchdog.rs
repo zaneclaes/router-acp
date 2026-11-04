@@ -27,6 +27,12 @@
 //!    runs first and pending wakes after, through the ordinary wake loop. A
 //!    tool call that keeps reporting is progress; one silent for the limit is
 //!    not.
+//! 3. **Adapter without its tools** (every planner parent turn): grok-1.0.70 can
+//!    leave a session with an MCP catalog that stays empty for good (`search_tool`
+//!    answers "still connecting" and `use_tool` answers "Tool not found", for an
+//!    hour on 2026-11-04, on a process that had sat idle since its probe). A
+//!    parent without the router's tools cannot admit or finish anything and
+//!    waiting does not help, so the first such failure replaces the adapter.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -51,6 +57,8 @@ pub struct TurnProgress {
     pub active_tools: BTreeSet<String>,
     /// The turn started at least one tool call.
     pub tools_seen: bool,
+    /// A router tool the adapter says does not exist.
+    pub missing_router_tool: Option<String>,
 }
 
 impl TurnProgress {
@@ -61,6 +69,7 @@ impl TurnProgress {
             autonomous_result_at: None,
             active_tools: BTreeSet::new(),
             tools_seen: false,
+            missing_router_tool: None,
         }
     }
 
@@ -76,6 +85,9 @@ impl TurnProgress {
             return;
         };
         self.tools_seen = true;
+        if let Some(tool) = missing_router_tool(update) {
+            self.missing_router_tool = Some(tool);
+        }
         match update.get("status").and_then(Value::as_str) {
             Some("completed" | "failed" | "cancelled") => {
                 self.active_tools.remove(id);
@@ -89,6 +101,28 @@ impl TurnProgress {
             _ => {}
         }
     }
+}
+
+/// The router tool a failed tool call names as not found.
+fn missing_router_tool(update: &Value) -> Option<String> {
+    if update.get("status").and_then(Value::as_str) != Some("failed") {
+        return None;
+    }
+    let message = update.pointer("/rawOutput/message")?.as_str()?;
+    let tool = message.strip_prefix("Tool not found: ")?;
+    tool.trim_start_matches("mcp__")
+        .starts_with("router-")
+        .then(|| tool.to_string())
+}
+
+fn take_missing_router_tool(shared: &Shared, sid: &str) -> Option<String> {
+    shared
+        .turn_progress
+        .lock()
+        .unwrap()
+        .get_mut(sid)?
+        .missing_router_tool
+        .take()
 }
 
 /// Any downstream progress for `sid` (a router or delegate session id).
@@ -244,6 +278,9 @@ fn awaiting_operator(shared: &Shared, sid: &str) -> bool {
         .is_some_and(|run| !run.approval_waits.is_empty())
 }
 
+/// A replacement that also lacks the tools is not fixed by another one.
+const MAX_TOOL_REPLACEMENTS: u32 = 3;
+
 /// Run one planner parent turn under the stuck-turn watchdog.
 pub async fn guard_parent_turn<F>(
     shared: &Arc<Shared>,
@@ -266,6 +303,36 @@ where
             tokio::select! {
                 result = &mut turn => return result,
                 _ = tick.tick() => {}
+            }
+            if let Some(tool) = take_missing_router_tool(shared, sid)
+                && crate::planner_guard::with_runtime(shared, sid, |rt| {
+                    rt.tool_replacements += 1;
+                    rt.tool_replacements <= MAX_TOOL_REPLACEMENTS
+                })
+            {
+                tracing::error!(
+                    session = sid,
+                    tool,
+                    "adapter lost the router's tools; replacing it"
+                );
+                log_notice(
+                    shared,
+                    sid,
+                    &format!("router-acp · the adapter has no {tool}: replacing it"),
+                );
+                with_runtime_stalled(shared, sid);
+                cancel_downstream(shared, sid);
+                let result = tokio::select! {
+                    result = &mut turn => result,
+                    _ = tokio::time::sleep(cancel_grace(shared)) => {
+                        shared.with_session(sid, |s| s.cancelled = true);
+                        shared.planner_deliveries.lock().unwrap().remove(sid);
+                        shared.background_interrupts.lock().unwrap().remove(sid);
+                        Ok(PromptResponse::new(StopReason::Cancelled))
+                    }
+                };
+                restart_adapter(shared, sid).await;
+                return result;
             }
             let quiet = quiet_for(shared, sid, started);
             // A turn parked on its router-managed background terminals waits on
@@ -426,6 +493,21 @@ async fn restart_adapter(shared: &Arc<Shared>, sid: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_failed_lookup_of_a_router_tool_means_the_adapter_lost_its_tools() {
+        let failed = |message: &str| serde_json::json!({"status": "failed", "rawOutput": {"message": message}});
+        assert_eq!(
+            missing_router_tool(&failed("Tool not found: router-delegate__planner_workflow"))
+                .as_deref(),
+            Some("router-delegate__planner_workflow")
+        );
+        assert!(missing_router_tool(&failed("Tool not found: buildkite__list")).is_none());
+        assert!(missing_router_tool(&failed("boom")).is_none());
+        let running = serde_json::json!({"status": "in_progress",
+            "rawOutput": {"message": "Tool not found: router-delegate__x"}});
+        assert!(missing_router_tool(&running).is_none());
+    }
 
     #[test]
     fn adapter_warnings_are_not_agent_work_but_tools_and_agent_chunks_are() {
