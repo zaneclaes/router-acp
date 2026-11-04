@@ -17393,3 +17393,115 @@ async fn send_input_cli_reaches_a_session_without_a_planner_run() {
     let _ = std::fs::remove_file(&release);
     let _ = std::fs::remove_file(&hold);
 }
+
+/// `/shutdown` gives the router 15 seconds to answer, so the answer may never wait for the
+/// drain: not for its save host, nor for a parent turn that is still running.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_is_answered_over_the_wire_while_its_drain_runs() {
+    let state = temp_state_file("shutdown-wire-answer");
+    let log = temp_log("shutdown-wire-answer");
+    let repo = planner_wire_repository();
+    let yaml = planner_wire_yaml(&state, &log).replacen(
+        "routers:\n  planner:\n",
+        "routers:\n  planner:\n    shutdown: { command: /bin/sh, args: [\"-c\", \"sleep 20; echo {}\"], timeout_ms: 60000 }\n",
+        1,
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let turn = tokio::spawn(
+            cx.send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from("SLEEP:40000".to_string())],
+            ))
+            .block_task(),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..2 {
+            let request = agent_client_protocol::UntypedMessage::new(
+                "_router/planner_shutdown",
+                serde_json::json!({"sessionId": sid}),
+            )
+            .unwrap();
+            let answer = tokio::time::timeout(
+                Duration::from_secs(10),
+                cx.send_request(request).block_task(),
+            )
+            .await
+            .expect("the router answers while the drain runs")?;
+            assert_eq!(answer["accepted"], serde_json::json!(true));
+            assert!(router_acp::planner_shutdown::draining(&shared, &sid));
+        }
+        turn.abort();
+        Ok(())
+    })
+    .await;
+}
+
+/// These requests read the whole planner document under the state lock. That wait must not
+/// sit on the client connection's task, which also reads and answers everything else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_planner_request_waiting_on_state_leaves_the_connection_responsive() {
+    let state = temp_state_file("shutdown-state-wait");
+    let log = temp_log("shutdown-state-wait");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_wire_yaml(&state, &log),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+
+            let locked = Arc::new(std::sync::Barrier::new(2));
+            let holder = {
+                let shared = shared.clone();
+                let locked = locked.clone();
+                std::thread::spawn(move || {
+                    let _state = shared.state.lock().unwrap();
+                    locked.wait();
+                    std::thread::sleep(Duration::from_secs(3));
+                })
+            };
+            locked.wait();
+
+            let request = |method: &str, params: serde_json::Value| {
+                cx.send_request(agent_client_protocol::UntypedMessage::new(method, params).unwrap())
+                    .block_task()
+            };
+            let waiting = tokio::spawn(request(
+                "_router/planner_shutdown",
+                serde_json::json!({"sessionId": sid}),
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let other = tokio::time::timeout(
+                Duration::from_secs(1),
+                request("_router/no_such_method", serde_json::json!({})),
+            )
+            .await;
+            assert!(
+                other.is_ok(),
+                "the connection answered nothing while a planner request waited on state"
+            );
+            assert!(!waiting.is_finished(), "the lock holder is still running");
+
+            holder.join().unwrap();
+            let answer = waiting.await.unwrap()?;
+            assert_eq!(answer["accepted"], serde_json::json!(true));
+            Ok(())
+        },
+    )
+    .await;
+}
