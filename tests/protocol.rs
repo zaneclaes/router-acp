@@ -14734,6 +14734,7 @@ async fn planner_child_status_restores_only_the_current_router_attempt() {
                     required_integration_evidence: Vec::new(),
                     repository: None,
                     external_id: Some("external-work".into()),
+                    completion_contract_version: None,
                 },
             },
         )
@@ -15905,6 +15906,83 @@ async fn failed_environment_is_steered_into_the_running_implement_command_turn()
     let _ = std::fs::remove_file(&release);
 }
 
+/// Idle worker capacity reaches the operator's long `/implement` turn too
+/// (2026-11-06: 0 children for an hour of one turn polling production).
+#[tokio::test]
+async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
+    use router_acp::planner_workflow::{self as workflow, Wake};
+    let state = temp_state_file("command-turn-capacity");
+    let log = temp_log("command-turn-capacity");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    let skill = repo.path().join("repo/.agents/skills/select-plan/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        format!(
+            "---\nname: select-plan\n---\nCOMMAND-TURN-MARKER\nWAIT_FILE:{}\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            let (answer, ()) = tokio::join!(
+                prompt_text(&cx, &sid, "/implement drain the roadmap"),
+                async {
+                    wait_for_mock_prompt(&log, "COMMAND-TURN-MARKER").await;
+                    workflow::mutate(&shared, &sid, |run| {
+                        run.wakes.insert(
+                            "capacity:fixture".into(),
+                            Wake {
+                                work_id: sid.clone(),
+                                reason: "CAPACITY-FIXTURE".into(),
+                                ..Default::default()
+                            },
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                    let steered = || {
+                        read_log(&log).iter().any(|e| {
+                            e["event"] == "steer"
+                                && e["params"].to_string().contains("CAPACITY-FIXTURE")
+                        })
+                    };
+                    for _ in 0..200 {
+                        if steered() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    assert!(
+                        steered(),
+                        "the capacity wake reached the running command turn"
+                    );
+                    assert!(
+                        !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                        "never cancelled"
+                    );
+                    std::fs::write(&release, "").unwrap();
+                }
+            );
+            answer?;
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
 /// A parent that answers wake after wake with prose and no tool call while
 /// staging is failed (live: fifteen "still paused" turns) is told, from the
 /// second such turn, that nothing stops the run.
@@ -16855,11 +16933,91 @@ async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next()
     .await;
 }
 
+fn goal_yaml(tag: &str) -> (String, PathBuf) {
+    let state = temp_state_file(tag);
+    let log = temp_log(tag);
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{enabled: false}}\nauto_upgrade: {{enabled: false}}\nfailover: {{enabled: false}}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 50)],
+            &[("MOCK_LOG", log.to_str().unwrap())]
+        )
+    );
+    (yaml, log)
+}
+
+fn prompts_logged(log: &PathBuf) -> usize {
+    read_log(log)
+        .iter()
+        .filter(|event| event["event"] == "prompt")
+        .count()
+}
+
+/// An agent that never affirms its goal does not end the client's turn: the router sends it
+/// back to work until the limit, then says the goal stalled.
+#[tokio::test]
+async fn an_unaffirmed_goal_keeps_the_turn_working_until_it_stalls() {
+    let (yaml, log) = goal_yaml("goal-stalls");
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let done = prompt_text(&cx, &sid, "/goal finish the work").await?;
+        assert_eq!(done.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            prompts_logged(&log),
+            1 + router_acp::goals::MAX_CONTINUATIONS as usize,
+            "the first turn and every continuation"
+        );
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("Start working toward this goal now"),
+            "{text}"
+        );
+        assert!(text.contains("continuation 12 of 12"), "{text}");
+        // A stalled goal rests until the person speaks, and their words resume it.
+        prompt_text(&cx, &sid, "/goal clear").await?;
+        let before = prompts_logged(&log);
+        prompt_text(&cx, &sid, "something else").await?;
+        assert_eq!(prompts_logged(&log), before + 1, "no goal, no continuation");
+        Ok(())
+    })
+    .await;
+}
+
+/// An affirmation with its proof ends the goal, and later turns run normally.
+#[tokio::test]
+async fn an_affirmed_goal_ends_and_later_turns_are_ordinary() {
+    let (yaml, log) = goal_yaml("goal-met");
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        // The mock echoes its prompt, so the objective carries the reply it must give.
+        prompt_text(
+            &cx,
+            &sid,
+            "/goal finish\nGOAL: MET\nProof: the suite ran green on build 7650 and production rolled out.\nend",
+        )
+        .await?;
+        let affirmed = prompts_logged(&log);
+        prompt_text(&cx, &sid, "/goal").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("Current goal (met)"), "{text}");
+        prompt_text(&cx, &sid, "an ordinary question").await?;
+        assert_eq!(prompts_logged(&log), affirmed + 1, "one prompt, no continuation");
+        Ok(())
+    })
+    .await;
+}
+
 /// The live crash's trigger: the stall watchdog cancelled a quiet parent
 /// turn, and within the cancel grace the turn came back and asked the person
 /// a question. The watchdog restarted the adapter under the open question
-/// anyway. A turn that revives during the grace is watched afresh, and an
-/// open question is the operator's wait, not a stall.
+/// anyway. A turn that revives during the grace is watched afresh. A planner
+/// run never puts a question to the operator (operator 2026-11-03: the run
+/// unblocks itself and records only human-only actions), so the question is
+/// refused at once with that instruction instead of waiting on anyone.
 #[tokio::test]
 async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_restarted() {
     let state = temp_state_file("stall-revived");
@@ -16889,11 +17047,18 @@ async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_rest
             std::fs::write(&gate_for_test, "").unwrap();
             let answered = tokio::time::timeout(Duration::from_secs(20), asking)
                 .await
-                .expect("the turn ends once the person answers")
+                .expect("the turn ends without anyone answering")
                 .unwrap()?;
             assert_eq!(answered.stop_reason, StopReason::EndTurn);
             let text = agent_text(&observed, &sid);
-            assert!(text.contains("elicit:accept"), "{text}");
+            assert!(
+                !text.contains("elicit:accept"),
+                "the operator was asked: {text}"
+            );
+            assert!(
+                text.contains("elicit-error") && text.contains("autonomous planner run"),
+                "the agent is told to unblock itself: {text}"
+            );
             assert!(text.contains("parent turn stalled"), "{text}");
             assert!(!text.contains("restarting its adapter"), "{text}");
             Ok(())
@@ -17304,4 +17469,116 @@ async fn send_input_cli_reaches_a_session_without_a_planner_run() {
     .await;
     let _ = std::fs::remove_file(&release);
     let _ = std::fs::remove_file(&hold);
+}
+
+/// `/shutdown` gives the router 15 seconds to answer, so the answer may never wait for the
+/// drain: not for its save host, nor for a parent turn that is still running.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_is_answered_over_the_wire_while_its_drain_runs() {
+    let state = temp_state_file("shutdown-wire-answer");
+    let log = temp_log("shutdown-wire-answer");
+    let repo = planner_wire_repository();
+    let yaml = planner_wire_yaml(&state, &log).replacen(
+        "routers:\n  planner:\n",
+        "routers:\n  planner:\n    shutdown: { command: /bin/sh, args: [\"-c\", \"sleep 20; echo {}\"], timeout_ms: 60000 }\n",
+        1,
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let turn = tokio::spawn(
+            cx.send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from("SLEEP:40000".to_string())],
+            ))
+            .block_task(),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..2 {
+            let request = agent_client_protocol::UntypedMessage::new(
+                "_router/planner_shutdown",
+                serde_json::json!({"sessionId": sid}),
+            )
+            .unwrap();
+            let answer = tokio::time::timeout(
+                Duration::from_secs(10),
+                cx.send_request(request).block_task(),
+            )
+            .await
+            .expect("the router answers while the drain runs")?;
+            assert_eq!(answer["accepted"], serde_json::json!(true));
+            assert!(router_acp::planner_shutdown::draining(&shared, &sid));
+        }
+        turn.abort();
+        Ok(())
+    })
+    .await;
+}
+
+/// These requests read the whole planner document under the state lock. That wait must not
+/// sit on the client connection's task, which also reads and answers everything else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_planner_request_waiting_on_state_leaves_the_connection_responsive() {
+    let state = temp_state_file("shutdown-state-wait");
+    let log = temp_log("shutdown-state-wait");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_wire_yaml(&state, &log),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+
+            let locked = Arc::new(std::sync::Barrier::new(2));
+            let holder = {
+                let shared = shared.clone();
+                let locked = locked.clone();
+                std::thread::spawn(move || {
+                    let _state = shared.state.lock().unwrap();
+                    locked.wait();
+                    std::thread::sleep(Duration::from_secs(3));
+                })
+            };
+            locked.wait();
+
+            let request = |method: &str, params: serde_json::Value| {
+                cx.send_request(agent_client_protocol::UntypedMessage::new(method, params).unwrap())
+                    .block_task()
+            };
+            let waiting = tokio::spawn(request(
+                "_router/planner_shutdown",
+                serde_json::json!({"sessionId": sid}),
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let other = tokio::time::timeout(
+                Duration::from_secs(1),
+                request("_router/no_such_method", serde_json::json!({})),
+            )
+            .await;
+            assert!(
+                other.is_ok(),
+                "the connection answered nothing while a planner request waited on state"
+            );
+            assert!(!waiting.is_finished(), "the lock holder is still running");
+
+            holder.join().unwrap();
+            let answer = waiting.await.unwrap()?;
+            assert_eq!(answer["accepted"], serde_json::json!(true));
+            Ok(())
+        },
+    )
+    .await;
 }

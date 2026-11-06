@@ -192,6 +192,8 @@ pub struct SessionRuntime {
     /// The stuck-turn watchdog cancelled or released the current turn
     /// (`crate::planner_watchdog`): its wakes go again at once.
     pub stalled: bool,
+    /// Times this parent's adapter was replaced for having no router tools.
+    pub tool_replacements: u32,
     /// Pending wake ids and `input:<id>` keys already steered into the current
     /// router-owned turn (`crate::planner_wake::steer_pending`); cleared when
     /// that turn ends, because the boundary delivers them for real.
@@ -794,7 +796,7 @@ pub(crate) async fn integrate_reply(
         Ok(out) if out.code == Some(0) => {
             if matches!(
                 action.as_str(),
-                "finalize" | "release" | "retire" | "release-selection-check"
+                "finished" | "finalize" | "release" | "retire" | "release-selection-check"
             ) && serde_json::from_slice::<Value>(&out.stdout)
                 .ok()
                 .and_then(|v| {

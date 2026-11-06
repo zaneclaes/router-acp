@@ -343,6 +343,11 @@ pub struct RouterSession {
     /// Whether the current downstream session received the ordinary delegation
     /// directive. Used to detect native-subagent bypasses as telemetry.
     pub delegation_directive_active: bool,
+    /// The session's `/goal` (`crate::goals`), kept until it is met, found unmeetable,
+    /// cleared or replaced.
+    pub goal: Option<crate::goals::Goal>,
+    /// The next turn clears a Claude/Grok agent's own goal mode (`/goal clear`).
+    pub goal_clear_pending: bool,
     /// Pre-classifier has already run once for this session (v1: first eligible
     /// turn only).
     pub preclass_done: bool,
@@ -528,6 +533,16 @@ impl RouterSession {
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
             delegation_directive_active: false,
+            // A restored goal resumes where it was; its kickoff already ran.
+            goal: routing
+                .and_then(|r| r.get("goal"))
+                .and_then(|g| serde_json::from_value::<crate::goals::Goal>(g.clone()).ok())
+                .map(|mut goal| {
+                    goal.kickoff = false;
+                    goal.continuations = 0;
+                    goal
+                }),
+            goal_clear_pending: false,
             preclass_done: saved_class.is_some(),
             preclass_profile: saved_class.map(|class| crate::classifier::TaskProfile {
                 class,
@@ -622,6 +637,8 @@ impl RouterSession {
             pending_injects: Vec::new(),
             pending_delegation_directive: None,
             delegation_directive_active: false,
+            goal: None,
+            goal_clear_pending: false,
             preclass_done: false,
             preclass_profile: None,
             planner_command_text: None,
@@ -1894,6 +1911,7 @@ pub(crate) fn refresh_pinned_effort(
 fn persist_runtime_context(shared: &Shared, sid: &str) -> Result<(), AcpError> {
     let patch = shared.with_session(sid, |s| json!({
         "candidate": s.pin.as_ref().map(|p| p.candidate.to_string()),
+        "goal": s.goal,
         "planner_phase": s.planner_phase,
         "coordinator": s.coordinator,
         "effort": {
@@ -2906,6 +2924,9 @@ pub fn handle_downstream_dispatch(
                             .and_then(|k| k.as_str())
                             .unwrap_or("");
                         if su == "tool_call" || su == "tool_call_update" {
+                            // Work the agent starts with its own background tools
+                            // reaches the client as `_router/background`.
+                            crate::native_backgrounds::observe(shared, &router_sid, update);
                             let tool_id = update
                                 .get("toolCallId")
                                 .and_then(|v| v.as_str())
@@ -3110,6 +3131,10 @@ pub fn handle_downstream_dispatch(
                     responder.respond(answer)?;
                     return Ok(Handled::Yes);
                 }
+                if is_question_method(&method) && in_planner_run(shared, &router_sid) {
+                    refuse_planner_question(shared, &router_sid, responder)?;
+                    return Ok(Handled::Yes);
+                }
                 let responder = track_approval(shared, &router_sid, &down_sid, &method, responder)?;
                 // Escalation router: a file read is investigation; a write or
                 // a terminal command is a side effect that locks out mid-turn
@@ -3239,6 +3264,11 @@ pub fn handle_downstream_dispatch(
                         },
                     );
                     responder.respond(answer)?;
+                    return Ok(Handled::Yes);
+                }
+                // No one answers a planner run's workers either.
+                if is_question_method(&method) && in_planner_run(shared, &parent_router_sid) {
+                    refuse_planner_question(shared, &parent_router_sid, responder)?;
                     return Ok(Handled::Yes);
                 }
                 let responder =
@@ -6014,6 +6044,55 @@ fn build_background_instructions() -> String {
         .to_string()
 }
 
+/// What a planner run's agents are told instead of how to ask: they never ask.
+const PLANNER_NO_QUESTIONS: &str = "This is an autonomous planner run: no one answers \
+     questions here. Do not ask the operator anything, neither with a question tool nor in \
+     prose, and never stop work to wait for an answer. Unblock yourself: decide, act, and \
+     verify. Ordering, priority, admission, scope and \"may I\" decisions are yours to make, \
+     including whether a repair or a prepared fix goes ahead; they are never a blocker. \
+     Only an action that literally needs a human to do something you cannot (a credential, \
+     a payment, a physical or account action) is recorded where the run's instructions put \
+     operator actions (Docs/BLOCKED.md), and you continue with other work at once.";
+
+fn build_planner_question_instructions() -> String {
+    format!("[router-acp questions]\n{PLANNER_NO_QUESTIONS}")
+}
+
+fn is_question_method(method: &str) -> bool {
+    matches!(method, "elicitation/create" | "_x.ai/ask_user_question")
+}
+
+/// A planner run's parent (the operator's `/implement` session) or one of its workers.
+fn in_planner_run(shared: &Arc<Shared>, router_sid: &str) -> bool {
+    shared
+        .with_session(router_sid, |s| s.strategy == StrategyKind::Planner)
+        .unwrap_or(false)
+        || crate::planner_workflow::load(shared, router_sid)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+/// A planner run's agent asked a question: it gets a refusal that says why and what to do,
+/// and the operator never sees a prompt that would stall the run.
+fn refuse_planner_question(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    responder: Responder<Value>,
+) -> Result<(), AcpError> {
+    shared.state.lock().unwrap().log(
+        router_sid,
+        &crate::state::LogEntry {
+            kind: "planner_question_refused".to_string(),
+            role: "router".to_string(),
+            summary: "a planner run asked a question; refused".to_string(),
+            tokens_estimated: true,
+            ..Default::default()
+        },
+    );
+    responder.respond_with_error(AcpError::invalid_request().data(PLANNER_NO_QUESTIONS))
+}
+
 fn build_question_instructions() -> String {
     "[router-acp questions]\n\
      Whenever you need an answer, choice, confirmation, or approval from the user, use the \
@@ -6460,12 +6539,50 @@ pub(crate) async fn run_primary_turn(
         .flatten()
         .is_some();
     publish_session_activity(&shared, &router_sid, true);
-    let turn = run_primary_turn_inner(shared.clone(), router_sid.clone(), req, cancellation);
-    let result = if planner_parent {
-        crate::planner_watchdog::guard_parent_turn(&shared, &router_sid, turn).await
-    } else {
-        turn.await
+    // A client attached to a restored session learns its goal with the first turn.
+    if let Some(goal) = shared
+        .with_session(&router_sid, |s| s.goal.clone())
+        .flatten()
+    {
+        crate::goals::publish(&shared, &router_sid, Some(&goal));
+    }
+    let mut req = req;
+    let result = loop {
+        let turn = run_primary_turn_inner(
+            shared.clone(),
+            router_sid.clone(),
+            req.clone(),
+            cancellation.clone(),
+        );
+        let result = if planner_parent {
+            crate::planner_watchdog::guard_parent_turn(&shared, &router_sid, turn).await
+        } else {
+            turn.await
+        };
+        // An active goal the reply did not affirm sends the agent back to work inside this
+        // same client turn (crate::goals). A cancelled or failed turn is never continued.
+        let ended_normally = matches!(&result, Ok(resp) if resp.stop_reason == StopReason::EndTurn)
+            && !cancellation
+                .as_ref()
+                .is_some_and(RequestCancellation::is_cancelled)
+            && !shared
+                .with_session(&router_sid, |s| s.cancelled)
+                .unwrap_or(false);
+        match crate::goals::after_turn(&shared, &router_sid, ended_normally) {
+            crate::goals::Followup::Continue(text) => {
+                req = PromptRequest::new(req.session_id.clone(), vec![ContentBlock::from(text)])
+                    .meta(req.meta.clone());
+            }
+            crate::goals::Followup::Done => break result,
+        }
     };
+    // The goal's status after the turn is what a restored session resumes with.
+    if shared
+        .with_session(&router_sid, |s| s.goal.is_some())
+        .unwrap_or(false)
+    {
+        let _ = persist_runtime_context(&shared, &router_sid);
+    }
     publish_session_activity(&shared, &router_sid, false);
     result
 }
@@ -6633,7 +6750,58 @@ async fn run_primary_turn_inner(
                 )
             })
             .unwrap_or((None, Vec::new(), None, Vec::new()));
-        let effective_prompt = {
+        // `/goal` (crate::goals): the turn that sets a goal reaches the agent the way the
+        // agent takes one, and every other turn with an active goal ends with its terms.
+        let goal_family = crate::goals::family(&candidate.agent);
+        let (goal_kickoff, goal_clear, active_goal) = shared
+            .with_session(&router_sid, |s| {
+                let kickoff = s.goal.as_mut().filter(|goal| goal.kickoff).map(|goal| {
+                    goal.kickoff = false;
+                    goal.objective.clone()
+                });
+                let clear = std::mem::take(&mut s.goal_clear_pending);
+                let active = s
+                    .goal
+                    .as_ref()
+                    .filter(|goal| goal.active())
+                    .map(|goal| goal.objective.clone());
+                (kickoff, clear, active)
+            })
+            .unwrap_or((None, false, None));
+        if let (Some(objective), crate::goals::Family::ControlRequest) =
+            (&goal_kickoff, goal_family)
+        {
+            crate::goals::send_control(&shared, &router_sid, Some(objective));
+        }
+        // Claude and Grok run a goal natively only when the prompt is the command itself.
+        // A turn that carries a handoff or a continuation keeps its framing and says the
+        // goal in words instead.
+        let native_goal_text = match goal_family {
+            crate::goals::Family::SlashCommand
+                if handoff.is_none()
+                    && history.is_empty()
+                    && !continuing
+                    && background_completion.is_none() =>
+            {
+                goal_kickoff
+                    .as_deref()
+                    .map(|objective| crate::goals::kickoff_text(objective, goal_family))
+                    .or_else(|| goal_clear.then(|| "/goal clear".to_string()))
+            }
+            _ => None,
+        };
+        if native_goal_text.is_some() {
+            // The command is the whole prompt; the router's framing waits for the next turn.
+            shared.with_session(&router_sid, |s| {
+                if s.pending_delegation_directive.is_none() {
+                    s.pending_delegation_directive = delegation.clone();
+                }
+                s.pending_injects.splice(0..0, injects.clone());
+            });
+        }
+        let effective_prompt = if let Some(text) = native_goal_text {
+            vec![ContentBlock::from(text)]
+        } else {
             let mut blocks = Vec::new();
             // Router framing first (background contract, then the scoped
             // delegation directive), followed by host pre-class injects (e.g.
@@ -6688,13 +6856,29 @@ async fn run_primary_turn_inner(
             blocks.extend(history.clone());
             if let Some(completion) = background_completion.take() {
                 blocks.extend(completion);
+            } else if let Some(objective) = &goal_kickoff {
+                blocks.push(ContentBlock::from(crate::goals::kickoff_text(
+                    objective,
+                    crate::goals::Family::None,
+                )));
             } else {
                 blocks.extend(req.prompt.clone());
             }
             if continuing {
                 blocks.push(ContentBlock::from("Continue the interrupted task using the original request above as context. Verify uncertain tool effects and do not repeat completed actions.".to_string()));
             }
-            blocks.push(ContentBlock::from(build_question_instructions()));
+            if goal_kickoff.is_none()
+                && let Some(objective) = &active_goal
+            {
+                blocks.push(ContentBlock::from(crate::goals::protocol(objective)));
+            }
+            blocks.push(ContentBlock::from(
+                if in_planner_run(&shared, &router_sid) {
+                    build_planner_question_instructions()
+                } else {
+                    build_question_instructions()
+                },
+            ));
             blocks
         };
         shared
@@ -10216,6 +10400,23 @@ fn continue_prompt(
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<ClientPeer>,
 ) -> Result<(), AcpError> {
+    // A client turn starts the goal's continuation count over, and its words are the
+    // guidance a stalled goal was waiting for.
+    shared.with_session(&router_sid, |s| {
+        if let Some(goal) = s.goal.as_mut() {
+            goal.continuations = 0;
+            if goal.status == crate::goals::Status::Stalled {
+                goal.status = crate::goals::Status::Active;
+            }
+        }
+    });
+    match crate::goals::handle_command(&shared, &router_sid, &req.prompt) {
+        Some(crate::goals::Handling::Answered) => {
+            persist_runtime_context(&shared, &router_sid)?;
+            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        }
+        Some(crate::goals::Handling::Dispatch) | None => {}
+    }
     if crate::accounts::intercepts(&shared, &router_sid, &req.prompt) {
         return cx.spawn(async move {
             crate::accounts::handle_prompt(shared, router_sid, req, responder).await
@@ -11311,19 +11512,58 @@ fn log_user_steer(
 
 fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispatch>, AcpError> {
     if let Dispatch::Request(msg, responder) = message {
-        if msg.method() == crate::planner_shutdown::STATUS_METHOD {
-            let result = crate::planner_shutdown::status(&shared, msg.params())
+        // kory's run census and `/shutdown`. Both read the whole planner document under the
+        // state lock, and this handler runs on the task that also reads and answers everything
+        // else on the client connection, so the wait happens on a blocking thread. `/shutdown`
+        // answers at once otherwise; its drain reports itself as `_router/shutdown_progress`.
+        let method = msg.method();
+        if method == crate::planner_shutdown::STATUS_METHOD
+            || method == crate::planner_shutdown::METHOD
+        {
+            let is_status = method == crate::planner_shutdown::STATUS_METHOD;
+            let params = msg.params().clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    if is_status {
+                        crate::planner_shutdown::status(&shared, &params)
+                    } else {
+                        crate::planner_shutdown::request(&shared, &params)
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
                 .map_err(|e| AcpError::invalid_params().data(e));
+                let _ = responder.respond_with_result(result);
+            });
+            return Ok(Handled::Yes);
+        }
+        // A goal edited or removed from the client's goal row, also mid-turn.
+        if msg.method() == crate::goals::METHOD {
+            let result = crate::goals::control(&shared, msg.params())
+                .map_err(|e| AcpError::invalid_params().data(e));
+            if let Some(sid) = msg.params().get("sessionId").and_then(|v| v.as_str()) {
+                let _ = persist_runtime_context(&shared, sid);
+            }
             let _ = responder.respond_with_result(result);
             return Ok(Handled::Yes);
         }
-        // kory's `/shutdown`: answered at once; the drain reports itself as
-        // `_router/shutdown_progress` notifications.
-        if msg.method() == crate::planner_shutdown::METHOD {
-            let result = crate::planner_shutdown::request(&shared, msg.params())
-                .map_err(|e| AcpError::invalid_params().data(e));
-            let _ = responder.respond_with_result(result);
-            return Ok(Handled::Yes);
+        // The operator's message typed into a child session in the client.
+        if msg.method() == crate::delegate_message::METHOD {
+            let params = msg.params().clone();
+            if let Some(upstream) = shared.upstream() {
+                upstream.spawn(async move {
+                    let result = crate::delegate_message::send(&shared, &params)
+                        .await
+                        .map_err(|e| AcpError::invalid_params().data(e));
+                    let _ = responder.respond_with_result(result);
+                    Ok(())
+                })?;
+                return Ok(Handled::Yes);
+            }
+            return Ok(Handled::No {
+                message: Dispatch::Request(msg, responder),
+                retry: false,
+            });
         }
         if msg.method() == "router-acp/planner-child" {
             let params = msg.params().clone();

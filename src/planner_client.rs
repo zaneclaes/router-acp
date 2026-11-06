@@ -301,6 +301,12 @@ pub async fn control(shared: &Arc<Shared>, params: Value) -> Result<Value, Strin
     if !supported(shared) {
         return Err("client did not negotiate planner children".into());
     }
+    act(shared, params).await
+}
+
+/// A child control, for a caller that already knows the client may act on the child (the
+/// operator typing into a child's input box: `crate::delegate_message`).
+pub(crate) async fn act(shared: &Arc<Shared>, params: Value) -> Result<Value, String> {
     let sid = params
         .get("sessionId")
         .and_then(Value::as_str)

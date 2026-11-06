@@ -174,6 +174,23 @@ pub struct WorkSpec {
     /// Repository-defined ticket or artifact identity. The core treats it as
     /// opaque; a host lifecycle gate enforces service-specific constraints.
     pub external_id: Option<String>,
+    /// Version of the worker's persisted completion contract. Absent and `1`
+    /// mean the legacy contract; `2` is the current contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_contract_version: Option<u32>,
+}
+
+fn validate_work_spec(work: &WorkSpec) -> Result<(), String> {
+    if work
+        .completion_contract_version
+        .is_some_and(|version| !matches!(version, 1 | 2))
+    {
+        return Err(format!(
+            "unsupported completion contract version: {:?}",
+            work.completion_contract_version
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +242,21 @@ pub struct Reconciliation {
     pub source_revision: Option<String>,
     pub evidence: Vec<String>,
     pub prior_specs: Vec<WorkSpec>,
+    /// Terminal v2 corrections retain the completed assignment's proof. A
+    /// correction is a new attempt for the same work identity, never a rewrite
+    /// of the release record that accepted the earlier revision.
+    #[serde(default)]
+    pub prior_completions: Vec<CompletionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionRecord {
+    pub spec: WorkSpec,
+    pub status: WorkStatus,
+    pub artifact: Option<Artifact>,
+    pub review: Option<Review>,
+    pub finish: Option<Receipt>,
+    pub integration: Option<Receipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,7 +484,8 @@ pub enum Operation {
         key: String,
         work: WorkSpec,
     },
-    /// Explicit parent handoff of the current scope and preserved source after recovery.
+    /// Explicit parent handoff of the current scope and preserved source after recovery,
+    /// or a bounded v2 correction that reopens its terminal identity.
     Reconcile {
         key: String,
         work: WorkSpec,
@@ -1693,6 +1726,7 @@ async fn operate_once(
                 .get(&work.work_id)
                 .ok_or("unknown reconciliation work")?
                 .clone();
+            validate_work_spec(&work)?;
             if run.execution_request.is_none()
                 || work.plan_id != existing.spec.plan_id
                 || work.scope.trim().is_empty()
@@ -1701,23 +1735,50 @@ async fn operate_once(
             {
                 return Err("reconcile requires the same admitted plan, complete current scope and parent custody evidence".into());
             }
-            if existing
-                .attempt
-                .as_ref()
-                .is_some_and(|a| !a.ended && owner_alive(a))
+            if work.completion_contract_version != existing.spec.completion_contract_version {
+                return Err(
+                    "reconcile cannot change the admitted completion contract version".into(),
+                );
+            }
+            let terminal_correction = existing.spec.completion_contract_version == Some(2)
+                && matches!(
+                    existing.status,
+                    WorkStatus::Finished | WorkStatus::Integrated
+                );
+            if terminal_correction
+                && (work.external_id != existing.spec.external_id
+                    || work.scope == existing.spec.scope
+                    || evidence.iter().any(|e| !valid_evidence(e)))
+            {
+                return Err("v2 correction must retain its external guide and name a changed bounded scope with durable evidence".into());
+            }
+            if terminal_correction
+                && existing
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| !attempt.ended)
+            {
+                return Err("v2 correction requires the prior attempt to be ended before reopening the work identity".into());
+            }
+            if !terminal_correction
+                && existing
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|a| !a.ended && owner_alive(a))
             {
                 return Err("reconcile requires the owning attempt to stop first; never change a live worker's assignment".into());
             }
-            if matches!(
-                existing.status,
-                WorkStatus::Finished
-                    | WorkStatus::Integrated
-                    | WorkStatus::Watching
-                    | WorkStatus::Retired
-            ) || run
-                .releases
-                .values()
-                .any(|release| release.works.contains_key(&work.work_id))
+            if !terminal_correction
+                && (matches!(
+                    existing.status,
+                    WorkStatus::Finished
+                        | WorkStatus::Integrated
+                        | WorkStatus::Watching
+                        | WorkStatus::Retired
+                ) || run
+                    .releases
+                    .values()
+                    .any(|release| release.works.contains_key(&work.work_id)))
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
             }
@@ -1739,8 +1800,21 @@ async fn operate_once(
                 return Err("work cannot depend on itself".into());
             }
             let workspace = match existing.workspace.clone() {
-                Some(workspace) => workspace,
+                Some(workspace)
+                    if !terminal_correction || workspace_available(&workspace).is_ok() =>
+                {
+                    workspace
+                }
                 None => {
+                    let mut allocation = existing.clone();
+                    allocation.spec = work.clone();
+                    allocate_workspace(shared, sid, &allocation, &run.policy).await?
+                }
+                // Integrated workspaces may already have been returned to the
+                // host. A v2 correction is explicitly reopening that same
+                // identity, so restore a lease instead of treating the old
+                // historical path as current custody.
+                Some(_) => {
                     let mut allocation = existing.clone();
                     allocation.spec = work.clone();
                     allocate_workspace(shared, sid, &allocation, &run.policy).await?
@@ -1753,6 +1827,19 @@ async fn operate_once(
                     .as_ref()
                     .is_some_and(|a| a.revision != source_revision);
             let current = run.works.get_mut(&work.work_id).unwrap();
+            if terminal_correction {
+                current
+                    .reconciliation
+                    .prior_completions
+                    .push(CompletionRecord {
+                        spec: current.spec.clone(),
+                        status: current.status,
+                        artifact: current.artifact.clone(),
+                        review: current.review.clone(),
+                        finish: current.finish.clone(),
+                        integration: current.integration.clone(),
+                    });
+            }
             if work != current.spec {
                 current
                     .reconciliation
@@ -1773,6 +1860,9 @@ async fn operate_once(
                 current.artifact = None;
                 current.review = None;
                 current.finish = None;
+                if terminal_correction {
+                    current.integration = None;
+                }
             }
             current.status = if current.review.as_ref().is_some_and(|r| r.accepted) {
                 WorkStatus::Accepted
@@ -1788,6 +1878,7 @@ async fn operate_once(
             }
         }
         Operation::Admit { work, .. } => {
+            validate_work_spec(&work)?;
             if run.execution_request.is_none() || run.phase != PlannerPhase::Implementation {
                 return Err("work admission requires an authentic implementation request".into());
             }
@@ -1802,6 +1893,18 @@ async fn operate_once(
                     return Err("work identity already names a different assignment".into());
                 }
             } else {
+                if let Some(existing) = run.works.values().find(|existing| {
+                    existing.spec.completion_contract_version == Some(2)
+                        && work.completion_contract_version == Some(2)
+                        && (existing.spec.plan_id == work.plan_id
+                            || (work.external_id.is_some()
+                                && existing.spec.external_id == work.external_id))
+                }) {
+                    return Err(format!(
+                        "v2 plan/external guide already has work identity {}; reconcile or resume that identity instead",
+                        existing.spec.work_id
+                    ));
+                }
                 if work.dependencies.contains(&work.work_id)
                     || work.ready_dependencies.contains_key(&work.work_id)
                 {
@@ -1954,6 +2057,14 @@ async fn operate_once(
             if receipt.evidence.is_empty() || receipt.evidence.values().any(|v| !valid_evidence(v))
             {
                 return Err("finishing requires durable handoff and custody evidence".into());
+            }
+            if work.spec.completion_contract_version == Some(2) {
+                if shared.cfg.routers.planner.integrate_check.is_none() {
+                    return Err("completion contract v2 requires a trusted finish verifier".into());
+                }
+                let mut check = value.clone();
+                check["assignment"] = serde_json::to_value(&*work).map_err(|e| e.to_string())?;
+                crate::planner_guard::integrate_check(shared, sid, &check).await?;
             }
             work.finish = Some(receipt);
             work.status = WorkStatus::Finished;

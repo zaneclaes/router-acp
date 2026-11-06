@@ -679,6 +679,7 @@ fn work(work_id: &str) -> WorkSpec {
         required_integration_evidence: Vec::new(),
         repository: None,
         external_id: Some("external-1".into()),
+        completion_contract_version: None,
     }
 }
 
@@ -692,6 +693,102 @@ fn work_spec_without_repository_deserializes_for_saved_runs() {
     .unwrap();
 
     assert_eq!(work.repository, None);
+}
+
+#[test]
+fn completion_contract_version_is_backward_compatible_and_validated() {
+    let legacy: WorkSpec = serde_json::from_value(json!({
+        "work_id": "work-1",
+        "plan_id": "plan-1",
+        "scope": "preserve old saved work"
+    }))
+    .unwrap();
+    assert_eq!(legacy.completion_contract_version, None);
+    assert!(
+        !serde_json::to_value(&legacy)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("completion_contract_version")
+    );
+
+    for version in [1, 2] {
+        let work: WorkSpec = serde_json::from_value(json!({
+            "work_id": "work-1",
+            "plan_id": "plan-1",
+            "scope": "accept supported contract",
+            "completion_contract_version": version
+        }))
+        .unwrap();
+        assert_eq!(work.completion_contract_version, Some(version));
+    }
+
+    let fixture = fixture(|_| {});
+    authorize(&fixture.shared);
+    let mut unsupported = work("unsupported");
+    unsupported.completion_contract_version = Some(3);
+    let error = futures::executor::block_on(planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "admit-unsupported-contract".into(),
+            work: unsupported,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        error.contains("unsupported completion contract version"),
+        "{error}"
+    );
+}
+
+#[test]
+fn admitted_completion_contract_version_cannot_change_on_readmit_or_reconcile() {
+    let fixture = fixture(|_| {});
+    let mut original = work("versioned");
+    original.completion_contract_version = Some(1);
+    admit(&fixture.shared, original.clone());
+
+    let mut readmit = original.clone();
+    readmit.completion_contract_version = Some(2);
+    let error = futures::executor::block_on(planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Admit {
+            key: "readmit-new-contract".into(),
+            work: readmit.clone(),
+        },
+    ))
+    .unwrap_err();
+    assert!(error.contains("different assignment"), "{error}");
+
+    let error = futures::executor::block_on(planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "reconcile-new-contract".into(),
+            work: readmit,
+            source_revision: "0".repeat(40),
+            evidence: vec!["parent custody".into()],
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        error.contains("cannot change the admitted completion contract version"),
+        "{error}"
+    );
+    assert_eq!(
+        planner_workflow::load(&fixture.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works["versioned"]
+            .spec
+            .completion_contract_version,
+        Some(1)
+    );
 }
 
 fn artifact(revision: &str) -> Artifact {
@@ -3749,6 +3846,134 @@ async fn busy_parent_capacity_queries_and_wakes_survive_continuous_tool_activity
     );
 }
 
+/// A parent that never idles (one long `/implement` turn; live 2026-11-06: 0
+/// children for an hour while it polled production) is filled by the router.
+#[tokio::test]
+async fn busy_parent_that_leaves_capacity_wakes_unanswered_is_auto_admitted() {
+    // Pending and unanswered for auto_admit_after_secs.
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a", "b"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 1;
+        capacity_host(cfg, script, 1_000, 120);
+    });
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    let start = parent_turn_ended(shared);
+    for elapsed in [1, 61, 120, 180] {
+        parent_tool_activity(shared, start + elapsed);
+        tick(shared, start + elapsed).await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        assert!(run.works.is_empty(), "too early at {elapsed}");
+    }
+    parent_tool_activity(shared, start + 182);
+    tick(shared, start + 182).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works.keys().cloned().collect::<Vec<_>>(),
+        vec!["work-a"]
+    );
+    assert!(run.works["work-a"].attempt.is_some(), "started");
+
+    // Delivered (steered) but answered by nothing, auto_admit_after_wakes times.
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 2, 1_000_000));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    let start = parent_turn_ended(shared);
+    for elapsed in [1, 61] {
+        parent_tool_activity(shared, start + elapsed);
+        tick(shared, start + elapsed).await;
+    }
+    assert_eq!(wakes_with(shared, "capacity:").len(), 1);
+    deliver_all(shared);
+    parent_tool_activity(shared, start + 70);
+    tick(shared, start + 70).await;
+    assert!(
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty(),
+        "one ignored wake is not yet enough"
+    );
+    parent_tool_activity(shared, start + 125);
+    tick(shared, start + 125).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 2);
+    deliver_all(shared);
+    parent_tool_activity(shared, start + 130);
+    tick(shared, start + 130).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(run.works.contains_key("work-a"), "busy parent was filled");
+    assert_eq!(run.capacity.unfilled_wakes, 0);
+}
+
+/// An adopted run marks every work for reconciliation, and the host lists only
+/// plans without a work (live 2026-11-06: 42 interrupted works, 0 children, the
+/// production repair owner among them, and no capacity wake). The waiting works
+/// keep the condition open and are named; nothing is auto-admitted for them.
+#[tokio::test]
+async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&[], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 1, 5));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    admit(shared, work("repair"));
+    planner_workflow::mutate(shared, SID, |run| {
+        let work = run.works.get_mut("repair").unwrap();
+        work.status = planner_workflow::WorkStatus::Interrupted;
+        work.reconciliation.required = true;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 30).await;
+    assert!(
+        wakes_with(shared, "capacity:").is_empty(),
+        "not unfilled long enough"
+    );
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1, "waiting works keep the condition open");
+    assert!(
+        wakes[0].1.reason.contains("reconcile"),
+        "{}",
+        wakes[0].1.reason
+    );
+    assert!(
+        wakes[0].1.reason.contains("repair"),
+        "{}",
+        wakes[0].1.reason
+    );
+    deliver_all(shared);
+    tick(shared, last + 200).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works.len(),
+        1,
+        "nothing is auto-admitted for a reconcile"
+    );
+    // Negative control: once reconciled, nothing waits and the condition resets.
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("repair").unwrap().reconciliation.required = false;
+        Ok(())
+    })
+    .unwrap();
+    tick(shared, last + 400).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(
+        run.capacity.unfilled_since.is_none(),
+        "no waiting work, no unfilled condition"
+    );
+}
+
 #[tokio::test]
 async fn busy_parent_capacity_clock_resets_when_all_candidates_are_held() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5068,6 +5293,99 @@ async fn release_checkpoints_keep_every_gate_and_the_two_release_lanes() {
             .releases["repair"]
             .stage(),
         Stage::Selected
+    );
+}
+
+// A failed production rollout may overlap a staging failure. The latter must
+// keep its failure history while freeing the staging lane for the former's repair.
+#[tokio::test]
+async fn two_failed_release_lanes_require_exact_staging_abandonment_before_repair() {
+    use router_acp::planner_release::{self, Checkpoint, Stage};
+    let f = fixture(|_| {});
+    let revision = finished_work(&f.shared).await;
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let checkpoint = |stage, key: &str| Checkpoint {
+        stage,
+        revision: revision.clone(),
+        works: BTreeMap::new(),
+        replaces: None,
+        evidence: BTreeMap::from([(key.into(), "preserved-evidence.md".into())]),
+    };
+    let mut production = checkpoint(Stage::Selected, "selection");
+    production.works.insert("work-1".into(), revision.clone());
+    planner_release::record(&mut run, "production", &production).unwrap();
+    for (stage, key) in [
+        (Stage::CandidatePassed, "candidate-build"),
+        (Stage::StagingDeployed, "staging-rollout"),
+        (Stage::StagingPassed, "staging-smoke"),
+        (Stage::ProductionMerged, "production-pr"),
+    ] {
+        planner_release::record(&mut run, "production", &checkpoint(stage, key)).unwrap();
+    }
+    let mut second = run.works["work-1"].clone();
+    second.spec.work_id = "work-2".into();
+    run.works.insert("work-2".into(), second);
+    let mut staging = checkpoint(Stage::Selected, "selection");
+    staging.works.insert("work-2".into(), revision.clone());
+    planner_release::record(&mut run, "staging", &staging).unwrap();
+    planner_release::record(
+        &mut run,
+        "production",
+        &checkpoint(Stage::Failed, "failure"),
+    )
+    .unwrap();
+    planner_release::record(&mut run, "staging", &checkpoint(Stage::Failed, "failure")).unwrap();
+
+    let mut repair = checkpoint(Stage::Selected, "selection");
+    repair.works = BTreeMap::from([
+        ("work-1".into(), revision.clone()),
+        ("work-2".into(), revision.clone()),
+    ]);
+    repair.replaces = Some("production".into());
+    assert!(planner_release::record(&mut run, "repair", &repair).is_err());
+    assert!(
+        planner_release::record(
+            &mut run,
+            "production",
+            &checkpoint(Stage::Abandoned, "abandonment")
+        )
+        .is_err()
+    );
+    let mut foreign = checkpoint(Stage::Abandoned, "abandonment");
+    foreign.revision = "f".repeat(40);
+    assert!(planner_release::record(&mut run, "staging", &foreign).is_err());
+    planner_release::record(
+        &mut run,
+        "staging",
+        &checkpoint(Stage::Abandoned, "abandonment"),
+    )
+    .unwrap();
+    assert_eq!(run.releases["staging"].checkpoints.len(), 3);
+    assert_eq!(run.releases["staging"].checkpoints[1].stage, Stage::Failed);
+    assert!(
+        planner_release::record(
+            &mut run,
+            "staging",
+            &checkpoint(Stage::Abandoned, "abandonment")
+        )
+        .is_ok()
+    );
+    assert!(planner_release::record(&mut run, "unreplaced", &staging).is_err());
+    planner_release::record(&mut run, "repair", &repair).unwrap();
+    assert!(
+        planner_release::record(
+            &mut run,
+            "repair",
+            &checkpoint(Stage::ProductionPassed, "production-smoke")
+        )
+        .is_err()
+    );
+    assert!(
+        planner_release::integration_allowed(&run, "work-1", &receipt(&revision, "merge")).is_err()
+    );
+    assert_eq!(
+        run.releases["production"].superseded_by.as_deref(),
+        Some("repair")
     );
 }
 
@@ -7270,9 +7588,14 @@ async fn completion_requires_a_clean_completing_audit() {
     );
 }
 
-/// Take `work-1` to `finished` on its current workspace revision.
-async fn finished_work(shared: &Arc<Shared>) -> String {
-    admit(shared, work("work-1"));
+/// Prepare `work-1` through review on its current workspace revision.
+async fn prepared_work(
+    shared: &Arc<Shared>,
+    completion_contract_version: Option<u32>,
+) -> (planner_workflow::WorkerIdentity, String) {
+    let mut assignment = work("work-1");
+    assignment.completion_contract_version = completion_contract_version;
+    admit(shared, assignment);
     let (identity, workspace, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
         .await
         .unwrap();
@@ -7305,6 +7628,12 @@ async fn finished_work(shared: &Arc<Shared>) -> String {
     )
     .await
     .unwrap();
+    (identity, revision)
+}
+
+/// Take `work-1` to `finished` on its current workspace revision.
+async fn finished_work(shared: &Arc<Shared>) -> String {
+    let (identity, revision) = prepared_work(shared, None).await;
     planner_workflow::operate(
         shared,
         SID,
@@ -7320,6 +7649,350 @@ async fn finished_work(shared: &Arc<Shared>) -> String {
     .unwrap();
     planner_workflow::attempt_ended(shared, SID, &identity, None, "done".into(), false).unwrap();
     revision
+}
+
+async fn finish_prepared_work(
+    shared: &Arc<Shared>,
+    identity: &planner_workflow::WorkerIdentity,
+    revision: &str,
+) -> Result<String, String> {
+    planner_workflow::operate(
+        shared,
+        SID,
+        Some(identity),
+        Operation::Finished {
+            key: "finished".into(),
+            work_id: "work-1".into(),
+            attempt_id: identity.attempt_id.clone(),
+            receipt: receipt(revision, "handoff"),
+        },
+    )
+    .await
+}
+
+fn trusted_finish_fixture() -> Fixture {
+    fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/echo".into(),
+            args: vec![r#"{"verified_action":"finished"}"#.into()],
+            timeout_ms: 5_000,
+        });
+    })
+}
+
+#[tokio::test]
+async fn v2_terminal_correction_reuses_identity_and_preserves_frozen_release_proof() {
+    let fixture = trusted_finish_fixture();
+    let (identity, revision) = prepared_work(&fixture.shared, Some(2)).await;
+    finish_prepared_work(&fixture.shared, &identity, &revision)
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(
+        &fixture.shared,
+        SID,
+        &identity,
+        None,
+        "finished".into(),
+        false,
+    )
+    .unwrap();
+
+    planner_workflow::mutate(&fixture.shared, SID, |run| {
+        run.releases.insert(
+            "historical-release".into(),
+            serde_json::from_value(json!({
+                "candidate": revision.clone(),
+                "works": {"work-1": revision.clone()},
+                "checkpoints": [],
+                "superseded_by": null
+            }))
+            .unwrap(),
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    let mut correction = work("work-1");
+    correction.completion_contract_version = Some(2);
+    correction.scope = "fix the bounded regression found after the accepted release".into();
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "v2-correction".into(),
+            work: correction,
+            source_revision: revision.clone(),
+            evidence: vec!["post-release-regression.md".into()],
+        },
+    )
+    .await
+    .unwrap();
+
+    let run = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    let reopened = &run.works["work-1"];
+    assert_eq!(reopened.status, WorkStatus::Admitted);
+    assert!(reopened.attempt.is_none());
+    assert!(reopened.artifact.is_none());
+    assert!(reopened.review.is_none());
+    assert!(reopened.finish.is_none());
+    assert!(reopened.integration.is_none());
+    assert_eq!(reopened.reconciliation.prior_completions.len(), 1);
+    let prior = &reopened.reconciliation.prior_completions[0];
+    assert_eq!(prior.finish.as_ref().unwrap().revision, revision);
+    assert!(prior.review.as_ref().unwrap().accepted);
+    assert_eq!(
+        run.releases["historical-release"].works["work-1"], revision,
+        "the correction must not rewrite the historical release candidate"
+    );
+
+    let (replacement, _, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    let error = planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        Some(&replacement),
+        Operation::Finished {
+            key: "corrected-finish-without-artifact".into(),
+            work_id: "work-1".into(),
+            attempt_id: replacement.attempt_id.clone(),
+            receipt: receipt(&revision, "handoff"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains("current artifact has no acceptance"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn v2_correction_refuses_wrong_identity_live_attempt_and_legacy_reopen() {
+    let v2 = trusted_finish_fixture();
+    let (identity, revision) = prepared_work(&v2.shared, Some(2)).await;
+    finish_prepared_work(&v2.shared, &identity, &revision)
+        .await
+        .unwrap();
+
+    let mut changed = work("work-1");
+    changed.completion_contract_version = Some(2);
+    changed.scope = "a bounded correction".into();
+    let error = planner_workflow::operate(
+        &v2.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "live-v2-correction".into(),
+            work: changed.clone(),
+            source_revision: revision.clone(),
+            evidence: vec!["regression.md".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("prior attempt to be ended"), "{error}");
+
+    planner_workflow::attempt_ended(&v2.shared, SID, &identity, None, "done".into(), false)
+        .unwrap();
+    let mut wrong_version = changed.clone();
+    wrong_version.completion_contract_version = Some(1);
+    let error = planner_workflow::operate(
+        &v2.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "wrong-version".into(),
+            work: wrong_version,
+            source_revision: revision.clone(),
+            evidence: vec!["regression.md".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains("cannot change the admitted completion contract version"),
+        "{error}"
+    );
+    let mut wrong_plan = changed.clone();
+    wrong_plan.plan_id = "other-plan".into();
+    let error = planner_workflow::operate(
+        &v2.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "wrong-plan".into(),
+            work: wrong_plan,
+            source_revision: revision.clone(),
+            evidence: vec!["regression.md".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("same admitted plan"), "{error}");
+    let mut wrong_external = changed.clone();
+    wrong_external.external_id = Some("other-guide".into());
+    let error = planner_workflow::operate(
+        &v2.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "wrong-external".into(),
+            work: wrong_external,
+            source_revision: revision.clone(),
+            evidence: vec!["regression.md".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("retain its external guide"), "{error}");
+
+    let legacy = fixture(|_| {});
+    let legacy_revision = finished_work(&legacy.shared).await;
+    let mut legacy_correction = work("work-1");
+    legacy_correction.scope = "a bounded legacy correction".into();
+    let error = planner_workflow::operate(
+        &legacy.shared,
+        SID,
+        None,
+        Operation::Reconcile {
+            key: "legacy-terminal".into(),
+            work: legacy_correction,
+            source_revision: legacy_revision,
+            evidence: vec!["regression.md".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("cannot rewrite finished work"), "{error}");
+}
+
+#[test]
+fn v2_admission_refuses_a_second_work_id_for_the_same_plan_and_external_guide() {
+    let fixture = fixture(|_| {});
+    let mut original = work("original-v2");
+    original.completion_contract_version = Some(2);
+    admit(&fixture.shared, original);
+    for (suffix, alternate_plan, alternate_guide) in [
+        ("both", false, false),
+        ("guide", true, false),
+        ("plan", false, true),
+    ] {
+        let mut duplicate = work("duplicate-v2");
+        duplicate.completion_contract_version = Some(2);
+        if alternate_plan {
+            duplicate.plan_id = "different-plan".into();
+        }
+        if alternate_guide {
+            duplicate.external_id = Some("Docs/Plans/DIFFERENT.md".into());
+        }
+        let error = futures::executor::block_on(planner_workflow::operate(
+            &fixture.shared,
+            SID,
+            None,
+            Operation::Admit {
+                key: format!("duplicate-v2-{suffix}"),
+                work: duplicate,
+            },
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("already has work identity original-v2"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn completion_contract_v2_requires_an_explicit_trusted_finish_verifier() {
+    let without_host = fixture(|_| {});
+    let (identity, revision) = prepared_work(&without_host.shared, Some(2)).await;
+    assert!(
+        finish_prepared_work(&without_host.shared, &identity, &revision)
+            .await
+            .unwrap_err()
+            .contains("completion contract v2 requires a trusted finish verifier")
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let request = tmp.path().join("request");
+    std::fs::write(&reply, "reject").unwrap();
+    let host_script = format!(
+        "cat > '{}'; v=$(cat '{}'); if [ \"$v\" = reject ]; then echo refused >&2; exit 2; fi; if [ \"$v\" = empty ]; then exit 0; fi; cat '{}'",
+        request.display(),
+        reply.display(),
+        reply.display()
+    );
+    let with_host = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), host_script],
+            timeout_ms: 5_000,
+        });
+    });
+    let (identity, revision) = prepared_work(&with_host.shared, Some(2)).await;
+    for response in ["reject", "empty", "{}"] {
+        std::fs::write(&reply, response).unwrap();
+        let error = finish_prepared_work(&with_host.shared, &identity, &revision)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("rejected by the integrate-check host")
+                || error.contains("did not explicitly acknowledge this action"),
+            "{response}: {error}"
+        );
+        assert_eq!(
+            planner_workflow::load(&with_host.shared, SID)
+                .unwrap()
+                .unwrap()
+                .works["work-1"]
+                .status,
+            WorkStatus::Accepted
+        );
+    }
+
+    std::fs::write(&reply, r#"{"verified_action":"finished"}"#).unwrap();
+    finish_prepared_work(&with_host.shared, &identity, &revision)
+        .await
+        .unwrap();
+    let request_value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&request).unwrap()).unwrap();
+    assert_eq!(request_value["action"], "finished");
+    assert_eq!(request_value["receipt"]["revision"], revision);
+    assert_eq!(
+        request_value["receipt"]["evidence"]["handoff"],
+        "verified-log.txt"
+    );
+    assert_eq!(
+        request_value["assignment"]["spec"]["completion_contract_version"],
+        2
+    );
+    assert_eq!(
+        planner_workflow::load(&with_host.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works["work-1"]
+            .status,
+        WorkStatus::Finished
+    );
+
+    let legacy = fixture(|_| {});
+    let (identity, revision) = prepared_work(&legacy.shared, None).await;
+    finish_prepared_work(&legacy.shared, &identity, &revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        planner_workflow::load(&legacy.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works["work-1"]
+            .status,
+        WorkStatus::Finished
+    );
 }
 
 #[tokio::test]
