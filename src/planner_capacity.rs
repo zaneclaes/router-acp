@@ -745,7 +745,13 @@ async fn fill_slots(
     }
     let host = run.capacity.host.clone().expect("snapshot present");
     let unheld = unheld_candidates(&run, now_ms);
-    if host.ok && unheld.is_empty() {
+    // Works that wait only on the parent's `reconcile` (an adopted or resumed run
+    // marks every one) are invisible to the host, which lists only plans without
+    // a work. They keep the slots-empty condition open and are named in the wake
+    // (2026-11-06: after a Kory restart, 42 interrupted works waited on reconcile
+    // with 0 children live, the production repair owner among them).
+    let awaiting = awaiting_reconciliation(&run);
+    if host.ok && unheld.is_empty() && awaiting.is_empty() {
         reset_unfilled(shared, sid, &run);
         return false;
     }
@@ -786,7 +792,7 @@ async fn fill_slots(
         } else {
             run.capacity.unfilled_wakes >= timing.auto_admit_after_wakes
         };
-    if host.ok && pinned && (idle_admission || busy_admission) {
+    if host.ok && pinned && !unheld.is_empty() && (idle_admission || busy_admission) {
         auto_admit(shared, sid, &run, unheld, live, max, now).await;
         return true;
     }
@@ -798,7 +804,16 @@ async fn fill_slots(
     if now - since < timing.wake_after_secs as i64 || pending_wake(&run, "capacity:") {
         return false;
     }
-    let reason = if host.ok {
+    let reason = if host.ok && unheld.is_empty() {
+        format!(
+            "capacity: {live} of {max} worker slots are in use, {free} free, and {} work(s) wait \
+             only on your planner_workflow `reconcile` (record current scope and preserved source) \
+             before they can resume: {}. Reconcile and resume up to {free} of them NOW, repairs of a \
+             red environment first; the router cannot resume them without it.",
+            awaiting.len(),
+            awaiting.join(", ")
+        )
+    } else if host.ok {
         let mut text = format!(
             "capacity: {live} of {max} worker slots are in use, {free} free, and the capacity \
              host lists {} admissible candidate(s) no hold covers, in priority order:\n",
@@ -979,6 +994,27 @@ async fn auto_admit(
     }
     tracing::warn!(session = sid, admitted = ?admitted, held = ?held, "router auto-admitted planner work to fill free worker slots");
     crate::session::notify_user(shared, sid, format!("router-acp · {reason}"));
+}
+
+/// Work ids that could run now but for the parent's reconciliation: no live
+/// attempt, a status the router would resume, and `reconciliation.required`.
+pub(crate) fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
+    use planner_workflow::WorkStatus;
+    run.works
+        .iter()
+        .filter(|(_, work)| {
+            work.reconciliation.required
+                && matches!(
+                    work.status,
+                    WorkStatus::Admitted
+                        | WorkStatus::Interrupted
+                        | WorkStatus::Corrections
+                        | WorkStatus::Accepted
+                )
+                && work.attempt.as_ref().is_none_or(|attempt| attempt.ended)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 fn recovery_prerequisite(run: &PlannerRun, work: &planner_workflow::Work) -> Option<String> {

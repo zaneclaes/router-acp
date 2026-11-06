@@ -3913,6 +3913,67 @@ async fn busy_parent_that_leaves_capacity_wakes_unanswered_is_auto_admitted() {
     assert_eq!(run.capacity.unfilled_wakes, 0);
 }
 
+/// An adopted run marks every work for reconciliation, and the host lists only
+/// plans without a work (live 2026-11-06: 42 interrupted works, 0 children, the
+/// production repair owner among them, and no capacity wake). The waiting works
+/// keep the condition open and are named; nothing is auto-admitted for them.
+#[tokio::test]
+async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&[], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 1, 5));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    admit(shared, work("repair"));
+    planner_workflow::mutate(shared, SID, |run| {
+        let work = run.works.get_mut("repair").unwrap();
+        work.status = planner_workflow::WorkStatus::Interrupted;
+        work.reconciliation.required = true;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 30).await;
+    assert!(
+        wakes_with(shared, "capacity:").is_empty(),
+        "not unfilled long enough"
+    );
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1, "waiting works keep the condition open");
+    assert!(
+        wakes[0].1.reason.contains("reconcile"),
+        "{}",
+        wakes[0].1.reason
+    );
+    assert!(
+        wakes[0].1.reason.contains("repair"),
+        "{}",
+        wakes[0].1.reason
+    );
+    deliver_all(shared);
+    tick(shared, last + 200).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works.len(),
+        1,
+        "nothing is auto-admitted for a reconcile"
+    );
+    // Negative control: once reconciled, nothing waits and the condition resets.
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("repair").unwrap().reconciliation.required = false;
+        Ok(())
+    })
+    .unwrap();
+    tick(shared, last + 400).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(
+        run.capacity.unfilled_since.is_none(),
+        "no waiting work, no unfilled condition"
+    );
+}
+
 #[tokio::test]
 async fn busy_parent_capacity_clock_resets_when_all_candidates_are_held() {
     let tmp = tempfile::tempdir().unwrap();
