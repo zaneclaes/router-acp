@@ -766,13 +766,27 @@ async fn fill_slots(
     let pinned = shared
         .with_session(sid, |s| s.pin.is_some())
         .unwrap_or(false);
-    if parent_idle
-        && host.ok
-        && pinned
+    let idle_admission = parent_idle
         && !pending_wake(&run, "capacity:")
         && (run.capacity.unfilled_wakes >= timing.auto_admit_after_wakes
-            || idle >= timing.auto_admit_after_secs as i64)
-    {
+            || idle >= timing.auto_admit_after_secs as i64);
+    // A parent that never idles (one long `/implement` turn of release polls and
+    // reviews) must not keep slots empty either (operator, 2026-11-06: "The core
+    // invariant of kory/implement is that it must keep WIP children active"; run
+    // 4faa… had 0 children for an hour while its turn polled production 7980).
+    // Its capacity wake is steered into the running turn; once that wake has
+    // gone unanswered for `auto_admit_after_secs`, or the parent was handed
+    // `auto_admit_after_wakes` of them and still left the slots empty, the
+    // router admits and starts the unheld candidates itself, exactly as it does
+    // for an idle parent.
+    let busy_admission = !parent_idle
+        && run.capacity.last_wake_at > 0
+        && if pending_wake(&run, "capacity:") {
+            now - run.capacity.last_wake_at >= timing.auto_admit_after_secs as i64
+        } else {
+            run.capacity.unfilled_wakes >= timing.auto_admit_after_wakes
+        };
+    if host.ok && pinned && (idle_admission || busy_admission) {
         auto_admit(shared, sid, &run, unheld, live, max, now).await;
         return true;
     }

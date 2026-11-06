@@ -275,9 +275,13 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     }
     // Inside the operator's `/implement` turn only the deployment obligation
-    // is steered; the fallback below cancels router-owned turns only.
+    // and idle worker capacity are steered; the fallback below cancels
+    // router-owned turns only. A parent can spend its whole run inside that one
+    // turn, so a capacity wake that waited for its boundary kept every slot
+    // empty (2026-11-06: 0 children for an hour while it polled production).
     if command_turn
         && !interrupt
+        && !key.starts_with("capacity:")
         && !((environment_wake(&key)
             || key.starts_with("release:")
             || key.starts_with("audit:release:"))

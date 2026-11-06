@@ -3846,6 +3846,73 @@ async fn busy_parent_capacity_queries_and_wakes_survive_continuous_tool_activity
     );
 }
 
+/// A parent that never idles (one long `/implement` turn; live 2026-11-06: 0
+/// children for an hour while it polled production) is filled by the router.
+#[tokio::test]
+async fn busy_parent_that_leaves_capacity_wakes_unanswered_is_auto_admitted() {
+    // Pending and unanswered for auto_admit_after_secs.
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a", "b"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 1;
+        capacity_host(cfg, script, 1_000, 120);
+    });
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    let start = parent_turn_ended(shared);
+    for elapsed in [1, 61, 120, 180] {
+        parent_tool_activity(shared, start + elapsed);
+        tick(shared, start + elapsed).await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        assert!(run.works.is_empty(), "too early at {elapsed}");
+    }
+    parent_tool_activity(shared, start + 182);
+    tick(shared, start + 182).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        run.works.keys().cloned().collect::<Vec<_>>(),
+        vec!["work-a"]
+    );
+    assert!(run.works["work-a"].attempt.is_some(), "started");
+
+    // Delivered (steered) but answered by nothing, auto_admit_after_wakes times.
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["a"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 2, 1_000_000));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    shared.with_session(SID, |s| s.prompt_activity = 1);
+    let start = parent_turn_ended(shared);
+    for elapsed in [1, 61] {
+        parent_tool_activity(shared, start + elapsed);
+        tick(shared, start + elapsed).await;
+    }
+    assert_eq!(wakes_with(shared, "capacity:").len(), 1);
+    deliver_all(shared);
+    parent_tool_activity(shared, start + 70);
+    tick(shared, start + 70).await;
+    assert!(
+        planner_workflow::load(shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty(),
+        "one ignored wake is not yet enough"
+    );
+    parent_tool_activity(shared, start + 125);
+    tick(shared, start + 125).await;
+    assert_eq!(wakes_with(shared, "capacity:").len(), 2);
+    deliver_all(shared);
+    parent_tool_activity(shared, start + 130);
+    tick(shared, start + 130).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(run.works.contains_key("work-a"), "busy parent was filled");
+    assert_eq!(run.capacity.unfilled_wakes, 0);
+}
+
 #[tokio::test]
 async fn busy_parent_capacity_clock_resets_when_all_candidates_are_held() {
     let tmp = tempfile::tempdir().unwrap();

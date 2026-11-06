@@ -15906,6 +15906,83 @@ async fn failed_environment_is_steered_into_the_running_implement_command_turn()
     let _ = std::fs::remove_file(&release);
 }
 
+/// Idle worker capacity reaches the operator's long `/implement` turn too
+/// (2026-11-06: 0 children for an hour of one turn polling production).
+#[tokio::test]
+async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
+    use router_acp::planner_workflow::{self as workflow, Wake};
+    let state = temp_state_file("command-turn-capacity");
+    let log = temp_log("command-turn-capacity");
+    let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
+    let repo = preempt_repository(&release);
+    let skill = repo.path().join("repo/.agents/skills/select-plan/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        format!(
+            "---\nname: select-plan\n---\nCOMMAND-TURN-MARKER\nWAIT_FILE:{}\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            init(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            let (answer, ()) = tokio::join!(
+                prompt_text(&cx, &sid, "/implement drain the roadmap"),
+                async {
+                    wait_for_mock_prompt(&log, "COMMAND-TURN-MARKER").await;
+                    workflow::mutate(&shared, &sid, |run| {
+                        run.wakes.insert(
+                            "capacity:fixture".into(),
+                            Wake {
+                                work_id: sid.clone(),
+                                reason: "CAPACITY-FIXTURE".into(),
+                                ..Default::default()
+                            },
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                    let steered = || {
+                        read_log(&log).iter().any(|e| {
+                            e["event"] == "steer"
+                                && e["params"].to_string().contains("CAPACITY-FIXTURE")
+                        })
+                    };
+                    for _ in 0..200 {
+                        if steered() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    assert!(
+                        steered(),
+                        "the capacity wake reached the running command turn"
+                    );
+                    assert!(
+                        !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                        "never cancelled"
+                    );
+                    std::fs::write(&release, "").unwrap();
+                }
+            );
+            answer?;
+            Ok(())
+        },
+    )
+    .await;
+    let _ = std::fs::remove_file(&release);
+}
+
 /// A parent that answers wake after wake with prose and no tool call while
 /// staging is failed (live: fifteen "still paused" turns) is told, from the
 /// second such turn, that nothing stops the run.
