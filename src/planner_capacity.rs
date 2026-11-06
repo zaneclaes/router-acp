@@ -809,7 +809,8 @@ async fn fill_slots(
             "capacity: {live} of {max} worker slots are in use, {free} free, and {} work(s) wait \
              only on your planner_workflow `reconcile` (record current scope and preserved source) \
              before they can resume: {}. Reconcile and resume up to {free} of them NOW, repairs of a \
-             red environment first; the router cannot resume them without it.",
+             red environment first; the router cannot resume them without it. A work whose plan is \
+             done or superseded is retired instead (planner_workflow `retire`), so it stops waiting.",
             awaiting.len(),
             awaiting.join(", ")
         )
@@ -998,11 +999,22 @@ async fn auto_admit(
 
 /// Work ids that could run now but for the parent's reconciliation: no live
 /// attempt, a status the router would resume, and `reconciliation.required`.
+/// A superseded identity is not one: a work whose plan has another work that
+/// is not retired is parked on purpose (2026-11-06: 14 stale `-r1101c` and
+/// `inspect-…` works sat admitted beside their plans' v2 works), so it never
+/// keeps the slots-empty condition open.
 pub(crate) fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
     use planner_workflow::WorkStatus;
+    let superseded = |id: &str, work: &planner_workflow::Work| {
+        run.works.iter().any(|(other_id, other)| {
+            other_id != id
+                && other.spec.plan_id == work.spec.plan_id
+                && other.status != WorkStatus::Retired
+        })
+    };
     run.works
         .iter()
-        .filter(|(_, work)| {
+        .filter(|(id, work)| {
             work.reconciliation.required
                 && matches!(
                     work.status,
@@ -1012,6 +1024,7 @@ pub(crate) fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
                         | WorkStatus::Accepted
                 )
                 && work.attempt.as_ref().is_none_or(|attempt| attempt.ended)
+                && !superseded(id, work)
         })
         .map(|(id, _)| id.clone())
         .collect()

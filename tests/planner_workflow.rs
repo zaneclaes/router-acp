@@ -3972,6 +3972,25 @@ async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them()
         run.capacity.unfilled_since.is_none(),
         "no waiting work, no unfilled condition"
     );
+    // A superseded identity of the same plan is parked on purpose and never waits.
+    let mut stale = work("repair-old");
+    stale.plan_id = run.works["repair"].spec.plan_id.clone();
+    admit(shared, stale);
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works
+            .get_mut("repair-old")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    tick(shared, last + 600).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(
+        run.capacity.unfilled_since.is_none(),
+        "a superseded identity kept the condition open"
+    );
 }
 
 #[tokio::test]
