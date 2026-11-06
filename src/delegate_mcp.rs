@@ -1112,7 +1112,7 @@ pub async fn start_background_delegate(
 
 /// `delegate_followup` with `background: true`: the follow-up turn runs as a
 /// background job collected by `delegate_await`.
-fn start_background_followup(
+pub(crate) fn start_background_followup(
     shared: &Arc<Shared>,
     router_sid: &str,
     args: DelegateFollowupArgs,

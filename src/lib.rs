@@ -13,6 +13,7 @@ pub mod config_admin;
 pub mod credentials;
 pub mod delegate_hook;
 pub mod delegate_mcp;
+pub mod delegate_message;
 pub mod downstream;
 pub mod external_message;
 pub mod goals;

@@ -11547,6 +11547,24 @@ fn on_catch_all(shared: Arc<Shared>, message: Dispatch) -> Result<Handled<Dispat
             let _ = responder.respond_with_result(result);
             return Ok(Handled::Yes);
         }
+        // The operator's message typed into a child session in the client.
+        if msg.method() == crate::delegate_message::METHOD {
+            let params = msg.params().clone();
+            if let Some(upstream) = shared.upstream() {
+                upstream.spawn(async move {
+                    let result = crate::delegate_message::send(&shared, &params)
+                        .await
+                        .map_err(|e| AcpError::invalid_params().data(e));
+                    let _ = responder.respond_with_result(result);
+                    Ok(())
+                })?;
+                return Ok(Handled::Yes);
+            }
+            return Ok(Handled::No {
+                message: Dispatch::Request(msg, responder),
+                retry: false,
+            });
+        }
         if msg.method() == "router-acp/planner-child" {
             let params = msg.params().clone();
             if let Some(upstream) = shared.upstream() {
