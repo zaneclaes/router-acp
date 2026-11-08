@@ -356,6 +356,122 @@ async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
     );
 }
 
+fn input_wakes(shared: &Arc<Shared>) -> Vec<String> {
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    run.wakes
+        .iter()
+        .filter(|(id, wake)| id.starts_with("input:") && !wake.acknowledged)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// A coordinator answered each human message in full and was then woken to
+/// answer it again ("was delivered but your turn ended without its
+/// acknowledgment"). A turn that replied handled the inputs it was delivered.
+#[test]
+fn a_parent_turn_that_replies_acknowledges_its_inputs_and_is_not_woken() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let id = "f95f9796-faf3-419d-9983-fd1197c11f6f";
+    let request = input_request(Some(id), "The square looping is a little weird", false);
+    planner_workflow::record_steered_input(&f.shared, SID, &request).unwrap();
+    planner_workflow::acknowledge_answered_inputs(&f.shared, SID, true).unwrap();
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.inputs[id].acknowledged);
+    assert!(
+        input_wakes(&f.shared).is_empty(),
+        "an answered input was woken again"
+    );
+}
+
+/// A turn with no reply, an error or a cancel did not handle its input: turn
+/// end still wakes the parent for it once.
+#[test]
+fn a_parent_turn_without_a_reply_still_wakes_once_for_its_input() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let id = "bb27f646-cfaa-4bf0-b231-74fb35d09880";
+    let request = input_request(Some(id), "what is the 53% thing?", false);
+    planner_workflow::record_steered_input(&f.shared, SID, &request).unwrap();
+    planner_workflow::acknowledge_answered_inputs(&f.shared, SID, false).unwrap();
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    assert_eq!(input_wakes(&f.shared), vec![format!("input:{id}")]);
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(!run.inputs[id].acknowledged);
+    // The unanswered input does not ride along with a later turn's reply.
+    planner_workflow::acknowledge_answered_inputs(&f.shared, SID, true).unwrap();
+    assert_eq!(input_wakes(&f.shared), vec![format!("input:{id}")]);
+}
+
+/// The agent's own acknowledge-input and the automatic one record a single
+/// acknowledgment: the second changes nothing.
+#[tokio::test]
+async fn explicit_and_automatic_acknowledgment_record_one_acknowledgment() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let id = "6a5c0d5e-c7b5-4979-beaa-d9e9e5de6833";
+    let request = input_request(Some(id), "Should we change the font size", false);
+    planner_workflow::record_steered_input(&f.shared, SID, &request).unwrap();
+    planner_workflow::operate(
+        &f.shared,
+        SID,
+        None,
+        Operation::AcknowledgeInput {
+            key: "ack-font".into(),
+            input_id: id.into(),
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+    let before = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    planner_workflow::acknowledge_answered_inputs(&f.shared, SID, true).unwrap();
+    let after = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(after.inputs[id].acknowledged);
+    assert_eq!(
+        after.revision, before.revision,
+        "the automatic acknowledgment wrote again"
+    );
+    router_acp::planner_guard::parent_turn_ended(&f.shared, SID, chrono::Utc::now().timestamp());
+    assert!(input_wakes(&f.shared).is_empty());
+}
+
+/// Two "Review Sub-tasks" auto prompts, each answered in its own turn, came
+/// back bundled in one wake. Answered queued inputs leave both the queue and
+/// the wake list, so nothing is re-delivered or merged with the next prompt.
+#[test]
+fn answered_queued_agent_inputs_are_not_bundled_into_a_later_wake() {
+    use router_acp::planner_input;
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    let first = "9825a1c5-9f7e-4ec1-bde8-01a968984372";
+    let second = "b2660b01-3d38-4f9c-b65e-bd6da6394841";
+    for id in [first, second] {
+        planner_input::send(&store, SID, &f.repo, id, "Review Sub-tasks").unwrap();
+    }
+    for id in [first, second] {
+        planner_workflow::mark_input_delivered(&f.shared, SID, id, SID).unwrap();
+        planner_workflow::acknowledge_answered_inputs(&f.shared, SID, true).unwrap();
+        router_acp::planner_guard::parent_turn_ended(
+            &f.shared,
+            SID,
+            chrono::Utc::now().timestamp(),
+        );
+    }
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(run.inputs[first].acknowledged && run.inputs[second].acknowledged);
+    assert!(run.parent_queue.is_empty());
+    assert!(input_wakes(&f.shared).is_empty());
+}
+
 /// A standing agent instruction that is no longer in force (a lifted repair
 /// hold, a served correction) is retired by id after its acknowledgment, so
 /// a host that counts unwithdrawn holds as active stops counting it. A bulk

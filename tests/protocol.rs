@@ -15613,6 +15613,65 @@ async fn open_planner_parent(
     Ok(sid)
 }
 
+/// Over the wire: a human message the parent answered is acknowledged by its
+/// own turn and never comes back as a wake. A turn that ends with no reply is
+/// woken exactly once, and that wake's reply closes it.
+#[tokio::test]
+async fn an_answered_human_message_is_not_redelivered_and_a_silent_turn_wakes_once() {
+    use router_acp::planner_workflow as workflow;
+    let state = temp_state_file("answered-input");
+    let log = temp_log("answered-input");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let input_id = |text: &str| {
+                let run = workflow::load(&shared, &sid).unwrap().unwrap();
+                run.inputs
+                    .iter()
+                    .find(|(_, input)| input.text == text)
+                    .map(|(id, _)| id.clone())
+                    .unwrap()
+            };
+            let answered = "what is the 53% thing?";
+            prompt_text(&cx, &sid, answered).await?;
+            let answered_id = input_id(answered);
+            let run = workflow::load(&shared, &sid).unwrap().unwrap();
+            assert!(run.inputs[&answered_id].acknowledged);
+            assert!(
+                run.wakes
+                    .get(&format!("input:{answered_id}"))
+                    .is_none_or(|wake| wake.acknowledged)
+            );
+
+            let silent = "NO_REPLY\nlook at this later";
+            prompt_text(&cx, &sid, silent).await?;
+            let silent_id = input_id(silent);
+            wait_for_mock_prompt(&log, &format!("Input {silent_id}")).await;
+            for _ in 0..100 {
+                if workflow::load(&shared, &sid).unwrap().unwrap().inputs[&silent_id].acknowledged {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let run = workflow::load(&shared, &sid).unwrap().unwrap();
+            assert!(
+                run.inputs[&silent_id].acknowledged,
+                "the wake's reply did not close it"
+            );
+            assert_eq!(mock_prompts(&log, &format!("Input {silent_id}")).len(), 1);
+            assert!(
+                mock_prompts(&log, &format!("Input {answered_id}")).is_empty(),
+                "an answered human message was re-delivered"
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn planner_wake_carries_the_recorded_human_execution_request() {
     use router_acp::planner_workflow as workflow;

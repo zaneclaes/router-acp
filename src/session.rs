@@ -6547,6 +6547,7 @@ pub(crate) async fn run_primary_turn(
         crate::goals::publish(&shared, &router_sid, Some(&goal));
     }
     let mut req = req;
+    let mut replied = false;
     let result = loop {
         let turn = run_primary_turn_inner(
             shared.clone(),
@@ -6568,6 +6569,10 @@ pub(crate) async fn run_primary_turn(
             && !shared
                 .with_session(&router_sid, |s| s.cancelled)
                 .unwrap_or(false);
+        replied |= ended_normally
+            && shared
+                .with_session(&router_sid, |s| !s.turn_output.trim().is_empty())
+                .unwrap_or(false);
         match crate::goals::after_turn(&shared, &router_sid, ended_normally) {
             crate::goals::Followup::Continue(text) => {
                 req = PromptRequest::new(req.session_id.clone(), vec![ContentBlock::from(text)])
@@ -6576,6 +6581,12 @@ pub(crate) async fn run_primary_turn(
             crate::goals::Followup::Done => break result,
         }
     };
+    // A turn that replied handled its inputs; turn end wakes only the rest.
+    if let Err(error) =
+        crate::planner_workflow::acknowledge_answered_inputs(&shared, &router_sid, replied)
+    {
+        tracing::warn!(session = router_sid, %error, "answered inputs not acknowledged");
+    }
     // The goal's status after the turn is what a restored session resumes with.
     if shared
         .with_session(&router_sid, |s| s.goal.is_some())
