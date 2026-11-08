@@ -17127,6 +17127,102 @@ async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_rest
     let _ = std::fs::remove_file(&gate);
 }
 
+async fn init_with_elicitation(
+    cx: &ConnectionTo<AgentPeer>,
+) -> Result<InitializeResponse, AcpError> {
+    cx.send_request(
+        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new().elicitation(
+                ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+            ),
+        ),
+    )
+    .block_task()
+    .await
+}
+
+/// A Kory coordinator runs on the planner pool with a person watching it. Its
+/// question reaches the client and its prompts carry the normal question
+/// instruction, also after it becomes a run's durable parent.
+#[tokio::test]
+async fn a_coordinator_planner_session_asks_its_questions() {
+    use router_acp::planner_workflow as workflow;
+    let state = temp_state_file("coordinator-asks");
+    let log = temp_log("coordinator-asks");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, observed, shared| {
+            init_with_elicitation(&cx).await?;
+            let sid = cx
+                .send_request(
+                    NewSessionRequest::new(repo.path().join("repo")).meta(coordinator_meta()),
+                )
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            session_manager_prompt(&cx, &sid, "ELICIT:Approve the change set?", true).await?;
+            session_manager_prompt(&cx, &sid, EPIC_COMMAND, true).await?;
+            assert!(
+                workflow::load(&shared, &sid).unwrap().is_some(),
+                "the coordinator parents a run"
+            );
+            session_manager_prompt(&cx, &sid, "ELICIT:Merge it?", true).await?;
+            let text = agent_text(&observed, &sid);
+            assert_eq!(
+                text.matches(r#"elicit:accept:"yes""#).count(),
+                2,
+                "both questions reached the client: {text}"
+            );
+            assert!(!text.contains("elicit-error"), "{text}");
+            assert!(mock_prompts(&log, "autonomous planner run").is_empty());
+            assert!(!mock_prompts(&log, "structured question-asking tool").is_empty());
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// An autonomous planner run (the operator's `/implement` parent, no
+/// coordinator role) still never asks: the question is refused with the
+/// instruction to unblock itself, and its prompts say no one answers.
+#[tokio::test]
+async fn an_autonomous_planner_run_still_never_asks() {
+    let state = temp_state_file("planner-never-asks");
+    let log = temp_log("planner-never-asks");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_gate_yaml(&state, &log, ""),
+        async |cx, observed, _shared| {
+            init_with_elicitation(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+            prompt_text(&cx, &sid, "ELICIT:Merge it?").await?;
+            let text = agent_text(&observed, &sid);
+            assert!(
+                !text.contains("elicit:accept"),
+                "the operator was asked: {text}"
+            );
+            assert!(
+                text.contains("elicit-error") && text.contains("autonomous planner run"),
+                "{text}"
+            );
+            assert!(observed.lock().unwrap().elicitation_session_ids.is_empty());
+            assert!(!mock_prompts(&log, "autonomous planner run").is_empty());
+            Ok(())
+        },
+    )
+    .await;
+}
+
 fn dead_router() -> router_acp::planner_workflow::RunOwner {
     let mut child = std::process::Command::new("true").spawn().unwrap();
     child.wait().unwrap();
