@@ -42,6 +42,7 @@ fn restore(
     session.pending_history = crate::restoration::lookup_context(shared, sid);
     session.cwd = cwd.clone();
     session.coordinator |= meta_marks_coordinator(meta);
+    session.host_coordinator |= meta_marks_coordinator(meta);
     {
         let mut sessions = shared.sessions.lock().unwrap();
         if let Some(live) = sessions.get_mut(sid) {

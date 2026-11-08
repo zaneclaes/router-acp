@@ -413,6 +413,12 @@ pub struct RouterSession {
     /// the Planning phase and on `planning_candidates`; only an explicit user
     /// pick may move it elsewhere (`Shared::coordinator_blocks`).
     pub coordinator: bool,
+    /// The host itself declared `session_role: "coordinator"` (Kory Code's
+    /// coordinator, with a person watching). Set only from request `_meta`,
+    /// never from a planner run: `coordinator` above is also set by an
+    /// `/implement` parent. Sticky in memory; every Kory coordinator prompt
+    /// carries the tag, so a reload regains it on the next prompt.
+    pub host_coordinator: bool,
     /// The current pin came from an explicit human pick (`router.candidate`,
     /// `[router: candidate=…]` / `switch=…`, `model:` shorthand). Persisted as
     /// `routing.user_pick` so it survives session/load. A coordinator on a
@@ -573,6 +579,7 @@ impl RouterSession {
                 .and_then(|r| r.get("coordinator"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            host_coordinator: false,
             pin_user_pick: persisted
                 .routing
                 .as_ref()
@@ -655,6 +662,7 @@ impl RouterSession {
             planner_phase: None,
             planner_difficulty: None,
             coordinator: meta_marks_coordinator(req.meta.as_ref()),
+            host_coordinator: meta_marks_coordinator(req.meta.as_ref()),
             pin_user_pick: false,
         }
     }
@@ -6062,12 +6070,19 @@ fn is_question_method(method: &str) -> bool {
     matches!(method, "elicitation/create" | "_x.ai/ask_user_question")
 }
 
-/// A planner run's parent (the operator's `/implement` session) or one of its workers.
+/// An autonomous planner run: the session holds a `planner_workflow` record
+/// (the operator's `/implement` parent, or a child admitted to a run). Its
+/// workers are checked through their parent's id. The planner strategy alone
+/// is not the signal: a Kory coordinator runs on the planner pool with a
+/// person watching it. A host-declared coordinator (`host_coordinator`, from
+/// `_meta.router_acp.session_role`) is never an autonomous run, even when it
+/// parents a run record, so its questions reach the client. `coordinator` is
+/// not the signal either: an operator's `/implement` parent sets it too.
 fn in_planner_run(shared: &Arc<Shared>, router_sid: &str) -> bool {
-    shared
-        .with_session(router_sid, |s| s.strategy == StrategyKind::Planner)
+    !shared
+        .with_session(router_sid, |s| s.host_coordinator)
         .unwrap_or(false)
-        || crate::planner_workflow::load(shared, router_sid)
+        && crate::planner_workflow::load(shared, router_sid)
             .ok()
             .flatten()
             .is_some()
@@ -9994,6 +10009,7 @@ fn on_session_new(
                 crate::restoration::restore_continued_config(&mut session, &saved)?;
                 crate::restoration::migrate_seats(&shared, &mut session);
                 session.coordinator |= meta_marks_coordinator(req.meta.as_ref());
+                session.host_coordinator |= meta_marks_coordinator(req.meta.as_ref());
                 inherited_context = Some(crate::restoration::snapshot(&shared, source)?);
                 session.pending_history = crate::restoration::lookup_context(&shared, &router_sid);
             }
@@ -10622,6 +10638,7 @@ fn prepare_parent_prompt_inner(
     let (mut coordinator, planner_session) = shared
         .with_session(&router_sid, |s| {
             s.coordinator |= meta_marks_coordinator(req.meta.as_ref());
+            s.host_coordinator |= meta_marks_coordinator(req.meta.as_ref());
             (s.coordinator, s.strategy == StrategyKind::Planner)
         })
         .unwrap_or((false, false));
