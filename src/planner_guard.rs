@@ -198,6 +198,9 @@ pub struct SessionRuntime {
     /// router-owned turn (`crate::planner_wake::steer_pending`); cleared when
     /// that turn ends, because the boundary delivers them for real.
     pub steered: std::collections::HashSet<String>,
+    /// Parent-owned input ids delivered to the current primary turn
+    /// (`crate::planner_workflow::acknowledge_answered_inputs`).
+    pub turn_inputs: std::collections::BTreeSet<String>,
     /// A steer request is in flight for this session (one at a time).
     pub steering: bool,
     /// Session-wide throttle, retained across parent turn boundaries.

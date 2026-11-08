@@ -1248,14 +1248,16 @@ pub fn record_steered_input(
     if load(shared, sid)?.is_none() {
         return Ok(());
     }
+    let mut input_id = String::new();
     mutate(shared, sid, |run| {
-        let input_id = record_input(run, req)?;
+        input_id = record_input(run, req)?;
         if let Some(input) = run.inputs.get_mut(&input_id) {
             input.delivered_to.insert(sid.to_string());
         }
         Ok(())
-    })
-    .map(|_| ())
+    })?;
+    crate::planner_guard::with_runtime(shared, sid, |rt| rt.turn_inputs.insert(input_id));
+    Ok(())
 }
 
 pub fn mark_input_delivered(
@@ -1282,6 +1284,51 @@ pub fn mark_input_delivered(
             }
         }
         input.delivered_to.insert(owner.to_string());
+        Ok(())
+    })?;
+    if owner == sid {
+        crate::planner_guard::with_runtime(shared, sid, |rt| {
+            rt.turn_inputs.insert(input_id.to_string())
+        });
+    }
+    Ok(())
+}
+
+/// A parent turn that ended normally with a reply answered the inputs it was
+/// delivered: record their acknowledgment, so turn end does not wake the
+/// parent to answer them a second time. A turn with no reply, an error or a
+/// cancel leaves them to `reconcile_delivered_inputs`. Idempotent with the
+/// agent's own `acknowledge-input`.
+pub fn acknowledge_answered_inputs(
+    shared: &Shared,
+    sid: &str,
+    replied: bool,
+) -> Result<(), String> {
+    let ids =
+        crate::planner_guard::with_runtime(shared, sid, |rt| std::mem::take(&mut rt.turn_inputs));
+    let answered = |run: &PlannerRun, id: &String| {
+        run.inputs.get(id).is_some_and(|input| {
+            !run.commands.contains(id)
+                && !input.resolved()
+                && input.owner.is_none()
+                && input.delivered_to.contains(sid)
+        })
+    };
+    if !replied || ids.is_empty() {
+        return Ok(());
+    }
+    let Some(run) = load(shared, sid)? else {
+        return Ok(());
+    };
+    if !ids.iter().any(|id| answered(&run, id)) {
+        return Ok(());
+    }
+    mutate(shared, sid, |run| {
+        for id in &ids {
+            if answered(run, id) {
+                acknowledge_input(run, sid, id, None)?;
+            }
+        }
         Ok(())
     })
     .map(|_| ())
