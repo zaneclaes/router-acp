@@ -1185,6 +1185,26 @@ struct Refresh {
     value: Option<Value>,
 }
 
+/// `ROUTER_ACP_CREDENTIAL_REFRESH=off` (also `0`, `false`, `no`) makes this host a read-only
+/// consumer of shared credentials: it never refreshes or rewrites a login. For a build agent
+/// that mounts a workstation's synced router configuration read-only.
+pub fn credential_refresh_enabled() -> bool {
+    refresh_setting_enabled(
+        std::env::var("ROUTER_ACP_CREDENTIAL_REFRESH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn refresh_setting_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
 pub async fn repair(agent: &AgentConfig, observed: Option<&str>) -> RepairOutcome {
     let kimi_host = agent
         .env_var("KIMI_CODE_OAUTH_HOST")
@@ -1227,6 +1247,28 @@ where
     F: FnOnce(Value, String) -> Fut,
     Fut: std::future::Future<Output = Refresh>,
 {
+    repair_with_policy(agent, observed, action, credential_refresh_enabled()).await
+}
+
+async fn repair_with_policy<F, Fut>(
+    agent: &AgentConfig,
+    observed: Option<&str>,
+    action: F,
+    refresh_enabled: bool,
+) -> RepairOutcome
+where
+    F: FnOnce(Value, String) -> Fut,
+    Fut: std::future::Future<Output = Refresh>,
+{
+    // A host that reads another machine's synced credentials must never rotate them: a refresh
+    // replaces the provider's refresh token, so the machine that owns the login would be signed
+    // out even when this host cannot write the result back (a read-only mount fails only after
+    // the provider already rotated, since the repair lock is machine-local). With refresh off,
+    // the host uses access tokens as it finds them, and an expired one stays unavailable until
+    // the owning machine's refresh syncs in.
+    if !refresh_enabled {
+        return RepairOutcome::Unknown;
+    }
     let Some(dir) = directory(agent) else {
         return RepairOutcome::Unknown;
     };
@@ -2564,6 +2606,34 @@ flag = 7
             AuthAvailability::Unauthenticated { .. }
         ));
         assert!(crate::accounts::registered(&agent));
+    }
+
+    /// A read-only consumer (`ROUTER_ACP_CREDENTIAL_REFRESH=off`) never calls the provider and never
+    /// rewrites the shared login, so the workstation that owns it is never signed out by a rotation.
+    #[tokio::test]
+    async fn a_read_only_host_never_refreshes_or_writes_shared_credentials() {
+        let (_root, agent) = fixture("claude");
+        let observed = request_generation(&agent).unwrap();
+        let before = read(&agent).unwrap().value;
+        let outcome = repair_with_policy(
+            &agent,
+            Some(&observed),
+            |_, _| async { panic!("a read-only host called the provider's token endpoint") },
+            false,
+        )
+        .await;
+        assert_eq!(outcome, RepairOutcome::Unknown);
+        assert_eq!(
+            read(&agent).unwrap().value,
+            before,
+            "the shared login was rewritten"
+        );
+        for off in ["off", "OFF", "0", "false", " no "] {
+            assert!(!refresh_setting_enabled(Some(off)), "{off}");
+        }
+        for on in [None, Some(""), Some("on"), Some("1")] {
+            assert!(refresh_setting_enabled(on), "{on:?}");
+        }
     }
 
     #[tokio::test]
