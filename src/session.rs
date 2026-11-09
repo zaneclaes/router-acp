@@ -3139,7 +3139,7 @@ pub fn handle_downstream_dispatch(
                     responder.respond(answer)?;
                     return Ok(Handled::Yes);
                 }
-                if is_question_method(&method) && in_planner_run(shared, &router_sid) {
+                if is_question_method(&method) && refuses_questions(shared, &router_sid) {
                     refuse_planner_question(shared, &router_sid, responder)?;
                     return Ok(Handled::Yes);
                 }
@@ -3274,8 +3274,8 @@ pub fn handle_downstream_dispatch(
                     responder.respond(answer)?;
                     return Ok(Handled::Yes);
                 }
-                // No one answers a planner run's workers either.
-                if is_question_method(&method) && in_planner_run(shared, &parent_router_sid) {
+                // A child of an implementation run that opted out of questions refuses too.
+                if is_question_method(&method) && refuses_questions(shared, &parent_router_sid) {
                     refuse_planner_question(shared, &parent_router_sid, responder)?;
                     return Ok(Handled::Yes);
                 }
@@ -6052,44 +6052,52 @@ fn build_background_instructions() -> String {
         .to_string()
 }
 
-/// What a planner run's agents are told instead of how to ask: they never ask.
-const PLANNER_NO_QUESTIONS: &str = "This is an autonomous planner run: no one answers \
-     questions here. Do not ask the operator anything, neither with a question tool nor in \
-     prose, and never stop work to wait for an answer. Unblock yourself: decide, act, and \
-     verify. Ordering, priority, admission, scope and \"may I\" decisions are yours to make, \
-     including whether a repair or a prepared fix goes ahead; they are never a blocker. \
-     Only an action that literally needs a human to do something you cannot (a credential, \
-     a payment, a physical or account action) is recorded where the run's instructions put \
-     operator actions (Docs/BLOCKED.md), and you continue with other work at once.";
+// Questions are refused only where a project opts out (`routers.planner.questions: false` in its own
+// overlay) and only inside an implementation run: an `/implement` parent driving children, and those
+// children. Planning sessions and host coordinators always ask. A refused run records what only a
+// person can do through the pluggable blockers mechanism (`routers.planner.blockers`, default the
+// Markdown layout's `Docs/BLOCKED.md`). Until 2026-11-09 the refusal and a fixed `Docs/BLOCKED.md` were
+// hardcoded here for every planner run, so no question reached any client and no host could change it.
+pub fn no_questions_instruction(planner: &crate::config::PlannerRouterConfig) -> String {
+    format!(
+        "This is an autonomous implementation run: no one answers questions here. Do not ask the \
+         operator anything, neither with a question tool nor in prose, and never stop work to wait \
+         for an answer. Unblock yourself: decide, act, and verify. Ordering, priority, admission, \
+         scope and \"may I\" decisions are yours to make, including whether a repair or a prepared \
+         fix goes ahead; they are never a blocker. Only an action that literally needs a human to do \
+         something you cannot (a credential, a payment, a physical or account action) is recorded in \
+         the run's blockers ({}), and you continue with other work at once.",
+        planner.blockers
+    )
+}
 
-fn build_planner_question_instructions() -> String {
-    format!("[router-acp questions]\n{PLANNER_NO_QUESTIONS}")
+fn build_planner_question_instructions(planner: &crate::config::PlannerRouterConfig) -> String {
+    format!(
+        "[router-acp questions]\n{}",
+        no_questions_instruction(planner)
+    )
 }
 
 fn is_question_method(method: &str) -> bool {
     matches!(method, "elicitation/create" | "_x.ai/ask_user_question")
 }
 
-/// An autonomous planner run: the session holds a `planner_workflow` record
-/// (the operator's `/implement` parent, or a child admitted to a run). Its
-/// workers are checked through their parent's id. The planner strategy alone
-/// is not the signal: a Kory coordinator runs on the planner pool with a
-/// person watching it. A host-declared coordinator (`host_coordinator`, from
-/// `_meta.router_acp.session_role`) is never an autonomous run, even when it
-/// parents a run record, so its questions reach the client. `coordinator` is
-/// not the signal either: an operator's `/implement` parent sets it too.
-fn in_planner_run(shared: &Arc<Shared>, router_sid: &str) -> bool {
-    !shared
-        .with_session(router_sid, |s| s.host_coordinator)
-        .unwrap_or(false)
+/// The project opted out of questions (`routers.planner.questions: false`) and this session is in
+/// an implementation run: it holds a `planner_workflow` record in the Implementation phase (the
+/// `/implement` parent, or a child checked through its parent's id). A host-declared coordinator
+/// (`host_coordinator`, from `_meta.router_acp.session_role`) always asks: a person is watching it.
+fn refuses_questions(shared: &Arc<Shared>, router_sid: &str) -> bool {
+    !shared.cfg.routers.planner.questions
+        && !shared
+            .with_session(router_sid, |s| s.host_coordinator)
+            .unwrap_or(false)
         && crate::planner_workflow::load(shared, router_sid)
             .ok()
             .flatten()
-            .is_some()
+            .is_some_and(|run| run.phase == crate::config::PlannerPhase::Implementation)
 }
 
-/// A planner run's agent asked a question: it gets a refusal that says why and what to do,
-/// and the operator never sees a prompt that would stall the run.
+/// A refusing run's agent asked a question: it gets a refusal that says to continue on its own.
 fn refuse_planner_question(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -6100,12 +6108,14 @@ fn refuse_planner_question(
         &crate::state::LogEntry {
             kind: "planner_question_refused".to_string(),
             role: "router".to_string(),
-            summary: "a planner run asked a question; refused".to_string(),
+            summary: "an implementation run that takes no questions asked one; refused".to_string(),
             tokens_estimated: true,
             ..Default::default()
         },
     );
-    responder.respond_with_error(AcpError::invalid_request().data(PLANNER_NO_QUESTIONS))
+    responder.respond_with_error(
+        AcpError::invalid_request().data(no_questions_instruction(&shared.cfg.routers.planner)),
+    )
 }
 
 fn build_question_instructions() -> String {
@@ -6899,8 +6909,8 @@ async fn run_primary_turn_inner(
                 blocks.push(ContentBlock::from(crate::goals::protocol(objective)));
             }
             blocks.push(ContentBlock::from(
-                if in_planner_run(&shared, &router_sid) {
-                    build_planner_question_instructions()
+                if refuses_questions(&shared, &router_sid) {
+                    build_planner_question_instructions(&shared.cfg.routers.planner)
                 } else {
                     build_question_instructions()
                 },

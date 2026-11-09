@@ -253,6 +253,15 @@ fn default_true() -> bool {
     true
 }
 
+/// The Markdown planning layout's defaults for the pluggable planner registers.
+fn default_planner_blockers() -> String {
+    "Docs/BLOCKED.md".into()
+}
+
+fn default_planner_continuation() -> String {
+    "Docs/CONTINUE.md".into()
+}
+
 fn default_max_concurrent() -> usize {
     3
 }
@@ -1368,6 +1377,25 @@ pub struct PlannerRouterConfig {
     /// must resolve the repository's convention before admitting work.
     #[serde(default)]
     pub roadmap: Option<PathBuf>,
+    /// Whether an implementation run (an `/implement` parent driving children,
+    /// and those children) may put questions to the client. Default `true`:
+    /// every session asks normally. A project whose unattended implement runs
+    /// must never wait on a person sets `false` in its own overlay
+    /// (`.router-acp/router.yaml`); planning sessions and host coordinators
+    /// still ask. The router names no project file in the refusal.
+    #[serde(default = "default_true")]
+    pub questions: bool,
+    /// Where an implementation run that takes no questions records an action
+    /// only a person can take (a credential, a payment, a physical or account
+    /// action). A repository path or any instruction text; pluggable like every
+    /// other planner setting. Default: the Markdown layout's `Docs/BLOCKED.md`.
+    #[serde(default = "default_planner_blockers")]
+    pub blockers: String,
+    /// Where a run's parent writes its exact resume point when the operator
+    /// requests a shutdown. Pluggable; default: the Markdown layout's
+    /// `Docs/CONTINUE.md`.
+    #[serde(default = "default_planner_continuation")]
+    pub continuation: String,
     #[serde(default, rename = "create-plan")]
     pub create_plan: PlannerSkillConfig,
     #[serde(default, rename = "select-plan")]
@@ -1458,6 +1486,9 @@ impl Default for PlannerRouterConfig {
             profile: None,
             skills: None,
             roadmap: None,
+            questions: true,
+            blockers: default_planner_blockers(),
+            continuation: default_planner_continuation(),
             create_plan: PlannerSkillConfig::default(),
             select_plan: PlannerSkillConfig::default(),
             implement_work: PlannerSkillConfig::default(),

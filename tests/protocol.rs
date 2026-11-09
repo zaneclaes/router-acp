@@ -15449,16 +15449,22 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
             let started = std::time::Instant::now();
             router_acp::planner_shutdown::request(&shared, &serde_json::json!({"sessionId":sid}))
                 .unwrap();
+            let parent_prompt =
+                router_acp::planner_shutdown::parent_prompt(&shared.cfg.routers.planner);
+            assert!(
+                parent_prompt.contains("Docs/CONTINUE.md"),
+                "the Markdown default: {parent_prompt}"
+            );
             tokio::time::timeout(
                 Duration::from_secs(5),
-                wait_for_mock_prompt(&log, router_acp::planner_shutdown::PARENT_PROMPT),
+                wait_for_mock_prompt(&log, &parent_prompt),
             )
             .await
             .expect("shutdown promptly preempts the router turn");
             assert!(started.elapsed() < Duration::from_secs(5));
             let events = read_log(&log);
             let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
-            let shutdown = mock_prompts(&log, router_acp::planner_shutdown::PARENT_PROMPT)[0];
+            let shutdown = mock_prompts(&log, &parent_prompt)[0];
             assert!(cancel < shutdown);
             assert!(
                 !release.exists(),
@@ -17073,10 +17079,8 @@ async fn an_affirmed_goal_ends_and_later_turns_are_ordinary() {
 /// The live crash's trigger: the stall watchdog cancelled a quiet parent
 /// turn, and within the cancel grace the turn came back and asked the person
 /// a question. The watchdog restarted the adapter under the open question
-/// anyway. A turn that revives during the grace is watched afresh. A planner
-/// run never puts a question to the operator (operator 2026-11-03: the run
-/// unblocks itself and records only human-only actions), so the question is
-/// refused at once with that instruction instead of waiting on anyone.
+/// anyway. A turn that revives during the grace is watched afresh, and an
+/// open question is the operator's wait, not a stall.
 #[tokio::test]
 async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_restarted() {
     let state = temp_state_file("stall-revived");
@@ -17106,18 +17110,11 @@ async fn a_stalled_turn_that_asks_a_question_during_its_cancel_grace_is_not_rest
             std::fs::write(&gate_for_test, "").unwrap();
             let answered = tokio::time::timeout(Duration::from_secs(20), asking)
                 .await
-                .expect("the turn ends without anyone answering")
+                .expect("the turn ends once the person answers")
                 .unwrap()?;
             assert_eq!(answered.stop_reason, StopReason::EndTurn);
             let text = agent_text(&observed, &sid);
-            assert!(
-                !text.contains("elicit:accept"),
-                "the operator was asked: {text}"
-            );
-            assert!(
-                text.contains("elicit-error") && text.contains("autonomous planner run"),
-                "the agent is told to unblock itself: {text}"
-            );
+            assert!(text.contains("elicit:accept"), "{text}");
             assert!(text.contains("parent turn stalled"), "{text}");
             assert!(!text.contains("restarting its adapter"), "{text}");
             Ok(())
@@ -17177,7 +17174,6 @@ async fn a_coordinator_planner_session_asks_its_questions() {
                 "both questions reached the client: {text}"
             );
             assert!(!text.contains("elicit-error"), "{text}");
-            assert!(mock_prompts(&log, "autonomous planner run").is_empty());
             assert!(!mock_prompts(&log, "structured question-asking tool").is_empty());
             Ok(())
         },
@@ -17185,13 +17181,13 @@ async fn a_coordinator_planner_session_asks_its_questions() {
     .await;
 }
 
-/// An autonomous planner run (the operator's `/implement` parent, no
-/// coordinator role) still never asks: the question is refused with the
-/// instruction to unblock itself, and its prompts say no one answers.
+/// By default (`routers.planner.questions` unset) an `/implement` run's question reaches the client,
+/// and its prompts carry the ordinary question instruction with no blockers path in them (operator,
+/// 2026-11-09: a hardcoded planner-run refusal naming `Docs/BLOCKED.md` hid every question for every host).
 #[tokio::test]
-async fn an_autonomous_planner_run_still_never_asks() {
-    let state = temp_state_file("planner-never-asks");
-    let log = temp_log("planner-never-asks");
+async fn a_planner_run_asks_its_questions_with_no_project_policy() {
+    let state = temp_state_file("planner-asks");
+    let log = temp_log("planner-asks");
     let repo = planner_wire_repository();
     run_test_shared(
         planner_gate_yaml(&state, &log, ""),
@@ -17208,19 +17204,87 @@ async fn an_autonomous_planner_run_still_never_asks() {
             prompt_text(&cx, &sid, "ELICIT:Merge it?").await?;
             let text = agent_text(&observed, &sid);
             assert!(
-                !text.contains("elicit:accept"),
-                "the operator was asked: {text}"
+                text.contains(r#"elicit:accept:"yes""#),
+                "the question reached the client: {text}"
             );
+            assert!(!text.contains("elicit-error"), "{text}");
+            assert!(!observed.lock().unwrap().elicitation_session_ids.is_empty());
+            assert!(!mock_prompts(&log, "structured question-asking tool").is_empty());
             assert!(
-                text.contains("elicit-error") && text.contains("autonomous planner run"),
-                "{text}"
+                mock_prompts(&log, "Docs/BLOCKED.md").is_empty(),
+                "a prompt named a blockers path"
             );
-            assert!(observed.lock().unwrap().elicitation_session_ids.is_empty());
-            assert!(!mock_prompts(&log, "autonomous planner run").is_empty());
+            assert!(mock_prompts(&log, "no one answers questions").is_empty());
             Ok(())
         },
     )
     .await;
+}
+
+/// A project that opts out (`questions: false` in its overlay) refuses questions only inside an
+/// implementation run, and records human-only actions through its plugged `blockers` mechanism,
+/// never a fixed path. A `/plan` session on the same configuration still asks.
+#[tokio::test]
+async fn questions_false_refuses_only_implementation_runs_and_uses_the_plugged_blockers() {
+    let state = temp_state_file("planner-no-questions");
+    let log = temp_log("planner-no-questions");
+    let repo = planner_wire_repository();
+    let yaml = planner_gate_yaml(&state, &log, "").replacen(
+        "  planner:\n",
+        "  planner:\n    questions: false\n    blockers: \"the ops tracker\"\n",
+        1,
+    );
+    run_test_shared(yaml, async |cx, observed, _shared| {
+        init_with_elicitation(&cx).await?;
+        let open = async || -> Result<String, AcpError> {
+            Ok(cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string())
+        };
+        let implementing = open().await?;
+        prompt_text(&cx, &implementing, "/implement prepare the assignment").await?;
+        prompt_text(&cx, &implementing, "ELICIT:Merge it?").await?;
+        let text = agent_text(&observed, &implementing);
+        assert!(
+            !text.contains("elicit:accept"),
+            "the operator was asked: {text}"
+        );
+        assert!(
+            text.contains("elicit-error") && text.contains("the ops tracker"),
+            "the refusal names the plugged blockers: {text}"
+        );
+        assert!(!text.contains("Docs/BLOCKED.md"), "{text}");
+        assert!(!mock_prompts(&log, "the ops tracker").is_empty());
+        assert!(mock_prompts(&log, "Docs/BLOCKED.md").is_empty());
+
+        let planning = open().await?;
+        prompt_text(&cx, &planning, "/plan a local Markdown change").await?;
+        prompt_text(&cx, &planning, "ELICIT:Approve the plan?").await?;
+        let text = agent_text(&observed, &planning);
+        assert!(
+            text.contains(r#"elicit:accept:"yes""#),
+            "a planning session still asks: {text}"
+        );
+        assert!(!text.contains("elicit-error"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the default.
+#[test]
+fn the_default_blockers_and_continuation_are_the_markdown_layouts() {
+    let planner = router_acp::config::PlannerRouterConfig::default();
+    assert!(
+        planner.questions,
+        "every session asks unless a project opts out"
+    );
+    assert!(router_acp::session::no_questions_instruction(&planner).contains("Docs/BLOCKED.md"));
+    assert!(router_acp::planner_shutdown::parent_prompt(&planner).contains("Docs/CONTINUE.md"));
 }
 
 fn dead_router() -> router_acp::planner_workflow::RunOwner {
