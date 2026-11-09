@@ -58,8 +58,15 @@ pub fn status(shared: &Shared, params: &Value) -> Result<Value, String> {
     };
     Ok(json!({"status":run.status,"live":capacity["live"],"admissible":admissible}))
 }
-pub const PARENT_PROMPT: &str = "Shutdown requested by the operator: rewrite Docs/CONTINUE.md and \
-     your registers now with the exact resume point; admit nothing; end your turn.";
+/// Where the parent records its resume point is the pluggable `routers.planner.continuation`
+/// (default the Markdown layout's `Docs/CONTINUE.md`), never a fixed project path.
+pub fn parent_prompt(planner: &crate::config::PlannerRouterConfig) -> String {
+    format!(
+        "Shutdown requested by the operator: rewrite {} and your registers now with the exact \
+         resume point; admit nothing; end your turn.",
+        planner.continuation
+    )
+}
 pub const WORKER_PROMPT: &str = "Shutdown requested: commit and push your branch now, record your \
      status notes and exact resume point, then hand off `waiting` with that resume point and \
      stop.";
@@ -402,7 +409,13 @@ async fn prompt_parent_once(
         saved,
         workers,
     );
-    let prompt = PromptRequest::new(sid.to_string(), vec![ContentBlock::from(PARENT_PROMPT)]).meta(
+    let prompt = PromptRequest::new(
+        sid.to_string(),
+        vec![ContentBlock::from(parent_prompt(
+            &shared.cfg.routers.planner,
+        ))],
+    )
+    .meta(
         serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(
             json!({"router_acp":{"agent_origin":true,"origin":"planner-shutdown"}}),
         )

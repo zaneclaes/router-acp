@@ -1704,11 +1704,11 @@ async fn operate_once(
                 | Operation::Complete { .. }
         )
     {
-        return Err(
-            "run is shutting down: admit nothing; record the exact resume point in \
-             Docs/CONTINUE.md and your registers, then end your turn"
-                .into(),
-        );
+        return Err(format!(
+            "run is shutting down: admit nothing; record the exact resume point in {} and your \
+             registers, then end your turn",
+            shared.cfg.routers.planner.continuation
+        ));
     }
     if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
         && !matches!(
