@@ -4716,6 +4716,68 @@ async fn unchanged_worker_failures_suspend_retries_without_stopping_other_work()
     );
 }
 
+/// A worker parked on its own exact build is waiting, not failing. When the observer cannot read that build (an
+/// Unknown observation after a failed or stale read), the worker is resumed with backoff but never suspended
+/// (2026-11-09: engraver-release-v2 and r9409 were suspended while their full builds 9433/9435 ran).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_parked_on_its_own_unobserved_build_is_never_suspended() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    let fixture = fixture(|cfg| cfg.delegation.max_concurrent = 2);
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    pin_parent(shared);
+    let revision = "5daa9247ff9f60be1913e5a388027e6566cb4cd2";
+    let park = |shared: &std::sync::Arc<router_acp::session::Shared>| {
+        planner_workflow::mutate(shared, SID, |run| {
+            run.observations.insert(
+                "ci:work-1".into(),
+                Observation {
+                    revision: revision.into(),
+                    reference: "wip/work-1".into(),
+                    state: ObservationState::Unknown,
+                    evidence: "read failed".into(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    };
+    let mut now = chrono::Utc::now().timestamp() + 10_000;
+    for _ in 0..5 {
+        let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+            .await
+            .unwrap();
+        planner_workflow::record_handoff(
+            shared,
+            SID,
+            &identity,
+            router_acp::delegate_hook::Handoff {
+                kind: "waiting".into(),
+                message: format!("full build running: ci:work-1@{revision}"),
+            },
+        )
+        .unwrap();
+        planner_workflow::attempt_ended(shared, SID, &identity, None, "waiting".into(), false)
+            .unwrap();
+        park(shared);
+        tick(shared, now).await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        let state = run.capacity.resumes.get("work-1").cloned().unwrap();
+        assert!(
+            state.suspended.is_none(),
+            "suspended while parked on its own build: {state:?}"
+        );
+        assert_eq!(
+            state.same_failure_count, 1,
+            "a parked wait counted as a repeated failure"
+        );
+        assert!(!run.wakes.contains_key("recovery:work-1"));
+        now += 100_000;
+        tick(shared, now).await;
+        attempt_settled(shared, "work-1").await;
+    }
+}
+
 #[tokio::test]
 async fn an_idle_parent_with_a_release_in_flight_is_woken() {
     let fixture = fixture(|_| {});

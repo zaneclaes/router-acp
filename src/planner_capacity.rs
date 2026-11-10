@@ -1072,6 +1072,37 @@ pub(crate) fn waiting_on_build(run: &PlannerRun, work: &planner_workflow::Work, 
     })
 }
 
+/// A `waiting` handoff that names this work's exact build (`ci:<work>@<revision>`) whose observation has not
+/// failed or passed: Pending, or Unknown because the observer could not read it. Unlike `waiting_on_build`, this
+/// does not need a fresh audit: a stale or failed read must not turn a parked worker into a repeated failure
+/// (2026-11-09: engraver-release-v2 and r9409 were suspended while their full builds 9433/9435 ran, after reads
+/// recorded Unknown).
+pub(crate) fn parked_on_own_build(run: &PlannerRun, work: &planner_workflow::Work) -> bool {
+    let id = format!("ci:{}", work.spec.work_id);
+    let Some(handoff) = work.handoff.as_ref().filter(|h| h.kind == "waiting") else {
+        return false;
+    };
+    let named = |revision: &str| {
+        handoff
+            .message
+            .split_whitespace()
+            .any(|word| word == format!("{id}@{revision}"))
+    };
+    match run.observations.get(&id) {
+        Some(observation) => {
+            matches!(
+                observation.state,
+                crate::planner_guard::ObservationState::Pending
+                    | crate::planner_guard::ObservationState::Unknown
+            ) && named(&observation.revision)
+        }
+        None => handoff
+            .message
+            .split_whitespace()
+            .any(|word| word.starts_with(&format!("{id}@"))),
+    }
+}
+
 /// Retry transient interruptions, but do not allocate another model to an
 /// unchanged failure or a missing workspace. The parent owns reconciliation.
 async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: i64) {
@@ -1108,10 +1139,13 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
         if prerequisite.is_none() && waiting_on_build(run, work, now) {
             continue;
         }
+        // A worker parked on its own exact build is waiting, not failing: while the observer cannot see that build
+        // (a failed or stale read records Unknown), it is resumed with backoff but never counted toward suspension.
+        let parked = prerequisite.is_none() && parked_on_own_build(run, work);
         let fingerprint = failure_fingerprint(work, &prerequisite);
         let changed = state.is_none_or(|s| s.failure_fingerprint.as_ref() != Some(&fingerprint));
         if changed || state.is_some_and(|s| s.due_at.is_none() && s.suspended.is_none()) {
-            let count = if changed {
+            let count = if changed || parked {
                 1
             } else {
                 state.map_or(1, |s| s.same_failure_count.saturating_add(1))
