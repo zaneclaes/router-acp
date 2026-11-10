@@ -279,9 +279,13 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     // router-owned turns only. A parent can spend its whole run inside that one
     // turn, so a capacity wake that waited for its boundary kept every slot
     // empty (2026-11-06: 0 children for an hour while it polled production).
+    // A queued input is addressed to the parent, so it reaches that turn at its
+    // next tool boundary too: a monitor's correction waited over three hours
+    // inside one `/implement` turn (2026-11-10) until resent as an interrupt.
     if command_turn
         && !interrupt
         && !key.starts_with("capacity:")
+        && !key.starts_with("input:")
         && !((environment_wake(&key)
             || key.starts_with("release:")
             || key.starts_with("audit:release:"))
