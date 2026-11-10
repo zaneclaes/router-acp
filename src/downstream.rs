@@ -589,26 +589,24 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
 /// Claude model families the adapter's selector may list by bare family name.
 const CLAUDE_SELECTOR_FAMILIES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
 
-/// Selector spellings a catalog `id` may be offered as, in preference order.
-/// Claude dropped the `[1m]` suffix from natively-1M families (`opus[1m]` → `opus`),
-/// and lists a full id by its family alias (`claude-fable-5-1[1m]` → `fable`).
-/// The alias names no version; the LLM proxy still sends the pin's `api_model`.
+/// Selector spellings a catalog `id` may be offered as, in preference order:
+/// the id itself, the id without a legacy `[1m]` suffix, then the bare family
+/// alias for a full Claude id (`claude-fable-5-1` → `fable`). An alias is
+/// only ever the bare family name; no spelling here carries a `[1m]` suffix
+/// the id did not already have. The alias names no version; the LLM proxy
+/// still sends the pin's `api_model`.
 pub fn selector_aliases(id: &str) -> Vec<String> {
     let base = id.strip_suffix("[1m]").unwrap_or(id);
     let mut aliases = vec![id.to_string()];
-    let toggled = if base == id {
-        format!("{id}[1m]")
-    } else {
-        base.to_string()
-    };
-    aliases.push(toggled);
+    if base != id {
+        aliases.push(base.to_string());
+    }
     if let Some(family) = base.strip_prefix("claude-").and_then(|rest| {
         CLAUDE_SELECTOR_FAMILIES
             .into_iter()
             .find(|family| rest.starts_with(&format!("{family}-")))
     }) {
         aliases.push(family.to_string());
-        aliases.push(format!("{family}[1m]"));
     }
     aliases
 }
@@ -863,14 +861,18 @@ agents:
     }
 
     #[test]
-    fn selector_aliases_round_trip_the_1m_suffix() {
+    fn selector_aliases_are_bare_family_names() {
+        assert_eq!(selector_aliases("opus"), ["opus".to_string()]);
+        assert_eq!(selector_aliases("fable"), ["fable".to_string()]);
+        assert_eq!(
+            selector_aliases("claude-fable-5-2"),
+            ["claude-fable-5-2".to_string(), "fable".to_string()]
+        );
+        // A legacy configured `[1m]` id still matches its bare spelling, but
+        // no alias ever gains a `[1m]` suffix.
         assert_eq!(
             selector_aliases("opus[1m]"),
             ["opus[1m]".to_string(), "opus".to_string()]
-        );
-        assert_eq!(
-            selector_aliases("opus"),
-            ["opus".to_string(), "opus[1m]".to_string()]
         );
         assert_eq!(
             selector_aliases("claude-fable-5-1[1m]"),
@@ -878,9 +880,11 @@ agents:
                 "claude-fable-5-1[1m]".to_string(),
                 "claude-fable-5-1".to_string(),
                 "fable".to_string(),
-                "fable[1m]".to_string()
             ]
         );
+        for id in ["opus", "fable", "claude-fable-5-2", "claude-opus-4-6", "sonnet"] {
+            assert!(selector_aliases(id).iter().all(|a| !a.ends_with("[1m]")));
+        }
     }
 
     #[test]
@@ -906,14 +910,15 @@ agents:
     }
 
     #[test]
-    fn offered_selector_value_prefers_exact_then_1m_synonym() {
+    fn offered_selector_value_prefers_exact_then_bare_spelling() {
         let both = vec!["opus[1m]".into(), "opus".into(), "sonnet".into()];
         assert_eq!(offered_selector_value(&both, "opus[1m]"), Some("opus[1m]"));
         assert_eq!(offered_selector_value(&both, "opus"), Some("opus"));
         let bare = vec!["opus".into(), "sonnet".into()];
         assert_eq!(offered_selector_value(&bare, "opus[1m]"), Some("opus"));
+        // A bare id never matches a `[1m]`-suffixed selector entry.
         let suffixed = vec!["opus[1m]".into(), "sonnet".into()];
-        assert_eq!(offered_selector_value(&suffixed, "opus"), Some("opus[1m]"));
+        assert_eq!(offered_selector_value(&suffixed, "opus"), None);
         assert_eq!(offered_selector_value(&bare, "haiku"), None);
     }
 

@@ -133,7 +133,7 @@ class CatalogTest(unittest.TestCase):
     def test_reads_enabled_and_disabled_models(self):
         catalog = parse_catalog(CATALOG_PATH)
         ids = {model.candidate for model in catalog.all_models()}
-        self.assertIn("claude/opus[1m]", ids)
+        self.assertIn("claude/opus", ids)
         self.assertIn("kimi/kimi-k2", ids)
         # Commented-out models are parsed too — that is how retirement and
         # "parked until scored" are represented.
@@ -144,7 +144,7 @@ class CatalogTest(unittest.TestCase):
 
     def test_multiline_flow_maps_are_one_model(self):
         catalog = parse_catalog(CATALOG_PATH)
-        fable = catalog.model("claude/claude-fable-5-2[1m]")
+        fable = catalog.model("claude/fable")
         self.assertGreater(fable.end - fable.start, 1, "spans its wrapped pricing lines")
         self.assertEqual(fable.cost_rank, 5)
         self.assertAlmostEqual(fable.pricing["output_per_mtok"], 40.0)
@@ -580,12 +580,12 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("-      - { id:", catalog_diff)
         catalog = parse_catalog(CATALOG_PATH)
         # The shipped example enables the four auto-routed models (haiku,
-        # sonnet, opus[1m], claude-fable-5-2[1m]) followed by the explicit-pick
+        # sonnet, opus, fable) followed by the explicit-pick
         # older versions, each under its own id (Fable 5.1, Opus 5, Opus 4.6).
         self.assertEqual(
             [model.candidate for model in catalog.agent("claude").enabled_models],
-            ["claude/haiku", "claude/sonnet", "claude/opus[1m]", "claude/claude-fable-5-2[1m]",
-             "claude/claude-fable-5-1[1m]", "claude/claude-opus-5", "claude/claude-opus-4-6"],
+            ["claude/haiku", "claude/sonnet", "claude/opus", "claude/fable",
+             "claude/claude-fable-5-1", "claude/claude-opus-5", "claude/claude-opus-4-6"],
         )
         self.assertEqual(
             [model.cost_rank for model in catalog.agent("claude").enabled_models],
