@@ -354,6 +354,8 @@ candidates:
     max_output_tokens: 64000
     adaptive_thinking: false
     effort: false
+    # Predates mid-conversation `role: "system"` turns (a 400 otherwise).
+    system_turns: false
     default_quality: 1.29
     quality:
       UiTweak: 1.29
