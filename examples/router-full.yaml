@@ -128,15 +128,6 @@ skill_routing:
     candidates: ["*opus*", "*gpt-5.5*"]
     also_acceptable: ["*fable*", "*sol*"]
 
-# Version pinning. Run an older (or newer, gated) provider version of a model:
-# the value is `default` (the model's `api_model`) or one of that model's
-# `versions[].api_model`, and the load fails on anything else. Routing never
-# sees it — the candidate keeps its id everywhere — and the proxy sends the
-# pinned version on the wire, priced and scored as that version. Useful for a
-# reversible rollout: one line in, one line out.
-# pinned_versions:
-#   "claude/claude-fable-5[1m]": claude-fable-5-1
-
 # Reasoning effort for primary sessions when nobody asked for a level (the
 # `router.effort` option or `[router: effort=…]`). `default` replaces the
 # automatic class/complexity recommendation — a long, detailed prompt such as a
@@ -183,26 +174,18 @@ agents:
         cost_rank: 2            # 1 = cheapest/least scarce
         # Permanently $2/$10: the 2026-09-01 increase to $3/$15 was cancelled.
         pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 }
+      # A family alias sends that family's current model; an older version
+      # would be its own candidate under its exact API id.
       - id: opus
-        display_name: Claude Opus 5
-        api_model: claude-opus-5
+        display_name: Claude Opus 5.5
+        api_model: claude-opus-5-5
         cost_rank: 3
-        pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00, cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 }
-      # The fable DEFAULT serves Fable 5, deliberately not 5.1: the wire id
-      # `claude-fable-5-1` is gated server-side on Claude Code >= 2.1.251, so
-      # defaulting to it would 400 every fable-routed request (auto, planner
-      # globs, apex complexity) on any older CLI.
-      - id: "claude-fable-5[1m]"
-        display_name: Claude Fable 5 1M
-        api_model: claude-fable-5
+        pricing: { input_per_mtok: 4.00, output_per_mtok: 20.00, cache_read_per_mtok: 0.20, cache_write_per_mtok: 5.00 }
+      - id: fable
+        display_name: Claude Fable 5.2
+        api_model: claude-fable-5-2
         cost_rank: 4
-        pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 }
-        # Fable 5.1, selectable only through `pinned_versions`. Its cache READ
-        # is 0.025x input ($0.25) rather than the usual 0.1x, so state the
-        # rate — do not derive it.
-        versions:
-          - api_model: claude-fable-5-1
-            pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 }
+        pricing: { input_per_mtok: 8.00, output_per_mtok: 40.00, cache_read_per_mtok: 0.20, cache_write_per_mtok: 10.00 }
 
   - name: codex
     command:

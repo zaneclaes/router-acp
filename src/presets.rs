@@ -371,7 +371,7 @@ mod tests {
                 .unwrap()
                 .ends_with("claude-agent-acp")
         );
-        assert_eq!(agent["models"].as_sequence().unwrap().len(), 4);
+        assert_eq!(agent["models"].as_sequence().unwrap().len(), 7);
         assert_eq!(agent["preference"], 0.1);
         let env = &agent["command"]["env"][0];
         assert_eq!(env["name"], "CLAUDE_CONFIG_DIR");

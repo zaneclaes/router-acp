@@ -5,8 +5,8 @@
     "claude": {
       "status": "ok",
       "method": "command",
-      "available": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]", "opus-next[1m]"],
-      "configured": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]"],
+      "available": ["haiku", "sonnet", "opus", "fable", "opus-next[1m]"],
+      "configured": ["haiku", "sonnet", "opus", "fable"],
       "note": "synthetic fixture for the new-release path"
     },
     "codex": {

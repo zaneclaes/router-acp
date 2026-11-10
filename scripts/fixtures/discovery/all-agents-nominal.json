@@ -5,8 +5,8 @@
     "claude": {
       "status": "snapshot",
       "method": "snapshot",
-      "available": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]"],
-      "configured": ["haiku", "sonnet", "opus[1m]", "claude-fable-5[1m]"],
+      "available": ["haiku", "sonnet", "opus", "fable"],
+      "configured": ["haiku", "sonnet", "opus", "fable"],
       "note": "model list comes from the ACP adapter's model selector"
     },
     "codex": {

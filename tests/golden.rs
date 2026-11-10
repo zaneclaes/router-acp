@@ -27,8 +27,8 @@ use router_acp::strategies::{AutoStrategy, CandidateView, RouteContext, RouterSt
 const CANDIDATES: &[(&str, &str, u32, f64)] = &[
     ("claude", "haiku", 1, 0.05),
     ("claude", "sonnet", 2, 0.05),
-    ("claude", "opus[1m]", 4, 0.05),
-    ("claude", "claude-fable-5[1m]", 5, 0.05),
+    ("claude", "opus", 4, 0.05),
+    ("claude", "fable", 5, 0.05),
     ("codex", "gpt-5.4-mini", 1, 0.0),
     ("codex", "gpt-5.5", 3, 0.0),
 ];
@@ -157,7 +157,7 @@ const GOLDEN: &[Golden] = &[
                       and a new left nav, then update every affected component",
         class: TaskClass::Architecture,
         complexity: 0.72,
-        winner: "claude/opus[1m]",
+        winner: "claude/opus",
         utility: 0.80,
     },
     Golden {
@@ -165,7 +165,7 @@ const GOLDEN: &[Golden] = &[
                       worker pool and the scheduler that only reproduces under load",
         class: TaskClass::Research,
         complexity: 0.26,
-        winner: "claude/opus[1m]",
+        winner: "claude/opus",
         utility: 0.58,
     },
     Golden {
@@ -180,7 +180,7 @@ const GOLDEN: &[Golden] = &[
                       delivery and backpressure",
         class: TaskClass::Architecture,
         complexity: 0.39,
-        winner: "claude/opus[1m]",
+        winner: "claude/opus",
         utility: 0.65,
     },
     Golden {
@@ -188,7 +188,7 @@ const GOLDEN: &[Golden] = &[
                       spans the parser, the type checker, and the CLI, then propose a fix plan",
         class: TaskClass::BugFix,
         complexity: 0.23,
-        winner: "claude/opus[1m]",
+        winner: "claude/opus",
         utility: 0.49,
     },
     // The apex carve-out: at extreme classified complexity the cost term is
@@ -200,7 +200,7 @@ const GOLDEN: &[Golden] = &[
                       module",
         class: TaskClass::Architecture,
         complexity: 1.00,
-        winner: "claude/claude-fable-5[1m]",
+        winner: "claude/fable",
         utility: 0.76,
     },
 ];
