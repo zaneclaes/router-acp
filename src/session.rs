@@ -3552,12 +3552,22 @@ pub(crate) async fn open_downstream_session_at(
     let conn = shared.target_conn(&key).ok_or_else(|| {
         AcpError::internal_error().data(format!("no live downstream process for {candidate}"))
     })?;
-    let (selection, config_id) = {
+    let (selection, config_id, api_model) = {
         let targets = shared.targets.lock().unwrap();
         let t = targets
             .get(&key)
             .ok_or_else(|| AcpError::internal_error().data("target vanished"))?;
-        (t.spec.selection.clone(), t.model_config_id.clone())
+        let api_model = t
+            .spec
+            .models
+            .iter()
+            .find(|m| m.id == candidate.model)
+            .and_then(|m| m.api_model.clone());
+        (
+            t.spec.selection.clone(),
+            t.model_config_id.clone(),
+            api_model,
+        )
     };
     // Broker entries are streamable HTTP: an adapter that does not advertise
     // HTTP MCP support never receives one.
@@ -3655,7 +3665,8 @@ pub(crate) async fn open_downstream_session_at(
         let selector_values = find_model_option(resp.config_options.as_deref().unwrap_or(&[]))
             .map(|option| select_values(&option))
             .unwrap_or_default();
-        let downstream_model = selector_value_to_send(&selector_values, &candidate.model);
+        let downstream_model =
+            selector_value_to_send(&selector_values, &candidate.model, api_model.as_deref());
         let set_req = SetSessionConfigOptionRequest::new(
             resp.session_id.clone(),
             config_id.clone(),

@@ -51,6 +51,53 @@ pub struct ProcessTargetSpec {
     pub selection: SelectionKind,
 }
 
+/// Claude Code's native self-updating install (`claude install`), when present.
+fn native_claude_code() -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::path::Path::new(&std::env::var_os("HOME")?).join(".local/bin/claude");
+    let meta = std::fs::metadata(&path).ok()?;
+    (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| path.display().to_string())
+}
+
+/// Claude Code settings a `claude-agent-acp` target gets when its configuration
+/// leaves them unset. An operator value always wins.
+///
+/// - `CLAUDE_CODE_EXECUTABLE`: the adapter otherwise runs the exact Claude Code
+///   release it bundles, which lags the native install that updates itself, so
+///   a model released today stays unknown until the adapter ships again.
+/// - `ANTHROPIC_CUSTOM_MODEL_OPTION`: for an inference-only login Anthropic's
+///   model list still carries a Fable row for an older version, which hides
+///   Claude Code's own `fable` row. Claude Code then lists one custom row; it
+///   names the exact model the `fable` candidate sends.
+fn claude_code_env(
+    agent: &AgentConfig,
+    mut env: Vec<(String, String)>,
+    native: Option<&str>,
+) -> Vec<(String, String)> {
+    let adapter = std::path::Path::new(&agent.command.command)
+        .file_name()
+        .is_some_and(|name| name == "claude-agent-acp");
+    if !adapter {
+        return env;
+    }
+    let fable = agent
+        .models
+        .iter()
+        .find(|m| m.id == "fable")
+        .and_then(|m| m.api_model.as_deref());
+    for (name, value) in [
+        ("CLAUDE_CODE_EXECUTABLE", native),
+        ("ANTHROPIC_CUSTOM_MODEL_OPTION", fable),
+    ] {
+        if let Some(value) = value
+            && !env.iter().any(|(n, _)| n == name)
+        {
+            env.push((name.to_string(), value.to_string()));
+        }
+    }
+    env
+}
+
 /// Expand one agent config into its process targets.
 pub(crate) fn agent_targets(agent: &AgentConfig) -> Vec<ProcessTargetSpec> {
     match &agent.model_selection {
@@ -59,12 +106,16 @@ pub(crate) fn agent_targets(agent: &AgentConfig) -> Vec<ProcessTargetSpec> {
             agent_name: agent.name.clone(),
             command: agent.command.command.clone(),
             args: agent.command.args.clone(),
-            env: agent
-                .command
-                .env
-                .iter()
-                .map(|e| (e.name.clone(), e.value.clone()))
-                .collect(),
+            env: claude_code_env(
+                agent,
+                agent
+                    .command
+                    .env
+                    .iter()
+                    .map(|e| (e.name.clone(), e.value.clone()))
+                    .collect(),
+                native_claude_code().as_deref(),
+            ),
             models: agent.models.clone(),
             selection: SelectionKind::ConfigOption,
         }],
@@ -532,7 +583,9 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
                     // server-side picker rename cannot empty the pool.
                     for model in &spec.models {
                         let wanted = model.id.as_str();
-                        if offered_selector_value(&values, wanted).is_some() {
+                        if offered_selector_value(&values, wanted, model.api_model.as_deref())
+                            .is_some()
+                        {
                             routeable.push(model.id.clone());
                         } else {
                             if model.auto_eligible {
@@ -612,21 +665,26 @@ pub fn selector_aliases(id: &str) -> Vec<String> {
 }
 
 /// First value in `values` that names `wanted` (exact match, then `[1m]` and
-/// family synonyms).
-pub fn offered_selector_value<'a>(values: &'a [String], wanted: &str) -> Option<&'a str> {
-    for alias in selector_aliases(wanted) {
-        if let Some(v) = values.iter().find(|v| v.as_str() == alias) {
-            return Some(v.as_str());
-        }
-    }
-    None
+/// family synonyms), else the entry's exact `api_model`. A family candidate
+/// (`fable`) whose bare row the adapter hides still selects the row named for
+/// the exact model it sends, never a row for another version.
+pub fn offered_selector_value<'a>(
+    values: &'a [String],
+    wanted: &str,
+    api_model: Option<&str>,
+) -> Option<&'a str> {
+    selector_aliases(wanted)
+        .into_iter()
+        .chain(api_model.map(str::to_string))
+        .find_map(|alias| values.iter().find(|v| **v == alias))
+        .map(String::as_str)
 }
 
 /// Value to send to a config-option model selector for this catalog entry.
 /// Prefers a spelling the selector actually listed; falls back to `wanted`
 /// so a miss still fails verification instead of inventing another id.
-pub fn selector_value_to_send(values: &[String], wanted: &str) -> String {
-    offered_selector_value(values, wanted)
+pub fn selector_value_to_send(values: &[String], wanted: &str, api_model: Option<&str>) -> String {
+    offered_selector_value(values, wanted, api_model)
         .unwrap_or(wanted)
         .to_string()
 }
@@ -882,7 +940,13 @@ agents:
                 "fable".to_string(),
             ]
         );
-        for id in ["opus", "fable", "claude-fable-5-2", "claude-opus-4-6", "sonnet"] {
+        for id in [
+            "opus",
+            "fable",
+            "claude-fable-5-2",
+            "claude-opus-4-6",
+            "sonnet",
+        ] {
             assert!(selector_aliases(id).iter().all(|a| !a.ends_with("[1m]")));
         }
     }
@@ -892,42 +956,139 @@ agents:
         // claude-agent-acp 0.99.1 lists Fable as `fable`, like `opus`/`sonnet`.
         let family = vec!["default".into(), "opus".into(), "fable".into()];
         assert_eq!(
-            offered_selector_value(&family, "claude-fable-5-1[1m]"),
+            offered_selector_value(&family, "claude-fable-5-1[1m]", None),
             Some("fable")
         );
         assert_eq!(
-            selector_value_to_send(&family, "claude-fable-5-1[1m]"),
+            selector_value_to_send(&family, "claude-fable-5-1[1m]", None),
             "fable"
         );
         let full = vec!["claude-fable-5-1".into(), "fable".into()];
         assert_eq!(
-            offered_selector_value(&full, "claude-fable-5-1[1m]"),
+            offered_selector_value(&full, "claude-fable-5-1[1m]", None),
             Some("claude-fable-5-1")
         );
-        assert_eq!(offered_selector_value(&family, "claude-sonnet-5"), None);
-        assert_eq!(offered_selector_value(&family, "claude-fablet-1"), None);
-        assert_eq!(offered_selector_value(&family, "fable-5"), None);
+        assert_eq!(
+            offered_selector_value(&family, "claude-sonnet-5", None),
+            None
+        );
+        assert_eq!(
+            offered_selector_value(&family, "claude-fablet-1", None),
+            None
+        );
+        assert_eq!(offered_selector_value(&family, "fable-5", None), None);
     }
 
     #[test]
     fn offered_selector_value_prefers_exact_then_bare_spelling() {
         let both = vec!["opus[1m]".into(), "opus".into(), "sonnet".into()];
-        assert_eq!(offered_selector_value(&both, "opus[1m]"), Some("opus[1m]"));
-        assert_eq!(offered_selector_value(&both, "opus"), Some("opus"));
+        assert_eq!(
+            offered_selector_value(&both, "opus[1m]", None),
+            Some("opus[1m]")
+        );
+        assert_eq!(offered_selector_value(&both, "opus", None), Some("opus"));
         let bare = vec!["opus".into(), "sonnet".into()];
-        assert_eq!(offered_selector_value(&bare, "opus[1m]"), Some("opus"));
+        assert_eq!(
+            offered_selector_value(&bare, "opus[1m]", None),
+            Some("opus")
+        );
         // A bare id never matches a `[1m]`-suffixed selector entry.
         let suffixed = vec!["opus[1m]".into(), "sonnet".into()];
-        assert_eq!(offered_selector_value(&suffixed, "opus"), None);
-        assert_eq!(offered_selector_value(&bare, "haiku"), None);
+        assert_eq!(offered_selector_value(&suffixed, "opus", None), None);
+        assert_eq!(offered_selector_value(&bare, "haiku", None), None);
+    }
+
+    #[test]
+    fn claude_code_env_fills_unset_settings_for_the_claude_adapter() {
+        let cfg = Config::from_yaml(
+            "agents:\n  - name: claude\n    command: {type: stdio, command: /usr/bin/claude-agent-acp}\n    model_selection: {type: config-option}\n    models:\n      - {id: opus, cost_rank: 4, api_model: claude-opus-5-5}\n      - {id: fable, cost_rank: 5, api_model: claude-fable-5-2}\n",
+        )
+        .unwrap();
+        let agent = &cfg.agents[0];
+        let env = claude_code_env(agent, vec![], Some("/home/u/.local/bin/claude"));
+        assert_eq!(
+            env,
+            [
+                (
+                    "CLAUDE_CODE_EXECUTABLE".to_string(),
+                    "/home/u/.local/bin/claude".to_string()
+                ),
+                (
+                    "ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(),
+                    "claude-fable-5-2".to_string()
+                ),
+            ]
+        );
+        // Operator values win, and no native install means no executable.
+        let set = vec![
+            (
+                "CLAUDE_CODE_EXECUTABLE".to_string(),
+                "/opt/claude".to_string(),
+            ),
+            ("ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(), "x".to_string()),
+        ];
+        assert_eq!(claude_code_env(agent, set.clone(), Some("/n")), set);
+        assert_eq!(
+            claude_code_env(agent, vec![], None),
+            [(
+                "ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(),
+                "claude-fable-5-2".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn claude_code_env_leaves_other_adapters_alone() {
+        let cfg = Config::from_yaml(
+            "agents:\n  - name: codex\n    command: {type: stdio, command: codex-acp}\n    model_selection: {type: config-option}\n    models:\n      - {id: fable, cost_rank: 5, api_model: claude-fable-5-2}\n",
+        )
+        .unwrap();
+        assert!(claude_code_env(&cfg.agents[0], vec![], Some("/n")).is_empty());
+    }
+
+    #[test]
+    fn family_candidate_selects_its_exact_api_model_row() {
+        // Anthropic's Fable 5.1 row hides Claude Code's own `fable` row; the
+        // exact 5.2 row (a custom picker option) is selected instead.
+        let custom: Vec<String> = [
+            "default",
+            "claude-fable-5-1[1m]",
+            "opus",
+            "claude-fable-5-2",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            offered_selector_value(&custom, "fable", Some("claude-fable-5-2")),
+            Some("claude-fable-5-2")
+        );
+        assert_eq!(
+            selector_value_to_send(&custom, "fable", Some("claude-fable-5-2")),
+            "claude-fable-5-2"
+        );
+        // The bare row wins when the adapter lists it.
+        let bare: Vec<String> = ["fable", "claude-fable-5-2"].map(String::from).to_vec();
+        assert_eq!(
+            offered_selector_value(&bare, "fable", Some("claude-fable-5-2")),
+            Some("fable")
+        );
+        // Another version's row never stands in for the candidate's model.
+        let old = vec!["claude-fable-5-1[1m]".to_string()];
+        assert_eq!(
+            offered_selector_value(&old, "fable", Some("claude-fable-5-2")),
+            None
+        );
     }
 
     #[test]
     fn selector_value_to_send_uses_the_offered_spelling() {
         let bare = vec!["opus".into(), "sonnet".into()];
-        assert_eq!(selector_value_to_send(&bare, "opus[1m]"), "opus");
-        assert_eq!(selector_value_to_send(&bare, "opus"), "opus");
+        assert_eq!(selector_value_to_send(&bare, "opus[1m]", None), "opus");
+        assert_eq!(selector_value_to_send(&bare, "opus", None), "opus");
         let missing = vec!["sonnet".into()];
-        assert_eq!(selector_value_to_send(&missing, "opus[1m]"), "opus[1m]");
+        assert_eq!(
+            selector_value_to_send(&missing, "opus[1m]", None),
+            "opus[1m]"
+        );
     }
 }
