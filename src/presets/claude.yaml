@@ -19,15 +19,17 @@ mode_map:
   preclass: plan
 lineage: claude
 models:
+# Haiku 5.5 bills prompts over 100K tokens at 5x ($0.50/$2.50). Agent turns
+# usually exceed that, so routing prices it at the long-prompt rate.
 - id: haiku
   display_name: Claude Haiku 5.5
   cost_rank: 1
   api_model: claude-haiku-5-5
   pricing:
-    input_per_mtok: 0.1
-    output_per_mtok: 0.5
-    cache_read_per_mtok: 0.01
-    cache_write_per_mtok: 0.125
+    input_per_mtok: 0.5
+    output_per_mtok: 2.5
+    cache_read_per_mtok: 0.05
+    cache_write_per_mtok: 0.625
 - id: sonnet
   display_name: Claude Sonnet 5.5
   cost_rank: 2

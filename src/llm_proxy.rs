@@ -549,7 +549,11 @@ async fn proxy_request(
 
     let outbound_body = match (decision.as_ref(), parsed.as_ref()) {
         (Some(decision), Some(value)) => shape_provider_request(
-            value,
+            &fit_model_limits(
+                value,
+                decision.drop_adaptive_thinking,
+                decision.max_output_cap,
+            ),
             decision.rewrite.then_some(decision.model.as_str()),
             &decision.effort,
             target.config.protocol,
@@ -849,6 +853,8 @@ async fn proxy_request(
                             ),
                             event: "proxy-fallback".to_string(),
                             fold_system_turns: false,
+                            drop_adaptive_thinking: false,
+                            max_output_cap: None,
                             estimated_input,
                             effort: request_effort(
                                 &state.shared,
@@ -1640,6 +1646,11 @@ struct RequestDecision {
     /// The model on the wire predates mid-conversation `role: "system"` turns:
     /// fold them into user turns and drop the beta tokens before sending.
     fold_system_turns: bool,
+    /// The rewritten model takes no adaptive thinking: drop the `thinking`
+    /// config the adapter shaped for the model it believes it is talking to.
+    drop_adaptive_thinking: bool,
+    /// The rewritten model's output cap, when `max_tokens` may exceed it.
+    max_output_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1973,6 +1984,10 @@ fn select_request_model(
         .map_or(selected != active.candidate, |original| {
             original != &upstream_model
         });
+    // The adapter shapes the body for the model its selector names. When the
+    // wire model is rewritten (an explicit pick of an older version, or an
+    // alternate), fit the parameters that model lacks instead of sending a 400.
+    let scores = turn_scores(shared, version, &selected);
     RequestDecision {
         rewrite,
         honors_pin: rewrite && selected == active.candidate,
@@ -1981,14 +1996,20 @@ fn select_request_model(
         reason,
         event,
         estimated_input: signals.estimated_input,
-        effort: request_effort(
-            shared,
-            &active.parent_router_sid,
-            &active.state_sid,
-            version,
-            &selected,
-        ),
-        fold_system_turns: !turn_scores(shared, version, &selected).system_turns,
+        effort: if rewrite && !scores.effort {
+            EffortShape::Omit
+        } else {
+            request_effort(
+                shared,
+                &active.parent_router_sid,
+                &active.state_sid,
+                version,
+                &selected,
+            )
+        },
+        fold_system_turns: !scores.system_turns,
+        drop_adaptive_thinking: rewrite && !scores.adaptive_thinking,
+        max_output_cap: scores.max_output_tokens.filter(|_| rewrite),
     }
 }
 
@@ -2066,6 +2087,53 @@ fn inspect_request(body: &Value) -> RequestSignals {
 
 fn estimate_request_tokens(body: &[u8]) -> u64 {
     (body.len() as u64).div_ceil(4)
+}
+
+/// Fit a request to a rewritten model's limits: drop an adaptive `thinking`
+/// config the model does not accept (with the context edits that clear
+/// thinking, which require thinking on) and cap the output budget at its
+/// maximum.
+fn fit_model_limits(
+    body: &Value,
+    drop_adaptive_thinking: bool,
+    max_output_cap: Option<u64>,
+) -> std::borrow::Cow<'_, Value> {
+    let wire = request_wire_shape(body);
+    let drop_thinking = drop_adaptive_thinking && wire.adaptive_thinking;
+    let cap = max_output_cap.filter(|cap| wire.max_output > *cap);
+    if !drop_thinking && cap.is_none() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        if drop_thinking {
+            object.remove("thinking");
+            let emptied = object
+                .get_mut("context_management")
+                .and_then(|management| management.get_mut("edits"))
+                .and_then(Value::as_array_mut)
+                .is_some_and(|edits| {
+                    edits.retain(|edit| {
+                        !edit
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind.starts_with("clear_thinking"))
+                    });
+                    edits.is_empty()
+                });
+            if emptied {
+                object.remove("context_management");
+            }
+        }
+        if let Some(cap) = cap {
+            for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+                if object.get(key).and_then(Value::as_u64).is_some() {
+                    object.insert(key.into(), Value::from(cap));
+                }
+            }
+        }
+    }
+    std::borrow::Cow::Owned(body)
 }
 
 fn max_output_tokens(body: &Value) -> Option<u64> {
@@ -3103,6 +3171,61 @@ agents:
             request_effort(&shared, "r1", "r1", None, &worker),
             EffortShape::Set("worker-max".to_string())
         );
+    }
+
+    #[test]
+    fn a_rewritten_model_gets_a_request_fitted_to_its_limits() {
+        // Claude Code shapes the body for its selector model (Haiku 5.5: adaptive
+        // thinking, 128K output). An explicit pick of Haiku 4.5 rewrites the wire
+        // model, so the proxy drops what 4.5 rejects instead of sending a 400.
+        let body = json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 128000,
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015"}]},
+        });
+        let fitted = fit_model_limits(&body, true, Some(64000));
+        assert_eq!(fitted["max_tokens"], 64000);
+        assert!(fitted.get("thinking").is_none());
+        // Clearing thinking requires thinking on; other edits stay.
+        assert!(fitted.get("context_management").is_none());
+        let mixed = json!({
+            "thinking": {"type": "adaptive"},
+            "context_management": {"edits": [
+                {"type": "clear_thinking_20251015"},
+                {"type": "clear_tool_uses_20250919"},
+            ]},
+        });
+        assert_eq!(
+            fit_model_limits(&mixed, true, None)["context_management"]["edits"],
+            json!([{"type": "clear_tool_uses_20250919"}])
+        );
+        let shaped: Value = serde_json::from_slice(
+            &shape_provider_request(
+                &fitted,
+                Some("claude-haiku-4-5"),
+                &EffortShape::Omit,
+                LlmWireProtocol::Anthropic,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shaped["model"], "claude-haiku-4-5");
+        assert!(shaped["output_config"].get("effort").is_none());
+
+        // Nothing to fit leaves the body untouched; a budget under the cap stays.
+        let small =
+            json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 2048}});
+        assert!(matches!(
+            fit_model_limits(&small, true, Some(64000)),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            fit_model_limits(&body, false, None),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

@@ -223,8 +223,8 @@ cost:
   # $8 input) and Fable 5.1 ($0.25 against $10) are 0.025x, Opus 5.5
   # ($0.20 against $4 input) is 0.05x, and Sonnet 5.5 ($0.10 against $2
   # input) is 0.05x. Each lengthens the cache-reprime break-even the
-  # demotion gate computes. Writes are unchanged (1.25x). Haiku 5.5 ($0.01
-  # against $0.10 input) stays on the standard 0.1x agent ratio.
+  # demotion gate computes. Writes are unchanged (1.25x). Haiku 5.5 ($0.05
+  # against $0.50 input) stays on the standard 0.1x agent ratio.
   #
   # Scoped to those exact ids: Fable 5 (`claude-fable-5*` without a minor)
   # and the explicit-pick `claude/claude-opus-5` and `claude/claude-sonnet-5`
@@ -473,10 +473,12 @@ published_pricing:
     "claude/claude-sonnet-5": { input_per_mtok: 2.00, output_per_mtok: 10.00 }
     "claude/claude-opus-5-5": { input_per_mtok: 4.00, output_per_mtok: 20.00 }
     "claude/claude-fable-5": { input_per_mtok: 10.00, output_per_mtok: 50.00 }
-    # Haiku 5.5 is the `haiku` family candidate: $0.10/$0.50, standard 0.1x
-    # cache read ($0.01).
-    "claude/haiku": { input_per_mtok: 0.10, output_per_mtok: 0.50 }
-    "claude/claude-haiku-5-5": { input_per_mtok: 0.10, output_per_mtok: 0.50 }
+    # Haiku 5.5 is the `haiku` family candidate: $0.10/$0.50 for prompts up to
+    # 100K tokens and $0.50/$2.50 beyond, standard 0.1x cache read at both.
+    # Agent turns usually exceed 100K (a Kory Code request is ~214K), so the
+    # long-prompt rate is the one routing compares against.
+    "claude/haiku": { input_per_mtok: 0.50, output_per_mtok: 2.50 }
+    "claude/claude-haiku-5-5": { input_per_mtok: 0.50, output_per_mtok: 2.50 }
     # Sonnet 5.5 is PERMANENTLY $2/$10, same as Sonnet 5 (the increase to
     # $3/$15 scheduled for 2026-09-01 was cancelled, note on Anthropic's
     # pricing page), but its cache read is 0.05x ($0.10), not the standard
