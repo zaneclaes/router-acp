@@ -147,7 +147,7 @@ class CatalogTest(unittest.TestCase):
         fable = catalog.model("claude/claude-fable-5[1m]")
         self.assertGreater(fable.end - fable.start, 1, "spans its wrapped pricing lines")
         self.assertEqual(fable.cost_rank, 5)
-        self.assertAlmostEqual(fable.pricing["output_per_mtok"], 50.0)
+        self.assertAlmostEqual(fable.pricing["output_per_mtok"], 40.0)
 
     def test_set_price_preserves_decimal_formatting(self):
         catalog = parse_catalog(CATALOG_PATH)

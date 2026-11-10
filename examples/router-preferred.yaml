@@ -82,9 +82,9 @@ agents:
     # claude-agent-acp actually puts on the wire for each alias.
     # Cache rates price each request's cache reads and writes. Anthropic's rates
     # are usually a fixed ratio of the input rate — read 0.1x, write 1.25x — but
-    # two Claude models break the read ratio, so state every rate explicitly
-    # rather than deriving one: Fable 5.1 is 0.025x ($0.25/Mtok), and Opus 5.5
-    # is 0.05x ($0.20/Mtok).
+    # some Claude models break the read ratio, so state every rate explicitly
+    # rather than deriving one: Fable 5.2 and 5.1 are 0.025x ($0.20 and
+    # $0.25/Mtok), and Opus 5.5 is 0.05x ($0.20/Mtok).
     models:
       - { id: haiku, display_name: Claude Haiku, cost_rank: 1,
           api_model: claude-haiku-4-5,
@@ -114,26 +114,24 @@ agents:
             { api_model: claude-opus-4-6,
               pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
                          cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } } ] }
-      # The fable DEFAULT still serves Fable 5. `claude-fable-5-1` is gated
-      # server-side on Claude Code >= 2.1.251 (older CLIs get a 400 telling
-      # them to update), so making 5.1 the automatic default here would 400
-      # every fable-routed request — auto, planner globs, apex complexity — for
-      # any consumer below that floor. 5.1 is a pinnable version for now.
-      #
-      # Fable 5.1 is the same $10/$50 list as Fable 5, but its CACHE READ is
-      # $0.25/Mtok: 0.025x input, where every other Claude model is 0.1x. A 4x
-      # cheaper warm read lengthens the cache-reprime break-even, so the rate
-      # has to be stated, not derived. Once your CLI clears the floor, pin it
-      # (`"claude/claude-fable-5[1m]": claude-fable-5-1`) or make it the
-      # `api_model`.
-      - { id: "claude-fable-5[1m]", display_name: Claude Fable 5 1M, cost_rank: 5,
-          api_model: claude-fable-5,
-          pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
-                     cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 },
+      # The fable candidate serves Claude Fable 5.2 — API id `claude-fable-5-2`,
+      # released 2026-11-10. $8/$40 list (cheaper than 5.1's $10/$50); cache
+      # read is 0.025x input ($0.20), the same special ratio as 5.1. The
+      # candidate id is the adapter's selector entry; the proxy sends
+      # `api_model` on the wire. Older versions are selectable only through
+      # `pinned_versions`: 5.1 keeps its $0.25 cache read, Fable 5 is $10/$50
+      # at the standard 0.1x.
+      - { id: "claude-fable-5[1m]", display_name: Claude Fable 5.2 1M, cost_rank: 5,
+          api_model: claude-fable-5-2,
+          pricing: { input_per_mtok: 8.00, output_per_mtok: 40.00,
+                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 10.00 },
           versions: [
             { api_model: claude-fable-5-1,
               pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
-                         cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 } } ] }
+                         cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 } },
+            { api_model: claude-fable-5,
+              pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
+                         cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 } } ] }
 
   - name: codex
     command:

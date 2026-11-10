@@ -59,12 +59,22 @@ models:
       output_per_mtok: 25.0
       cache_read_per_mtok: 0.5
       cache_write_per_mtok: 6.25
+# The id is the adapter's selector entry, which still reads
+# `claude-fable-5-1[1m]`; the proxy sends `api_model` on the wire, so this
+# candidate serves Fable 5.2 (same pattern as `opus[1m]` serving Opus 5.5).
 - id: claude-fable-5-1[1m]
-  display_name: Claude Fable 5.1 1M
+  display_name: Claude Fable 5.2 1M
   cost_rank: 5
-  api_model: claude-fable-5-1
+  api_model: claude-fable-5-2
   pricing:
-    input_per_mtok: 10.0
-    output_per_mtok: 50.0
-    cache_read_per_mtok: 0.25
-    cache_write_per_mtok: 12.5
+    input_per_mtok: 8.0
+    output_per_mtok: 40.0
+    cache_read_per_mtok: 0.2
+    cache_write_per_mtok: 10.0
+  versions:
+  - api_model: claude-fable-5-1
+    pricing:
+      input_per_mtok: 10.0
+      output_per_mtok: 50.0
+      cache_read_per_mtok: 0.25
+      cache_write_per_mtok: 12.5
