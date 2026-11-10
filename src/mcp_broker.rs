@@ -246,6 +246,24 @@ impl Broker {
         }
     }
 
+    /// The project servers in `cwd` the broker serves (none while unbound):
+    /// signed in or helper-covered, plus explicit account profiles.
+    fn brokered(&self, cwd: &FsPath) -> Vec<(crate::mcp_oauth::RemoteServer, Arc<TokenSource>)> {
+        if self.addr.get().is_none() {
+            return Vec::new();
+        }
+        crate::mcp_oauth::project_servers(cwd)
+            .into_iter()
+            .filter_map(|project| project.remote())
+            .filter_map(|remote| {
+                let source = self.source_for(&remote);
+                // An explicit identity stays brokered even before login. Letting
+                // the adapter use its own default credentials would cross accounts.
+                (source.injectable() || remote.account.is_some()).then_some((remote, source))
+            })
+            .collect()
+    }
+
     /// The broker entries for a session in `cwd`: each brokered project server
     /// the router is signed in to, plus explicit account profiles. Unsigned
     /// default-profile servers are left to adapters as before. `model` is the
@@ -260,16 +278,7 @@ impl Broker {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for project in crate::mcp_oauth::project_servers(cwd) {
-            let Some(remote) = project.remote() else {
-                continue;
-            };
-            let source = self.source_for(&remote);
-            // An explicit identity stays brokered even before login. Letting
-            // the adapter use its own default credentials would cross accounts.
-            if !source.injectable() && remote.account.is_none() {
-                continue;
-            }
+        for (remote, source) in self.brokered(cwd) {
             let id: String = Sha256::digest(
                 format!(
                     "{}\n{}\n{}\n{}\n{}",
@@ -397,18 +406,32 @@ impl Broker {
 
     /// A process's Claude runtime (root, mirrored config dir), or None for a
     /// process without one. Called on every spawn, before the adapter starts;
-    /// a respawn starts clean. Every name the broker already serves is
+    /// a respawn starts clean. Every name the broker already serves, and every
+    /// project server it will serve in `cwd` (where the adapter starts), is
     /// suppressed now, not at the first `session/new`: the adapter starts
     /// Claude on its own before any session, and that Claude would otherwise
-    /// try the project copies and cache their names as needing auth.
-    pub fn register_runtime(&self, key: &ProcessKey, claude: Option<(PathBuf, PathBuf)>) {
-        let names: BTreeSet<String> = self
+    /// try the project copies and cache their names as needing auth. A fresh
+    /// process has no entries yet, so `cwd` is what covers it.
+    pub fn register_runtime(
+        &self,
+        key: &ProcessKey,
+        cwd: &FsPath,
+        claude: Option<(PathBuf, PathBuf)>,
+    ) {
+        let mut names: BTreeSet<String> = self
             .entries
             .lock()
             .unwrap()
             .values()
             .map(|entry| entry.name.clone())
             .collect();
+        if claude.is_some() {
+            names.extend(
+                self.brokered(cwd)
+                    .into_iter()
+                    .map(|(remote, _)| remote.name),
+            );
+        }
         let mut runtimes = self.runtimes.lock().unwrap();
         match claude {
             Some((root, config)) => {
@@ -1361,10 +1384,58 @@ mod tests {
             r#"{"fake":{"timestamp":1},"other":{"timestamp":2}}"#,
         )
         .unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
         broker.register_runtime(
             &ProcessKey("claude".into()),
+            elsewhere.path(),
             Some((runtime.path().to_path_buf(), config.path().to_path_buf())),
         );
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(runtime.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["disabledMcpjsonServers"], json!(["fake"]));
+        let cache: Value = serde_json::from_slice(
+            &std::fs::read(runtime.path().join("mcp-needs-auth-cache.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache, json!({"other": {"timestamp": 2}}));
+    }
+
+    /// A fresh router process (a recipe run) has served no session yet: the
+    /// adapter's working directory alone decides what is suppressed, so
+    /// Claude's startup never tries, or caches as needing auth, a project
+    /// copy of a server the broker will serve. An unsigned server stays
+    /// with the adapter.
+    #[tokio::test]
+    async fn a_fresh_process_suppresses_its_cwd_brokered_servers_before_the_adapter_starts() {
+        let (upstream_url, _) = fake_upstream().await;
+        let root = tempfile::tempdir().unwrap();
+        let unsigned = Broker::new(root.path().to_path_buf(), None);
+        unsigned.bind().await.unwrap();
+        let project = project(&upstream_url);
+        let runtime = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let claude = || Some((runtime.path().to_path_buf(), config.path().to_path_buf()));
+        unsigned.register_runtime(&ProcessKey("claude".into()), project.path(), claude());
+        assert!(
+            !runtime.path().join("settings.json").exists(),
+            "not signed in: left to the adapter"
+        );
+
+        let (broker, project) = broker_for(
+            &upstream_url,
+            "http://127.0.0.1:1/token",
+            root.path(),
+            tokens("t", 3_600_000),
+        )
+        .await;
+        assert!(broker.entries.lock().unwrap().is_empty());
+        std::fs::write(
+            runtime.path().join("mcp-needs-auth-cache.json"),
+            r#"{"fake":{"timestamp":1},"other":{"timestamp":2}}"#,
+        )
+        .unwrap();
+        broker.register_runtime(&ProcessKey("claude".into()), project.path(), claude());
         let settings: Value =
             serde_json::from_slice(&std::fs::read(runtime.path().join("settings.json")).unwrap())
                 .unwrap();

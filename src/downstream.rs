@@ -224,8 +224,11 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
         }
         None => None,
     };
+    // The adapter inherits the router's working directory, which is the
+    // probe cwd.
     shared.mcp_broker.register_runtime(
         key,
+        &shared.probe_cwd,
         credential
             .as_ref()
             .and_then(crate::credentials::RuntimeCredential::claude_settings),
