@@ -216,6 +216,22 @@ pub fn send(
     send_from(store, sid, cwd, id, message, None, false)
 }
 
+/// An interrupting input cancels the running turn, and the agent's client words each cancelled tool call as a refusal
+/// ("The user doesn't want to take this action right now"). On 2026-11-10 an implement parent read ten such cancelled
+/// `planner_workflow` acknowledgements as "wake acknowledgements are paused". The frame says what happened.
+pub const INTERRUPT_NOTICE: &str = "\nThis input interrupted your previous turn. Any tool call it cancelled, including \
+     one reported as \"The user doesn't want to take this action right now\", was cancelled by this interrupt, not \
+     refused or paused: repeat the ones you still need.";
+
+/// The text an input is delivered as: the sender frame, the interrupt notice when it interrupts, then the message.
+pub fn framed(sender: Option<&str>, interrupt: bool, message: &str) -> String {
+    format!(
+        "{}{}\n\n{message}",
+        crate::external_message::agent_frame(sender),
+        if interrupt { INTERRUPT_NOTICE } else { "" }
+    )
+}
+
 /// `send` naming its sender (`send-input --from`), which the operator sees in
 /// the client and the agent sees in the frame. `interrupt` steers it into the
 /// running parent turn at once, past in-flight tool calls and the steering
@@ -258,10 +274,7 @@ pub fn send_from(
     }
     let req: PromptRequest = serde_json::from_value(json!({
         "sessionId": sid,
-        "prompt": [{"type": "text", "text": format!(
-            "{}\n\n{message}",
-            crate::external_message::agent_frame(sender.as_deref())
-        )}],
+        "prompt": [{"type": "text", "text": framed(sender.as_deref(), interrupt, message)}],
         "_meta": {"router_acp": router}
     }))
     .map_err(|e| e.to_string())?;

@@ -472,6 +472,25 @@ fn answered_queued_agent_inputs_are_not_bundled_into_a_later_wake() {
     assert!(input_wakes(&f.shared).is_empty());
 }
 
+/// An interrupting input says its interrupt cancelled the previous turn's tool calls, which the client words as a
+/// refusal; an ordinary input does not (2026-11-10: a parent read cancelled acknowledgements as "paused").
+#[test]
+fn an_interrupting_input_says_cancelled_calls_were_not_refused() {
+    use router_acp::planner_input;
+    let interrupting = planner_input::framed(Some("monitor agent"), true, "fix it");
+    assert!(
+        interrupting.contains("interrupted your previous turn"),
+        "{interrupting}"
+    );
+    assert!(
+        interrupting.contains("not \n     refused") || interrupting.contains("not refused"),
+        "{interrupting}"
+    );
+    assert!(interrupting.ends_with("\n\nfix it"));
+    let ordinary = planner_input::framed(Some("monitor agent"), false, "fix it");
+    assert!(!ordinary.contains("interrupted"), "{ordinary}");
+}
+
 /// A standing agent instruction that is no longer in force (a lifted repair
 /// hold, a served correction) is retired by id after its acknowledgment, so
 /// a host that counts unwithdrawn holds as active stops counting it. A bulk
