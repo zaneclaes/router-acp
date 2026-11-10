@@ -3106,11 +3106,13 @@ agents:
     }
 
     #[test]
-    fn haiku_is_excluded_when_the_request_carries_adaptive_thinking_and_effort() {
+    fn haiku_4_5_is_excluded_when_the_request_carries_adaptive_thinking_and_effort() {
         // Real Kory Code requests carry `thinking: {type: adaptive}` and
-        // `output_config.effort`; Haiku 4.5 rejects both. Since the proxy forwards
-        // every byte but the model name, demoting to Haiku would 400 — it must not
-        // be offered as an alternate for such a request.
+        // `output_config.effort`; Haiku 4.5 (the explicit-pick-only
+        // `claude-haiku-4-5` candidate — the `haiku` family candidate now
+        // sends Haiku 5.5, which accepts both) rejects both. Since the proxy
+        // forwards every byte but the model name, demoting to Haiku 4.5 would
+        // 400 — it must not be offered as an alternate for such a request.
         let wire = request_wire_shape(&json!({
             "thinking": {"type": "adaptive", "display": "omitted"},
             "output_config": {"effort": "high"},
@@ -3120,8 +3122,8 @@ agents:
         assert!(wire.effort);
         assert_eq!(wire.max_output, 64000);
 
-        let haiku = ModelOption {
-            id: CandidateId::new("claude", "haiku"),
+        let haiku_4_5 = ModelOption {
+            id: CandidateId::new("claude", "claude-haiku-4-5"),
             api_model: "claude-haiku-4-5".to_string(),
             cost_rank: 1,
             quality: 0.55,
@@ -3131,33 +3133,37 @@ agents:
             effort: false,
             system_turns: true,
         };
-        let sonnet = ModelOption {
+        let haiku = ModelOption {
             adaptive_thinking: true,
             effort: true,
             context_window: Some(1_000_000),
-            id: CandidateId::new("claude", "sonnet"),
-            api_model: "claude-sonnet-5".to_string(),
-            ..haiku.clone()
+            max_output_tokens: Some(128_000),
+            id: CandidateId::new("claude", "haiku"),
+            api_model: "claude-haiku-5-5".to_string(),
+            ..haiku_4_5.clone()
         };
-        assert!(!haiku.accepts(&wire));
-        assert!(sonnet.accepts(&wire));
+        assert!(!haiku_4_5.accepts(&wire));
+        assert!(haiku.accepts(&wire));
 
-        // A request with neither feature is fine on Haiku.
+        // A request with neither feature is fine on Haiku 4.5.
         let plain = request_wire_shape(&json!({"max_tokens": 4096}));
-        assert!(haiku.accepts(&plain));
+        assert!(haiku_4_5.accepts(&plain));
     }
 
     #[test]
     fn scored_context_windows_match_the_shipped_model_generation() {
         // The gate that blocked every demotion: a 214k-token request (the real
         // median in a Kory Code session) is only reroutable if the score table
-        // knows Opus 5 and Sonnet 5 hold 1M tokens. Haiku 4.5 really is 200k.
+        // knows Opus 5 and Sonnet 5 hold 1M tokens. Haiku 4.5 (explicit-pick
+        // only) really is 200k; the `haiku` family candidate now sends Haiku
+        // 5.5, which is 1M like every other current Claude model.
         let table = crate::candidate::ScoreTable::builtin();
         for (model, expected) in [
             ("claude-fable-5[1m]", 1_000_000),
             ("opus[1m]", 1_000_000),
             ("sonnet", 1_000_000),
-            ("haiku", 200_000),
+            ("haiku", 1_000_000),
+            ("claude-haiku-4-5", 200_000),
         ] {
             let scores = table.lookup(&CandidateId::new("claude", model));
             assert_eq!(
@@ -3167,7 +3173,9 @@ agents:
             );
         }
         let haiku = table.lookup(&CandidateId::new("claude", "haiku"));
-        assert!(!haiku.adaptive_thinking && !haiku.effort);
+        assert!(haiku.adaptive_thinking && haiku.effort);
+        let haiku_4_5 = table.lookup(&CandidateId::new("claude", "claude-haiku-4-5"));
+        assert!(!haiku_4_5.adaptive_thinking && !haiku_4_5.effort);
         let sonnet = table.lookup(&CandidateId::new("claude", "sonnet"));
         assert!(sonnet.adaptive_thinking && sonnet.effort);
     }
