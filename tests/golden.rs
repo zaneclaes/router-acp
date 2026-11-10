@@ -28,7 +28,7 @@ const CANDIDATES: &[(&str, &str, u32, f64)] = &[
     ("claude", "haiku", 1, 0.05),
     ("claude", "sonnet", 2, 0.05),
     ("claude", "opus[1m]", 4, 0.05),
-    ("claude", "claude-fable-5[1m]", 5, 0.05),
+    ("claude", "claude-fable-5-2[1m]", 5, 0.05),
     ("codex", "gpt-5.4-mini", 1, 0.0),
     ("codex", "gpt-5.5", 3, 0.0),
 ];
@@ -200,7 +200,7 @@ const GOLDEN: &[Golden] = &[
                       module",
         class: TaskClass::Architecture,
         complexity: 1.00,
-        winner: "claude/claude-fable-5[1m]",
+        winner: "claude/claude-fable-5-2[1m]",
         utility: 0.76,
     },
 ];
