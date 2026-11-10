@@ -74,18 +74,23 @@ agents:
     # are usually a fixed ratio of the input rate — read 0.1x, write 1.25x — but
     # some Claude models break the read ratio, so state every rate explicitly
     # rather than deriving one: Fable 5.2 and 5.1 are 0.025x ($0.20 and
-    # $0.25/Mtok), and Opus 5.5 is 0.05x ($0.20/Mtok).
+    # $0.25/Mtok), Opus 5.5 is 0.05x ($0.20/Mtok), and Sonnet 5.5 is 0.05x
+    # ($0.10/Mtok).
     models:
-      - { id: haiku, display_name: Claude Haiku, cost_rank: 1,
-          api_model: claude-haiku-4-5,
-          pricing: { input_per_mtok: 1.00, output_per_mtok: 5.00,
-                     cache_read_per_mtok: 0.10, cache_write_per_mtok: 1.25 } }
-      # Sonnet 5 is permanently $2/$10 — the increase to $3/$15 scheduled for
-      # 2026-09-01 was cancelled. Sonnet 4.6/4.5 are still $3/$15.
-      - { id: sonnet, display_name: Claude Sonnet, cost_rank: 2,
-          api_model: claude-sonnet-5,
+      # Claude Haiku 5.5 — API id `claude-haiku-5-5`. $0.10/$0.50 list (down
+      # from Haiku 4.5's $1/$5); cache read is the standard 0.1x ($0.01).
+      - { id: haiku, display_name: Claude Haiku 5.5, cost_rank: 1,
+          api_model: claude-haiku-5-5,
+          pricing: { input_per_mtok: 0.10, output_per_mtok: 0.50,
+                     cache_read_per_mtok: 0.01, cache_write_per_mtok: 0.125 } }
+      # Claude Sonnet 5.5 — API id `claude-sonnet-5-5`. Same $2/$10 list as
+      # Sonnet 5 (permanently $2/$10 — the increase to $3/$15 scheduled for
+      # 2026-09-01 was cancelled), but cache read is 0.05x input ($0.10),
+      # not the standard 0.1x. Sonnet 4.6/4.5 are still $3/$15.
+      - { id: sonnet, display_name: Claude Sonnet 5.5, cost_rank: 2,
+          api_model: claude-sonnet-5-5,
           pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
-                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 } }
+                     cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 } }
       # A family candidate is the bare family alias (`fable`, `opus`, ...)
       # and sends that family's current model; its display name states the
       # version. An older version is its own candidate under its exact API id
@@ -119,6 +124,14 @@ agents:
           api_model: claude-opus-4-6, auto_eligible: false,
           pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
                      cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
+      - { id: claude-haiku-4-5, display_name: Claude Haiku 4.5, cost_rank: 1,
+          api_model: claude-haiku-4-5, auto_eligible: false,
+          pricing: { input_per_mtok: 1.00, output_per_mtok: 5.00,
+                     cache_read_per_mtok: 0.10, cache_write_per_mtok: 1.25 } }
+      - { id: claude-sonnet-5, display_name: Claude Sonnet 5, cost_rank: 2,
+          api_model: claude-sonnet-5, auto_eligible: false,
+          pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
+                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 } }
 
   - name: codex
     command:

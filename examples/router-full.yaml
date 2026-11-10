@@ -169,11 +169,12 @@ agents:
       # prompt cache and re-primes the prefix at cache_write on the switch turn,
       # so accurate cache pricing is what keeps session-wide savings honest.
       - id: sonnet
-        display_name: Claude Sonnet
-        api_model: claude-sonnet-5
+        display_name: Claude Sonnet 5.5
+        api_model: claude-sonnet-5-5
         cost_rank: 2            # 1 = cheapest/least scarce
-        # Permanently $2/$10: the 2026-09-01 increase to $3/$15 was cancelled.
-        pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 }
+        # Same $2/$10 list as Sonnet 5; cache read is 0.05x input ($0.10),
+        # not the standard 0.1x.
+        pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 }
       # A family alias sends that family's current model; an older version
       # would be its own candidate under its exact API id.
       - id: opus

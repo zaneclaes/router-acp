@@ -580,16 +580,18 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("-      - { id:", catalog_diff)
         catalog = parse_catalog(CATALOG_PATH)
         # The shipped example enables the four auto-routed models (haiku,
-        # sonnet, opus, fable) followed by the explicit-pick
-        # older versions, each under its own id (Fable 5.1, Opus 5, Opus 4.6).
+        # sonnet, opus, fable) followed by the explicit-pick older versions,
+        # each under its own id (Fable 5.1, Opus 5, Opus 4.6, Haiku 4.5,
+        # Sonnet 5).
         self.assertEqual(
             [model.candidate for model in catalog.agent("claude").enabled_models],
             ["claude/haiku", "claude/sonnet", "claude/opus", "claude/fable",
-             "claude/claude-fable-5-1", "claude/claude-opus-5", "claude/claude-opus-4-6"],
+             "claude/claude-fable-5-1", "claude/claude-opus-5", "claude/claude-opus-4-6",
+             "claude/claude-haiku-4-5", "claude/claude-sonnet-5"],
         )
         self.assertEqual(
             [model.cost_rank for model in catalog.agent("claude").enabled_models],
-            [1, 2, 4, 5, 5, 4, 4],
+            [1, 2, 4, 5, 5, 4, 4, 1, 2],
         )
 
     def test_new_family_without_benchmarks_is_parked_unscored(self):

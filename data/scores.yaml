@@ -338,18 +338,49 @@ candidates:
       Ops: 1.39
       CodingGeneral: 1.39
 
-  # Haiku 4.5 predates adaptive thinking and the effort parameter: a request
-  # carrying `thinking: {type: adaptive}` or `output_config.effort` is rejected
-  # outright. Since the per-request proxy rewrites only the model field and
-  # forwards every other byte, Haiku cannot serve a request shaped by a newer
-  # model — the wire flags below keep it out of that demotion set.
-  - pattern: "*haiku*"
+  # Haiku 4.5, explicit-pick only (`claude/claude-haiku-4-5`), predates
+  # adaptive thinking and the effort parameter: a request carrying
+  # `thinking: {type: adaptive}` or `output_config.effort` is rejected
+  # outright, and its real output cap is 64K against Haiku 5.5's 128K. Since
+  # the per-request proxy rewrites only the model field and forwards every
+  # other byte, Haiku 4.5 cannot serve a request shaped by a newer model —
+  # the narrower pattern below must precede `*haiku*` so this exact id keeps
+  # its own wire shape instead of inheriting 5.5's. Quality mirrors the
+  # family entry below and is never ranked (`auto_eligible: false`).
+  - pattern: "*haiku-4-5*"
     coding_tier: medium
     coding_percentile: 0.5
     context_window: 200000
     max_output_tokens: 64000
     adaptive_thinking: false
     effort: false
+    default_quality: 1.29
+    quality:
+      UiTweak: 1.29
+      BugFix: 1.29
+      Feature: 1.29
+      Refactor: 1.29
+      Algorithms: 1.29
+      Architecture: 1.29
+      Research: 1.29
+      Writing: 1.29
+      Ops: 1.29
+      CodingGeneral: 1.29
+
+  # Haiku 5.5, the `haiku` family candidate: 1M context / 128K output,
+  # adaptive thinking on by default, and the effort parameter (default
+  # medium). No published benchmark card yet, so it inherits Haiku 4.5's
+  # quality rows (no score churn — the same version-bump treatment Sonnet
+  # 5.5/Opus 5.5/Fable 5.1/5.2 got above).
+  - pattern: "*haiku*"
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 1000000
+    max_output_tokens: 128000
+    # adaptive_thinking/effort both default true and are left unset, same as
+    # the opus/sonnet entries above.
+    effort_levels: [low, medium, high, xhigh, max]
+    effort_mapping: { low: low, medium: medium, high: high, xhigh: max, max: max }
     default_quality: 1.29
     quality:
       UiTweak: 1.29
