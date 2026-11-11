@@ -8618,6 +8618,47 @@ async fn pre_pin_set_mode_is_deferred_and_applied_at_pin() {
     .await;
 }
 
+/// A client that never sets a mode (goose's `run --no-session`, 2026-11-11: every Linux Chordzy
+/// LLM smoke routed to Codex kept its sandboxed default, with no network) gets the configured
+/// `default_mode`, translated through `mode_map` exactly like a client-requested mode.
+#[tokio::test]
+async fn a_session_without_a_client_mode_gets_the_configured_default_mode() {
+    let state = temp_state_file("mode-default");
+    let log = temp_log("mode-default");
+    let yaml = format!(
+        "state_file: {}\ndefault_mode: auto\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml(
+            "mock",
+            &[("m1", 1)],
+            &[
+                ("MOCK_SESSION_MODES", "default,agent-full-access"),
+                ("MOCK_LOG", &log.display().to_string()),
+            ],
+        )
+        .replace(
+            "    model_selection:",
+            "    mode_map: { auto: agent-full-access }\n    model_selection:"
+        )
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let session = new_session(&cx).await?;
+        let sid = session.session_id.0.to_string();
+        let resp = prompt_text(&cx, &sid, "no client mode").await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert!(agent_text(&observed, &sid).contains("echo:m1:no client mode"));
+        let set_modes: Vec<_> = read_log(&log)
+            .into_iter()
+            .filter(|e| e["event"] == "set_mode")
+            .collect();
+        assert_eq!(set_modes.len(), 1, "{set_modes:?}");
+        assert_eq!(set_modes[0]["modeId"], "agent-full-access");
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn pre_pin_set_mode_with_mode_map_translation() {
     let state = temp_state_file("mode-map");

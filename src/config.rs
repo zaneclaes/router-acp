@@ -1718,6 +1718,12 @@ pub struct Config {
     /// Skill → model-class routing rules.
     #[serde(default)]
     pub skill_routing: Vec<SkillRoute>,
+    /// The client session mode a session starts in when its client never sets one (e.g. `auto`),
+    /// mapped through `agents[].mode_map` like a client-requested mode. Unset leaves each downstream
+    /// in its own default. goose's router provider sends no mode, so without this a Codex session kept
+    /// its sandboxed default (no network) even under `GOOSE_MODE: auto`.
+    #[serde(default)]
+    pub default_mode: Option<String>,
     /// Version pinning: `agent/model-id` → `default` or one of that model's
     /// `versions[].api_model`. Routing never sees it — the candidate stays
     /// `agent/model-id` everywhere — and the proxy sends the pinned version on

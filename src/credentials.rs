@@ -1265,9 +1265,23 @@ where
     // out even when this host cannot write the result back (a read-only mount fails only after
     // the provider already rotated, since the repair lock is machine-local). With refresh off,
     // the host uses access tokens as it finds them, and an expired one stays unavailable until
-    // the owning machine's refresh syncs in.
+    // the owning machine's refresh syncs in. It still reads what synced in: material that differs
+    // from the failed request's is that refresh, so the caller retries with it (2026-11-11: a
+    // read-only CI agent answered "Managed credential temporarily unavailable" for good, since this
+    // branch returned before reading the newer login another machine had already written). It takes
+    // no lock: the mount is read-only and nothing here writes.
     if !refresh_enabled {
-        return RepairOutcome::Unknown;
+        let Some(credential) = read(agent) else {
+            return RepairOutcome::Unknown;
+        };
+        let previous = directory(agent)
+            .and_then(|dir| record(&dir))
+            .filter(|r| r.generation == credential.generation);
+        let current = marker(&credential, previous.as_ref());
+        return match observed {
+            Some(failed) if failed != current => RepairOutcome::Repaired,
+            _ => RepairOutcome::Unknown,
+        };
     }
     let Some(dir) = directory(agent) else {
         return RepairOutcome::Unknown;
@@ -2634,6 +2648,33 @@ flag = 7
         for on in [None, Some(""), Some("on"), Some("1")] {
             assert!(refresh_setting_enabled(on), "{on:?}");
         }
+    }
+
+    /// A read-only consumer picks up the login another machine refreshed and synced in, without
+    /// rotating anything itself: a failed request's material that no longer matches the stored one
+    /// is repaired. Before, it stayed "temporarily unavailable" until the process restarted.
+    #[tokio::test]
+    async fn a_read_only_host_picks_up_a_refresh_synced_from_another_machine() {
+        let (_root, agent) = fixture("claude");
+        let failed = request_generation(&agent).unwrap();
+        let file = directory(&agent).unwrap().join(".credentials.json");
+        assert!(file.exists(), "fixture credential at {}", file.display());
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"synced-access","refreshToken":"synced-refresh","expiresAt":4070908800000},"mcpOAuth":{"keep":true}}"#,
+        )
+        .unwrap();
+        let never = |_, _| async { panic!("a read-only host called the provider's token endpoint") };
+        assert_eq!(
+            repair_with_policy(&agent, Some(&failed), never, false).await,
+            RepairOutcome::Repaired
+        );
+        let current = request_generation(&agent).unwrap();
+        assert_eq!(
+            repair_with_policy(&agent, Some(&current), never, false).await,
+            RepairOutcome::Unknown,
+            "the material that just failed is not a repair"
+        );
     }
 
     #[tokio::test]
