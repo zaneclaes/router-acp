@@ -5412,9 +5412,13 @@ async fn pin_ranked(
                         s.native_effort_options = opened.config_options.clone();
                         s.struggle = 0.0;
                         // Deferred pre-pin mode wins; on failover re-apply
-                        // whatever the client had set for this session.
+                        // whatever the client had set for this session; a client
+                        // that never set one gets the configured `default_mode`.
                         (
-                            s.pending_mode.take().or_else(|| s.applied_mode.clone()),
+                            s.pending_mode
+                                .take()
+                                .or_else(|| s.applied_mode.clone())
+                                .or_else(|| shared.cfg.default_mode.clone()),
                             previous,
                         )
                     })
