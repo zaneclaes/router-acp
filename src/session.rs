@@ -10450,6 +10450,9 @@ fn queue_parent_prompt(
         router_sid,
         "router-acp · original input and controls retained for the next parent turn",
     );
+    // Shown with this prompt's own answer. Left queued, every retained input's
+    // notice waited for the next streamed text and arrived there as one burst.
+    flush_pending_disclosure(shared, router_sid);
     responder.respond(PromptResponse::new(StopReason::EndTurn))
 }
 
