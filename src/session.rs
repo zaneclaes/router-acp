@@ -3988,6 +3988,15 @@ fn find_prompt_directive(prompt: &[ContentBlock]) -> Option<(usize, String, usiz
     None
 }
 
+/// A model reference as written: `agent/model-id`, `provider/family`, or a bare
+/// `family`/model id (carried with an empty agent until
+/// `Config::canonical_candidate` resolves it).
+fn candidate_reference(value: &str) -> Option<CandidateId> {
+    CandidateId::parse(value).or_else(|| {
+        (!value.is_empty() && !value.contains('/')).then(|| CandidateId::new("", value))
+    })
+}
+
 /// Parse (and strip) the first active routing directive in the prompt.
 ///
 /// The directive is matched outside quoted code and history on any line of
@@ -4042,18 +4051,18 @@ fn parse_one_prompt_directive(
         let value = value.trim();
         match key.trim().to_lowercase().as_str() {
             "candidate" => {
-                directives.candidate = Some(CandidateId::parse(value).ok_or_else(|| {
-                    format!("directive candidate `{value}` must have the form `agent/model-id`")
+                directives.candidate = Some(candidate_reference(value).ok_or_else(|| {
+                    format!("directive candidate `{value}` must name a model: `agent/model-id`, `provider/family` or `family`")
                 })?);
             }
             "prefer" => {
-                directives.prefer = Some(CandidateId::parse(value).ok_or_else(|| {
-                    format!("directive prefer `{value}` must have the form `agent/model-id`")
+                directives.prefer = Some(candidate_reference(value).ok_or_else(|| {
+                    format!("directive prefer `{value}` must name a model: `agent/model-id`, `provider/family` or `family`")
                 })?);
             }
             "switch" => {
-                directives.switch = Some(CandidateId::parse(value).ok_or_else(|| {
-                    format!("directive switch `{value}` must have the form `agent/model-id`")
+                directives.switch = Some(candidate_reference(value).ok_or_else(|| {
+                    format!("directive switch `{value}` must name a model: `agent/model-id`, `provider/family` or `family`")
                 })?);
             }
             "strategy" => {
@@ -8075,88 +8084,42 @@ fn cordon_escape_target(
     }
 }
 
-/// Resolve a loose model reference (from the `model:` shorthand) to the best
-/// eligible candidate: an exact `agent/model` id, a bare model id (`sonnet`),
-/// a family/prefix (`gpt`, `claude/opus`), or any substring — highest quality
-/// wins on ambiguity. `None` = nothing eligible matches (so the caller leaves
-/// the prompt untouched rather than mis-routing prose).
+/// Resolve a `model:` shorthand to a candidate. The reference names models the
+/// way every shorthand does (`Config::resolve_reference`): an exact
+/// `agent/model-id`, or `provider/family` / `family` for the family's pinned
+/// or newest model. Across account seats the highest-quality eligible one
+/// wins. `None` = it names no model (so the caller leaves the prompt
+/// untouched rather than mis-routing prose).
 fn resolve_candidate_ref(
     shared: &Arc<Shared>,
     reference: &str,
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
+    let named: Vec<CandidateId> = shared
+        .cfg
+        .resolve_reference(reference)
+        .into_iter()
+        .map(|id| shared.restored_seat(&id))
+        .filter(|id| !is_excluded(id, excluded))
+        .collect();
     let views = shared.eligible_views_revivable(&RequiredCaps::default(), class);
-    // Exact `agent/model` id wins outright — and naming a full id is explicit
-    // selection, so it may name a pinned legacy version. The fuzzy matching
-    // below stays on the automatic pool: `opus:` must not land on a legacy
-    // version just because it scores a hair higher.
-    if let Some(id) = CandidateId::parse(reference).map(|id| shared.restored_seat(&id))
-        && !is_excluded(&id, excluded)
-        && shared.candidate_runtime(&id).is_some()
-    {
-        return Some(id);
-    }
-    let needle = reference.to_lowercase();
-    let has_slash = reference.contains('/');
     views
         .iter()
-        .filter(|v| !view_excluded(v, excluded))
-        .filter(|v| {
-            let full = v.id.to_string().to_lowercase();
-            let model = v.id.model.to_lowercase();
-            if has_slash {
-                full == needle
-                    || crate::candidate::glob_match(&needle, &full)
-                    || crate::candidate::glob_match(&format!("{needle}*"), &full)
-            } else {
-                model == needle
-                    || full == needle
-                    || crate::candidate::glob_match(&format!("*{needle}*"), &model)
-                    || crate::candidate::glob_match(&format!("*{needle}*"), &full)
-            }
-        })
+        .filter(|v| named.contains(&v.id))
         .max_by(|a, b| {
             a.quality
                 .partial_cmp(&b.quality)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|v| v.id.clone())
+        // An explicit shorthand stays a control command while its target is
+        // cordoned or its adapter is down: switch_pin revives the adapter and
+        // fails loudly if the target is still unavailable.
         .or_else(|| {
-            // An explicit shorthand must remain a control command even while
-            // its target is cordoned or its adapter is down. switch_pin will
-            // revive the adapter and then fail loudly if the target is still
-            // unavailable; silently forwarding `opus:` as prose loses the
-            // user's request and makes recovery impossible.
-            let needle = reference.to_lowercase();
-            shared
-                .candidates
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|candidate| !is_excluded(&candidate.id, excluded))
-                .filter(|candidate| {
-                    let full = candidate.id.to_string().to_lowercase();
-                    let model = candidate.id.model.to_lowercase();
-                    if has_slash {
-                        full == needle
-                            || crate::candidate::glob_match(&needle, &full)
-                            || crate::candidate::glob_match(&format!("{needle}*"), &full)
-                    } else {
-                        model == needle
-                            || full == needle
-                            || model.contains(&needle)
-                            || full.contains(&needle)
-                    }
-                })
-                .max_by(|a, b| {
-                    shared
-                        .scores
-                        .lookup_exact(&a.id)
-                        .quality(class)
-                        .total_cmp(&shared.scores.lookup_exact(&b.id).quality(class))
-                })
-                .map(|candidate| candidate.id.clone())
+            named
+                .into_iter()
+                .find(|id| shared.candidate_runtime(id).is_some())
         })
 }
 
@@ -8490,12 +8453,10 @@ fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
 /// session's task class) than the current pin — the auto-upgrade target.
 ///
 /// The +0.05 normalized-quality margin filters out noise-level "upgrades"
-/// that would forfeit a warm cache for no real capability gain. But the
-/// score table's compressed peer pairs (`benchmark_scoring.compression` in
-/// data/model-policy.yaml) sit a deliberate ~0.007 normalized above their
-/// cheaper sibling — Fable over Opus, Sol over Terra — and a session pinned
-/// on the cheaper peer whose confidence keeps dropping (a fix surviving
-/// round after round) must still be able to climb onto the preferred member.
+/// that would forfeit a warm cache for no real capability gain. But two
+/// peers can score within a hair of each other, and a session pinned on the
+/// lower one whose confidence keeps dropping (a fix surviving round after
+/// round) must still be able to climb onto the higher one.
 /// So when nothing clears the margin, fall back to the best strictly-better
 /// candidate instead of returning nothing.
 fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
@@ -10230,7 +10191,7 @@ async fn on_set_config_option(
                                     session.candidate_override_source = None;
                                     Action::RouterUpdated
                                 } else {
-                                    match CandidateId::parse(&value) {
+                                    match shared.cfg.resolve_reference(&value).into_iter().next() {
                                         Some(id) => {
                                             session.candidate_override = Some(id);
                                             session.candidate_override_source =
@@ -10263,7 +10224,7 @@ async fn on_set_config_option(
                     if value.eq_ignore_ascii_case("default") || value.eq_ignore_ascii_case("auto") {
                         Action::RouterUpdated
                     } else {
-                        match CandidateId::parse(&value) {
+                        match shared.cfg.resolve_reference(&value).into_iter().next() {
                             Some(id) => {
                                 session.candidate_override = Some(id);
                                 session.candidate_override_source = Some(OverrideSource::UserPick);
@@ -10849,7 +10810,12 @@ fn prepare_parent_prompt_inner(
             }
         }
         Ok(Some((mut directives, stripped))) => {
-            // `candidate=claude/opus[1m]` names that agent's account seats.
+            // Shorthand (`claude/haiku`, `haiku`) names the family's pinned or newest model.
+            let canonical = |id: CandidateId| shared.cfg.canonical_candidate(&id);
+            directives.candidate = directives.candidate.map(canonical);
+            directives.prefer = directives.prefer.map(canonical);
+            directives.switch = directives.switch.map(canonical);
+            // `candidate=claude/opus` names that agent's account seats.
             directives.candidate = directives.candidate.map(|id| shared.seat_for(&id));
             directives.switch = directives.switch.map(|id| shared.seat_for(&id));
             explicit_routing = true;
@@ -12249,10 +12215,10 @@ mod directive_tests {
     #[test]
     fn malformed_live_commands_still_fail_after_examples() {
         let prompt = vec![ContentBlock::from(
-            "Example: `[router: candidate=…]`\n[router: candidate=invalid] Resume".to_string(),
+            "Example: `[router: candidate=…]`\n[router: candidate=invalid/] Resume".to_string(),
         )];
         let error = parse_prompt_directives(&prompt).unwrap_err();
-        assert!(error.contains("candidate `invalid`"), "{error}");
+        assert!(error.contains("candidate `invalid/`"), "{error}");
     }
 
     #[test]

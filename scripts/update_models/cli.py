@@ -3,26 +3,28 @@
 The CLI lives in the package rather than in the script so it is importable (a
 top-level `update_models.py` next to the `update_models/` package is shadowed by
 the package and can only ever be run, never imported — including by tests).
+
+The catalog is `<data>/providers/<name>.yaml` (each provider's models, grouped
+by family) and the scoring procedure is `<data>/classifier.yaml` (`scoring`,
+`cost`). The updater writes only the provider files, and in them only model
+quality lines, retired entries and parked new models. Router configs do not
+list models (agents inherit their provider's), so nothing else is touched.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-import sys
-
-from . import benchmarks
 from . import discover as discovery
 from . import goose as goose_bridge
-from . import patterns as pat
 from . import provenance, score, validate
-from .catalog import Catalog, parse_catalog, parse_preset, render_disabled_model
-from .policy import Policy, PolicyError, load_policy
+from .catalog import Catalog, CatalogError, load_catalog, load_catalog_texts, render_parked_entry
+from .policy import Policy, PolicyError
 from .report import PendingWrite, Report
-from .scores_file import ScoresFile, parse_scores, parse_scores_text
 
 EXIT_OK = 0
 EXIT_VALIDATION = 1
@@ -40,18 +42,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="update_models.py",
         description=(
-            "Update router-acp's model catalog and quality/cost tables: discover what "
-            "each agent exposes, derive scores from calibrated benchmarks, keep the "
-            "first-match pattern table correct, and validate that routing ORDER still "
-            "matches policy. Runbook: docs/model-updater.md"
+            "Update router-acp's model catalog, data/providers/<name>.yaml: discover what "
+            "each provider exposes, re-score every model from the evidence recorded on it, "
+            "and validate the catalog's shape, evidence, ordering and cost contract. "
+            "Runbook: docs/model-updater.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help="repository root")
-    parser.add_argument("--policy", type=Path, help="default: <repo>/data/model-policy.yaml")
-    parser.add_argument("--scores", type=Path, help="default: <repo>/data/scores.yaml")
     parser.add_argument(
-        "--config", type=Path, help="agent catalog; default: <repo>/examples/router-preferred.yaml"
+        "--data",
+        type=Path,
+        help="directory holding classifier.yaml and providers/*.yaml; default: <repo>/data",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -64,11 +66,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="check invariants against what is checked in; no discovery, no proposals",
+        help="check what is checked in; no discovery, no re-scoring",
     )
-    parser.add_argument("--providers", help="comma-separated agent subset, e.g. grok,kimi")
+    parser.add_argument("--providers", help="comma-separated provider subset, e.g. grok,kimi")
     parser.add_argument("--skip-discover", action="store_true")
-    parser.add_argument("--skip-score", action="store_true")
+    parser.add_argument("--skip-score", action="store_true", help="do not re-score models")
     parser.add_argument("--skip-write", action="store_true")
     parser.add_argument(
         "--discovery-fixture",
@@ -79,7 +81,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     goose_flags.add_argument(
         "--use-goose",
         action="store_true",
-        help="run the judgment step through `goose run --recipe` (tier + base proposals)",
+        help="ask `goose run --recipe` for published evidence on models that have none",
     )
     goose_flags.add_argument("--no-goose", action="store_true", default=True)
     parser.add_argument(
@@ -98,191 +100,111 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
-    repo = args.repo.resolve()
-    policy = args.policy or repo / "data" / "model-policy.yaml"
-    scores = args.scores or repo / "data" / "scores.yaml"
-    config = args.config or repo / "examples" / "router-preferred.yaml"
-    return repo, policy, scores, config
+def configured_by_provider(models: Catalog) -> dict[str, list[str]]:
+    """Each provider's live models — the basis for retirements."""
+    return {provider: [row.model_id for row in models.by_provider(provider)] for provider in models.providers()}
 
 
-def shipped_presets(repo: Path) -> list[Path]:
-    """`src/presets/*.yaml`, when this repo ships them (a sandbox copy may not)."""
-    preset_dir = repo / "src" / "presets"
-    return sorted(preset_dir.glob("*.yaml")) if preset_dir.is_dir() else []
+def known_by_provider(models: Catalog) -> dict[str, list[str]]:
+    """Every id a provider file names, including commented-out entries, so a
+    parked model is not proposed again on the next run."""
+    return {provider: models.known_ids(provider) for provider in models.providers()}
 
 
-def configured_by_agent(catalog: Catalog) -> dict[str, list[str]]:
-    """Models the catalog routes to today — the basis for retirements."""
-    return {
-        agent.name: [model.model_id for model in agent.enabled_models] for agent in catalog.agents
-    }
+def unevidenced(models: Catalog, discovered: dict[str, discovery.AgentDiscovery]) -> list[str]:
+    """`provider/id` of every model with no published evidence of its own,
+    plus newly discovered models."""
+    missing = [row.key for row in models.rows if not row.evidence]
+    for provider, found in discovered.items():
+        missing += [f"{provider}/{model_id}" for model_id in found.to_add]
+    return missing
 
 
-def known_by_agent(catalog: Catalog) -> dict[str, list[str]]:
-    """Every id the catalog mentions, including commented-out ones.
-
-    A model parked awaiting a score is already known, so discovery must not
-    propose adding it again on the next run.
-    """
-    return {
-        agent.name: [model.model_id for model in agent.models] for agent in catalog.agents
-    }
-
-
-def build_proposals(
+def gather_evidence(
+    models: Catalog,
     policy: Policy,
-    scores: ScoresFile,
-    catalog: Catalog,
-    discovered: dict[str, discovery.AgentDiscovery],
-    use_goose: bool,
+    candidates: list[str],
+    data_dir: Path,
     recipe: Path,
     out_dir: Path,
     report: Report,
-) -> list[score.ScoreProposal]:
-    """Propose scores for candidates that have calibrated evidence.
-
-    Deliberately narrow. A model that already resolves to a family inherits that
-    family's score — which is how the table is designed (patterns key on the
-    model LINE, so version bumps inherit on purpose). Those are reported, not
-    rescored: silently differentiating every new id would rewrite the table on
-    each release and flip the routing goldens.
-    """
-    candidates: list[str] = [model.candidate for model in catalog.all_models() if model.enabled]
-    for agent, found in discovered.items():
-        for model_id in found.to_add:
-            candidate = f"{agent}/{model_id}"
-            if candidate not in candidates:
-                candidates.append(candidate)
-            inherited = pat.resolve(scores.patterns, candidate)
-            if inherited is not None:
-                report.notes.append(
-                    f"`{candidate}` inherits the existing `{inherited}` score. If this "
-                    "generation is materially stronger, give it its own entry above that "
-                    "pattern — inheriting an older sibling's numbers under-scores it."
-                )
-
-    unscored = score.unscored_candidates(scores, candidates)
-    if not unscored:
-        return []
-    derived = benchmarks.derive(policy)
-
-    if use_goose:
-        try:
-            found_judgments, renames = goose_bridge.run_recipe(
-                recipe=recipe,
-                params={
-                    "UNSCORED": ",".join(unscored),
-                    "CURRENT_SCORES": str(scores.path),
-                    "POLICY": str(policy.path),
-                    "CATALOG": str(catalog.path),
-                },
-                band=policy.quality_band,
-                transcript_out=out_dir / "goose-transcript.txt",
-            )
-        except goose_bridge.GooseError as exc:
-            raise GooseStepFailed(str(exc)) from exc
-        for judgment in found_judgments:
-            report.notes.append(
-                f"goose found {len(judgment.observations)} benchmark observation(s) for "
-                f"`{judgment.candidate}`. Add reviewed observations to "
-                "`benchmark_scoring.model_evidence`; quality is not inferred from prose."
-            )
-        for rename in renames:
-            report.notes.append(
-                f"goose proposes rename `{rename.old}` → `{rename.new}` "
-                f"(confidence {rename.confidence:.2f}): {rename.rationale} "
-                "— renames are never auto-applied"
-            )
-
-    proposals: list[score.ScoreProposal] = []
-    for candidate in unscored:
-        evidence_pattern = benchmarks.resolve_profile(derived, candidate)
-        if evidence_pattern is None:
-            report.notes.append(
-                f"`{candidate}` remains disabled/unscored: no calibrated benchmark evidence. "
-                "The updater never assigns quality from its name or a vendor claim."
-            )
-            continue
-        profile = derived[evidence_pattern]
-        proposals.append(
-            score.propose_from_benchmarks(
-                policy,
-                scores,
-                candidate,
-                evidence_pattern,
-                profile.default_quality,
-                profile.quality,
-                profile.observations,
-            )
+) -> None:
+    """Ask goose for published evidence. Reported for review, never written."""
+    if not candidates:
+        return
+    try:
+        judgments, renames = goose_bridge.run_recipe(
+            recipe=recipe,
+            params={
+                "UNSCORED": ",".join(candidates),
+                "PROVIDERS": str(data_dir / "providers"),
+                "CLASSIFIER": str(models.classifier_path),
+            },
+            band=policy.quality_band,
+            transcript_out=out_dir / "goose-transcript.txt",
         )
-    return proposals
+    except goose_bridge.GooseError as exc:
+        raise GooseStepFailed(str(exc)) from exc
+    for judgment in judgments:
+        report.notes.append(
+            f"goose found {len(judgment.observations)} benchmark observation(s) for "
+            f"`{judgment.candidate}`. Review them and add the accepted ones to that model's "
+            "`evidence:` in its data/providers/<name>.yaml; quality is never inferred from prose."
+        )
+    for rename in renames:
+        report.notes.append(
+            f"goose proposes rename `{rename.old}` → `{rename.new}` "
+            f"(confidence {rename.confidence:.2f}): {rename.rationale} "
+            "— renames are never auto-applied"
+        )
 
 
-def catalog_entry_lines(model_id: str, cost_rank: int, stamp: str) -> list[str]:
-    return render_disabled_model(
-        indent="      ",
-        model_id=model_id,
-        display_name=model_id.replace("-", " ").title(),
-        cost_rank=cost_rank,
-        note=provenance.new_model_note(model_id, stamp),
-    )
-
-
-def apply_catalog_changes(
-    catalog: Catalog,
+def apply_discovery(
+    models: Catalog,
     discovered: dict[str, discovery.AgentDiscovery],
     policy: Policy,
     stamp: str,
     report: Report,
 ) -> None:
-    """Retire vanished models, park newly discovered ones, refresh pricing."""
-    for agent_name, found in discovered.items():
-        agent = catalog.agent(agent_name)
-        if not found.trustworthy or agent is None:
+    """Retire vanished models and park newly discovered ones, in their provider file."""
+    for provider, found in discovered.items():
+        if not found.trustworthy or models.file(provider) is None:
             continue
         for model_id in found.to_remove:
-            model = catalog.model(f"{agent_name}/{model_id}")
-            if model is not None and model.enabled:
-                catalog.disable(model, provenance.retirement_note(model_id, stamp))
+            row = models.find(model_id, provider)
+            if row is not None:
+                grace = policy.retire_grace_releases(provider)
+                models.disable(row, provenance.retirement_note(model_id, stamp, grace))
                 report.notes.append(
-                    f"`{agent_name}/{model_id}` commented out: discovery no longer offers it "
-                    "(kept one release before removal)"
+                    f"`{provider}/{model_id}` commented out: discovery no longer offers it "
+                    f"(kept {grace} release(s) before removal)"
                 )
         for model_id in found.to_add:
             peers = [
-                (model.cost_rank, policy.blended_price(model.pricing))
-                for model in agent.enabled_models
-                if model.cost_rank is not None and policy.blended_price(model.pricing) is not None
+                (row.cost_rank, policy.blended_price(row.pricing))
+                for row in models.by_provider(provider)
+                if row.cost_rank is not None and policy.blended_price(row.pricing) is not None
             ]
             # Discovery reports ids, not prices, so this rank is a floor
             # placeholder until someone fills in `pricing`.
             suggested = score.rank_suggestion(policy, None, peers)  # type: ignore[arg-type]
-            catalog.add_disabled(agent_name, catalog_entry_lines(model_id, suggested, stamp))
-            report.notes.append(
-                f"`{agent_name}/{model_id}` added commented-out at placeholder cost_rank "
-                f"{suggested} (discovery reports no price for it); set its real rank and "
-                "pricing before enabling it"
+            models.add_parked(
+                provider,
+                model_id,
+                render_parked_entry(model_id, suggested, provenance.new_model_note(model_id, stamp)),
             )
-
-    reference = (policy.published_pricing or {}).get("models") or {}
-    for candidate, rates in reference.items():
-        model = catalog.model(candidate)
-        if model is None or not model.enabled or not model.pricing:
-            continue
-        for key, want in rates.items():
-            current = (model.pricing or {}).get(key)
-            if current is not None and abs(float(current) - float(want)) > 0.0001:
-                if catalog.set_price(model, key, float(want)):
-                    report.notes.append(
-                        f"`{candidate}` {key}: {current} → {want} (published reference)"
-                    )
+            report.notes.append(
+                f"`{provider}/{model_id}` added to data/providers/{provider}.yaml commented out, at "
+                f"placeholder cost_rank {suggested}: move it under its family, set its version, fill "
+                "in pricing and evidence, uncomment it and rerun with --apply"
+            )
 
 
 def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
     out = stdout or sys.stdout
     args = parse_args(argv)
-    repo, policy_path, scores_path, config_path = _resolve_paths(args)
+    repo = args.repo.resolve()
+    data_dir: Path = args.data or repo / "data"
     # A provenance stamp is a system timestamp, so UTC — never a naive today().
     stamp = args.today or datetime.now(timezone.utc).date().isoformat()
     applied = bool(args.apply)
@@ -290,34 +212,24 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        policy = load_policy(policy_path)
-    except PolicyError as exc:
+        models = load_catalog(data_dir)
+        policy = models.policy
+    except (CatalogError, PolicyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_VALIDATION
 
-    if not config_path.exists() and args.config is not None:
-        # An explicitly named catalog that is not there is a typo, not a signal
-        # to validate nothing: without a catalog every catalog check silently
-        # passes, which reads like a clean audit.
-        print(f"error: --config {config_path} does not exist", file=sys.stderr)
-        return EXIT_VALIDATION
-
-    scores = parse_scores(scores_path)
-    catalog = parse_catalog(config_path) if config_path.exists() else None
     report = Report(generated_at=stamp, applied=applied)
-
-    scores_before = scores.render()
-    catalog_before = catalog.render() if catalog else ""
+    before = {f.path: f.render() for f in models.files}
 
     # -- discover ---------------------------------------------------------
     discovered: dict[str, discovery.AgentDiscovery] = {}
-    if not args.validate_only and not args.skip_discover and catalog is not None:
+    if not args.validate_only and not args.skip_discover:
         discovered = discovery.discover(
             policy_discovery=policy.discovery,
-            configured_by_agent=configured_by_agent(catalog),
+            configured_by_agent=configured_by_provider(models),
             only=[name.strip() for name in args.providers.split(",")] if args.providers else None,
             fixture=args.discovery_fixture,
-            known_by_agent=known_by_agent(catalog),
+            known_by_agent=known_by_provider(models),
         )
         report.discovered = discovered
         (out_dir / "discovered.json").write_text(discovery.to_json(discovered, stamp))
@@ -330,70 +242,42 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
             )
             return EXIT_DISCOVERY
 
-    # -- score ------------------------------------------------------------
-    if not args.validate_only and not args.skip_score and catalog is not None:
+    # -- gather evidence (goose; reported, never written) ------------------
+    if not args.validate_only and args.use_goose:
         try:
-            report.proposals = build_proposals(
-                policy=policy,
-                scores=scores,
-                catalog=catalog,
-                discovered=discovered,
-                use_goose=bool(args.use_goose),
-                recipe=args.recipe or repo / "scripts" / "recipes" / "update-models-score.yaml",
-                out_dir=out_dir,
-                report=report,
+            gather_evidence(
+                models,
+                policy,
+                unevidenced(models, discovered),
+                data_dir,
+                args.recipe or repo / "scripts" / "recipes" / "update-models-score.yaml",
+                out_dir,
+                report,
             )
         except GooseStepFailed as exc:
-            print(f"error: goose judgment step failed: {exc}", file=sys.stderr)
+            print(f"error: goose evidence step failed: {exc}", file=sys.stderr)
             return EXIT_GOOSE
 
     # -- write (in memory; only flushed with --apply) ----------------------
-    scores_after = scores_before
     if not args.validate_only and not args.skip_write:
-        for pattern, derived in benchmarks.derive(policy).items():
-            if scores.set_quality(pattern, derived.default_quality, derived.quality):
-                report.notes.append(
-                    f"`{pattern}` refreshed from {derived.observations} benchmark observations "
-                    f"(base {derived.default_quality:.2f})"
-                )
-        for proposal in report.proposals:
-            comment = provenance.entry_comment(
-                proposal,
-                source="calibrated benchmarks",
-                generated_at=stamp,
-            )
-            scores.insert_entry(proposal.to_entry(comment), before=proposal.insert_before)
-
-        order = None
-        violations = pat.order_violations(scores.patterns)
-        if violations:
-            order = pat.sorted_by_specificity(scores.patterns)
-            report.notes.append(
-                f"reordered {len(violations)} shadowed pattern(s) so the first-match table "
-                "resolves each id to its own family"
-            )
-        scores_after = scores.render(order=order)
-
-        if catalog is not None and discovered:
-            apply_catalog_changes(catalog, discovered, policy, stamp, report)
+        if not args.skip_score:
+            try:
+                report.rescores = score.rescore(policy, models)
+            except PolicyError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_VALIDATION
+            report.notes += [rescore.describe() for rescore in report.rescores]
+        if discovered:
+            apply_discovery(models, discovered, policy, stamp, report)
+    after = {f.path: f.render() for f in models.files}
 
     # -- validate the state that would ship -------------------------------
-    validated_scores = parse_scores_text(scores_after, scores_path)
-    report.findings = validate.validate(policy, validated_scores, catalog)
-    # The shipped provider presets are catalogs too: a `provider: codex` agent
-    # routes on `src/presets/codex.yaml`, so a model enabled there without its
-    # score, evidence, rank and published pricing is the same defect as one in
-    # an example config (GPT-6 Astra once sat parked there for exactly this).
-    for preset_path in shipped_presets(repo):
-        report.findings.extend(
-            validate.validate_catalog(policy, validated_scores, parse_preset(preset_path))
-        )
+    try:
+        report.findings = validate.validate(load_catalog_texts(after, models.classifier_path))
+    except CatalogError as exc:
+        report.findings = [validate.Finding(validate.ERROR, "unparseable", str(exc))]
 
-    report.writes = [PendingWrite(path=scores_path, before=scores_before, after=scores_after)]
-    if catalog is not None:
-        report.writes.append(
-            PendingWrite(path=config_path, before=catalog_before, after=catalog.render())
-        )
+    report.writes = [PendingWrite(path=path, before=before[path], after=after[path]) for path in after]
 
     # -- emit -------------------------------------------------------------
     report_path = args.report or out_dir / "report.md"

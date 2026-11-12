@@ -1,8 +1,13 @@
-use std::collections::BTreeMap;
+//! The contract of the model catalog. `data/providers/<name>.yaml` is the one
+//! definition of each provider and every model it supports (operator,
+//! 2026-11-12): each model is one exact API id, versioned within its family,
+//! with its pricing, cost rank and its own published benchmark evidence, from
+//! which its quality is computed. `data/classifier.yaml` defines the
+//! benchmarks and the cost ladder. No shipped example restates a model.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use router_acp::candidate::glob_match;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -12,67 +17,24 @@ struct Pricing {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct Version {
-    api_model: String,
-    pricing: Option<Pricing>,
+struct Evidence {
+    benchmark: String,
+    #[allow(dead_code)]
+    result: f64,
+    source: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct Model {
+    version: Option<serde_yaml::Value>,
     id: String,
     api_model: Option<String>,
+    display_name: Option<String>,
     cost_rank: Option<u8>,
     pricing: Option<Pricing>,
     #[serde(default)]
-    versions: Vec<Version>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct Agent {
-    name: String,
-    provider: Option<String>,
-    #[serde(default)]
-    models: Vec<Model>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouterConfig {
-    #[serde(default)]
-    agents: Vec<Agent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Preset {
-    #[serde(default)]
-    models: Vec<Model>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScoreRow {
-    pattern: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Scores {
-    candidates: Vec<ScoreRow>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Policy {
-    benchmark_scoring: BenchmarkScoring,
-    cost: CostPolicy,
-    invariants: Invariants,
-    published_pricing: PublishedPricing,
-}
-
-#[derive(Debug, Deserialize)]
-struct BenchmarkScoring {
-    model_evidence: BTreeMap<String, serde_yaml::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CostPolicy {
-    ladder: Ladder,
+    evidence: Vec<Evidence>,
+    default_quality: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,13 +44,25 @@ struct Ladder {
 }
 
 #[derive(Debug, Deserialize)]
-struct Invariants {
-    resolves_to: BTreeMap<String, String>,
+struct Cost {
+    ladder: Ladder,
 }
 
 #[derive(Debug, Deserialize)]
-struct PublishedPricing {
-    models: BTreeMap<String, Pricing>,
+struct Scoring {
+    benchmarks: serde_yaml::Mapping,
+}
+
+#[derive(Debug, Deserialize)]
+struct Classifier {
+    scoring: Scoring,
+    cost: Cost,
+}
+
+#[derive(Debug, Deserialize)]
+struct Provider {
+    provider: String,
+    models: std::collections::BTreeMap<String, Vec<Model>>,
 }
 
 fn root() -> PathBuf {
@@ -100,193 +74,121 @@ fn read_yaml<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
         .unwrap_or_else(|error| panic!("{} must parse: {error}", path.display()))
 }
 
-fn shipped_catalogs() -> Vec<(String, Vec<Agent>)> {
-    let repo = root();
-    let mut paths = fs::read_dir(repo.join("examples"))
+fn classifier() -> Classifier {
+    read_yaml(&root().join("data/classifier.yaml"))
+}
+
+fn providers() -> Vec<(PathBuf, Provider)> {
+    let mut files: Vec<PathBuf> = fs::read_dir(root().join("data/providers"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("router") && name.ends_with(".yaml"))
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    let mut catalogs = paths
+        .filter(|path| path.extension().is_some_and(|e| e == "yaml"))
+        .collect();
+    files.sort();
+    files
         .into_iter()
         .map(|path| {
-            let config: RouterConfig = read_yaml(&path);
-            (
-                path.strip_prefix(&repo).unwrap().display().to_string(),
-                config.agents,
-            )
+            let provider = read_yaml(&path);
+            (path, provider)
         })
-        .collect::<Vec<_>>();
-
-    let preset_dir = repo.join("src/presets");
-    let mut presets = fs::read_dir(&preset_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "yaml")
-        })
-        .collect::<Vec<_>>();
-    presets.sort();
-    catalogs.extend(presets.into_iter().map(|path| {
-        let preset: Preset = read_yaml(&path);
-        let provider = path.file_stem().unwrap().to_str().unwrap().to_string();
-        (
-            path.strip_prefix(&repo).unwrap().display().to_string(),
-            vec![Agent {
-                name: provider,
-                provider: None,
-                models: preset.models,
-            }],
-        )
-    }));
-    catalogs
+        .collect()
 }
 
-fn first_match<'a>(patterns: &'a [String], candidate: &str) -> Option<&'a str> {
-    patterns
-        .iter()
-        .find(|pattern| glob_match(pattern, candidate))
-        .map(String::as_str)
-}
-
-fn validate_identity(
-    source: &str,
-    candidate: &str,
-    pricing: Option<&Pricing>,
-    score_patterns: &[String],
-    evidence_patterns: &[String],
-    policy: &Policy,
-    errors: &mut Vec<String>,
-) {
-    let score = first_match(score_patterns, candidate);
-    if score.is_none() {
-        errors.push(format!("{source}: {candidate} has no score entry"));
-    }
-    if first_match(evidence_patterns, candidate).is_none() {
-        errors.push(format!(
-            "{source}: {candidate} has no calibrated benchmark evidence"
-        ));
-    }
-    match policy.invariants.resolves_to.get(candidate) {
-        None => errors.push(format!(
-            "{source}: {candidate} has no deliberate score resolution"
-        )),
-        Some(expected) if Some(expected.as_str()) != score => errors.push(format!(
-            "{source}: {candidate} resolves to {score:?}, expected {expected}"
-        )),
-        Some(_) => {}
-    }
-    if !policy.published_pricing.models.contains_key(candidate) {
-        errors.push(format!(
-            "{source}: {candidate} has no published-pricing entry"
-        ));
-    }
-    match pricing {
-        Some(rates) if rates.input_per_mtok.is_some() && rates.output_per_mtok.is_some() => {}
-        _ => errors.push(format!(
-            "{source}: {candidate} has incomplete catalog pricing"
-        )),
-    }
-}
-
-fn validate_catalogs(catalogs: &[(String, Vec<Agent>)]) -> Vec<String> {
-    let repo = root();
-    let scores: Scores = read_yaml(&repo.join("data/scores.yaml"));
-    let policy: Policy = read_yaml(&repo.join("data/model-policy.yaml"));
-    let score_patterns = scores
-        .candidates
-        .iter()
-        .map(|row| row.pattern.clone())
-        .collect::<Vec<_>>();
-    let evidence_patterns = policy
-        .benchmark_scoring
-        .model_evidence
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
+/// Every contract violation of one provider's models, each with its family.
+fn violations(provider: &str, models: &[(String, Model)], classifier: &Classifier) -> Vec<String> {
     let mut errors = Vec::new();
-
-    for (source, agents) in catalogs {
-        for agent in agents {
-            let provider = agent
-                .provider
-                .as_deref()
-                .unwrap_or_else(|| agent.name.split('@').next().unwrap());
-            for model in &agent.models {
-                let candidate = format!("{provider}/{}", model.id);
-                match model.cost_rank {
-                    Some(rank)
-                        if rank >= policy.cost.ladder.min && rank <= policy.cost.ladder.max => {}
-                    _ => errors.push(format!(
-                        "{source}: {candidate} has no cost rank in {}..={} ",
-                        policy.cost.ladder.min, policy.cost.ladder.max
-                    )),
-                }
-                validate_identity(
-                    source,
-                    &candidate,
-                    model.pricing.as_ref(),
-                    &score_patterns,
-                    &evidence_patterns,
-                    &policy,
-                    &mut errors,
-                );
-                if let Some(api_model) = model.api_model.as_deref().filter(|id| *id != model.id) {
-                    validate_identity(
-                        source,
-                        &format!("{provider}/{api_model}"),
-                        model.pricing.as_ref(),
-                        &score_patterns,
-                        &evidence_patterns,
-                        &policy,
-                        &mut errors,
-                    );
-                }
-                for version in &model.versions {
-                    validate_identity(
-                        source,
-                        &format!("{provider}/{}", version.api_model),
-                        version.pricing.as_ref(),
-                        &score_patterns,
-                        &evidence_patterns,
-                        &policy,
-                        &mut errors,
-                    );
-                }
+    let ladder = &classifier.cost.ladder;
+    for (index, (family, model)) in models.iter().enumerate() {
+        let name = format!("{provider}/{}", model.id);
+        if model.id.contains('*') || family.contains('*') {
+            errors.push(format!("{name}: a pattern, not a model"));
+        }
+        if model.api_model.is_some() {
+            errors.push(format!(
+                "{name}: `id` is the API id; there is no `api_model`"
+            ));
+        }
+        let version = match &model.version {
+            Some(serde_yaml::Value::Number(n)) => Some(n.to_string()),
+            Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        if !version.is_some_and(|v| v.split('.').all(|p| p.parse::<u32>().is_ok())) {
+            errors.push(format!("{name} has no dotted version"));
+        }
+        if model.display_name.is_none() {
+            errors.push(format!("{name} has no display name"));
+        }
+        if !model
+            .cost_rank
+            .is_some_and(|rank| rank >= ladder.min && rank <= ladder.max)
+        {
+            errors.push(format!(
+                "{name} has no cost rank in {}..={}",
+                ladder.min, ladder.max
+            ));
+        }
+        if !model
+            .pricing
+            .as_ref()
+            .is_some_and(|p| p.input_per_mtok.is_some() && p.output_per_mtok.is_some())
+        {
+            errors.push(format!("{name} has incomplete pricing"));
+        }
+        // Every model is scored, and only on its own evidence.
+        if model.evidence.is_empty() {
+            errors.push(format!("{name} has no evidence of its own"));
+        }
+        if model.default_quality.is_none() {
+            errors.push(format!("{name} has no computed quality"));
+        }
+        for result in &model.evidence {
+            if !classifier
+                .scoring
+                .benchmarks
+                .contains_key(result.benchmark.as_str())
+            {
+                errors.push(format!("{name}: unknown benchmark `{}`", result.benchmark));
             }
+            if result.source.trim().is_empty() {
+                errors.push(format!(
+                    "{name}: a `{}` result has no source",
+                    result.benchmark
+                ));
+            }
+        }
+        if models[..index]
+            .iter()
+            .any(|(_, other)| other.id == model.id)
+        {
+            errors.push(format!("{name} is listed twice"));
         }
     }
     errors
 }
 
-#[test]
-fn every_shipped_model_has_the_complete_cross_file_contract() {
-    let catalogs = shipped_catalogs();
-    let names = catalogs
+fn flatten(provider: &Provider) -> Vec<(String, Model)> {
+    provider
+        .models
         .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>();
-    for expected in [
-        "examples/router-accounts.yaml",
-        "examples/router-full.yaml",
-        "examples/router-preferred.yaml",
-        "src/presets/claude.yaml",
-        "src/presets/codex.yaml",
-        "src/presets/grok.yaml",
-        "src/presets/kimi.yaml",
-    ] {
-        assert!(
-            names.contains(&expected),
-            "missing shipped catalog {expected}"
-        );
+        .flat_map(|(family, versions)| versions.iter().map(|m| (family.clone(), m.clone())))
+        .collect()
+}
+
+#[test]
+fn every_model_is_one_exact_version_with_its_whole_contract() {
+    let classifier = classifier();
+    let mut errors = Vec::new();
+    for (path, provider) in providers() {
+        if path.file_stem().and_then(|s| s.to_str()) != Some(provider.provider.as_str()) {
+            errors.push(format!("{} must be named for its provider", path.display()));
+        }
+        errors.extend(violations(
+            &provider.provider,
+            &flatten(&provider),
+            &classifier,
+        ));
     }
-    let errors = validate_catalogs(&catalogs);
     assert!(
         errors.is_empty(),
         "model contract violations:\n{}",
@@ -294,32 +196,81 @@ fn every_shipped_model_has_the_complete_cross_file_contract() {
     );
 }
 
+/// The catalog is the only place a model is defined, and the retired files stay gone.
 #[test]
-fn an_enabled_model_cannot_omit_any_companion_configuration() {
-    // A model no shipped file knows: every companion check must fire. (GPT-6
-    // Astra used to be this fixture, until it got its full contract.)
-    let incomplete = vec![(
-        "fixture.yaml".to_string(),
-        vec![Agent {
-            name: "codex".to_string(),
-            provider: None,
-            models: vec![Model {
-                id: "gpt-7-nova".to_string(),
-                api_model: None,
-                cost_rank: None,
-                pricing: None,
-                versions: Vec::new(),
-            }],
+fn no_shipped_example_restates_a_model() {
+    let repo = root();
+    for retired in [
+        "data/scores.yaml",
+        "data/models.yaml",
+        "data/model-policy.yaml",
+        "data/providers.yaml",
+        "data/agents",
+        "src/presets",
+    ] {
+        assert!(!repo.join(retired).exists(), "{retired} is retired");
+    }
+    let mut offenders = Vec::new();
+    for entry in fs::read_dir(repo.join("examples")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "yaml") {
+            continue;
+        }
+        let document: serde_yaml::Value = read_yaml(&path);
+        let agents = document
+            .get("agents")
+            .and_then(|a| a.as_sequence())
+            .cloned()
+            .unwrap_or_default();
+        let providers: Vec<serde_yaml::Value> = document
+            .get("providers")
+            .and_then(|p| p.as_mapping())
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        if agents
+            .iter()
+            .chain(&providers)
+            .any(|entry| entry.get("models").is_some())
+        {
+            offenders.push(path.strip_prefix(&repo).unwrap().display().to_string());
+        }
+    }
+    assert!(offenders.is_empty(), "models restated in: {offenders:?}");
+}
+
+#[test]
+fn an_incomplete_model_fires_every_companion_check() {
+    let model = Model {
+        id: "gpt-7-*".to_string(),
+        api_model: Some("gpt-7".to_string()),
+        evidence: vec![Evidence {
+            benchmark: "Vibes-Bench".to_string(),
+            result: 1.0,
+            source: " ".to_string(),
         }],
-    )];
-    let errors = validate_catalogs(&incomplete).join("\n");
+        ..Model::default()
+    };
+    let empty = Model {
+        id: "gpt-7-nova".to_string(),
+        ..Model::default()
+    };
+    let errors = violations(
+        "codex",
+        &[("gpt".to_string(), model), ("gpt".to_string(), empty)],
+        &classifier(),
+    )
+    .join("\n");
     for required in [
+        "a pattern",
+        "there is no `api_model`",
+        "has no dotted version",
+        "has no display name",
         "has no cost rank",
-        "has no score entry",
-        "has no calibrated benchmark evidence",
-        "has no deliberate score resolution",
-        "has no published-pricing entry",
-        "has incomplete catalog pricing",
+        "has incomplete pricing",
+        "unknown benchmark",
+        "has no source",
+        "has no evidence of its own",
+        "has no computed quality",
     ] {
         assert!(
             errors.contains(required),

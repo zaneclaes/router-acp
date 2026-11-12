@@ -1,19 +1,25 @@
-"""Load `data/model-policy.yaml` — the encoded scoring procedure.
+"""The scoring procedure and per-provider catalog settings.
 
-The policy file is the answer to "where did these numbers come from?": fixed
-benchmark calibrations, evidence, the ordering invariants any edit must keep,
-and the documented reasons a `cost_rank` diverges from list price.
+  * `data/classifier.yaml` holds, beside the classifier rules, the two
+    non-per-model sections the updater uses:
+      - `scoring` — the fixed benchmark calibrations (anchors per benchmark),
+        the quality band, rounding and the task-override thresholds: the
+        procedure that turns a model's evidence into its quality;
+      - `cost` — the cost-rank ladder and the blended-price weight used to
+        validate `cost_rank`.
+  * each `data/providers/<name>.yaml` holds two catalog-maintenance keys:
+    `cache_ratio` (the default for a cache rate a model leaves unset) and
+    `discovery` (how its live model list is probed, including
+    `retire_grace_releases`).
+
+This module turns those into a `Policy`; it never reads model entries.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-import yaml
-
-from . import patterns as pat
 
 # TaskClass order, matching `TaskClass::ALL` in src/candidate.rs. Emitted in
 # this order so a generated block reads like the hand-written ones.
@@ -32,78 +38,41 @@ TASK_CLASSES = [
 
 
 class PolicyError(RuntimeError):
-    """The policy file is missing, malformed, or internally inconsistent."""
-
-
-@dataclass(frozen=True)
-class RankException:
-    """A documented reason a cost_rank does not follow list price."""
-
-    candidate: str
-    why: str
-    over: str | None = None
+    """The scoring sections are missing, malformed, or internally inconsistent."""
 
 
 @dataclass
 class Policy:
     path: Path
-    raw: dict[str, Any]
     quality_band: tuple[float, float]
     round_to: float
-    witnesses: dict[str, str]
-    invariants: dict[str, Any]
+    scoring: dict[str, Any]
     cost: dict[str, Any]
-    published_pricing: dict[str, Any]
-    discovery: dict[str, Any]
-    benchmark_scoring: dict[str, Any]
+    # provider name -> its parsed data/providers/<name>.yaml
+    providers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    # -- scoring ----------------------------------------------------------
+    @property
+    def benchmarks(self) -> dict[str, Any]:
+        return self.scoring.get("benchmarks") or {}
+
+    @property
+    def minimum_task_observations(self) -> int:
+        return int(self.scoring.get("minimum_task_observations", 2))
+
+    @property
+    def meaningful_task_delta(self) -> float:
+        return float(self.scoring.get("meaningful_task_delta", 0.15))
+
+    # -- cost -------------------------------------------------------------
     @property
     def blended_output_weight(self) -> float:
         return float(self.cost.get("blended_output_weight", 3))
 
     @property
     def ladder(self) -> tuple[int, int]:
-        ladder = self.cost.get("ladder", {})
+        ladder = self.cost.get("ladder", {}) or {}
         return int(ladder.get("min", 1)), int(ladder.get("max", 5))
-
-    @property
-    def rank_exceptions(self) -> list[RankException]:
-        return [
-            RankException(
-                candidate=entry["candidate"],
-                why=" ".join(str(entry.get("why", "")).split()),
-                over=entry.get("over"),
-            )
-            for entry in self.cost.get("rank_exceptions", [])
-        ]
-
-    def cache_ratio(self, agent: str) -> dict[str, float] | None:
-        ratios = self.cost.get("cache_ratios", {}) or {}
-        found = ratios.get(agent)
-        return {key: float(value) for key, value in found.items()} if found else None
-
-    def cache_ratio_for(self, agent: str, candidate: str) -> dict[str, float] | None:
-        """The agent's cache ratios with any per-candidate override applied.
-
-        The flat per-agent ratio holds for a whole provider until one model
-        breaks it (Fable 5.1's 0.025x cache read). An override states only the
-        rate that differs and merges over the agent's, so the rest of the
-        family keeps being validated against one number.
-        """
-        base = self.cache_ratio(agent) or {}
-        overrides = self.cost.get("cache_ratio_overrides", {}) or {}
-        for pattern, ratios in overrides.items():
-            if pat.glob_match(pattern, candidate):
-                merged = dict(base)
-                merged.update({key: float(value) for key, value in ratios.items()})
-                return merged or None
-        return base or None
-
-    def witness_id(self, name: str) -> str:
-        try:
-            return self.witnesses[name]
-        except KeyError as exc:  # pragma: no cover - policy authoring error
-            raise PolicyError(f"invariant references unknown witness `{name}`") from exc
 
     def blended_price(self, pricing: dict[str, Any] | None) -> float | None:
         """input + k·output, the prior used to sanity-check ordinal ranks."""
@@ -116,29 +85,48 @@ class Policy:
         except (KeyError, TypeError, ValueError):
             return None
 
-def load_policy(path: Path) -> Policy:
-    try:
-        raw = yaml.safe_load(path.read_text()) or {}
-    except FileNotFoundError as exc:
-        raise PolicyError(f"policy file not found: {path}") from exc
-    except yaml.YAMLError as exc:
-        raise PolicyError(f"invalid policy YAML in {path}: {exc}") from exc
+    # -- providers --------------------------------------------------------
+    def cache_ratio(self, provider: str) -> dict[str, float] | None:
+        """The ratio an UNSET cache rate of this provider's models defaults to."""
+        spec = (self.providers.get(provider) or {}).get("cache_ratio") or {}
+        return {key: float(value) for key, value in spec.items()} or None
 
-    anchors = raw.get("anchors") or {}
-    band_raw = anchors.get("quality_band") or {}
+    def discovery_spec(self, provider: str) -> dict[str, Any] | None:
+        spec = (self.providers.get(provider) or {}).get("discovery")
+        return spec if isinstance(spec, dict) else None
+
+    @property
+    def discovery(self) -> dict[str, Any]:
+        """`{agents: {provider: spec}}`, the shape `discover.discover` takes."""
+        agents: dict[str, Any] = {}
+        for name in self.providers:
+            spec = self.discovery_spec(name)
+            if spec:
+                agents[name] = spec
+        return {"agents": agents}
+
+    def retire_grace_releases(self, provider: str) -> int:
+        return int((self.discovery_spec(provider) or {}).get("retire_grace_releases", 1))
+
+
+def load_policy(
+    classifier_raw: dict[str, Any], path: Path, providers: dict[str, dict[str, Any]] | None = None
+) -> Policy:
+    """Build the policy from a parsed `data/classifier.yaml` and the provider files."""
+    scoring = classifier_raw.get("scoring")
+    if not isinstance(scoring, dict):
+        raise PolicyError(f"{path} has no `scoring:` section")
+    band_raw = scoring.get("quality_band") or {}
     band = (float(band_raw.get("min", 0.5)), float(band_raw.get("max", 3.5)))
     if not band[0] < band[1]:
         raise PolicyError(f"quality_band min must be below max (got {band})")
-
+    if not scoring.get("benchmarks"):
+        raise PolicyError(f"{path} `scoring.benchmarks` is empty")
     return Policy(
         path=path,
-        raw=raw,
         quality_band=band,
-        round_to=float(anchors.get("round_to", 0.01)),
-        witnesses=dict(raw.get("witnesses") or {}),
-        invariants=raw.get("invariants") or {},
-        cost=raw.get("cost") or {},
-        published_pricing=raw.get("published_pricing") or {},
-        discovery=raw.get("discovery") or {},
-        benchmark_scoring=raw.get("benchmark_scoring") or {},
+        round_to=float(scoring.get("round_to", 0.01)),
+        scoring=scoring,
+        cost=classifier_raw.get("cost") or {},
+        providers=dict(providers or {}),
     )

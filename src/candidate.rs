@@ -216,7 +216,7 @@ impl RequiredCaps {
     }
 }
 
-/// One entry in the score-table YAML, keyed by candidate pattern.
+/// The score fields of one `data/providers/<provider>.yaml` row.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ScoreEntryRaw {
@@ -254,7 +254,7 @@ pub struct ScoreEntryRaw {
     pub effort_mapping: BTreeMap<EffortLevel, String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Per-class quality scores in [0, 1], keyed by task class name.
+    /// Per-class quality scores, keyed by task class name.
     #[serde(default)]
     pub quality: HashMap<String, f64>,
     /// Fallback quality when a class has no explicit entry.
@@ -262,22 +262,40 @@ pub struct ScoreEntryRaw {
     pub default_quality: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScoreTableRaw {
-    #[serde(default)]
-    pub version: Option<u32>,
-    /// Entries are matched in order; the first pattern matching
-    /// `agent/model` wins.
-    pub candidates: Vec<ScoreTablePatternEntry>,
-}
+/// The catalog fields of one `data/providers/<provider>.yaml` row: what every agent of
+/// `provider` inherits as one of its `models:` (`crate::presets`).
+pub const CATALOG_FIELDS: [&str; 8] = [
+    "provider",
+    "family",
+    "version",
+    "id",
+    "api_model",
+    "display_name",
+    "cost_rank",
+    "pricing",
+];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScoreTablePatternEntry {
-    pub pattern: String,
-    #[serde(flatten)]
-    pub entry: ScoreEntryRaw,
+/// One `data/providers/<provider>.yaml` row: one exact model.
+#[derive(Debug, Clone)]
+pub struct ModelRow {
+    pub provider: Option<String>,
+    /// The model line this row is a version of.
+    pub family: Option<String>,
+    /// The row's dotted version within its family.
+    pub version: Option<String>,
+    pub id: String,
+    pub api_model: Option<String>,
+    /// Whether the row carries quality scores. A model with no evidence of
+    /// its own is unscored and never ranked automatically.
+    pub scored: bool,
+    /// Rows this one must beat on every task class (`provider/id`, or a bare
+    /// id of the same provider).
+    pub outranks: Vec<String>,
+    /// This model's own published benchmark results.
+    pub evidence: Vec<serde_yaml::Value>,
+    /// The row's catalog fields, as written ([`CATALOG_FIELDS`] without `provider`).
+    pub catalog: serde_yaml::Mapping,
+    pub scores: ResolvedScores,
 }
 
 /// Resolved scores for one candidate.
@@ -312,20 +330,29 @@ impl ResolvedScores {
             .effort_levels
             .iter()
             .copied()
-            .filter(|level| *level != EffortLevel::Auto && self.effort_mapping.contains_key(level))
+            .filter(|level| *level != EffortLevel::Auto)
             .collect();
         let resolved = supported.into_iter().min_by_key(|level| {
             let requested_rank = requested as i16;
             let level_rank = *level as i16;
             (requested_rank - level_rank).unsigned_abs()
         });
-        let provider_value = resolved.and_then(|level| self.effort_mapping.get(&level).cloned());
+        let provider_value = resolved.map(|level| self.provider_effort(level));
         EffortResolution {
             requested,
             resolved,
             provider_value,
             confirmed: false,
         }
+    }
+
+    /// The provider's name for an advertised level: its own name unless
+    /// `effort_mapping` renames it.
+    fn provider_effort(&self, level: EffortLevel) -> String {
+        self.effort_mapping
+            .get(&level)
+            .cloned()
+            .unwrap_or_else(|| level.as_str().to_string())
     }
 
     /// Resolve an automatic recommendation without increasing it when this
@@ -336,13 +363,9 @@ impl ResolvedScores {
             .effort_levels
             .iter()
             .copied()
-            .filter(|level| {
-                *level != EffortLevel::Auto
-                    && *level <= requested
-                    && self.effort_mapping.contains_key(level)
-            })
+            .filter(|level| *level != EffortLevel::Auto && *level <= requested)
             .max();
-        let provider_value = resolved.and_then(|level| self.effort_mapping.get(&level).cloned());
+        let provider_value = resolved.map(|level| self.provider_effort(level));
         EffortResolution {
             requested,
             resolved,
@@ -371,16 +394,26 @@ impl Default for ResolvedScores {
     }
 }
 
-/// Score table shipped with the binary and overrideable by path.
+/// The model catalog and its scores (`data/providers/<provider>.yaml`), overrideable by path.
 #[derive(Debug, Clone)]
 pub struct ScoreTable {
-    entries: Vec<(String, ResolvedScores)>,
+    rows: Vec<ModelRow>,
     /// Candidate → `agent/<pinned api_model>`: a version-pinned candidate is
     /// scored as the version it runs (capabilities, quality, context window).
     pinned: HashMap<CandidateId, CandidateId>,
+    /// Candidate → `agent/<api_model>` for a selector alias.
+    aliases: HashMap<CandidateId, CandidateId>,
 }
 
-pub const BUILTIN_SCORE_TABLE: &str = include_str!("../data/scores.yaml");
+/// The provider files of `data/providers/`: each provider's default agent
+/// settings and the one definition of every model it supports, grouped by
+/// family (`models: { opus: [ { version: 5.5, id: claude-opus-5-5, … } ] }`).
+pub const BUILTIN_PROVIDERS: [(&str, &str); 4] = [
+    ("claude", include_str!("../data/providers/claude.yaml")),
+    ("codex", include_str!("../data/providers/codex.yaml")),
+    ("grok", include_str!("../data/providers/grok.yaml")),
+    ("kimi", include_str!("../data/providers/kimi.yaml")),
+];
 pub const QUALITY_MIN: f64 = 0.5;
 pub const QUALITY_MAX: f64 = 3.5;
 
@@ -415,65 +448,216 @@ pub fn quality_confidence(score: f64, class: TaskClass, complexity: f64) -> f64 
 
 impl ScoreTable {
     pub fn builtin() -> Self {
-        Self::from_yaml(BUILTIN_SCORE_TABLE).expect("built-in score table must parse")
+        Self::from_documents(BUILTIN_PROVIDERS.iter().map(|(_, text)| *text))
+            .expect("data/providers must parse")
     }
 
+    /// One provider file (`provider:` and `models:` grouped by family) or a
+    /// plain `models:` list of rows.
     pub fn from_yaml(yaml: &str) -> Result<Self, String> {
-        let raw: ScoreTableRaw =
-            serde_yaml::from_str(yaml).map_err(|e| format!("invalid score table YAML: {e}"))?;
-        let mut entries = Vec::new();
-        for pattern_entry in raw.candidates {
-            let raw_entry = pattern_entry.entry;
-            let mut quality = HashMap::new();
-            for (class_name, score) in &raw_entry.quality {
-                match TaskClass::parse(class_name) {
-                    Some(class) => {
-                        quality.insert(class, score.clamp(QUALITY_MIN, QUALITY_MAX));
-                    }
-                    None => {
-                        return Err(format!(
-                            "score table pattern `{}`: unknown task class `{class_name}`",
-                            pattern_entry.pattern
-                        ));
+        Self::from_documents([yaml])
+    }
+
+    /// The rows of one document, each as a mapping carrying its own
+    /// `provider`, `family` and `version` keys.
+    fn document_rows(yaml: &str) -> Result<Vec<serde_yaml::Mapping>, String> {
+        let document: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|e| format!("invalid models YAML: {e}"))?;
+        let provider = document.get("provider").cloned();
+        let as_row = |row: &serde_yaml::Value| {
+            row.as_mapping()
+                .cloned()
+                .ok_or_else(|| "every model must be a mapping".to_string())
+        };
+        match document.get("models") {
+            Some(serde_yaml::Value::Sequence(rows)) => rows.iter().map(as_row).collect(),
+            Some(serde_yaml::Value::Mapping(families)) => {
+                let mut out = Vec::new();
+                for (family, versions) in families {
+                    let versions = versions
+                        .as_sequence()
+                        .ok_or_else(|| format!("family `{family:?}` must list its versions"))?;
+                    for version in versions {
+                        let mut row = serde_yaml::Mapping::new();
+                        if let Some(provider) = &provider {
+                            row.insert("provider".into(), provider.clone());
+                        }
+                        row.insert("family".into(), family.clone());
+                        for (key, value) in as_row(version)? {
+                            row.insert(key, value);
+                        }
+                        out.push(row);
                     }
                 }
+                Ok(out)
             }
-            entries.push((
-                pattern_entry.pattern,
-                ResolvedScores {
-                    coding_tier: raw_entry.coding_tier.unwrap_or(CodingTier::Medium),
-                    coding_percentile: raw_entry.coding_percentile,
-                    context_window: raw_entry.context_window,
-                    max_output_tokens: raw_entry.max_output_tokens,
-                    adaptive_thinking: raw_entry.adaptive_thinking.unwrap_or(true),
-                    effort: raw_entry.effort.unwrap_or(true),
-                    system_turns: raw_entry.system_turns.unwrap_or(true),
-                    effort_levels: raw_entry.effort_levels.unwrap_or_default(),
-                    effort_mapping: raw_entry.effort_mapping,
-                    tags: raw_entry.tags,
+            _ => Err("models YAML needs `models:`".to_string()),
+        }
+    }
+
+    pub fn from_documents<'a>(
+        documents: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, String> {
+        let mut rows = Vec::new();
+        for document in documents {
+            rows.extend(Self::document_rows(document)?);
+        }
+        let mut parsed: Vec<ModelRow> = Vec::new();
+        for mut fields in rows {
+            let text = |fields: &serde_yaml::Mapping, key: &str| {
+                fields
+                    .get(key)
+                    .and_then(serde_yaml::Value::as_str)
+                    .map(str::to_string)
+            };
+            let id = text(&fields, "id").ok_or("every `models:` row needs an `id`")?;
+            let api_model = text(&fields, "api_model");
+            for key in std::iter::once(&id).chain(api_model.as_ref()) {
+                if key.contains('*') {
+                    return Err(format!(
+                        "model `{key}`: a row names one exact model, never a pattern"
+                    ));
+                }
+                if let Some(other) = parsed.iter().find(|r| r.answers_to(key)) {
+                    return Err(format!(
+                        "model `{key}` is listed twice (rows `{}` and `{id}`)",
+                        other.id
+                    ));
+                }
+            }
+            let provider = text(&fields, "provider");
+            let reference = |key: &str| {
+                fields
+                    .get(key)
+                    .cloned()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .map(|v| v.ok_or(format!("model `{id}`: `{key}` must be a model id")))
+                    .transpose()
+            };
+            let family = reference("family")?;
+            let version = match fields.get("version") {
+                None => None,
+                Some(serde_yaml::Value::Number(n)) => Some(n.to_string()),
+                Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(format!("model `{id}`: `version` must be a dotted number")),
+            };
+            let outranks: Vec<String> = match fields.shift_remove("outranks") {
+                Some(v) => serde_yaml::from_value(v)
+                    .map_err(|e| format!("model `{id}`: `outranks`: {e}"))?,
+                None => Vec::new(),
+            };
+            let evidence: Vec<serde_yaml::Value> = match fields.shift_remove("evidence") {
+                Some(v) => serde_yaml::from_value(v)
+                    .map_err(|e| format!("model `{id}`: `evidence`: {e}"))?,
+                None => Vec::new(),
+            };
+            fields.shift_remove("rank_exception");
+            let scored = fields.contains_key("quality") || fields.contains_key("default_quality");
+            let mut catalog = serde_yaml::Mapping::new();
+            for key in CATALOG_FIELDS {
+                if let Some(value) = fields.shift_remove(key)
+                    && key != "provider"
+                {
+                    catalog.insert(key.into(), value);
+                }
+            }
+            let raw: ScoreEntryRaw = serde_yaml::from_value(serde_yaml::Value::Mapping(fields))
+                .map_err(|e| format!("model `{id}`: {e}"))?;
+            // Advertise only the levels a model really has; a mapping only renames one. Two
+            // levels sent as the same provider value would claim a level the model lacks
+            // (operator, 2026-11-12: `xhigh: max` beside `max: max`).
+            let levels = raw.effort_levels.clone().unwrap_or_default();
+            let mut sent: HashMap<String, EffortLevel> = HashMap::new();
+            for level in &levels {
+                let value = raw
+                    .effort_mapping
+                    .get(level)
+                    .cloned()
+                    .unwrap_or_else(|| level.as_str().to_string());
+                if let Some(other) = sent.insert(value.clone(), *level) {
+                    return Err(format!(
+                        "model `{id}`: effort levels `{}` and `{}` are both sent as `{value}`; \
+                         advertise only the levels the model has",
+                        other.as_str(),
+                        level.as_str()
+                    ));
+                }
+            }
+            if let Some(level) = raw
+                .effort_mapping
+                .keys()
+                .find(|level| !levels.contains(level))
+            {
+                return Err(format!(
+                    "model `{id}`: `effort_mapping` renames `{}`, which `effort_levels` does not list",
+                    level.as_str()
+                ));
+            }
+            let mut quality = HashMap::new();
+            for (class_name, score) in &raw.quality {
+                let class = TaskClass::parse(class_name)
+                    .ok_or_else(|| format!("model `{id}`: unknown task class `{class_name}`"))?;
+                quality.insert(class, score.clamp(QUALITY_MIN, QUALITY_MAX));
+            }
+            parsed.push(ModelRow {
+                provider,
+                family,
+                version,
+                id,
+                api_model,
+                scored,
+                outranks,
+                evidence,
+                catalog,
+                scores: ResolvedScores {
+                    coding_tier: raw.coding_tier.unwrap_or(CodingTier::Medium),
+                    coding_percentile: raw.coding_percentile,
+                    context_window: raw.context_window,
+                    max_output_tokens: raw.max_output_tokens,
+                    adaptive_thinking: raw.adaptive_thinking.unwrap_or(true),
+                    effort: raw.effort.unwrap_or(true),
+                    system_turns: raw.system_turns.unwrap_or(true),
+                    effort_levels: raw.effort_levels.unwrap_or_default(),
+                    effort_mapping: raw.effort_mapping,
+                    tags: raw.tags,
                     quality,
-                    default_quality: raw_entry
+                    default_quality: raw
                         .default_quality
                         .unwrap_or(QUALITY_MIN)
                         .clamp(QUALITY_MIN, QUALITY_MAX),
                 },
-            ));
+            });
         }
         Ok(Self {
-            entries,
+            rows: parsed,
             pinned: HashMap::new(),
+            aliases: HashMap::new(),
         })
     }
 
-    /// Score each `pinned_versions` candidate as its pinned version.
+    /// Every row, in file order.
+    pub fn rows(&self) -> &[ModelRow] {
+        &self.rows
+    }
+
+    /// Score each `pinned_versions` candidate as its pinned version, and each candidate whose
+    /// selector is an alias (`opus[1m]`, with an `api_model`) as the API model it sends: a row is
+    /// one exact model, so an alias never finds one by its own text.
     pub fn with_pinned_versions(mut self, cfg: &crate::config::Config) -> Self {
-        self.pinned = cfg
-            .declared_candidates()
-            .into_iter()
+        let declared = cfg.declared_candidates();
+        self.pinned = declared
+            .iter()
             .filter_map(|id| {
-                let version = cfg.pinned_version(&id)?;
-                let key = CandidateId::new(&id.agent, &version.api_model);
-                Some((id, key))
+                let version = cfg.pinned_version(id)?;
+                Some((id.clone(), CandidateId::new(&id.agent, &version.api_model)))
+            })
+            .collect();
+        self.aliases = declared
+            .iter()
+            .filter_map(|id| {
+                let api_model = cfg.model_config(id)?.api_model.clone()?;
+                (api_model != id.model)
+                    .then(|| (id.clone(), CandidateId::new(&id.agent, &api_model)))
             })
             .collect();
         self
@@ -485,31 +669,48 @@ impl ScoreTable {
         Self::from_yaml(&yaml)
     }
 
-    /// Look up scores for a candidate; the first matching pattern wins,
-    /// falling back to neutral defaults.
+    /// Look up scores for a candidate, as the version it is pinned to when
+    /// it is, falling back to neutral defaults for a model no row lists.
     pub fn lookup(&self, id: &CandidateId) -> ResolvedScores {
         self.lookup_exact(self.pinned.get(id).unwrap_or(id))
     }
 
     /// `lookup` without the `pinned_versions` mapping: `id` is matched as is.
     pub fn lookup_exact(&self, id: &CandidateId) -> ResolvedScores {
-        let key = id.to_string();
-        // Account seats run the same model capabilities as their base agent.
-        // Ordered account-specific entries can still override the base entry.
-        let base_key = id
-            .agent
-            .split_once('@')
-            .map(|(agent, _)| CandidateId::new(agent, &id.model).to_string());
-        for (pattern, entry) in &self.entries {
-            if glob_match(pattern, &key)
-                || base_key
-                    .as_ref()
-                    .is_some_and(|key| glob_match(pattern, key))
-            {
-                return entry.clone();
-            }
-        }
-        ResolvedScores::default()
+        self.row(self.aliases.get(id).unwrap_or(id))
+            .map(|row| row.scores.clone())
+            .unwrap_or_default()
+    }
+
+    /// The row for `id`'s model: the one whose `id` or `api_model` is that
+    /// model exactly (case-insensitive). The agent does not take part, so an
+    /// account seat scores as the model it runs.
+    pub fn row(&self, id: &CandidateId) -> Option<&ModelRow> {
+        self.rows.iter().find(|row| row.answers_to(&id.model))
+    }
+}
+
+impl ModelRow {
+    /// The row a reference from this one names: `provider/id`, or a bare id
+    /// of this row's provider.
+    pub fn resolve<'t>(&self, table: &'t ScoreTable, reference: &str) -> Option<&'t ModelRow> {
+        let (provider, model) = match reference.split_once('/') {
+            Some((provider, model)) => (Some(provider), model),
+            None => (self.provider.as_deref(), reference),
+        };
+        table
+            .rows
+            .iter()
+            .find(|row| row.answers_to(model) && row.provider.as_deref() == provider)
+    }
+
+    /// Whether `model` names this row's model exactly.
+    pub fn answers_to(&self, model: &str) -> bool {
+        self.id.eq_ignore_ascii_case(model)
+            || self
+                .api_model
+                .as_deref()
+                .is_some_and(|api| api.eq_ignore_ascii_case(model))
     }
 }
 
@@ -531,6 +732,168 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_row(fields: &str) -> ResolvedScores {
+        ScoreTable::from_yaml(&format!("models:\n  - id: model\n{fields}"))
+            .unwrap()
+            .lookup(&CandidateId::new("test", "model"))
+    }
+
+    /// 2026-11-12 (operator): "Tests should assert that scores.yaml carry an exact match (no
+    /// wildcard) for every single supported model." Every model an agent of a shipped provider
+    /// inherits answers to a row that names it exactly, by `id` or `api_model`.
+    #[test]
+    fn every_supported_model_has_an_exact_row() {
+        let cfg = crate::config::Config::from_yaml(
+            "agents:\n- name: claude\n- name: codex\n- name: grok\n- name: kimi\n",
+        )
+        .unwrap();
+        let table = ScoreTable::builtin();
+        let mut missing = Vec::new();
+        for agent in &cfg.agents {
+            for model in &agent.models {
+                for name in std::iter::once(&model.id).chain(model.api_model.as_ref()) {
+                    let id = CandidateId::new(&agent.name, name);
+                    if !table.row(&id).is_some_and(|row| row.answers_to(name)) {
+                        missing.push(id.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "no exact row for:\n{}",
+            missing.join("\n")
+        );
+        assert_eq!(
+            cfg.agents.iter().map(|a| a.models.len()).sum::<usize>(),
+            table.rows().len(),
+            "every row is a model some provider supports"
+        );
+    }
+
+    #[test]
+    fn a_row_names_one_model_never_a_pattern() {
+        for yaml in [
+            "models:\n  - id: '*sol*'\n",
+            "models:\n  - id: sol\n    api_model: 'gpt-*-sol'\n",
+        ] {
+            let error = ScoreTable::from_yaml(yaml).unwrap_err();
+            assert!(error.contains("never a pattern"), "{error}");
+        }
+        let duplicate =
+            "models:\n  - id: opus\n    api_model: claude-opus-5-5\n  - id: claude-opus-5-5\n";
+        assert!(
+            ScoreTable::from_yaml(duplicate)
+                .unwrap_err()
+                .contains("listed twice")
+        );
+    }
+
+    /// A model no row names exactly scores as the neutral default; nothing
+    /// borrows a neighbour's row because their ids share a substring.
+    #[test]
+    fn only_an_exact_id_finds_a_row() {
+        let table = ScoreTable::builtin();
+        for id in [
+            "codex/gpt-5.6-sol-mini",
+            "codex/sol",
+            "claude/opus-next",
+            "grok/grok-4.5",
+        ] {
+            assert!(
+                table.row(&CandidateId::parse(id).unwrap()).is_none(),
+                "{id}"
+            );
+            assert_eq!(
+                table
+                    .lookup(&CandidateId::parse(id).unwrap())
+                    .quality(TaskClass::BugFix),
+                QUALITY_MIN
+            );
+        }
+        // A seat and the provider API id both find the model they run.
+        let seat = table
+            .row(&CandidateId::new("claude@work", "claude-opus-5-5"))
+            .unwrap();
+        assert_eq!(seat.id, "claude-opus-5-5");
+    }
+
+    /// Every row is scored on its own evidence and nothing else: a scored row
+    /// carries evidence of its own, and a row without evidence carries no
+    /// scores (it is never handed another model's).
+    #[test]
+    fn a_row_is_scored_exactly_when_it_has_evidence_of_its_own() {
+        for row in ScoreTable::builtin().rows() {
+            assert_eq!(row.scored, !row.evidence.is_empty(), "{}", row.id);
+        }
+    }
+
+    /// Every row states its family and version.
+    #[test]
+    fn every_row_states_its_family_and_version() {
+        for row in ScoreTable::builtin().rows() {
+            assert!(row.family.is_some(), "{} has no family", row.id);
+            assert!(
+                row.version
+                    .as_deref()
+                    .and_then(crate::config::parse_model_version)
+                    .is_some(),
+                "{} has no dotted version",
+                row.id
+            );
+        }
+    }
+
+    /// The ordering contract: every row beats each row it `outranks` on every
+    /// task class.
+    #[test]
+    fn every_declared_order_holds_on_every_task_class() {
+        let table = ScoreTable::builtin();
+        for row in table.rows() {
+            for reference in &row.outranks {
+                let below = row
+                    .resolve(&table, reference)
+                    .unwrap_or_else(|| panic!("{} outranks unknown `{reference}`", row.id));
+                assert!(
+                    row.scored && below.scored,
+                    "{} and {} must both be scored",
+                    row.id,
+                    below.id
+                );
+                for class in TaskClass::ALL {
+                    assert!(
+                        row.scores.quality(class) > below.scores.quality(class),
+                        "{} must outrank {} on {class:?}",
+                        row.id,
+                        below.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// 2026-11-12 (operator): advertise only the levels a model has; a mapping only renames.
+    /// `xhigh: max` beside `max: max` told users xhigh existed while sending max.
+    #[test]
+    fn an_effort_mapping_only_renames_a_level_the_model_has() {
+        for yaml in [
+            "models:\n  - { id: m, effort_levels: [xhigh, max], effort_mapping: { xhigh: max } }\n",
+            "models:\n  - { id: m, effort_levels: [high], effort_mapping: { max: deep } }\n",
+        ] {
+            assert!(ScoreTable::from_yaml(yaml).is_err(), "{yaml}");
+        }
+        for row in ScoreTable::builtin().rows() {
+            for (level, value) in &row.scores.effort_mapping {
+                assert_ne!(
+                    level.as_str(),
+                    value.as_str(),
+                    "{} maps `{value}` to itself",
+                    row.id
+                );
+            }
+        }
+    }
 
     #[test]
     fn candidate_id_parses_and_displays() {
@@ -562,15 +925,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_score_table_parses() {
-        let table = ScoreTable::builtin();
-        let scores = table.lookup(&CandidateId::new("claude", "claude-opus-4"));
-        assert_eq!(scores.coding_tier, CodingTier::High);
-        let unknown = table.lookup(&CandidateId::new("nobody", "nothing"));
-        assert_eq!(unknown.quality(TaskClass::BugFix), 0.5);
-    }
-
-    #[test]
     fn benchmark_quality_has_stable_utility_meaning() {
         assert_eq!(quality_utility(0.5), 0.0);
         assert_eq!(quality_utility(2.0), 0.5);
@@ -591,11 +945,9 @@ mod tests {
         assert_eq!(EffortLevel::parse("xhigh"), Some(EffortLevel::Xhigh));
         assert_eq!(EffortLevel::parse("AUTO"), Some(EffortLevel::Auto));
         assert_eq!(EffortLevel::parse("turbo"), None);
-        let scores = ScoreTable::from_yaml(
-            "candidates:\n  - pattern: '*model*'\n    effort: false\n    effort_levels: [low, high]\n    effort_mapping: { low: minimal, high: intensive }\n",
-        )
-        .unwrap()
-        .lookup(&CandidateId::new("test", "model"));
+        let scores = one_row(
+            "    effort: false\n    effort_levels: [low, high]\n    effort_mapping: { low: minimal, high: intensive }\n",
+        );
         // The legacy wire flag remains independent of level support.
         assert!(!scores.effort);
         let normalized = scores.resolve_effort(EffortLevel::Xhigh);
@@ -611,11 +963,9 @@ mod tests {
 
     #[test]
     fn automatic_effort_resolution_never_rounds_up_but_explicit_stays_compatible() {
-        let scores = ScoreTable::from_yaml(
-            "candidates:\n  - pattern: '*model*'\n    effort_levels: [medium, high, max]\n    effort_mapping: { medium: balanced, high: intensive, max: maximum }\n",
-        )
-        .unwrap()
-        .lookup(&CandidateId::new("test", "model"));
+        let scores = one_row(
+            "    effort_levels: [medium, high, max]\n    effort_mapping: { medium: balanced, high: intensive, max: maximum }\n",
+        );
 
         let automatic_low = scores.resolve_automatic_effort(EffortLevel::Low);
         assert_eq!(automatic_low.resolved, None);
@@ -629,14 +979,15 @@ mod tests {
         assert_eq!(explicit_low.resolved, Some(EffortLevel::Medium));
         assert_eq!(explicit_low.provider_value.as_deref(), Some("balanced"));
 
-        let missing_mapping = ScoreTable::from_yaml(
-            "candidates:\n  - pattern: '*unmapped*'\n    effort_levels: [medium, high]\n    effort_mapping: { medium: balanced }\n",
-        )
-        .unwrap()
-        .lookup(&CandidateId::new("test", "unmapped"));
-        let automatic_high = missing_mapping.resolve_automatic_effort(EffortLevel::High);
-        assert_eq!(automatic_high.resolved, Some(EffortLevel::Medium));
-        assert_eq!(automatic_high.provider_value.as_deref(), Some("balanced"));
+        // An unmapped level is sent under its own name.
+        let partly_renamed = one_row(
+            "    effort_levels: [medium, high]\n    effort_mapping: { medium: balanced }\n",
+        );
+        let automatic_high = partly_renamed.resolve_automatic_effort(EffortLevel::High);
+        assert_eq!(automatic_high.resolved, Some(EffortLevel::High));
+        assert_eq!(automatic_high.provider_value.as_deref(), Some("high"));
+        let automatic_medium = partly_renamed.resolve_automatic_effort(EffortLevel::Medium);
+        assert_eq!(automatic_medium.provider_value.as_deref(), Some("balanced"));
     }
 }
 
@@ -644,165 +995,17 @@ mod tests {
 mod score_resolution_tests {
     use super::*;
 
-    /// Regression: `*gpt-5*` must not shadow `*mini*` — mini-class models
-    /// are medium tier, not opus-grade (this once routed hour-long
-    /// investigations to gpt-5.4-mini).
-    #[test]
-    fn mini_models_resolve_to_medium_tier_not_gpt5_family() {
-        let t = ScoreTable::builtin();
-        let mini = t.lookup(&CandidateId::parse("codex/gpt-5.4-mini").unwrap());
-        let full = t.lookup(&CandidateId::parse("codex/gpt-5.5").unwrap());
-        assert_eq!(mini.coding_tier, CodingTier::Medium);
-        assert_eq!(mini.context_window, Some(400_000));
-        assert!(mini.quality(TaskClass::Research) < full.quality(TaskClass::Research));
-        assert_eq!(full.coding_tier, CodingTier::High);
+    fn q(t: &ScoreTable, id: &str) -> ResolvedScores {
+        t.lookup(&CandidateId::parse(id).unwrap())
     }
 
-    /// Regression: "gemini" contains the substring "mini", so a `*mini*` entry
-    /// above the gemini ones silently scores Gemini Pro as a small mini-class
-    /// model. Order in `data/scores.yaml` is the only thing preventing it.
+    /// Each version keeps its own wire shape: GPT-6 Sol/Luna take the 1.05M
+    /// window and native xhigh, while GPT-5.6 Sol maps xhigh to `high`.
     #[test]
-    fn gemini_ids_are_not_shadowed_by_the_mini_pattern() {
+    fn each_version_keeps_its_own_wire_shape() {
         let t = ScoreTable::builtin();
-        let pro = t.lookup(&CandidateId::parse("gemini/gemini-3-pro").unwrap());
-        let flash = t.lookup(&CandidateId::parse("gemini/gemini-3-flash").unwrap());
-        assert_eq!(pro.coding_tier, CodingTier::High, "gemini pro is high tier");
-        assert_eq!(pro.context_window, Some(1_000_000), "gemini's own window");
-        assert!(
-            pro.quality(TaskClass::CodingGeneral) > flash.quality(TaskClass::CodingGeneral),
-            "pro outranks flash"
-        );
-        assert_eq!(flash.context_window, Some(1_000_000), "flash is not mini");
-    }
-
-    #[test]
-    fn fable_models_score_at_the_top_tier() {
-        let t = ScoreTable::builtin();
-        let fable = t.lookup(&CandidateId::parse("claude/claude-fable-5[1m]").unwrap());
-        assert_eq!(fable.coding_tier, CodingTier::High);
-        assert!(fable.quality(TaskClass::Architecture) >= 0.95);
-        let sonnet = t.lookup(&CandidateId::parse("claude/sonnet").unwrap());
-        assert!(
-            fable.quality(TaskClass::Research) > sonnet.quality(TaskClass::Research),
-            "fable outranks sonnet"
-        );
-    }
-
-    /// The Fable/Opus, Sol/Terra, and Opus/Grok 4.7 pairs are COMPRESSED (see
-    /// `benchmark_scoring.compression` in data/model-policy.yaml): the
-    /// preferred member keeps its calibrated scores and the cheaper sibling
-    /// is pinned a deliberate hair below on every class, so cost_rank routes
-    /// everyday work to the cheaper member while ordering-sensitive paths
-    /// (apex complexity, escalation/auto-upgrade fallback, planner globs)
-    /// still resolve to the preferred one. Assert BOTH the order AND the gap
-    /// width: the previous ordering-only guard let the Opus 4.8 proxy blow
-    /// the intended ~0.02 gap out to 1.0 without any test noticing, which
-    /// silently handed all of `auto` to Fable.
-    #[test]
-    fn compressed_pairs_keep_order_and_a_hair_gap() {
-        let t = ScoreTable::builtin();
-        let pairs = [
-            ("claude/claude-fable-5[1m]", "claude/opus[1m]"),
-            ("codex/gpt-5.6-sol", "codex/gpt-5.6-terra"),
-            ("claude/opus[1m]", "grok/grok-4.7"),
-        ];
-        for (ahead_id, behind_id) in pairs {
-            let ahead = t.lookup(&CandidateId::parse(ahead_id).unwrap());
-            let behind = t.lookup(&CandidateId::parse(behind_id).unwrap());
-            for class in TaskClass::ALL {
-                let gap = ahead.quality(class) - behind.quality(class);
-                assert!(
-                    gap > 0.0,
-                    "{ahead_id} must stay ahead of {behind_id} on {class:?} \
-                     ({} vs {})",
-                    ahead.quality(class),
-                    behind.quality(class)
-                );
-                assert!(
-                    gap <= 0.021,
-                    "{ahead_id}−{behind_id} gap on {class:?} must stay compressed \
-                     (≤0.02), got {gap:.3} — a wide gap silently hands all of \
-                     `auto` to the pricier member"
-                );
-            }
-        }
-    }
-
-    /// Opus 5 stays above Grok 4.5 on quality, and the `*opus*` pattern must
-    /// resolve the wire alias `claude-opus-5` identically to the CLI alias.
-    #[test]
-    fn opus5_outranks_grok_and_resolves_both_aliases() {
-        let t = ScoreTable::builtin();
-        let opus = t.lookup(&CandidateId::parse("claude/opus[1m]").unwrap());
-        let grok = t.lookup(&CandidateId::parse("grok/grok-4.5").unwrap());
-        assert_eq!(opus.coding_tier, CodingTier::High);
-        assert!(
-            opus.quality(TaskClass::CodingGeneral) > grok.quality(TaskClass::CodingGeneral),
-            "opus5 ({}) must beat grok-4.5 ({})",
-            opus.quality(TaskClass::CodingGeneral),
-            grok.quality(TaskClass::CodingGeneral)
-        );
-        let by_api_id = t.lookup(&CandidateId::new("claude", "claude-opus-5"));
-        assert_eq!(
-            by_api_id.quality(TaskClass::BugFix),
-            opus.quality(TaskClass::BugFix)
-        );
-    }
-
-    #[test]
-    fn sol_line_scores_at_the_top_and_beats_generic_gpt5() {
-        let t = ScoreTable::builtin();
-        // Whatever the adapter names it, a "sol" id matches the frontier entry
-        // (not the generic `*gpt-5*` fallback), across id shapes.
-        for id in ["codex/sol", "codex/gpt-sol", "codex/gpt-5-sol"] {
-            let sol = t.lookup(&CandidateId::parse(id).unwrap());
-            assert_eq!(sol.coding_tier, CodingTier::High, "{id} is high tier");
-            assert!(
-                sol.quality(TaskClass::CodingGeneral) >= 0.95,
-                "{id} rated comparable to fable"
-            );
-        }
-        let sol = t.lookup(&CandidateId::parse("codex/gpt-5-sol").unwrap());
-        let gpt5 = t.lookup(&CandidateId::parse("codex/gpt-5.5").unwrap());
-        assert!(
-            sol.quality(TaskClass::CodingGeneral) > gpt5.quality(TaskClass::CodingGeneral),
-            "sol is not shadowed by the generic *gpt-5* pattern"
-        );
-        // Must not collide with sonnet (no "sol" substring).
-        let sonnet = t.lookup(&CandidateId::parse("claude/sonnet").unwrap());
-        assert!(sonnet.quality(TaskClass::CodingGeneral) < sol.quality(TaskClass::CodingGeneral));
-    }
-
-    #[test]
-    fn sol_terra_luna_tier_ordering() {
-        let t = ScoreTable::builtin();
-        let q = |id: &str| {
-            t.lookup(&CandidateId::parse(id).unwrap())
-                .quality(TaskClass::CodingGeneral)
-        };
-        // Provisional ordering: sol (frontier) > terra (strong) > luna (small).
-        assert!(q("codex/gpt-5.6-sol") > q("codex/gpt-5.6-terra"));
-        assert!(q("codex/gpt-5.6-terra") > q("codex/gpt-5.6-luna"));
-        // terra is high tier; luna is medium; and none fall through to *gpt-5*.
-        assert_eq!(
-            t.lookup(&CandidateId::parse("codex/gpt-5.6-terra").unwrap())
-                .coding_tier,
-            CodingTier::High
-        );
-        assert_eq!(
-            t.lookup(&CandidateId::parse("codex/gpt-5.6-luna").unwrap())
-                .coding_tier,
-            CodingTier::Medium
-        );
-        // luna must not collide with any real id, and terra/luna beat the
-        // generic gpt-5 fallback only where intended (terra yes, luna no).
-        assert!(q("codex/gpt-5.6-terra") > q("codex/gpt-5.5"));
-        // GPT-6 version bumps inherit family quality (no score churn) but
-        // take the 1.05M window and native xhigh/max. `*gpt-6-sol*` must
-        // not swallow `gpt-6.1-sol`.
-        for id in ["codex/gpt-6-sol", "codex/gpt-6.1-sol"] {
-            assert_eq!(q(id), q("codex/gpt-5.6-sol"), "{id} inherits *sol* quality");
-            let resolved = t.lookup(&CandidateId::parse(id).unwrap());
+        for id in ["codex/gpt-6-sol", "codex/gpt-6.1-sol", "codex/gpt-6-luna"] {
+            let resolved = q(&t, id);
             assert_eq!(resolved.context_window, Some(1_050_000), "{id} window");
             assert_eq!(resolved.max_output_tokens, Some(128_000), "{id} max out");
             let xhigh = resolved.resolve_effort(EffortLevel::Xhigh);
@@ -813,41 +1016,14 @@ mod score_resolution_tests {
             );
             assert_eq!(xhigh.provider_value.as_deref(), Some("xhigh"));
         }
-        assert_eq!(q("codex/gpt-6-luna"), q("codex/gpt-5.6-luna"));
-        let luna6 = t.lookup(&CandidateId::parse("codex/gpt-6-luna").unwrap());
-        assert_eq!(luna6.context_window, Some(1_050_000));
-        let luna_xhigh = luna6.resolve_effort(EffortLevel::Xhigh);
-        assert_eq!(luna_xhigh.resolved, Some(EffortLevel::Xhigh));
-        assert_eq!(luna_xhigh.provider_value.as_deref(), Some("xhigh"));
-        // 5.6 Sol still collapses xhigh to the provider value `high` — the
-        // family entry is unchanged. Canonical resolved stays Xhigh because
-        // the level is advertised; only the wire value is remapped.
-        let sol56 = t
-            .lookup(&CandidateId::parse("codex/gpt-5.6-sol").unwrap())
-            .resolve_effort(EffortLevel::Xhigh);
-        assert_eq!(sol56.resolved, Some(EffortLevel::Xhigh));
+        // GPT-5.6 Sol has no xhigh: an explicit xhigh request resolves to its nearest real level.
+        let sol56 = q(&t, "codex/gpt-5.6-sol").resolve_effort(EffortLevel::Xhigh);
+        assert_eq!(sol56.resolved, Some(EffortLevel::High));
         assert_eq!(sol56.provider_value.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn kimi_thinking_outranks_base_and_neither_falls_through() {
-        let t = ScoreTable::builtin();
-        let base = t.lookup(&CandidateId::parse("kimi/kimi-k2").unwrap());
-        let thinking = t.lookup(&CandidateId::parse("kimi/kimi-k2-thinking").unwrap());
-        // Both kimi entries are real (not the generic default fallback) and high
-        // coding tier; the reasoning variant scores strictly higher.
-        assert_eq!(base.coding_tier, CodingTier::High);
-        assert_eq!(thinking.coding_tier, CodingTier::High);
-        assert!(
-            thinking.quality(TaskClass::Algorithms) > base.quality(TaskClass::Algorithms),
-            "`*kimi*k2*thinking*` must win over the broad `*kimi*` (first-match order)"
-        );
-        // A plain kimi id and kimi-latest both resolve to the base kimi entry.
-        let latest = t.lookup(&CandidateId::parse("kimi/kimi-latest").unwrap());
-        assert_eq!(
-            latest.quality(TaskClass::CodingGeneral),
-            base.quality(TaskClass::CodingGeneral)
-        );
+        let haiku45 = q(&t, "claude/claude-haiku-4-5");
+        assert!(!haiku45.adaptive_thinking && !haiku45.effort && !haiku45.system_turns);
+        assert_eq!(haiku45.max_output_tokens, Some(64_000));
+        assert!(q(&t, "claude/haiku").adaptive_thinking);
     }
 
     #[test]

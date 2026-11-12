@@ -3,7 +3,8 @@
 What goose is for: the calls that need reading (a launch post, a benchmark
 table, two model lists that renamed a line), not arithmetic. It proposes
 sourced benchmark observations; the deterministic calibrator owns quality.
-Goose never edits production YAML.
+Goose never edits the catalog: a reviewer copies accepted observations into
+the model's entry (`evidence:`) in `data/providers/<name>.yaml`.
 """
 
 from __future__ import annotations
@@ -30,9 +31,6 @@ class GooseJudgment:
     observations: list[dict[str, Any]]
     rationale: str
     risks: list[str]
-    # An optional line-pattern proposal (`*sol*` rather than the whole id). The
-    # caller re-checks it for shadowing before using it.
-    pattern: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,14 +100,12 @@ def parse_judgments(payload: dict[str, Any], band: tuple[float, float]) -> tuple
                 raise GooseError(
                     f"models[{index}].observations[{observation_index}] result is not numeric"
                 ) from exc
-        proposed_pattern = item.get("pattern")
         judgments.append(
             GooseJudgment(
                 candidate=str(item["candidate"]),
                 observations=observations,
                 rationale=" ".join(str(item.get("rationale", "")).split()),
                 risks=[str(risk) for risk in (item.get("risks") or [])],
-                pattern=str(proposed_pattern) if proposed_pattern else None,
             )
         )
 

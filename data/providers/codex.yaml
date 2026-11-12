@@ -1,0 +1,214 @@
+# The codex provider: the defaults every `codex` agent inherits (an agent entry in a
+# router config states only what it changes: mappings merge, lists and scalars
+# replace) and the one definition of every codex model the router supports.
+#
+# `cache_ratio` and `discovery` are not agent settings; the model updater reads
+# them (docs/model-updater.md). `cache_ratio` prices a cache rate a model leaves
+# unset, as a multiple of its input rate. `discovery` is how the live model list
+# is obtained; a model that vanishes from it is commented out for
+# `retire_grace_releases` releases before it is deleted.
+#
+# `models:` groups each family's versions. Each entry is one exact model, scored
+# only on its own evidence:
+#   * `version` (dotted, compared component by component: only the newest
+#     version of a family is chosen automatically unless `pinned_versions`
+#     names an older one) and `id`, the provider's API model id. Never an alias.
+#   * `display_name`, `cost_rank` (1 = cheapest/least scarce .. 5) and
+#     `pricing` (published USD per Mtok).
+#   * `evidence`: its own published results on the benchmarks classifier.yaml
+#     defines, each with its source. `quality` and `default_quality` are
+#     computed from it by scripts/update_models.py and nothing else; a model
+#     with no evidence is unscored and chosen only by an explicit pick.
+#   * `outranks` (models it must beat on every task class; `provider/id` for
+#     another provider) and `rank_exception` (why its cost_rank breaks price
+#     order).
+#   * Wire capabilities the per-request proxy needs: `context_window`,
+#     `max_output_tokens`, `adaptive_thinking`, `effort`, `system_turns`,
+#     `effort_levels` (only the levels the model really has, each sent under
+#     its own name; `effort_mapping` exists only to rename one), plus `coding_tier`/`coding_percentile`.
+provider: codex
+command:
+  type: stdio
+  command: codex-acp
+model_selection:
+  type: config-option
+budget_prompts_5h: 400
+usage_source:
+  type: codex-rollout
+auth_probe:
+  command: codex
+  args:
+  - login
+  - status
+llm_proxy:
+  protocol: openai
+  base_url_env: OPENAI_BASE_URL
+  upstream_base_url: https://chatgpt.com/backend-api/codex
+  codex_chatgpt_provider: true
+mode_map:
+  auto: agent-full-access
+  approve: agent
+  chat: read-only
+  preclass: read-only
+lineage: codex
+discovery:
+  retire_grace_releases: 1
+  method: snapshot
+  note: >-
+    codex exposes no offline model list; ids come from its rollout config.
+models:
+  luna:
+    # GPT-6 Luna / Sol and 6.1 Sol: unscored until their own results are
+    # recorded. Their wire shape is their own (1.05M context, 128K output,
+    # native xhigh/max).
+  - version: 6
+    id: gpt-6-luna
+    display_name: GPT-6 Luna
+    cost_rank: 2
+    pricing: { input_per_mtok: 0.1, output_per_mtok: 0.5, cache_read_per_mtok: 0.01, cache_write_per_mtok: 0.125 }
+    # Vals' Terminus 2 run (2026-10-01).
+    evidence:
+      - { benchmark: Terminal-Bench-2.1, result: 73.03, source: "https://vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 81.65, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 13.64, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 4.29, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 1.05
+    quality: { UiTweak: 1.05, BugFix: 1.05, Feature: 1.05, Refactor: 1.05, Algorithms: 1.05, Architecture: 0.78, Research: 0.84, Writing: 1.05, Ops: 0.78, CodingGeneral: 1.05 }
+  - version: 5.6
+    id: gpt-5.6-luna
+    display_name: GPT-5.6 Luna
+    cost_rank: 2
+    pricing: { input_per_mtok: 1.0, output_per_mtok: 6.0 }
+    evidence:
+      - { benchmark: AA-Coding-Agent-v1.1, result: 74.6, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 62.7, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 67.2, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 84.7, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 77.06, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 11.62, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 0.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 79.03, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 400000
+    effort_levels: [low, medium, high]
+    default_quality: 1.52
+    quality: { UiTweak: 1.52, BugFix: 2.01, Feature: 1.74, Refactor: 2.01, Algorithms: 1.33, Architecture: 1.52, Research: 1.26, Writing: 1.52, Ops: 1.52, CodingGeneral: 1.79 }
+  terra:
+    # Terra's own rows trail GPT-5.6 Sol's by 0.9-3.1 points on all four.
+  - version: 5.6
+    id: gpt-5.6-terra
+    display_name: GPT-5.6 Terra
+    cost_rank: 4
+    pricing: { input_per_mtok: 2.5, output_per_mtok: 15.0 }
+    evidence:
+      - { benchmark: AA-Coding-Agent-v1.1, result: 77.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 63.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 69.6, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 87.4, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 74.59, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 22.73, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 10.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 77.53, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    outranks: [gpt-5.6-luna]
+    coding_tier: high
+    coding_percentile: 0.9
+    context_window: 400000
+    effort_levels: [low, medium, high]
+    default_quality: 1.80
+    quality: { UiTweak: 1.80, BugFix: 2.17, Feature: 1.80, Refactor: 2.17, Algorithms: 2.03, Architecture: 1.80, Research: 1.57, Writing: 1.80, Ops: 1.80, CodingGeneral: 2.02 }
+  sol:
+  - version: 6.1
+    id: gpt-6.1-sol
+    display_name: GPT-6.1 Sol
+    cost_rank: 5
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 10.0, cache_read_per_mtok: 0.1, cache_write_per_mtok: 2.5 }
+    # OpenAI's launch chart at high effort, as transcribed by Vellum
+    # (https://openai.com/index/introducing-gpt-6-1-sol/ refuses fetches).
+    evidence:
+      - { benchmark: DeepSWE-v1.1, result: 75.2, source: "https://www.vellum.ai/md/blog/gpt-6-1-sol-benchmarks-explained" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 88.93, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 55.05, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 52.86, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    rank_exception: >-
+      GPT-6.1 Sol is $2/$10 (0.05x cache). Same Sol-rank-5 hold as gpt-6-sol: list-price ranking would spend Sol-class capability on everyday work.
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.91
+    quality: { UiTweak: 2.91, BugFix: 2.91, Feature: 2.91, Refactor: 2.91, Algorithms: 2.91, Architecture: 2.91, Research: 2.91, Writing: 2.91, Ops: 2.91, CodingGeneral: 2.91 }
+  - version: 6
+    id: gpt-6-sol
+    display_name: GPT-6 Sol
+    cost_rank: 5
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 10.0, cache_read_per_mtok: 0.2, cache_write_per_mtok: 2.5 }
+    # Terminal-Bench: Vals' Terminus 2 run (2026-10-01). DeepSWE: OpenAI's launch
+    # chart at max effort, as transcribed by Vellum (openai.com refuses fetches).
+    evidence:
+      - { benchmark: Terminal-Bench-2.1, result: 83.15, source: "https://vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: DeepSWE-v1.1, result: 68.8, source: "https://www.vellum.ai/md/blog/gpt-6-1-sol-benchmarks-explained" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 87.82, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 44.44, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 30.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    rank_exception: >-
+      GPT-6 Sol is $2/$10, cheaper than Terra ($2.50/$15), but it is the Sol-class seat (native xhigh/max, 1.05M). Ranking it by list price would make it the default for routine turns. Held at rank 5 with Sol.
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.31
+    quality: { UiTweak: 2.31, BugFix: 2.31, Feature: 2.64, Refactor: 2.31, Algorithms: 2.31, Architecture: 2.06, Research: 2.10, Writing: 2.31, Ops: 2.06, CodingGeneral: 2.64 }
+  - version: 5.6
+    id: gpt-5.6-sol
+    display_name: GPT-5.6 Sol
+    cost_rank: 5
+    pricing: { input_per_mtok: 5.0, output_per_mtok: 30.0 }
+    # GPT-6 Luna / Sol and 6.1 Sol have no same-harness card yet.
+    evidence:
+      - { benchmark: AA-Coding-Agent-v1.1, result: 80.0, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: SWE-Bench-Pro, result: 64.6, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: DeepSWE-v1.1, result: 72.7, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Terminal-Bench-2.1, result: 88.8, source: "https://openai.com/index/gpt-5-6/" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 80.5, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 37.88, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 20.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 85.77, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    outranks: [gpt-5.6-terra]
+    coding_tier: high
+    coding_percentile: 0.96
+    context_window: 400000
+    effort_levels: [low, medium, high]
+    default_quality: 2.37
+    quality: { UiTweak: 2.37, BugFix: 2.37, Feature: 2.11, Refactor: 2.37, Algorithms: 2.63, Architecture: 2.37, Research: 2.37, Writing: 2.37, Ops: 2.37, CodingGeneral: 2.37 }
+  astra:
+    # GPT-6 Astra (2026-09-03): OpenAI's flagship above the Sol line. One
+    # published row with anchors here (DeepSWE v1.1 74.1), so every class
+    # carries the aggregate.
+  - version: 6
+    id: gpt-6-astra
+    display_name: GPT-6 Astra
+    cost_rank: 5
+    pricing: { input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 1.0, cache_write_per_mtok: 12.5 }
+    # GPT-6 Astra (released 2026-09-03). OpenAI's launch table puts it at
+    # 74.1% on DeepSWE v1.1 (GPT-5.6 Sol 72.7, Claude Opus 5 73.7), and the
+    # public v1.1 leaderboard (2026-09-22) records the same xhigh run at
+    # 74% ±3. That is the only published Astra row with anchors here: OpenAI
+    # and Artificial Analysis report Terminal-Bench 4.0, not 2.1, Scale's
+    # SWE-Bench Pro leaderboard carries no Astra row, and AA's Coding Agent
+    # Index is on a points scale that does not map onto the v1.1 anchors.
+    evidence:
+      - { benchmark: DeepSWE-v1.1, result: 74.1, source: "https://openai.com/index/gpt-6-astra/" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 89.59, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 59.6, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 62.86, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 87.27, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    outranks: [gpt-5.6-sol]
+    coding_tier: high
+    coding_percentile: 0.97
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.96
+    quality: { UiTweak: 2.96, BugFix: 2.96, Feature: 2.96, Refactor: 2.96, Algorithms: 2.96, Architecture: 2.73, Research: 2.96, Writing: 2.96, Ops: 2.73, CodingGeneral: 2.96 }

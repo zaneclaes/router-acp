@@ -2643,9 +2643,20 @@ agents:
 
     fn policy_shared() -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
+        // The fixture's own scores: the mock models are not shipped models.
+        let scores = dir.path().join("scores.yaml");
+        std::fs::write(
+            &scores,
+            "models:\n\
+             \x20 - { id: haiku, default_quality: 1.3, context_window: 1000000, max_output_tokens: 128000 }\n\
+             \x20 - { id: sonnet, default_quality: 1.9, context_window: 1000000, max_output_tokens: 128000 }\n\
+             \x20 - { id: opus, default_quality: 2.6, context_window: 1000000, max_output_tokens: 128000 }\n",
+        )
+        .unwrap();
         let yaml = format!(
             r#"
 state_file: {}
+score_table: {}
 llm_proxy:
   enabled: true
 agents:
@@ -2661,7 +2672,8 @@ agents:
       - {{ id: sonnet, cost_rank: 2 }}
       - {{ id: opus, cost_rank: 3 }}
 "#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            scores.display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg).unwrap();
@@ -2712,7 +2724,7 @@ agents:
     /// candidates, their real `api_model` values, and Anthropic's real cache rates
     /// (read = 0.1x input, write = 1.25x input) so the re-prime gate is live.
     /// Score data (context windows, wire features) comes from the shipped
-    /// `data/scores.yaml`, not from a test stub.
+    /// `data/providers/<provider>.yaml`, not from a test stub.
     fn kory_code_shared() -> (tempfile::TempDir, Arc<Shared>) {
         kory_code_shared_with("")
     }
@@ -3049,9 +3061,9 @@ agents:
         let scores = dir.path().join("scores.yaml");
         std::fs::write(
             &scores,
-            "candidates:\n\
-             \x20 - { pattern: 'mock/parent', default_quality: 3.0, context_window: 400000, effort_levels: [max], effort_mapping: { max: parent-max } }\n\
-             \x20 - { pattern: 'mock/subtool', default_quality: 1.0, context_window: 400000, effort_levels: [high], effort_mapping: { high: subtool-high } }\n",
+            "models:\n\
+             \x20 - { id: parent, default_quality: 3.0, context_window: 400000, effort_levels: [max], effort_mapping: { max: parent-max } }\n\
+             \x20 - { id: subtool, default_quality: 1.0, context_window: 400000, effort_levels: [high], effort_mapping: { high: subtool-high } }\n",
         )
         .unwrap();
         let yaml = format!(
@@ -3128,8 +3140,8 @@ agents:
         let scores = dir.path().join("scores.yaml");
         std::fs::write(
             &scores,
-            "candidates:\n\
-             \x20 - { pattern: 'mock/worker', default_quality: 3.0, context_window: 400000, effort_levels: [low, max], effort_mapping: { low: worker-low, max: worker-max } }\n",
+            "models:\n\
+             \x20 - { id: worker, default_quality: 3.0, context_window: 400000, effort_levels: [low, max], effort_mapping: { low: worker-low, max: worker-max } }\n",
         )
         .unwrap();
         let yaml = format!(
@@ -3282,10 +3294,10 @@ agents:
         // 5.5, which is 1M like every other current Claude model.
         let table = crate::candidate::ScoreTable::builtin();
         for (model, expected) in [
-            ("claude-fable-5[1m]", 1_000_000),
-            ("opus[1m]", 1_000_000),
-            ("sonnet", 1_000_000),
-            ("haiku", 1_000_000),
+            ("claude-fable-5-2", 1_000_000),
+            ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-5-5", 1_000_000),
+            ("claude-haiku-5-5", 1_000_000),
             ("claude-haiku-4-5", 200_000),
         ] {
             let scores = table.lookup(&CandidateId::new("claude", model));
@@ -3736,9 +3748,19 @@ agents:
 
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.db");
+        // The fixture's own scores: the mock models are not shipped models.
+        let scores = dir.path().join("scores.yaml");
+        std::fs::write(
+            &scores,
+            "models:\n\
+             \x20 - { id: claude-haiku-test, default_quality: 1.3, context_window: 1000000, max_output_tokens: 128000 }\n\
+             \x20 - { id: opus, default_quality: 2.6, context_window: 1000000, max_output_tokens: 128000 }\n",
+        )
+        .unwrap();
         let yaml = format!(
             r#"
 state_file: {}
+score_table: {}
 llm_proxy:
   enabled: true
 agents:
@@ -3756,7 +3778,8 @@ agents:
         pricing: {{ input_per_mtok: 1, output_per_mtok: 5 }}
       - {{ id: opus, cost_rank: 3 }}
 "#,
-            state_path.display()
+            state_path.display(),
+            scores.display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg).unwrap();

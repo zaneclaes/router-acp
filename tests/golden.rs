@@ -2,7 +2,7 @@
 //!
 //! These lock router-acp's OWN behavior against regressions: a fixed set of
 //! representative prompts is run through the real classifier (`data/
-//! classifier.yaml`), the real score table (`data/scores.yaml`), and the real
+//! classifier.yaml`), the real model catalog (`data/models.yaml`), and the real
 //! `auto` strategy, and the resulting (class, complexity, winner, utility) is
 //! asserted verbatim. Change the data tables or the scoring math and these
 //! break loudly, forcing an intentional re-bake (regenerate with the ignored
@@ -25,12 +25,12 @@ use router_acp::strategies::{AutoStrategy, CandidateView, RouteContext, RouterSt
 /// deployment: claude (preference 0.05, the bigger plan) + codex. Tuple is
 /// (agent, model, cost_rank, preference).
 const CANDIDATES: &[(&str, &str, u32, f64)] = &[
-    ("claude", "haiku", 1, 0.05),
-    ("claude", "sonnet", 2, 0.05),
-    ("claude", "opus", 4, 0.05),
-    ("claude", "fable", 5, 0.05),
-    ("codex", "gpt-5.4-mini", 1, 0.0),
-    ("codex", "gpt-5.5", 3, 0.0),
+    ("claude", "claude-haiku-5-5", 1, 0.05),
+    ("claude", "claude-sonnet-5-5", 2, 0.05),
+    ("claude", "claude-opus-5-5", 4, 0.05),
+    ("claude", "claude-fable-5-2", 5, 0.05),
+    ("codex", "gpt-6-luna", 2, 0.0),
+    ("codex", "gpt-6.1-sol", 5, 0.0),
 ];
 
 /// Fixed `auto` config for the golden cases (mirrors the shipped
@@ -121,35 +121,35 @@ const GOLDEN: &[Golden] = &[
         prompt: "fix the typo in the button label",
         class: TaskClass::UiTweak,
         complexity: 0.00,
-        winner: "claude/haiku",
+        winner: "claude/claude-haiku-5-5",
         utility: 0.47,
     },
     Golden {
         prompt: "add a null check in parse() before dereferencing",
         class: TaskClass::Ops,
         complexity: 0.02,
-        winner: "claude/haiku",
+        winner: "claude/claude-haiku-5-5",
         utility: 0.47,
     },
     Golden {
         prompt: "rename the variable foo to bar in utils.py",
         class: TaskClass::Refactor,
         complexity: 0.06,
-        winner: "claude/haiku",
-        utility: 0.52,
+        winner: "claude/claude-haiku-5-5",
+        utility: 0.53,
     },
     Golden {
         prompt: "write a haiku about the ocean",
         class: TaskClass::CodingGeneral,
         complexity: 0.01,
-        winner: "claude/haiku",
+        winner: "claude/claude-haiku-5-5",
         utility: 0.52,
     },
     Golden {
         prompt: "update the README to document the new --verbose flag",
         class: TaskClass::Writing,
         complexity: 0.02,
-        winner: "claude/haiku",
+        winner: "claude/claude-haiku-5-5",
         utility: 0.47,
     },
     Golden {
@@ -157,39 +157,39 @@ const GOLDEN: &[Golden] = &[
                       and a new left nav, then update every affected component",
         class: TaskClass::Architecture,
         complexity: 0.72,
-        winner: "claude/opus",
-        utility: 0.80,
+        winner: "claude/claude-fable-5-2",
+        utility: 0.89,
     },
     Golden {
         prompt: "investigate why the integration suite is flaky: there's a race between the \
                       worker pool and the scheduler that only reproduces under load",
         class: TaskClass::Research,
         complexity: 0.26,
-        winner: "claude/opus",
-        utility: 0.58,
+        winner: "claude/claude-sonnet-5-5",
+        utility: 0.64,
     },
     Golden {
         prompt: "implement an OAuth2 login flow with refresh tokens and secure token storage",
         class: TaskClass::Feature,
         complexity: 0.08,
-        winner: "claude/haiku",
-        utility: 0.52,
+        winner: "claude/claude-haiku-5-5",
+        utility: 0.53,
     },
     Golden {
         prompt: "design the architecture for a multi-region event bus with exactly-once \
                       delivery and backpressure",
         class: TaskClass::Architecture,
         complexity: 0.39,
-        winner: "claude/opus",
-        utility: 0.65,
+        winner: "claude/claude-sonnet-5-5",
+        utility: 0.70,
     },
     Golden {
         prompt: "spend as long as you need investigating this deep cross-cutting bug that \
                       spans the parser, the type checker, and the CLI, then propose a fix plan",
         class: TaskClass::BugFix,
-        complexity: 0.23,
-        winner: "claude/opus",
-        utility: 0.49,
+        complexity: 0.53,
+        winner: "claude/claude-sonnet-5-5",
+        utility: 0.68,
     },
     // The apex carve-out: at extreme classified complexity the cost term is
     // dropped and the compression pair's preferred member (Fable over the
@@ -200,8 +200,8 @@ const GOLDEN: &[Golden] = &[
                       module",
         class: TaskClass::Architecture,
         complexity: 1.00,
-        winner: "claude/fable",
-        utility: 0.76,
+        winner: "claude/claude-fable-5-2",
+        utility: 0.91,
     },
 ];
 
@@ -234,67 +234,37 @@ fn golden_routing_table() {
     }
 }
 
-/// Regression: a long, cross-cutting investigation must never be routed to a
-/// `*mini*` model. This is the exact failure the score-table pattern ordering
-/// (specific `*mini*` before broad `*gpt-5*`) exists to prevent.
+/// Regression: a long, cross-cutting investigation must never be routed to
+/// the cheapest small model (the hour-long investigation once routed to a mini).
 #[test]
-fn long_investigation_never_routes_to_mini() {
+fn long_investigation_never_routes_to_the_small_model() {
     let o = route(
         "spend as long as you need investigating this deep cross-cutting bug that spans the \
          parser, the type checker, and the CLI, then propose a fix plan",
     );
     assert!(
-        !o.winner.contains("mini"),
-        "a hard investigation routed to a mini model: {}",
+        !o.winner.contains("luna") && !o.winner.contains("haiku"),
+        "a hard investigation routed to a small model: {}",
         o.winner
     );
 }
 
-/// Regression for the same root cause at the data layer: the specific
-/// `*mini*` score-table pattern must win over the broad `*gpt-5*` one
-/// (first-match-wins), so mini and full gpt get DIFFERENT coding quality.
-/// If the broad pattern shadowed mini, these would be equal.
+/// Regression for the live disclosure "effort: X unsupported by codex/…;
+/// provider parameter omitted": a codex model advertises its real effort
+/// levels, each sent under its own name.
 #[test]
-fn mini_pattern_not_shadowed_by_broad_gpt_pattern() {
+fn codex_candidates_advertise_effort_capability() {
     let scores = ScoreTable::builtin();
-    let mini = scores
-        .lookup(&CandidateId::new("codex", "gpt-5.4-mini"))
-        .quality(TaskClass::CodingGeneral);
-    let full = scores
-        .lookup(&CandidateId::new("codex", "gpt-5.5"))
-        .quality(TaskClass::CodingGeneral);
-    assert!(
-        mini < full,
-        "mini ({mini}) should score below full gpt ({full}); the broad *gpt-5* pattern is \
-         shadowing the specific *mini* pattern in data/scores.yaml"
-    );
-}
-
-/// Regression for the live disclosure "effort: X unsupported by codex/gpt-5.5;
-/// provider parameter omitted": the `*gpt-5*` and `*mini*` score-table entries
-/// must advertise `effort_levels` / `effort_mapping` like their siblings, or
-/// every candidate resolving to them silently drops the provider's effort
-/// parameter and is excluded from auto-routing under an explicit effort ask.
-#[test]
-fn gpt5_and_mini_candidates_advertise_effort_capability() {
-    let scores = ScoreTable::builtin();
-
     let medium = scores
-        .lookup(&CandidateId::new("codex", "gpt-5.5"))
+        .lookup(&CandidateId::new("codex", "gpt-6-luna"))
         .resolve_effort(EffortLevel::Medium);
     assert_eq!(medium.resolved, Some(EffortLevel::Medium));
     assert_eq!(medium.provider_value.as_deref(), Some("medium"));
-
-    // xhigh is not on the codex wire; it nearest-matches down to high.
     let xhigh = scores
-        .lookup(&CandidateId::new("codex", "gpt-5.5"))
+        .lookup(&CandidateId::new("codex", "gpt-6.1-sol"))
         .resolve_effort(EffortLevel::Xhigh);
-    assert_eq!(xhigh.resolved, Some(EffortLevel::High));
-
-    let mini = scores
-        .lookup(&CandidateId::new("codex", "gpt-5.4-mini"))
-        .resolve_effort(EffortLevel::High);
-    assert_eq!(mini.resolved, Some(EffortLevel::High));
+    assert_eq!(xhigh.resolved, Some(EffortLevel::Xhigh));
+    assert_eq!(xhigh.provider_value.as_deref(), Some("xhigh"));
 }
 
 // Regenerate the golden table with:

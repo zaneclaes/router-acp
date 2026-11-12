@@ -1,0 +1,20 @@
+# The scoring half of a synthetic data/classifier.yaml for the updater's tests
+# (the classifier rules themselves are not read by the updater).
+version: 1
+
+scoring:
+  quality_band: { min: 0.5, max: 3.5 }
+  round_to: 0.01
+  minimum_task_observations: 2
+  meaningful_task_delta: 0.15
+  benchmarks:
+    Code-Bench:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 50, standard: 60, frontier: 70 }
+    Term-Bench:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 40, standard: 55, frontier: 70 }
+
+cost:
+  ladder: { min: 1, max: 5 }
+  blended_output_weight: 3

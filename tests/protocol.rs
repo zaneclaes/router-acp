@@ -289,6 +289,14 @@ where
         .with_writer(std::io::stderr)
         .try_init();
     let mut cfg = Config::from_yaml(&cfg_yaml).expect("test config parses");
+    // Mock models score from the test fixture, never from the shipped catalog: a
+    // mock `opus` is not Claude Opus, and catalog edits must not move these tests.
+    if cfg.score_table.is_none() {
+        cfg.score_table = Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mock-models.yaml"),
+        );
+    }
     // Mock adapters must never observe or publish state for a real login.
     let credential_home = tempfile::tempdir().unwrap();
     for agent in &mut cfg.agents {
@@ -1817,8 +1825,8 @@ async fn session_new_advertises_candidate_effort_capabilities() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/m1', effort_levels: [low, high, max], effort_mapping: { low: minimal, high: intensive, max: exhaustive } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [low, high, max], effort_mapping: { low: minimal, high: intensive, max: exhaustive } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2219,9 +2227,9 @@ async fn explicit_effort_precedes_automatic_and_is_reresolved_on_failover() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'a/*', default_quality: 3.0, effort_levels: [low, high], effort_mapping: { low: tiny, high: deep } }\n\
-         \x20 - { pattern: 'b/*', default_quality: 1.0, effort_levels: [max], effort_mapping: { max: tiny } }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 3.0, effort_levels: [low, high], effort_mapping: { low: tiny, high: deep } }\n\
+         \x20 - { id: m2, default_quality: 1.0, effort_levels: [max], effort_mapping: { max: tiny } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2283,9 +2291,9 @@ async fn auto_model_routing_requires_the_explicit_effort_level() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'a/*', default_quality: 3.0, effort_levels: [low], effort_mapping: { low: low } }\n\
-         \x20 - { pattern: 'b/*', default_quality: 1.0, effort_levels: [high], effort_mapping: { high: high } }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 3.0, effort_levels: [low], effort_mapping: { low: low } }\n\
+         \x20 - { id: m2, default_quality: 1.0, effort_levels: [high], effort_mapping: { high: high } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2324,8 +2332,8 @@ async fn auto_model_routing_errors_when_no_candidate_supports_explicit_effort() 
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/*', effort_levels: [low], effort_mapping: { low: low } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [low], effort_mapping: { low: low } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2364,8 +2372,8 @@ async fn preclassifier_omitted_effort_falls_back_to_task_depth_recommendation() 
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/*', effort_levels: [xhigh], effort_mapping: { xhigh: deep } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [xhigh], effort_mapping: { xhigh: deep } }\n",
     )
     .unwrap();
     let preclass = r#"{"routing":{"task_class":"Architecture","complexity":0.72,"confidence":0.9,"reason":"cross-system"}}"#;
@@ -2528,8 +2536,8 @@ async fn post_pin_effort_config_and_directives_apply_without_ignore_notices() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/*', effort_levels: [medium, high], effort_mapping: { medium: normal, high: deep } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [medium, high], effort_mapping: { medium: normal, high: deep } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -4384,9 +4392,9 @@ async fn context_overflow_fails_over_to_a_larger_window_with_sqlite_lookup() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"fancy/*\", context_window: 50000, default_quality: 0.9 }\n\
-         \x20 - { pattern: \"cheap/*\", context_window: 1000000, default_quality: 0.1 }\n",
+        "models:\n\
+         \x20 - { id: opus, context_window: 50000, default_quality: 0.9 }\n\
+         \x20 - { id: haiku, context_window: 1000000, default_quality: 0.1 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -6991,10 +6999,10 @@ async fn skill_routing_already_ok_cancels_queued_switch_to_also_acceptable() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"c/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.70 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n\
+         \x20 - { id: m2, default_quality: 0.70 }\n\
+         \x20 - { id: m3, default_quality: 0.90 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -7058,9 +7066,9 @@ async fn skill_routing_first_match_selection_overrides_quality_order() {
     // best-quality would pick c/m3; first-match must pick b/m2.
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'b/m2', default_quality: 1.0 }\n\
-         \x20 - { pattern: 'c/m3', default_quality: 3.0 }\n",
+        "models:\n\
+         \x20 - { id: m2, default_quality: 1.0 }\n\
+         \x20 - { id: m3, default_quality: 3.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -7354,11 +7362,11 @@ fn skill_pool_demotion_scores(tag: &str) -> PathBuf {
     ));
     std::fs::write(
         &p,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"d/*\", default_quality: 0.95 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 0.60 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m2, default_quality: 0.90 }\n\
+         \x20 - { id: m4, default_quality: 0.95 }\n\
+         \x20 - { id: m3, default_quality: 0.60 }\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n",
     )
     .unwrap();
     p
@@ -7553,10 +7561,10 @@ async fn usage_cordon_escape_follows_the_active_strategy() {
     // c/m3 is a real step down.
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 2.92 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 2.00 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 2.90 }\n\
+         \x20 - { id: m2, default_quality: 2.92 }\n\
+         \x20 - { id: m3, default_quality: 2.00 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -7635,10 +7643,10 @@ fn two_claude_seats_yaml(tag: &str, log: &std::path::Path, grok_quality: f64) ->
     std::fs::write(
         &scores,
         format!(
-            "version: 1\ncandidates:\n\
-             \x20 - {{ pattern: \"claude@*\", default_quality: 2.90 }}\n\
-             \x20 - {{ pattern: \"codex@*\", default_quality: 3.30 }}\n\
-             \x20 - {{ pattern: \"grok@*\", default_quality: {grok_quality} }}\n"
+            "models:\n\
+             \x20 - {{ id: opus, default_quality: 2.90 }}\n\
+             \x20 - {{ id: gpt-6.1-sol, default_quality: 3.30 }}\n\
+             \x20 - {{ id: grok-4.7, default_quality: {grok_quality} }}\n"
         ),
     )
     .unwrap();
@@ -7797,10 +7805,10 @@ async fn usage_cordon_escape_of_a_skill_pin_follows_the_route_order() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"a/*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 2.00 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 3.30 }\n",
+        "models:\n\
+         \x20 - { id: m3, default_quality: 2.90 }\n\
+         \x20 - { id: m1, default_quality: 2.00 }\n\
+         \x20 - { id: m2, default_quality: 3.30 }\n",
     )
     .unwrap();
     let env = [("MOCK_LOG", log.to_str().unwrap())];
@@ -7974,9 +7982,9 @@ async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n\
+         \x20 - { id: m2, default_quality: 0.90 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -8016,7 +8024,7 @@ async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
 #[tokio::test]
 async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_qualifies() {
     let state = temp_state_file("upgrade-compressed");
-    // Mirrors a declared score-table compression pair (Fable/Opus, Sol/Terra):
+    // Two peers scored within a hair of each other:
     // b/m2 sits only 0.02 above a/m1 on the raw 0.5..3.5 scale — normalized
     // ~0.007, well under the +0.05 real-upgrade margin. a/m1's 0.85 puts the
     // pinned session's confidence at (0.85−0.5)/(1.2−0.5) = 0.50, below the
@@ -8028,9 +8036,9 @@ async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_q
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.87 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.85 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.85 }\n\
+         \x20 - { id: m2, default_quality: 0.87 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -8070,9 +8078,9 @@ async fn auto_upgrade_is_off_by_default_and_keeps_the_pinned_model() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n\
+         \x20 - { id: m2, default_quality: 0.90 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -8103,24 +8111,24 @@ async fn auto_upgrade_is_off_by_default_and_keeps_the_pinned_model() {
 // escalation router
 // ======================================================================
 
-/// Score table making `b/*` strong (0.90) and `a/*` weak (0.40), so `b` is a
-/// valid escalation target above `a`. Optionally a mid-tier `c/*` (0.70).
+/// Score table making `b/m2` strong (0.90) and `a/m1` weak (0.40), so `b` is a
+/// valid escalation target above `a`. Optionally a mid-tier `c/m3` (0.70).
 fn escalation_scores(tag: &str, with_mid: bool) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "router-acp-escscores-{tag}-{}.yaml",
         uuid::Uuid::new_v4().simple()
     ));
     let mid = if with_mid {
-        "  - { pattern: \"c/*\", default_quality: 0.70 }\n"
+        "  - { id: m3, default_quality: 0.70 }\n"
     } else {
         ""
     };
     std::fs::write(
         &p,
         format!(
-            "version: 1\ncandidates:\n\
-             \x20 - {{ pattern: \"b/*\", default_quality: 0.90 }}\n{mid}\
-             \x20 - {{ pattern: \"a/*\", default_quality: 0.40 }}\n"
+            "models:\n\
+             \x20 - {{ id: m2, default_quality: 0.90 }}\n{mid}\
+             \x20 - {{ id: m1, default_quality: 0.40 }}\n"
         ),
     )
     .unwrap();
@@ -8545,7 +8553,7 @@ async fn escalation_mid_turn_on_tool_failures() {
 
 #[tokio::test]
 async fn escalation_escalates_across_a_compressed_gap_when_nothing_else_qualifies() {
-    // Mirrors a declared score-table compression pair (Fable/Opus, Sol/Terra):
+    // Two peers scored within a hair of each other:
     // b/m2 sits only 0.02 above a/m1 on the raw scale — normalized well under
     // the +0.05 real-upgrade margin `escalation_target` prefers — so a bug
     // that survives multiple rounds of thrashing must still be able to climb
@@ -8557,9 +8565,9 @@ async fn escalation_escalates_across_a_compressed_gap_when_nothing_else_qualifie
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 1.42 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 1.40 }\n",
+        "models:\n\
+         \x20 - { id: m2, default_quality: 1.42 }\n\
+         \x20 - { id: m1, default_quality: 1.40 }\n",
     )
     .unwrap();
     let logb = temp_log("esc-fail-compressed-b");
@@ -10043,9 +10051,9 @@ async fn availability_hint_penalizes_overage_seat() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"a/*\", default_quality: 1.2 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 1.1 }\n",
+        "models:\n\
+         \x20 - { id: fable-5, default_quality: 1.2 }\n\
+         \x20 - { id: sonnet, default_quality: 1.1 }\n",
     )
     .unwrap();
     // Pure-quality routing: a narrowly beats b — until a client hint reports
@@ -10160,8 +10168,8 @@ async fn overage_seat_with_more_dollars_left_beats_higher_fraction_smaller_cap()
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"*\", default_quality: 2.0 }\n",
+        "models:\n\
+         \x20 - { id: worker, default_quality: 2.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -10271,8 +10279,8 @@ async fn partial_plan_headroom_changes_effective_cost() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"*\", default_quality: 2.0 }\n",
+        "models:\n\
+         \x20 - { id: worker, default_quality: 2.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -11171,9 +11179,10 @@ fn legacy_scores(tag: &str) -> PathBuf {
     ));
     std::fs::write(
         &path,
-        "candidates:\n\
-         \x20 - { pattern: 'a/legacy', default_quality: 3.0 }\n\
-         \x20 - { pattern: 'a/*', default_quality: 1.0 }\n",
+        "models:\n\
+         \x20 - { id: legacy, default_quality: 3.0 }\n\
+         \x20 - { id: m1, default_quality: 1.0 }\n\
+         \x20 - { id: m1-old, default_quality: 1.0 }\n",
     )
     .unwrap();
     path
@@ -11190,9 +11199,9 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'a/m-1', default_quality: 3.0 }\n\
-         \x20 - { pattern: 'a/*', default_quality: 1.0 }\n",
+        "models:\n\
+         \x20 - { id: m-1, default_quality: 3.0 }\n\
+         \x20 - { id: m-2, default_quality: 1.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -11204,8 +11213,8 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
             "a",
             &["m-2", "m-1"],
             &[],
-            "      - { id: m-2, cost_rank: 1 }\n\
-             \x20     - { id: m-1, cost_rank: 1 }\n",
+            "      - { id: m-2, family: m, version: 2, cost_rank: 1 }\n\
+             \x20     - { id: m-1, family: m, version: 1, cost_rank: 1 }\n",
         ),
     );
     run_test(yaml, async |cx, observed| {
@@ -11328,9 +11337,9 @@ async fn native_effort_is_confirmed_before_account_failover_prompt() {
     ));
     std::fs::write(
         &scores,
-        r#"candidates:
-  - { pattern: "claude@work/*", default_quality: 3.0, effort_levels: [high], effort_mapping: { high: high } }
-  - { pattern: "claude@personal/*", default_quality: 2.0, effort_levels: [high], effort_mapping: { high: xhigh } }
+        // One model, so one row for both seats: a score belongs to the model, not the account.
+        r#"models:
+  - { id: sonnet, default_quality: 3.0, effort_levels: [high], effort_mapping: { high: xhigh } }
 "#,
     )
     .unwrap();
@@ -11394,7 +11403,7 @@ agents:
             event["event"] == "set_config_option"
                 && event["agent"] == "claude@work"
                 && event["configId"] == "reasoning_effort"
-                && event["value"] == "high"
+                && event["value"] == "xhigh"
         });
         let work_prompt = events
             .iter()
@@ -11438,9 +11447,9 @@ async fn effort_auto_switch_resets_native_metadata_without_losing_classification
     ));
     std::fs::write(
         &scores,
-        r#"candidates:
-  - { pattern: "claude@work/*", default_quality: 3.0, effort_levels: [medium, high], effort_mapping: { medium: medium, high: high } }
-  - { pattern: "claude@personal/*", default_quality: 2.0, effort_levels: [medium, high], effort_mapping: { medium: max, high: xhigh } }
+        // One model, so one row for both seats: a score belongs to the model, not the account.
+        r#"models:
+  - { id: sonnet, default_quality: 3.0, effort_levels: [medium, high], effort_mapping: { medium: max } }
 "#,
     )
     .unwrap();
@@ -12365,10 +12374,11 @@ fn epic_parent_yaml(tag: &str, log: &std::path::Path) -> String {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"claude@*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"codex@*\", default_quality: 3.00 }\n\
-         \x20 - { pattern: \"grok@*\", default_quality: 3.10 }\n",
+        "models:\n\
+         \x20 - { id: fable, default_quality: 2.90 }\n\
+         \x20 - { id: opus, default_quality: 2.90 }\n\
+         \x20 - { id: gpt-6.1-sol, default_quality: 3.00 }\n\
+         \x20 - { id: grok-4.7, default_quality: 3.10 }\n",
     )
     .unwrap();
     let log = log.display().to_string();
@@ -12857,10 +12867,10 @@ fn capacity_failover_yaml(label: &str, failover: &str) -> String {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.50 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 0.85 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.90 }\n\
+         \x20 - { id: m2, default_quality: 0.50 }\n\
+         \x20 - { id: m3, default_quality: 0.85 }\n",
     )
     .unwrap();
     format!(

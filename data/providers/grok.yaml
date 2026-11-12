@@ -1,0 +1,104 @@
+# The grok provider: the defaults every `grok` agent inherits (an agent entry in a
+# router config states only what it changes: mappings merge, lists and scalars
+# replace) and the one definition of every grok model the router supports.
+#
+# `cache_ratio` and `discovery` are not agent settings; the model updater reads
+# them (docs/model-updater.md). `cache_ratio` prices a cache rate a model leaves
+# unset, as a multiple of its input rate. `discovery` is how the live model list
+# is obtained; a model that vanishes from it is commented out for
+# `retire_grace_releases` releases before it is deleted.
+#
+# `models:` groups each family's versions. Each entry is one exact model, scored
+# only on its own evidence:
+#   * `version` (dotted, compared component by component: only the newest
+#     version of a family is chosen automatically unless `pinned_versions`
+#     names an older one) and `id`, the provider's API model id. Never an alias.
+#   * `display_name`, `cost_rank` (1 = cheapest/least scarce .. 5) and
+#     `pricing` (published USD per Mtok).
+#   * `evidence`: its own published results on the benchmarks classifier.yaml
+#     defines, each with its source. `quality` and `default_quality` are
+#     computed from it by scripts/update_models.py and nothing else; a model
+#     with no evidence is unscored and chosen only by an explicit pick.
+#   * `outranks` (models it must beat on every task class; `provider/id` for
+#     another provider) and `rank_exception` (why its cost_rank breaks price
+#     order).
+#   * Wire capabilities the per-request proxy needs: `context_window`,
+#     `max_output_tokens`, `adaptive_thinking`, `effort`, `system_turns`,
+#     `effort_levels` (only the levels the model really has, each sent under
+#     its own name; `effort_mapping` exists only to rename one), plus `coding_tier`/`coding_percentile`.
+provider: grok
+command:
+  type: stdio
+  command: ~/.grok/bin/grok
+  args:
+  - agent
+model_selection:
+  type: spawn-config
+  process_template:
+    args:
+    - --model
+    - ${model_id}
+    - stdio
+budget_prompts_5h: 400
+auth_probe:
+  command: ~/.grok/bin/grok
+  args:
+  - models
+  unauthenticated_patterns:
+  - not authenticated
+llm_proxy:
+  protocol: openai
+  base_url_env: GROK_CLI_CHAT_PROXY_BASE_URL
+  upstream_base_url: https://cli-chat-proxy.grok.com/v1
+lineage: xai
+discovery:
+  retire_grace_releases: 1
+  method: command
+  command: ["grok", "models"]
+  note: >-
+    documented in the preferred config; requires `grok login`.
+models:
+  grok:
+    # Grok 4.7: its own DeepSWE v1.1 row (71.0; Opus 5 posts 73.6).
+  - version: 4.7
+    id: grok-4.7
+    display_name: Grok 4.7
+    cost_rank: 5
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 6.0, cache_read_per_mtok: 0.5 }
+    # Same-harness DeepSWE v1.1, the strongest comparable published coding
+    # receipt: Grok 4.7 71.0% versus 4.6's 62.1% in the launch table.
+    evidence:
+      - { benchmark: DeepSWE-v1.1, result: 71.0, source: "https://x.ai/news/grok-4-7" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 86.17, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 28.79, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 10.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 73.41, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    rank_exception: >-
+      same hold as grok-4.6, at the same price.
+    coding_tier: high
+    coding_percentile: 0.88
+    context_window: 500000
+    # https://docs.x.ai/developers/grok-4-7
+    effort_levels: [low, medium, high, xhigh]
+    default_quality: 1.74
+    quality: { UiTweak: 1.74, BugFix: 1.74, Feature: 2.63, Refactor: 1.74, Algorithms: 1.74, Architecture: 1.09, Research: 1.14, Writing: 1.74, Ops: 1.09, CodingGeneral: 2.63 }
+  - version: 4.6
+    id: grok-4.6
+    display_name: Grok 4.6
+    cost_rank: 5
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 6.0, cache_read_per_mtok: 0.5 }
+    # DeepSWE: xAI's launch post (high effort). Terminal-Bench: Vals' Terminus 2
+    # run; xAI itself reports no 2.1 result (an earlier 88.4 here had no source).
+    evidence:
+      - { benchmark: DeepSWE-v1.1, result: 65.9, source: "https://x.ai/news/grok-4-6" }
+      - { benchmark: Terminal-Bench-2.1, result: 78.28, source: "https://vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 76.24, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 17.17, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 11.43, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    rank_exception: >-
+      Cheapest frontier on list price ($2/$6) but pinned at rank 5: it is a second company's frontier that hosts name explicitly, the seat is scarce, and a rank matching its price would make it win ordinary `auto` traffic that the Claude and Codex seats already cover.
+    coding_tier: high
+    coding_percentile: 0.88
+    context_window: 256000
+    default_quality: 1.46
+    quality: { UiTweak: 1.46, BugFix: 1.46, Feature: 1.86, Refactor: 1.46, Algorithms: 1.46, Architecture: 1.13, Research: 1.19, Writing: 1.46, Ops: 1.13, CodingGeneral: 1.86 }

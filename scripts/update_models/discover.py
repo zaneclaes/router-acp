@@ -11,8 +11,11 @@ Two adapter kinds today:
     its output. Requires the operator's existing CLI auth; no keys here.
   * `snapshot` — no offline model list exists (claude-agent-acp enumerates over
     an ACP session; codex reads its rollout config), so the configured catalog
-    is the record and drift is a human check. Documented per agent in
-    `data/model-policy.yaml`.
+    is the record and drift is a human check. Declared per provider as
+    `discovery:` in `data/providers/<name>.yaml`.
+
+"Configured" is the provider's live models in its provider file; "known" adds
+its commented-out (retired or parked) entries.
 """
 
 from __future__ import annotations
@@ -230,7 +233,7 @@ def discover(
                 available=list(configured),
                 configured=list(configured),
                 known=list(known),
-                note="no discovery adapter declared in data/model-policy.yaml",
+                note=f"no `discovery:` declared in data/providers/{agent}.yaml",
             )
             continue
         out[agent] = discover_agent(agent, spec, configured, known)
@@ -242,17 +245,31 @@ def load_fixture(
     configured_by_agent: dict[str, list[str]],
     known_by_agent: dict[str, list[str]] | None = None,
 ) -> dict[str, AgentDiscovery]:
-    """Read a recorded discovery result — how the tests drive the pipeline."""
+    """Read a recorded discovery result — how the tests drive the pipeline.
+
+    A fixture records the provider's answer (`available`, `status`); what is
+    configured comes from the live catalog, so a fixture cannot go stale
+    against `data/providers/*.yaml`. A fixture's own `configured` is used only for a
+    provider the catalog does not have. A fixture may state `available`
+    outright, or `releases` / `retires` relative to the catalog (what a probe
+    would return after a provider ships or drops a model).
+    """
     payload = json.loads(path.read_text())
     known_by_agent = known_by_agent or {}
     out: dict[str, AgentDiscovery] = {}
     for agent, spec in (payload.get("agents") or {}).items():
-        configured = list(spec.get("configured") or configured_by_agent.get(agent) or [])
+        configured = list(configured_by_agent.get(agent) or spec.get("configured") or [])
+        if "available" in spec:
+            available = list(spec.get("available") or [])
+        else:
+            retires = set(spec.get("retires") or [])
+            available = [model for model in configured if model not in retires]
+            available += [model for model in spec.get("releases") or [] if model not in available]
         out[agent] = AgentDiscovery(
             agent=agent,
             status=str(spec.get("status", OK)),
             method=str(spec.get("method", "fixture")),
-            available=list(spec.get("available") or []),
+            available=available,
             configured=configured,
             # A fixture records the provider's answer, not the local catalog, so
             # the live catalog's parked ids still suppress duplicate adds.

@@ -1,0 +1,71 @@
+# The kimi provider: the defaults every `kimi` agent inherits (an agent entry in a
+# router config states only what it changes: mappings merge, lists and scalars
+# replace) and the one definition of every kimi model the router supports.
+#
+# `cache_ratio` and `discovery` are not agent settings; the model updater reads
+# them (docs/model-updater.md). `cache_ratio` prices a cache rate a model leaves
+# unset, as a multiple of its input rate. `discovery` is how the live model list
+# is obtained; a model that vanishes from it is commented out for
+# `retire_grace_releases` releases before it is deleted.
+#
+# `models:` groups each family's versions. Each entry is one exact model, scored
+# only on its own evidence:
+#   * `version` (dotted, compared component by component: only the newest
+#     version of a family is chosen automatically unless `pinned_versions`
+#     names an older one) and `id`, the provider's API model id. Never an alias.
+#   * `display_name`, `cost_rank` (1 = cheapest/least scarce .. 5) and
+#     `pricing` (published USD per Mtok).
+#   * `evidence`: its own published results on the benchmarks classifier.yaml
+#     defines, each with its source. `quality` and `default_quality` are
+#     computed from it by scripts/update_models.py and nothing else; a model
+#     with no evidence is unscored and chosen only by an explicit pick.
+#   * `outranks` (models it must beat on every task class; `provider/id` for
+#     another provider) and `rank_exception` (why its cost_rank breaks price
+#     order).
+#   * Wire capabilities the per-request proxy needs: `context_window`,
+#     `max_output_tokens`, `adaptive_thinking`, `effort`, `system_turns`,
+#     `effort_levels` (only the levels the model really has, each sent under
+#     its own name; `effort_mapping` exists only to rename one), plus `coding_tier`/`coding_percentile`.
+provider: kimi
+command:
+  type: stdio
+  command: kimi
+lineage: moonshot
+budget_prompts_5h: 400
+llm_proxy:
+  protocol: openai
+  base_url_env: KIMI_BASE_URL
+  upstream_base_url: https://api.kimi.com/coding/v1
+model_selection:
+  type: spawn-config
+  process_template:
+    args:
+    - --model
+    - ${model_id}
+    - acp
+discovery:
+  retire_grace_releases: 1
+  method: command
+  command: ["kimi", "--version"]
+  probe_only: true
+  note: >-
+    kimi-cli writes the account's model ids into its own config at login;
+    there is no list subcommand, so this only proves the CLI exists.
+models:
+  kimi:
+  - version: 2
+    id: kimi-k2
+    display_name: Kimi K2
+    cost_rank: 2
+    pricing: { input_per_mtok: 0.95, output_per_mtok: 4, cache_read_per_mtok: 0.16 }
+    evidence:
+      - { benchmark: Kimi-SWE-Bench-Verified, result: 65.8, source: "https://github.com/MoonshotAI/Kimi-K2" }
+      - { benchmark: Kimi-TerminalBench, result: 30.0, source: "https://github.com/MoonshotAI/Kimi-K2" }
+      - { benchmark: SWE-Bench-Pro, result: 27.67, source: "https://labs.scale.com/leaderboard/swe_bench_pro_public" }
+    rank_exception: >-
+      Cheapest model in the catalog on list price, held at rank 2 rather than 1: it is a mid-tier worker (roughly sonnet-tier coding), not a haiku-class small model, and rank 1 would pull trivial traffic off seats whose flat-rate budget is already paid for.
+    coding_tier: high
+    coding_percentile: 0.78
+    context_window: 256000
+    default_quality: 1.30
+    quality: { UiTweak: 1.30, BugFix: 1.11, Feature: 1.11, Refactor: 1.11, Algorithms: 1.30, Architecture: 1.30, Research: 1.30, Writing: 1.30, Ops: 1.30, CodingGeneral: 1.11 }

@@ -1,0 +1,233 @@
+# The claude provider: the defaults every `claude` agent inherits (an agent entry in a
+# router config states only what it changes: mappings merge, lists and scalars
+# replace) and the one definition of every claude model the router supports.
+#
+# `cache_ratio` and `discovery` are not agent settings; the model updater reads
+# them (docs/model-updater.md). `cache_ratio` prices a cache rate a model leaves
+# unset, as a multiple of its input rate. `discovery` is how the live model list
+# is obtained; a model that vanishes from it is commented out for
+# `retire_grace_releases` releases before it is deleted.
+#
+# `models:` groups each family's versions. Each entry is one exact model, scored
+# only on its own evidence:
+#   * `version` (dotted, compared component by component: only the newest
+#     version of a family is chosen automatically unless `pinned_versions`
+#     names an older one) and `id`, the provider's API model id. Never an alias.
+#   * `display_name`, `cost_rank` (1 = cheapest/least scarce .. 5) and
+#     `pricing` (published USD per Mtok).
+#   * `evidence`: its own published results on the benchmarks classifier.yaml
+#     defines, each with its source. `quality` and `default_quality` are
+#     computed from it by scripts/update_models.py and nothing else; a model
+#     with no evidence is unscored and chosen only by an explicit pick.
+#   * `outranks` (models it must beat on every task class; `provider/id` for
+#     another provider) and `rank_exception` (why its cost_rank breaks price
+#     order).
+#   * Wire capabilities the per-request proxy needs: `context_window`,
+#     `max_output_tokens`, `adaptive_thinking`, `effort`, `system_turns`,
+#     `effort_levels` (only the levels the model really has, each sent under
+#     its own name; `effort_mapping` exists only to rename one), plus `coding_tier`/`coding_percentile`.
+provider: claude
+command:
+  type: stdio
+  command: claude-agent-acp
+model_selection:
+  type: config-option
+budget_prompts_5h: 400
+usage_source:
+  type: anthropic-oauth
+llm_proxy:
+  protocol: anthropic
+  base_url_env: ANTHROPIC_BASE_URL
+  upstream_base_url: https://api.anthropic.com
+mode_map:
+  auto: bypassPermissions
+  approve: default
+  chat: plan
+  preclass: plan
+lineage: claude
+cache_ratio: { read: 0.1, write: 1.25 }
+discovery:
+  retire_grace_releases: 1
+  method: snapshot
+  note: >-
+    claude-agent-acp enumerates models over ACP
+    `session/set_config_option` (category `model`), which needs a live
+    adapter session; there is no offline CLI list. Refresh by reading the
+    adapter's model selector.
+models:
+  haiku:
+    # Haiku 5.5 bills prompts over 100K tokens at 5x ($0.50/$2.50). Agent turns
+    # usually exceed that, so routing prices it at the long-prompt rate. 1M
+    # context / 128K output, adaptive thinking and the effort parameter.
+  - version: 5.5
+    id: claude-haiku-5-5
+    display_name: Claude Haiku 5.5
+    cost_rank: 1
+    pricing: { input_per_mtok: 0.5, output_per_mtok: 2.5, cache_read_per_mtok: 0.05, cache_write_per_mtok: 0.625 }
+    evidence:
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 90.44, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 36.36, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 10.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.00
+    quality: { UiTweak: 2.00, BugFix: 2.00, Feature: 2.00, Refactor: 2.00, Algorithms: 2.00, Architecture: 2.00, Research: 1.61, Writing: 2.00, Ops: 2.00, CodingGeneral: 2.00 }
+    # Haiku 4.5 predates adaptive thinking and the effort parameter (a request
+    # carrying either is rejected outright), caps output at 64K and predates
+    # mid-conversation system turns. The proxy forwards every byte but the
+    # model name, so it can never serve a request shaped by a newer model.
+  - version: 4.5
+    id: claude-haiku-4-5
+    display_name: Claude Haiku 4.5
+    cost_rank: 1
+    pricing: { input_per_mtok: 1.0, output_per_mtok: 5.0, cache_read_per_mtok: 0.1, cache_write_per_mtok: 1.25 }
+    evidence:
+      - { benchmark: SWE-Bench-Verified-2025, result: 73.3, source: "https://www.anthropic.com/news/claude-haiku-4-5" }
+      - { benchmark: Terminal-Bench-1, result: 41.75, source: "https://www.anthropic.com/news/claude-haiku-4-5" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 11.39, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-2.1, result: 43.82, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: SWE-Bench-Pro, result: 39.45, source: "https://labs.scale.com/leaderboard/swe_bench_pro_public" }
+    coding_tier: medium
+    coding_percentile: 0.5
+    context_window: 200000
+    max_output_tokens: 64000
+    adaptive_thinking: false
+    effort: false
+    system_turns: false
+    default_quality: 0.82
+    quality: { UiTweak: 0.82, BugFix: 0.99, Feature: 0.82, Refactor: 0.99, Algorithms: 0.82, Architecture: 0.82, Research: 0.82, Writing: 0.82, Ops: 0.82, CodingGeneral: 0.82 }
+  sonnet:
+  - version: 5.5
+    id: claude-sonnet-5-5
+    display_name: Claude Sonnet 5.5
+    cost_rank: 2
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 10.0, cache_read_per_mtok: 0.1, cache_write_per_mtok: 2.5 }
+    # Vals' Terminus 2 run (2026-10-01).
+    evidence:
+      - { benchmark: Terminal-Bench-2.1, result: 83.15, source: "https://vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 92.39, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 64.14, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 47.14, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.66
+    quality: { UiTweak: 2.66, BugFix: 2.66, Feature: 2.66, Refactor: 2.66, Algorithms: 2.66, Architecture: 2.41, Research: 2.66, Writing: 2.66, Ops: 2.41, CodingGeneral: 2.66 }
+  - version: 5
+    id: claude-sonnet-5
+    display_name: Claude Sonnet 5
+    cost_rank: 2
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 10.0, cache_read_per_mtok: 0.2, cache_write_per_mtok: 2.5 }
+    evidence:
+      - { benchmark: SWE-Bench-Pro, result: 63.2, source: "https://www.anthropic.com/news/claude-sonnet-5" }
+      - { benchmark: Terminal-Bench-2.1, result: 80.4, source: "https://www.anthropic.com/news/claude-sonnet-5" }
+      - { benchmark: DeepSWE-v1.1, result: 54.0, source: "https://deepswe.datacurve.ai/" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 81.33, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 10.61, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 5.71, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 74.53, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    coding_tier: high
+    coding_percentile: 0.8
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 1.18
+    quality: { UiTweak: 1.18, BugFix: 1.38, Feature: 1.46, Refactor: 1.38, Algorithms: 1.18, Architecture: 0.95, Research: 0.97, Writing: 1.18, Ops: 0.95, CodingGeneral: 1.46 }
+  opus:
+  - version: 5.5
+    id: claude-opus-5-5
+    display_name: Claude Opus 5.5
+    cost_rank: 4
+    pricing: { input_per_mtok: 4.0, output_per_mtok: 20.0, cache_read_per_mtok: 0.2, cache_write_per_mtok: 5.0 }
+    # Vals' Terminus 2 run (2026-10-01; 79.77 if fallback-assisted tasks count as failures).
+    evidence:
+      - { benchmark: Terminal-Bench-2.1, result: 87.64, source: "https://vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 90.29, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 65.15, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 47.14, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.81
+    quality: { UiTweak: 2.81, BugFix: 2.81, Feature: 2.81, Refactor: 2.81, Algorithms: 2.81, Architecture: 2.81, Research: 2.81, Writing: 2.81, Ops: 2.81, CodingGeneral: 2.81 }
+  - version: 5
+    id: claude-opus-5
+    display_name: Claude Opus 5
+    cost_rank: 4
+    pricing: { input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.5, cache_write_per_mtok: 6.25 }
+    # Claude Opus 5 (card published 2026-07-24). SWE-Bench-Pro comes from the
+    # same system-card table as the Fable 80.0 / Sol 64.6 rows. Terminal-Bench
+    # is Artificial Analysis's independent max-effort run (Vals.ai's harness
+    # reports 84.6 with a refusal-fallback caveat: harness variance, not a
+    # typo). DeepSWE is the public v1.1 leaderboard. No AA-Coding-Agent row:
+    # AA's current index publishes on a points scale that does not map onto
+    evidence:
+      - { benchmark: SWE-Bench-Pro, result: 79.2, source: "https://www.anthropic.com/news/claude-opus-5" }
+      - { benchmark: DeepSWE-v1.1, result: 73.6, source: "https://deepswe.datacurve.ai/" }
+      - { benchmark: Terminal-Bench-2.1, result: 89.1, source: "https://artificialanalysis.ai/evaluations/terminalbench-v2-1" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 88.4, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 53.53, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 27.14, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+      - { benchmark: Terminal-Bench-2.1, result: 84.64, source: "https://www.vals.ai/benchmarks/terminal-bench-2-1" }
+    coding_tier: high
+    coding_percentile: 0.93
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.65
+    quality: { UiTweak: 2.65, BugFix: 3.14, Feature: 2.92, Refactor: 3.14, Algorithms: 2.65, Architecture: 2.65, Research: 2.45, Writing: 2.65, Ops: 2.65, CodingGeneral: 2.92 }
+    # Opus 4.6 predates mid-conversation `role: "system"` turns (Claude Code's
+    # `mid-conversation-system` beta), which Claude Code sends when configured
+    # with a newer alias; `system_turns: false` makes the proxy fold them into
+    # user turns and drop the beta token, instead of a 400 on every session.
+  - version: 4.6
+    id: claude-opus-4-6
+    display_name: Claude Opus 4.6
+    cost_rank: 4
+    pricing: { input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.5, cache_write_per_mtok: 6.25 }
+    # Scale's public leaderboard (mini-swe-agent harness, thinking).
+    evidence:
+      - { benchmark: SWE-Bench-Pro, result: 51.9, source: "https://labs.scale.com/leaderboard/swe_bench_pro_public" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 53.5, source: "https://www.vals.ai/benchmarks/vibe-code" }
+    system_turns: false
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, max]
+    default_quality: 0.50
+    quality: { UiTweak: 0.50, BugFix: 0.50, Feature: 0.50, Refactor: 0.50, Algorithms: 0.50, Architecture: 0.50, Research: 0.50, Writing: 0.50, Ops: 0.50, CodingGeneral: 0.50 }
+  fable:
+  - version: 5.2
+    id: claude-fable-5-2
+    display_name: Claude Fable 5.2
+    cost_rank: 5
+    pricing: { input_per_mtok: 8.0, output_per_mtok: 40.0, cache_read_per_mtok: 0.2, cache_write_per_mtok: 10.0 }
+    evidence:
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 93.77, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 65.15, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 55.71, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 3.09
+    quality: { UiTweak: 3.09, BugFix: 3.09, Feature: 3.09, Refactor: 3.09, Algorithms: 3.09, Architecture: 3.09, Research: 3.09, Writing: 3.09, Ops: 3.09, CodingGeneral: 3.09 }
+  - version: 5.1
+    id: claude-fable-5-1
+    display_name: Claude Fable 5.1
+    cost_rank: 5
+    pricing: { input_per_mtok: 10.0, output_per_mtok: 50.0, cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.5 }
+    # Vals' Terminus 2 run (2026-10-01; 79.03 if fallback-assisted tasks count
+    # as failures). The GPT-5.6 table's 'Fable' rows were Fable 5, released before
+    # 5.1 (2026-09-01), so they are not this model's.
+    evidence:
+      - { benchmark: Terminal-Bench-2.1, result: 85.02, source: "https://vals.ai/benchmarks/terminal-bench-2-1" }
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 90.26, source: "https://www.vals.ai/benchmarks/vibe-code" }
+      - { benchmark: Terminal-Bench-4.0, result: 58.08, source: "https://www.vals.ai/benchmarks/terminal-bench-4" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 40.0, source: "https://www.vals.ai/benchmarks/terminal-bench-science" }
+    coding_tier: high
+    coding_percentile: 0.97
+    context_window: 1000000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.55
+    quality: { UiTweak: 2.55, BugFix: 2.55, Feature: 2.55, Refactor: 2.55, Algorithms: 2.55, Architecture: 2.55, Research: 2.55, Writing: 2.55, Ops: 2.55, CodingGeneral: 2.55 }

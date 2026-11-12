@@ -139,16 +139,18 @@ which factor drove it:
   keywords to a custom `classifier.rules_file`.
 - Wrong family winning → adjust `preference` (small values; 0.05
   recommended) or the per-model `cost_rank`s.
-- A model looks mis-scored → the quality data lives in `data/scores.yaml`
-  (override with `score_table`); patterns are first-match-wins, so specific
-  patterns (`*mini*`) must precede broad ones (`*gpt-5*`).
+- A model looks mis-scored → its evidence and computed quality live in its
+  provider's `data/providers/<name>.yaml` (override with `score_table`). Add
+  the model's own published results to its `evidence` and re-score with the
+  updater below; never copy another model's or version's numbers.
 
 ### Updating the model catalog and scores
 
 Run `./scripts/update_models.py --dry-run` after a model launch, pricing
 change, or quarterly benchmark refresh. The updater discovers provider model
-ids, converts cited benchmark results through the fixed calibrations in
-`data/model-policy.yaml`, validates routing invariants, and writes a reviewable
+ids, converts each model's cited benchmark results through the fixed
+calibrations in `data/classifier.yaml` (`scoring`), validates each provider
+file in `data/providers/` and the declared `outranks` orders, and writes a reviewable
 report without touching the checkout. Use `--apply` only after reviewing that
 report. Goose may research model aliases and benchmark observations, but the
 deterministic updater validates the evidence and owns every YAML edit. See

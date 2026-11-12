@@ -2664,7 +2664,8 @@ flag = 7
             r#"{"claudeAiOauth":{"accessToken":"synced-access","refreshToken":"synced-refresh","expiresAt":4070908800000},"mcpOAuth":{"keep":true}}"#,
         )
         .unwrap();
-        let never = |_, _| async { panic!("a read-only host called the provider's token endpoint") };
+        let never =
+            |_, _| async { panic!("a read-only host called the provider's token endpoint") };
         assert_eq!(
             repair_with_policy(&agent, Some(&failed), never, false).await,
             RepairOutcome::Repaired
