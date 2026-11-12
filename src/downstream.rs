@@ -67,8 +67,9 @@ fn native_claude_code() -> Option<String> {
 ///   a model released today stays unknown until the adapter ships again.
 /// - `ANTHROPIC_CUSTOM_MODEL_OPTION`: for an inference-only login Anthropic's
 ///   model list still carries a Fable row for an older version, which hides
-///   Claude Code's own `fable` row. Claude Code then lists one custom row; it
-///   names the exact model the `fable` candidate sends.
+///   Claude Code's own `fable` row. Claude Code then lists one custom row,
+///   named for the Fable model the catalog chooses for this agent (the pinned
+///   version, else the newest). Every Fable version is selected through it.
 fn claude_code_env(
     agent: &AgentConfig,
     mut env: Vec<(String, String)>,
@@ -80,11 +81,16 @@ fn claude_code_env(
     if !adapter {
         return env;
     }
-    let fable = agent
-        .models
-        .iter()
-        .find(|m| m.id == "fable")
-        .and_then(|m| m.api_model.as_deref());
+    let fable_models = || {
+        agent
+            .models
+            .iter()
+            .filter(|m| m.family.as_deref() == Some("fable"))
+    };
+    let fable = fable_models()
+        .find(|m| m.auto_eligible)
+        .or_else(|| fable_models().next())
+        .map(|m| m.api_model.as_deref().unwrap_or(&m.id));
     for (name, value) in [
         ("CLAUDE_CODE_EXECUTABLE", native),
         ("ANTHROPIC_CUSTOM_MODEL_OPTION", fable),
@@ -581,38 +587,21 @@ async fn probe_target_inner(shared: &Arc<Shared>, key: &ProcessKey) -> ProbeOutc
                 Some(option) => {
                     let values = select_values(&option);
                     let mut routeable = Vec::new();
-                    // Claude has dropped `[1m]` from natively-1M families
-                    // (`opus[1m]` → `opus`); accept either spelling so a
-                    // server-side picker rename cannot empty the pool.
+                    // The catalog decides which models exist. A model is
+                    // flagged missing only when the selector offers no row
+                    // for it and none for its family.
                     for model in &spec.models {
-                        let wanted = model.id.as_str();
-                        if offered_selector_value(&values, wanted, model.api_model.as_deref())
-                            .is_some()
-                        {
+                        if selector_row(&values, model, &spec.models).is_some() {
                             routeable.push(model.id.clone());
                         } else {
-                            if model.auto_eligible {
-                                tracing::error!(
-                                    agent = spec.agent_name,
-                                    model = model.id,
-                                    available = ?values,
-                                    "auto-eligible model not offered by downstream model selector; \
-                                     removing candidate from the pool"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    agent = spec.agent_name,
-                                    model = model.id,
-                                    available = ?values,
-                                    "declared model not offered by downstream model selector; \
-                                     removing candidate from the pool"
-                                );
-                            }
-                            shared.set_model_invalid(
-                                key,
-                                &model.id,
-                                "not offered by downstream model selector",
+                            tracing::warn!(
+                                agent = spec.agent_name,
+                                model = model.id,
+                                available = ?values,
+                                "model selector offers no row for this model or its family; \
+                                 flagging it missing"
                             );
+                            shared.set_model_invalid(key, &model.id, MISSING_FROM_BINARY);
                         }
                     }
                     shared.set_target_model_config_id(key, option.id.clone());
@@ -681,6 +670,30 @@ pub fn offered_selector_value<'a>(
         .chain(api_model.map(str::to_string))
         .find_map(|alias| values.iter().find(|v| **v == alias))
         .map(String::as_str)
+}
+
+/// Why a candidate is flagged missing: its provider binary offers no selector
+/// row for the model or for its family. Advertised as `missing` in
+/// `router.candidate`, never dropped from it.
+pub const MISSING_FROM_BINARY: &str = "Missing from binary";
+
+/// The selector row that serves `model`: its own row (`offered_selector_value`),
+/// else the row of another version of its family. The family row only opens the
+/// session; the per-request proxy puts the model's exact id on the wire, and a
+/// provider that rejects that id cordons the candidate with its reason.
+pub fn selector_row<'a>(
+    values: &'a [String],
+    model: &ModelConfig,
+    models: &[ModelConfig],
+) -> Option<&'a str> {
+    let own = |m: &ModelConfig| offered_selector_value(values, &m.id, m.api_model.as_deref());
+    own(model).or_else(|| {
+        let family = model.family.as_deref()?;
+        models
+            .iter()
+            .filter(|m| m.id != model.id && m.family.as_deref() == Some(family))
+            .find_map(own)
+    })
 }
 
 /// Value to send to a config-option model selector for this catalog entry.
@@ -1003,10 +1016,7 @@ agents:
 
     #[test]
     fn claude_code_env_fills_unset_settings_for_the_claude_adapter() {
-        let cfg = Config::from_yaml(
-            "agents:\n  - name: claude\n    command: {type: stdio, command: /usr/bin/claude-agent-acp}\n    model_selection: {type: config-option}\n    models:\n      - {id: opus, cost_rank: 4, api_model: claude-opus-5-5}\n      - {id: fable, cost_rank: 5, api_model: claude-fable-5-2}\n",
-        )
-        .unwrap();
+        let cfg = Config::from_yaml("agents:\n  - name: claude\n").unwrap();
         let agent = &cfg.agents[0];
         let env = claude_code_env(agent, vec![], Some("/home/u/.local/bin/claude"));
         assert_eq!(
@@ -1037,6 +1047,77 @@ agents:
                 "ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(),
                 "claude-fable-5-2".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn claude_code_env_names_the_pinned_fable_version() {
+        let cfg = Config::from_yaml(
+            "agents:\n  - name: claude\npinned_versions:\n  claude/fable: claude-fable-5-1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_code_env(&cfg.agents[0], vec![], None),
+            [(
+                "ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(),
+                "claude-fable-5-1".to_string()
+            )]
+        );
+    }
+
+    /// The selector a real Claude Code lists (2026-11-12): families by bare
+    /// name, no `fable` row, and the custom row the router asked for.
+    fn claude_selector() -> Vec<String> {
+        [
+            "default",
+            "sonnet",
+            "claude-fable-5-1[1m]",
+            "opus",
+            "haiku",
+            "claude-fable-5-2",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn every_claude_catalog_model_has_a_selector_row() {
+        let cfg = Config::from_yaml("agents:\n  - name: claude\n").unwrap();
+        let models = &cfg.agents[0].models;
+        let values = claude_selector();
+        for model in models {
+            assert!(
+                selector_row(&values, model, models).is_some(),
+                "{} has no selector row",
+                model.id
+            );
+        }
+        let row = |id: &str| {
+            let model = models.iter().find(|m| m.id == id).unwrap();
+            selector_row(&values, model, models).unwrap()
+        };
+        assert_eq!(row("claude-fable-5-2"), "claude-fable-5-2");
+        // An unlisted version opens on its family's row; the proxy sends its id.
+        assert_eq!(row("claude-fable-5-1"), "claude-fable-5-2");
+        assert_eq!(row("claude-opus-4-6"), "opus");
+    }
+
+    #[test]
+    fn a_model_with_no_row_for_itself_or_its_family_has_none() {
+        let cfg = Config::from_yaml("agents:\n  - name: claude\n").unwrap();
+        let models = &cfg.agents[0].models;
+        let fable = models.iter().find(|m| m.id == "claude-fable-5-1").unwrap();
+        // No Fable row at all: another family's row never stands in.
+        let values: Vec<String> = ["default", "sonnet", "opus", "haiku"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(selector_row(&values, fable, models), None);
+        // A model with no family (a custom row) needs its own row.
+        let custom: ModelConfig = serde_yaml::from_str("{id: gpt-5.5, cost_rank: 2}").unwrap();
+        let codex: Vec<String> = ["gpt-6.1-sol", "gpt-5.6-luna"].map(String::from).to_vec();
+        assert_eq!(
+            selector_row(&codex, &custom, std::slice::from_ref(&custom)),
+            None
         );
     }
 

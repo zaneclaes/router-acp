@@ -39,9 +39,9 @@ use crate::config::{
     Config, DisclosureMode, EscalationPath, RouteSelection, SkillRoute, StrategyKind,
 };
 use crate::downstream::{
-    ProcessKey, ProcessTargetSpec, SelectionKind, build_targets, find_model_option,
-    is_auth_required, probe_target, select_values, selector_value_to_send, start_downstream,
-    verify_model_selected,
+    MISSING_FROM_BINARY, ProcessKey, ProcessTargetSpec, SelectionKind, build_targets,
+    find_model_option, is_auth_required, probe_target, select_values, selector_row,
+    selector_value_to_send, start_downstream, verify_model_selected,
 };
 use crate::headroom::HeadroomTracker;
 use crate::relay;
@@ -1739,7 +1739,6 @@ impl Shared {
                 .unwrap()
                 .iter()
                 .filter(|c| c.id.agent == agent.name)
-                .filter(|c| !matches!(c.status, CandidateStatus::Invalid(_)))
                 .map(|c| {
                     let opt =
                         SessionConfigSelectOption::new(c.id.to_string(), c.display_name.clone());
@@ -1775,7 +1774,14 @@ impl Shared {
                                 .collect::<Vec<_>>()
                         );
                     }
-                    if let Some(cordon) = usage_cordons.get(&c.id) {
+                    // A declared model is never dropped from the picker. One the
+                    // provider binary has no row for is flagged so a client can
+                    // show it disabled.
+                    if c.status == CandidateStatus::Invalid(MISSING_FROM_BINARY.to_string()) {
+                        router_meta["missing"] = json!(true);
+                        router_meta["available"] = json!(false);
+                        router_meta["unavailable_reason"] = json!(MISSING_FROM_BINARY);
+                    } else if let Some(cordon) = usage_cordons.get(&c.id) {
                         router_meta["available"] = json!(false);
                         router_meta["unavailable_reason"] = json!(cordon.reason);
                         router_meta["resets_at"] = json!(cordon.resets_at_rfc3339);
@@ -3561,21 +3567,15 @@ pub(crate) async fn open_downstream_session_at(
     let conn = shared.target_conn(&key).ok_or_else(|| {
         AcpError::internal_error().data(format!("no live downstream process for {candidate}"))
     })?;
-    let (selection, config_id, api_model) = {
+    let (selection, config_id, target_models) = {
         let targets = shared.targets.lock().unwrap();
         let t = targets
             .get(&key)
             .ok_or_else(|| AcpError::internal_error().data("target vanished"))?;
-        let api_model = t
-            .spec
-            .models
-            .iter()
-            .find(|m| m.id == candidate.model)
-            .and_then(|m| m.api_model.clone());
         (
             t.spec.selection.clone(),
             t.model_config_id.clone(),
-            api_model,
+            t.spec.models.clone(),
         )
     };
     // Broker entries are streamable HTTP: an adapter that does not advertise
@@ -3674,8 +3674,13 @@ pub(crate) async fn open_downstream_session_at(
         let selector_values = find_model_option(resp.config_options.as_deref().unwrap_or(&[]))
             .map(|option| select_values(&option))
             .unwrap_or_default();
-        let downstream_model =
-            selector_value_to_send(&selector_values, &candidate.model, api_model.as_deref());
+        // A version the selector does not list opens on its family's row.
+        let downstream_model = target_models
+            .iter()
+            .find(|m| m.id == candidate.model)
+            .and_then(|m| selector_row(&selector_values, m, &target_models))
+            .map(str::to_string)
+            .unwrap_or_else(|| selector_value_to_send(&selector_values, &candidate.model, None));
         let set_req = SetSessionConfigOptionRequest::new(
             resp.session_id.clone(),
             config_id.clone(),

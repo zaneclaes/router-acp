@@ -2029,8 +2029,15 @@ fn declared_api_model(
     if let Some(version) = cfg.resolve_version(candidate, version) {
         return Some(version.api_model.clone());
     }
-    cfg.model_config(candidate)
-        .and_then(|model| model.api_model.clone())
+    // A catalog model (it has a `family`) is its exact provider id, so that id
+    // is its declared wire id: a version opened on its family's selector row is
+    // still sent as itself.
+    cfg.model_config(candidate).and_then(|model| {
+        model
+            .api_model
+            .clone()
+            .or_else(|| model.family.is_some().then(|| model.id.clone()))
+    })
 }
 
 fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
@@ -3624,6 +3631,44 @@ agents:
             &aliased_request("claude-opus-5"),
         );
         assert_eq!(decision.model, "claude-opus-5");
+        assert!(!decision.rewrite);
+    }
+
+    /// The shipped Claude catalog: exact provider ids, no `api_model`.
+    fn catalog_claude_shared() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "state_file: {}\nllm_proxy:\n  enabled: true\nagents:\n  - name: claude\n",
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let ids = cfg.agents[0].models.iter().map(|m| m.id.clone()).collect();
+        let shared = Shared::new(cfg).unwrap();
+        shared.set_models_routeable(&ProcessKey("claude".to_string()), ids);
+        (dir, shared)
+    }
+
+    #[test]
+    fn a_version_opened_on_its_family_row_is_sent_as_itself() {
+        let (_dir, shared) = catalog_claude_shared();
+        // Fable 5.1 opens on the Fable 5.2 selector row and Opus 4.6 on `opus`,
+        // so the adapter names the newer model. The wire carries the pick.
+        for (pick, adapter) in [
+            ("claude-fable-5-1", "claude-fable-5-2"),
+            ("claude-opus-4-6", "claude-opus-5-5"),
+        ] {
+            let decision =
+                select_request_model(&shared, &claude_active(pick), &aliased_request(adapter));
+            assert_eq!(decision.model, pick);
+            assert!(decision.rewrite && decision.honors_pin, "{decision:?}");
+        }
+        // The family's current model is already what the adapter sends.
+        let decision = select_request_model(
+            &shared,
+            &claude_active("claude-fable-5-2"),
+            &aliased_request("claude-fable-5-2"),
+        );
+        assert_eq!(decision.model, "claude-fable-5-2");
         assert!(!decision.rewrite);
     }
 

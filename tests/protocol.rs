@@ -1676,7 +1676,7 @@ async fn account_commands_survive_goose_turn_context_block() {
 }
 
 #[tokio::test]
-async fn declared_model_missing_downstream_is_omitted_from_client_options() {
+async fn declared_model_missing_downstream_is_flagged_not_dropped() {
     let state = temp_state_file("missing-model");
     // Config declares m1 and bogus; mock only offers m1.
     let yaml = format!(
@@ -1711,10 +1711,22 @@ async fn declared_model_missing_downstream_is_omitted_from_client_options() {
             values.contains(&"mock/m1".to_string()),
             "values: {values:?}"
         );
-        assert!(
-            !values.contains(&"mock/bogus".to_string()),
-            "values: {values:?}"
-        );
+        // A declared model is never dropped: the one the binary lacks is
+        // listed, flagged missing and unavailable.
+        let bogus = choices
+            .iter()
+            .find(|o| o.value.0.as_ref() == "mock/bogus")
+            .unwrap_or_else(|| panic!("values: {values:?}"));
+        let meta = &bogus.meta.as_ref().expect("meta")["router_acp"];
+        assert_eq!(meta["missing"], true, "meta: {meta}");
+        assert_eq!(meta["available"], false, "meta: {meta}");
+        assert_eq!(meta["unavailable_reason"], "Missing from binary");
+        let m1 = choices
+            .iter()
+            .find(|o| o.value.0.as_ref() == "mock/m1")
+            .unwrap();
+        let meta = &m1.meta.as_ref().expect("meta")["router_acp"];
+        assert!(meta.get("missing").is_none(), "meta: {meta}");
         Ok(())
     })
     .await;
@@ -1803,7 +1815,7 @@ async fn static_unrouteable_error_names_selector_miss() {
         let err = prompt_text(&cx, &sid, "should fail").await.unwrap_err();
         let text = format!("{err}");
         assert!(
-            text.contains("not offered by downstream model selector"),
+            text.contains("Missing from binary"),
             "expected selector-miss reason, got: {text}"
         );
         assert!(
