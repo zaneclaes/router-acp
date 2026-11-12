@@ -897,7 +897,13 @@ pub struct ModelConfig {
     /// scoping and per-request proxy routing — while leaving it explicitly
     /// selectable (`router.candidate`, `[router: candidate=…]`,
     /// `[router: switch=…]`): reachable on purpose, never by accident.
-    #[serde(default = "default_true")]
+    ///
+    /// Derived, never configured (operator, 2026-11-12): only the latest version of each model
+    /// family is auto-eligible (`Config::retire_superseded_versions`), and a user keeps an older
+    /// version in the automatic pool through `pinned_versions`. Not read from or written to YAML,
+    /// so a configured value can neither hide what the rule decided nor switch a family off; an
+    /// `auto_eligible:` key is refused as an unknown field.
+    #[serde(skip, default = "default_true")]
     pub auto_eligible: bool,
     /// Optional API-equivalent pricing. It prices every interposed provider
     /// request and synthesizes ACP-turn `cost_usd` only when the adapter
@@ -2231,8 +2237,13 @@ impl Config {
     fn retire_superseded_versions(&mut self) {
         let pinned: HashSet<&String> = self.pinned_versions.keys().collect();
         for agent in &mut self.agents {
-            let parsed: Vec<(String, Vec<u32>)> =
-                agent.models.iter().map(|m| model_family_version(&m.id)).collect();
+            // A family alias (`opus`) is the version it sends (`api_model: claude-opus-5-5`), so
+            // it supersedes the older pinned ids (`claude-opus-5`) and never the reverse.
+            let parsed: Vec<(String, Vec<u32>)> = agent
+                .models
+                .iter()
+                .map(|m| model_family_version(m.api_model.as_deref().unwrap_or(&m.id)))
+                .collect();
             for (index, model) in agent.models.iter_mut().enumerate() {
                 let (family, version) = &parsed[index];
                 let superseded = !version.is_empty()
@@ -2934,6 +2945,26 @@ agents:
         .unwrap();
         assert!(pinned.auto_eligible(&CandidateId { agent: "codex@one".into(), model: "gpt-5.6-sol".into() }));
         assert!(!pinned.auto_eligible(&CandidateId { agent: "codex@one".into(), model: "gpt-6-sol".into() }));
+        // A family alias is its `api_model` version: `opus` (claude-opus-5-5) supersedes the
+        // older pinned ids and stays eligible itself.
+        let claude = Config::from_yaml("agents:\n- name: claude\n").unwrap();
+        let claude_eligible =
+            |model: &str| claude.auto_eligible(&CandidateId { agent: "claude".into(), model: model.into() });
+        assert!(claude_eligible("opus") && claude_eligible("fable") && claude_eligible("sonnet"));
+        for old in ["claude-opus-5", "claude-opus-4-6", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5"] {
+            assert!(!claude_eligible(old), "{old} is superseded by its family alias");
+        }
+    }
+
+    /// `auto_eligible` is derived, never configured (operator, 2026-11-12): a configured value
+    /// could hide the rule's decision, or, set false on the latest version, switch the family off.
+    #[test]
+    fn auto_eligible_is_not_configurable() {
+        let error = Config::from_yaml(
+            "agents:\n- name: codex\n  models:\n  - { id: gpt-6.1-sol, cost_rank: 5, auto_eligible: false }\n",
+        )
+        .unwrap_err();
+        assert!(error.0.contains("auto_eligible"), "{}", error.0);
     }
 
     #[test]

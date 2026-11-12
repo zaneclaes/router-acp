@@ -11181,8 +11181,20 @@ fn legacy_scores(tag: &str) -> PathBuf {
 
 #[tokio::test]
 async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_never_auto_chosen() {
+    // `auto_eligible` is derived, never configured: the superseded version (`m-1` beside the
+    // newer `m-2`) is the ineligible one. It scores higher, so pure-quality auto would pick it.
     let state = temp_state_file("auto-ineligible");
-    let scores = legacy_scores("auto-ineligible");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-auto-ineligible-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "candidates:\n\
+         \x20 - { pattern: 'a/m-1', default_quality: 3.0 }\n\
+         \x20 - { pattern: 'a/*', default_quality: 1.0 }\n",
+    )
+    .unwrap();
     let yaml = format!(
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
          routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}",
@@ -11190,10 +11202,10 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
         scores.display(),
         agent_yaml_models(
             "a",
-            &["m1", "legacy"],
+            &["m-2", "m-1"],
             &[],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+            "      - { id: m-2, cost_rank: 1 }\n\
+             \x20     - { id: m-1, cost_rank: 1 }\n",
         ),
     );
     run_test(yaml, async |cx, observed| {
@@ -11206,27 +11218,27 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
             .unwrap()
             .to_string();
         let legacy_at = options
-            .find("a/legacy")
-            .unwrap_or_else(|| panic!("a/legacy must be advertised: {options}"));
+            .find("a/m-1")
+            .unwrap_or_else(|| panic!("a/m-1 must be advertised: {options}"));
         assert!(
             options[legacy_at..options.len().min(legacy_at + 400)]
                 .contains("\"auto_eligible\":false"),
-            "a/legacy must carry auto_eligible:false — {options}"
+            "a/m-1 must carry auto_eligible:false — {options}"
         );
-        let m1_at = options.find("a/m1").expect("a/m1 advertised");
+        let m1_at = options.find("a/m-2").expect("a/m-2 advertised");
         assert!(
             !options[m1_at..legacy_at.max(m1_at)].contains("auto_eligible"),
             "an auto-eligible candidate omits the key entirely: {options}"
         );
 
-        // Pure-quality auto would pick `legacy` (quality 3.0 vs 1.0); it must
+        // Pure-quality auto would pick `m-1` (quality 3.0 vs 1.0); it must
         // not even be a candidate.
         let sid = session.session_id.0.to_string();
         prompt_text(&cx, &sid, "implement the feature").await?;
         let routed = agent_text(&observed, &sid);
         assert!(
-            routed.contains("auto → a/m1"),
-            "auto must never choose an auto_eligible:false candidate — {routed}"
+            routed.contains("auto → a/m-2"),
+            "auto must never choose a superseded version — {routed}"
         );
 
         // Explicitly naming it still works.
@@ -11234,15 +11246,15 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
         prompt_text(
             &cx,
             &sid2,
-            "[router: candidate=a/legacy]\nimplement the feature",
+            "[router: candidate=a/m-1]\nimplement the feature",
         )
         .await?;
         let routed2 = agent_text(&observed, &sid2);
         assert!(
-            routed2.contains("static → a/legacy"),
-            "an explicit directive must reach the legacy candidate — {routed2}"
+            routed2.contains("static → a/m-1"),
+            "an explicit directive must reach the superseded version — {routed2}"
         );
-        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "legacy");
+        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "m-1");
         Ok(())
     })
     .await;

@@ -94,9 +94,10 @@ agents:
                      cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 } }
       # A family candidate is the bare family alias (`fable`, `opus`, ...)
       # and sends that family's current model; its display name states the
-      # version. An older version is its own candidate under its exact API id
-      # (`auto_eligible: false`, reachable only by an explicit pick), never a
-      # version swap under another id. No id carries a `[1m]` suffix.
+      # version. An older version is its own candidate under its exact API id,
+      # never a version swap under another id; the alias's `api_model` supersedes
+      # it, so it is reachable only by an explicit pick (or a `pinned_versions`
+      # entry). No id carries a `[1m]` suffix.
       #
       # Claude Opus 5.5 — API id `claude-opus-5-5`. $4/$20 list; cache read is
       # 0.05x input ($0.20). 1M context is its only window.
@@ -114,23 +115,23 @@ agents:
       # Explicit-pick-only older versions. Fable 5.1 keeps its 0.025x ($0.25)
       # cache read; Opus 5 and 4.6 are $5/$25 at the standard 0.1x.
       - { id: claude-fable-5-1, display_name: Claude Fable 5.1, cost_rank: 5,
-          api_model: claude-fable-5-1, auto_eligible: false,
+          api_model: claude-fable-5-1,
           pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
                      cache_read_per_mtok: 0.25, cache_write_per_mtok: 12.50 } }
       - { id: claude-opus-5, display_name: Claude Opus 5, cost_rank: 4,
-          api_model: claude-opus-5, auto_eligible: false,
+          api_model: claude-opus-5,
           pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
                      cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
       - { id: claude-opus-4-6, display_name: Claude Opus 4.6, cost_rank: 4,
-          api_model: claude-opus-4-6, auto_eligible: false,
+          api_model: claude-opus-4-6,
           pricing: { input_per_mtok: 5.00, output_per_mtok: 25.00,
                      cache_read_per_mtok: 0.50, cache_write_per_mtok: 6.25 } }
       - { id: claude-haiku-4-5, display_name: Claude Haiku 4.5, cost_rank: 1,
-          api_model: claude-haiku-4-5, auto_eligible: false,
+          api_model: claude-haiku-4-5,
           pricing: { input_per_mtok: 1.00, output_per_mtok: 5.00,
                      cache_read_per_mtok: 0.10, cache_write_per_mtok: 1.25 } }
       - { id: claude-sonnet-5, display_name: Claude Sonnet 5, cost_rank: 2,
-          api_model: claude-sonnet-5, auto_eligible: false,
+          api_model: claude-sonnet-5,
           pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
                      cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 } }
 
