@@ -369,6 +369,21 @@ fn acknowledge_input(
     Ok(())
 }
 
+/// An input steered into the session's running turn has been delivered: record the receipt and
+/// acknowledge it now. The turn-end reconciliation below never runs for a turn that does not end
+/// (an operator command turn runs for the life of the run), so a steered input stayed pending and
+/// the run a restart adopted replayed every steer ever made into it at once.
+pub fn acknowledge_steered_input(run: &mut PlannerRun, id: &str, sid: &str) {
+    if let Some(input) = run.inputs.get_mut(id) {
+        input.delivered_to.insert(sid.to_string());
+        input.acknowledged = true;
+    }
+    if let Some(wake) = run.wakes.get_mut(&format!("input:{id}")) {
+        wake.acknowledged = true;
+    }
+    run.parent_queue.retain(|queued| queued.input_id != id);
+}
+
 /// Direct/steered input used to remain unacknowledged silently until adoption
 /// recreated it as fresh work. Demand reconciliation at the ordinary turn end.
 pub fn reconcile_delivered_inputs(shared: &Shared, sid: &str) -> Result<(), String> {
