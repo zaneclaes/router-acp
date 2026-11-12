@@ -734,6 +734,13 @@ pub struct Shared {
     pub planner_child_routes:
         Mutex<HashMap<(ProcessKey, String), crate::planner_client::ChildRoute>>,
     pub planner_child_targets: Mutex<HashSet<ProcessKey>>,
+    /// Delegate turns in flight, by the delegate's state-session id
+    /// (`<parent>::delegate-<downstream>`). `send-input` to a delegate steers
+    /// a running child and delivers to an idle one (`crate::session_input`).
+    pub delegate_turns: Mutex<HashMap<String, usize>>,
+    /// Delegates whose `send-input` step is running now, so one wake tick
+    /// never starts a second step for the same child.
+    pub delegate_inputs_in_flight: Mutex<HashSet<String>>,
     /// Per-agent delegate slots for agents with `max_delegates`, beside the
     /// global `delegate_semaphore`.
     pub agent_delegate_slots: HashMap<String, Arc<tokio::sync::Semaphore>>,
@@ -876,6 +883,8 @@ impl Shared {
             turn_progress: Mutex::default(),
             planner_child_routes: Mutex::default(),
             planner_child_targets: Mutex::default(),
+            delegate_turns: Mutex::default(),
+            delegate_inputs_in_flight: Mutex::default(),
             agent_delegate_slots,
             worker_handoffs: Mutex::new(HashMap::new()),
             ticket_cache: Mutex::new(HashMap::new()),

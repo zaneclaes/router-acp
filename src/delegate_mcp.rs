@@ -2628,6 +2628,46 @@ const STALL_QUIET_SECS: i64 = 30 * 60;
 /// but a tool that never reports completion does not hold the turn forever.
 const STALL_OPEN_TOOL_SECS: i64 = 3 * 60 * 60;
 
+/// A delegate turn in flight (`Shared::delegate_turns`), counted for as long
+/// as this guard lives. `send-input` reads it to steer a running child and to
+/// deliver to an idle one.
+struct DelegateTurn {
+    shared: Arc<Shared>,
+    sub_sid: String,
+}
+
+impl DelegateTurn {
+    fn begin(shared: &Arc<Shared>, sub_sid: &str) -> Self {
+        *shared
+            .delegate_turns
+            .lock()
+            .unwrap()
+            .entry(sub_sid.to_string())
+            .or_default() += 1;
+        Self {
+            shared: shared.clone(),
+            sub_sid: sub_sid.to_string(),
+        }
+    }
+}
+
+impl Drop for DelegateTurn {
+    fn drop(&mut self) {
+        let mut turns = self.shared.delegate_turns.lock().unwrap();
+        if let Some(count) = turns.get_mut(&self.sub_sid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                turns.remove(&self.sub_sid);
+            }
+        }
+    }
+}
+
+/// Whether a turn of the delegate `sub_sid` is running now.
+pub(crate) fn delegate_turn_running(shared: &Shared, sub_sid: &str) -> bool {
+    shared.delegate_turns.lock().unwrap().contains_key(sub_sid)
+}
+
 /// Send one delegate prompt and wait for its reply, unless the sub-session
 /// goes silent past the stall limits. Then the turn is cancelled and fails
 /// with the reason, so its planner attempt ends and wakes the parent instead
@@ -2641,6 +2681,7 @@ async fn prompt_unless_stalled(
     parent_sid: &str,
     planner_parent: Option<&str>,
 ) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
+    let _turn = DelegateTurn::begin(shared, sub_sid);
     let downstream_sid = prompt.session_id.clone();
     let unavailable = |reason: String| {
         AcpError::internal_error().data(json!({
