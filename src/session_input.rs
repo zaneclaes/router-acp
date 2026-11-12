@@ -8,6 +8,10 @@
 //! once (`_session/steering`, when the adapter accepts it), otherwise the
 //! message waits for the next idle boundary. No adapter is spawned, no
 //! session is taken over, and no provider credential is read.
+//!
+//! A delegate (`<parent>::delegate-<id>`, a planner worker included) takes
+//! `send-input` too: the router that runs its parent delivers it through
+//! `crate::delegate_message` (see `tick_delegates`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -66,6 +70,16 @@ pub struct SessionInput {
     /// only the headline (`external_message::announce`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announced: bool,
+    /// A delegate's input only: `--interrupt` could not be steered, so the
+    /// router cancelled the child's running turn. The delivery that follows
+    /// is recorded as `interrupted`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled_turn: bool,
+    /// A delegate's input only: the planner assignment (`work_id`) the child
+    /// worked on when its turn was cancelled. A cancelled first turn closes
+    /// the child's session, so the input goes to that assignment instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
     #[serde(skip)]
     pub revision: u64,
 }
@@ -152,11 +166,23 @@ fn save(store: &StateStore, sid: &str, id: &str, input: &mut SessionInput) -> Re
     Ok(())
 }
 
+/// The parent router session of a delegate's state row (`<parent>::delegate-<id>`).
+pub fn delegate_parent(sid: &str) -> Option<&str> {
+    sid.split_once("::delegate-")
+        .filter(|(parent, child)| !parent.is_empty() && !child.is_empty())
+        .map(|(parent, _)| parent)
+}
+
+/// `--cwd` must name the session's checkout. A delegate also accepts its
+/// parent's, which is the checkout its sender (the parent) knows.
 fn check_cwd(store: &StateStore, sid: &str, cwd: &Path) -> Result<(), String> {
     let session = store.get(sid).ok_or("router session missing")?;
-    if session.cwd.canonicalize().map_err(|e| e.to_string())?
-        != cwd.canonicalize().map_err(|e| e.to_string())?
-    {
+    let wanted = cwd.canonicalize().map_err(|e| e.to_string())?;
+    let parent_cwd = delegate_parent(sid)
+        .and_then(|parent| store.get(parent))
+        .map(|parent| parent.cwd);
+    let matches = |checkout: &Path| checkout.canonicalize().is_ok_and(|c| c == wanted);
+    if !matches(&session.cwd) && !parent_cwd.as_deref().is_some_and(matches) {
         return Err("session checkout does not match --cwd".into());
     }
     Ok(())
@@ -240,6 +266,8 @@ pub fn send_from(
         claim_started_at_ms: 0,
         sender,
         announced: false,
+        cancelled_turn: false,
+        worker: None,
         revision: 0,
     };
     match save(store, sid, id, &mut input) {
@@ -539,6 +567,307 @@ async fn deliver(
     result.map(|_| ()).map_err(|e| e.to_string())
 }
 
+// ---- delegates (`<parent>::delegate-<id>`) ----
+//
+// A delegate is not a router session of its own, so the wake loop never ticks
+// it. The router that runs the parent does (`tick_delegates`, called for every
+// loaded session), through `crate::delegate_message`'s targets and delivery:
+// a running child is steered; an idle one gets the input as planner worker
+// input or a follow-up turn; with `--interrupt`, a declined steer cancels the
+// child's running turn and the input is delivered once that turn has ended.
+// A child this router does not run keeps its input queued.
+
+/// What `send-input` needs from the delegates this router runs. The router's
+/// is `RouterPort` (`crate::delegate_message`); tests stand in for a child.
+pub(crate) trait DelegatePort {
+    fn runs(&self, parent: &str, child: &str) -> bool;
+    fn busy(&self, child: &str) -> bool;
+    fn work_id(&self, parent: &str, child: &str) -> Option<String>;
+    async fn steer(&self, parent: &str, child: &str, text: &str) -> bool;
+    fn cancel(&self, parent: &str, child: &str) -> bool;
+    /// Deliver to an idle child (or, with `work_id`, to the planner
+    /// assignment whose child session ended). Returns how: `steered`,
+    /// `input` or `turn`.
+    async fn deliver(
+        &self,
+        parent: &str,
+        child: &str,
+        work_id: Option<&str>,
+        text: &str,
+    ) -> Result<String, String>;
+}
+
+struct RouterPort(Arc<Shared>);
+
+impl DelegatePort for RouterPort {
+    fn runs(&self, parent: &str, child: &str) -> bool {
+        crate::delegate_message::runs(&self.0, parent, child)
+    }
+    fn busy(&self, child: &str) -> bool {
+        crate::delegate_mcp::delegate_turn_running(&self.0, child)
+    }
+    fn work_id(&self, parent: &str, child: &str) -> Option<String> {
+        crate::delegate_message::work_id(&self.0, parent, child)
+    }
+    async fn steer(&self, parent: &str, child: &str, text: &str) -> bool {
+        crate::delegate_message::steer_into(&self.0, parent, child, text).await
+    }
+    fn cancel(&self, parent: &str, child: &str) -> bool {
+        crate::delegate_message::cancel_turn(&self.0, parent, child)
+    }
+    async fn deliver(
+        &self,
+        parent: &str,
+        child: &str,
+        work_id: Option<&str>,
+        text: &str,
+    ) -> Result<String, String> {
+        if let Some(work_id) = work_id {
+            crate::delegate_message::worker_input(&self.0, parent, work_id, text).await?;
+            return Ok("input".into());
+        }
+        let reply = crate::delegate_message::deliver_text(&self.0, parent, child, text).await?;
+        Ok(reply["delivery"].as_str().unwrap_or("turn").to_string())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DelegateStep {
+    /// Into the running child turn.
+    Steer,
+    /// At the child's boundary.
+    Deliver,
+}
+
+/// What a delegate's oldest pending input does now. `None` waits: a child
+/// this router does not run (unless an interrupt left its assignment to
+/// deliver to), a running turn already cancelled for it, or a declined steer
+/// not yet due again.
+fn delegate_step(input: &SessionInput, runs: bool, busy: bool, now: i64) -> Option<DelegateStep> {
+    if !runs {
+        return input.worker.is_some().then_some(DelegateStep::Deliver);
+    }
+    if !busy {
+        return Some(DelegateStep::Deliver);
+    }
+    if input.cancelled_turn {
+        return None;
+    }
+    steer_due(input, None, now).then_some(DelegateStep::Steer)
+}
+
+fn update(
+    shared: &Shared,
+    sid: &str,
+    id: &str,
+    change: impl FnOnce(&mut SessionInput),
+) -> Result<(), String> {
+    let state = shared.state.lock().unwrap();
+    let mut current = load(&state, sid, id)?.ok_or("session input vanished")?;
+    change(&mut current);
+    save(&state, sid, id, &mut current)
+}
+
+fn note(shared: &Shared, sid: &str, kind: &str, summary: String) {
+    shared.state.lock().unwrap().log(
+        sid,
+        &crate::state::LogEntry {
+            kind: kind.into(),
+            role: "router".into(),
+            summary,
+            ..Default::default()
+        },
+    );
+}
+
+/// One step for the delegate `child` of `parent`: its oldest pending input is
+/// steered, delivered, or (`--interrupt`, steer declined) the child's turn is
+/// cancelled. `release` runs once the step's bookkeeping is saved, before
+/// any wait on the child. Returns what happened, for the log and tests.
+pub(crate) async fn step_delegate<P: DelegatePort>(
+    shared: &Shared,
+    port: &P,
+    parent: &str,
+    child: &str,
+    release: impl FnOnce(),
+) -> Option<&'static str> {
+    let now = chrono::Utc::now().timestamp();
+    let pending = {
+        let state = shared.state.lock().unwrap();
+        load_all(&state, child)
+    };
+    let (id, mut input) = match pending {
+        Ok(all) => all.into_iter().find(|(id, input)| {
+            !input.resolved() && input.retry_after <= now && !input.claim_alive(id)
+        })?,
+        Err(error) => {
+            tracing::warn!(session = child, %error, "delegate inputs unreadable");
+            return None;
+        }
+    };
+    let runs = port.runs(parent, child);
+    let busy = runs && port.busy(child);
+    let step = delegate_step(&input, runs, busy, now)?;
+    let text = crate::planner_input::framed(input.sender.as_deref(), input.interrupt, &input.text);
+    match step {
+        DelegateStep::Steer => {
+            input.steer_attempted = true;
+            input.steer_attempted_at = now;
+            if let Err(error) = save(&shared.state.lock().unwrap(), child, &id, &mut input) {
+                tracing::warn!(session = child, %error, "delegate input steer attempt not recorded");
+                return None;
+            }
+            release();
+            if port.steer(parent, child, &text).await {
+                let at = chrono::Utc::now().timestamp_millis();
+                if let Err(error) = update(shared, child, &id, |current| {
+                    current.delivered_at_ms = Some(at);
+                    current.acknowledged_at_ms = Some(at);
+                    current.delivery = Some("steered".into());
+                }) {
+                    tracing::warn!(session = child, %error, "steered delegate input not recorded");
+                }
+                note(
+                    shared,
+                    child,
+                    "session_input_steer",
+                    format!("send-input {id}: steered into the running delegate turn"),
+                );
+                return Some("steered");
+            }
+            if !input.interrupt {
+                note(
+                    shared,
+                    child,
+                    "session_input_steer",
+                    format!("send-input {id}: steering declined; delivered at the turn's end"),
+                );
+                return Some("declined");
+            }
+            // `--interrupt`: the sender needs the child redirected now and its
+            // agent cannot take the message mid-turn. End the running turn (as
+            // a parent's cancel ends its delegates'); the input is delivered
+            // once it has ended. A cancelled first turn closes the child's
+            // session, so keep its planner assignment to deliver to.
+            let work_id = port.work_id(parent, child);
+            if let Err(error) = update(shared, child, &id, |current| {
+                current.cancelled_turn = true;
+                current.worker = work_id;
+            }) {
+                tracing::warn!(session = child, %error, "delegate interrupt not recorded");
+                return None;
+            }
+            let cancelled = port.cancel(parent, child);
+            note(
+                shared,
+                child,
+                "session_input_interrupt",
+                format!(
+                    "send-input {id}: steering declined; interrupt cancelled the running delegate turn (sent={cancelled})"
+                ),
+            );
+            Some("cancelled")
+        }
+        DelegateStep::Deliver => {
+            let (pid, started) = planner_workflow::process_identity();
+            input.claim_pid = pid;
+            input.claim_started_at_ms = started;
+            input.deliveries += 1;
+            input.retry_after = now + crate::planner_guard::wake_retry_secs(input.deliveries);
+            if let Err(error) = save(&shared.state.lock().unwrap(), child, &id, &mut input) {
+                tracing::warn!(session = child, %error, "delegate input claim not saved");
+                return None;
+            }
+            release();
+            let work_id = if runs { None } else { input.worker.as_deref() };
+            let result = port.deliver(parent, child, work_id, &text).await;
+            let at = chrono::Utc::now().timestamp_millis();
+            let interrupted = input.cancelled_turn;
+            let outcome = result.as_ref().map(|how| {
+                if interrupted {
+                    "interrupted".to_string()
+                } else {
+                    how.clone()
+                }
+            });
+            if let Err(error) = update(shared, child, &id, |current| {
+                if current.claim_pid != input.claim_pid
+                    || current.claim_started_at_ms != input.claim_started_at_ms
+                {
+                    return;
+                }
+                current.claim_pid = 0;
+                if let Ok(how) = &outcome {
+                    current.delivered_at_ms = Some(at);
+                    current.acknowledged_at_ms = Some(at);
+                    current.delivery = Some(how.clone());
+                }
+            }) {
+                tracing::warn!(session = child, %error, "delegate input delivery not recorded");
+            }
+            match result {
+                Ok(how) => {
+                    note(
+                        shared,
+                        child,
+                        "session_input_delivery",
+                        format!("send-input {id}: delivered to the delegate ({how})"),
+                    );
+                    Some(if interrupted {
+                        "interrupted"
+                    } else {
+                        "delivered"
+                    })
+                }
+                Err(error) => {
+                    tracing::warn!(session = child, %error, "delegate input remains pending for bounded retry");
+                    Some("failed")
+                }
+            }
+        }
+    }
+}
+
+/// One wake-loop tick for the delegates of `parent`, which this router has
+/// loaded: one step per child with pending `send-input`.
+pub(crate) fn tick_delegates(shared: &Arc<Shared>, parent: &str) {
+    let children = match shared.state.lock().unwrap().delegate_input_sessions(parent) {
+        Ok(children) => children,
+        Err(error) => {
+            tracing::debug!(session = parent, %error, "delegate inputs unreadable");
+            return;
+        }
+    };
+    for child in children {
+        if !shared
+            .delegate_inputs_in_flight
+            .lock()
+            .unwrap()
+            .insert(child.clone())
+        {
+            continue;
+        }
+        let shared = shared.clone();
+        let parent = parent.to_string();
+        tokio::spawn(async move {
+            let port = RouterPort(shared.clone());
+            let release = || {
+                shared
+                    .delegate_inputs_in_flight
+                    .lock()
+                    .unwrap()
+                    .remove(&child);
+            };
+            step_delegate(&shared, &port, &parent, &child, release).await;
+            shared
+                .delegate_inputs_in_flight
+                .lock()
+                .unwrap()
+                .remove(&child);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +891,8 @@ mod tests {
             claim_started_at_ms: 0,
             sender: sender.map(str::to_string),
             announced: false,
+            cancelled_turn: false,
+            worker: None,
             revision: 0,
         }
     }
@@ -605,5 +936,261 @@ mod tests {
                 .text
                 .starts_with("External message to this session (id kill-7;")
         );
+    }
+
+    // ---- delegates ----
+
+    const PARENT: &str = "rtr-parent";
+    const CHILD: &str = "rtr-parent::delegate-down-1";
+
+    /// A child the router may run: whether it is running a turn, whether its
+    /// agent takes a steer, and every call the step made.
+    #[derive(Default)]
+    struct FakeChild {
+        runs: bool,
+        busy: bool,
+        accepts_steer: bool,
+        work_id: Option<String>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeChild {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl DelegatePort for FakeChild {
+        fn runs(&self, _: &str, _: &str) -> bool {
+            self.runs
+        }
+        fn busy(&self, _: &str) -> bool {
+            self.busy
+        }
+        fn work_id(&self, _: &str, _: &str) -> Option<String> {
+            self.work_id.clone()
+        }
+        async fn steer(&self, parent: &str, child: &str, text: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("steer {parent} {child} {text}"));
+            self.accepts_steer
+        }
+        fn cancel(&self, parent: &str, child: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cancel {parent} {child}"));
+            true
+        }
+        async fn deliver(
+            &self,
+            parent: &str,
+            child: &str,
+            work_id: Option<&str>,
+            text: &str,
+        ) -> Result<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("deliver {parent} {child} {work_id:?} {text}"));
+            Ok(if work_id.is_some() { "input" } else { "turn" }.into())
+        }
+    }
+
+    fn shared() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "state_file: {}\nagents:\n  - name: mock\n    command: {{ type: stdio, command: mock-agent }}\n    \
+             model_selection: {{ type: config-option }}\n    models:\n      - {{ id: m, cost_rank: 1 }}\n",
+            dir.path().join("state.db").display(),
+        );
+        let shared = Shared::new(crate::config::Config::from_yaml(&yaml).unwrap()).unwrap();
+        (dir, shared)
+    }
+
+    fn queue(shared: &Shared, id: &str, interrupt: bool) {
+        let mut input = pending(Some("parent session"));
+        input.text = "stop and switch tasks".into();
+        input.interrupt = interrupt;
+        save(&shared.state.lock().unwrap(), CHILD, id, &mut input).unwrap();
+    }
+
+    fn receipt(shared: &Shared, id: &str) -> SessionInputStatus {
+        status(&shared.state.lock().unwrap(), CHILD, id).unwrap()
+    }
+
+    #[test]
+    fn a_delegate_id_names_its_parent() {
+        assert_eq!(delegate_parent(CHILD), Some(PARENT));
+        assert_eq!(delegate_parent(PARENT), None);
+        assert_eq!(delegate_parent("::delegate-x"), None);
+    }
+
+    #[test]
+    fn a_delegate_input_steers_a_running_child_and_waits_for_a_declined_steer() {
+        let input = pending(None);
+        assert_eq!(
+            delegate_step(&input, true, true, 1_000),
+            Some(DelegateStep::Steer)
+        );
+        assert_eq!(
+            delegate_step(&input, true, false, 1_000),
+            Some(DelegateStep::Deliver)
+        );
+        // Not this router's child: it stays queued.
+        assert_eq!(delegate_step(&input, false, false, 1_000), None);
+        let mut tried = pending(None);
+        tried.steer_attempted = true;
+        tried.steer_attempted_at = 1_000;
+        assert_eq!(delegate_step(&tried, true, true, 1_030), None);
+        let mut cancelled = pending(None);
+        cancelled.cancelled_turn = true;
+        assert_eq!(delegate_step(&cancelled, true, true, 1_000), None);
+        cancelled.worker = Some("work-1".into());
+        assert_eq!(
+            delegate_step(&cancelled, false, false, 1_000),
+            Some(DelegateStep::Deliver)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_child_is_steered_with_the_sender_frame() {
+        let (_dir, shared) = shared();
+        queue(&shared, "redirect-1", false);
+        assert_eq!(
+            shared
+                .state
+                .lock()
+                .unwrap()
+                .delegate_input_sessions(PARENT)
+                .unwrap(),
+            vec![CHILD.to_string()]
+        );
+        let child = FakeChild {
+            runs: true,
+            busy: true,
+            accepts_steer: true,
+            ..Default::default()
+        };
+        let outcome = step_delegate(&shared, &child, PARENT, CHILD, || {}).await;
+        assert_eq!(outcome, Some("steered"));
+        let calls = child.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].starts_with(&format!(
+            "steer {PARENT} {CHILD} External monitor message from parent session"
+        )));
+        assert!(calls[0].ends_with("stop and switch tasks"));
+        let receipt = receipt(&shared, "redirect-1");
+        assert!(receipt.delivered && receipt.acknowledged && !receipt.queued);
+        assert_eq!(receipt.delivery.as_deref(), Some("steered"));
+        assert!(
+            shared
+                .state
+                .lock()
+                .unwrap()
+                .delegate_input_sessions(PARENT)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_child_gets_the_input_at_its_boundary() {
+        let (_dir, shared) = shared();
+        queue(&shared, "redirect-2", false);
+        let child = FakeChild {
+            runs: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            step_delegate(&shared, &child, PARENT, CHILD, || {}).await,
+            Some("delivered")
+        );
+        let calls = child.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].starts_with(&format!("deliver {PARENT} {CHILD} None ")));
+        let receipt = receipt(&shared, "redirect-2");
+        assert!(receipt.delivered && receipt.acknowledged);
+        assert_eq!(receipt.delivery.as_deref(), Some("turn"));
+    }
+
+    #[tokio::test]
+    async fn a_declined_steer_without_interrupt_waits_for_the_boundary() {
+        let (_dir, shared) = shared();
+        queue(&shared, "redirect-3", false);
+        let child = FakeChild {
+            runs: true,
+            busy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            step_delegate(&shared, &child, PARENT, CHILD, || {}).await,
+            Some("declined")
+        );
+        // Not retried within the interval, never cancelled.
+        assert_eq!(
+            step_delegate(&shared, &child, PARENT, CHILD, || {}).await,
+            None
+        );
+        assert_eq!(child.calls().len(), 1);
+        assert!(receipt(&shared, "redirect-3").queued);
+    }
+
+    #[tokio::test]
+    async fn a_child_this_router_does_not_run_keeps_its_input_queued() {
+        let (_dir, shared) = shared();
+        queue(&shared, "redirect-4", true);
+        let child = FakeChild::default();
+        assert_eq!(
+            step_delegate(&shared, &child, PARENT, CHILD, || {}).await,
+            None
+        );
+        assert!(child.calls().is_empty());
+        assert!(receipt(&shared, "redirect-4").queued);
+    }
+
+    /// `--interrupt` to a planner delegate whose agent declines the steer: the router
+    /// cancels its running turn, then delivers the input to the same planner
+    /// assignment once the cancelled first turn closed the child's session.
+    #[tokio::test]
+    async fn an_interrupt_cancels_a_running_child_that_declines_the_steer() {
+        let (_dir, shared) = shared();
+        queue(&shared, "redirect-5", true);
+        let running = FakeChild {
+            runs: true,
+            busy: true,
+            work_id: Some("work-7".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            step_delegate(&shared, &running, PARENT, CHILD, || {}).await,
+            Some("cancelled")
+        );
+        let calls = running.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[0].starts_with("steer ")
+                && calls[0].contains(crate::planner_input::INTERRUPT_NOTICE)
+        );
+        assert_eq!(calls[1], format!("cancel {PARENT} {CHILD}"));
+        assert!(receipt(&shared, "redirect-5").queued);
+        // Still running: it is not cancelled twice.
+        assert_eq!(
+            step_delegate(&shared, &running, PARENT, CHILD, || {}).await,
+            None
+        );
+        let closed = FakeChild::default();
+        assert_eq!(
+            step_delegate(&shared, &closed, PARENT, CHILD, || {}).await,
+            Some("interrupted")
+        );
+        let calls = closed.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].starts_with(&format!("deliver {PARENT} {CHILD} Some(\"work-7\") ")));
+        let receipt = receipt(&shared, "redirect-5");
+        assert!(receipt.delivered && receipt.acknowledged);
+        assert_eq!(receipt.delivery.as_deref(), Some("interrupted"));
     }
 }

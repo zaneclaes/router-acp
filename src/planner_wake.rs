@@ -110,6 +110,10 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 .cloned()
                 .collect::<Vec<_>>();
             for sid in ids {
+                // `send-input` to this session's delegates (planner workers
+                // included): they are not router sessions, so the router
+                // that has their parent loaded delivers to them.
+                crate::session_input::tick_delegates(&shared, &sid);
                 let Some(run) = planner_workflow::load(&shared, &sid).ok().flatten() else {
                     // No planner run: the only router-owned delivery this
                     // session takes is `send-input` (`crate::session_input`).

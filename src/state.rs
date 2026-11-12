@@ -663,6 +663,14 @@ impl StateStore {
             .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
     }
 
+    /// The delegates of `parent` (`<parent>::delegate-…`) with an unresolved
+    /// `send-input` document. Delegates live in their parent's file.
+    pub fn delegate_input_sessions(&self, parent: &str) -> Result<Vec<String>, String> {
+        self.with_file(parent, |file| file.delegate_input_sessions(parent))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(parent).to_string()))
+    }
+
     /// Every `send-input` document of a session, oldest first.
     pub fn session_inputs(
         &self,
@@ -1850,6 +1858,27 @@ impl StateFile {
                     .map_err(|error| error.to_string())
             })
             .transpose()
+    }
+
+    fn delegate_input_sessions(&self, parent: &str) -> Result<Vec<String>, String> {
+        let prefix = format!("{parent}::delegate-");
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT session_id FROM session_inputs \
+                 WHERE substr(session_id, 1, ?2) = ?1 \
+                 AND json_extract(document, '$.acknowledged_at_ms') IS NULL \
+                 AND json_extract(document, '$.withdrawn') IS NULL \
+                 ORDER BY session_id",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![prefix, prefix.chars().count() as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     /// Every input ever sent to `sid`, oldest first (insertion order, which

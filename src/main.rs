@@ -292,12 +292,18 @@ enum Command {
     /// Send an agent-origin message to any active router session, or inspect
     /// its delivery receipt. A planner parent takes it through its durable run
     /// queue; any other session gets a router-owned turn at its next idle
-    /// boundary (or one steer into a running turn). Does not start or take
-    /// over a session. `planner-input` remains an alias.
+    /// boundary (or one steer into a running turn). A delegate session
+    /// (`<parent>::delegate-<id>`) is steered while it runs and gets the
+    /// message at its next boundary otherwise, delivered by the router that
+    /// runs its parent. Does not start or take over a session. `planner-input`
+    /// remains an alias.
     #[command(name = "send-input", alias = "planner-input")]
     SendInput {
         #[arg(long, default_value = "~/.local/state/router-acp/sessions.db")]
         state: PathBuf,
+        /// The router session, or a delegate session's state row
+        /// `<parent>::delegate-<id>` (the id `state-query delegates` reports).
+        /// For a delegate, --cwd may name its own checkout or its parent's.
         #[arg(long)]
         session: String,
         /// Stable caller-chosen id; retrying the same id never duplicates input.
@@ -316,6 +322,10 @@ enum Command {
         /// Steer into a planner parent's running turn at once, even while its
         /// tool calls run (a native steer may abort an edit) and inside the
         /// operator's `/implement` turn. Use only when the parent must act now.
+        /// For a delegate (`<parent>::delegate-<id>`): steer into its running
+        /// turn at once, even mid tool call; if its agent declines, cancel
+        /// that turn and deliver the message as its next turn or input. Any
+        /// other session: a declined steer cancels the running turn too.
         #[arg(long, requires = "message_file")]
         interrupt: bool,
         /// Read delivery/acknowledgment metadata without modifying state.
