@@ -1307,6 +1307,23 @@ pub struct PlannerModelBoost {
     pub planning: f64,
 }
 
+/// A model id split into its family (the id without its version numbers) and its version:
+/// `gpt-5.6-sol` → (`gpt-sol`, [5, 6]), `grok-4.7` → (`grok`, [4, 7]), `claude-fable-5-1` →
+/// (`claude-fable`, [5, 1]), `opus` → (`opus`, []). Versions compare component-wise.
+pub fn model_family_version(id: &str) -> (String, Vec<u32>) {
+    let mut family = Vec::new();
+    let mut version = Vec::new();
+    for token in id.split('-') {
+        let parts: Vec<_> = token.split('.').map(str::parse::<u32>).collect();
+        if !token.is_empty() && parts.iter().all(Result::is_ok) {
+            version.extend(parts.into_iter().map(Result::unwrap));
+        } else {
+            family.push(token);
+        }
+    }
+    (family.join("-"), version)
+}
+
 fn default_planning_candidates() -> Vec<String> {
     // Everyday planning is Opus (currently 5.5) and Sol. Fable/Astra stay in
     // the pool so auto's apex_complexity (pure quality) can reach them for
@@ -2200,8 +2217,31 @@ impl Config {
                 }
             }
         }
+        cfg.retire_superseded_versions();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Only the latest version of each model family is chosen automatically: a model whose
+    /// agent also declares a newer version of the same family (`gpt-5.6-sol` beside
+    /// `gpt-6.1-sol`, `grok-4.6` beside `grok-4.7`) becomes explicit-selection only, unless the
+    /// user pinned that candidate in `pinned_versions`. 2026-11-12: implement workers were routed
+    /// to gpt-5.6-sol while gpt-6.1-sol shipped beside it, because model scores match a family
+    /// pattern and the older version scored the same while costing less.
+    fn retire_superseded_versions(&mut self) {
+        let pinned: HashSet<&String> = self.pinned_versions.keys().collect();
+        for agent in &mut self.agents {
+            let parsed: Vec<(String, Vec<u32>)> =
+                agent.models.iter().map(|m| model_family_version(&m.id)).collect();
+            for (index, model) in agent.models.iter_mut().enumerate() {
+                let (family, version) = &parsed[index];
+                let superseded = !version.is_empty()
+                    && parsed.iter().any(|(other, newer)| other == family && newer > version);
+                if superseded && !pinned.contains(&format!("{}/{}", agent.name, model.id)) {
+                    model.auto_eligible = false;
+                }
+            }
+        }
     }
 
     /// `yaml` reduced to the values that differ from router-acp's defaults:
@@ -2861,6 +2901,39 @@ agents:
         display_name: Claude Sonnet
         cost_rank: 2
 "#
+    }
+
+    #[test]
+    fn model_family_version_separates_the_family_from_its_version() {
+        assert_eq!(model_family_version("gpt-5.6-sol"), ("gpt-sol".into(), vec![5, 6]));
+        assert_eq!(model_family_version("grok-4.7"), ("grok".into(), vec![4, 7]));
+        assert_eq!(model_family_version("claude-fable-5-1"), ("claude-fable".into(), vec![5, 1]));
+        assert_eq!(model_family_version("opus"), ("opus".into(), vec![]));
+    }
+
+    /// 2026-11-12 (operator): "only the latest version of each model is eligible for
+    /// auto-selection (unless the user has pinned a different version)".
+    #[test]
+    fn only_the_latest_version_of_each_model_family_is_auto_eligible() {
+        let cfg = Config::from_yaml("agents:\n- name: codex@one\n- name: grok@two\n").unwrap();
+        let eligible = |agent: &str, model: &str| {
+            cfg.auto_eligible(&CandidateId { agent: agent.into(), model: model.into() })
+        };
+        for old in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-sol"] {
+            assert!(!eligible("codex@one", old), "{old} is superseded and must be explicit-only");
+        }
+        for latest in ["gpt-6-luna", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+            assert!(eligible("codex@one", latest), "{latest} is its family's latest");
+        }
+        assert!(!eligible("grok@two", "grok-4.6"));
+        assert!(eligible("grok@two", "grok-4.7"));
+        // A pinned candidate keeps automatic selection.
+        let pinned = Config::from_yaml(
+            "pinned_versions:\n  codex@one/gpt-5.6-sol: default\nagents:\n- name: codex@one\n",
+        )
+        .unwrap();
+        assert!(pinned.auto_eligible(&CandidateId { agent: "codex@one".into(), model: "gpt-5.6-sol".into() }));
+        assert!(!pinned.auto_eligible(&CandidateId { agent: "codex@one".into(), model: "gpt-6-sol".into() }));
     }
 
     #[test]
