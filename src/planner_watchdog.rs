@@ -26,7 +26,14 @@
 //!    drops) and its adapter process is restarted. Queued operator input then
 //!    runs first and pending wakes after, through the ordinary wake loop. A
 //!    tool call that keeps reporting is progress; one silent for the limit is
-//!    not.
+//!    not. A turn parked on its router-managed background terminals, or
+//!    waiting on the operator, waits on someone else: that time is not
+//!    silence, and the quiet window starts over when the wait ends (live
+//!    2026-11-12: a turn parked 64 minutes was cancelled on the tick after its
+//!    watcher exited, before the resumed adapter sent its first frame).
+//!    An adapter that answers the stall cancel but keeps streaming runs a turn
+//!    no client prompt can see; that counts as ignoring the cancel, and its
+//!    adapter is restarted.
 //! 3. **Adapter without its tools** (every planner parent turn): grok-1.0.70 can
 //!    leave a session with an MCP catalog that stays empty for good (`search_tool`
 //!    answers "still connecting" and `use_tool` answers "Tool not found", for an
@@ -50,6 +57,8 @@ pub struct TurnProgress {
     pub at: Instant,
     /// Actual agent output or tool activity in this prompt, excluding adapter notices.
     pub agent_activity: bool,
+    /// When the last such agent output or tool activity arrived.
+    pub agent_at: Option<Instant>,
     /// When the adapter last reported a result frame attributed to an
     /// autonomous cycle, with nothing after it.
     pub autonomous_result_at: Option<Instant>,
@@ -66,6 +75,7 @@ impl TurnProgress {
         Self {
             at,
             agent_activity: false,
+            agent_at: None,
             autonomous_result_at: None,
             active_tools: BTreeSet::new(),
             tools_seen: false,
@@ -147,7 +157,10 @@ pub fn note_update(shared: &Shared, sid: &str, params: &Value) {
         .entry(sid.to_string())
         .or_insert_with(|| TurnProgress::new(now));
     current.at = now;
-    current.agent_activity |= is_agent_activity(params);
+    if is_agent_activity(params) {
+        current.agent_activity = true;
+        current.agent_at = Some(now);
+    }
     current.autonomous_result_at = autonomous.then_some(now);
     current.note_tool(params);
 }
@@ -334,15 +347,21 @@ where
                 restart_adapter(shared, sid).await;
                 return result;
             }
-            let quiet = quiet_for(shared, sid, started);
             // A turn parked on its router-managed background terminals waits on
             // the router, not the adapter: that wait has its own completion.
+            // An open question waits on the operator. Neither is silence, so
+            // the quiet window starts over when the wait ends.
             let parked = shared
                 .background_interrupts
                 .lock()
                 .unwrap()
                 .contains_key(sid);
-            if quiet >= limit && !parked && !awaiting_operator(shared, sid) {
+            if parked || awaiting_operator(shared, sid) {
+                started = Instant::now();
+                continue;
+            }
+            let quiet = quiet_for(shared, sid, started);
+            if quiet >= limit {
                 break quiet;
             }
         };
@@ -369,7 +388,21 @@ where
         let deadline = tokio::time::Instant::now() + cancel_grace(shared);
         let revived = loop {
             tokio::select! {
-                result = &mut turn => return result,
+                result = &mut turn => {
+                    if detached_after_cancel(shared, sid).await {
+                        tracing::error!(
+                            session = sid,
+                            "stalled planner parent turn answered its cancel but kept running: restarting its adapter"
+                        );
+                        log_notice(
+                            shared,
+                            sid,
+                            "router-acp · stalled parent turn kept running after its cancel: restarting its adapter",
+                        );
+                        restart_adapter(shared, sid).await;
+                    }
+                    return result;
+                }
                 _ = tokio::time::sleep_until(deadline) => break false,
                 _ = tick.tick() => {}
             }
@@ -410,6 +443,33 @@ where
         restart_adapter(shared, sid).await;
         return Ok(PromptResponse::new(StopReason::Cancelled));
     }
+}
+
+/// How long, after a stall-cancelled turn returns, its adapter is watched
+/// for output that no client prompt would carry.
+const DETACH_SETTLE: Duration = Duration::from_secs(5);
+
+/// The stall-cancelled turn just returned. `true` when its adapter keeps
+/// producing agent output anyway: claude-agent-acp can answer the cancel and
+/// still run the cycle it had started (live 2026-11-12, a child that worked
+/// for hours with no open client prompt while every later prompt queued).
+async fn detached_after_cancel(shared: &Shared, sid: &str) -> bool {
+    let returned = Instant::now();
+    let settle = DETACH_SETTLE.min(cancel_grace(shared));
+    while returned.elapsed() < settle {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let detached = shared
+            .turn_progress
+            .lock()
+            .unwrap()
+            .get(sid)
+            .and_then(|p| p.agent_at)
+            .is_some_and(|at| at > returned);
+        if detached {
+            return true;
+        }
+    }
+    false
 }
 
 fn current_pin(shared: &Shared, sid: &str) -> Option<String> {

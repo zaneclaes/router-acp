@@ -51,6 +51,9 @@
 //!   creating the file
 //! - `TEXT:<message>` — stream text before the remaining directives
 //! - `HANG_IGNORING_CANCEL` — go silent forever and ignore `session/cancel`
+//! - `DETACH_ON_CANCEL:<ms>` — go silent until `session/cancel`, answer the
+//!   prompt `cancelled`, then stream `detached-after-cancel` `<ms>` later
+//!   (claude-agent-acp finishing a cycle the cancel did not stop)
 //! - `STALL_IGNORING_CANCEL:<ms>` — go silent for `<ms>`, then run the
 //!   remaining directives as if no `session/cancel` had arrived (a turn the
 //!   stall watchdog cancels that later comes back, e.g. to ask a question)
@@ -538,6 +541,25 @@ async fn run_prompt(
             .unwrap_or(false)
         {
             return responder.respond(PromptResponse::new(StopReason::Cancelled));
+        }
+        if let Some(ms) = line.strip_prefix("DETACH_ON_CANCEL:") {
+            let ms: u64 = ms.parse().unwrap_or(100);
+            while !mock
+                .state
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&session_id)
+                .map(|s| s.cancelled)
+                .unwrap_or(false)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            responder.respond(PromptResponse::new(StopReason::Cancelled))?;
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            mock.log(json!({"event": "detached_output", "sessionId": session_id}));
+            let _ = cx.send_notification(chunk(&session_id, "detached-after-cancel".to_string()));
+            return Ok(());
         }
         if line == "HANG_IGNORING_CANCEL" {
             // A wedged adapter: alive, silent, never answers, ignores cancel.

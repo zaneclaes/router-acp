@@ -232,6 +232,11 @@ struct Observed {
     /// Hold `terminal/wait_for_exit` open until the terminal is killed, like
     /// a long-running watcher.
     hang_terminal_waits: bool,
+    /// Answer `terminal/wait_for_exit` only after this long, like a watcher
+    /// whose condition fires later.
+    terminal_exit_after: Option<Duration>,
+    /// Extra terminal output, after the default `watch-fired` line.
+    terminal_output: Option<String>,
     /// Hold each elicitation answer until this file exists, like a person
     /// who has not answered the question yet.
     elicitation_gate: Option<PathBuf>,
@@ -312,6 +317,7 @@ where
     let o_wait = observed.clone();
     let o_kill = observed.clone();
     let o_release = observed.clone();
+    let o_output = observed.clone();
 
     let client_result = tokio::time::timeout(
         Duration::from_secs(120),
@@ -427,6 +433,15 @@ where
                       cx: ConnectionTo<AgentPeer>| {
                     let observed = o_wait.clone();
                     async move {
+                        let exit_after = observed.lock().unwrap().terminal_exit_after;
+                        if let Some(after) = exit_after {
+                            return cx.spawn(async move {
+                                tokio::time::sleep(after).await;
+                                responder.respond(WaitForTerminalExitResponse::new(
+                                    TerminalExitStatus::new().exit_code(0),
+                                ))
+                            });
+                        }
                         if !observed.lock().unwrap().hang_terminal_waits {
                             return responder.respond(WaitForTerminalExitResponse::new(
                                 TerminalExitStatus::new().exit_code(0),
@@ -477,8 +492,12 @@ where
             .on_receive_request(
                 move |_req: TerminalOutputRequest,
                       responder: Responder<TerminalOutputResponse>,
-                      _cx| async move {
-                    responder.respond(TerminalOutputResponse::new("watch-fired\n", false))
+                      _cx| {
+                    let extra = o_output.lock().unwrap().terminal_output.clone();
+                    async move {
+                        let output = format!("watch-fired\n{}", extra.unwrap_or_default());
+                        responder.respond(TerminalOutputResponse::new(output, false))
+                    }
                 },
                 on_receive_request!(),
             )
@@ -17087,6 +17106,12 @@ async fn a_silent_parent_turn_is_cancelled_released_and_queued_input_runs_next()
             wait_for_mock_event(&log, "hang").await;
             // An operator turn holds the parent, so this input queues.
             prompt_text(&cx, &sid, "TEXT:queued-after-stall").await?;
+            // Its notice comes with its own answer, not with the next turn's text.
+            assert!(
+                agent_text(&observed, &sid).contains("retained for the next parent turn"),
+                "{}",
+                agent_text(&observed, &sid)
+            );
             assert_eq!(
                 router_acp::planner_workflow::load(&shared, &sid)
                     .unwrap()
@@ -17202,6 +17227,118 @@ async fn an_affirmed_goal_ends_and_later_turns_are_ordinary() {
         assert_eq!(prompts_logged(&log), affirmed + 1, "one prompt, no continuation");
         Ok(())
     })
+    .await;
+}
+
+/// The live failure: a parent parked on a router-managed watcher for longer
+/// than `stuck_turn_secs`. The park exempted it, but the quiet clock kept
+/// counting from the last frame before the park, so the tick after the
+/// watcher exited cancelled the turn that was just resuming. Time parked is
+/// not silence: the resumed turn gets a fresh window and runs to its end.
+#[tokio::test]
+async fn a_turn_resuming_from_a_long_background_wait_is_not_a_stall() {
+    let state = temp_state_file("park-not-stall");
+    let log = temp_log("park-not-stall");
+    let repo = planner_wire_repository();
+    // SAFETY: every helper-enabled test uses the same executable.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test_shared(
+        planner_watchdog_yaml(&state, &log, 1, 1),
+        async |cx, observed, _shared| {
+            init_with_terminals(&cx).await?;
+            let sid = cx
+                .send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task()
+                .await?
+                .session_id
+                .0
+                .to_string();
+            prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+            // Parked three times the stuck limit.
+            // Like a real adapter, the resumed turn's first frame comes a
+            // moment after its prompt: here 600 ms, inside the 1 s limit.
+            {
+                let mut observed = observed.lock().unwrap();
+                observed.terminal_exit_after = Some(Duration::from_secs(3));
+                observed.terminal_output = Some("SLEEP:600\nTEXT:resumed-after-park".into());
+            }
+            let resp = tokio::time::timeout(
+                Duration::from_secs(20),
+                prompt_text(&cx, &sid, "BACKGROUND_START:sleep 3"),
+            )
+            .await
+            .expect("the parked turn finishes")?;
+            assert_eq!(resp.stop_reason, StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert!(
+                text.contains("resumed-after-park"),
+                "the turn resumed with the watcher's result: {text}"
+            );
+            assert!(
+                !text.contains("parent turn stalled"),
+                "a background wait is not a stall: {text}"
+            );
+            assert!(
+                !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                "the resumed turn was never cancelled"
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// An adapter that answers the stall cancel and then keeps streaming runs a
+/// turn no client prompt carries (live: a child worked for hours that way,
+/// and every later prompt only queued). The router treats it as ignoring the
+/// cancel: it restarts the adapter, and the next client prompt runs a real
+/// turn on the fresh one.
+#[tokio::test]
+async fn a_stalled_turn_that_keeps_running_after_its_cancel_restarts_its_adapter() {
+    let state = temp_state_file("stall-detached");
+    let log = temp_log("stall-detached");
+    let repo = planner_wire_repository();
+    run_test_shared(
+        planner_watchdog_yaml(&state, &log, 1, 3),
+        async |cx, observed, _shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let initializes = read_log(&log)
+                .iter()
+                .filter(|e| e["event"] == "initialize")
+                .count();
+            let resp = tokio::time::timeout(
+                Duration::from_secs(20),
+                prompt_text(&cx, &sid, "operator: work\nDETACH_ON_CANCEL:300"),
+            )
+            .await
+            .expect("the stalled turn ends")?;
+            assert_eq!(resp.stop_reason, StopReason::Cancelled);
+            assert!(
+                read_log(&log)
+                    .iter()
+                    .any(|e| e["event"] == "detached_output"),
+                "the adapter kept streaming after it answered the cancel"
+            );
+            let text = agent_text(&observed, &sid);
+            assert!(
+                text.contains("kept running after its cancel: restarting its adapter"),
+                "{text}"
+            );
+            assert!(
+                read_log(&log)
+                    .iter()
+                    .filter(|e| e["event"] == "initialize")
+                    .count()
+                    > initializes,
+                "the adapter process was restarted"
+            );
+            let next = prompt_text(&cx, &sid, "TEXT:a-real-turn").await?;
+            assert_eq!(next.stop_reason, StopReason::EndTurn);
+            assert!(agent_text(&observed, &sid).contains("a-real-turn"));
+            wait_for_prompt_index(&log, "a-real-turn").await;
+            Ok(())
+        },
+    )
     .await;
 }
 
