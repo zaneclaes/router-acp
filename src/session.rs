@@ -10336,6 +10336,43 @@ fn on_prompt(
         drop(activity);
         result
     });
+    // A turn parked on its managed terminals has an idle downstream and may
+    // wait for hours. Queued behind it, this prompt answered at once with an
+    // empty turn and waited for the watcher to exit. Hand it to the parked
+    // turn, as `_session/steering` does. A mode command or model switch must
+    // run as its own turn and keeps the paths below.
+    if !routing_control && crate::planner_workflow::command(&req).is_none() {
+        let parked = shared
+            .background_interrupts
+            .lock()
+            .unwrap()
+            .remove(&router_sid);
+        // A wait that ended as this prompt arrived has dropped its receiver;
+        // the prompt then takes the ordinary paths below.
+        if let Some(interrupt) = parked
+            && interrupt
+                .send(BackgroundInterrupt::Steer(req.prompt.clone()))
+                .is_ok()
+        {
+            let recorded =
+                crate::planner_workflow::record_steered_input(&shared, &router_sid, &req)
+                    .and_then(|()| log_user_steer(&shared, &router_sid, &req.prompt));
+            if let Err(error) = recorded {
+                tracing::warn!(session = router_sid, %error, "input handed to a parked turn not recorded");
+            }
+            tracing::info!(
+                session = router_sid,
+                "prompt handed to the turn parked on managed terminals"
+            );
+            notify_user(
+                &shared,
+                &router_sid,
+                "router-acp · your message was handed to the turn waiting on its background terminals",
+            );
+            flush_pending_disclosure(&shared, &router_sid);
+            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        }
+    }
     // Operator input preempts a router-owned planner turn instead of queuing
     // behind it (`planner_preempt`): steered into it, or it is cancelled and
     // this prompt runs as the very next turn.

@@ -1040,6 +1040,64 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
     .await;
 }
 
+/// The live failure: a child parked on a deploy watcher got its parent's
+/// message as an agent-origin `session/prompt`. The router queued it behind
+/// the parked turn and answered at once with an empty turn, so every message
+/// "ended" in 17 ms until the watcher exited. The prompt must reach the
+/// parked turn instead.
+#[tokio::test]
+async fn prompt_reaches_turn_parked_on_managed_background() {
+    let state = temp_state_file("managed-background-prompt");
+    // SAFETY: test-scoped env mutation; identical value in every test.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let pending = park_on_managed_background(&cx, &observed, &sid).await?;
+
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "router_acp".to_string(),
+            serde_json::json!({"agent_origin": true}),
+        );
+        let resp = cx
+            .send_request(
+                PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::from("parent: stop watching".to_string())],
+                )
+                .meta(meta),
+            )
+            .block_task()
+            .await?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+        let resp = tokio::time::timeout(Duration::from_secs(20), pending)
+            .await
+            .expect("the parked turn resumes instead of waiting on its watcher")
+            .expect("prompt task")?;
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("managed background interrupted")
+                && text.contains("parent: stop watching"),
+            "the parked turn must resume with the message, got: {text}"
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.terminal_kills,
+            vec!["managed-terminal-1".to_string()]
+        );
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn cancel_ends_turn_parked_on_managed_background() {
     let state = temp_state_file("managed-background-cancel");
