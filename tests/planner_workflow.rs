@@ -247,6 +247,43 @@ fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
 }
 
 #[test]
+fn a_steered_input_is_acknowledged_in_the_persisted_run_so_a_restart_does_not_replay_it() {
+    // 2026-11-12: every monitor steer into an operator command turn (a turn that never ends) stayed
+    // unacknowledged, and the run a restarted client adopted replayed 168 of them at once.
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner::current());
+        Ok(())
+    })
+    .unwrap();
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    router_acp::planner_input::send(&store, SID, &f.repo, "monitor-steer", "advice").unwrap();
+    router_acp::planner_input::send(&store, SID, &f.repo, "monitor-later", "later advice").unwrap();
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        planner_workflow::acknowledge_steered_input(run, "monitor-steer", SID);
+        Ok(())
+    })
+    .unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let steered = &run.inputs["monitor-steer"];
+    assert!(steered.acknowledged && steered.delivered_to.contains(SID));
+    assert!(run.wakes["input:monitor-steer"].acknowledged);
+    assert!(run.parent_queue.iter().all(|q| q.input_id != "monitor-steer"));
+    // Negative control: an input that was not steered stays pending.
+    assert!(!run.inputs["monitor-later"].acknowledged);
+    assert!(run.parent_queue.iter().any(|q| q.input_id == "monitor-later"));
+    let resend =
+        router_acp::planner_input::send(&store, SID, &f.repo, "monitor-steer", "advice").unwrap();
+    assert!(!resend.queued && resend.delivered && resend.acknowledged);
+}
+
+#[test]
 fn external_monitor_input_is_durable_agent_origin_and_idempotent_after_delivery() {
     let f = fixture(|_| {});
     authorize(&f.shared);

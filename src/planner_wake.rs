@@ -356,6 +356,12 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     ..Default::default()
                 },
             );
+            if let Some(id) = key.strip_prefix("input:") {
+                let _ = planner_workflow::mutate(&shared, &sid, |run| {
+                    planner_workflow::acknowledge_steered_input(run, id, &sid);
+                    Ok(())
+                });
+            }
             if let Some((input_id, sender, message, deliveries)) = &announced {
                 let mut first = false;
                 let _ = planner_workflow::mutate(&shared, &sid, |run| {
