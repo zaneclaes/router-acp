@@ -7784,6 +7784,157 @@ async fn usage_cordon_escape_with_every_claude_seat_capped_follows_the_planner_b
     .await;
 }
 
+/// A planner coordinator on two Claude accounts, each serving Fable and Opus.
+/// Opus is cheaper and close enough in quality that the planner score picks
+/// it for routine coordination; only a human pick puts the session on Fable.
+fn picked_fable_coordinator_yaml(tag: &str) -> String {
+    let state = temp_state_file(tag);
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "version: 1\ncandidates:\n\
+         \x20 - { pattern: \"*fable*\", default_quality: 3.00 }\n\
+         \x20 - { pattern: \"*opus*\", default_quality: 2.90 }\n",
+    )
+    .unwrap();
+    let mut home = agent_yaml("claude@home", &[("fable", 5), ("opus", 3)], &[]);
+    home.push_str("    account_priority: 0\n");
+    let mut main = agent_yaml("claude@main", &[("fable", 5), ("opus", 3)], &[]);
+    main.push_str("    account_priority: 1\n");
+    format!(
+        "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\n\
+         router: planner\nrouters:\n  planner:\n    \
+         planning_candidates: [\"*fable*\", \"*opus*\"]\n    \
+         implementation_candidates: [\"*opus*\"]\n\
+         agents:\n{home}{main}",
+        state.display(),
+        scores.display(),
+    )
+}
+
+fn reserve_cordon(
+    seats: &[CandidateId],
+) -> std::collections::HashMap<CandidateId, router_acp::headroom::UsageCordon> {
+    seats
+        .iter()
+        .map(|seat| {
+            (
+                seat.clone(),
+                router_acp::headroom::UsageCordon {
+                    reason: "5-hour usage limit reached (5% capacity reserved)".to_string(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".to_string(),
+                    soft: true,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The 2026-11-12 coordinator: the owner picked Fable, the account serving it
+/// hit its 5-hour reserve, and the next turn ran on Opus because the planner
+/// score preferred it, while the other account still served Fable. The pick
+/// names the model, so it moves to Fable on the other account and stays a
+/// human pick there.
+#[tokio::test]
+async fn a_coordinator_human_pick_moves_to_another_account_not_to_the_planner_score() {
+    let yaml = picked_fable_coordinator_yaml("pick-beats-score");
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let home_fable = CandidateId::new("claude@home", "fable");
+        let main_fable = CandidateId::new("claude@main", "fable");
+
+        // Control: with Fable on the home account unavailable, the planner
+        // score alone chooses the cheaper Opus.
+        let control = new_coordinator_session(&cx).await?;
+        coordinator_prompt(
+            &cx,
+            &control,
+            "[router: exclude=claude@home/fable]\nReview Sub-tasks",
+        )
+        .await?;
+        assert_eq!(pinned(&shared, &control).model, "opus");
+
+        let sid = new_coordinator_session(&cx).await?;
+        coordinator_prompt(
+            &cx,
+            &sid,
+            "[router: candidate=claude@home/fable]\nReview Sub-tasks",
+        )
+        .await?;
+        assert_eq!(pinned(&shared, &sid), home_fable);
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(reserve_cordon(std::slice::from_ref(&home_fable)));
+        for _ in 0..2 {
+            coordinator_prompt(&cx, &sid, "Review Sub-tasks").await?;
+            let text = agent_text(&observed, &sid);
+            assert_eq!(pinned(&shared, &sid), main_fable, "{text}");
+            assert!(
+                shared.with_session(&sid, |s| s.pin_user_pick).unwrap(),
+                "the moved pick is still the human's: {text}"
+            );
+        }
+        let text = agent_text(&observed, &sid);
+        assert!(!text.contains("echo:opus:"), "a turn ran on Opus: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// A human pick that no account can serve is not replaced silently: the
+/// session says the pick cannot run, the turn routes automatically, and the
+/// session returns to the pick, still a human pick, once its seat recovers.
+#[tokio::test]
+async fn a_human_pick_no_account_can_serve_is_disclosed_and_restored_on_recovery() {
+    let yaml = picked_fable_coordinator_yaml("pick-cannot-run");
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let home_fable = CandidateId::new("claude@home", "fable");
+        let sid = new_coordinator_session(&cx).await?;
+        coordinator_prompt(
+            &cx,
+            &sid,
+            "[router: candidate=claude@home/fable]\nReview Sub-tasks",
+        )
+        .await?;
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(reserve_cordon(&[
+                home_fable.clone(),
+                CandidateId::new("claude@main", "fable"),
+            ]));
+        coordinator_prompt(&cx, &sid, "Review Sub-tasks").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(pinned(&shared, &sid).model, "opus", "{text}");
+        assert!(
+            text.contains("your pick claude@home/fable cannot run"),
+            "the session names the pick it could not honor: {text}"
+        );
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::new());
+        coordinator_prompt(&cx, &sid, "Review Sub-tasks").await?;
+        assert_eq!(pinned(&shared, &sid), home_fable);
+        assert!(shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
 /// A skill-elevated pin escapes inside its skill's candidates, in the
 /// route's own order: `first-match` names m1 before m2, although `auto`
 /// would rank m2 (higher quality, cheaper) first.
@@ -9371,7 +9522,7 @@ async fn native_accounts_fail_over_without_cordoning_the_other_login() {
         )
         .await?;
         assert_eq!(response.stop_reason, StopReason::EndTurn);
-        assert!(agent_text(&observed, &sid).contains("failover: auto → claude@personal/sonnet"));
+        assert!(agent_text(&observed, &sid).contains("failover: static → claude@personal/sonnet"));
         let mut headroom = shared.headroom.lock().unwrap();
         assert!(headroom.cordon_active("claude@work").is_some());
         assert!(headroom.cordon_active("claude@personal").is_none());
@@ -9400,7 +9551,7 @@ async fn provider_terms_gate_fails_over_to_another_native_account() {
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
         assert!(
-            text.contains("failover: auto → claude@ready/"),
+            text.contains("failover: static → claude@ready/"),
             "terms-gated account must fail over: {text}"
         );
         let mut headroom = shared.headroom.lock().unwrap();
@@ -11372,7 +11523,7 @@ agents:
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
         assert!(
-            text.contains("failover: auto → claude@personal/sonnet")
+            text.contains("failover: static → claude@personal/sonnet")
                 && text.contains("echo:sonnet:Fix the login bug"),
             "the failed account resumed on its sibling: {text}"
         );
