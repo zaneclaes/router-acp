@@ -71,9 +71,10 @@ And for `auto`, each candidate carries three numbers:
 
 - **quality** — a benchmark-calibrated 0.5–3.5 score *for the kind of task you
   asked* (roughly 1 minimal, 2 standard, 3 frontier), from a data
-  table ([`data/scores.yaml`](data/scores.yaml), overridable with
-  `score_table:`). Patterns are first-match-wins, so specific patterns
-  (`*mini*`) must come before broad ones (`*gpt-5*`).
+  catalog ([`data/providers/<name>.yaml`](data/providers), overridable with
+  `score_table:`). Each model is one exact API id scored only on its own
+  published benchmark evidence; there are no patterns and no family scores,
+  so a new version is weighed on what it actually changed.
 - **cost rank** — your `models[].cost_rank` (1 = cheapest/least scarce).
   With flat-rate seats this models *scarcity*, not dollars.
 - **headroom** — the lower of the local sliding-window estimate and the
@@ -159,13 +160,11 @@ Two behaviors make `auto` feel smart:
    complexity, ranking goes pure quality (tradeoff forced to 0, demand cap
    bypassed) — the same regime as `cost_quality_tradeoff: 0`, but automatic
    at genuine extremes rather than requiring a global config change. This
-   matters most for a **compressed** score-table pair (see
-   `data/model-policy.yaml`'s `benchmark_scoring.compression`): two peers
-   whose priced tiers differ but whose raw benchmark evidence is within
-   noise get a deliberately tiny (`max_gap`, default 0.02) quality gap so
-   `cost_rank` decides everyday ties — but that gap is too small to survive
-   even a modest cost term, so without the apex carve-out the preferred
-   member would only be reachable via explicit pins or planner globs, never
+   matters most for two peers whose own evidence puts them within a hair of
+   each other while their priced tiers differ: `cost_rank` decides everyday
+   ties, but that gap is too small to survive even a modest cost term, so
+   without the apex carve-out the stronger member would only be reachable
+   via explicit pins or planner globs, never
    by `auto` itself. At the apex, the full (still small but now undiluted)
    gap decides.
 

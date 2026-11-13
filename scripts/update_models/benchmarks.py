@@ -1,24 +1,33 @@
 """Deterministic benchmark-to-quality calibration.
 
-Each benchmark defines three fixed result anchors: the raw result corresponding
-to minimal (1), standard (2), and frontier (3) capability. Results interpolate
-piecewise between those anchors and may extend only to the policy's 0.5..3.5
-guardrails. This keeps model scores stable when the catalog changes.
+Each benchmark in `scoring.benchmarks` defines three fixed result anchors: the
+raw result corresponding to minimal (1), standard (2), and frontier (3)
+capability. Results interpolate piecewise between those anchors and may extend
+only to the 0.5..3.5 guardrails. This keeps model scores stable when the
+catalog changes: adding one model never moves another's calibration.
+
+Every model is scored ONLY on its own `evidence:` (operator, 2026-11-12): no
+row ever takes another model's or another version's numbers, and no row's
+quality is set from another's (there is no compression and no `scored_as`). A
+row with no evidence is unscored — it carries no `quality`, the router gives it
+the neutral default, and the validator lists it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .policy import TASK_CLASSES, Policy, PolicyError
-from . import patterns as pat
+
+if TYPE_CHECKING:
+    from .catalog import Catalog
 
 
 @dataclass(frozen=True)
 class BenchmarkScore:
-    pattern: str
+    key: str
     default_quality: float
     quality: dict[str, float]
     observations: int
@@ -41,98 +50,68 @@ def _calibrate(result: float, anchors: dict[str, Any], band: tuple[float, float]
     return min(band[1], max(band[0], quality))
 
 
-def derive(policy: Policy) -> dict[str, BenchmarkScore]:
-    config = policy.benchmark_scoring
-    definitions = config.get("benchmarks") or {}
-    evidence = config.get("model_evidence") or {}
-    minimum = int(config.get("minimum_task_observations", 2))
-    meaningful = float(config.get("meaningful_task_delta", 0.15))
-    out: dict[str, BenchmarkScore] = {}
+def calibrate_evidence(policy: Policy, key: str, observations: list[dict[str, Any]]) -> BenchmarkScore:
+    """Raw quality from one model's observations."""
+    definitions = policy.benchmarks
+    all_values: list[tuple[float, float]] = []
+    by_class: dict[str, list[tuple[float, float]]] = {name: [] for name in TASK_CLASSES}
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise PolicyError(f"`{key}` evidence entry is not a mapping: {observation!r}")
+        name = observation.get("benchmark")
+        definition = definitions.get(name)
+        if not definition:
+            raise PolicyError(f"`{key}` references unknown benchmark `{name}`")
+        if not observation.get("source"):
+            raise PolicyError(f"`{key}` benchmark `{name}` has no source")
+        value = _calibrate(float(observation["result"]), definition.get("anchors") or {}, policy.quality_band)
+        weight = float(observation.get("weight", definition.get("weight", 1.0)))
+        all_values.append((value, weight))
+        for task_class in definition.get("task_classes") or []:
+            if task_class not in by_class:
+                raise PolicyError(f"benchmark `{name}` has unknown task class `{task_class}`")
+            by_class[task_class].append((value, weight))
 
-    for pattern, observations in evidence.items():
-        all_values: list[tuple[float, float]] = []
-        by_class: dict[str, list[tuple[float, float]]] = {name: [] for name in TASK_CLASSES}
-        for observation in observations:
-            name = observation.get("benchmark")
-            definition = definitions.get(name)
-            if not definition:
-                raise PolicyError(f"`{pattern}` references unknown benchmark `{name}`")
-            if not observation.get("source"):
-                raise PolicyError(f"`{pattern}` benchmark `{name}` has no source")
-            value = _calibrate(
-                float(observation["result"]),
-                definition.get("anchors") or {},
-                policy.quality_band,
-            )
-            weight = float(observation.get("weight", definition.get("weight", 1.0)))
-            all_values.append((value, weight))
-            for task_class in definition.get("task_classes") or []:
-                if task_class not in by_class:
-                    raise PolicyError(f"benchmark `{name}` has unknown task class `{task_class}`")
-                by_class[task_class].append((value, weight))
+    if not all_values:
+        raise PolicyError(f"`{key}` has no benchmark observations")
 
-        if not all_values:
-            raise PolicyError(f"`{pattern}` has no benchmark observations")
+    def mean(values: list[tuple[float, float]]) -> float:
+        total_weight = sum(weight for _, weight in values)
+        return sum(value * weight for value, weight in values) / total_weight
 
-        def mean(values: list[tuple[float, float]]) -> float:
-            total_weight = sum(weight for _, weight in values)
-            return sum(value * weight for value, weight in values) / total_weight
+    quantum = Decimal(str(policy.round_to))
 
-        quantum = Decimal(str(policy.round_to))
+    def rounded(value: float) -> float:
+        return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
 
-        def rounded(value: float) -> float:
-            return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
-
-        base = rounded(mean(all_values))
-        quality = {task_class: base for task_class in TASK_CLASSES}
-        for task_class, values in by_class.items():
-            if len(values) < minimum:
-                continue
-            candidate = rounded(mean(values))
-            if abs(candidate - base) + 1e-9 >= meaningful:
-                quality[task_class] = candidate
-        out[pattern] = BenchmarkScore(
-            pattern=pattern,
-            default_quality=base,
-            quality=quality,
-            observations=len(all_values),
-        )
-    _apply_compression(config, out)
-    return out
+    base = rounded(mean(all_values))
+    quality = {task_class: base for task_class in TASK_CLASSES}
+    for task_class, values in by_class.items():
+        if len(values) < policy.minimum_task_observations:
+            continue
+        candidate = rounded(mean(values))
+        if abs(candidate - base) + 1e-9 >= policy.meaningful_task_delta:
+            quality[task_class] = candidate
+    return BenchmarkScore(key=key, default_quality=base, quality=quality, observations=len(all_values))
 
 
-def _apply_compression(config: dict[str, Any], scores: dict[str, BenchmarkScore]) -> None:
-    """Pin declared same-tier peers `max_gap` below their preferred member.
+@dataclass
+class Scored:
+    """Every live row's computed quality."""
 
-    Peers whose benchmark gaps sit inside measurement noise must not let a
-    small, unreliable per-class delta out-vote a real price difference in
-    cost-aware routing. Policy declares the pair and its order; the `behind`
-    member's per-class output is superseded (its raw observations stay in the
-    evidence log), leaving a deterministic `max_gap` residual so ordering-
-    sensitive paths still resolve to `ahead`.
-    """
-    compression = config.get("compression") or {}
-    gap = float(compression.get("max_gap", 0.02))
-    for pair in compression.get("pairs") or []:
-        ahead_pattern, behind_pattern = pair.get("ahead"), pair.get("behind")
-        ahead = scores.get(ahead_pattern)
-        behind = scores.get(behind_pattern)
-        if ahead is None or behind is None:
-            missing = behind_pattern if ahead is not None else ahead_pattern
-            raise PolicyError(
-                f"compression pair references `{missing}`, which has no benchmark evidence"
-            )
-        scores[behind_pattern] = BenchmarkScore(
-            pattern=behind.pattern,
-            default_quality=round(ahead.default_quality - gap, 2),
-            quality={
-                task_class: round(score - gap, 2)
-                for task_class, score in ahead.quality.items()
-            },
-            observations=behind.observations,
-        )
+    # row key -> quality computed from that row's own evidence
+    rows: dict[str, BenchmarkScore]
+    # rows with no evidence of their own: unscored by design, never copied
+    unscored: list[str]
 
 
-def resolve_profile(profiles: dict[str, BenchmarkScore], candidate: str) -> str | None:
-    """Resolve benchmark patterns by specificity, independent of YAML order."""
-    return pat.resolve(pat.sorted_by_specificity(list(profiles)), candidate)
+def score_rows(policy: Policy, models: "Catalog") -> Scored:
+    """Compute every live row's quality from its own `evidence`, and nothing else."""
+    rows: dict[str, BenchmarkScore] = {}
+    unscored: list[str] = []
+    for row in models.rows:
+        if row.evidence:
+            rows[row.key] = calibrate_evidence(policy, row.key, row.evidence)
+        else:
+            unscored.append(row.key)
+    return Scored(rows=rows, unscored=unscored)

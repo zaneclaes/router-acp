@@ -1,34 +1,10 @@
 {
-  "_comment": "Synthetic release: Anthropic ships a new frontier alias `opus-next[1m]` and retires nothing. Exercises the add path — a new model must land commented-out with a proposed curve and a suggested rank, WITHOUT collapsing the existing rank ladder to pure quality-max.",
-  "generated_at": "2026-07-26",
+  "_comment": "Synthetic release: Anthropic ships `opus-next[1m]` and retires nothing. It is a new model, not a version of `opus`: there are no families, so it inherits nothing and lands commented-out, awaiting its own evidence (or a stated scored_as), pricing and rank.",
+  "generated_at": "2026-11-12",
   "agents": {
-    "claude": {
-      "status": "ok",
-      "method": "command",
-      "available": ["haiku", "sonnet", "opus", "fable", "opus-next[1m]"],
-      "configured": ["haiku", "sonnet", "opus", "fable"],
-      "note": "synthetic fixture for the new-release path"
-    },
-    "codex": {
-      "status": "snapshot",
-      "method": "snapshot",
-      "available": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"],
-      "configured": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"],
-      "note": "unchanged"
-    },
-    "grok": {
-      "status": "ok",
-      "method": "command",
-      "available": ["grok-4.5"],
-      "configured": ["grok-4.5"],
-      "note": "unchanged"
-    },
-    "kimi": {
-      "status": "snapshot",
-      "method": "command",
-      "available": ["kimi-k2"],
-      "configured": ["kimi-k2"],
-      "note": "unchanged"
-    }
+    "claude": { "status": "ok", "method": "command", "releases": ["opus-next[1m]"], "note": "synthetic fixture for the new-release path" },
+    "codex": { "status": "snapshot", "method": "snapshot", "note": "unchanged" },
+    "grok": { "status": "ok", "method": "command", "note": "unchanged" },
+    "kimi": { "status": "snapshot", "method": "command", "note": "unchanged" }
   }
 }

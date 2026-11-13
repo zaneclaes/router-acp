@@ -1,5 +1,32 @@
 # Standardize model catalog + score updates for router-acp
 
+> **Historical plan — superseded in part (2026-11-12).** The updater shipped,
+> and the data design it describes has since changed. Read
+> [`model-updater.md`](model-updater.md) for how it works today. What no longer
+> holds below:
+>
+> - `data/scores.yaml` (a first-match glob table), `data/model-policy.yaml` and
+>   `src/presets/*.yaml` are gone. Each provider is one file,
+>   `data/providers/<name>.yaml`: its default agent settings, `cache_ratio`,
+>   `discovery`, and `models:` grouped by family, one exact entry per version
+>   (its real API id — no patterns, no aliases), carrying its pricing,
+>   `cost_rank`, its own `evidence` and the quality computed from it. The
+>   benchmark calibrations (`scoring`) and the cost ladder (`cost`) live in
+>   `data/classifier.yaml`.
+> - Model lists no longer live in `examples/*.yaml`: every agent inherits its
+>   provider's models, and a config may only add a model or override fields of
+>   one by `id`. The updater writes only the provider files.
+> - "Version bumps inherit the family score", "provisional" tier curves and the
+>   frontier compression rule are gone: every model is scored only on its own
+>   evidence; a model without any is unscored (no quality), never a copy of or
+>   a derivation from another's.
+> - Pattern ordering, `resolves_to`, witnesses, `strict_desc`/`at_most`
+>   invariants, `published_pricing` and policy-level `rank_exceptions` are
+>   replaced by per-model `outranks` and `rank_exception`.
+>
+> The goals, discovery safety rules (a failed probe never retires a model) and
+> the "never re-bake goldens automatically" rule still hold.
+
 ## Summary
 
 Add a maintained **model updater** pipeline to [router-acp](https://github.com/zaneclaes/router-acp) that:

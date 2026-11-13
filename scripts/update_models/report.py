@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .discover import AgentDiscovery
-from .score import ScoreProposal
+from .score import Rescore
 from .validate import ERROR, INFO, WARN, Finding
 
 
@@ -39,7 +39,7 @@ class Report:
     generated_at: str
     applied: bool
     discovered: dict[str, AgentDiscovery] = field(default_factory=dict)
-    proposals: list[ScoreProposal] = field(default_factory=list)
+    rescores: list[Rescore] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     writes: list[PendingWrite] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -69,9 +69,9 @@ class Report:
 
         if not self.changed_writes and not errors:
             lines += [
-                "**No changes required.** The catalog and score table already satisfy every",
-                "invariant in `data/model-policy.yaml`, so the updater reproduces today's",
-                "policy exactly.",
+                "**No changes required.** Every model in `data/providers/*.yaml` already",
+                "carries the quality its own evidence computes and satisfies every check, so",
+                "the updater reproduces today's catalog exactly.",
                 "",
             ]
 
@@ -102,28 +102,31 @@ class Report:
                     lines.append(f"- **{found.agent}** ({found.status}): {reason}")
         lines.append("")
 
-        lines += ["## Score proposals", ""]
-        if not self.proposals:
-            lines.append("_none — every configured model already resolves to a scored family_")
+        lines += ["## Re-scored models", ""]
+        if not self.rescores:
+            lines.append(
+                "_none — every model with evidence already carries the quality it computes, "
+                "and no model without evidence carries any_"
+            )
         else:
-            for proposal in self.proposals:
+            for rescore in self.rescores:
+                if rescore.cleared:
+                    lines += [f"### {rescore.key}", "", f"- {rescore.describe()}", ""]
+                    continue
                 lines += [
-                    f"### {proposal.candidate} → `{proposal.pattern}`",
+                    f"### {rescore.key}",
                     "",
-                    f"- tier: **{proposal.tier}**, base {proposal.base:.2f}",
-                    f"- rationale: {proposal.rationale}",
+                    f"- source: {rescore.origin}",
+                    f"- default_quality: {rescore.before_default:.2f} → {rescore.after_default:.2f}",
+                    "",
+                    "| class | before | after |",
+                    "| --- | --- | --- |",
                 ]
-                if proposal.insert_before:
-                    lines.append(f"- insert before: `{proposal.insert_before}`")
-                for risk in proposal.risks:
-                    lines.append(f"- **risk**: {risk}")
                 lines += [
-                    "",
-                    "| " + " | ".join(proposal.quality) + " |",
-                    "| " + " | ".join("---" for _ in proposal.quality) + " |",
-                    "| " + " | ".join(f"{value:.2f}" for value in proposal.quality.values()) + " |",
-                    "",
+                    f"| {task_class} | {rescore.before[task_class]:.2f} | {value:.2f} |"
+                    for task_class, value in rescore.after.items()
                 ]
+                lines.append("")
         lines.append("")
 
         lines += ["## Findings", ""]

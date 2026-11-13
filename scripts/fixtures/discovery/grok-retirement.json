@@ -1,0 +1,7 @@
+{
+  "_comment": "A trustworthy probe that no longer lists `grok-4.6`: the row is commented out with a `retired` note (kept one release), never deleted.",
+  "generated_at": "2026-11-12",
+  "agents": {
+    "grok": { "status": "ok", "method": "command", "retires": ["grok-4.6"], "note": "synthetic fixture for the retirement path" }
+  }
+}

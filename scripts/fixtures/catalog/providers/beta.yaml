@@ -1,0 +1,36 @@
+# A second synthetic provider: a cross-provider `outranks` and a rank exception.
+provider: beta
+command:
+  type: stdio
+  command: beta-acp
+discovery:
+  retire_grace_releases: 1
+  method: snapshot
+  note: no offline list
+models:
+  one:
+  - version: 1
+    id: beta-one
+    display_name: Beta One
+    cost_rank: 5
+    pricing: { input_per_mtok: 1.0, output_per_mtok: 2.0 }
+    evidence:
+      - { benchmark: Code-Bench, result: 61, source: "https://beta.example/one" }
+    outranks: [alpha/alpha-small-1]
+    rank_exception: a scarce second-company seat, held at the top rank
+    coding_tier: high
+    context_window: 256000
+    default_quality: 2.10
+    quality: { UiTweak: 2.10, BugFix: 2.10, Feature: 2.10, Refactor: 2.10, Algorithms: 2.10, Architecture: 2.10, Research: 2.10, Writing: 2.10, Ops: 2.10, CodingGeneral: 2.10 }
+  two:
+  - version: 1
+    id: beta-two
+    display_name: Beta Two
+    cost_rank: 4
+    pricing: { input_per_mtok: 3.0, output_per_mtok: 9.0 }
+    evidence:
+      - { benchmark: Term-Bench, result: 50, source: "https://beta.example/two" }
+    coding_tier: medium
+    context_window: 256000
+    default_quality: 1.67
+    quality: { UiTweak: 1.67, BugFix: 1.67, Feature: 1.67, Refactor: 1.67, Algorithms: 1.67, Architecture: 1.67, Research: 1.67, Writing: 1.67, Ops: 1.67, CodingGeneral: 1.67 }

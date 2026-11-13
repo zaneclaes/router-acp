@@ -60,7 +60,7 @@ complexity:
     # Cross-system work (repos, tickets, PRs) and open-ended investigation
     # are complex even when the prompt is short.
     - bump: 0.15
-      keywords: [pull request, merge request, " pr ", ticket, issue, investigate, investigation, analyze, analyse, audit, remaining work, status of, current state, deep dive, root cause, thorough, comprehensive]
+      keywords: [pull request, merge request, " pr ", ticket, issue, investigate, investigating, investigation, analyze, analyse, audit, remaining work, status of, current state, deep dive, root cause, thorough, comprehensive, cross-cutting, as long as you need]
     - bump: -0.25
       keywords: [typo, one-line, one line, trivial, quick, tiny, small change, simple, just change, rename this]
 
@@ -106,3 +106,80 @@ languages:
   tf: terraform
   yaml: yaml
   yml: yaml
+
+# ---------------------------------------------------------------------------
+# The quality scale. Fixed, deliberately NOT min-maxed over the live models:
+# adding one model never changes another model's calibration. 1 = minimal,
+# 2 = standard, 3 = frontier; decimals preserve measured differences inside a
+# band; 0.5 and 3.5 are the hard extrapolation limits.
+#
+# Each benchmark has fixed raw-result anchors for quality 1, 2 and 3.
+# Piecewise interpolation/extrapolation (clipped to the band) turns a model's
+# `evidence` result (data/providers/<name>.yaml) into a comparable quality unit. Anchors move only when the
+# benchmark itself changes version. A model's `default_quality` is the
+# weighted mean of its observations; a task-class override is emitted only
+# when at least `minimum_task_observations` mapped observations agree and
+# differ from the default by >= `meaningful_task_delta`.
+# ---------------------------------------------------------------------------
+scoring:
+  quality_band: { min: 0.5, max: 3.5 }
+  round_to: 0.01
+  minimum_task_observations: 2
+  meaningful_task_delta: 0.15
+  benchmarks:
+    AA-Coding-Agent-v1.1:
+      task_classes: [Algorithms, CodingGeneral]
+      anchors: { minimal: 70, standard: 75, frontier: 78 }
+    SWE-Bench-Pro:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 60, standard: 69, frontier: 80 }
+    DeepSWE-v1.1:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 50, standard: 60, frontier: 70 }
+    Terminal-Bench-2.1:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 78, standard: 84, frontier: 89 }
+    SWE-Bench-Verified-2025:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 70, standard: 77, frontier: 84 }
+    Terminal-Bench-1:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 40, standard: 55, frontier: 70 }
+    Local-Executable-Gate:
+      task_classes: [UiTweak, Ops, CodingGeneral]
+      anchors: { minimal: 1, standard: 2, frontier: 3 }
+    Kimi-SWE-Bench-Verified:
+      task_classes: [BugFix, Feature, Refactor, CodingGeneral]
+      anchors: { minimal: 55, standard: 70, frontier: 80 }
+    Kimi-TerminalBench:
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 20, standard: 35, frontier: 50 }
+    Kimi-BrowseComp:
+      task_classes: [Research, Architecture]
+      anchors: { minimal: 30, standard: 50, frontier: 70 }
+    # The three below are Vals.ai boards, each one harness across nearly every
+    # model (2026-11-09). Anchors were set once, on 2026-11-12, from the field
+    # then: `minimal` at the small models' results, `standard` at the mid-tier
+    # models', `frontier` at the strongest flagships'. They stay fixed, so a new
+    # model's result never moves another model's score.
+    Vibe-Code-Bench-v1.1:          # build a working app end to end (OpenHands)
+      task_classes: [UiTweak, Feature, CodingGeneral]
+      anchors: { minimal: 75, standard: 85, frontier: 92 }
+    Terminal-Bench-4.0:            # Mini-SWE-agent, avg@3
+      task_classes: [Ops, Research, Architecture]
+      anchors: { minimal: 12, standard: 37, frontier: 65 }
+    Terminal-Bench-Science-0.1:    # Mini-SWE-agent
+      task_classes: [Research, Algorithms]
+      anchors: { minimal: 5, standard: 25, frontier: 55 }
+
+# ---------------------------------------------------------------------------
+# `cost_rank` is an ORDINAL 1..5 (1 = cheapest/least scarce, 5 = frontier/
+# scarce), not USD: seats are flat-rate, and `auto` min-max normalizes rank
+# inside the surviving pool. Do not extend past 5: that rescales every pool
+# norm and moves models you did not touch. Ranks are weakly monotonic in
+# blended price (input + blended_output_weight * output) within a provider;
+# a row that breaks that states why in its `rank_exception`.
+# ---------------------------------------------------------------------------
+cost:
+  ladder: { min: 1, max: 5 }
+  blended_output_weight: 3

@@ -136,6 +136,14 @@ pub struct ClassifierRules {
     #[serde(default)]
     pub multi_step: MultiStepRules,
     pub languages: HashMap<String, String>,
+    /// How a model's benchmark evidence becomes its quality scores. The model
+    /// updater (`scripts/update_models.py`) reads it; the router does not.
+    #[serde(default)]
+    pub scoring: Option<serde_yaml::Value>,
+    /// How a model's `cost_rank` is held to its price. Read by the model
+    /// updater, not the router.
+    #[serde(default)]
+    pub cost: Option<serde_yaml::Value>,
 }
 
 pub const BUILTIN_CLASSIFIER_RULES: &str = include_str!("../data/classifier.yaml");

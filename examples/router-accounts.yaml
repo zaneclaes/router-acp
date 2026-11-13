@@ -3,27 +3,16 @@
 cordon:
   enabled: true
 
-agents:
-  - name: claude
-    command:
-      type: stdio
-      command: claude-agent-acp
-    model_selection:
-      type: config-option
-    models:
-      - id: opus
-        display_name: Claude Opus
-        cost_rank: 3
-        pricing: { input_per_mtok: 4.00, output_per_mtok: 20.00 }
-      - id: sonnet
-        display_name: Claude Sonnet
-        cost_rank: 2
-        pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00 }
+# `providers:` changes router-acp's defaults for a provider; `agents:` lists
+# the accounts, each inheriting its provider's settings.
+providers:
+  claude:
     auth_probe:
       command: claude
       args: [auth, status]
-    usage_source: { type: anthropic-oauth }
-    lineage: anthropic
+
+agents:
+  - name: claude
     accounts:
       - name: existing
         priority: 0

@@ -1,0 +1,7 @@
+{
+  "_comment": "Synthetic release of a model no row names and no evidence covers (`gpt-6-atlas`). Exercises the add path: the model lands in data/models.yaml as a commented-out row with a placeholder rank, without rewriting any existing row's numbers or ranks.",
+  "generated_at": "2026-11-12",
+  "agents": {
+    "codex": { "status": "ok", "method": "command", "releases": ["gpt-6-atlas"], "note": "synthetic fixture for the new-model path" }
+  }
+}

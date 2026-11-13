@@ -1,26 +1,29 @@
-version: 1.0.0
-title: router-acp model scoring judgment
+version: 2.0.0
+title: router-acp model evidence gathering
 description: >-
-  Find comparable published benchmark results for newly discovered models and
-  flag id renames. Returns JSON only; deterministic Python owns score math.
+  Find comparable published benchmark results for models that have no evidence
+  of their own and flag id renames. Returns JSON only; deterministic Python owns
+  score math, and a human copies accepted evidence into the model's entry in
+  data/providers/<name>.yaml.
 
 parameters:
   - key: UNSCORED
     input_type: string
     requirement: required
-    description: comma-separated `agent/model` ids that have no score-table entry yet
-  - key: CURRENT_SCORES
+    description: >-
+      comma-separated `provider/id` models with no published evidence of their
+      own (unscored, or newly discovered)
+  - key: PROVIDERS
     input_type: string
     requirement: required
-    description: path to data/scores.yaml
-  - key: POLICY
+    description: >-
+      path to data/providers/ — one file per provider whose `models:` groups
+      each family's versions, each with its id, pricing, rank, evidence and
+      quality
+  - key: CLASSIFIER
     input_type: string
     requirement: required
-    description: path to data/model-policy.yaml (benchmark calibrations/evidence, invariants)
-  - key: CATALOG
-    input_type: string
-    requirement: required
-    description: path to the agent config whose catalog is being updated
+    description: path to data/classifier.yaml, whose `scoring.benchmarks` are the fixed calibrations
   - key: BENCHMARKS
     input_type: string
     requirement: optional
@@ -28,23 +31,26 @@ parameters:
     description: local benchmark notes to weigh above published evals
 
 instructions: |
-  You are collecting benchmark EVIDENCE for a router's quality table. You do
+  You are collecting benchmark EVIDENCE for a router's model catalog. You do
   not assign a tier, base, or per-class score. Deterministic code maps raw
-  results through the fixed calibrations in POLICY.
+  results through the fixed calibrations in CLASSIFIER.
 
   Read first, in this order of authority:
     1. {{ BENCHMARKS }} — local seat measurements, if present. Outranks everything.
-    2. {{ POLICY }} — use only benchmark names already declared under
-       `benchmark_scoring.benchmarks`, whose versions and calibrations are fixed.
-    3. {{ CURRENT_SCORES }} — the currently shipped benchmark-derived output.
-    4. {{ CATALOG }} — how the model is configured (price, rank, whether enabled).
+    2. {{ CLASSIFIER }} `scoring.benchmarks` — use only benchmark names declared
+       there, whose versions and calibrations are fixed.
+    3. {{ PROVIDERS }}/<provider>.yaml `models:` — each entry's existing
+       `evidence`, pricing and rank. Every version of a model is its own entry:
+       evidence for one version is never evidence for another.
 
   Rules that are not negotiable:
     * Every observation needs the exact benchmark name, numeric result, and a
       primary-source URL or checked-in local result path.
+    * The observation must be measured on exactly the candidate model id, not
+      a sibling version or a family name.
     * Do not translate marketing prose into a score. With no comparable result,
       return no observations and name the missing evidence under `risks`.
-    * Do not mix benchmark versions or harnesses. If the POLICY lacks the exact
+    * Do not mix benchmark versions or harnesses. If CLASSIFIER lacks the exact
       benchmark version, list it as a risk for an operator to calibrate first.
 
   For renames, propose one only when a NEW id plainly supersedes an OLD one (a
@@ -58,8 +64,7 @@ instructions: |
   {
     "models": [
       {
-        "candidate": "claude/opus-next[1m]",
-        "pattern": "*opus-next*",
+        "candidate": "claude/opus-next",
         "observations": [
           {"benchmark": "SWE-Bench-Pro", "result": 71.2,
            "source": "https://provider.example/model-card"}
@@ -79,7 +84,7 @@ instructions: |
   rejected by the caller.
 
 prompt: |
-  Find comparable benchmark evidence for these unscored candidates: {{ UNSCORED }}.
+  Find comparable benchmark evidence for these models: {{ UNSCORED }}.
   Output JSON only.
 
 extensions:

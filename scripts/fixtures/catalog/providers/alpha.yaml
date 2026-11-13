@@ -1,0 +1,65 @@
+# A synthetic provider for the updater's tests: own evidence only, a
+# task-class override, outranks, an unscored entry and numeric versions, on
+# entries that never change when the real catalog does.
+provider: alpha
+command:
+  type: stdio
+  command: alpha-acp
+cache_ratio: { read: 0.1, write: 1.25 }
+discovery:
+  retire_grace_releases: 1
+  method: command
+  command: ["alpha-cli", "models"]
+models:
+  small:
+  - version: 1
+    id: alpha-small-1
+    display_name: Alpha Small 1
+    cost_rank: 1
+    pricing: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+    evidence:
+      - { benchmark: Code-Bench, result: 52, source: "https://alpha.example/small" }
+      - { benchmark: Term-Bench, result: 45, source: "https://alpha.example/small" }
+    coding_tier: medium
+    context_window: 200000
+    default_quality: 1.27
+    quality: { UiTweak: 1.27, BugFix: 1.27, Feature: 1.27, Refactor: 1.27, Algorithms: 1.27, Architecture: 1.27, Research: 1.27, Writing: 1.27, Ops: 1.27, CodingGeneral: 1.27 }
+  big:
+    # Two code results that agree make a BugFix override.
+  - version: 2.10
+    id: alpha-big-2-10
+    display_name: Alpha Big 2.10
+    cost_rank: 4
+    pricing: { input_per_mtok: 5.0, output_per_mtok: 25.0, cache_read_per_mtok: 0.25 }
+    evidence:
+      - { benchmark: Code-Bench, result: 69, source: "https://alpha.example/big" }
+      - { benchmark: Code-Bench, result: 68, source: "https://alpha.example/big-2" }
+      - { benchmark: Term-Bench, result: 56, source: "https://alpha.example/big" }
+    outranks: [alpha-small-1, alpha-mid-2]
+    coding_tier: high
+    context_window: 1000000
+    default_quality: 2.59
+    quality: { UiTweak: 2.59, BugFix: 2.85, Feature: 2.85, Refactor: 2.85, Algorithms: 2.59, Architecture: 2.59, Research: 2.59, Writing: 2.59, Ops: 2.59, CodingGeneral: 2.85 }
+    # An earlier version (2.9 < 2.10, compared numerically) with no published
+    # results of its own: unscored, never a copy of 2.10's numbers.
+  - version: 2.9
+    id: alpha-big-2-9
+    display_name: Alpha Big 2.9
+    cost_rank: 4
+    pricing: { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+    coding_tier: high
+    context_window: 1000000
+  mid:
+  - version: 2
+    id: alpha-mid-2
+    display_name: Alpha Mid 2
+    cost_rank: 3
+    pricing: { input_per_mtok: 2.5, output_per_mtok: 12.5 }
+    evidence:
+      - { benchmark: Code-Bench, result: 58, source: "https://alpha.example/mid" }
+      - { benchmark: Term-Bench, result: 50, source: "https://alpha.example/mid" }
+    outranks: [alpha-small-1]
+    coding_tier: high
+    context_window: 1000000
+    default_quality: 1.73
+    quality: { UiTweak: 1.73, BugFix: 1.73, Feature: 1.73, Refactor: 1.73, Algorithms: 1.73, Architecture: 1.73, Research: 1.73, Writing: 1.73, Ops: 1.73, CodingGeneral: 1.73 }

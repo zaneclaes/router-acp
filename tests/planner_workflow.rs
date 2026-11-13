@@ -274,10 +274,18 @@ fn a_steered_input_is_acknowledged_in_the_persisted_run_so_a_restart_does_not_re
     let steered = &run.inputs["monitor-steer"];
     assert!(steered.acknowledged && steered.delivered_to.contains(SID));
     assert!(run.wakes["input:monitor-steer"].acknowledged);
-    assert!(run.parent_queue.iter().all(|q| q.input_id != "monitor-steer"));
+    assert!(
+        run.parent_queue
+            .iter()
+            .all(|q| q.input_id != "monitor-steer")
+    );
     // Negative control: an input that was not steered stays pending.
     assert!(!run.inputs["monitor-later"].acknowledged);
-    assert!(run.parent_queue.iter().any(|q| q.input_id == "monitor-later"));
+    assert!(
+        run.parent_queue
+            .iter()
+            .any(|q| q.input_id == "monitor-later")
+    );
     let resend =
         router_acp::planner_input::send(&store, SID, &f.repo, "monitor-steer", "advice").unwrap();
     assert!(!resend.queued && resend.delivered && resend.acknowledged);

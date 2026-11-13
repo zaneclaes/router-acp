@@ -289,6 +289,14 @@ where
         .with_writer(std::io::stderr)
         .try_init();
     let mut cfg = Config::from_yaml(&cfg_yaml).expect("test config parses");
+    // Mock models score from the test fixture, never from the shipped catalog: a
+    // mock `opus` is not Claude Opus, and catalog edits must not move these tests.
+    if cfg.score_table.is_none() {
+        cfg.score_table = Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mock-models.yaml"),
+        );
+    }
     // Mock adapters must never observe or publish state for a real login.
     let credential_home = tempfile::tempdir().unwrap();
     for agent in &mut cfg.agents {
@@ -1668,7 +1676,7 @@ async fn account_commands_survive_goose_turn_context_block() {
 }
 
 #[tokio::test]
-async fn declared_model_missing_downstream_is_omitted_from_client_options() {
+async fn declared_model_missing_downstream_is_flagged_not_dropped() {
     let state = temp_state_file("missing-model");
     // Config declares m1 and bogus; mock only offers m1.
     let yaml = format!(
@@ -1703,10 +1711,22 @@ async fn declared_model_missing_downstream_is_omitted_from_client_options() {
             values.contains(&"mock/m1".to_string()),
             "values: {values:?}"
         );
-        assert!(
-            !values.contains(&"mock/bogus".to_string()),
-            "values: {values:?}"
-        );
+        // A declared model is never dropped: the one the binary lacks is
+        // listed, flagged missing and unavailable.
+        let bogus = choices
+            .iter()
+            .find(|o| o.value.0.as_ref() == "mock/bogus")
+            .unwrap_or_else(|| panic!("values: {values:?}"));
+        let meta = &bogus.meta.as_ref().expect("meta")["router_acp"];
+        assert_eq!(meta["missing"], true, "meta: {meta}");
+        assert_eq!(meta["available"], false, "meta: {meta}");
+        assert_eq!(meta["unavailable_reason"], "Missing from binary");
+        let m1 = choices
+            .iter()
+            .find(|o| o.value.0.as_ref() == "mock/m1")
+            .unwrap();
+        let meta = &m1.meta.as_ref().expect("meta")["router_acp"];
+        assert!(meta.get("missing").is_none(), "meta: {meta}");
         Ok(())
     })
     .await;
@@ -1795,7 +1815,7 @@ async fn static_unrouteable_error_names_selector_miss() {
         let err = prompt_text(&cx, &sid, "should fail").await.unwrap_err();
         let text = format!("{err}");
         assert!(
-            text.contains("not offered by downstream model selector"),
+            text.contains("Missing from binary"),
             "expected selector-miss reason, got: {text}"
         );
         assert!(
@@ -1817,8 +1837,8 @@ async fn session_new_advertises_candidate_effort_capabilities() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/m1', effort_levels: [low, high, max], effort_mapping: { low: minimal, high: intensive, max: exhaustive } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [low, high, max], effort_mapping: { low: minimal, high: intensive, max: exhaustive } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2219,9 +2239,9 @@ async fn explicit_effort_precedes_automatic_and_is_reresolved_on_failover() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'a/*', default_quality: 3.0, effort_levels: [low, high], effort_mapping: { low: tiny, high: deep } }\n\
-         \x20 - { pattern: 'b/*', default_quality: 1.0, effort_levels: [max], effort_mapping: { max: tiny } }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 3.0, effort_levels: [low, high], effort_mapping: { low: tiny, high: deep } }\n\
+         \x20 - { id: m2, default_quality: 1.0, effort_levels: [max], effort_mapping: { max: tiny } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2283,9 +2303,9 @@ async fn auto_model_routing_requires_the_explicit_effort_level() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'a/*', default_quality: 3.0, effort_levels: [low], effort_mapping: { low: low } }\n\
-         \x20 - { pattern: 'b/*', default_quality: 1.0, effort_levels: [high], effort_mapping: { high: high } }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 3.0, effort_levels: [low], effort_mapping: { low: low } }\n\
+         \x20 - { id: m2, default_quality: 1.0, effort_levels: [high], effort_mapping: { high: high } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2324,8 +2344,8 @@ async fn auto_model_routing_errors_when_no_candidate_supports_explicit_effort() 
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/*', effort_levels: [low], effort_mapping: { low: low } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [low], effort_mapping: { low: low } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -2364,8 +2384,8 @@ async fn preclassifier_omitted_effort_falls_back_to_task_depth_recommendation() 
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/*', effort_levels: [xhigh], effort_mapping: { xhigh: deep } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [xhigh], effort_mapping: { xhigh: deep } }\n",
     )
     .unwrap();
     let preclass = r#"{"routing":{"task_class":"Architecture","complexity":0.72,"confidence":0.9,"reason":"cross-system"}}"#;
@@ -2528,8 +2548,8 @@ async fn post_pin_effort_config_and_directives_apply_without_ignore_notices() {
     ));
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'mock/*', effort_levels: [medium, high], effort_mapping: { medium: normal, high: deep } }\n",
+        "models:\n\
+         \x20 - { id: m1, effort_levels: [medium, high], effort_mapping: { medium: normal, high: deep } }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -4134,6 +4154,114 @@ async fn a_resumed_session_follows_its_seat_into_an_account() {
     .await;
 }
 
+/// A session saved on a family alias (`fable`, before catalog ids became exact
+/// API ids) resumes on that family's current model instead of failing every
+/// turn as an unrouteable static candidate.
+#[tokio::test]
+async fn a_resumed_session_on_a_retired_family_alias_runs_the_familys_model() {
+    let state = temp_state_file("alias-restore");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml_models(
+            "fancy@one",
+            &["m-2", "m-1"],
+            &[],
+            "      - { id: m-2, family: m, version: 2, cost_rank: 1 }\n\
+             \x20     - { id: m-1, family: m, version: 1, cost_rank: 1 }\n",
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=fancy@one/m-2] first").await?;
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+
+        // The checkpoint as a router that named the family `m` wrote it.
+        let mut persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        let snapshot = persisted.session_config.as_mut().expect("checkpoint");
+        snapshot["candidate"] = serde_json::json!("fancy@one/m");
+        snapshot["preferred_candidate"] = serde_json::json!("fancy@one/m");
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(sid.clone(), persisted)
+            .unwrap();
+
+        cx.send_request(
+            agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(),
+                std::env::temp_dir(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let restored = shared
+            .with_session(&sid, |s| {
+                (
+                    s.candidate_override.as_ref().map(ToString::to_string),
+                    s.preferred_candidate.as_ref().map(ToString::to_string),
+                )
+            })
+            .unwrap();
+        assert_eq!(restored.0.as_deref(), Some("fancy@one/m-2"));
+        assert_eq!(restored.1.as_deref(), Some("fancy@one/m-2"));
+        prompt_text(&cx, &sid, "second").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(text.matches("static → fancy@one/m-2").count(), 2, "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// A family shorthand (`m:`) with the family on two healthy accounts goes to
+/// the first account, not whichever equal-scoring seat is listed last. With
+/// the first account out of usage it goes to the second.
+#[tokio::test]
+async fn a_family_shorthand_takes_the_first_account_with_usage_left() {
+    let state = temp_state_file("shorthand-first-seat");
+    let model_lines = "      - { id: m-2, family: m, version: 2, cost_rank: 1 }\n";
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml_models("fancy@one", &["m-2"], &[], model_lines),
+        agent_yaml_models("fancy@two", &["m-2"], &[], model_lines),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let first = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &first, "m: hello").await?;
+        let text = agent_text(&observed, &first);
+        assert!(text.contains("fancy@one/m-2"), "{text}");
+        assert!(!text.contains("fancy@two/m-2"), "{text}");
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([(
+                CandidateId::new("fancy@one", "m-2"),
+                router_acp::headroom::UsageCordon {
+                    reason: "weekly limit".into(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".into(),
+                    soft: false,
+                },
+            )]));
+        let second = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &second, "m: hello").await?;
+        let text = agent_text(&observed, &second);
+        assert!(text.contains("fancy@two/m-2"), "{text}");
+        assert!(!text.contains("fancy@one/m-2"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
 /// Grok reports an exhausted seat as `402 Payment Required … usage balance
 /// exhausted`. That classified as an ordinary error, so every turn routed back
 /// to the exhausted seat and failed instead of failing over.
@@ -4384,9 +4512,9 @@ async fn context_overflow_fails_over_to_a_larger_window_with_sqlite_lookup() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"fancy/*\", context_window: 50000, default_quality: 0.9 }\n\
-         \x20 - { pattern: \"cheap/*\", context_window: 1000000, default_quality: 0.1 }\n",
+        "models:\n\
+         \x20 - { id: opus, context_window: 50000, default_quality: 0.9 }\n\
+         \x20 - { id: haiku, context_window: 1000000, default_quality: 0.1 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -6991,10 +7119,10 @@ async fn skill_routing_already_ok_cancels_queued_switch_to_also_acceptable() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"c/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.70 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n\
+         \x20 - { id: m2, default_quality: 0.70 }\n\
+         \x20 - { id: m3, default_quality: 0.90 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -7058,9 +7186,9 @@ async fn skill_routing_first_match_selection_overrides_quality_order() {
     // best-quality would pick c/m3; first-match must pick b/m2.
     std::fs::write(
         &scores,
-        "candidates:\n\
-         \x20 - { pattern: 'b/m2', default_quality: 1.0 }\n\
-         \x20 - { pattern: 'c/m3', default_quality: 3.0 }\n",
+        "models:\n\
+         \x20 - { id: m2, default_quality: 1.0 }\n\
+         \x20 - { id: m3, default_quality: 3.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -7354,11 +7482,11 @@ fn skill_pool_demotion_scores(tag: &str) -> PathBuf {
     ));
     std::fs::write(
         &p,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"d/*\", default_quality: 0.95 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 0.60 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m2, default_quality: 0.90 }\n\
+         \x20 - { id: m4, default_quality: 0.95 }\n\
+         \x20 - { id: m3, default_quality: 0.60 }\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n",
     )
     .unwrap();
     p
@@ -7553,10 +7681,10 @@ async fn usage_cordon_escape_follows_the_active_strategy() {
     // c/m3 is a real step down.
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 2.92 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 2.00 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 2.90 }\n\
+         \x20 - { id: m2, default_quality: 2.92 }\n\
+         \x20 - { id: m3, default_quality: 2.00 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -7635,10 +7763,10 @@ fn two_claude_seats_yaml(tag: &str, log: &std::path::Path, grok_quality: f64) ->
     std::fs::write(
         &scores,
         format!(
-            "version: 1\ncandidates:\n\
-             \x20 - {{ pattern: \"claude@*\", default_quality: 2.90 }}\n\
-             \x20 - {{ pattern: \"codex@*\", default_quality: 3.30 }}\n\
-             \x20 - {{ pattern: \"grok@*\", default_quality: {grok_quality} }}\n"
+            "models:\n\
+             \x20 - {{ id: opus, default_quality: 2.90 }}\n\
+             \x20 - {{ id: gpt-6.1-sol, default_quality: 3.30 }}\n\
+             \x20 - {{ id: grok-4.7, default_quality: {grok_quality} }}\n"
         ),
     )
     .unwrap();
@@ -7948,10 +8076,10 @@ async fn usage_cordon_escape_of_a_skill_pin_follows_the_route_order() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"a/*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 2.00 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 3.30 }\n",
+        "models:\n\
+         \x20 - { id: m3, default_quality: 2.90 }\n\
+         \x20 - { id: m1, default_quality: 2.00 }\n\
+         \x20 - { id: m2, default_quality: 3.30 }\n",
     )
     .unwrap();
     let env = [("MOCK_LOG", log.to_str().unwrap())];
@@ -8125,9 +8253,9 @@ async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n\
+         \x20 - { id: m2, default_quality: 0.90 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -8167,7 +8295,7 @@ async fn low_confidence_pin_auto_upgrades_to_a_more_capable_model() {
 #[tokio::test]
 async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_qualifies() {
     let state = temp_state_file("upgrade-compressed");
-    // Mirrors a declared score-table compression pair (Fable/Opus, Sol/Terra):
+    // Two peers scored within a hair of each other:
     // b/m2 sits only 0.02 above a/m1 on the raw 0.5..3.5 scale — normalized
     // ~0.007, well under the +0.05 real-upgrade margin. a/m1's 0.85 puts the
     // pinned session's confidence at (0.85−0.5)/(1.2−0.5) = 0.50, below the
@@ -8179,9 +8307,9 @@ async fn low_confidence_pin_upgrades_across_a_compressed_gap_when_nothing_else_q
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.87 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.85 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.85 }\n\
+         \x20 - { id: m2, default_quality: 0.87 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -8221,9 +8349,9 @@ async fn auto_upgrade_is_off_by_default_and_keeps_the_pinned_model() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.40 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.40 }\n\
+         \x20 - { id: m2, default_quality: 0.90 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -8254,24 +8382,24 @@ async fn auto_upgrade_is_off_by_default_and_keeps_the_pinned_model() {
 // escalation router
 // ======================================================================
 
-/// Score table making `b/*` strong (0.90) and `a/*` weak (0.40), so `b` is a
-/// valid escalation target above `a`. Optionally a mid-tier `c/*` (0.70).
+/// Score table making `b/m2` strong (0.90) and `a/m1` weak (0.40), so `b` is a
+/// valid escalation target above `a`. Optionally a mid-tier `c/m3` (0.70).
 fn escalation_scores(tag: &str, with_mid: bool) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "router-acp-escscores-{tag}-{}.yaml",
         uuid::Uuid::new_v4().simple()
     ));
     let mid = if with_mid {
-        "  - { pattern: \"c/*\", default_quality: 0.70 }\n"
+        "  - { id: m3, default_quality: 0.70 }\n"
     } else {
         ""
     };
     std::fs::write(
         &p,
         format!(
-            "version: 1\ncandidates:\n\
-             \x20 - {{ pattern: \"b/*\", default_quality: 0.90 }}\n{mid}\
-             \x20 - {{ pattern: \"a/*\", default_quality: 0.40 }}\n"
+            "models:\n\
+             \x20 - {{ id: m2, default_quality: 0.90 }}\n{mid}\
+             \x20 - {{ id: m1, default_quality: 0.40 }}\n"
         ),
     )
     .unwrap();
@@ -8696,7 +8824,7 @@ async fn escalation_mid_turn_on_tool_failures() {
 
 #[tokio::test]
 async fn escalation_escalates_across_a_compressed_gap_when_nothing_else_qualifies() {
-    // Mirrors a declared score-table compression pair (Fable/Opus, Sol/Terra):
+    // Two peers scored within a hair of each other:
     // b/m2 sits only 0.02 above a/m1 on the raw scale — normalized well under
     // the +0.05 real-upgrade margin `escalation_target` prefers — so a bug
     // that survives multiple rounds of thrashing must still be able to climb
@@ -8708,9 +8836,9 @@ async fn escalation_escalates_across_a_compressed_gap_when_nothing_else_qualifie
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"b/*\", default_quality: 1.42 }\n\
-         \x20 - { pattern: \"a/*\", default_quality: 1.40 }\n",
+        "models:\n\
+         \x20 - { id: m2, default_quality: 1.42 }\n\
+         \x20 - { id: m1, default_quality: 1.40 }\n",
     )
     .unwrap();
     let logb = temp_log("esc-fail-compressed-b");
@@ -10194,9 +10322,9 @@ async fn availability_hint_penalizes_overage_seat() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"a/*\", default_quality: 1.2 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 1.1 }\n",
+        "models:\n\
+         \x20 - { id: fable-5, default_quality: 1.2 }\n\
+         \x20 - { id: sonnet, default_quality: 1.1 }\n",
     )
     .unwrap();
     // Pure-quality routing: a narrowly beats b — until a client hint reports
@@ -10311,8 +10439,8 @@ async fn overage_seat_with_more_dollars_left_beats_higher_fraction_smaller_cap()
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"*\", default_quality: 2.0 }\n",
+        "models:\n\
+         \x20 - { id: worker, default_quality: 2.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -10422,8 +10550,8 @@ async fn partial_plan_headroom_changes_effective_cost() {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"*\", default_quality: 2.0 }\n",
+        "models:\n\
+         \x20 - { id: worker, default_quality: 2.0 }\n",
     )
     .unwrap();
     let yaml = format!(
@@ -11322,9 +11450,10 @@ fn legacy_scores(tag: &str) -> PathBuf {
     ));
     std::fs::write(
         &path,
-        "candidates:\n\
-         \x20 - { pattern: 'a/legacy', default_quality: 3.0 }\n\
-         \x20 - { pattern: 'a/*', default_quality: 1.0 }\n",
+        "models:\n\
+         \x20 - { id: legacy, default_quality: 3.0 }\n\
+         \x20 - { id: m1, default_quality: 1.0 }\n\
+         \x20 - { id: m1-old, default_quality: 1.0 }\n",
     )
     .unwrap();
     path
@@ -11332,8 +11461,20 @@ fn legacy_scores(tag: &str) -> PathBuf {
 
 #[tokio::test]
 async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_never_auto_chosen() {
+    // `auto_eligible` is derived, never configured: the superseded version (`m-1` beside the
+    // newer `m-2`) is the ineligible one. It scores higher, so pure-quality auto would pick it.
     let state = temp_state_file("auto-ineligible");
-    let scores = legacy_scores("auto-ineligible");
+    let scores = std::env::temp_dir().join(format!(
+        "router-acp-auto-ineligible-scores-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &scores,
+        "models:\n\
+         \x20 - { id: m-1, default_quality: 3.0 }\n\
+         \x20 - { id: m-2, default_quality: 1.0 }\n",
+    )
+    .unwrap();
     let yaml = format!(
         "state_file: {}\nscore_table: {}\ndelegation: {{ enabled: false }}\n\
          routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}",
@@ -11341,10 +11482,10 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
         scores.display(),
         agent_yaml_models(
             "a",
-            &["m1", "legacy"],
+            &["m-2", "m-1"],
             &[],
-            "      - { id: m1, cost_rank: 1 }\n\
-             \x20     - { id: legacy, cost_rank: 1, auto_eligible: false }\n",
+            "      - { id: m-2, family: m, version: 2, cost_rank: 1 }\n\
+             \x20     - { id: m-1, family: m, version: 1, cost_rank: 1 }\n",
         ),
     );
     run_test(yaml, async |cx, observed| {
@@ -11357,27 +11498,27 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
             .unwrap()
             .to_string();
         let legacy_at = options
-            .find("a/legacy")
-            .unwrap_or_else(|| panic!("a/legacy must be advertised: {options}"));
+            .find("a/m-1")
+            .unwrap_or_else(|| panic!("a/m-1 must be advertised: {options}"));
         assert!(
             options[legacy_at..options.len().min(legacy_at + 400)]
                 .contains("\"auto_eligible\":false"),
-            "a/legacy must carry auto_eligible:false — {options}"
+            "a/m-1 must carry auto_eligible:false — {options}"
         );
-        let m1_at = options.find("a/m1").expect("a/m1 advertised");
+        let m1_at = options.find("a/m-2").expect("a/m-2 advertised");
         assert!(
             !options[m1_at..legacy_at.max(m1_at)].contains("auto_eligible"),
             "an auto-eligible candidate omits the key entirely: {options}"
         );
 
-        // Pure-quality auto would pick `legacy` (quality 3.0 vs 1.0); it must
+        // Pure-quality auto would pick `m-1` (quality 3.0 vs 1.0); it must
         // not even be a candidate.
         let sid = session.session_id.0.to_string();
         prompt_text(&cx, &sid, "implement the feature").await?;
         let routed = agent_text(&observed, &sid);
         assert!(
-            routed.contains("auto → a/m1"),
-            "auto must never choose an auto_eligible:false candidate — {routed}"
+            routed.contains("auto → a/m-2"),
+            "auto must never choose a superseded version — {routed}"
         );
 
         // Explicitly naming it still works.
@@ -11385,15 +11526,15 @@ async fn auto_ineligible_candidate_is_advertised_and_explicitly_pinnable_but_nev
         prompt_text(
             &cx,
             &sid2,
-            "[router: candidate=a/legacy]\nimplement the feature",
+            "[router: candidate=a/m-1]\nimplement the feature",
         )
         .await?;
         let routed2 = agent_text(&observed, &sid2);
         assert!(
-            routed2.contains("static → a/legacy"),
-            "an explicit directive must reach the legacy candidate — {routed2}"
+            routed2.contains("static → a/m-1"),
+            "an explicit directive must reach the superseded version — {routed2}"
         );
-        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "legacy");
+        assert_eq!(open_state(&state).get(&sid2).unwrap().model, "m-1");
         Ok(())
     })
     .await;
@@ -11467,9 +11608,9 @@ async fn native_effort_is_confirmed_before_account_failover_prompt() {
     ));
     std::fs::write(
         &scores,
-        r#"candidates:
-  - { pattern: "claude@work/*", default_quality: 3.0, effort_levels: [high], effort_mapping: { high: high } }
-  - { pattern: "claude@personal/*", default_quality: 2.0, effort_levels: [high], effort_mapping: { high: xhigh } }
+        // One model, so one row for both seats: a score belongs to the model, not the account.
+        r#"models:
+  - { id: sonnet, default_quality: 3.0, effort_levels: [high], effort_mapping: { high: xhigh } }
 "#,
     )
     .unwrap();
@@ -11533,7 +11674,7 @@ agents:
             event["event"] == "set_config_option"
                 && event["agent"] == "claude@work"
                 && event["configId"] == "reasoning_effort"
-                && event["value"] == "high"
+                && event["value"] == "xhigh"
         });
         let work_prompt = events
             .iter()
@@ -11577,9 +11718,9 @@ async fn effort_auto_switch_resets_native_metadata_without_losing_classification
     ));
     std::fs::write(
         &scores,
-        r#"candidates:
-  - { pattern: "claude@work/*", default_quality: 3.0, effort_levels: [medium, high], effort_mapping: { medium: medium, high: high } }
-  - { pattern: "claude@personal/*", default_quality: 2.0, effort_levels: [medium, high], effort_mapping: { medium: max, high: xhigh } }
+        // One model, so one row for both seats: a score belongs to the model, not the account.
+        r#"models:
+  - { id: sonnet, default_quality: 3.0, effort_levels: [medium, high], effort_mapping: { medium: max } }
 "#,
     )
     .unwrap();
@@ -12504,10 +12645,11 @@ fn epic_parent_yaml(tag: &str, log: &std::path::Path) -> String {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"claude@*\", default_quality: 2.90 }\n\
-         \x20 - { pattern: \"codex@*\", default_quality: 3.00 }\n\
-         \x20 - { pattern: \"grok@*\", default_quality: 3.10 }\n",
+        "models:\n\
+         \x20 - { id: fable, default_quality: 2.90 }\n\
+         \x20 - { id: opus, default_quality: 2.90 }\n\
+         \x20 - { id: gpt-6.1-sol, default_quality: 3.00 }\n\
+         \x20 - { id: grok-4.7, default_quality: 3.10 }\n",
     )
     .unwrap();
     let log = log.display().to_string();
@@ -12996,10 +13138,10 @@ fn capacity_failover_yaml(label: &str, failover: &str) -> String {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"a/*\", default_quality: 0.90 }\n\
-         \x20 - { pattern: \"b/*\", default_quality: 0.50 }\n\
-         \x20 - { pattern: \"c/*\", default_quality: 0.85 }\n",
+        "models:\n\
+         \x20 - { id: m1, default_quality: 0.90 }\n\
+         \x20 - { id: m2, default_quality: 0.50 }\n\
+         \x20 - { id: m3, default_quality: 0.85 }\n",
     )
     .unwrap();
     format!(

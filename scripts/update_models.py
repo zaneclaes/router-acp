@@ -5,11 +5,12 @@
 #   "PyYAML>=6.0,<7",
 # ]
 # ///
-"""Update router-acp's model catalog and quality/cost tables.
+"""Update router-acp's model catalog, `data/providers/<name>.yaml`.
 
-One command that discovers what each agent currently exposes, proposes anchored
-scores for anything unscored, keeps the first-match pattern table correct, and
-validates that routing ORDER still matches policy — then shows you the diff.
+One command that discovers what each provider currently exposes, re-scores
+every model from the evidence recorded on its own entry, parks newly
+discovered models as commented-out entries, and validates the catalog's shape, evidence, ordering and
+cost contract — then shows you the diff.
 
     scripts/update_models.py                   # dry run: report + diffs, no writes
     scripts/update_models.py --validate-only    # just the invariants (CI-friendly)

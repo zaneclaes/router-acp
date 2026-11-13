@@ -414,7 +414,7 @@ Every strategy except `static` needs to know what kind of task it's routing and 
 
 ### Quality data
 
-Per-class quality scores, coding tiers/percentiles, and context windows live in a versioned YAML table shipped with the binary ([`data/scores.yaml`](data/scores.yaml)), overridable wholesale with `score_table`. Entries key off a candidate pattern (`agent/model`, `*` wildcards, first match wins — keep specific patterns like `*mini*` above broad ones like `*gpt-5*`). Quality sits on a benchmark-calibrated 0.5–3.5 scale (about 1 minimal, 2 standard, 3 frontier), mapped linearly to 0–1 before combining it with quota and preference, so a one-point quality difference always means the same thing to the router. Capability above what a task can actually use earns no extra utility — which is what stops routine work from spending frontier headroom it doesn't need — and a task-class override is only emitted when at least two relevant benchmarks agree on a difference of 0.15 or more. The classifier's own rule tables work the same way ([`data/classifier.yaml`](data/classifier.yaml), `classifier.rules_file`). The reproducible update procedure — discovery, scoring, validation — is documented in [`docs/model-updater.md`](docs/model-updater.md).
+Per-class quality scores, coding tiers/percentiles, and context windows live on each model's own entry in its provider's file, shipped with the binary ([`data/providers/<name>.yaml`](data/providers/)) — the one source of truth for every supported model — with scores overridable wholesale by `score_table`. Each provider file groups its models by family, one entry per exact version (no patterns or aliases: a model is found by its exact API `id`), and every entry is scored only from its own published benchmark `evidence`, recorded on that entry, through the fixed calibrations under `scoring` in [`data/classifier.yaml`](data/classifier.yaml); a model with none is unscored and is chosen only by an explicit pick. Quality sits on a benchmark-calibrated 0.5–3.5 scale (about 1 minimal, 2 standard, 3 frontier), mapped linearly to 0–1 before combining it with quota and preference, so a one-point quality difference always means the same thing to the router. Capability above what a task can actually use earns no extra utility — which is what stops routine work from spending frontier headroom it doesn't need — and a task-class override is only emitted when at least two relevant benchmarks agree on a difference of 0.15 or more. The classifier's own rule tables work the same way ([`data/classifier.yaml`](data/classifier.yaml), `classifier.rules_file`). To re-score a model, record its results under `evidence:` on its entry in `data/providers/<name>.yaml` and run `scripts/update_models.py --apply`, which rewrites that entry's quality and nothing else; the procedure — discovery, scoring, validation — is documented in [`docs/model-updater.md`](docs/model-updater.md).
 
 ## Per-request LLM routing
 
@@ -988,7 +988,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `router` | `auto` | Default strategy: `auto`, `pareto-code`, `escalation`, `static`. |
 | `state_file` | `~/.local/state/router-acp/sessions.db` | SQLite database. `sessions` records pins, lineage, token/context totals, and per-request aggregate cost/count. `session_log` records ACP and proxy events. `llm_requests` records each attributed provider request's model, policy event, latency, exact/cache tokens, and cost. `tool_calls` plus `active_tool_calls` expose tool/model lifecycle. A legacy `sessions.json` beside it is imported once. |
 | `history` | `30d` | How long to keep sessions before auto-pruning (with their rows in every table). Duration string: `30d`, `12h`, `90m`, `3600s`, or a bare number of days. Pruned by the background maintenance worker (see [State DB maintenance](#state-db-maintenance)). |
-| `score_table` | built-in | Path to a score-table YAML overriding the shipped data. |
+| `score_table` | built-in | Path to a score file whose quality numbers override the shipped ones (agents still inherit their models from `data/providers/<name>.yaml`). |
 | `disclosure` | `chunk` | `chunk` = visible status line before the first response; `meta` = attach route details under `_meta.router_acp` on the first forwarded update. |
 | `probe_timeout_ms` | `120000` | Timeout for downstream initialize/probe/session-open calls. |
 | `mcp_credential_command` | unset | Host helper that supplies a bearer for a project MCP server the router has no sign-in for (see Project MCP servers). |
@@ -1047,8 +1047,8 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `demotion.after_quiet_turns` | `0` (disabled) | Steps an *elevated* pin (from a skill route, an escalation, or an auto-upgrade — never an explicit user pick) back down to the strongest cheaper candidate after this many consecutive turns with no struggle signal. `0` keeps an elevated pin for the rest of the session. |
 | `skill_routing[]` | `[]` | Rules forcing a skill onto a model class: `pattern` (skill name, matched as `/name` or a standalone token) → `candidates` (switch-target globs in preference order), plus optional `also_acceptable` (globs that are fine to stay pinned on but are never switch targets), `selection` (`best-quality` default, or `first-match`), and `terse_handoff` (a three-line handoff instead of a full summary). The pin is left alone if it matches either list; a switch only ever targets `candidates`. Mid-session it switches; pre-pin it steers routing unless an explicit UserPick (`[router: candidate=…]`, `model:` shorthand, `router.candidate`) is already set. |
 | `ticket_context[]` | `[]` | Ticket-loading rules: `prefix` (e.g. `ABC-`, matched at a word start + digits) → `command` (argv, `$TICKET` substituted, run without a shell) whose stdout is prepended to the prompt before routing. Pluggable across ticketing systems; fail-open. |
-| `pinned_versions` | `{}` | Version pinning: `agent/model-id` → `default` or one of that model's `versions[].api_model`. Routing never sees it — the candidate keeps its id in every pool, directive, glob and state row — and the per-request proxy sends the pinned version on the wire, priced (`versions[].pricing`) and scored (`data/scores.yaml` matched against `agent/<pinned api_model>`) as that version. The routing disclosure adds a `pinned version <api_model>` note. A key that is not a declared model, or a version the model does not declare, fails the load. |
-| — pin rejected by the provider | – | When the provider rejects the pinned model's `api_model` (HTTP 400/404 — a version gated behind a newer client, a retired id), the router does **not** fall back to whatever the downstream alias would have served: the session is attributed and priced as the pinned version, so serving a different one silently would be a lie. Instead the provider's error is returned to the adapter verbatim (its message is usually actionable), the session gets a notice, and the candidate is cordoned for `headroom.cordon_default_secs` with the provider's reason — so the picker shows it unavailable, automatic routing drops it, and the next turn routes elsewhere instead of paying the same failing round trip again. Rejections of a router-chosen **alternate** keep the original retry-unchanged recovery: there the pinned model is what the adapter asked for anyway. For a version the score table marks `system_turns: false` (Opus 4.6/4.7, Sonnet 4.6), the proxy folds Claude Code's mid-conversation `role: "system"` turns into user turns and drops the `mid-conversation-system` / `per-turn-control` beta tokens before sending, so the pinned version is never asked for a feature it lacks. A 400 that still rejects a **feature of the request** rather than the model (`… is not supported on this model`, a structured tool-addition turn the proxy cannot fold, `cache_control`) is relayed but does **not** cordon: the adapter re-sends without the feature and the pinned version serves that retry. |
+| `pinned_versions` | `{}` | Version pinning: `agent/model-id` → `default` or one of that model's `versions[].api_model`. Routing never sees it — the candidate keeps its id in every pool, directive, glob and state row — and the per-request proxy sends the pinned version on the wire, priced (`versions[].pricing`) and scored (the entry in its provider's `data/providers/<name>.yaml` whose `id` is the pinned model id) as that version. The routing disclosure adds a `pinned version <api_model>` note. A key that is not a declared model, or a version the model does not declare, fails the load. |
+| — pin rejected by the provider | – | When the provider rejects the pinned model's `api_model` (HTTP 400/404 — a version gated behind a newer client, a retired id), the router does **not** fall back to whatever the downstream alias would have served: the session is attributed and priced as the pinned version, so serving a different one silently would be a lie. Instead the provider's error is returned to the adapter verbatim (its message is usually actionable), the session gets a notice, and the candidate is cordoned for `headroom.cordon_default_secs` with the provider's reason — so the picker shows it unavailable, automatic routing drops it, and the next turn routes elsewhere instead of paying the same failing round trip again. Rejections of a router-chosen **alternate** keep the original retry-unchanged recovery: there the pinned model is what the adapter asked for anyway. For a version whose provider-file entry says `system_turns: false` (Opus 4.6/4.7, Sonnet 4.6), the proxy folds Claude Code's mid-conversation `role: "system"` turns into user turns and drops the `mid-conversation-system` / `per-turn-control` beta tokens before sending, so the pinned version is never asked for a feature it lacks. A 400 that still rejects a **feature of the request** rather than the model (`… is not supported on this model`, a structured tool-addition turn the proxy cannot fold, `cache_control`) is relayed but does **not** cordon: the adapter re-sends without the feature and the pinned version serves that retry. |
 
 ### Delegation
 
@@ -1104,13 +1104,34 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 
 ### Agents & models
 
-**Provider presets.** router-acp ships defaults for `claude` (claude-agent-acp), `codex` (codex-acp) and
-`grok` (the Grok CLI): command, model selection, usage source, LLM-proxy upstream, mode map, auth probe,
-lineage, budget, and the model list with pricing and versions (`src/presets/*.yaml`). An entry inherits
-its preset when it names `provider:` or runs no program of its own. The provider comes from `provider:`,
-from the name (`claude`, `claude@<id>`), or from the usage source. Keys the entry sets win: mappings
-merge, while lists (such as `models`) and scalars replace the preset's. Bare program names resolve
-through `PATH`. An account seat `<provider>@<id>` also implies its directory,
+**Providers and models.** `data/providers/<name>.yaml` defines each provider router-acp supports
+(`claude`, `codex`, `grok`, `kimi`): its default agent settings (command, model selection, usage source,
+LLM-proxy upstream, mode map, auth probe, lineage, budget) and every model it supports, grouped by family
+and listed by version. Each model is its exact provider API id (never an alias) with its display name,
+cost rank, pricing, wire capabilities, its own published benchmark evidence and the quality computed from
+that evidence alone. It is the one source of truth for model definitions.
+
+A router config changes those defaults in `providers:`, a map merged over them: mappings merge, lists and
+scalars replace, and its `models:` merge over the catalog by `id` (overriding a model's fields, or adding
+a model the catalog lacks). `agents:` lists the accounts: each inherits its provider's effective
+settings, and a config that omits `agents:` runs one agent per provider. An agent's provider comes from
+`provider:`, from its name (`claude`, `claude@<id>`), or from its usage source. Bare program names
+resolve through `PATH`.
+
+```yaml
+providers:
+  claude:
+    command:
+      command: npx
+      args: ["-y", "@agentclientprotocol/claude-agent-acp"]
+    preference: 0.1
+```
+
+**Model shorthand.** Anywhere a model is named (`routers.static.candidate`, `router.candidate`,
+`[router: candidate=…]`, `model:` prompt prefixes, `pinned_versions`), `claude/haiku` or `haiku` names the
+family: the version `pinned_versions` pins for it (`claude/haiku: claude-haiku-4-5`), else its newest. Only
+that version of a family is chosen automatically; an older one stays selectable by its exact id. A model
+with no evidence of its own is unscored and chosen only by an explicit pick. An account seat `<provider>@<id>` also implies its directory,
 `~/.config/router-acp/accounts/<name>`, through the provider's directory variable (`CLAUDE_CONFIG_DIR`,
 `CODEX_HOME`, `GROK_HOME`). An entry that sets its own `command` without `provider:` stays exactly as
 written. So a complete seat can be just:
@@ -1134,8 +1155,9 @@ it would not.
 | `agents[].command` | – | `type: stdio` command/args/env for the adapter. `$VAR` and `${VAR}` in the whole file interpolate from the launching process's environment (unknown names are left intact). |
 | `agents[].model_selection.type` | – | `config-option`: one process per agent; the router discovers the `category: model` select option at probe time and applies `session/set_config_option` per session. `spawn-config`: one process per model, built from `process_template` (with `${model_id}` substitution); no universal `-m` flag is assumed. |
 | `agents[].budget_prompts_5h` | `400` | Headroom normalization budget. |
-| `agents[].models[]` | – | `id` (must match the downstream selector's value for `config-option`; a `[1m]` suffix difference is accepted), optional `display_name`, `api_model` (provider model id for proxy rewrites; defaults to `id`), `versions`, `cost_rank` (1 = cheapest/least scarce), `auto_eligible`, and optional `pricing`. |
-| `agents[].models[].auto_eligible` | `true` | `false` removes the candidate from every **automatic** selection pool — the `auto`/`pareto-code` strategies, escalation and demotion targets, pre-classifier evaluators, skill routes, failover, delegate scoping, and per-request proxy routing — while it stays advertised in `router.candidate` (flagged `auto_eligible: false` in the option's `_meta.router_acp`) and selectable by name via `[router: candidate=…]`/`switch=`. |
+| `providers.<name>` | – | Changes to router-acp's defaults for that provider (`data/providers/<name>.yaml`), merged over them for every agent of it; a name router-acp does not ship defines a provider of its own. |
+| `agents[].models[]` | catalog | Merged over the provider's catalog by `id`: an entry overrides a model's fields or adds one. `id` (the provider's model id; for `config-option` a model with no selector row of its own opens on its family's row, and one with neither is flagged missing), optional `family` and `version` (only the newest version of a family is chosen automatically), `display_name`, `api_model` (provider model id when `id` is a selector alias; defaults to `id`, and the model is scored as it), `versions`, `cost_rank` (1 = cheapest/least scarce), and optional `pricing`. |
+| — automatic eligibility | derived | Not configurable. A model is left out of every **automatic** selection pool (the `auto`/`pareto-code` strategies, escalation and demotion targets, pre-classifier evaluators, skill routes, failover, delegate scoping, and per-request proxy routing) when a newer version of its family is declared, unless `pinned_versions` keeps it, or when its catalog entry is unscored. It stays advertised in `router.candidate` (flagged `auto_eligible: false` in the option's `_meta.router_acp`) and selectable by name. |
 | `agents[].models[].versions` | `[]` | Older provider versions `pinned_versions` may select: each `{ api_model, pricing? }`. `api_model` must be unique and differ from the model's current one. |
 | `agents[].models[].pricing` | – | API-equivalent USD per Mtok: `input_per_mtok`, `output_per_mtok`, and optional `cache_read_per_mtok`/`cache_write_per_mtok` (default to `0.1×`/`1.25×` the input rate when unset). Prices every attributed request and drives the LLM-proxy cache-reprime gate. |
 | `agents[].mode_map` | `{}` | Translate client-requested session mode ids to this agent's ids (e.g. goose's `auto` -> claude's `bypassPermissions`). When `pre_classifier.enabled`, an evaluator that advertises session modes requires an explicit tool-safe `preclass` entry whose target it advertises; it is applied before the classifier prompt. Mode-less adapters run the evaluator without `session/set_mode`; a tool call from those adapters is cancelled but not cordoned, and routing falls back to the static classifier. |
@@ -1227,8 +1249,8 @@ Hosts own presentation state and queued UI actions. They must retain the router 
 **`initialize` fails with "zero routeable candidates".**
 Every agent failed spawn/probe/model validation. Run `router-acp check-config --config …`, then `RUST_LOG=router_acp=debug` and read the per-target warnings (spawn failure, probe timeout, missing model option).
 
-**"declared model not offered by downstream model selector".**
-Your `models[].id` doesn't exactly match the adapter's model-selector values. The candidate is removed from the pool at startup (missing models are never discovered later at prompt time). Debug logging prints the values the adapter actually offers; copy the exact id.
+**A model shows "Missing from binary".**
+The catalog decides which models exist, so a declared model is never dropped from `router.candidate`. It is flagged (`missing: true`, `available: false`, `unavailable_reason: "Missing from binary"` in the option's `_meta.router_acp`) only when the adapter's model selector offers no row for it and none for another version of its family. A flagged model is never chosen automatically and a pick of it is refused with that reason. A version the selector does not list by name opens on its family's row, and the per-request proxy sends its exact id; a provider that rejects that id cordons the candidate with the provider's reason. `RUST_LOG=router_acp=debug` prints the values the adapter offers.
 
 **"model verification failed … silent no-op".**
 The adapter accepted `session/set_config_option` but still reports another model as current. The router refuses to pin (the response is authoritative; no `config_option_update` notification is awaited). Usually this means the model id exists in the selector but the seat/plan doesn't allow it.

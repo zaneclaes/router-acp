@@ -2029,8 +2029,15 @@ fn declared_api_model(
     if let Some(version) = cfg.resolve_version(candidate, version) {
         return Some(version.api_model.clone());
     }
-    cfg.model_config(candidate)
-        .and_then(|model| model.api_model.clone())
+    // A catalog model (it has a `family`) is its exact provider id, so that id
+    // is its declared wire id: a version opened on its family's selector row is
+    // still sent as itself.
+    cfg.model_config(candidate).and_then(|model| {
+        model
+            .api_model
+            .clone()
+            .or_else(|| model.family.is_some().then(|| model.id.clone()))
+    })
 }
 
 fn configured_api_model(shared: &Shared, candidate: &CandidateId) -> String {
@@ -2643,9 +2650,20 @@ agents:
 
     fn policy_shared() -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
+        // The fixture's own scores: the mock models are not shipped models.
+        let scores = dir.path().join("scores.yaml");
+        std::fs::write(
+            &scores,
+            "models:\n\
+             \x20 - { id: haiku, default_quality: 1.3, context_window: 1000000, max_output_tokens: 128000 }\n\
+             \x20 - { id: sonnet, default_quality: 1.9, context_window: 1000000, max_output_tokens: 128000 }\n\
+             \x20 - { id: opus, default_quality: 2.6, context_window: 1000000, max_output_tokens: 128000 }\n",
+        )
+        .unwrap();
         let yaml = format!(
             r#"
 state_file: {}
+score_table: {}
 llm_proxy:
   enabled: true
 agents:
@@ -2661,7 +2679,8 @@ agents:
       - {{ id: sonnet, cost_rank: 2 }}
       - {{ id: opus, cost_rank: 3 }}
 "#,
-            dir.path().join("state.db").display()
+            dir.path().join("state.db").display(),
+            scores.display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg).unwrap();
@@ -2712,7 +2731,7 @@ agents:
     /// candidates, their real `api_model` values, and Anthropic's real cache rates
     /// (read = 0.1x input, write = 1.25x input) so the re-prime gate is live.
     /// Score data (context windows, wire features) comes from the shipped
-    /// `data/scores.yaml`, not from a test stub.
+    /// `data/providers/<provider>.yaml`, not from a test stub.
     fn kory_code_shared() -> (tempfile::TempDir, Arc<Shared>) {
         kory_code_shared_with("")
     }
@@ -3049,9 +3068,9 @@ agents:
         let scores = dir.path().join("scores.yaml");
         std::fs::write(
             &scores,
-            "candidates:\n\
-             \x20 - { pattern: 'mock/parent', default_quality: 3.0, context_window: 400000, effort_levels: [max], effort_mapping: { max: parent-max } }\n\
-             \x20 - { pattern: 'mock/subtool', default_quality: 1.0, context_window: 400000, effort_levels: [high], effort_mapping: { high: subtool-high } }\n",
+            "models:\n\
+             \x20 - { id: parent, default_quality: 3.0, context_window: 400000, effort_levels: [max], effort_mapping: { max: parent-max } }\n\
+             \x20 - { id: subtool, default_quality: 1.0, context_window: 400000, effort_levels: [high], effort_mapping: { high: subtool-high } }\n",
         )
         .unwrap();
         let yaml = format!(
@@ -3128,8 +3147,8 @@ agents:
         let scores = dir.path().join("scores.yaml");
         std::fs::write(
             &scores,
-            "candidates:\n\
-             \x20 - { pattern: 'mock/worker', default_quality: 3.0, context_window: 400000, effort_levels: [low, max], effort_mapping: { low: worker-low, max: worker-max } }\n",
+            "models:\n\
+             \x20 - { id: worker, default_quality: 3.0, context_window: 400000, effort_levels: [low, max], effort_mapping: { low: worker-low, max: worker-max } }\n",
         )
         .unwrap();
         let yaml = format!(
@@ -3282,10 +3301,10 @@ agents:
         // 5.5, which is 1M like every other current Claude model.
         let table = crate::candidate::ScoreTable::builtin();
         for (model, expected) in [
-            ("claude-fable-5[1m]", 1_000_000),
-            ("opus[1m]", 1_000_000),
-            ("sonnet", 1_000_000),
-            ("haiku", 1_000_000),
+            ("claude-fable-5-2", 1_000_000),
+            ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-5-5", 1_000_000),
+            ("claude-haiku-5-5", 1_000_000),
             ("claude-haiku-4-5", 200_000),
         ] {
             let scores = table.lookup(&CandidateId::new("claude", model));
@@ -3615,6 +3634,44 @@ agents:
         assert!(!decision.rewrite);
     }
 
+    /// The shipped Claude catalog: exact provider ids, no `api_model`.
+    fn catalog_claude_shared() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "state_file: {}\nllm_proxy:\n  enabled: true\nagents:\n  - name: claude\n",
+            dir.path().join("state.db").display()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
+        let ids = cfg.agents[0].models.iter().map(|m| m.id.clone()).collect();
+        let shared = Shared::new(cfg).unwrap();
+        shared.set_models_routeable(&ProcessKey("claude".to_string()), ids);
+        (dir, shared)
+    }
+
+    #[test]
+    fn a_version_opened_on_its_family_row_is_sent_as_itself() {
+        let (_dir, shared) = catalog_claude_shared();
+        // Fable 5.1 opens on the Fable 5.2 selector row and Opus 4.6 on `opus`,
+        // so the adapter names the newer model. The wire carries the pick.
+        for (pick, adapter) in [
+            ("claude-fable-5-1", "claude-fable-5-2"),
+            ("claude-opus-4-6", "claude-opus-5-5"),
+        ] {
+            let decision =
+                select_request_model(&shared, &claude_active(pick), &aliased_request(adapter));
+            assert_eq!(decision.model, pick);
+            assert!(decision.rewrite && decision.honors_pin, "{decision:?}");
+        }
+        // The family's current model is already what the adapter sends.
+        let decision = select_request_model(
+            &shared,
+            &claude_active("claude-fable-5-2"),
+            &aliased_request("claude-fable-5-2"),
+        );
+        assert_eq!(decision.model, "claude-fable-5-2");
+        assert!(!decision.rewrite);
+    }
+
     #[test]
     fn candidate_without_api_model_keeps_the_adapters_own_model_string() {
         // No `api_model` declared means the router has no authoritative wire
@@ -3736,9 +3793,19 @@ agents:
 
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.db");
+        // The fixture's own scores: the mock models are not shipped models.
+        let scores = dir.path().join("scores.yaml");
+        std::fs::write(
+            &scores,
+            "models:\n\
+             \x20 - { id: claude-haiku-test, default_quality: 1.3, context_window: 1000000, max_output_tokens: 128000 }\n\
+             \x20 - { id: opus, default_quality: 2.6, context_window: 1000000, max_output_tokens: 128000 }\n",
+        )
+        .unwrap();
         let yaml = format!(
             r#"
 state_file: {}
+score_table: {}
 llm_proxy:
   enabled: true
 agents:
@@ -3756,7 +3823,8 @@ agents:
         pricing: {{ input_per_mtok: 1, output_per_mtok: 5 }}
       - {{ id: opus, cost_rank: 3 }}
 "#,
-            state_path.display()
+            state_path.display(),
+            scores.display()
         );
         let cfg = crate::config::Config::from_yaml(&yaml).unwrap();
         let shared = Shared::new(cfg).unwrap();

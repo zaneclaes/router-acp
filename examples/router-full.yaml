@@ -125,7 +125,7 @@ ticket_context:
 # genuine switch to the most expensive entry.
 skill_routing:
   - pattern: ship-pr
-    candidates: ["*opus*", "*gpt-5.5*"]
+    candidates: ["*opus*", "*gpt-5.6-terra*"]
     also_acceptable: ["*fable*", "*sol*"]
 
 # Reasoning effort for primary sessions when nobody asked for a level (the
@@ -137,171 +137,21 @@ skill_routing:
 #   default: medium
 #   max_automatic: high
 
-agents:
-  - name: claude
+# `providers:` changes router-acp's defaults for a provider
+# (data/providers/<name>.yaml): an entry states only what it changes, merged
+# over the default (mappings merge, lists and scalars replace). Its `models:`
+# merge over the provider's catalog by `id`: an entry overrides that model's
+# fields or adds a model the catalog lacks. Here: run Claude's adapter through
+# npx, and prefer Claude a little when candidates are otherwise comparable.
+#
+# `agents:` lists accounts (`claude@<seat>`), each inheriting its provider's
+# settings; omit it for one agent per provider.
+providers:
+  claude:
     command:
-      type: stdio
       command: npx
       args: ["-y", "@agentclientprotocol/claude-agent-acp"]
-      env: []
-    model_selection:
-      type: config-option       # discover the category:model config option,
-                                # then session/set_config_option per session
-    budget_prompts_5h: 400
-    usage_source:               # proactive cordons from the Anthropic usage API
-      type: anthropic-oauth     # (reads the CLI OAuth token; see `cordon` above)
-    llm_proxy:
-      protocol: anthropic
-      base_url_env: ANTHROPIC_BASE_URL
-      upstream_base_url: https://api.anthropic.com
-    # `preclass` is required when pre_classifier.enabled: a tool-safe evaluator mode.
-    mode_map: { auto: bypassPermissions, approve: default, chat: plan, preclass: plan }
-    preference: 0.1             # static tie-break; client/provider plan
-                                # headroom makes scarce seats costlier
-    models:
-      # ids must exactly match the downstream model selector's values;
-      # run with RUST_LOG=router_acp=debug to see what the adapter offers.
-      # `api_model` is what the proxy writes into the /v1/messages body when it
-      # demotes — it must be a real Anthropic model id (the ACP `id` above is
-      # only a selector alias). These three are verified valid on the Claude
-      # Code subscription OAuth endpoint. Include cache_read/cache_write pricing:
-      # on the Anthropic wire a mid-session demotion forfeits the per-model
-      # prompt cache and re-primes the prefix at cache_write on the switch turn,
-      # so accurate cache pricing is what keeps session-wide savings honest.
-      - id: sonnet
-        display_name: Claude Sonnet 5.5
-        api_model: claude-sonnet-5-5
-        cost_rank: 2            # 1 = cheapest/least scarce
-        # Same $2/$10 list as Sonnet 5; cache read is 0.05x input ($0.10),
-        # not the standard 0.1x.
-        pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00, cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 }
-      # A family alias sends that family's current model; an older version
-      # would be its own candidate under its exact API id.
-      - id: opus
-        display_name: Claude Opus 5.5
-        api_model: claude-opus-5-5
-        cost_rank: 3
-        pricing: { input_per_mtok: 4.00, output_per_mtok: 20.00, cache_read_per_mtok: 0.20, cache_write_per_mtok: 5.00 }
-      - id: fable
-        display_name: Claude Fable 5.2
-        api_model: claude-fable-5-2
-        cost_rank: 4
-        pricing: { input_per_mtok: 8.00, output_per_mtok: 40.00, cache_read_per_mtok: 0.20, cache_write_per_mtok: 10.00 }
-
-  - name: codex
-    command:
-      type: stdio
-      command: npx
-      # Use @agentclientprotocol/codex-acp (>= 1.1.2). It drives your installed
-      # `codex` CLI, so its model selector lists whatever your codex offers,
-      # including the newer gpt-5.6-* models. (The older @zed-industries build
-      # bundled a stale Codex core that couldn't run them.)
-      args: ["-y", "@agentclientprotocol/codex-acp"]
-      env: []
-    # config-option: discover codex-acp's model selector and set per session.
-    model_selection: { type: config-option }
-    budget_prompts_5h: 400
-    usage_source:               # proactive cordons from Codex's on-disk snapshot
-      type: codex-rollout       # (no pollable endpoint; last-known + reactive backstop)
-    auth_probe:                 # `Not logged in` matches the default patterns
-      command: codex
-      args: ["login", "status"]
-    # ChatGPT OAuth endpoint. For API-key auth use
-    # `upstream_base_url: https://api.openai.com/v1`.
-    llm_proxy:
-      protocol: openai
-      base_url_env: OPENAI_BASE_URL
-      upstream_base_url: https://chatgpt.com/backend-api/codex
-      codex_chatgpt_provider: true
-    mode_map: { auto: agent-full-access, approve: agent, chat: read-only, preclass: read-only }
-    models:
-      - { id: gpt-5.4-mini, display_name: GPT-5.4 Mini, cost_rank: 1,
-          pricing: { input_per_mtok: 0.75, output_per_mtok: 4.50 } }
-      - { id: gpt-5.5, display_name: GPT-5.5, cost_rank: 3,
-          pricing: { input_per_mtok: 5.00, output_per_mtok: 30.00 } }
-      # Newer "sol / terra / luna" lines, scored via `*sol*`/`*terra*`/`*luna*`
-      # in data/scores.yaml (sol = frontier, terra = strong, luna = small).
-      # Available whenever your codex CLI + codex-acp expose them.
-      - { id: gpt-5.6-luna, display_name: GPT Luna, cost_rank: 2,
-          pricing: { input_per_mtok: 1.00, output_per_mtok: 6.00 } }
-      - { id: gpt-5.6-terra, display_name: GPT Terra, cost_rank: 4,
-          pricing: { input_per_mtok: 2.50, output_per_mtok: 15.00 } }
-      - { id: gpt-5.6-sol, display_name: GPT Sol, cost_rank: 5,
-          pricing: { input_per_mtok: 5.00, output_per_mtok: 30.00 } }
-      - { id: gpt-6-luna, display_name: GPT-6 Luna, cost_rank: 2,
-          pricing: { input_per_mtok: 0.10, output_per_mtok: 0.50,
-                     cache_read_per_mtok: 0.01, cache_write_per_mtok: 0.125 } }
-      - { id: gpt-6-sol, display_name: GPT-6 Sol, cost_rank: 5,
-          pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
-                     cache_read_per_mtok: 0.20, cache_write_per_mtok: 2.50 } }
-      - { id: gpt-6.1-sol, display_name: GPT-6.1 Sol, cost_rank: 5,
-          pricing: { input_per_mtok: 2.00, output_per_mtok: 10.00,
-                     cache_read_per_mtok: 0.10, cache_write_per_mtok: 2.50 } }
-      - { id: gpt-6-astra, display_name: GPT-6 Astra, cost_rank: 5,
-          pricing: { input_per_mtok: 10.00, output_per_mtok: 50.00,
-                     cache_read_per_mtok: 1.00, cache_write_per_mtok: 12.50 } }
-
-  # xAI Grok — the official CLI (`@xai-official/grok`) is itself an ACP agent
-  # (`grok agent stdio`); no separate adapter needed. Own company/lineage, so it
-  # can review (and be reviewed by) claude and codex. `grok login` is separate.
-  # No `usage_source`: Grok has no usage meter, so the router auto-cordons it off
-  # its own subscription access gate when you're over your plan (via `cordon:`).
-  - name: grok
-    command:
-      type: stdio
-      command: grok
-      args: ["agent"]
-    lineage: xai
-    budget_prompts_5h: 400
-    # `grok models` exits zero either way, so the text is the only signal:
-    # logged out says `You are not authenticated.`
-    auth_probe:
-      command: grok
-      args: ["models"]
-      unauthenticated_patterns: ["not authenticated"]
-    # Browser-login/OAuth endpoint. With XAI_API_KEY use GROK_MODELS_BASE_URL
-    # and https://api.x.ai/v1 instead.
-    llm_proxy:
-      protocol: openai
-      base_url_env: GROK_CLI_CHAT_PROXY_BASE_URL
-      upstream_base_url: https://cli-chat-proxy.grok.com/v1
-    model_selection:
-      type: spawn-config              # model fixed per process via --model
-      process_template:
-        args: ["--model", "${model_id}", "stdio"]
-    models:
-      - { id: grok-4.7, display_name: Grok 4.7, cost_rank: 5,
-          pricing: { input_per_mtok: 2.00, output_per_mtok: 6.00,
-                     cache_read_per_mtok: 0.50 } }
-      - { id: grok-4.6, display_name: Grok 4.6, cost_rank: 5,
-          pricing: { input_per_mtok: 2.00, output_per_mtok: 6.00,
-                     cache_read_per_mtok: 0.50 } }
-      # confirm ids with `grok models` after login; router-acp drops unknown ids
-
-  # Moonshot Kimi — the CLI (`uv tool install kimi-cli`) is itself an ACP agent
-  # (`kimi acp`); no separate adapter needed. Own company/lineage, so it can
-  # review (and be reviewed by) claude, codex and grok. `kimi login` is separate
-  # (browser OAuth) and auto-configures your account's model ids. `--model` is a
-  # global flag, so it precedes the `acp` subcommand. No `usage_source` (no
-  # pollable Moonshot usage endpoint) → reactive cordon only.
-  - name: kimi
-    command:
-      type: stdio
-      command: kimi
-    lineage: moonshot
-    budget_prompts_5h: 400
-    llm_proxy:
-      protocol: openai
-      base_url_env: KIMI_BASE_URL
-      upstream_base_url: https://api.kimi.com/coding/v1
-    model_selection:
-      type: spawn-config              # model fixed per process via --model
-      process_template:
-        args: ["--model", "${model_id}", "acp"]
-    models:
-      - { id: kimi-k2, display_name: Kimi K2, cost_rank: 2,
-          pricing: { input_per_mtok: 0.55, output_per_mtok: 2.20 } }
-      # - { id: kimi-k2-thinking, display_name: Kimi K2 Thinking, cost_rank: 3 }
+    preference: 0.1
 
 routers:
   static:

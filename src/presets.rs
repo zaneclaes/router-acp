@@ -1,5 +1,11 @@
 //! Built-in agent defaults, so a configuration states only what it changes.
 //!
+//! An agent's `models:` come from `data/providers/<provider>.yaml`, the one catalog of the
+//! models router-acp supports: every row whose `provider` is the agent's
+//! provider. An entry's own `models:` merge over those rows by `id` (its
+//! fields win) and may add models the catalog lacks; they never replace the
+//! list.
+//!
 //! An agent entry names its provider with `provider:`, or implies it by its
 //! name (`claude`, `claude@<id>`) or its command (`claude-agent-acp`). Every key
 //! the entry does not set comes from that provider's preset: mappings merge
@@ -16,21 +22,119 @@
 use serde_yaml::{Mapping, Value};
 use std::path::Path;
 
-const CLAUDE: &str = include_str!("presets/claude.yaml");
-const CODEX: &str = include_str!("presets/codex.yaml");
-const GROK: &str = include_str!("presets/grok.yaml");
-const KIMI: &str = include_str!("presets/kimi.yaml");
+/// Keys of a `data/providers/<provider>.yaml` file that are not agent settings:
+/// the model catalog and what the model updater reads.
+const CATALOG_KEYS: [&str; 4] = ["provider", "models", "cache_ratio", "discovery"];
 
-/// The preset for `provider`, when router-acp ships one.
+/// Each provider's file of `data/providers/`, by provider name.
+fn providers() -> Mapping {
+    crate::candidate::BUILTIN_PROVIDERS
+        .iter()
+        .map(|(name, text)| {
+            let document: Value = serde_yaml::from_str(text).expect("data/providers is valid YAML");
+            (Value::from(*name), document)
+        })
+        .collect()
+}
+
+/// The names of the providers `data/providers/` defines.
+pub fn provider_names() -> Vec<String> {
+    providers()
+        .keys()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The catalog rows of `provider` in `data/providers/<provider>.yaml`, as `models:` entries.
+pub fn catalog_models(provider: &str) -> Vec<Value> {
+    crate::candidate::ScoreTable::builtin()
+        .rows()
+        .iter()
+        .filter(|row| row.provider.as_deref() == Some(provider))
+        .map(|row| Value::Mapping(row.catalog.clone()))
+        .collect()
+}
+
+/// `catalog` with `own` merged over it by `id`: an entry naming a catalog
+/// model overrides that row's fields, and one naming another model is added
+/// after the catalog's.
+fn merge_models(own: Vec<Value>, catalog: Vec<Value>) -> Vec<Value> {
+    let id = |v: &Value| v.get("id").and_then(Value::as_str).map(str::to_string);
+    let mut models = catalog;
+    for entry in own {
+        match models
+            .iter_mut()
+            .find(|m| id(m).is_some() && id(m) == id(&entry))
+        {
+            Some(Value::Mapping(row)) => {
+                if let Value::Mapping(mut mine) = entry {
+                    merge(&mut mine, row);
+                    *row = mine;
+                }
+            }
+            _ => models.push(entry),
+        }
+    }
+    models
+}
+
+/// The default agent settings for `provider` in `data/providers/`, when
+/// router-acp ships them, its `models:` the provider's catalog rows.
 pub fn preset(provider: &str) -> Option<Value> {
-    let text = match provider {
-        "claude" => CLAUDE,
-        "codex" => CODEX,
-        "grok" => GROK,
-        "kimi" => KIMI,
-        _ => return None,
-    };
-    Some(serde_yaml::from_str(text).expect("built-in preset is valid YAML"))
+    let mut preset = providers().get(provider)?.as_mapping()?.clone();
+    for key in CATALOG_KEYS {
+        preset.shift_remove(key);
+    }
+    preset.insert("models".into(), Value::Sequence(catalog_models(provider)));
+    Some(Value::Mapping(preset))
+}
+
+/// A router config's `providers:` section: per provider, the settings it
+/// changes. Each entry merges over router-acp's defaults for that provider
+/// (`data/providers/<name>.yaml`; mappings merge, lists and scalars replace,
+/// and its `models:` merge over the catalog by `id`), and names a provider of
+/// its own when router-acp ships none.
+pub type ProviderOverrides = Mapping;
+
+/// The providers a configuration knows: router-acp's and its own.
+fn known_providers(overrides: &ProviderOverrides) -> Vec<String> {
+    let mut names = provider_names();
+    for name in overrides.keys().filter_map(Value::as_str) {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The settings an agent of `provider` inherits: router-acp's defaults with
+/// the configuration's `providers.<provider>` merged over them.
+pub fn effective_preset(provider: &str, overrides: &ProviderOverrides) -> Option<Value> {
+    let builtin = preset(provider);
+    let own = overrides.get(provider).and_then(Value::as_mapping).cloned();
+    match (builtin, own) {
+        (None, None) => None,
+        (Some(builtin), None) => Some(builtin),
+        (None, Some(own)) => Some(Value::Mapping(own)),
+        (Some(Value::Mapping(mut builtin)), Some(mut own)) => {
+            let catalog = match builtin.shift_remove("models") {
+                Some(Value::Sequence(models)) => models,
+                _ => Vec::new(),
+            };
+            let own_models = match own.shift_remove("models") {
+                Some(Value::Sequence(models)) => models,
+                _ => Vec::new(),
+            };
+            merge(&mut own, &builtin);
+            own.insert(
+                "models".into(),
+                Value::Sequence(merge_models(own_models, catalog)),
+            );
+            Some(Value::Mapping(own))
+        }
+        (Some(other), Some(_)) => Some(other),
+    }
 }
 
 fn text<'a>(map: &'a Mapping, key: &str) -> Option<&'a str> {
@@ -38,35 +142,43 @@ fn text<'a>(map: &'a Mapping, key: &str) -> Option<&'a str> {
 }
 
 /// The provider an agent entry names or implies.
-pub fn provider_of(agent: &Mapping) -> Option<&'static str> {
-    const KNOWN: [&str; 4] = ["claude", "codex", "grok", "kimi"];
+pub fn provider_of(agent: &Mapping) -> Option<String> {
+    provider_of_among(agent, &provider_names())
+}
+
+/// The provider an agent entry names or implies, among `known`.
+fn provider_of_among(agent: &Mapping, known: &[String]) -> Option<String> {
+    let known = known.to_vec();
     if let Some(explicit) = text(agent, "provider") {
-        return KNOWN.into_iter().find(|p| *p == explicit);
+        return known.into_iter().find(|p| p == explicit);
     }
     let base = text(agent, "name").and_then(|n| n.split('@').next());
-    if let Some(p) = KNOWN.into_iter().find(|p| Some(*p) == base) {
-        return Some(p);
+    if let Some(p) = known.iter().find(|p| Some(p.as_str()) == base) {
+        return Some(p.clone());
     }
     let usage = agent
         .get("usage_source")
         .and_then(Value::as_mapping)
         .and_then(|u| text(u, "type"));
     match usage {
-        Some("anthropic-oauth") => return Some("claude"),
-        Some("codex-rollout") => return Some("codex"),
+        Some("anthropic-oauth") => return Some("claude".into()),
+        Some("codex-rollout") => return Some("codex".into()),
         _ => {}
     }
     let command = agent
         .get("command")
         .and_then(Value::as_mapping)
         .and_then(|c| text(c, "command"))?;
-    match Path::new(command).file_name()?.to_str()? {
-        "claude-agent-acp" | "claude-acp" => Some("claude"),
-        "codex-acp" => Some("codex"),
-        "grok" => Some("grok"),
-        "kimi" => Some("kimi"),
-        _ => None,
-    }
+    let program = Path::new(command).file_name()?.to_str()?;
+    // A command runs a provider when it runs that provider's default program.
+    let provider = providers().into_iter().find_map(|(name, entry)| {
+        let default = entry.get("command")?.get("command")?.as_str()?;
+        let default = Path::new(default).file_name()?.to_str()?.to_string();
+        (default == program)
+            .then(|| name.as_str().map(str::to_string))
+            .flatten()
+    });
+    provider.or_else(|| (program == "claude-acp").then(|| "claude".to_string()))
 }
 
 /// Fill `target` with every key of `defaults` it lacks, merging nested
@@ -149,11 +261,35 @@ fn own_program(agent: &Mapping) -> Option<&Value> {
         .and_then(|c| c.get("command"))
 }
 
-/// Apply the presets and implied seat directories to a parsed configuration.
+/// Apply the presets and implied seat directories to a parsed configuration,
+/// and give a configuration that lists no `agents:` one agent per provider.
 /// An entry inherits its preset when it names `provider:` or runs no program
 /// of its own; one with its own `command` and no `provider:` stays exactly as
 /// written, as every configuration did before presets.
 pub fn apply(document: &mut Value) {
+    // `providers:` changes router-acp's provider defaults; it is folded into
+    // the agents here and is no setting of the loaded configuration.
+    let overrides = document
+        .as_mapping_mut()
+        .and_then(|map| map.shift_remove("providers"))
+        .and_then(|value| value.as_mapping().cloned())
+        .unwrap_or_default();
+    let known = known_providers(&overrides);
+    // A configuration that lists no agents (accounts) runs one per provider.
+    if let Some(map) = document.as_mapping_mut()
+        && !map.contains_key("agents")
+    {
+        let defaults = known
+            .clone()
+            .into_iter()
+            .map(|name| {
+                let mut entry = Mapping::new();
+                entry.insert("name".into(), name.into());
+                Value::Mapping(entry)
+            })
+            .collect();
+        map.insert("agents".into(), Value::Sequence(defaults));
+    }
     let Some(agents) = document
         .as_mapping_mut()
         .and_then(|d| d.get_mut("agents"))
@@ -162,14 +298,14 @@ pub fn apply(document: &mut Value) {
         return;
     };
     for agent in agents.iter_mut().filter_map(Value::as_mapping_mut) {
-        let Some(provider) = provider_of(agent) else {
+        let Some(provider) = provider_of_among(agent, &known) else {
             continue;
         };
         let explicit = agent.shift_remove("provider").is_some();
         if !explicit && own_program(agent).is_some() {
             continue;
         }
-        if let Some((variable, path)) = implied_directory(agent, provider)
+        if let Some((variable, path)) = implied_directory(agent, &provider)
             && let Some(env) = env_list(agent)
             && !names_variable(env, variable)
         {
@@ -178,9 +314,18 @@ pub fn apply(document: &mut Value) {
             entry.insert("value".into(), path.into());
             env.push(Value::Mapping(entry));
         }
-        if let Some(Value::Mapping(mut defaults)) = preset(provider) {
+        if let Some(Value::Mapping(mut defaults)) = effective_preset(&provider, &overrides) {
             resolve_programs(&mut defaults);
+            let catalog = match defaults.shift_remove("models") {
+                Some(Value::Sequence(models)) => models,
+                _ => Vec::new(),
+            };
+            let own = match agent.shift_remove("models") {
+                Some(Value::Sequence(models)) => models,
+                _ => Vec::new(),
+            };
             merge(agent, &defaults);
+            agent.insert("models".into(), Value::Sequence(merge_models(own, catalog)));
         }
     }
 }
@@ -249,6 +394,11 @@ pub fn minimize(document: &Value, defaults: &Value, agent_defaults: &Value) -> V
     let Some(map) = out.as_mapping_mut() else {
         return out;
     };
+    let overrides = map
+        .get("providers")
+        .and_then(Value::as_mapping)
+        .cloned()
+        .unwrap_or_default();
     for (section, key) in IGNORED_KEYS {
         if let Some(section) = map.get_mut(section).and_then(Value::as_mapping_mut) {
             section.shift_remove(key);
@@ -278,8 +428,20 @@ pub fn minimize(document: &Value, defaults: &Value, agent_defaults: &Value) -> V
     }
     if let Some(agents) = map.get_mut("agents").and_then(Value::as_sequence_mut) {
         for agent in agents.iter_mut().filter_map(Value::as_mapping_mut) {
-            minimize_agent(agent, agent_defaults);
+            minimize_agent_with(agent, agent_defaults, &overrides);
         }
+    }
+    // Exactly one bare agent per provider is what an omitted `agents:` means.
+    let bare: Vec<Value> = known_providers(&overrides)
+        .into_iter()
+        .map(|name| {
+            let mut entry = Mapping::new();
+            entry.insert("name".into(), name.into());
+            Value::Mapping(entry)
+        })
+        .collect();
+    if map.get("agents").and_then(Value::as_sequence) == Some(&bare) {
+        map.shift_remove("agents");
     }
     out
 }
@@ -288,6 +450,16 @@ pub fn minimize(document: &Value, defaults: &Value, agent_defaults: &Value) -> V
 /// seat directory or the agent defaults (`agent_defaults`, a serialized agent
 /// with only its required keys) already supply.
 pub fn minimize_agent(agent: &mut Mapping, agent_defaults: &Value) {
+    minimize_agent_with(agent, agent_defaults, &Mapping::new());
+}
+
+/// [`minimize_agent`] against the defaults a configuration's `providers:`
+/// section changes.
+pub fn minimize_agent_with(
+    agent: &mut Mapping,
+    agent_defaults: &Value,
+    overrides: &ProviderOverrides,
+) {
     // Field defaults, for the keys a preset (when one applies) does not set.
     let field_defaults = |agent: &mut Mapping, preset: Option<&Mapping>| {
         if let Some(defaults) = agent_defaults.as_mapping() {
@@ -301,7 +473,10 @@ pub fn minimize_agent(agent: &mut Mapping, agent_defaults: &Value) {
             subtract(agent, &defaults);
         }
     };
-    let preset = provider_of(agent).and_then(|p| Some((p, preset(p)?)));
+    let preset = provider_of_among(agent, &known_providers(overrides)).and_then(|p| {
+        let defaults = effective_preset(&p, overrides)?;
+        Some((p, defaults))
+    });
     let Some((provider, Value::Mapping(preset))) = preset else {
         field_defaults(agent, None);
         return;
@@ -320,7 +495,7 @@ pub fn minimize_agent(agent: &mut Mapping, agent_defaults: &Value) {
         return;
     }
     field_defaults(agent, Some(&preset));
-    if let Some((variable, path)) = implied_directory(agent, provider)
+    if let Some((variable, path)) = implied_directory(agent, &provider)
         && let Some(env) = agent
             .get_mut("command")
             .and_then(Value::as_mapping_mut)
@@ -336,6 +511,10 @@ pub fn minimize_agent(agent: &mut Mapping, agent_defaults: &Value) {
                     == Some(path.clone()))
         });
     }
+    let mut preset = preset;
+    if let Some(Value::Sequence(catalog)) = preset.shift_remove("models") {
+        minimize_models(agent, &catalog);
+    }
     subtract(agent, &preset);
     if let Some(command) = agent.get_mut("command").and_then(Value::as_mapping_mut) {
         if command
@@ -348,6 +527,36 @@ pub fn minimize_agent(agent: &mut Mapping, agent_defaults: &Value) {
         if command.is_empty() {
             agent.shift_remove("command");
         }
+    }
+}
+
+/// Drop from an entry's `models:` every field its catalog row already
+/// supplies, every entry left naming only its `id`, and the list once empty.
+fn minimize_models(agent: &mut Mapping, catalog: &[Value]) {
+    let Some(Value::Sequence(models)) = agent.get_mut("models") else {
+        return;
+    };
+    models.retain_mut(|entry| {
+        let Some(mine) = entry.as_mapping_mut() else {
+            return true;
+        };
+        let row = catalog
+            .iter()
+            .filter_map(Value::as_mapping)
+            .find(|row| row.get("id").is_some() && row.get("id") == mine.get("id"));
+        let Some(row) = row else {
+            return true;
+        };
+        let id = mine.shift_remove("id");
+        subtract(mine, row);
+        let keep = !mine.is_empty();
+        if let Some(id) = id {
+            mine.insert("id".into(), id);
+        }
+        keep
+    });
+    if models.is_empty() {
+        agent.shift_remove("models");
     }
 }
 
@@ -371,7 +580,11 @@ mod tests {
                 .unwrap()
                 .ends_with("claude-agent-acp")
         );
-        assert_eq!(agent["models"].as_sequence().unwrap().len(), 9);
+        assert_eq!(
+            agent["models"].as_sequence().unwrap(),
+            &catalog_models("claude"),
+            "a seat inherits its provider's catalog rows"
+        );
         assert_eq!(agent["preference"], 0.1);
         let env = &agent["command"]["env"][0];
         assert_eq!(env["name"], "CLAUDE_CONFIG_DIR");
@@ -384,13 +597,26 @@ mod tests {
     }
 
     #[test]
-    fn entry_values_win_lists_replace_and_mappings_merge() {
+    fn entry_values_win_and_models_merge_over_the_catalog_by_id() {
         let mut doc = yaml(
-            "agents:\n- name: work\n  provider: codex\n  models:\n  - { id: gpt-6.1-sol, cost_rank: 5 }\n  mode_map: { auto: agent }\n",
+            "agents:\n- name: work\n  provider: codex\n  models:\n  - { id: gpt-6.1-sol, cost_rank: 3 }\n  - { id: gpt-7-nova, cost_rank: 5 }\n  mode_map: { auto: agent }\n",
         );
         apply(&mut doc);
         let agent = &doc["agents"][0];
-        assert_eq!(agent["models"].as_sequence().unwrap().len(), 1);
+        let models = agent["models"].as_sequence().unwrap();
+        let catalog = catalog_models("codex");
+        assert_eq!(
+            models.len(),
+            catalog.len() + 1,
+            "an override adds nothing; a new id is added"
+        );
+        let sol = models.iter().find(|m| m["id"] == "gpt-6.1-sol").unwrap();
+        assert_eq!(sol["cost_rank"], 3, "the entry's field wins");
+        assert_eq!(
+            sol["display_name"], "GPT-6.1 Sol",
+            "the row's other fields stay"
+        );
+        assert_eq!(models.last().unwrap()["id"], "gpt-7-nova");
         assert_eq!(agent["mode_map"]["auto"], "agent");
         assert_eq!(agent["mode_map"]["chat"], "read-only");
         assert!(agent.get("provider").is_none());
@@ -478,6 +704,108 @@ mod tests {
             small,
             yaml("agents:\n- name: claude@abc\n  preference: 0.1\n")
         );
+    }
+
+    #[test]
+    fn a_configuration_without_agents_runs_one_agent_per_provider() {
+        let mut doc = yaml("router: auto\n");
+        apply(&mut doc);
+        let names: Vec<&str> = doc["agents"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, provider_names());
+        assert!(names.contains(&"claude") && names.contains(&"kimi"));
+        assert_eq!(
+            minimize(&doc, &yaml("{}"), &yaml("{}")),
+            yaml("router: auto\n"),
+            "the default agents minimize back to an omitted `agents:`"
+        );
+        let mut listed = yaml("agents:\n- name: codex\n");
+        apply(&mut listed);
+        assert_eq!(
+            listed["agents"].as_sequence().unwrap().len(),
+            1,
+            "listed agents run exactly"
+        );
+    }
+
+    /// `providers:` changes a provider's defaults for every agent of it; `agents:` are accounts.
+    #[test]
+    fn a_providers_entry_merges_over_the_defaults_for_every_agent_of_it() {
+        let text = "providers:\n  claude:\n    command:\n      command: npx\n      args: [\"-y\", \"@agentclientprotocol/claude-agent-acp\"]\n    preference: 0.1\n";
+        let mut doc = yaml(text);
+        apply(&mut doc);
+        assert!(doc.get("providers").is_none(), "folded into the agents");
+        let claude = doc["agents"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "claude")
+            .unwrap();
+        assert!(
+            claude["command"]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("npx")
+        );
+        assert_eq!(
+            claude["command"]["type"], "stdio",
+            "the rest of the default stays"
+        );
+        assert_eq!(claude["preference"], 0.1);
+        assert_eq!(
+            claude["models"].as_sequence().unwrap(),
+            &catalog_models("claude")
+        );
+        assert_eq!(
+            minimize(&doc_raw(text), &yaml("{}"), &yaml("{}")),
+            yaml(text)
+        );
+        // A seat inherits the override too.
+        let mut seats = yaml(&format!("{text}agents:\n- name: claude@a\n"));
+        apply(&mut seats);
+        assert_eq!(seats["agents"][0]["preference"], 0.1);
+        assert_eq!(seats["agents"].as_sequence().unwrap().len(), 1);
+    }
+
+    fn doc_raw(text: &str) -> Value {
+        let mut doc = yaml(text);
+        let providers = doc["providers"].clone();
+        apply(&mut doc);
+        doc.as_mapping_mut()
+            .unwrap()
+            .insert("providers".into(), providers);
+        doc
+    }
+
+    #[test]
+    fn a_provider_is_known_by_its_default_program() {
+        for (program, provider) in [
+            ("/opt/bin/codex-acp", "codex"),
+            ("/usr/local/bin/claude-agent-acp", "claude"),
+            ("kimi", "kimi"),
+        ] {
+            let entry = yaml(&format!("name: x\ncommand: {{ command: {program} }}\n"));
+            assert_eq!(
+                provider_of(entry.as_mapping().unwrap()).as_deref(),
+                Some(provider)
+            );
+        }
+        assert!(
+            preset("claude").unwrap().get("discovery").is_none(),
+            "catalog keys are not agent settings"
+        );
+    }
+
+    #[test]
+    fn minimize_keeps_only_model_overrides_and_additions() {
+        let text = "agents:\n- name: codex\n  models:\n  - { id: gpt-6.1-sol, cost_rank: 3 }\n  - { id: gpt-7-nova, cost_rank: 5 }\n";
+        let mut full = yaml(text);
+        apply(&mut full);
+        assert_eq!(minimize(&full, &yaml("{}"), &yaml("{}")), yaml(text));
     }
 
     #[test]

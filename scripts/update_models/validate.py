@@ -1,25 +1,54 @@
-"""Invariant checks over the score table + catalog.
+"""The contract checks over the model catalog, `data/providers/<name>.yaml`.
 
-The contract this enforces: absolute quality numbers may drift, ORDERING may
-not. Everything here runs through the same first-match glob the router uses, on
-concrete `agent/model` witness ids, so a pattern-ordering mistake fails the
-check rather than hiding behind a plausible-looking number.
+The contract: absolute quality numbers may drift, ORDERING may not, and every
+entry is one exact, fully described model scored only on its own evidence.
+Concretely:
+
+  * shape — `models:` maps each family to its versions; every entry has
+    version/id/display_name/cost_rank/pricing; `version` is a dotted number;
+    no `*` anywhere a model is named; no id twice in a provider; no
+    `api_model` (an `id` is the provider's real API id, never an alias), no
+    retired `scored_as` / `compressed_behind`, no identity `effort_mapping`
+    entry (only renames are allowed); `discovery.retire_grace_releases` lives
+    in the provider's `discovery`;
+  * references — `outranks` names existing models (a bare id is the same
+    provider, `provider/id` crosses providers);
+  * evidence — a model with no `evidence` of its own is UNSCORED: it must
+    carry no quality, and the run lists every such model as a warning;
+  * quality — inside the band, and equal to what the model's evidence computes
+    (`benchmark-score-drift`), so a hand edit cannot bypass the procedure;
+  * ordering — each model's `outranks` claims hold on every task class;
+  * cost — ranks on the ladder and weakly monotonic in blended price within a
+    provider unless the cheaper model states a `rank_exception`; stated prices
+    and cache rates are positive (an unset cache rate takes the provider's
+    `cache_ratio`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
-from . import patterns as pat
 from . import benchmarks
-from .catalog import Catalog, CatalogModel
-from .policy import TASK_CLASSES, Policy
-from .scores_file import ScoresFile
+from .catalog import REQUIRED_FIELDS, Catalog
+from .policy import TASK_CLASSES, Policy, PolicyError
 
 ERROR = "error"
 WARN = "warn"
 INFO = "info"
+
+_RETIRED_FIELDS = {
+    "scored_as": "every model is scored only on its own `evidence`",
+    "compressed_behind": "no model's quality is derived from another's",
+    "api_model": "`id` is the provider's real API model id; there are no aliases",
+    "family": "the family is the group key under `models:`",
+    "provider": "the provider is the file",
+}
+_RETIRED_TOP_LEVEL = {
+    "discovery_retire_grace_releases": "it is `discovery.retire_grace_releases`",
+}
+_PRICE_KEYS = ("input_per_mtok", "output_per_mtok")
+_CACHE_KEYS = ("cache_read_per_mtok", "cache_write_per_mtok")
 
 
 @dataclass(frozen=True)
@@ -34,317 +63,276 @@ class Finding:
         return f"{head}\n    {self.detail}" if self.detail else head
 
 
-class Validator:
-    def __init__(self, policy: Policy, scores: ScoresFile, catalog: Catalog | None):
-        self.policy = policy
-        self.scores = scores
-        self.catalog = catalog
-        self.findings: list[Finding] = []
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-    # -- helpers ----------------------------------------------------------
+
+class Validator:
+    def __init__(self, models: Catalog, policy: Policy | None = None):
+        self.models = models
+        self.policy = policy or models.policy
+        self.findings: list[Finding] = []
+        self.scored: benchmarks.Scored | None = None
+
     def _add(self, severity: str, code: str, message: str, detail: str = "") -> None:
         self.findings.append(Finding(severity, code, message, detail))
 
-    def _qualities(self, candidate_id: str) -> dict[str, float] | None:
-        """Resolved per-class quality for an id, via first-match lookup."""
-        pattern = pat.resolve(self.scores.patterns, candidate_id)
-        if pattern is None:
-            return None
-        entry = self.scores.entry(pattern)
-        return entry.qualities() if entry else None
-
-    def _witness_qualities(self, name: str) -> tuple[str, dict[str, float]] | None:
-        candidate_id = self.policy.witness_id(name)
-        qualities = self._qualities(candidate_id)
-        if qualities is None:
-            self._add(
-                ERROR,
-                "no-score-entry",
-                f"witness `{name}` ({candidate_id}) matches no score-table pattern",
-                "it would fall back to the neutral 0.5 default and route unpredictably",
-            )
-            return None
-        return candidate_id, qualities
-
-    # -- checks -----------------------------------------------------------
-    def check_pattern_order(self) -> None:
-        table_patterns = self.scores.patterns
-        for duplicate in pat.duplicate_patterns(table_patterns):
-            self._add(
-                ERROR,
-                "duplicate-pattern",
-                f"`{duplicate}` is listed more than once",
-                "first match wins, so the later copy is dead",
-            )
-        violations = pat.order_violations(table_patterns)
-        for violation in violations:
-            self._add(ERROR, "pattern-shadowed", violation.describe())
-        if violations:
-            self._add(
-                INFO,
-                "pattern-order-fix",
-                "a non-shadowing order exists",
-                " → ".join(pat.sorted_by_specificity(table_patterns)),
-            )
-
-    def check_resolution(self) -> None:
-        expected: dict[str, str] = self.policy.invariants.get("resolves_to") or {}
-        for candidate_id, want in expected.items():
-            got = pat.resolve(self.scores.patterns, candidate_id)
-            if got != want:
+    # -- shape ------------------------------------------------------------
+    def check_shape(self) -> None:
+        for provider_file in self.models.files:
+            name = provider_file.path.name
+            if not provider_file.raw.get("provider"):
+                self._add(ERROR, "provider-missing", f"{name} has no top-level `provider:`")
+            elif provider_file.provider != provider_file.path.stem:
                 self._add(
                     ERROR,
-                    "wrong-pattern",
-                    f"`{candidate_id}` resolves to `{got}`, expected `{want}`",
-                    "pattern order in data/scores.yaml sends this id to the wrong family",
+                    "provider-mismatch",
+                    f"{name} says `provider: {provider_file.provider}`; the file must be named after it",
                 )
+            for key, why in _RETIRED_TOP_LEVEL.items():
+                if key in provider_file.raw:
+                    self._add(ERROR, "retired-section", f"{name} has a top-level `{key}:`", why)
 
+        seen: dict[tuple[str, str], str] = {}
+        releases: dict[tuple[str, str, tuple[int, ...]], str] = {}
+        for index, row in enumerate(self.models.rows):
+            label = row.key if row.model_id else f"{row.provider} entry {index + 1}"
+            for name in REQUIRED_FIELDS:
+                if row.fields.get(name) in (None, "", {}):
+                    self._add(ERROR, "model-missing-field", f"`{label}` has no `{name}`")
+            if row.fields.get("version") not in (None, "") and row.version is None:
+                self._add(
+                    ERROR,
+                    "bad-version",
+                    f"`{label}` version `{row.version_text}` is not a dotted number (e.g. 5.5, 4.10)",
+                )
+            if row.version is not None:
+                release = (row.provider, row.family, row.version)
+                if release in releases:
+                    self._add(
+                        WARN,
+                        "duplicate-release",
+                        f"`{releases[release]}` and `{label}` are both {row.provider} "
+                        f"{row.family} {row.version_text}",
+                    )
+                releases.setdefault(release, label)
+            for name, why in _RETIRED_FIELDS.items():
+                if name in row.fields:
+                    self._add(ERROR, "retired-field", f"`{label}` sets `{name}`, which no longer exists", why)
+            for name, value in (("id", row.model_id), ("family", row.family), *(("outranks", ref) for ref in row.outranks)):
+                if "*" in value:
+                    self._add(
+                        ERROR,
+                        "wildcard-key",
+                        f"`{label}` {name} `{value}` contains `*`",
+                        "every entry and every reference names one exact model; there are no patterns",
+                    )
+            mapping = row.fields.get("effort_mapping") or {}
+            if isinstance(mapping, dict):
+                identity = [str(key) for key, value in mapping.items() if str(key) == str(value)]
+                if identity:
+                    self._add(
+                        ERROR,
+                        "identity-effort-mapping",
+                        f"`{label}` effort_mapping maps {', '.join(identity)} to itself",
+                        "effort_mapping only renames a level; the router refuses identity entries",
+                    )
+            if row.model_id:
+                owner = seen.get((row.provider, row.model_id.lower()))
+                if owner is not None:
+                    self._add(
+                        ERROR,
+                        "duplicate-model",
+                        f"`{row.model_id}` is listed twice in {row.provider} ({owner} and {label})",
+                        "a model is found by its exact id, so each must be unique in its provider",
+                    )
+                seen.setdefault((row.provider, row.model_id.lower()), label)
+
+    # -- references -------------------------------------------------------
+    def check_references(self) -> None:
+        for row in self.models.rows:
+            for ref in row.outranks:
+                if self.models.resolve_ref(ref, row.provider) is None:
+                    self._add(
+                        ERROR,
+                        "unknown-reference",
+                        f"`{row.key}` outranks `{ref}`, which names no model",
+                        "a bare id means the same provider; write `provider/id` across providers",
+                    )
+
+    # -- evidence ---------------------------------------------------------
+    def check_evidence(self) -> None:
+        try:
+            self.scored = benchmarks.score_rows(self.policy, self.models)
+        except PolicyError as exc:
+            self._add(ERROR, "bad-evidence", str(exc))
+            return
+        unscored = list(self.scored.unscored)
+        for key in unscored:
+            row = self.models.resolve_ref(key, "")
+            if row is not None and row.scored:
+                self._add(
+                    ERROR,
+                    "quality-without-evidence",
+                    f"`{key}` carries quality but has no `evidence` of its own",
+                    "a model is scored only on its own evidence, never a sibling's or an earlier "
+                    "version's; run `scripts/update_models.py --apply` to remove the copied numbers",
+                )
+        if unscored:
+            self._add(
+                WARN,
+                "unscored-models",
+                f"{len(unscored)} model(s) have no evidence of their own and are unscored: "
+                + ", ".join(f"`{key}`" for key in unscored),
+                "an unscored model is chosen only by an explicit pick; record its published "
+                "results under `evidence:` to score it",
+            )
+
+    # -- quality ----------------------------------------------------------
     def check_band(self) -> None:
         low, high = self.policy.quality_band
-        for entry in self.scores.entries:
-            for task_class, value in entry.qualities().items():
+        for row in self.models.rows:
+            if not row.scored:
+                continue
+            for task_class, value in row.qualities().items():
                 if not low <= value <= high:
                     self._add(
                         ERROR,
                         "out-of-band",
-                        f"`{entry.pattern}` {task_class}={value:.2f} is outside "
-                        f"the working band [{low:.2f}, {high:.2f}]",
+                        f"`{row.key}` {task_class}={value:.2f} is outside the band [{low:.2f}, {high:.2f}]",
                     )
-
-    def _chain(self, chain: Iterable[str], why: str, strict: bool) -> None:
-        resolved: list[tuple[str, str, dict[str, float]]] = []
-        for name in chain:
-            found = self._witness_qualities(name)
-            if found is None:
-                return
-            resolved.append((name, found[0], found[1]))
-        relation = "must score strictly above" if strict else "must not score below"
-
-        def is_broken(above: float, below: float) -> bool:
-            return above <= below if strict else above < below
-
-        for (upper_name, upper_id, upper), (lower_name, lower_id, lower) in zip(resolved, resolved[1:]):
-            broken = [
-                f"{task_class} {upper[task_class]:.2f} vs {lower[task_class]:.2f}"
-                for task_class in TASK_CLASSES
-                if is_broken(upper[task_class], lower[task_class])
-            ]
-            if broken:
-                self._add(
-                    ERROR,
-                    "order-broken",
-                    f"{upper_name} ({upper_id}) {relation} {lower_name} ({lower_id})",
-                    f"{why} — offending classes: {', '.join(broken)}",
-                )
-
-    def check_orderings(self) -> None:
-        for rule in self.policy.invariants.get("strict_desc") or []:
-            self._chain(rule["chain"], " ".join(str(rule.get("why", "")).split()), strict=True)
-        for rule in self.policy.invariants.get("weak_desc") or []:
-            self._chain(rule["chain"], " ".join(str(rule.get("why", "")).split()), strict=False)
-
-    def check_ceilings(self) -> None:
-        for rule in self.policy.invariants.get("at_most") or []:
-            lower = self._witness_qualities(rule["a"])
-            upper = self._witness_qualities(rule["b"])
-            if lower is None or upper is None:
-                continue
-            why = " ".join(str(rule.get("why", "")).split())
-            broken = [
-                f"{task_class} {lower[1][task_class]:.2f} > {upper[1][task_class]:.2f}"
-                for task_class in TASK_CLASSES
-                if lower[1][task_class] > upper[1][task_class]
-            ]
-            if broken:
-                self._add(
-                    ERROR,
-                    "ceiling-broken",
-                    f"{rule['a']} ({lower[0]}) must not score above {rule['b']} ({upper[0]})",
-                    f"{why} — offending classes: {', '.join(broken)}",
-                )
 
     def check_benchmark_scores(self) -> None:
         """Checked-in quality must equal the deterministic benchmark result."""
-        for pattern, expected in benchmarks.derive(self.policy).items():
-            entry = self.scores.entry(pattern)
-            if entry is None:
-                self._add(ERROR, "benchmark-pattern-missing", f"`{pattern}` has benchmark evidence but no score entry")
+        if self.scored is None:
+            return
+        for row in self.models.rows:
+            expected = self.scored.rows.get(row.key)
+            if expected is None:
                 continue
             if (
-                abs(float(entry.fields.get("default_quality", 0.5)) - expected.default_quality) > 1e-9
-                or entry.qualities() != expected.quality
+                "quality" not in row.fields
+                or abs(float(row.fields.get("default_quality", 0.5)) - expected.default_quality) > 1e-9
+                or row.qualities() != expected.quality
             ):
                 self._add(
                     ERROR,
                     "benchmark-score-drift",
-                    f"`{pattern}` does not match its benchmark-derived score",
-                    f"run the updater to restore base {expected.default_quality:.2f}",
+                    f"`{row.key}` does not match the score its own evidence computes "
+                    f"({expected.observations} observation(s))",
+                    f"run `scripts/update_models.py --apply` to write base {expected.default_quality:.2f}",
                 )
 
-    # -- catalog ----------------------------------------------------------
-    def check_catalog(self) -> None:
-        if self.catalog is None:
-            return
+    def check_outranks(self) -> None:
+        for row in self.models.rows:
+            for ref in row.outranks:
+                other = self.models.resolve_ref(ref, row.provider)
+                if other is None:
+                    continue  # reported by check_references
+                if not row.scored or not other.scored:
+                    unscored = row.key if not row.scored else other.key
+                    self._add(
+                        WARN,
+                        "order-unchecked",
+                        f"`{row.key}` outranks `{other.key}` cannot be checked: `{unscored}` is unscored",
+                    )
+                    continue
+                upper, lower = row.qualities(), other.qualities()
+                broken = [
+                    f"{task_class} {upper[task_class]:.2f} vs {lower[task_class]:.2f}"
+                    for task_class in TASK_CLASSES
+                    if upper[task_class] <= lower[task_class]
+                ]
+                if broken:
+                    self._add(
+                        ERROR,
+                        "order-broken",
+                        f"`{row.key}` must score strictly above `{other.key}` on every task class",
+                        f"offending classes: {', '.join(broken)}",
+                    )
+
+    # -- cost -------------------------------------------------------------
+    def check_cost(self) -> None:
         low, high = self.policy.ladder
-        benchmark_profiles = benchmarks.derive(self.policy)
-        for model in self.catalog.all_models():
-            if not model.enabled:
-                continue
-            if pat.resolve(self.scores.patterns, model.candidate) is None:
-                self._add(
-                    ERROR,
-                    "unscored-model",
-                    f"`{model.candidate}` is enabled but matches no score-table pattern",
-                    "it resolves to the neutral 0.5 default, so `auto` ranks it blind",
-                )
-            if benchmarks.resolve_profile(benchmark_profiles, model.candidate) is None:
-                self._add(
-                    ERROR,
-                    "model-without-benchmarks",
-                    f"`{model.candidate}` is enabled without calibrated benchmark evidence",
-                    "disable it or add sourced observations under benchmark_scoring.model_evidence",
-                )
-            rank = model.cost_rank
+        for row in self.models.rows:
+            rank = row.cost_rank
             if rank is None:
-                self._add(ERROR, "missing-cost-rank", f"`{model.candidate}` has no cost_rank")
+                if row.fields.get("cost_rank") is not None:
+                    self._add(ERROR, "bad-cost-rank", f"`{row.key}` cost_rank is not an integer")
             elif not low <= rank <= high:
                 self._add(
                     ERROR,
                     "cost-rank-off-ladder",
-                    f"`{model.candidate}` cost_rank={rank} is outside the {low}..{high} ladder",
+                    f"`{row.key}` cost_rank={rank} is outside the {low}..{high} ladder",
                     "extending the ladder rescales every `auto` pool norm, moving models you did not touch",
                 )
-            if not model.pricing:
-                self._add(
-                    WARN,
-                    "missing-pricing",
-                    f"`{model.candidate}` has no pricing",
-                    "sessions on it record $0, so cost comparisons are blind",
-                )
+            pricing = row.pricing
+            if pricing is None:
+                continue
+            for key in (*_PRICE_KEYS, *(key for key in _CACHE_KEYS if key in pricing)):
+                value = _number(pricing.get(key))
+                if value is None or value <= 0:
+                    self._add(
+                        ERROR,
+                        "bad-pricing",
+                        f"`{row.key}` pricing.{key} must be a positive number (got {pricing.get(key)!r})",
+                        "an unset cache rate takes the provider's `cache_ratio` × input"
+                        if key in _CACHE_KEYS
+                        else "",
+                    )
         self._check_rank_monotonicity()
-        self._check_cache_ratios()
-        self._check_published_pricing()
 
     def _check_rank_monotonicity(self) -> None:
-        """Within an agent, a cheaper model must not carry a higher rank."""
-        assert self.catalog is not None
-        excepted = {
-            (exception.candidate, exception.over)
-            for exception in self.policy.rank_exceptions
-            if exception.over
-        }
-        blanket = {
-            exception.candidate for exception in self.policy.rank_exceptions if not exception.over
-        }
-        for agent in self.catalog.agents:
+        """Within a provider, a cheaper model must not carry a higher rank."""
+        for provider in self.models.providers():
             priced = [
-                (model, self.policy.blended_price(model.pricing))
-                for model in agent.enabled_models
-                if model.cost_rank is not None
+                (row, self.policy.blended_price(row.pricing))
+                for row in self.models.by_provider(provider)
+                if row.cost_rank is not None
             ]
-            priced = [(model, price) for model, price in priced if price is not None]
+            priced = [(row, price) for row, price in priced if price is not None]
             for cheaper, cheap_price in priced:
                 for pricier, high_price in priced:
-                    if cheap_price >= high_price:
+                    if cheap_price >= high_price or cheaper.cost_rank <= pricier.cost_rank:  # type: ignore[operator]
                         continue
-                    if cheaper.cost_rank <= pricier.cost_rank:  # type: ignore[operator]
-                        continue
-                    if (cheaper.candidate, pricier.candidate) in excepted or cheaper.candidate in blanket:
+                    if cheaper.rank_exception:
                         self._add(
                             INFO,
                             "rank-exception-applied",
-                            f"`{cheaper.candidate}` outranks the pricier `{pricier.candidate}` "
-                            "by documented exception",
+                            f"`{cheaper.key}` outranks the pricier `{pricier.key}` by its rank_exception",
                         )
                         continue
                     self._add(
                         ERROR,
                         "rank-price-inversion",
-                        f"`{cheaper.candidate}` (rank {cheaper.cost_rank}, blended "
-                        f"${cheap_price:.2f}/Mtok) outranks the pricier "
-                        f"`{pricier.candidate}` (rank {pricier.cost_rank}, ${high_price:.2f})",
-                        "either fix the rank or add a documented exception under "
-                        "`cost.rank_exceptions` in data/model-policy.yaml",
-                    )
-
-    def _check_cache_ratios(self) -> None:
-        assert self.catalog is not None
-        for agent in self.catalog.agents:
-            for model in agent.enabled_models:
-                ratios = self.policy.cache_ratio_for(agent.name, model.candidate)
-                if not ratios:
-                    continue
-                pricing = model.pricing or {}
-                base = pricing.get("input_per_mtok")
-                if base is None:
-                    continue
-                for kind, key in (("read", "cache_read_per_mtok"), ("write", "cache_write_per_mtok")):
-                    if kind not in ratios or key not in pricing:
-                        continue
-                    want = round(float(base) * ratios[kind], 6)
-                    got = float(pricing[key])
-                    if abs(want - got) > 0.005:
-                        self._add(
-                            WARN,
-                            "cache-rate-off-ratio",
-                            f"`{model.candidate}` {key}={got} but its published "
-                            f"{kind} rate is {ratios[kind]}× input (${want:.2f})",
-                            "the cache-reprime break-even the demotion gate uses is computed "
-                            "from these rates",
-                        )
-
-    def _check_published_pricing(self) -> None:
-        assert self.catalog is not None
-        reference = (self.policy.published_pricing or {}).get("models") or {}
-        as_of = (self.policy.published_pricing or {}).get("as_of", "unknown")
-        for candidate, rates in reference.items():
-            model = self.catalog.model(candidate)
-            if model is None or not model.enabled:
-                continue
-            pricing = model.pricing or {}
-            for key, want in rates.items():
-                got = pricing.get(key)
-                if got is None:
-                    self._add(
-                        WARN,
-                        "pricing-missing-rate",
-                        f"`{candidate}` is missing `{key}` (published {as_of}: {want})",
-                    )
-                elif abs(float(got) - float(want)) > 0.0001:
-                    self._add(
-                        WARN,
-                        "pricing-drift",
-                        f"`{candidate}` {key}={got} but the reference rate ({as_of}) is {want}",
-                        "either the provider changed price (update both) or the catalog is wrong",
+                        f"`{cheaper.key}` (rank {cheaper.cost_rank}, blended ${cheap_price:.2f}/Mtok) "
+                        f"outranks the pricier `{pricier.key}` (rank {pricier.cost_rank}, ${high_price:.2f})",
+                        "either fix the rank or state why on the entry: `rank_exception: <reason>`",
                     )
 
     # -- entry point ------------------------------------------------------
     def run(self) -> list[Finding]:
-        self.check_pattern_order()
-        self.check_resolution()
+        self.check_shape()
+        self.check_references()
+        self.check_evidence()
         self.check_band()
-        self.check_orderings()
-        self.check_ceilings()
         self.check_benchmark_scores()
-        self.check_catalog()
+        self.check_outranks()
+        self.check_cost()
         return self.findings
 
 
-def validate_catalog(policy: Policy, scores: ScoresFile, catalog: Catalog) -> list[Finding]:
-    """Only the catalog checks, for a second catalog (a shipped preset) beside
-    the primary one: the table-wide pattern, ordering and benchmark checks are
-    the same for every catalog and are reported once by `validate`."""
-    validator = Validator(policy, scores, catalog)
-    validator.check_catalog()
-    source = catalog.path.name
-    return [
-        Finding(f.severity, f.code, f"{f.message} (in {source})", f.detail)
-        for f in validator.findings
-    ]
-
-
-def validate(policy: Policy, scores: ScoresFile, catalog: Catalog | None) -> list[Finding]:
-    return Validator(policy, scores, catalog).run()
+def validate(models: Catalog) -> list[Finding]:
+    try:
+        policy = models.policy
+    except PolicyError as exc:
+        return [Finding(ERROR, "bad-scoring", str(exc))]
+    return Validator(models, policy).run()
 
 
 def errors(findings: Iterable[Finding]) -> list[Finding]:

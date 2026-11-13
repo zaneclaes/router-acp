@@ -873,6 +873,14 @@ pub enum ModelSelectionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    /// The model line this model is a version of (`opus`, `sol`). With
+    /// `version`, it decides which models are superseded: only the newest
+    /// version of a family is chosen automatically.
+    #[serde(default)]
+    pub family: Option<String>,
+    /// This model's dotted version within its family (`5.5`).
+    #[serde(default, deserialize_with = "version_text")]
+    pub version: Option<String>,
     pub id: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -897,7 +905,13 @@ pub struct ModelConfig {
     /// scoping and per-request proxy routing — while leaving it explicitly
     /// selectable (`router.candidate`, `[router: candidate=…]`,
     /// `[router: switch=…]`): reachable on purpose, never by accident.
-    #[serde(default = "default_true")]
+    ///
+    /// Derived, never configured (operator, 2026-11-12): only the latest version of each model
+    /// family is auto-eligible (`Config::retire_superseded_versions`), and a user keeps an older
+    /// version in the automatic pool through `pinned_versions`. Not read from or written to YAML,
+    /// so a configured value can neither hide what the rule decided nor switch a family off; an
+    /// `auto_eligible:` key is refused as an unknown field.
+    #[serde(skip, default = "default_true")]
     pub auto_eligible: bool,
     /// Optional API-equivalent pricing. It prices every interposed provider
     /// request and synthesizes ACP-turn `cost_usd` only when the adapter
@@ -1305,6 +1319,31 @@ pub struct PlannerModelBoost {
     /// Additive utility boost during the `Planning` phase.
     #[serde(default)]
     pub planning: f64,
+}
+
+/// A dotted model version (`5.5`, `6.1`, `4`) as its numeric components, so
+/// versions compare component by component (`6.1` > `6` > `5.6`). `None` when
+/// a component is not a number.
+pub fn parse_model_version(version: &str) -> Option<Vec<u32>> {
+    version
+        .split('.')
+        .map(|part| part.trim().parse().ok())
+        .collect()
+}
+
+/// Accept a YAML version written as a number (`version: 5.5`) or a string.
+fn version_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<serde_yaml::Value>::deserialize(d)?;
+    Ok(match value {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(text)) => Some(text),
+        Some(serde_yaml::Value::Number(number)) => Some(number.to_string()),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "a model version is a dotted number, not {other:?}"
+            )));
+        }
+    })
 }
 
 fn default_planning_candidates() -> Vec<String> {
@@ -1724,10 +1763,12 @@ pub struct Config {
     /// its sandboxed default (no network) even under `GOOSE_MODE: auto`.
     #[serde(default)]
     pub default_mode: Option<String>,
-    /// Version pinning: `agent/model-id` → `default` or one of that model's
-    /// `versions[].api_model`. Routing never sees it — the candidate stays
-    /// `agent/model-id` everywhere — and the proxy sends the pinned version on
-    /// the wire, priced and scored as that version.
+    /// Version pinning, two forms. A family shorthand (`claude/haiku` or `haiku`) → one of that
+    /// family's model ids pins the family: the shorthand resolves to that version and it is the
+    /// family's version chosen automatically, in place of the newest. An `agent/model-id` →
+    /// `default` or one of that model's `versions[].api_model` keeps the candidate and sends the
+    /// pinned version on the wire, priced and scored as that version; it also keeps a superseded
+    /// model in automatic selection.
     #[serde(default)]
     pub pinned_versions: HashMap<String, String>,
     /// Ticket-reference → context-loading rules (prefix + fetch command).
@@ -2200,8 +2241,148 @@ impl Config {
                 }
             }
         }
+        cfg.retire_superseded_versions();
+        // `routers.static.candidate` may be shorthand (`claude/sonnet`): store the model it names.
+        if let Some(candidate) = cfg.routers.static_.candidate.clone()
+            && let Some(id) = cfg.resolve_reference(&candidate).into_iter().next()
+        {
+            cfg.routers.static_.candidate = Some(id.to_string());
+        }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Only the latest version of each model family is chosen automatically: a model whose
+    /// agent also declares a newer `version` of the same `family` (`gpt-5.6-sol` beside
+    /// `gpt-6.1-sol`, `grok-4.6` beside `grok-4.7`) becomes explicit-selection only, unless the
+    /// user pinned that candidate in `pinned_versions`. Family and version are the catalog's own
+    /// fields (`data/providers/<provider>.yaml`), never read out of an id. 2026-11-12: implement workers were
+    /// routed to gpt-5.6-sol while gpt-6.1-sol shipped beside it.
+    ///
+    /// An UNSCORED catalog model (one with no published evidence of its own yet, so no quality
+    /// in `data/providers/<provider>.yaml`) is explicit-selection only too: the router cannot rank a model it
+    /// has no scores for, and it never borrows another model's (operator, 2026-11-12).
+    fn retire_superseded_versions(&mut self) {
+        self.retire_superseded_versions_by(&crate::candidate::ScoreTable::builtin());
+    }
+
+    fn retire_superseded_versions_by(&mut self, catalog: &crate::candidate::ScoreTable) {
+        let chosen: Vec<Vec<Option<String>>> = self
+            .agents
+            .iter()
+            .map(|agent| {
+                agent
+                    .models
+                    .iter()
+                    .map(|m| {
+                        let family = m.family.as_deref()?;
+                        self.family_choice(agent, family).map(|c| c.id.clone())
+                    })
+                    .collect()
+            })
+            .collect();
+        let pinned: HashSet<String> = self.pinned_versions.keys().cloned().collect();
+        for (a, agent) in self.agents.iter_mut().enumerate() {
+            for (index, model) in agent.models.iter_mut().enumerate() {
+                let superseded = chosen[a][index].as_ref().is_some_and(|id| *id != model.id);
+                // Only the catalog's own model: same id, family and version. A model that merely
+                // shares an id (a test agent's `haiku`) is not that row.
+                let unscored = catalog
+                    .row(&CandidateId::new(
+                        &agent.name,
+                        model.api_model.as_deref().unwrap_or(&model.id),
+                    ))
+                    .is_some_and(|row| {
+                        !row.scored
+                            && model.family.is_some()
+                            && row.family == model.family
+                            && row.version == model.version
+                    });
+                if unscored
+                    || (superseded && !pinned.contains(&format!("{}/{}", agent.name, model.id)))
+                {
+                    model.auto_eligible = false;
+                }
+            }
+        }
+    }
+
+    /// The provider an agent runs: its name before any `@<seat>`.
+    fn agent_provider(agent: &AgentConfig) -> &str {
+        agent.name.split('@').next().unwrap_or(&agent.name)
+    }
+
+    /// The model of `family` that `agent` uses for it: the version `pinned_versions` names for
+    /// the family's shorthand (`<provider>/<family>`, else `<family>`), else the newest version.
+    pub fn family_choice<'a>(
+        &self,
+        agent: &'a AgentConfig,
+        family: &str,
+    ) -> Option<&'a ModelConfig> {
+        let members = || {
+            agent
+                .models
+                .iter()
+                .filter(|m| m.family.as_deref() == Some(family))
+        };
+        let provider = Self::agent_provider(agent);
+        let pinned = [format!("{provider}/{family}"), family.to_string()]
+            .into_iter()
+            .find_map(|key| self.pinned_versions.get(&key))
+            .and_then(|id| members().find(|m| &m.id == id));
+        pinned.or_else(|| {
+            members()
+                .filter_map(|m| Some((parse_model_version(m.version.as_deref()?)?, m)))
+                .max_by(|a, b| a.0.cmp(&b.0))
+                .map(|(_, m)| m)
+        })
+    }
+
+    /// The candidates a model reference names (operator, 2026-11-12: "the correct way for all
+    /// shorthand is to match provider+family (or just family)"). `agent/model-id` naming a declared
+    /// model is that model. Otherwise `<provider>/<family>` or a bare `<family>` names, on each
+    /// agent of that provider (any agent, for a bare family), the family's pinned or newest version
+    /// (`family_choice`). A bare model id names that model on every agent declaring it.
+    pub fn resolve_reference(&self, reference: &str) -> Vec<CandidateId> {
+        let reference = reference.trim();
+        if let Some(id) = CandidateId::parse(reference)
+            && self.model_config(&id).is_some()
+        {
+            return vec![id];
+        }
+        let (scope, name) = match reference.split_once('/') {
+            Some((scope, name)) => (Some(scope), name),
+            None => (None, reference),
+        };
+        let mut out = Vec::new();
+        for agent in &self.agents {
+            if let Some(scope) = scope
+                && scope != agent.name
+                && scope != Self::agent_provider(agent)
+            {
+                continue;
+            }
+            if let Some(model) = self.family_choice(agent, name) {
+                out.push(CandidateId::new(&agent.name, &model.id));
+            } else if scope.is_none() && agent.models.iter().any(|m| m.id == name) {
+                out.push(CandidateId::new(&agent.name, name));
+            }
+        }
+        out
+    }
+
+    /// `id` as the candidate it names: itself when declared, else the first candidate its text
+    /// resolves to as shorthand (`claude/haiku`), else unchanged so the caller's own check fails.
+    pub fn canonical_candidate(&self, id: &CandidateId) -> CandidateId {
+        let text = if id.agent.is_empty() {
+            id.model.clone()
+        } else {
+            id.to_string()
+        };
+        self.resolve_reference(&text)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| id.clone())
     }
 
     /// `yaml` reduced to the values that differ from router-acp's defaults:
@@ -2522,8 +2703,24 @@ impl Config {
         // A typo'd pin must fail the load rather than silently serve latest.
         for (key, version) in &self.pinned_versions {
             let Some(model) = CandidateId::parse(key).and_then(|id| self.model_config(&id)) else {
+                // A family shorthand pins one of that family's model ids.
+                let (scope, family) = match key.split_once('/') {
+                    Some((scope, family)) => (Some(scope), family.as_ref()),
+                    None => (None, key.as_str()),
+                };
+                let pins_a_member = self.agents.iter().any(|agent| {
+                    scope.is_none_or(|s| s == agent.name || s == Self::agent_provider(agent))
+                        && agent
+                            .models
+                            .iter()
+                            .any(|m| m.family.as_deref() == Some(family) && &m.id == version)
+                });
+                if pins_a_member {
+                    continue;
+                }
                 return Err(ConfigError(format!(
-                    "pinned_versions `{key}` does not match any declared agent/model"
+                    "pinned_versions `{key}` matches no declared agent/model, and `{version}` is no \
+                     model of a `{key}` family"
                 )));
             };
             if version != DEFAULT_VERSION && !model.versions.iter().any(|v| &v.api_model == version)
@@ -2542,16 +2739,7 @@ impl Config {
             ));
         }
         if let Some(candidate) = &self.routers.static_.candidate {
-            let id = CandidateId::parse(candidate).ok_or_else(|| {
-                ConfigError(format!(
-                    "routers.static.candidate `{candidate}` must have the form `agent/model-id`"
-                ))
-            })?;
-            let declared = self
-                .agents
-                .iter()
-                .any(|a| a.name == id.agent && a.models.iter().any(|m| m.id == id.model));
-            if !declared {
+            if self.resolve_reference(candidate).is_empty() {
                 return Err(ConfigError(format!(
                     "routers.static.candidate `{candidate}` does not match any declared agent/model"
                 )));
@@ -2864,6 +3052,121 @@ agents:
     }
 
     #[test]
+    fn versions_compare_component_by_component() {
+        let v = |text: &str| parse_model_version(text).unwrap();
+        assert!(v("6.1") > v("6") && v("6") > v("5.6") && v("5.10") > v("5.9"));
+        assert_eq!(parse_model_version("k2"), None);
+    }
+
+    /// 2026-11-12 (operator): "only the latest version of each model is eligible for
+    /// auto-selection (unless the user has pinned a different version)".
+    #[test]
+    fn only_the_latest_version_of_each_model_family_is_auto_eligible() {
+        let cfg = Config::from_yaml("agents:\n- name: codex@one\n- name: grok@two\n").unwrap();
+        let eligible = |agent: &str, model: &str| {
+            cfg.auto_eligible(&CandidateId {
+                agent: agent.into(),
+                model: model.into(),
+            })
+        };
+        for old in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-sol"] {
+            assert!(
+                !eligible("codex@one", old),
+                "{old} is superseded and must be explicit-only"
+            );
+        }
+        for latest in ["gpt-6-luna", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+            assert!(
+                eligible("codex@one", latest),
+                "{latest} is its family's latest"
+            );
+        }
+        assert!(!eligible("grok@two", "grok-4.6"));
+        assert!(eligible("grok@two", "grok-4.7"));
+        // A pinned candidate keeps automatic selection.
+        let pinned = Config::from_yaml(
+            "pinned_versions:\n  codex@one/gpt-5.6-sol: default\nagents:\n- name: codex@one\n",
+        )
+        .unwrap();
+        assert!(pinned.auto_eligible(&CandidateId {
+            agent: "codex@one".into(),
+            model: "gpt-5.6-sol".into()
+        }));
+        assert!(!pinned.auto_eligible(&CandidateId {
+            agent: "codex@one".into(),
+            model: "gpt-6-sol".into()
+        }));
+        // The family alias `opus` is version 5.5 by its catalog row, so it supersedes the older
+        // ids; nothing is read out of the id text.
+        let claude = Config::from_yaml("agents:\n- name: claude\n").unwrap();
+        let claude_eligible = |model: &str| {
+            claude.auto_eligible(&CandidateId {
+                agent: "claude".into(),
+                model: model.into(),
+            })
+        };
+        for old in [
+            "claude-opus-5",
+            "claude-opus-4-6",
+            "claude-fable-5-1",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                !claude_eligible(old),
+                "{old} is superseded by its family's newest version"
+            );
+        }
+        // A model with family and version of its own is ranked by them, whatever its id says.
+        let custom = Config::from_yaml(
+            "agents:\n- name: codex\n  models:\n  - { id: nova, family: nova, version: 2, cost_rank: 3 }\n  - { id: nova-next, family: nova, version: 10, cost_rank: 3 }\n",
+        )
+        .unwrap();
+        assert!(!custom.auto_eligible(&CandidateId::new("codex", "nova")));
+        assert!(custom.auto_eligible(&CandidateId::new("codex", "nova-next")));
+    }
+
+    /// A catalog model with no evidence of its own is unscored, and an unscored model is never
+    /// chosen automatically: it would otherwise be ranked on scores it does not have.
+    #[test]
+    fn an_unscored_model_is_explicit_selection_only() {
+        let mut cfg = Config::from_yaml(
+            "agents:\n- name: mock\n  command: { type: stdio, command: mock }\n  model_selection: { type: config-option }\n  models:\n  - { id: rated, family: r, version: 1, cost_rank: 1 }\n  - { id: unrated, family: u, version: 1, cost_rank: 1 }\n  - { id: unlisted, cost_rank: 1 }\n  - { id: unlisted-twin, cost_rank: 1 }\n",
+        )
+        .unwrap();
+        let catalog = crate::candidate::ScoreTable::from_yaml(
+            "models:\n  - { id: rated, family: r, version: 1, default_quality: 2.0 }\n  - { id: unrated, family: u, version: 1 }\n  - { id: unlisted-twin }\n",
+        )
+        .unwrap();
+        cfg.retire_superseded_versions_by(&catalog);
+        let eligible = |model: &str| cfg.auto_eligible(&CandidateId::new("mock", model));
+        assert!(eligible("rated"));
+        assert!(
+            !eligible("unrated"),
+            "a listed model with no scores is never ranked"
+        );
+        assert!(
+            eligible("unlisted"),
+            "a model the catalog does not list keeps the neutral default"
+        );
+        assert!(
+            eligible("unlisted-twin"),
+            "sharing a row's id does not make a model that row"
+        );
+    }
+
+    /// `auto_eligible` is derived, never configured (operator, 2026-11-12): a configured value
+    /// could hide the rule's decision, or, set false on the latest version, switch the family off.
+    #[test]
+    fn auto_eligible_is_not_configurable() {
+        let error = Config::from_yaml(
+            "agents:\n- name: codex\n  models:\n  - { id: gpt-6.1-sol, cost_rank: 5, auto_eligible: false }\n",
+        )
+        .unwrap_err();
+        assert!(error.0.contains("auto_eligible"), "{}", error.0);
+    }
+
+    #[test]
     fn a_seat_named_for_its_provider_needs_no_other_keys() {
         let cfg = Config::from_yaml("agents:\n- name: codex@one\n- name: grok@two\n").unwrap();
         let codex = &cfg.agents[0];
@@ -3171,7 +3474,7 @@ agents:
             versioned_yaml()
         );
         let err = Config::from_yaml(&yaml).unwrap_err();
-        assert!(err.0.contains("does not match any declared"), "{}", err.0);
+        assert!(err.0.contains("matches no declared"), "{}", err.0);
     }
 
     #[test]

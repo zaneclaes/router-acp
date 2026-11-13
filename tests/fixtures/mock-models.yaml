@@ -1,0 +1,124 @@
+# Scores for the mock model ids the protocol tests name (`haiku`, `opus`, `sol`, …).
+# These are test fixtures, not shipped models: each row carries the values the
+# old pattern table gave that id, so the tests keep the routing they were
+# written against. The harness (`run_test_shared`) loads this file unless a
+# test sets its own `score_table`.
+models:
+- id: claude-fable-5
+  coding_tier: high
+  coding_percentile: 0.97
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: &id001 [low, medium, high, xhigh, max]
+  default_quality: 2.64
+  quality: &id002 {UiTweak: 2.64, BugFix: 2.99, Feature: 2.99, Refactor: 2.99, Algorithms: 2.64, Architecture: 2.64, Research: 2.64, Writing: 2.64, Ops: 2.64, CodingGeneral: 2.9}
+- id: fable
+  coding_tier: high
+  coding_percentile: 0.97
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: *id001
+  default_quality: 2.64
+  quality: *id002
+- id: fable-5
+  coding_tier: high
+  coding_percentile: 0.97
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: *id001
+  default_quality: 2.64
+  quality: *id002
+- id: gpt-5.4-mini
+  coding_tier: medium
+  coding_percentile: 0.45
+  context_window: 400000
+  effort_levels: [low, medium, high]
+  default_quality: 1.0
+  quality: {UiTweak: 1.0, BugFix: 1.0, Feature: 1.0, Refactor: 1.0, Algorithms: 1.0, Architecture: 1.0, Research: 1.0, Writing: 1.0, Ops: 1.0, CodingGeneral: 1.0}
+- id: gpt-5.5
+  coding_tier: high
+  coding_percentile: 0.8
+  context_window: 400000
+  effort_levels: &id003 [low, medium, high]
+  default_quality: 2.11
+  quality: &id004 {UiTweak: 2.11, BugFix: 1.82, Feature: 1.82, Refactor: 1.82, Algorithms: 2.11, Architecture: 2.11, Research: 2.11, Writing: 2.11, Ops: 2.11, CodingGeneral: 2.11}
+- id: gpt-5.6
+  coding_tier: high
+  coding_percentile: 0.8
+  context_window: 400000
+  effort_levels: *id003
+  default_quality: 2.11
+  quality: *id004
+- id: gpt-6.1-sol
+  coding_tier: high
+  coding_percentile: 0.96
+  context_window: 1050000
+  max_output_tokens: 128000
+  effort_levels: [low, medium, high, xhigh, max]
+  default_quality: 2.81
+  quality: {UiTweak: 2.81, BugFix: 2.39, Feature: 2.39, Refactor: 2.39, Algorithms: 2.81, Architecture: 2.81, Research: 2.81, Writing: 2.81, Ops: 2.81, CodingGeneral: 2.81}
+- id: grok
+  coding_tier: high
+  coding_percentile: 0.88
+  context_window: 256000
+  default_quality: 1.57
+  quality: &id005 {UiTweak: 1.57, BugFix: 1.41, Feature: 1.41, Refactor: 1.41, Algorithms: 1.57, Architecture: 1.57, Research: 1.57, Writing: 1.57, Ops: 1.57, CodingGeneral: 1.41}
+- id: grok-4.5
+  coding_tier: high
+  coding_percentile: 0.88
+  context_window: 256000
+  default_quality: 1.57
+  quality: *id005
+- id: grok-4.7
+  coding_tier: high
+  coding_percentile: 0.88
+  context_window: 500000
+  effort_levels: [low, medium, high, xhigh]
+  default_quality: 2.6
+  quality: {UiTweak: 2.6, BugFix: 2.95, Feature: 2.95, Refactor: 2.95, Algorithms: 2.6, Architecture: 2.6, Research: 2.6, Writing: 2.6, Ops: 2.6, CodingGeneral: 2.86}
+- id: haiku
+  coding_tier: medium
+  coding_percentile: 0.5
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: [low, medium, high, xhigh, max]
+  default_quality: 1.29
+  quality: {UiTweak: 1.29, BugFix: 1.29, Feature: 1.29, Refactor: 1.29, Algorithms: 1.29, Architecture: 1.29, Research: 1.29, Writing: 1.29, Ops: 1.29, CodingGeneral: 1.29}
+- id: opus
+  coding_tier: high
+  coding_percentile: 0.93
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: &id006 [low, medium, high, xhigh, max]
+  default_quality: 2.62
+  quality: &id007 {UiTweak: 2.62, BugFix: 2.97, Feature: 2.97, Refactor: 2.97, Algorithms: 2.62, Architecture: 2.62, Research: 2.62, Writing: 2.62, Ops: 2.62, CodingGeneral: 2.88}
+- id: opus[1m]
+  coding_tier: high
+  coding_percentile: 0.93
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: *id006
+  default_quality: 2.62
+  quality: *id007
+- id: sol
+  coding_tier: high
+  coding_percentile: 0.96
+  context_window: 400000
+  effort_levels: [low, medium, high, xhigh, max]
+  default_quality: 2.81
+  quality: {UiTweak: 2.81, BugFix: 2.39, Feature: 2.39, Refactor: 2.39, Algorithms: 2.81, Architecture: 2.81, Research: 2.81, Writing: 2.81, Ops: 2.81, CodingGeneral: 2.81}
+- id: sonnet
+  coding_tier: high
+  coding_percentile: 0.8
+  context_window: 1000000
+  max_output_tokens: 128000
+  effort_levels: [low, medium, high, xhigh, max]
+  default_quality: 1.39
+  quality: {UiTweak: 1.39, BugFix: 1.39, Feature: 1.39, Refactor: 1.39, Algorithms: 1.39, Architecture: 1.39, Research: 1.39, Writing: 1.39, Ops: 1.39, CodingGeneral: 1.39}
+- id: terra
+  coding_tier: high
+  coding_percentile: 0.9
+  context_window: 400000
+  effort_levels: [low, medium, high]
+  default_quality: 2.79
+  quality: {UiTweak: 2.79, BugFix: 2.37, Feature: 2.37, Refactor: 2.37, Algorithms: 2.79, Architecture: 2.79, Research: 2.79, Writing: 2.79, Ops: 2.79, CodingGeneral: 2.79}
