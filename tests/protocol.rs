@@ -4154,6 +4154,114 @@ async fn a_resumed_session_follows_its_seat_into_an_account() {
     .await;
 }
 
+/// A session saved on a family alias (`fable`, before catalog ids became exact
+/// API ids) resumes on that family's current model instead of failing every
+/// turn as an unrouteable static candidate.
+#[tokio::test]
+async fn a_resumed_session_on_a_retired_family_alias_runs_the_familys_model() {
+    let state = temp_state_file("alias-restore");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml_models(
+            "fancy@one",
+            &["m-2", "m-1"],
+            &[],
+            "      - { id: m-2, family: m, version: 2, cost_rank: 1 }\n\
+             \x20     - { id: m-1, family: m, version: 1, cost_rank: 1 }\n",
+        ),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=fancy@one/m-2] first").await?;
+        cx.send_request(CloseSessionRequest::new(sid.clone()))
+            .block_task()
+            .await?;
+
+        // The checkpoint as a router that named the family `m` wrote it.
+        let mut persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        let snapshot = persisted.session_config.as_mut().expect("checkpoint");
+        snapshot["candidate"] = serde_json::json!("fancy@one/m");
+        snapshot["preferred_candidate"] = serde_json::json!("fancy@one/m");
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert_checked(sid.clone(), persisted)
+            .unwrap();
+
+        cx.send_request(
+            agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(),
+                std::env::temp_dir(),
+            ),
+        )
+        .block_task()
+        .await?;
+        let restored = shared
+            .with_session(&sid, |s| {
+                (
+                    s.candidate_override.as_ref().map(ToString::to_string),
+                    s.preferred_candidate.as_ref().map(ToString::to_string),
+                )
+            })
+            .unwrap();
+        assert_eq!(restored.0.as_deref(), Some("fancy@one/m-2"));
+        assert_eq!(restored.1.as_deref(), Some("fancy@one/m-2"));
+        prompt_text(&cx, &sid, "second").await?;
+        let text = agent_text(&observed, &sid);
+        assert_eq!(text.matches("static → fancy@one/m-2").count(), 2, "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+/// A family shorthand (`m:`) with the family on two healthy accounts goes to
+/// the first account, not whichever equal-scoring seat is listed last. With
+/// the first account out of usage it goes to the second.
+#[tokio::test]
+async fn a_family_shorthand_takes_the_first_account_with_usage_left() {
+    let state = temp_state_file("shorthand-first-seat");
+    let model_lines = "      - { id: m-2, family: m, version: 2, cost_rank: 1 }\n";
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\n\
+         auto_upgrade: {{ enabled: false }}\ncordon: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml_models("fancy@one", &["m-2"], &[], model_lines),
+        agent_yaml_models("fancy@two", &["m-2"], &[], model_lines),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let first = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &first, "m: hello").await?;
+        let text = agent_text(&observed, &first);
+        assert!(text.contains("fancy@one/m-2"), "{text}");
+        assert!(!text.contains("fancy@two/m-2"), "{text}");
+
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(std::collections::HashMap::from([(
+                CandidateId::new("fancy@one", "m-2"),
+                router_acp::headroom::UsageCordon {
+                    reason: "weekly limit".into(),
+                    resets_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+                    resets_at_rfc3339: "2099-01-01T00:00:00+00:00".into(),
+                    soft: false,
+                },
+            )]));
+        let second = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &second, "m: hello").await?;
+        let text = agent_text(&observed, &second);
+        assert!(text.contains("fancy@two/m-2"), "{text}");
+        assert!(!text.contains("fancy@one/m-2"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
 /// Grok reports an exhausted seat as `402 Payment Required … usage balance
 /// exhausted`. That classified as an ordinary error, so every turn routed back
 /// to the exhausted seat and failed instead of failing over.

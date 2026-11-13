@@ -1335,6 +1335,13 @@ impl Shared {
     /// chosen, by account priority, when none is routable at this moment, so
     /// the next pin reports that seat's state instead of an unknown agent.
     pub fn restored_seat(&self, reference: &CandidateId) -> CandidateId {
+        // A saved id the catalog no longer declares, such as the family alias
+        // `fable` from before model ids became exact API ids, names its
+        // family's current model.
+        let reference = &CandidateId::new(
+            &reference.agent,
+            &self.cfg.canonical_candidate(reference).model,
+        );
         let agents = self.agent_configs();
         if agents.iter().any(|agent| agent.name == reference.agent) {
             return reference.clone();
@@ -8109,6 +8116,17 @@ fn resolve_candidate_ref(
         .filter(|id| !is_excluded(id, excluded))
         .collect();
     let views = shared.eligible_views_revivable(&RequiredCaps::default(), class);
+    let agents = shared.agent_configs();
+    // Seats of one model score alike, so a tie goes to the first account:
+    // account priority, then config order.
+    let seat_order = |v: &CandidateView| {
+        let priority = agents
+            .iter()
+            .find(|a| a.name == v.id.agent)
+            .and_then(|a| a.account_priority)
+            .unwrap_or(u32::MAX);
+        (priority, v.config_index)
+    };
     views
         .iter()
         .filter(|v| named.contains(&v.id))
@@ -8116,6 +8134,7 @@ fn resolve_candidate_ref(
             a.quality
                 .partial_cmp(&b.quality)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| seat_order(b).cmp(&seat_order(a)))
         })
         .map(|v| v.id.clone())
         // An explicit shorthand stays a control command while its target is
