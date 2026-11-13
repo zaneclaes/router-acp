@@ -7877,9 +7877,9 @@ fn human_pick(s: &RouterSession, candidate: &CandidateId) -> bool {
 /// next eligible account seat, in account order, and say so. Planner and auto
 /// scoring rank models, so without this a cheaper model that wins the score
 /// silently replaces the human's model while another account still serves it.
-/// With no such seat, the session is told the pick cannot run, the turn routes
-/// automatically, and the cordon recovery returns to the pick once its seat is
-/// routeable again.
+/// With no such seat, the session is told the pick cannot run and the turn
+/// routes automatically. When the seat is spent rather than failed, the cordon
+/// recovery returns to the pick once the seat is routeable again.
 fn carry_human_pick(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -7913,8 +7913,10 @@ fn carry_human_pick(
             })
             .map(|view| view.id)
     });
-    let why =
-        seat_unavailable(shared, pick).unwrap_or_else(|| "it failed on this account".to_string());
+    let unavailable = seat_unavailable(shared, pick);
+    // Only a spent seat comes back on its own; a failed one is not retried.
+    let recovers = unavailable.is_some();
+    let why = unavailable.unwrap_or_else(|| "it failed on this account".to_string());
     match &seat {
         Some(seat) => {
             shared.with_session(router_sid, |s| {
@@ -7930,17 +7932,23 @@ fn carry_human_pick(
             );
         }
         None => {
-            shared.with_session(router_sid, |s| {
-                s.usage_recovery_target = Some(pick.clone());
-            });
+            if recovers {
+                shared.with_session(router_sid, |s| {
+                    s.usage_recovery_target = Some(pick.clone());
+                });
+            }
             notify_user(
                 shared,
                 router_sid,
                 format!(
                     "router-acp · your pick {pick} cannot run ({why}) and no other account \
-                     serves {}; this turn routes automatically and returns to your pick when \
-                     it can run",
-                    pick.model
+                     serves {}; this turn routes automatically{}",
+                    pick.model,
+                    if recovers {
+                        " and returns to your pick when its account recovers"
+                    } else {
+                        ""
+                    }
                 ),
             );
         }
