@@ -7923,9 +7923,9 @@ fn picked_fable_coordinator_yaml(tag: &str) -> String {
     ));
     std::fs::write(
         &scores,
-        "version: 1\ncandidates:\n\
-         \x20 - { pattern: \"*fable*\", default_quality: 3.00 }\n\
-         \x20 - { pattern: \"*opus*\", default_quality: 2.90 }\n",
+        "models:\n\
+         \x20 - { id: fable, default_quality: 3.00 }\n\
+         \x20 - { id: opus, default_quality: 2.90 }\n",
     )
     .unwrap();
     let mut home = agent_yaml("claude@home", &[("fable", 5), ("opus", 3)], &[]);
