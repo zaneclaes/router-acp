@@ -4945,8 +4945,9 @@ struct RoutePlan {
 /// cordons, coordinator pool, exclusions and preferences. `exclude` names
 /// candidates that must not be chosen (a failed or cordoned pin); an
 /// override naming one of them is dropped, so the session's own strategy
-/// decides instead. The first prompt's pin, every failover re-pin and the
-/// usage-cordon escape all choose through here.
+/// decides instead. A dropped human pick first moves to the same model on
+/// another account seat (`carry_human_pick`). The first prompt's pin, every
+/// failover re-pin and the usage-cordon escape all choose through here.
 fn plan_route(
     shared: &Arc<Shared>,
     router_sid: &str,
@@ -4966,6 +4967,19 @@ fn plan_route(
             )
         })
         .ok_or_else(|| AcpError::invalid_params().data("unknown session"))?;
+    // A resumed session keeps a human pick only as its pin's flag.
+    let resumed_pick = shared
+        .with_session(router_sid, |s| {
+            s.pin
+                .as_ref()
+                .filter(|_| s.pin_user_pick && s.candidate_override.is_none())
+                .map(|p| p.candidate.clone())
+        })
+        .flatten();
+    let human_pick = override_
+        .clone()
+        .filter(|_| matches!(override_source, Some(OverrideSource::UserPick)))
+        .or(resumed_pick);
     // A failover must not keep re-selecting the failed candidate even when
     // it was explicitly pinned via router.candidate.
     let override_ = override_.filter(|o| !exclude.contains(o));
@@ -4997,6 +5011,17 @@ fn plan_route(
             }
         }
         None => None,
+    };
+    // A human picks a model; the account seat is only where it runs. Losing
+    // the seat moves the pick to the same model on another account instead
+    // of handing the turn to the strategy's score.
+    let override_ = match (override_, human_pick) {
+        (None, Some(pick))
+            if exclude.contains(&pick) || seat_unavailable(shared, &pick).is_some() =>
+        {
+            carry_human_pick(shared, router_sid, &pick, profile.class, &required, exclude)
+        }
+        (override_, _) => override_,
     };
     // With Model=Auto, an explicit effort is a routing requirement rather
     // than a post-selection preference. A concrete candidate remains allowed
@@ -6476,6 +6501,10 @@ fn queue_usage_cordon_escape(shared: &Arc<Shared>, router_sid: &str) {
     let Some(c) = shared.headroom.lock().unwrap().usage_cordon(&cur).cloned() else {
         return;
     };
+    // Read before choosing: carrying a human pick moves the override.
+    let picked = shared
+        .with_session(router_sid, |s| human_pick(s, &cur))
+        .unwrap_or(false);
     // Escaping a dead seat is not a quality upgrade: the same model on the
     // next account seat comes first, then the non-peer rule. Skill-elevated
     // pins stay inside that skill's `candidates`.
@@ -6491,7 +6520,8 @@ fn queue_usage_cordon_escape(shared: &Arc<Shared>, router_sid: &str) {
             target: target.clone(),
             reason: reason.clone(),
             handoff: HandoffStyle::Full,
-            user_pick: false,
+            // The human's model on another seat is still their pick.
+            user_pick: picked && target.model == cur.model,
         });
         s.pending_switch_notice = Some(if c.soft {
             crate::notice::Reason::Reserve
@@ -6557,7 +6587,8 @@ fn queue_usage_cordon_recovery(shared: &Arc<Shared>, router_sid: &str) {
             target: target.clone(),
             reason: reason.clone(),
             handoff: HandoffStyle::Full,
-            user_pick: false,
+            // Returning to a human pick that could not run restores it.
+            user_pick: self::human_pick(s, &target),
         });
     });
     notify_user(shared, router_sid, format!("router-acp · {reason}"));
@@ -7838,6 +7869,102 @@ fn human_pick(s: &RouterSession, candidate: &CandidateId) -> bool {
                 && matches!(s.candidate_override_source, Some(OverrideSource::UserPick))
         }
         None => s.pin_user_pick,
+    }
+}
+
+/// A human picked `pick`, and its seat cannot serve this turn: it failed, or
+/// its account is cordoned or spent. Move the pick to the same model on the
+/// next eligible account seat, in account order, and say so. Planner and auto
+/// scoring rank models, so without this a cheaper model that wins the score
+/// silently replaces the human's model while another account still serves it.
+/// With no such seat, the session is told the pick cannot run and the turn
+/// routes automatically. When the seat is spent rather than failed, the cordon
+/// recovery returns to the pick once the seat is routeable again.
+fn carry_human_pick(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    pick: &CandidateId,
+    class: TaskClass,
+    required: &RequiredCaps,
+    exclude: &[CandidateId],
+) -> Option<CandidateId> {
+    let mut excluded = shared
+        .with_session(router_sid, |s| s.excluded.clone())
+        .unwrap_or_default();
+    excluded.extend(exclude.iter().map(ToString::to_string));
+    excluded.push(pick.to_string());
+    let agents = shared.agent_configs();
+    let agent = |name: &str| agents.iter().find(|a| a.name == name);
+    let group = agent(&pick.agent).and_then(crate::accounts::provider);
+    let seat = group.and_then(|group| {
+        shared
+            .eligible_views_filtered(required, class, None, false, &excluded, |view| {
+                view.id.model == pick.model
+                    && agent(&view.id.agent).and_then(crate::accounts::provider) == Some(group)
+            })
+            .into_iter()
+            .min_by_key(|view| {
+                (
+                    agent(&view.id.agent)
+                        .and_then(|a| a.account_priority)
+                        .unwrap_or(u32::MAX),
+                    view.config_index,
+                )
+            })
+            .map(|view| view.id)
+    });
+    let unavailable = seat_unavailable(shared, pick);
+    // Only a spent seat comes back on its own; a failed one is not retried.
+    let recovers = unavailable.is_some();
+    let why = unavailable.unwrap_or_else(|| "it failed on this account".to_string());
+    match &seat {
+        Some(seat) => {
+            shared.with_session(router_sid, |s| {
+                s.candidate_override = Some(seat.clone());
+                s.candidate_override_source = Some(OverrideSource::UserPick);
+            });
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · keeping your pick: {pick} cannot run ({why}); {seat} runs it"
+                ),
+            );
+        }
+        None => {
+            if recovers {
+                shared.with_session(router_sid, |s| {
+                    s.usage_recovery_target = Some(pick.clone());
+                });
+            }
+            notify_user(
+                shared,
+                router_sid,
+                format!(
+                    "router-acp · your pick {pick} cannot run ({why}) and no other account \
+                     serves {}; this turn routes automatically{}",
+                    pick.model,
+                    if recovers {
+                        " and returns to your pick when its account recovers"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+    }
+    seat
+}
+
+/// Why `candidate`'s account cannot spend on it now, if it cannot.
+fn seat_unavailable(shared: &Arc<Shared>, candidate: &CandidateId) -> Option<String> {
+    let headroom = shared.headroom.lock().unwrap();
+    if let Some(cordon) = headroom.usage_cordon(candidate) {
+        Some(cordon.reason.clone())
+    } else if headroom.seat_exhausted(candidate) {
+        Some("account plan exhausted with no usable overage".to_string())
+    } else {
+        None
     }
 }
 
