@@ -316,6 +316,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     if !claimed {
         return;
     }
+    let deliveries = run.wakes.get(&key).map_or(0, |w| w.deliveries);
     let announced = queued.map(|input| {
         (
             input.input_id.clone(),
@@ -385,7 +386,13 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             }
         } else if (key.starts_with("input:") || ownership || release_audit)
             && crate::planner_guard::with_runtime(&shared, &sid, |rt| {
-                preempt_allowed(&rt.turn_cancels, &key, interrupt, std::time::Instant::now())
+                preempt_allowed(
+                    &rt.turn_cancels,
+                    &key,
+                    deliveries,
+                    interrupt,
+                    std::time::Instant::now(),
+                )
             })
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
             && (interrupt || !crate::planner_watchdog::tools_in_flight(&shared, &sid))
@@ -417,7 +424,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             // after the request: withdrawal, acknowledgment, a live delivery or
             // queued operator input may have superseded this correction.
             crate::planner_guard::with_runtime(&shared, &sid, |rt| {
-                rt.turn_cancels.insert(key.clone(), std::time::Instant::now());
+                rt.turn_cancels
+                    .insert(key.clone(), (std::time::Instant::now(), deliveries));
             });
             let ended = crate::planner_preempt::preempt(&shared, &sid).await;
             shared.state.lock().unwrap().log(
@@ -454,19 +462,27 @@ const CANCEL_ANY_ITEM_SECS: u64 = 5 * 60;
 /// 2026-11-14 logged `planner_handoff_preempt` for one ended worker's ownership
 /// handoff every minute for 40 minutes: each wake started a parent turn and the
 /// still-pending handoff cancelled it, so no orchestration ran while production
-/// was failed and its repair worker sat interrupted. An `--interrupt` input
-/// keeps its authority to cancel once whatever else just cancelled. Pure, for tests.
+/// was failed and its repair worker sat interrupted. Once the item has been
+/// delivered after its cancel (`deliveries` grew), the cancel has done its job
+/// and that item never cancels again: the same day a release audit that had
+/// already been delivered cancelled the turn every two to three minutes, and
+/// each cancel ended the repair worker the parent had just dispatched. An
+/// `--interrupt` input keeps its authority to cancel once whatever else just
+/// cancelled. Pure, for tests.
 pub(crate) fn preempt_allowed(
-    cancels: &std::collections::HashMap<String, std::time::Instant>,
+    cancels: &std::collections::HashMap<String, (std::time::Instant, u32)>,
     key: &str,
+    deliveries: u32,
     interrupt: bool,
     now: std::time::Instant,
 ) -> bool {
     let since = |at: &std::time::Instant| now.saturating_duration_since(*at).as_secs();
-    if cancels.get(key).is_some_and(|at| since(at) < CANCEL_SAME_ITEM_SECS) {
-        return false;
+    if let Some((at, delivered_then)) = cancels.get(key) {
+        if deliveries > *delivered_then || since(at) < CANCEL_SAME_ITEM_SECS {
+            return false;
+        }
     }
-    interrupt || !cancels.values().any(|at| since(at) < CANCEL_ANY_ITEM_SECS)
+    interrupt || !cancels.values().any(|(at, _)| since(at) < CANCEL_ANY_ITEM_SECS)
 }
 
 fn ownership_handoff(
@@ -1350,37 +1366,42 @@ mod steer_tests {
         use std::time::{Duration, Instant};
         let start = Instant::now();
         let mut cancels = std::collections::HashMap::new();
+        let after = |secs: u64| start + Duration::from_secs(secs);
         let handoff = "smokescreen-deterministic-v3:ff346996";
-        assert!(preempt_allowed(&cancels, handoff, false, start));
-        cancels.insert(handoff.to_string(), start);
-        // The loop that happened: the same item a minute later, and again.
-        assert!(!preempt_allowed(&cancels, handoff, false, start + Duration::from_secs(60)));
-        assert!(!preempt_allowed(
-            &cancels,
-            handoff,
-            false,
-            start + Duration::from_secs(CANCEL_SAME_ITEM_SECS - 1)
-        ));
-        assert!(preempt_allowed(
-            &cancels,
-            handoff,
-            false,
-            start + Duration::from_secs(CANCEL_SAME_ITEM_SECS)
-        ));
+        assert!(preempt_allowed(&cancels, handoff, 0, false, start));
+        cancels.insert(handoff.to_string(), (start, 0));
+        // The loop that happened: the same undelivered item a minute later, and again.
+        assert!(!preempt_allowed(&cancels, handoff, 0, false, after(60)));
+        assert!(!preempt_allowed(&cancels, handoff, 0, false, after(CANCEL_SAME_ITEM_SECS - 1)));
+        // Still undelivered after the window: one more cancel may help.
+        assert!(preempt_allowed(&cancels, handoff, 0, false, after(CANCEL_SAME_ITEM_SECS)));
         // A second worker's handoff may not take over the cancelling at once.
         let other = "lead-magnets-receipt401:671e23df";
-        assert!(!preempt_allowed(&cancels, other, false, start + Duration::from_secs(60)));
-        assert!(preempt_allowed(
-            &cancels,
-            other,
-            false,
-            start + Duration::from_secs(CANCEL_ANY_ITEM_SECS)
-        ));
+        assert!(!preempt_allowed(&cancels, other, 0, false, after(60)));
+        assert!(preempt_allowed(&cancels, other, 0, false, after(CANCEL_ANY_ITEM_SECS)));
         // An interrupting input still cancels once, then waits like any item.
         let input = "input:monitor-fix";
-        assert!(preempt_allowed(&cancels, input, true, start + Duration::from_secs(60)));
-        cancels.insert(input.to_string(), start + Duration::from_secs(60));
-        assert!(!preempt_allowed(&cancels, input, true, start + Duration::from_secs(120)));
+        assert!(preempt_allowed(&cancels, input, 0, true, after(60)));
+        cancels.insert(input.to_string(), (after(60), 0));
+        assert!(!preempt_allowed(&cancels, input, 0, true, after(120)));
+    }
+
+    /// A release audit that had already been delivered cancelled the parent's
+    /// turn every two to three minutes while production was failed, and each
+    /// cancel ended the repair worker just dispatched (2026-11-14). Once an
+    /// item is delivered after its cancel it never cancels again.
+    #[test]
+    fn a_delivered_item_never_cancels_again() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let audit = "audit:release:c794c9c1";
+        let mut cancels = std::collections::HashMap::new();
+        cancels.insert(audit.to_string(), (start, 3));
+        let much_later = start + Duration::from_secs(CANCEL_SAME_ITEM_SECS * 10);
+        assert!(!preempt_allowed(&cancels, audit, 4, false, much_later));
+        assert!(!preempt_allowed(&cancels, audit, 4, true, much_later));
+        // Not delivered since the cancel: the window alone decides.
+        assert!(preempt_allowed(&cancels, audit, 3, false, much_later));
     }
 
     #[test]
