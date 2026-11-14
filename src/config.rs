@@ -995,6 +995,13 @@ pub struct AgentConfig {
     /// run for delegated work. Off unless set.
     #[serde(default)]
     pub bypass_hook_trust: bool,
+    /// Codex adapters only: `false` writes `features.plugins = false` into each
+    /// runtime's `config.toml`. With plugins on, a Codex process whose shared
+    /// catalog cache is stale downloads the whole remote plugin catalog when it
+    /// starts (about 69 MB in Codex 0.159), and a router starts one process per
+    /// session. On unless set, which is Codex's own default.
+    #[serde(default = "default_true")]
+    pub plugins: bool,
     /// Most delegated sub-sessions this agent runs at once, beside the global
     /// `delegation.max_concurrent`. Each account seat gets its own limit, so
     /// adding accounts or agents adds delegate capacity. Unset: only the

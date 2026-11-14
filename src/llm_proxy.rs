@@ -7,7 +7,7 @@
 //! prompt); ambiguous traffic passes through unchanged.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -83,6 +83,9 @@ pub struct LlmProxyRuntime {
     policy: Mutex<HashMap<String, RequestPolicyState>>,
     next_registration: AtomicU64,
     client: reqwest::Client,
+    /// Set once an upstream refused a zstd request body and then accepted the
+    /// same body uncompressed. Compression stays off for this process.
+    zstd_refused: AtomicBool,
 }
 
 impl std::fmt::Debug for LlmProxyRuntime {
@@ -133,6 +136,7 @@ impl LlmProxyRuntime {
             policy: Mutex::new(HashMap::new()),
             next_registration: AtomicU64::new(1),
             client,
+            zstd_refused: AtomicBool::new(false),
         }))
     }
 
@@ -607,14 +611,58 @@ async fn proxy_request(
     }
     let request_id = format!("llm-{}", uuid::Uuid::new_v4());
     let started = Instant::now();
+    let compressed = (!state.runtime.zstd_refused.load(Ordering::Relaxed))
+        .then(|| zstd_request_body(&target.config, &parts.method, &outbound_body))
+        .flatten();
+    let sent_compressed = compressed.is_some();
     let first_request = build_upstream_request(
         &state.runtime.client,
         &parts.method,
         upstream_url.clone(),
         &outbound_headers,
-        outbound_body.clone(),
+        compressed.unwrap_or_else(|| outbound_body.clone()),
+        sent_compressed.then_some("zstd"),
     );
-    let mut upstream = match first_request.send().await {
+    let mut first_response = first_request.send().await;
+    // An upstream that cannot read the compressed body answers 400 or 415
+    // before any model runs. Send the same request plain, once; if that is
+    // accepted, the refusal was the encoding, and later requests go plain.
+    // This runs before every other error path, so a refused encoding is never
+    // mistaken for a rejected model or a rejected pin.
+    if sent_compressed
+        && let Ok(response) = &first_response
+        && matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        )
+    {
+        let refused = response.status();
+        let plain = build_upstream_request(
+            &state.runtime.client,
+            &parts.method,
+            upstream_url.clone(),
+            &outbound_headers,
+            outbound_body.clone(),
+            None,
+        )
+        .send()
+        .await;
+        if let Ok(response) = &plain
+            && !matches!(
+                response.status(),
+                StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            )
+        {
+            state.runtime.zstd_refused.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                target = %target.key,
+                %refused,
+                "upstream refused a zstd request body; sending plain bodies from now on"
+            );
+        }
+        first_response = plain;
+    }
+    let mut upstream = match first_response {
         Ok(response) => response,
         Err(err) => {
             let completion = start_request_record(
@@ -681,6 +729,7 @@ async fn proxy_request(
                     upstream_url.clone(),
                     &outbound_headers,
                     outbound_body,
+                    None,
                 )
                 .send()
                 .await
@@ -787,6 +836,7 @@ async fn proxy_request(
                 upstream_url,
                 &retry_headers,
                 body.to_vec(),
+                None,
             )
             .send()
             .await;
@@ -952,20 +1002,49 @@ async fn proxy_request(
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "cannot build proxy response"))
 }
 
+/// Bodies below this size are sent as they are: the saving would not pay for
+/// the compression.
+const ZSTD_MIN_BODY_BYTES: usize = 4096;
+
+/// The zstd form of an inference request body, for the one upstream known to
+/// accept it. Codex compresses its own requests to the ChatGPT Codex backend,
+/// but only on its built-in provider; `codex_chatgpt_provider` replaces that
+/// provider with this proxy, so Codex sends the body plain and the proxy puts
+/// the compression back. A request resends its whole conversation, so plain
+/// bodies are about a megabyte each.
+fn zstd_request_body(
+    config: &AgentLlmProxyConfig,
+    method: &Method,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    if !config.codex_chatgpt_provider || method != Method::POST || body.len() < ZSTD_MIN_BODY_BYTES
+    {
+        return None;
+    }
+    zstd::bulk::compress(body, 3)
+        .ok()
+        .filter(|compressed| compressed.len() < body.len())
+}
+
 fn build_upstream_request(
     client: &reqwest::Client,
     method: &Method,
     url: reqwest::Url,
     headers: &HeaderMap,
     body: Vec<u8>,
+    content_encoding: Option<&'static str>,
 ) -> reqwest::RequestBuilder {
     let mut request = client
         .request(method.clone(), url)
         .header("accept-encoding", "identity")
         .body(body);
+    if let Some(encoding) = content_encoding {
+        request = request.header("content-encoding", encoding);
+    }
     for (name, value) in headers {
         if !is_hop_by_hop(name.as_str())
             && !matches!(name.as_str(), "host" | "content-length" | "accept-encoding")
+            && !(content_encoding.is_some() && name.as_str() == "content-encoding")
         {
             request = request.header(name, value);
         }
@@ -3339,6 +3418,66 @@ agents:
         let usage = parse_response_usage(openai, LlmWireProtocol::Openai);
         assert_eq!(usage.cache_read, 80);
         assert!(usage.input_includes_cache);
+    }
+
+    #[test]
+    fn codex_backend_request_bodies_are_compressed_and_decode_to_the_original() {
+        let codex = AgentLlmProxyConfig {
+            protocol: LlmWireProtocol::Openai,
+            base_url_env: "OPENAI_BASE_URL".into(),
+            upstream_base_url: "https://chatgpt.com/backend-api/codex".into(),
+            codex_chatgpt_provider: true,
+        };
+        let other = AgentLlmProxyConfig {
+            codex_chatgpt_provider: false,
+            ..codex.clone()
+        };
+        // A conversation resent in full: repetitive JSON well over the floor.
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-test",
+            "input": (0..400).map(|turn| json!({"role": "user", "content": format!("turn {turn}: read the file and report what changed")})).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+
+        let compressed = zstd_request_body(&codex, &Method::POST, &body).unwrap();
+        assert!(
+            compressed.len() * 4 < body.len(),
+            "{} of {}",
+            compressed.len(),
+            body.len()
+        );
+        assert_eq!(
+            zstd::bulk::decompress(&compressed, body.len()).unwrap(),
+            body
+        );
+
+        // Only the upstream known to accept it, only request bodies worth it.
+        assert!(zstd_request_body(&other, &Method::POST, &body).is_none());
+        assert!(zstd_request_body(&codex, &Method::GET, &body).is_none());
+        assert!(zstd_request_body(&codex, &Method::POST, br#"{"model":"gpt-test"}"#).is_none());
+
+        let client = reqwest::Client::new();
+        let url = reqwest::Url::parse("http://127.0.0.1:1/responses").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "identity".parse().unwrap());
+        headers.insert("x-kept", "yes".parse().unwrap());
+        let sent = build_upstream_request(
+            &client,
+            &Method::POST,
+            url.clone(),
+            &headers,
+            compressed,
+            Some("zstd"),
+        )
+        .build()
+        .unwrap();
+        let encodings: Vec<_> = sent.headers().get_all("content-encoding").iter().collect();
+        assert_eq!(encodings, ["zstd"]);
+        assert_eq!(sent.headers()["x-kept"], "yes");
+        let plain = build_upstream_request(&client, &Method::POST, url, &headers, body, None)
+            .build()
+            .unwrap();
+        assert_eq!(plain.headers()["content-encoding"], "identity");
     }
 
     #[test]

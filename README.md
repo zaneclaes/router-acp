@@ -1064,6 +1064,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `delegation.native_subagents` | `forbid` | `allow` removes the ban on provider-native subagent tools from the injected delegation directive. |
 | `delegation.lifecycle_hook` | unset | `{ command, args, timeout_ms, max_continuations }` run with a JSON `delegate_start` / `delegate_turn_end` / `delegate_stop` / `parent_repinned` event on stdin; a failed start refuses the delegate, exit 2 at a turn end sends the worker back. See [Host-directed workers](#host-directed-workers). |
 | `agents[].max_delegates` | unset | Concurrent delegates for this agent (each account seat separately), beside `delegation.max_concurrent`. |
+| `agents[].plugins` | `true` | Codex adapters only. `false` writes `features.plugins = false` into every runtime's `config.toml`. With plugins on, a Codex process that finds the shared catalog cache stale downloads the whole remote plugin catalog at startup (about 69 MB in Codex 0.159), and the router starts one process per session. |
 | `ROUTER_ACP_MCP_CATALOGS` (env) | unset | JSON seed for `delegate_mcp_catalogs` when no client connection can ever send the `router-acp/delegate_mcp_catalogs` notification. Fails open on absent/malformed content. |
 
 ### Per-request LLM proxy

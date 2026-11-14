@@ -373,7 +373,7 @@ pub(crate) async fn runtime(
             .map_err(|_| "Could not preserve adapter configuration")?;
     }
     if matches!(provider, "codex" | "grok") {
-        write_runtime_config(provider, &config, &runtime.root)?;
+        write_runtime_config(provider, &config, &runtime.root, agent.plugins)?;
     }
     if provider == "claude" && config != dir {
         write_claude_state(&config, &dir, &runtime.root)?;
@@ -527,7 +527,12 @@ pub(crate) async fn runtime(
     Ok(Some(runtime))
 }
 
-fn write_runtime_config(provider: &str, dir: &Path, root: &Path) -> Result<(), String> {
+fn write_runtime_config(
+    provider: &str,
+    dir: &Path,
+    root: &Path,
+    plugins: bool,
+) -> Result<(), String> {
     let source = dir.join("config.toml");
     let mut config = if source.exists() {
         toml::from_str(
@@ -552,6 +557,11 @@ fn write_runtime_config(provider: &str, dir: &Path, root: &Path) -> Result<(), S
                 "default_mode_request_user_input".into(),
                 toml::Value::Boolean(true),
             );
+            // Only an explicit opt-out is written: the user's own setting
+            // otherwise passes through unchanged.
+            if !plugins {
+                features.insert("plugins".into(), toml::Value::Boolean(false));
+            }
         }
         "grok" => {
             let folder_trust = root_table
@@ -2381,6 +2391,34 @@ oauth = { storage = "keyring", key = "oauth/kimi-code" }
         assert!(request_generation(&agent).is_some());
         record_success(&agent);
         assert_eq!(availability(&agent), AuthAvailability::Authenticated);
+    }
+
+    #[test]
+    fn codex_runtime_turns_plugins_off_only_when_the_agent_opts_out() {
+        let features = |source: &str, plugins: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.toml"), source).unwrap();
+            write_runtime_config("codex", dir.path(), root.path(), plugins).unwrap();
+            let written: toml::Value =
+                toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap())
+                    .unwrap();
+            written["features"].clone()
+        };
+        let user = "model = \"gpt-test\"\n[features]\napps = true\nplugins = true\n";
+
+        let off = features(user, false);
+        assert_eq!(off["plugins"].as_bool(), Some(false));
+        assert_eq!(off["apps"].as_bool(), Some(true));
+        assert_eq!(features("", false)["plugins"].as_bool(), Some(false));
+
+        // Left on, the user's own choice passes through either way.
+        assert_eq!(features(user, true)["plugins"].as_bool(), Some(true));
+        assert!(features("", true).get("plugins").is_none());
+        assert_eq!(
+            features("[features]\nplugins = false\n", true)["plugins"].as_bool(),
+            Some(false)
+        );
     }
 
     #[tokio::test]
