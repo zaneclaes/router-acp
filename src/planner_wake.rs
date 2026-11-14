@@ -384,6 +384,9 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                 );
             }
         } else if (key.starts_with("input:") || ownership || release_audit)
+            && crate::planner_guard::with_runtime(&shared, &sid, |rt| {
+                preempt_allowed(&rt.turn_cancels, &key, interrupt, std::time::Instant::now())
+            })
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
             && (interrupt || !crate::planner_watchdog::tools_in_flight(&shared, &sid))
             && planner_workflow::load(&shared, &sid)
@@ -413,6 +416,9 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             // stranding a correction, ownership handoff or release audit behind a router-owned turn. Recheck
             // after the request: withdrawal, acknowledgment, a live delivery or
             // queued operator input may have superseded this correction.
+            crate::planner_guard::with_runtime(&shared, &sid, |rt| {
+                rt.turn_cancels.insert(key.clone(), std::time::Instant::now());
+            });
             let ended = crate::planner_preempt::preempt(&shared, &sid).await;
             shared.state.lock().unwrap().log(
                 &sid,
@@ -434,6 +440,33 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             );
         }
     });
+}
+
+/// One queued item may cancel a router-owned turn again only after this long,
+/// and no item may cancel within the shorter window after any other did.
+const CANCEL_SAME_ITEM_SECS: u64 = 15 * 60;
+const CANCEL_ANY_ITEM_SECS: u64 = 5 * 60;
+
+/// Whether a queued item whose steering was declined may cancel the running
+/// router-owned turn now. A cancel exists to get the item delivered at the next
+/// boundary; cancelling for the same item again before that turn has had time
+/// to act delivers nothing and stops the parent from ever acting. A run on
+/// 2026-11-14 logged `planner_handoff_preempt` for one ended worker's ownership
+/// handoff every minute for 40 minutes: each wake started a parent turn and the
+/// still-pending handoff cancelled it, so no orchestration ran while production
+/// was failed and its repair worker sat interrupted. An `--interrupt` input
+/// keeps its authority to cancel once whatever else just cancelled. Pure, for tests.
+pub(crate) fn preempt_allowed(
+    cancels: &std::collections::HashMap<String, std::time::Instant>,
+    key: &str,
+    interrupt: bool,
+    now: std::time::Instant,
+) -> bool {
+    let since = |at: &std::time::Instant| now.saturating_duration_since(*at).as_secs();
+    if cancels.get(key).is_some_and(|at| since(at) < CANCEL_SAME_ITEM_SECS) {
+        return false;
+    }
+    interrupt || !cancels.values().any(|at| since(at) < CANCEL_ANY_ITEM_SECS)
 }
 
 fn ownership_handoff(
@@ -1306,6 +1339,48 @@ mod steer_tests {
         steered: &HashSet<String>,
     ) -> Option<(String, String)> {
         super::pending_steer(queue, wakes, steered, &BTreeMap::new())
+    }
+
+    /// One pending handoff cancelled a parent's turn every minute for 40
+    /// minutes (2026-11-14). A cancel for the same item waits out its window,
+    /// another item waits out the shorter one, and an interrupt may still
+    /// cancel once.
+    #[test]
+    fn a_declined_item_cancels_a_turn_once_per_window() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut cancels = std::collections::HashMap::new();
+        let handoff = "smokescreen-deterministic-v3:ff346996";
+        assert!(preempt_allowed(&cancels, handoff, false, start));
+        cancels.insert(handoff.to_string(), start);
+        // The loop that happened: the same item a minute later, and again.
+        assert!(!preempt_allowed(&cancels, handoff, false, start + Duration::from_secs(60)));
+        assert!(!preempt_allowed(
+            &cancels,
+            handoff,
+            false,
+            start + Duration::from_secs(CANCEL_SAME_ITEM_SECS - 1)
+        ));
+        assert!(preempt_allowed(
+            &cancels,
+            handoff,
+            false,
+            start + Duration::from_secs(CANCEL_SAME_ITEM_SECS)
+        ));
+        // A second worker's handoff may not take over the cancelling at once.
+        let other = "lead-magnets-receipt401:671e23df";
+        assert!(!preempt_allowed(&cancels, other, false, start + Duration::from_secs(60)));
+        assert!(preempt_allowed(
+            &cancels,
+            other,
+            false,
+            start + Duration::from_secs(CANCEL_ANY_ITEM_SECS)
+        ));
+        // An interrupting input still cancels once, then waits like any item.
+        let input = "input:monitor-fix";
+        assert!(preempt_allowed(&cancels, input, true, start + Duration::from_secs(60)));
+        cancels.insert(input.to_string(), start + Duration::from_secs(60));
+        assert!(!preempt_allowed(&cancels, input, true, start + Duration::from_secs(120)));
     }
 
     #[test]

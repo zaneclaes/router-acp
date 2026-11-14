@@ -205,6 +205,10 @@ pub struct SessionRuntime {
     pub steering: bool,
     /// Session-wide throttle, retained across parent turn boundaries.
     pub last_steer: Option<std::time::Instant>,
+    /// When each queued item last cancelled a router-owned turn because
+    /// steering was declined (`crate::planner_wake::preempt_allowed`).
+    /// Retained across turns: the cancel is what ends the turn.
+    pub turn_cancels: HashMap<String, std::time::Instant>,
     /// Each work's latest child session (process key, downstream session id).
     pub children: HashMap<String, (crate::downstream::ProcessKey, String)>,
     pub drain: Option<crate::planner_shutdown::Drain>,
