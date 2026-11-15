@@ -4154,6 +4154,74 @@ async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them()
     );
 }
 
+/// Live 2026-11-15: an adopted run's reconcile wake named 119 works, about 30
+/// of them live; the rest were old records a newer work on the same plan had
+/// already carried on. The parent dismissed the whole list as stale and left 48
+/// of 50 slots empty for seven hours. A superseded record is not named; the host
+/// is told which works need a reconcile; a reconcile refusal is labelled so.
+#[tokio::test]
+async fn a_reconcile_wake_names_only_works_no_sibling_has_carried_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stdin = tmp.path().join("stdin.json");
+    let script = host_script(&[], &stdin);
+    let f = fixture(|cfg| capacity_host(cfg, script, 1, 5));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let on = |id: &str, plan: &str| WorkSpec {
+        plan_id: plan.into(),
+        external_id: Some(plan.into()),
+        ..work(id)
+    };
+    admit(shared, on("plan-a-old", "plan-a"));
+    admit(shared, on("plan-a-new", "plan-a"));
+    admit(shared, on("plan-b-sole", "plan-b"));
+    planner_workflow::mutate(shared, SID, |run| {
+        for id in ["plan-a-old", "plan-b-sole"] {
+            let work = run.works.get_mut(id).unwrap();
+            work.status = planner_workflow::WorkStatus::Interrupted;
+            work.reconciliation.required = true;
+        }
+        run.works.get_mut("plan-a-new").unwrap().status = planner_workflow::WorkStatus::Finished;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1, "the sole waiting work keeps the condition open");
+    let reason = &wakes[0].1.reason;
+    assert!(reason.contains("plan-b-sole"), "{reason}");
+    assert!(
+        !reason.contains("plan-a-old"),
+        "a record its sibling carried on is not waiting: {reason}"
+    );
+    let request = std::fs::read_to_string(&stdin).unwrap();
+    assert!(
+        request.contains("\"reconciliation_required\":true"),
+        "the host is told which works need a reconcile: {request}"
+    );
+    // Negative control: with no sibling past admission, both are named.
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("plan-a-new").unwrap().status = planner_workflow::WorkStatus::Admitted;
+        Ok(())
+    })
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let waiting = router_acp::planner_capacity::awaiting_reconciliation(&run);
+    assert!(waiting.contains(&"plan-a-old".to_string()), "{waiting:?}");
+    assert!(waiting.contains(&"plan-b-sole".to_string()), "{waiting:?}");
+
+    use router_acp::planner_capacity::start_refusal_reason;
+    assert_eq!(
+        start_refusal_reason(
+            "parent reconciliation required: record current scope and preserved source with planner_workflow reconcile before resuming"
+        ),
+        "reconciliation"
+    );
+    assert_eq!(start_refusal_reason("unmet dependencies: plan-b"), "dependency");
+}
+
 #[tokio::test]
 async fn busy_parent_capacity_clock_resets_when_all_candidates_are_held() {
     let tmp = tempfile::tempdir().unwrap();
