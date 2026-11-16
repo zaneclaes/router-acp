@@ -1050,6 +1050,13 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `pinned_versions` | `{}` | Version pinning: `agent/model-id` → `default` or one of that model's `versions[].api_model`. Routing never sees it — the candidate keeps its id in every pool, directive, glob and state row — and the per-request proxy sends the pinned version on the wire, priced (`versions[].pricing`) and scored (the entry in its provider's `data/providers/<name>.yaml` whose `id` is the pinned model id) as that version. The routing disclosure adds a `pinned version <api_model>` note. A key that is not a declared model, or a version the model does not declare, fails the load. |
 | — pin rejected by the provider | – | When the provider rejects the pinned model's `api_model` (HTTP 400/404 — a version gated behind a newer client, a retired id), the router does **not** fall back to whatever the downstream alias would have served: the session is attributed and priced as the pinned version, so serving a different one silently would be a lie. Instead the provider's error is returned to the adapter verbatim (its message is usually actionable), the session gets a notice, and the candidate is cordoned for `headroom.cordon_default_secs` with the provider's reason — so the picker shows it unavailable, automatic routing drops it, and the next turn routes elsewhere instead of paying the same failing round trip again. Rejections of a router-chosen **alternate** keep the original retry-unchanged recovery: there the pinned model is what the adapter asked for anyway. For a version whose provider-file entry says `system_turns: false` (Opus 4.6/4.7, Sonnet 4.6), the proxy folds Claude Code's mid-conversation `role: "system"` turns into user turns and drops the `mid-conversation-system` / `per-turn-control` beta tokens before sending, so the pinned version is never asked for a feature it lacks. A 400 that still rejects a **feature of the request** rather than the model (`… is not supported on this model`, a structured tool-addition turn the proxy cannot fold, `cache_control`) is relayed but does **not** cordon: the adapter re-sends without the feature and the pinned version serves that retry. |
 
+The request-feature distinction also covers the provider's wording
+`"thinking.type.disabled" is not supported for this model`. That response
+does not remove the model from service. The error reaches the adapter unchanged;
+the router does not enable thinking or change the selected model to hide it.
+A corrected request can use the same pin. Missing-model and client-version
+rejections still cordon the model.
+
 ### Delegation
 
 | Key | Default | Meaning |

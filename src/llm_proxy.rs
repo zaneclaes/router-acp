@@ -1252,6 +1252,7 @@ async fn reject_pinned_rewrite(
 fn is_request_shape_rejection(detail: &str) -> bool {
     let lower = detail.to_lowercase();
     lower.contains("not supported on this model")
+        || (lower.contains("thinking.type.") && lower.contains("not supported for this model"))
         || lower.contains("requires a model that supports")
         || lower.contains("role 'system'")
         || lower.contains("unexpected role")
@@ -4178,12 +4179,18 @@ agents:
         assert!(is_request_shape_rejection(
             "role 'system' is not supported on this model"
         ));
+        assert!(is_request_shape_rejection(
+            "\"thinking.type.disabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."
+        ));
         assert!(!is_request_shape_rejection(
             "Claude Code 2.1.246 does not support this model; version 2.1.251 or newer \
              is required. Run `claude update`."
         ));
         assert!(!is_request_shape_rejection(
             "model: claude-opus-4-6 not found"
+        ));
+        assert!(!is_request_shape_rejection(
+            "thinking.type.disabled model not found"
         ));
     }
 
@@ -4373,6 +4380,15 @@ pinned_versions:
             State(seen): State<Seen>,
             axum::Json(body): axum::Json<Value>,
         ) -> Response<Body> {
+            if body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"\"thinking.type.disabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."}}"#,
+                    ))
+                    .unwrap();
+            }
             let model = body["model"].as_str().unwrap_or("").to_string();
             let has_system_turn = body["messages"]
                 .as_array()
@@ -4522,7 +4538,36 @@ pinned_versions:
             "user notified that the pin survives: {notice}"
         );
 
-        // (d) The adapter's healed retry — same alias, no system turn — is
+        // A rejected thinking option is also a request-shape error. The live
+        // provider spells this "for this model", not "on this model".
+        let disabled = post(
+            proxy_base.clone(),
+            json!({
+                "model": "claude-opus-5",
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "continue"}]
+            }),
+        )
+        .await;
+        assert_eq!(disabled.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            disabled
+                .text()
+                .await
+                .unwrap()
+                .contains("thinking.type.disabled")
+        );
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&pinned)
+                .is_none(),
+            "a rejected thinking option must not remove the model from service"
+        );
+
+        // (d) The adapter's healed retry — same alias, no rejected option — is
         //     served by the pinned version itself, not by an alternate.
         drop(turn);
         let _turn2 = shared.llm_proxy.begin_turn(
