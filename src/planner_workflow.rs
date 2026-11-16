@@ -3123,10 +3123,8 @@ pub fn begin_followup(
 ) -> Result<String, String> {
     let mut context = String::new();
     mutate(shared, sid, |run| {
-        // A drain's shutdown follow-up is the one turn a draining run gives.
-        if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
-            || run.phase != PlannerPhase::Implementation
-        {
+        // Shutdown interrupts existing turns; it never revives an idle child.
+        if run.status != RunStatus::Running || run.phase != PlannerPhase::Implementation {
             return Err("planner run is suspended".into());
         }
         let work = run

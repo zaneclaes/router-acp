@@ -1026,7 +1026,7 @@ pub fn child_may_continue(
         .ok()
         .flatten()
         .is_some_and(|run| {
-            matches!(run.status, RunStatus::Running | RunStatus::Draining)
+            run.status == RunStatus::Running
                 && run.works.get(&identity.work_id).is_some_and(|w| {
                     !w.paused
                         && w.attempt
@@ -1038,9 +1038,7 @@ pub fn child_may_continue(
 
 /// Wait out a planner child's continuation backoff (`continued` earlier
 /// continuations). `None`: stop continuing it (its run stopped, its work was
-/// paused or a drain cancelled it). `Some(Some(message))`: a shutdown drain's
-/// message, which goes at once instead of the host's. `Some(None)`: send the
-/// host's message.
+/// paused or is draining). `Some(None)`: send the host's message.
 pub async fn child_continuation(
     shared: &Shared,
     sid: &str,
@@ -1053,11 +1051,6 @@ pub async fn child_continuation(
     loop {
         if !child_may_continue(shared, sid, identity) {
             return None;
-        }
-        if let Some(message) =
-            crate::planner_shutdown::take_injection(shared, sid, &identity.work_id)
-        {
-            return Some(Some(message));
         }
         if std::time::Instant::now() >= until {
             return Some(None);

@@ -7,13 +7,11 @@
 //! 1. sets the run `draining`: admissions, capacity and audit wakes,
 //!    auto-admission, worker resumptions, in-flight wakes and turn-end gates
 //!    all stop (each of them runs only for a `running` run);
-//! 2. saves the resume state through `routers.planner.shutdown` (`saving`,
+//! 2. interrupts only active worker attempts to record their resume state;
+//!    ended attempts are already recorded and never get a new turn;
+//! 3. saves the final state through `routers.planner.shutdown` (`saving`,
 //!    then `saved` or `failed`; a failed save does not stop the drain);
-//! 3. prompts the parent once to record its exact resume point, and waits up
-//!    to 10 minutes for that turn;
-//! 4. tells every live worker to commit, push, record its resume point and
-//!    hand off `waiting`, and waits for each to stop, up to
-//!    `drain_timeout_secs`, after which it is cancelled (`draining`);
+//! 4. prompts the parent once to update its continuation from that final state;
 //! 5. sets the run `paused` (`drained`), which the next `/implement` resumes.
 //!
 //! A router that dies mid-drain leaves the run `draining`; `/implement`
@@ -27,7 +25,7 @@ use agent_client_protocol::schema::v1::{CancelNotification, ContentBlock, Prompt
 use serde_json::{Value, json};
 
 use crate::planner_guard::{self, with_runtime};
-use crate::planner_workflow::{self, PlannerRun, RunStatus, WorkStatus};
+use crate::planner_workflow::{self, PlannerRun, RunStatus};
 use crate::session::Shared;
 
 pub const METHOD: &str = "_router/planner_shutdown";
@@ -62,24 +60,22 @@ pub fn status(shared: &Shared, params: &Value) -> Result<Value, String> {
 /// (default the Markdown layout's `Docs/CONTINUE.md`), never a fixed project path.
 pub fn parent_prompt(planner: &crate::config::PlannerRouterConfig) -> String {
     format!(
-        "Shutdown requested by the operator: rewrite {} and your registers now with the exact \
-         resume point; admit nothing; end your turn.",
+        "Shutdown requested by the operator: the live children have stopped. Update {} now \
+         with their final recorded state and the exact resume point. Use the state already \
+         recorded; do not start or resume children, audit, build, commit, push, or wait for CI. \
+         Make this one brief state-saving turn, then stop.",
         planner.continuation
     )
 }
-pub const WORKER_PROMPT: &str = "Shutdown requested: commit and push your branch now, record your \
-     status notes and exact resume point, then hand off `waiting` with that resume point and \
-     stop.";
-const PARENT_TURN_LIMIT: Duration = Duration::from_secs(10 * 60);
+pub const WORKER_PROMPT: &str = "Shutdown requested: interrupt your current work, record your \
+     current state and exact resume point, including any uncommitted or unpushed changes, \
+     then hand off `waiting` and stop. Do not build, commit, push, or wait for CI.";
+const PARENT_TURN_LIMIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(500);
 
 /// One active drain, in process.
 #[derive(Default)]
 pub struct Drain {
-    /// Mid-turn workers whose next turn end delivers [`WORKER_PROMPT`].
-    pub pending: HashSet<String>,
-    /// Workers that received [`WORKER_PROMPT`] at a turn end.
-    pub injected: HashSet<String>,
     /// Workers cancelled after their drain bound.
     pub cancelled: HashSet<String>,
 }
@@ -116,16 +112,6 @@ pub fn draining(shared: &Shared, sid: &str) -> bool {
         .unwrap()
         .get(sid)
         .is_some_and(|rt| rt.drain.is_some())
-}
-
-/// The shutdown message a mid-turn worker gets at its turn end, once.
-pub fn take_injection(shared: &Shared, sid: &str, work_id: &str) -> Option<String> {
-    let mut runtimes = shared.planner_runtime.lock().unwrap();
-    let drain = runtimes.get_mut(sid)?.drain.as_mut()?;
-    drain.pending.remove(work_id).then(|| {
-        drain.injected.insert(work_id.to_string());
-        WORKER_PROMPT.to_string()
-    })
 }
 
 pub fn cancelled(shared: &Shared, sid: &str, work_id: &str) -> bool {
@@ -181,12 +167,12 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
     let mut workers = BTreeMap::new();
     let mut saved = Vec::new();
     let mut prior = RunStatus::Running;
-    let run = match planner_workflow::mutate(shared, sid, |run| {
+    match planner_workflow::mutate(shared, sid, |run| {
         prior = run.status;
         run.status = RunStatus::Draining;
         Ok(())
     }) {
-        Ok(run) => run,
+        Ok(_) => (),
         Err(error) => {
             notify(
                 shared,
@@ -201,32 +187,28 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
         }
     };
 
-    notify(
-        shared,
-        sid,
-        "saving",
-        "admissions stopped; saving the run's resume state",
-        &saved,
-        &workers,
-    );
-    match save_state(shared, sid, &run, prior, &cfg).await {
-        Ok((paths, summary)) => {
-            saved = paths;
-            notify(shared, sid, "saved", &summary, &saved, &workers);
+    // Stop the coordinator's current work while its children save state. Only
+    // the final continuation update may run after their state is collected.
+    if shared
+        .with_session(sid, |s| s.prompt_activity > 0)
+        .unwrap_or(false)
+    {
+        with_runtime(shared, sid, |rt| rt.preempted = true);
+        shared.with_session(sid, |s| s.cancelled = true);
+        if let Some(interrupt) = shared.background_interrupts.lock().unwrap().remove(sid) {
+            let _ = interrupt.send(crate::session::BackgroundInterrupt::Cancel);
         }
-        Err(error) => notify(
+        if let Some((conn, child, _)) = shared.pinned_route(sid) {
+            let _ = conn.send_notification(CancelNotification::new(child));
+        }
+        notify(
             shared,
             sid,
-            "failed",
-            &format!("the resume state was not saved ({error}); the drain continues"),
+            "draining",
+            "interrupting the parent turn for shutdown",
             &saved,
             &workers,
-        ),
-    }
-
-    if matches!(prior, RunStatus::Running | RunStatus::Draining) {
-        let outcome = prompt_parent(shared, sid, &saved, &workers).await;
-        notify(shared, sid, "draining", &outcome, &saved, &workers);
+        );
     }
 
     let live = live_workers(shared, sid);
@@ -239,7 +221,7 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
         sid,
         "draining",
         &format!(
-            "asking {} live worker(s) to commit, push and stop",
+            "interrupting {} live worker(s) to save state and stop",
             live.len()
         ),
         &saved,
@@ -260,6 +242,39 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
             workers.insert(work_id, status);
             notify(shared, sid, "draining", &message, &saved, &workers);
         }
+    }
+
+    notify(
+        shared,
+        sid,
+        "saving",
+        "saving the final recorded worker state",
+        &saved,
+        &workers,
+    );
+    let final_run = planner_workflow::load(shared, sid);
+    let result = match final_run {
+        Ok(Some(run)) => save_state(shared, sid, &run, prior, &cfg).await,
+        Ok(None) => Err("planner run disappeared".into()),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok((paths, summary)) => {
+            saved = paths;
+            notify(shared, sid, "saved", &summary, &saved, &workers);
+        }
+        Err(error) => notify(
+            shared,
+            sid,
+            "failed",
+            &format!("final resume save failed: {error}"),
+            &saved,
+            &workers,
+        ),
+    }
+    if matches!(prior, RunStatus::Running | RunStatus::Draining) {
+        let outcome = prompt_parent(shared, sid, &saved, &workers).await;
+        notify(shared, sid, "draining", &outcome, &saved, &workers);
     }
 
     let end = match prior {
@@ -304,7 +319,7 @@ async fn save_state(
     let Some(command) = &cfg.command else {
         return Ok((
             Vec::new(),
-            "no routers.planner.shutdown host is configured: nothing was saved".into(),
+            "native run state is persisted; no additional shutdown host is configured".into(),
         ));
     };
     let cwd = shared
@@ -345,7 +360,7 @@ async fn save_state(
     Ok((paths, summary))
 }
 
-/// Prompt the parent once, then wait for that turn, all within 10 minutes.
+/// One short final continuation update, with cancellation on timeout.
 async fn prompt_parent(
     shared: &Arc<Shared>,
     sid: &str,
@@ -359,7 +374,7 @@ async fn prompt_parent(
         tokio::select! {
             outcome = &mut prompt => return outcome,
             _ = heartbeat.tick() => notify(shared, sid, "draining",
-                "waiting for the parent's shutdown handoff; operator turns are allowed to finish", saved, workers),
+                "waiting for the parent's final continuation update", saved, workers),
         }
     }
 }
@@ -379,16 +394,25 @@ async fn prompt_parent_once(
             .into();
     }
     let started = Instant::now();
-    if crate::planner_preempt::router_turn_in_flight(shared, sid) {
+    if shared
+        .with_session(sid, |s| s.prompt_activity > 0)
+        .unwrap_or(false)
+    {
         notify(
             shared,
             sid,
             "draining",
-            "cancelling the router-owned parent turn for shutdown",
+            "interrupting the parent turn for shutdown",
             saved,
             workers,
         );
-        if !crate::planner_preempt::preempt(shared, sid).await {
+        if !tokio::time::timeout(
+            PARENT_TURN_LIMIT,
+            crate::planner_preempt::preempt(shared, sid),
+        )
+        .await
+        .unwrap_or(false)
+        {
             return "the router-owned parent turn did not stop within its cancellation bound; the saved resume state stands and workers drain anyway".into();
         }
     }
@@ -397,7 +421,7 @@ async fn prompt_parent_once(
             break activity;
         }
         if started.elapsed() >= PARENT_TURN_LIMIT {
-            return "the parent stayed busy for 10 minutes, so it was not prompted".into();
+            return "the parent did not settle within the shutdown bound; the saved state remains available".into();
         }
         tokio::time::sleep(POLL).await;
     };
@@ -423,78 +447,41 @@ async fn prompt_parent_once(
     );
     let task_shared = shared.clone();
     let task_sid = sid.to_string();
-    let turn = tokio::spawn(async move {
+    let mut turn = tokio::spawn(async move {
         let _activity = activity;
         crate::session::run_primary_turn(task_shared, task_sid, prompt, None).await
     });
     let remaining = PARENT_TURN_LIMIT.saturating_sub(started.elapsed());
-    match tokio::time::timeout(remaining, turn).await {
+    match tokio::time::timeout(remaining, &mut turn).await {
         Ok(Ok(Ok(_))) => "the parent recorded its resume point and ended its turn".into(),
         Ok(Ok(Err(error))) => format!("the parent's shutdown turn failed: {error}"),
         Ok(Err(error)) => format!("the parent's shutdown turn failed: {error}"),
-        Err(_) => "the parent's shutdown turn ran past 10 minutes; the workers drain anyway".into(),
+        Err(_) => {
+            if let Some((conn, down_sid, _)) = shared.pinned_route(sid) {
+                let _ = conn.send_notification(CancelNotification::new(down_sid));
+            }
+            turn.abort();
+            let _ = turn.await;
+            "the final parent update exceeded 30 seconds and was cancelled; the saved worker state remains available".into()
+        }
     }
 }
 
-fn open_delegate(shared: &Shared, sid: &str, work_id: &str, attempt_id: &str) -> Option<String> {
-    shared
-        .live_delegates
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(_, d)| {
-            d.parent_sid == sid
-                && d.planner
-                    .as_ref()
-                    .is_some_and(|p| p.work_id == work_id && p.attempt_id == attempt_id)
-        })
-        .map(|(id, _)| id.clone())
-}
-
-/// Works with a worker that can still act: a turn running, or an open
-/// sub-session for the current attempt.
+/// Only unfinished attempts need shutdown. An idle keep-open session is not work.
 fn live_workers(shared: &Shared, sid: &str) -> Vec<String> {
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {
         return Vec::new();
     };
     run.works
         .iter()
-        .filter(|(_, w)| {
-            !matches!(
-                w.status,
-                WorkStatus::Finished
-                    | WorkStatus::Integrated
-                    | WorkStatus::Blocked
-                    | WorkStatus::Watching
-            )
-        })
-        .filter(|(id, w)| {
-            w.attempt
-                .as_ref()
-                .is_some_and(|a| !a.ended || open_delegate(shared, sid, id, &a.id).is_some())
-        })
+        .filter(|(_, w)| w.attempt.as_ref().is_some_and(|a| !a.ended))
         .map(|(id, _)| id.clone())
         .collect()
 }
 
-fn set_pending(shared: &Shared, sid: &str, work_id: &str, pending: bool) -> bool {
-    with_runtime(shared, sid, |rt| {
-        let Some(drain) = rt.drain.as_mut() else {
-            return false;
-        };
-        let injected = drain.injected.contains(work_id);
-        if pending && !injected {
-            drain.pending.insert(work_id.to_string());
-        } else {
-            drain.pending.remove(work_id);
-        }
-        injected
-    })
-}
-
-/// Stop one worker: a mid-turn worker receives a named queued notice, with
-/// [`WORKER_PROMPT`] at its turn end as fallback; an idle open sub-session gets it as a
-/// follow-up turn. Each update goes to `tx`; past `bound` it is cancelled.
+/// Interrupt one existing worker. Never create a delegate or restart an ended attempt.
+/// Steering lets the active child save its state; an adapter which cannot steer is
+/// cancelled, preserving the state already recorded throughout the attempt.
 async fn drain_worker(
     shared: &Arc<Shared>,
     sid: &str,
@@ -503,13 +490,13 @@ async fn drain_worker(
     tx: tokio::sync::mpsc::UnboundedSender<(String, String)>,
 ) {
     let deadline = Instant::now() + bound;
-    let mut notice_queued = false;
+    let mut notified = false;
     let send = |status: &str| {
         let _ = tx.send((work_id.clone(), status.to_string()));
     };
     loop {
         if Instant::now() >= deadline {
-            cancel_worker(shared, sid, &work_id);
+            cancel_worker(shared, sid, &work_id).await;
             send("cancelled");
             return;
         }
@@ -522,94 +509,46 @@ async fn drain_worker(
             return;
         };
         if !attempt.ended {
-            if !notice_queued {
-                let job_id = shared
-                    .background_delegates
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(_, job)| {
-                        job.parent_sid == sid
-                            && job.result.is_none()
-                            && job.claim.as_ref().is_some_and(|claim| {
-                                claim.work_id == work_id && claim.attempt_id == attempt.id
-                            })
-                    })
-                    .map(|(id, _)| id.clone());
-                if let Some(delegate_id) = job_id {
-                    notice_queued = matches!(
-                        crate::delegate_mcp::queue_running_background_followup(
-                            shared,
-                            sid,
-                            &crate::delegate_mcp::DelegateFollowupArgs {
-                                delegate_id,
-                                message: WORKER_PROMPT.into(),
-                                ..Default::default()
-                            }
-                        ),
-                        Some(Ok(_))
-                    );
+            if !notified {
+                let route = with_runtime(shared, sid, |rt| rt.children.get(&work_id).cloned());
+                if let Some((process, child)) = route {
+                    let delivered = if let Some(conn) = shared.target_conn(&process) {
+                        let request = agent_client_protocol::UntypedMessage::new(
+                            "_session/steering",
+                            json!({"sessionId":child,"prompt":[ContentBlock::from(WORKER_PROMPT)],
+                                "_meta":{"steering":{"idleBehavior":"promptRequired"}}}),
+                        )
+                        .expect("shutdown steering serializes");
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        matches!(tokio::time::timeout(remaining.min(Duration::from_secs(3)),
+                            conn.send_request(request).block_task()).await,
+                            Ok(Ok(reply)) if reply["outcome"] == "injected")
+                    } else {
+                        false
+                    };
+                    if !delivered {
+                        cancel_worker(shared, sid, &work_id).await;
+                        send("cancelled");
+                        return;
+                    }
+                    notified = true;
                 }
             }
-            let injected = set_pending(shared, sid, &work_id, true);
-            send(if injected {
-                "notified"
-            } else if notice_queued {
-                "notice-queued"
-            } else {
-                "running"
-            });
+            send(if notified { "notified" } else { "running" });
             tokio::time::sleep(POLL).await;
             continue;
         }
-        if set_pending(shared, sid, &work_id, false) {
-            // It took the shutdown message and its turn has ended.
-            send("stopped");
-            return;
-        }
-        let Some(delegate_id) = open_delegate(shared, sid, &work_id, &attempt.id) else {
-            send("stopped");
-            return;
-        };
-        send("notified");
-        let task_shared = shared.clone();
-        let task_sid = sid.to_string();
-        let followup = tokio::spawn(async move {
-            crate::delegate_mcp::run_delegate_followup(
-                &task_shared,
-                &task_sid,
-                crate::delegate_mcp::DelegateFollowupArgs {
-                    delegate_id,
-                    message: WORKER_PROMPT.to_string(),
-                    ..Default::default()
-                },
-            )
-            .await
-        });
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, followup).await {
-            Ok(result) => {
-                if let Ok(Err(error)) = result {
-                    tracing::warn!(session = sid, work_id, %error, "shutdown follow-up refused; the worker is idle");
-                }
-                send("stopped");
-            }
-            Err(_) => {
-                cancel_worker(shared, sid, &work_id);
-                send("cancelled");
-            }
-        }
+        send("stopped");
         return;
     }
 }
 
 /// Cancel a worker past its drain bound: its running turn, then any open
 /// sub-session it holds.
-fn cancel_worker(shared: &Arc<Shared>, sid: &str, work_id: &str) {
+async fn cancel_worker(shared: &Arc<Shared>, sid: &str, work_id: &str) {
     let child = with_runtime(shared, sid, |rt| {
         if let Some(drain) = rt.drain.as_mut() {
             drain.cancelled.insert(work_id.to_string());
-            drain.pending.remove(work_id);
         }
         rt.children.get(work_id).cloned()
     });
@@ -635,9 +574,18 @@ fn cancel_worker(shared: &Arc<Shared>, sid: &str, work_id: &str) {
             crate::delegate_mcp::DelegateCloseArgs { delegate_id },
         );
     }
+    // Let the cancelled turn persist its end before the final host snapshot.
+    // A stuck adapter cannot hold the whole shutdown; its native attempt then
+    // remains visibly unfinished for adoption instead of being fabricated done.
+    let settle = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < settle
+        && with_runtime(shared, sid, |rt| rt.children.contains_key(work_id))
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     tracing::warn!(
         session = sid,
         work_id,
-        "planner worker cancelled after its shutdown drain bound"
+        "planner worker received shutdown cancellation; recorded attempt state retained"
     );
 }

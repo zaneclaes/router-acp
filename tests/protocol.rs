@@ -15777,12 +15777,8 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
 
             tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
-                    let queued = {
-                        let store = shared.state.lock().unwrap();
-                        store.all().into_iter().filter(|(_, row)| row.parent_session_id.as_deref() == Some(&sid))
-                            .any(|(child, _)| router_acp::session_input::list(&store, &child).unwrap().iter()
-                                .any(|input| input.origin == "agent"))
-                    };
+                    let queued = read_log(&log).iter().any(|event| event["event"] == "steer"
+                        && event["params"].to_string().contains("Shutdown requested: interrupt"));
                     if queued { break; }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -15806,14 +15802,17 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             .await;
             assert!(paused.is_ok(), "the drain never paused the run");
             wait_for_mock_prompt(&log, "Shutdown requested by the operator").await;
-            wait_for_mock_prompt(&log, "Shutdown requested: commit and push your branch now").await;
+            assert!(mock_prompts(&log, "Shutdown requested: interrupt").is_empty(),
+                "a shutdown interrupt must not start another child turn");
             let progress = router_acp::planner_shutdown::progress(&shared, &sid);
             let phases = progress
                 .iter()
                 .map(|p| p["phase"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>();
-            assert_eq!(phases.first().map(String::as_str), Some("saving"));
-            assert_eq!(phases.get(1).map(String::as_str), Some("saved"));
+            let saving = phases.iter().position(|p| p == "saving").unwrap();
+            assert_eq!(progress[saving]["workersStopped"], 1,
+                "the final snapshot follows the live child's stop");
+            assert_eq!(phases.get(saving + 1).map(String::as_str), Some("saved"));
             assert_eq!(phases.last().map(String::as_str), Some("drained"));
             let done = progress.last().unwrap();
             assert_eq!(

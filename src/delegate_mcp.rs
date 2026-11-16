@@ -2511,12 +2511,11 @@ async fn gate_turns(
         ) {
             return Ok(resp);
         }
-        let shutdown = gate.planner.and_then(|identity| {
-            crate::planner_shutdown::take_injection(shared, gate.parent_sid, &identity.work_id)
-        });
-        let message = match (shutdown, host) {
-            (Some(message), _) => message,
-            (None, Some((hook, event))) => {
+        if crate::planner_shutdown::draining(shared, gate.parent_sid) {
+            return Ok(resp);
+        }
+        let message = match host {
+            Some((hook, event)) => {
                 let text = gate.capture.lock().unwrap().clone();
                 let handoff = shared
                     .worker_handoffs
@@ -2585,7 +2584,7 @@ async fn gate_turns(
                     }
                 }
             }
-            (None, None) => return Ok(resp),
+            None => return Ok(resp),
         };
         continued += 1;
         *turns += 1;

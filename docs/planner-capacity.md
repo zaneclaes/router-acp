@@ -261,7 +261,7 @@ routers:
       command: planner-shutdown-host    # optional: without it nothing is saved
       args: []
       timeout_ms: 120000                # default 120000
-      drain_timeout_secs: 900           # default 900
+      drain_timeout_secs: 20            # default 20, save state only
 ```
 
 Every block is optional. Without `audit`, the gate below still enforces
@@ -362,26 +362,26 @@ notification `_router/shutdown_progress` with
    auto-admission, worker resumption, in-flight wakes and the turn-end gate
    all stop. Workers and the parent can still record artifacts, reviews,
    receipts and dispositions.
-2. `saving`, then the shutdown host gets
+2. Interrupt every unfinished worker attempt concurrently with a request to save its
+   current state and exact resume point, including uncommitted or unpushed changes,
+   then stop. Ended attempts (including idle keep-open sessions) are already recorded:
+   they are never resumed or given follow-up turns. The interrupt uses live steering;
+   an adapter that declines it is cancelled with recorded state preserved. Each active
+   worker has `drain_timeout_secs` (default 20) to stop. No commits, pushes or CI waits.
+3. After the children stop, `saving`, then the shutdown host gets
    `{"event":"shutdown","session_id","cwd","run_status","works","holds"}`
    (`run_status` is the status before the drain) and answers
    `{"saved":[paths],"summary":"…"}`: `saved` carries the paths, with the
    summary as its message. A failure is reported as `failed` with the error,
    and the drain goes on.
-3. The parent, if loaded, is prompted once: "Shutdown requested by the
-   operator: rewrite Docs/CONTINUE.md and your registers now with the exact
-   resume point; admit nothing; end your turn." The router waits for that
-   turn, at most 10 minutes in all. A busy router-owned turn is cancelled through
-   the same preemption path as operator input, then the shutdown prompt runs.
-   Only an operator turn is allowed to finish naturally. While waiting for either
-   cancellation, an operator turn or the shutdown turn, `shutdown_progress`
-   reports progress every 30 seconds.
-4. Every live worker (a turn running, or an open sub-session) is told:
-   "Shutdown requested: commit and push your branch now, record your status
-   notes and exact resume point, then hand off `waiting` with that resume
-   point and stop." A mid-turn worker gets it at its turn end; an idle one as
-   a follow-up turn. Each gets `drain_timeout_secs` to stop and is then
-   cancelled. `draining` reports every change.
+   The host should only save recorded state, without fresh audits or network work.
+4. The parent, if loaded, updates its configured continuation (default
+   `Docs/CONTINUE.md`) from the final recorded state in one brief turn. It must not
+   start children, audit, build, commit, push or wait for CI. An existing parent turn
+   is interrupted first. The final update has a 30-second bound; on timeout the router
+   cancels the downstream turn and aborts its task, preserving the saved checkpoint.
+   An idle run should normally shut down in under 30 seconds; an unresponsive adapter
+   or host is reported explicitly rather than silently starting more work.
 5. The run becomes `paused` (`drained`); the next `implement` command resumes
    it.
 

@@ -8308,7 +8308,10 @@ async fn a_planner_child_may_keep_continuing_until_its_run_or_attempt_stops() {
     let may = || router_acp::planner_guard::child_may_continue(shared, SID, &identity);
     assert!(may());
     set_status(shared, RunStatus::Draining);
-    assert!(may(), "a drain lets a worker finish committing and pushing");
+    assert!(
+        !may(),
+        "a drain saves the existing turn; it must not launch another continuation"
+    );
     set_status(shared, RunStatus::Paused);
     assert!(!may());
     set_status(shared, RunStatus::Running);
@@ -9046,7 +9049,7 @@ async fn run_reaches(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds() {
+async fn shutdown_interrupts_an_operator_turn_instead_of_waiting_for_it() {
     let f = fixture(|_| {});
     authorize(&f.shared);
     pin_parent(&f.shared);
@@ -9058,18 +9061,18 @@ async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds(
             .filter(|p| {
                 p["message"]
                     .as_str()
-                    .is_some_and(|m| m.contains("waiting for the parent's shutdown handoff"))
+                    .is_some_and(|m| m.contains("interrupting the parent turn"))
             })
             .count()
     };
-    tokio::time::timeout(std::time::Duration::from_secs(33), async {
-        while waiting() < 2 {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while waiting() < 1 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("shutdown remains visible while an operator turn is busy");
-    assert!(!router_acp::planner_preempt::preempted(&f.shared, SID));
+    .expect("shutdown interrupts an existing parent turn immediately");
+    assert!(router_acp::planner_preempt::preempted(&f.shared, SID));
     assert!(
         !router_acp::planner_shutdown::progress(&f.shared, SID)
             .iter()
@@ -9079,6 +9082,35 @@ async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds(
     );
     f.shared.with_session(SID, |s| s.prompt_activity = 0);
     run_reaches(&f.shared, RunStatus::Paused).await;
+}
+
+#[tokio::test]
+async fn shutdown_with_only_ended_attempts_never_restarts_them() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("already-recorded"));
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "already-recorded")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(shared, SID, &identity, None, "waiting for CI".into(), false)
+        .unwrap();
+    let before =
+        planner_workflow::load(shared, SID).unwrap().unwrap().works["already-recorded"].clone();
+    router_acp::planner_shutdown::request(shared, &json!({"sessionId":SID})).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_reaches(shared, RunStatus::Paused),
+    )
+    .await
+    .expect("zero live children must not wait for a drain timeout");
+    let after =
+        planner_workflow::load(shared, SID).unwrap().unwrap().works["already-recorded"].clone();
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+    let updates = router_acp::planner_shutdown::progress(shared, SID);
+    assert!(updates.iter().all(|p| p["workersTotal"] == 0));
 }
 
 #[tokio::test]
@@ -9105,8 +9137,8 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     planner_workflow::begin_work(shared, SID, "work-1")
         .await
         .unwrap();
-    // work-2 is idle on an open sub-session: it gets the shutdown follow-up
-    // (which fails at once here: its agent process is gone).
+    // work-2 is idle on an open sub-session: its state is already recorded;
+    // shutdown must not start a follow-up or alter its attempt.
     let (second, _, _, _) = planner_workflow::begin_work(shared, SID, "work-2")
         .await
         .unwrap();
@@ -9143,6 +9175,10 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     let reply = planner_shutdown::request(shared, &json!({"sessionId": SID})).unwrap();
     assert_eq!(reply, json!({"accepted":true}));
     run_reaches(shared, RunStatus::Draining).await;
+    assert!(
+        planner_workflow::begin_followup(shared, SID, &second).is_err(),
+        "even an explicit follow-up cannot revive an idle child during shutdown"
+    );
     assert_eq!(
         planner_shutdown::request(shared, &json!({"sessionId": SID})).unwrap(),
         json!({"accepted":true}),
@@ -9198,35 +9234,43 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
         .iter()
         .map(|p| p["phase"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(phases[..2], ["saving", "saved"], "{phases:?}");
+    let save_index = phases.iter().position(|p| *p == "saving").unwrap();
+    assert!(save_index > 0, "children stop before saving: {phases:?}");
+    assert_eq!(phases[save_index + 1], "saved");
     assert_eq!(*phases.last().unwrap(), "drained", "{phases:?}");
-    assert!(phases[2..phases.len() - 1].iter().all(|p| *p == "draining"));
     assert_eq!(
-        progress[1]["saved"],
+        progress[save_index + 1]["saved"],
         json!([
             "Docs/Plans/data/implementation/resume.md",
             ".scratch/router-host/shutdown/x.json"
         ])
     );
     assert_eq!(
-        progress[1]["message"],
+        progress[save_index + 1]["message"],
         "3 works, 1 with unpushed or uncommitted source"
     );
     assert!(
-        progress[2]["message"]
+        progress[save_index + 2]["message"]
             .as_str()
             .unwrap()
             .contains("not loaded"),
         "an unloaded parent is not prompted: {}",
-        progress[2]
+        progress[save_index + 2]
     );
     let done = progress.last().unwrap();
-    assert_eq!(done["workersTotal"], 2);
-    assert_eq!(done["workersStopped"], 2);
+    assert_eq!(done["workersTotal"], 1);
+    assert_eq!(done["workersStopped"], 1);
     assert_eq!(
         done["workers"],
-        json!([{"workId":"work-1","status":"cancelled"},{"workId":"work-2","status":"stopped"}])
+        json!([{"workId":"work-1","status":"cancelled"}])
     );
+    let idle = planner_workflow::load(shared, SID).unwrap().unwrap().works["work-2"]
+        .attempt
+        .clone()
+        .unwrap();
+    assert_eq!(idle.id, second.attempt_id);
+    assert!(idle.ended);
+    assert_eq!(shared.live_delegates.lock().unwrap()["d-2"].turns, 1);
     let asked: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
     assert_eq!(asked["event"], "shutdown");
@@ -9261,13 +9305,8 @@ async fn a_failed_resume_save_is_reported_and_the_drain_still_finishes() {
     router_acp::planner_shutdown::request(shared, &json!({"sessionId": SID})).unwrap();
     run_reaches(shared, RunStatus::Paused).await;
     let progress = router_acp::planner_shutdown::progress(shared, SID);
-    assert_eq!(progress[1]["phase"], "failed");
-    assert!(
-        progress[1]["message"]
-            .as_str()
-            .unwrap()
-            .contains("disk full")
-    );
+    let failed = progress.iter().find(|p| p["phase"] == "failed").unwrap();
+    assert!(failed["message"].as_str().unwrap().contains("disk full"));
     assert_eq!(progress.last().unwrap()["phase"], "drained");
 }
 

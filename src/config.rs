@@ -1679,7 +1679,7 @@ pub struct PlannerShutdownConfig {
     pub args: Vec<String>,
     #[serde(default = "default_planner_host_slow_timeout_ms")]
     pub timeout_ms: u64,
-    /// How long one live worker gets to commit, push and stop before it is
+    /// How long one live worker gets to save its state and stop before it is
     /// cancelled.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
@@ -1705,7 +1705,7 @@ fn default_audit_interval_secs() -> u64 {
 }
 
 fn default_drain_timeout_secs() -> u64 {
-    900
+    20
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

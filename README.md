@@ -654,9 +654,12 @@ worker and its current attempt. The reply confirms queuing, not delivery; it doe
 second prompt or cancel an in-flight tool. Foreign parents, stale planner attempts and jobs
 without a unique linked child are refused. Original planner `input_ids` still use the normal
 owner follow-up at a turn boundary and are never silently consumed by this route.
-Graceful planner shutdown uses the same route to notify a busy background worker during
-its turn. A turn-boundary shutdown prompt remains the fallback if steering is declined;
-the existing drain deadline and saved-state procedure remain in effect.
+Planner shutdown interrupts only active children to save state, then saves the final
+checkpoint and asks the parent for one brief continuation update. Ended attempts and idle
+keep-open sessions never receive shutdown prompts. An adapter that declines the interrupt
+is cancelled with its already recorded state preserved. Shutdown never asks for commits,
+pushes, builds or audits. The default child grace is 20 seconds; the parent's final update
+is bounded at 30 seconds and is cancelled if it overruns.
 
 ### Host-directed workers
 
