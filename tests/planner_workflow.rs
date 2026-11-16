@@ -216,6 +216,43 @@ async fn status_execution_context_is_unpaginated_and_requires_human_admission() 
 }
 
 #[test]
+fn audit_dependency_readiness_follows_the_native_dependency_gate() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    admit(&f.shared, work("base"));
+    let mut dependent = work("dependent");
+    dependent.dependencies = vec!["base".into()];
+    admit(&f.shared, dependent);
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let ready = |run: &planner_workflow::PlannerRun, id: &str| {
+        router_acp::planner_guard::works_json(run)
+            .into_iter()
+            .find(|row| row["work_id"] == id)
+            .unwrap()["dependencies_ready"]
+            .as_bool()
+    };
+    assert_eq!(ready(&run, "base"), Some(true));
+    assert_eq!(ready(&run, "dependent"), Some(false));
+    run.works.get_mut("base").unwrap().status = WorkStatus::Integrated;
+    run.works
+        .get_mut("dependent")
+        .unwrap()
+        .reconciliation
+        .required = true;
+    assert_eq!(
+        ready(&run, "dependent"),
+        Some(true),
+        "reconciliation is a separate prerequisite"
+    );
+    run.works.remove("base");
+    assert_eq!(
+        ready(&run, "dependent"),
+        Some(false),
+        "a missing dependency cannot enable dispatch"
+    );
+}
+
+#[test]
 fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
     let f = fixture(|_| {});
     authorize(&f.shared);

@@ -353,6 +353,9 @@ pub fn works_json(run: &PlannerRun) -> Vec<Value> {
                 // A host that tells the parent to dispatch a work must know it
                 // first needs the parent's `reconcile`.
                 "reconciliation_required":w.reconciliation.required,
+                // A dependency wait is not idle capacity the parent can refill.
+                // Reuse the dispatch gate, including exact accepted-source dependencies.
+                "dependencies_ready":planner_workflow::dependencies_ready(run, w).is_ok(),
                 "waiting_build_revision":planner_capacity::waiting_on_build(run, w, now)
                     .then(|| &run.observations[&format!("ci:{id}")].revision),
                 "revision":w.artifact.as_ref().map(|a| &a.revision)})

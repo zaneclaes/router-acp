@@ -269,6 +269,12 @@ capacity candidates, and holds and completion are not audited.
 
 ## Audit
 
+Host work rows include `dependencies_ready`, evaluated by the same dependency gate as
+dispatch, including integrated dependencies and exact accepted-source dependencies. This
+is separate from `reconciliation_required`: a parent can reconcile a work but cannot
+dispatch it until its dependencies are ready. Hosts should not report dependency waits
+as idle workers needing dispatch. Missing evidence from an older router is unknown.
+
 The capacity tick sends, at most every `interval_secs` and again after every
 parent turn end, whatever the free slots:
 
