@@ -426,7 +426,9 @@ fn followup_tool_definition() -> Value {
         "name": DELEGATE_FOLLOWUP_TOOL_NAME,
         "description": "Send a follow-up instruction to a sub-agent previously started with \
              delegate_task(keep_open=true), preserving that sub-session's context. Use for \
-             review→fix→re-review loops. Returns the sub-agent's reply.",
+             review→fix→re-review loops. Returns the sub-agent's reply. A running b-… job id \
+             instead queues a named parent correction for its existing worker; the receipt \
+             confirms queuing, not delivery, and no second worker is started.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1117,6 +1119,9 @@ pub(crate) fn start_background_followup(
     router_sid: &str,
     args: DelegateFollowupArgs,
 ) -> Result<String, String> {
+    if let Some(result) = queue_running_background_followup(shared, router_sid, &args) {
+        return result;
+    }
     let job_id = format!("b-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let summary = format!("follow-up to {}: {}", args.delegate_id, args.message);
     let (planner, claim) = {
@@ -3148,6 +3153,101 @@ fn pending_without_session(
     format!("delegate {id} — pending ({seconds}s): {summary}\n{stage}")
 }
 
+// A running background id is already a known worker, although its keep-open
+// delegate id does not exist until its turn ends. Use the existing durable
+// session-input delivery path; never start another prompt or planner attempt.
+fn queue_running_background_followup(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    args: &DelegateFollowupArgs,
+) -> Option<Result<String, String>> {
+    let (claim, resume_of) = {
+        let jobs = shared.background_delegates.lock().unwrap();
+        let job = jobs.get(&args.delegate_id)?;
+        if job.parent_sid != router_sid {
+            return Some(Err("delegate_id does not belong to this session".into()));
+        }
+        if job.result.is_some() {
+            return None;
+        }
+        (job.claim.clone(), job.resume_of.clone())
+    };
+    Some((|| {
+        if !args.input_ids.is_empty() {
+            return Err("durable planner input receipts require the normal owner follow-up at its turn boundary; no input_ids were consumed".into());
+        }
+        if let Some(claim) = &claim {
+            let run = crate::planner_workflow::load(shared, router_sid)?;
+            let current = run
+                .as_ref()
+                .and_then(|run| run.works.get(&claim.work_id))
+                .and_then(|work| work.attempt.as_ref());
+            if !current.is_some_and(|attempt| attempt.id == claim.attempt_id && !attempt.ended) {
+                return Err(
+                    "background job no longer owns the live planner attempt; no correction queued"
+                        .into(),
+                );
+            }
+        }
+        let live_sub = resume_of.as_ref().and_then(|id| {
+            shared
+                .live_delegates
+                .lock()
+                .unwrap()
+                .get(id)
+                .filter(|delegate| delegate.parent_sid == router_sid)
+                .map(|delegate| delegate.sub_sid.clone())
+        });
+        let active_sessions = shared
+            .with_session(router_sid, |session| {
+                session
+                    .delegates
+                    .iter()
+                    .map(|delegate| delegate.downstream_sid.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let state = shared.state.lock().unwrap();
+        let children: Vec<_> = state
+            .all()
+            .into_iter()
+            .filter(|(sid, row)| {
+                row.parent_session_id.as_deref() == Some(router_sid)
+                    && active_sessions.contains(&row.downstream_session_id)
+                    && (live_sub.as_deref() == Some(sid.as_str())
+                        || row.routing.as_ref().is_some_and(|routing| {
+                            routing["background_id"].as_str() == Some(args.delegate_id.as_str())
+                                || routing["worker_id"].as_str() == Some(args.delegate_id.as_str())
+                        }))
+                    && claim.as_ref().is_none_or(|claim| {
+                        row.routing.as_ref().is_some_and(|routing| {
+                            routing["worker_id"].as_str() == Some(claim.child_id.as_str())
+                        })
+                    })
+            })
+            .collect();
+        if children.len() != 1 {
+            return Err("running background job has no unique linked child session; no correction queued and no second worker started".into());
+        }
+        let (child, row) = &children[0];
+        let id = format!("followup:{}", uuid::Uuid::new_v4().simple());
+        let sender = format!("parent session {router_sid}");
+        crate::session_input::send_from(
+            &state,
+            child,
+            &row.cwd,
+            &id,
+            &args.message,
+            Some(&sender),
+            false,
+        )?;
+        Ok(format!(
+            "Queued correction {id} for running delegate {} in {child}. Delivery is pending through session input; its existing worker continues.",
+            args.delegate_id
+        ))
+    })())
+}
+
 /// Send a follow-up instruction to a delegate sub-session kept alive by an
 /// earlier `delegate_task(keep_open=true)`, preserving that sub-agent's context.
 pub async fn run_delegate_followup(
@@ -3155,6 +3255,9 @@ pub async fn run_delegate_followup(
     router_sid: &str,
     args: DelegateFollowupArgs,
 ) -> Result<String, String> {
+    if let Some(result) = queue_running_background_followup(shared, router_sid, &args) {
+        return result;
+    }
     let planner = shared
         .live_delegates
         .lock()

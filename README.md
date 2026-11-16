@@ -644,6 +644,13 @@ wakes and are never held in `delegate_await`, but a completed background failure
 collected and records a parent wake. `delegate_result` also reports failed or queued jobs
 before a child session exists. A queued job is not proof that a worker is making progress.
 
+`delegate_followup` also accepts a running `b-…` job id. It queues an agent-origin correction
+named for the owning parent through the existing session-input delivery path, preserving the
+worker and its current attempt. The reply confirms queuing, not delivery; it does not start a
+second prompt or cancel an in-flight tool. Foreign parents, stale planner attempts and jobs
+without a unique linked child are refused. Original planner `input_ids` still use the normal
+owner follow-up at a turn boundary and are never silently consumed by this route.
+
 ### Host-directed workers
 
 Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:

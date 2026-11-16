@@ -3870,6 +3870,152 @@ fn unlinked_background_job_names_a_claim_missing_from_the_run() {
     );
 }
 
+#[tokio::test]
+async fn running_background_followup_queues_named_input_without_a_second_worker() {
+    use router_acp::delegate_mcp::{DelegateFollowupArgs, run_delegate_followup};
+    let f = fixture(|_| {});
+    admit(&f.shared, work("design-jam"));
+    let (identity, _, child_id, _) = planner_workflow::begin_work(&f.shared, SID, "design-jam")
+        .await
+        .unwrap();
+    let child = format!("{SID}::delegate-running");
+    f.shared.with_session(SID, |session| {
+        session.delegates.push(router_acp::session::DelegateHandle {
+            process_key: router_acp::downstream::ProcessKey("live-process".into()),
+            downstream_sid: "down-running".into(),
+        })
+    });
+    f.shared.state.lock().unwrap().upsert(
+        format!("{SID}::delegate-old"),
+        PersistedSession {
+            agent: "test".into(),
+            model: "model".into(),
+            downstream_session_id: "down-old".into(),
+            cwd: f.repo.clone(),
+            kind: "delegate".into(),
+            parent_session_id: Some(SID.into()),
+            routing: Some(json!({"worker_id": child_id, "background_id": "b-running"})),
+            ..PersistedSession::default()
+        },
+    );
+    f.shared.state.lock().unwrap().upsert(
+        child.clone(),
+        PersistedSession {
+            agent: "test".into(),
+            model: "model".into(),
+            downstream_session_id: "down-running".into(),
+            cwd: f.repo.clone(),
+            kind: "delegate".into(),
+            parent_session_id: Some(SID.into()),
+            routing: Some(json!({"worker_id": child_id, "background_id": "b-running"})),
+            ..PersistedSession::default()
+        },
+    );
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-running".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "repair".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+            claim: Some(router_acp::session::PlannerJobClaim {
+                work_id: identity.work_id.clone(),
+                attempt_id: identity.attempt_id.clone(),
+                child_id,
+            }),
+            resume_of: None,
+        },
+    );
+    let args = || DelegateFollowupArgs {
+        delegate_id: "b-running".into(),
+        message: "Inspect the failed required job.".into(),
+        ..DelegateFollowupArgs::default()
+    };
+    let response = run_delegate_followup(&f.shared, SID, args()).await.unwrap();
+    assert!(
+        response.contains("Queued") && response.contains(&child),
+        "{response}"
+    );
+    let response = run_delegate_followup(&f.shared, SID, args()).await.unwrap();
+    assert!(response.contains("Queued"), "{response}");
+    assert_eq!(f.shared.background_delegates.lock().unwrap().len(), 1);
+    let inputs = router_acp::session_input::list(&f.shared.state.lock().unwrap(), &child).unwrap();
+    assert_eq!(inputs.len(), 2);
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input.queued && !input.delivered && input.origin == "agent")
+    );
+    for input in &inputs {
+        let (_, value) = f
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .session_input(&child, &input.input_id)
+            .unwrap()
+            .unwrap();
+        let input: router_acp::session_input::SessionInput = serde_json::from_value(value).unwrap();
+        assert_eq!(input.sender, Some(format!("parent session {SID}")));
+        assert_eq!(input.text, "Inspect the failed required job.");
+        assert!(!input.interrupt);
+    }
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let attempt = run.works["design-jam"].attempt.as_ref().unwrap();
+    assert_eq!(attempt.id, identity.attempt_id);
+    assert!(!attempt.ended);
+    assert!(
+        run_delegate_followup(&f.shared, "foreign-parent", args())
+            .await
+            .is_err()
+    );
+    let mut receipts = args();
+    receipts.input_ids = vec!["operator-original".into()];
+    assert!(
+        run_delegate_followup(&f.shared, SID, receipts)
+            .await
+            .is_err()
+    );
+    f.shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .get_mut("b-running")
+        .unwrap()
+        .claim
+        .as_mut()
+        .unwrap()
+        .attempt_id = "stale-attempt".into();
+    assert!(run_delegate_followup(&f.shared, SID, args()).await.is_err());
+    assert_eq!(
+        router_acp::session_input::list(&f.shared.state.lock().unwrap(), &child)
+            .unwrap()
+            .len(),
+        2
+    );
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-unlinked".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "starting".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: false,
+            claim: None,
+            resume_of: None,
+        },
+    );
+    let mut unlinked = args();
+    unlinked.delegate_id = "b-unlinked".into();
+    assert!(
+        run_delegate_followup(&f.shared, SID, unlinked)
+            .await
+            .unwrap_err()
+            .contains("no unique linked child")
+    );
+}
+
 #[test]
 fn follow_up_background_job_reports_the_open_child_session() {
     let f = fixture(|_| {});
