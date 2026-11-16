@@ -263,6 +263,10 @@ pub struct CompletionRecord {
 pub struct Workspace {
     pub path: PathBuf,
     pub lease: String,
+    /// Trusted allocator's persisted contract. A matching resumed lease can
+    /// recover an omitted native field; it cannot change an explicit version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_contract_version: Option<u32>,
     /// Host allocator supplies per-child runtime context, never model prose.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
@@ -2751,6 +2755,7 @@ async fn begin_work_once(
             None => allocate_workspace(shared, sid, &snapshot, &run.policy).await?,
         };
         workspace_available(&workspace)?;
+        allocator_contract_recovery(&snapshot, &workspace)?;
         shared.state.lock().unwrap().claim_planner_workspace(
             &workspace.path,
             sid,
@@ -2783,12 +2788,17 @@ async fn begin_work_once(
         let suspended =
             run.status != RunStatus::Running || run.phase != PlannerPhase::Implementation;
         let work = run.works.get_mut(work_id).ok_or("assignment disappeared")?;
+        let recovered_contract = allocator_contract_recovery(work, &workspace)?;
         let attempt = work
             .attempt
             .as_mut()
             .ok_or("allocation attempt disappeared")?;
         if attempt.id != attempt_id {
             return Err("workspace allocation lost its ownership fence".into());
+        }
+        if let Some(version) = recovered_contract {
+            work.reconciliation.prior_specs.push(work.spec.clone());
+            work.spec.completion_contract_version = Some(version);
         }
         work.workspace = Some(workspace.clone());
         if suspended {
@@ -2862,7 +2872,8 @@ async fn allocate_workspace(
             .spawn()
             .map_err(|e| format!("workspace allocator failed to start: {e}"))?;
         let mut stdin = child.stdin.take().ok_or("allocator stdin missing")?;
-        stdin.write_all(json!({"event":"planner_allocate","session_id":sid,"work":work.spec,"child_id":work.child_id}).to_string().as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.write_all(json!({"event":"planner_allocate","session_id":sid,"work":work.spec,"child_id":work.child_id,
+            "completion_contract_recovery":true}).to_string().as_bytes()).await.map_err(|e| e.to_string())?;
         drop(stdin);
         let output = tokio::time::timeout(
             std::time::Duration::from_millis(allocator.timeout_ms),
@@ -2918,6 +2929,7 @@ async fn allocate_workspace(
         Workspace {
             path,
             lease: work.child_id.clone(),
+            completion_contract_version: None,
             environment: BTreeMap::new(),
             mcp_servers: Vec::new(),
         }
@@ -2935,9 +2947,31 @@ async fn allocate_workspace(
     Ok(Workspace {
         path,
         lease: workspace.lease,
+        completion_contract_version: workspace.completion_contract_version,
         environment: workspace.environment,
         mcp_servers: workspace.mcp_servers,
     })
+}
+
+fn allocator_contract_recovery(work: &Work, workspace: &Workspace) -> Result<Option<u32>, String> {
+    let Some(version) = workspace.completion_contract_version else {
+        return Ok(None);
+    };
+    if !matches!(version, 1 | 2) {
+        return Err("allocator returned an unsupported completion contract version".into());
+    }
+    if work.spec.completion_contract_version.unwrap_or(1) == version {
+        return Ok(None);
+    }
+    if work.spec.completion_contract_version.is_none()
+        && version == 2
+        && work.workspace.as_ref().is_some_and(|previous| {
+            previous.path == workspace.path && previous.lease == workspace.lease
+        })
+    {
+        return Ok(Some(2));
+    }
+    Err("allocator cannot change an explicit completion contract or recover it without the same existing lease".into())
 }
 
 /// Keep the handoff a planner worker just recorded on its own attempt, so the

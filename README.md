@@ -1241,6 +1241,13 @@ Planner Resume also restores the durable phase, coordinator role, and assignment
 Adopted unfinished assignments require scope/source reconciliation before dispatch.
 That fence applies to each affected assignment: independent capacity checks and
 release reminders continue under the normal ownership and dependency gates.
+An allocator can return its persisted `completion_contract_version`. On refresh of
+the same recorded workspace and lease, version 2 recovers an omitted native field
+and preserves the prior assignment in reconciliation history. Explicit versions,
+new allocations and different leases cannot be migrated this way. The allocation
+request advertises `completion_contract_recovery: true` so hosts do not enable this
+recovery for older routers that ignore the receipt. Ordinary readmission and
+reconciliation still cannot change the admitted version.
 See [durable planner progress](docs/planner-throughput.md).
 An `implement` command that overlaps a previous router's drain records a pending
 handoff. The ordinary capacity cycle retries after owner exit before new work can

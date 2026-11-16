@@ -2349,18 +2349,19 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
             .success()
     );
     let receipt = tmp.path().join("workspace.json");
-    let write_receipt = |lease: &str, cache: &str| {
+    let write_receipt = |lease: &str, cache: &str, version: Option<u32>| {
         std::fs::write(
             &receipt,
             serde_json::to_vec(&json!({
                 "path": workspace, "lease": lease,
-                "environment": {"CHORDZY_HOOK_CACHE": cache}
+                "environment": {"CHORDZY_HOOK_CACHE": cache},
+                "completion_contract_version": version
             }))
             .unwrap(),
         )
         .unwrap();
     };
-    write_receipt("stable", "/old/cache");
+    write_receipt("stable", "/old/cache", None);
     let shared = shared_for(&repo, &state_path, |cfg| {
         cfg.routers.planner.workspace = Some(PlannerWorkspaceConfig {
             command: "/bin/sh".into(),
@@ -2371,6 +2372,12 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         });
     });
     admit(&shared, work("work-1"));
+    write_receipt("stable", "/old/cache", Some(2));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(error.contains("without the same existing lease"), "{error}");
+    write_receipt("stable", "/old/cache", None);
     let first = planner_workflow::begin_work(&shared, SID, "work-1")
         .await
         .unwrap();
@@ -2382,7 +2389,7 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         planner_workflow::save(&shared, SID, &mut run).unwrap();
     };
     interrupt();
-    write_receipt("stable", "/physical/current/cache");
+    write_receipt("stable", "/physical/current/cache", Some(2));
     let second = planner_workflow::begin_work(&shared, SID, "work-1")
         .await
         .unwrap();
@@ -2392,8 +2399,66 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         "/physical/current/cache"
     );
     assert_eq!(first.1.lease, second.1.lease);
+    let recovered = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    assert_eq!(
+        recovered.works["work-1"].spec.completion_contract_version,
+        Some(2)
+    );
+    assert_eq!(
+        recovered.works["work-1"]
+            .reconciliation
+            .prior_specs
+            .last()
+            .unwrap()
+            .completion_contract_version,
+        None
+    );
     interrupt();
-    write_receipt("different-lease", "/physical/current/cache");
+    write_receipt("stable", "/physical/current/cache", Some(1));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("cannot change an explicit completion contract"),
+        "{error}"
+    );
+    assert_eq!(
+        planner_workflow::load(&shared, SID).unwrap().unwrap().works["work-1"]
+            .spec
+            .completion_contract_version,
+        Some(2)
+    );
+    let mut explicit_legacy = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    explicit_legacy
+        .works
+        .get_mut("work-1")
+        .unwrap()
+        .spec
+        .completion_contract_version = Some(1);
+    planner_workflow::save(&shared, SID, &mut explicit_legacy).unwrap();
+    write_receipt("stable", "/physical/current/cache", Some(2));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("cannot change an explicit completion contract"),
+        "{error}"
+    );
+    assert_eq!(
+        planner_workflow::load(&shared, SID).unwrap().unwrap().works["work-1"]
+            .spec
+            .completion_contract_version,
+        Some(1)
+    );
+    write_receipt("stable", "/physical/current/cache", Some(3));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("unsupported completion contract version"),
+        "{error}"
+    );
+    write_receipt("different-lease", "/physical/current/cache", Some(2));
     let error = planner_workflow::begin_work(&shared, SID, "work-1")
         .await
         .unwrap_err();
