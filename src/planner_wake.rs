@@ -477,12 +477,15 @@ pub(crate) fn preempt_allowed(
     now: std::time::Instant,
 ) -> bool {
     let since = |at: &std::time::Instant| now.saturating_duration_since(*at).as_secs();
-    if let Some((at, delivered_then)) = cancels.get(key) {
-        if deliveries > *delivered_then || since(at) < CANCEL_SAME_ITEM_SECS {
-            return false;
-        }
+    if let Some((at, delivered_then)) = cancels.get(key)
+        && (deliveries > *delivered_then || since(at) < CANCEL_SAME_ITEM_SECS)
+    {
+        return false;
     }
-    interrupt || !cancels.values().any(|(at, _)| since(at) < CANCEL_ANY_ITEM_SECS)
+    interrupt
+        || !cancels
+            .values()
+            .any(|(at, _)| since(at) < CANCEL_ANY_ITEM_SECS)
 }
 
 fn ownership_handoff(
@@ -1372,13 +1375,31 @@ mod steer_tests {
         cancels.insert(handoff.to_string(), (start, 0));
         // The loop that happened: the same undelivered item a minute later, and again.
         assert!(!preempt_allowed(&cancels, handoff, 0, false, after(60)));
-        assert!(!preempt_allowed(&cancels, handoff, 0, false, after(CANCEL_SAME_ITEM_SECS - 1)));
+        assert!(!preempt_allowed(
+            &cancels,
+            handoff,
+            0,
+            false,
+            after(CANCEL_SAME_ITEM_SECS - 1)
+        ));
         // Still undelivered after the window: one more cancel may help.
-        assert!(preempt_allowed(&cancels, handoff, 0, false, after(CANCEL_SAME_ITEM_SECS)));
+        assert!(preempt_allowed(
+            &cancels,
+            handoff,
+            0,
+            false,
+            after(CANCEL_SAME_ITEM_SECS)
+        ));
         // A second worker's handoff may not take over the cancelling at once.
         let other = "lead-magnets-receipt401:671e23df";
         assert!(!preempt_allowed(&cancels, other, 0, false, after(60)));
-        assert!(preempt_allowed(&cancels, other, 0, false, after(CANCEL_ANY_ITEM_SECS)));
+        assert!(preempt_allowed(
+            &cancels,
+            other,
+            0,
+            false,
+            after(CANCEL_ANY_ITEM_SECS)
+        ));
         // An interrupting input still cancels once, then waits like any item.
         let input = "input:monitor-fix";
         assert!(preempt_allowed(&cancels, input, 0, true, after(60)));

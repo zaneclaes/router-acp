@@ -2712,7 +2712,7 @@ impl Config {
             let Some(model) = CandidateId::parse(key).and_then(|id| self.model_config(&id)) else {
                 // A family shorthand pins one of that family's model ids.
                 let (scope, family) = match key.split_once('/') {
-                    Some((scope, family)) => (Some(scope), family.as_ref()),
+                    Some((scope, family)) => (Some(scope), family),
                     None => (None, key.as_str()),
                 };
                 let pins_a_member = self.agents.iter().any(|agent| {

@@ -4189,7 +4189,11 @@ async fn a_reconcile_wake_names_only_works_no_sibling_has_carried_on() {
     let last = parent_turn_ended(shared);
     tick(shared, last + 61).await;
     let wakes = wakes_with(shared, "capacity:");
-    assert_eq!(wakes.len(), 1, "the sole waiting work keeps the condition open");
+    assert_eq!(
+        wakes.len(),
+        1,
+        "the sole waiting work keeps the condition open"
+    );
     let reason = &wakes[0].1.reason;
     assert!(reason.contains("plan-b-sole"), "{reason}");
     assert!(
@@ -4219,7 +4223,10 @@ async fn a_reconcile_wake_names_only_works_no_sibling_has_carried_on() {
         ),
         "reconciliation"
     );
-    assert_eq!(start_refusal_reason("unmet dependencies: plan-b"), "dependency");
+    assert_eq!(
+        start_refusal_reason("unmet dependencies: plan-b"),
+        "dependency"
+    );
 }
 
 #[tokio::test]
@@ -9326,6 +9333,128 @@ fn assert_lossless_transfer(shared: &Arc<Shared>, into: &str, revision: &str) {
     assert!(old.works.is_empty() && old.releases.is_empty());
     assert!(old.capacity.holds.is_empty() && old.parent_queue.is_empty());
     assert!(old.wakes["ci:work-1"].acknowledged);
+}
+
+#[tokio::test]
+async fn adoption_recomputes_capacity_wakes_and_busy_parent_recovery() {
+    let mut dependent = candidate_json("dependent");
+    dependent["work"]["dependencies"] = json!(["admitted-later"]);
+    let reply = json!({"candidates": [
+        candidate_json("held"), dependent, candidate_json("independent")
+    ]});
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 3;
+        capacity_host(
+            cfg,
+            format!("cat >/dev/null; printf '%s' '{reply}'"),
+            1_000,
+            120,
+        );
+    });
+    let shared = &f.shared;
+    let revision = finished_work(shared).await;
+    admit(shared, work("admitted-later"));
+    seed_transferable_state(shared, &revision);
+    planner_workflow::mutate(shared, SID, |run| {
+        run.capacity.last_wake_at = 1;
+        run.capacity.unfilled_wakes = 5;
+        run.works
+            .get_mut("admitted-later")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        run.wakes.insert(
+            "capacity:old".into(),
+            planner_workflow::Wake {
+                reason: "capacity: stale inventory from the previous owner".into(),
+                work_id: SID.into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    pin_parent(shared);
+    let pin = shared.with_session(SID, |s| s.pin.clone()).unwrap();
+    receiving_run(shared, "next");
+    shared.with_session("next", |s| {
+        s.pin = pin;
+        s.prompt_activity = 1;
+    });
+    unload_parent(shared);
+    lease(shared, None, 0);
+    let start = quiet_after(shared);
+    router_acp::planner_adopt::adopt_at(shared.as_ref(), SID, "next", start).unwrap();
+    assert_lossless_transfer(shared, "next", &revision);
+    let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+    assert!(
+        run.wakes["capacity:old"].acknowledged,
+        "the previous inventory must not suppress the new owner's capacity clock"
+    );
+    router_acp::planner_capacity::tick(shared, "next", start).await;
+    assert_eq!(
+        planner_workflow::load(shared, "next")
+            .unwrap()
+            .unwrap()
+            .capacity
+            .last_wake_at,
+        0,
+        "queued operator input still takes precedence"
+    );
+    // Simulate the normal delivery of that operator turn before capacity resumes.
+    planner_workflow::mutate(shared, "next", |run| {
+        run.parent_queue.clear();
+        run.inputs.get_mut("queued-input").unwrap().acknowledged = true;
+        run.wakes
+            .get_mut("input:queued-input")
+            .unwrap()
+            .acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    shared.state.lock().unwrap().log(
+        "next",
+        &router_acp::state::LogEntry {
+            ts: Some(start),
+            kind: "tool_call".into(),
+            role: "agent".into(),
+            summary: "parent processing the operator turn".into(),
+            ..Default::default()
+        },
+    );
+    for elapsed in [1, 61, 120, 180] {
+        router_acp::planner_capacity::tick(shared, "next", start + elapsed).await;
+        let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+        assert!(
+            !run.works.contains_key("work-independent"),
+            "too early at {elapsed}"
+        );
+    }
+    let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+    assert!(run.capacity.last_wake_at >= start);
+    assert!(
+        run.wakes
+            .iter()
+            .any(|(id, wake)| id.starts_with("capacity:")
+                && !wake.acknowledged
+                && wake.reason.contains("work-independent"))
+    );
+    router_acp::planner_capacity::tick(shared, "next", start + 182).await;
+    let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+    assert!(
+        run.works["work-independent"].attempt.is_some(),
+        "busy parent recovered"
+    );
+    assert!(
+        !run.works.contains_key("work-held"),
+        "adopted hold still applies"
+    );
+    assert!(
+        run.works["work-dependent"].attempt.is_none(),
+        "dependency still applies"
+    );
+    assert!(run.works["admitted-later"].reconciliation.required);
+    assert!(run.works["admitted-later"].attempt.is_none());
 }
 
 #[tokio::test]

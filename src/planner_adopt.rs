@@ -618,7 +618,12 @@ fn merge(
                 } else {
                     wake.work_id.clone()
                 },
-                acknowledged: false,
+                // Capacity is derived from this owner's inventory and timers.
+                // Carry the old notice as history, then let the next capacity
+                // tick recompute it. A pending notice with last_wake_at == 0
+                // otherwise prevents both a fresh wake and busy auto-admission.
+                // Operator inputs, CI and work wakes remain pending.
+                acknowledged: id.starts_with("capacity:"),
                 ..Default::default()
             },
         );

@@ -427,6 +427,11 @@ retry sees it alive and refuses. A router that dies between phases leaves the
 source claimed with its content; the next retry (or `adopt-run`) resumes from
 the claim rather than reporting an empty adoption.
 
+Capacity notices describe the previous owner's inventory. Adoption retains them
+as acknowledged history so the next capacity tick recomputes the condition and
+starts the new owner's wake clock. Pending operator inputs, CI and work wakes
+remain pending; holds and reconciliation requirements still apply.
+
 While adoption is pending, `audit:` and `gate:` wakes carry the recovery state
 (source run and the current blocker) instead of demanding admissions, the gate
 lists no capacity-host candidates, `admit` and dispatch of an identity still
