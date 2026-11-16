@@ -492,8 +492,8 @@ fn set_pending(shared: &Shared, sid: &str, work_id: &str, pending: bool) -> bool
     })
 }
 
-/// Stop one worker: a mid-turn worker gets [`WORKER_PROMPT`] at its turn end
-/// (through the turn gate); an idle one with an open sub-session gets it as a
+/// Stop one worker: a mid-turn worker receives a named queued notice, with
+/// [`WORKER_PROMPT`] at its turn end as fallback; an idle open sub-session gets it as a
 /// follow-up turn. Each update goes to `tx`; past `bound` it is cancelled.
 async fn drain_worker(
     shared: &Arc<Shared>,
@@ -503,6 +503,7 @@ async fn drain_worker(
     tx: tokio::sync::mpsc::UnboundedSender<(String, String)>,
 ) {
     let deadline = Instant::now() + bound;
+    let mut notice_queued = false;
     let send = |status: &str| {
         let _ = tx.send((work_id.clone(), status.to_string()));
     };
@@ -521,8 +522,43 @@ async fn drain_worker(
             return;
         };
         if !attempt.ended {
+            if !notice_queued {
+                let job_id = shared
+                    .background_delegates
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, job)| {
+                        job.parent_sid == sid
+                            && job.result.is_none()
+                            && job.claim.as_ref().is_some_and(|claim| {
+                                claim.work_id == work_id && claim.attempt_id == attempt.id
+                            })
+                    })
+                    .map(|(id, _)| id.clone());
+                if let Some(delegate_id) = job_id {
+                    notice_queued = matches!(
+                        crate::delegate_mcp::queue_running_background_followup(
+                            shared,
+                            sid,
+                            &crate::delegate_mcp::DelegateFollowupArgs {
+                                delegate_id,
+                                message: WORKER_PROMPT.into(),
+                                ..Default::default()
+                            }
+                        ),
+                        Some(Ok(_))
+                    );
+                }
+            }
             let injected = set_pending(shared, sid, &work_id, true);
-            send(if injected { "notified" } else { "running" });
+            send(if injected {
+                "notified"
+            } else if notice_queued {
+                "notice-queued"
+            } else {
+                "running"
+            });
             tokio::time::sleep(POLL).await;
             continue;
         }

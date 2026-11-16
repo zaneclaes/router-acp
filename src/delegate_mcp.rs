@@ -3156,7 +3156,7 @@ fn pending_without_session(
 // A running background id is already a known worker, although its keep-open
 // delegate id does not exist until its turn ends. Use the existing durable
 // session-input delivery path; never start another prompt or planner attempt.
-fn queue_running_background_followup(
+pub(crate) fn queue_running_background_followup(
     shared: &Arc<Shared>,
     router_sid: &str,
     args: &DelegateFollowupArgs,
@@ -3231,14 +3231,16 @@ fn queue_running_background_followup(
         }
         let (child, row) = &children[0];
         let id = format!("followup:{}", uuid::Uuid::new_v4().simple());
-        let sender = format!("parent session {router_sid}");
+        // Sender is a display label (48 characters maximum), not the authority
+        // key. Full parent identity was verified above and remains in child state.
+        let sender = "parent session";
         crate::session_input::send_from(
             &state,
             child,
             &row.cwd,
             &id,
             &args.message,
-            Some(&sender),
+            Some(sender),
             false,
         )?;
         Ok(format!(

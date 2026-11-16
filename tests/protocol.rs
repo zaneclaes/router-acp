@@ -15727,14 +15727,15 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
 }
 
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
-/// parent records its resume point, a mid-turn worker gets the shutdown
-/// message at its turn end and stops, and the run ends paused for the next
+/// parent records its resume point, a mid-turn worker gets a queued shutdown
+/// notice before its turn ends, then stops, and the run ends paused for the next
 /// `/implement`.
 #[tokio::test]
 async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
     let state = temp_state_file("planner-shutdown");
     let log = temp_log("planner-shutdown");
     let repo = planner_wire_repository();
+    let release = repo.path().join("release-worker");
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     run_test_shared(
         planner_gate_yaml(&state, &log, ""),
@@ -15751,10 +15752,10 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             let task = format!(
                 "{}MCP_CALL:router-delegate delegate_task {}",
                 planner_admit_wire_prompt(),
-                serde_json::json!({"work_id": "work-1", "task": "SLEEP:4000", "background": true})
+                serde_json::json!({"work_id": "work-1", "task": format!("WAIT_FILE:{}", release.display()), "background": true})
             );
             prompt_text(&cx, &sid, &task).await?;
-            // The child's own prompt (the parent's also names SLEEP:4000).
+            // Hold the child at a controllable boundary, independent of host speed.
             wait_for_mock_prompt(&log, "[Assignment briefing]").await;
 
             let shutdown = |session: &str| {
@@ -15773,6 +15774,22 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             );
             let ack = cx.send_request(shutdown(&sid)).block_task().await?;
             assert_eq!(ack, serde_json::json!({"accepted": true}));
+
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let queued = {
+                        let store = shared.state.lock().unwrap();
+                        store.all().into_iter().filter(|(_, row)| row.parent_session_id.as_deref() == Some(&sid))
+                            .any(|(child, _)| router_acp::session_input::list(&store, &child).unwrap().iter()
+                                .any(|input| input.origin == "agent"))
+                    };
+                    if queued { break; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.expect("shutdown never notified the busy worker before its turn ended");
+            assert!(!router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap()
+                .works["work-1"].attempt.as_ref().unwrap().ended);
+            std::fs::write(&release, "finish the current turn").unwrap();
 
             let paused = tokio::time::timeout(Duration::from_secs(60), async {
                 loop {

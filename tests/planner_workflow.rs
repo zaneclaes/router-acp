@@ -3957,7 +3957,7 @@ async fn running_background_followup_queues_named_input_without_a_second_worker(
             .unwrap()
             .unwrap();
         let input: router_acp::session_input::SessionInput = serde_json::from_value(value).unwrap();
-        assert_eq!(input.sender, Some(format!("parent session {SID}")));
+        assert_eq!(input.sender.as_deref(), Some("parent session"));
         assert_eq!(input.text, "Inspect the failed required job.");
         assert!(!input.interrupt);
     }
