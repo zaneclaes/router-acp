@@ -41,6 +41,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 base64 = "0.22"
 getrandom = "0.2"
 zstd = "0.13"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"
