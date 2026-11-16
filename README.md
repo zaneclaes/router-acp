@@ -59,7 +59,7 @@ This is intentionally **not** a token-router/LiteLLM architecture. Subscription 
 ## Install & quick start
 
 ```sh
-cargo install --path .              # or: cargo build --release
+cargo install --path . --locked     # or: cargo build --release --locked
 router-acp check-config --config router.yaml
 router-acp serve --config router.yaml
 ```
@@ -109,7 +109,7 @@ Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
 watchdog. The router has no resource-guard authority over Kory/goose or the
 supervisor's process tree.
 
-`cargo install --path .` also installs `router-resource-run`. Explicitly wrap a
+`cargo install --path . --locked` also installs `router-resource-run`. Explicitly wrap a
 worker build/tool with `router-resource-run -- <command> [arguments]` to contain
 that command and its descendants. Its detached watcher follows process birth
 identities and owned groups across reparenting; its root is always the runner

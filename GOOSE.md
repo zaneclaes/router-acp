@@ -51,7 +51,7 @@ Codex adapters downstream.
 ## 1. Install router-acp
 
 ```sh
-cargo install --path .          # installs ~/.cargo/bin/router-acp
+cargo install --path . --locked # installs ~/.cargo/bin/router-acp with the tested lockfile
 router-acp --version
 ```
 
@@ -547,7 +547,7 @@ release checks. Protocol fixtures do not establish those runtime results.
   `router_acp=debug` in the shim when diagnosing routing or model discovery.
 - **"Failed to set session mode … modes are unavailable before the first
   prompt"**: this error came from router-acp builds before the deferred-mode
-  fix. Rebuild/reinstall (`cargo install --path . --force`) — goose's
+  fix. Rebuild/reinstall (`cargo install --path . --force --locked`) — goose's
   post-`session/new` `set_mode` is now accepted and deferred.
 - **Reverting:** remove the `pi-acp` entries and the `GOOSE_SEARCH_PATHS`
   block from `~/.config/goose/config.yaml` (and delete

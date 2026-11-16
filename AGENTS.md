@@ -20,7 +20,7 @@ best `(agent, model)` candidate, pins it, relays everything, and offers a
 cargo test                    # 113 tests: unit + tests/protocol.rs E2E
 cargo clippy --all-targets    # keep at zero warnings
 cargo fmt
-cargo install --path . --force   # the user's goose shim runs ~/.cargo/bin/router-acp
+cargo install --path . --force --locked   # install the dependencies tested from Cargo.lock
 ```
 
 The protocol tests spawn real `mock-agent` subprocesses and complete in a
@@ -598,7 +598,7 @@ fails.
   was chosen), `codex-acp` takes `-c` flags (why it can't be shimmed).
   Kory starts new and resumed work through the router, with legacy transcript
   handoff for resumed work. After code changes run
-  `cargo install --path . --force` or goose keeps the old binary.
+  `cargo install --path . --force --locked` or goose keeps the old binary.
 - Real adapters live at `~/nvm/versions/node/v24.16.0/bin/{claude-agent-acp,codex-acp,grok}`
   (nvm-versioned paths — they move on node upgrades) and `~/.local/bin/kimi`
   (uv tool). Verified model ids (July 2026): claude offers `default, haiku,
