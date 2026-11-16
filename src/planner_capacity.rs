@@ -224,6 +224,7 @@ fn open(run: &PlannerRun, work_id: &str) -> bool {
         None => true,
         Some(w) => {
             !w.paused
+                && !w.reconciliation.required
                 && w.attempt.as_ref().is_none_or(|a| a.ended)
                 && (w.status == WorkStatus::Admitted
                     || (w.status == WorkStatus::Interrupted && w.workspace.is_none()))
@@ -235,7 +236,14 @@ fn hold_for<'a>(run: &'a PlannerRun, candidate: &Candidate, now_ms: i64) -> Opti
     [&candidate.work.plan_id, &candidate.work.work_id]
         .into_iter()
         .filter_map(|id| run.capacity.holds.get(id.as_str()))
-        .find(|h| h.expires_at_ms > now_ms)
+        .find(|h| {
+            h.expires_at_ms > now_ms
+                && !(h.reason == RECONCILIATION
+                    && run
+                        .works
+                        .get(&candidate.work.work_id)
+                        .is_some_and(|w| !w.reconciliation.required))
+        })
 }
 
 /// The host's candidates that still need a slot and no unexpired hold covers,

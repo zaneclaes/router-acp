@@ -445,6 +445,10 @@ can reconcile that same work identity with its corrected brief and preserved sou
 revision. Reconciliation retries the normal allocator and verifies source custody
 before accepting the assignment. A work that already has a workspace must retain
 and restore that original workspace; reconciliation never replaces it.
+If the capacity host reoffers an adopted assignment that still requires reconciliation,
+the router names that prerequisite in its capacity wake instead of attempting automatic
+admission. Once reconciliation succeeds, the same candidate becomes eligible normally,
+even if a previous automatic admission left a reconciliation hold. Other holds remain in force.
 
 Pending input, original attachments, accepted revisions, finishing/integration
 receipts, and wake acknowledgements persist in SQLite. An idle-parent wake has

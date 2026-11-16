@@ -4219,6 +4219,77 @@ async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them()
     );
 }
 
+/// A host may reoffer an admitted assignment after adoption. It still needs
+/// reconciliation, so it must raise recovery rather than attempt auto-admission.
+#[tokio::test]
+async fn reoffered_adopted_candidate_waits_for_reconcile_before_admission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["repair"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 1, 5));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    admit(
+        shared,
+        serde_json::from_value(candidate_json("repair")["work"].clone()).unwrap(),
+    );
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works
+            .get_mut("work-repair")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 30).await;
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1);
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(!router_acp::planner_capacity::awaiting_reconciliation(&run).is_empty());
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, (last + 61) * 1000).is_empty());
+    deliver_all(shared);
+    tick(shared, last + 200).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(run.capacity.auto_admit_runs, 0);
+    assert!(run.works["work-repair"].reconciliation.required);
+    assert_eq!(run.works.len(), 1);
+    planner_workflow::mutate(shared, SID, |run| {
+        // An older router may already have held the failed auto-admission.
+        // Successful reconciliation must clear this prerequisite immediately.
+        run.capacity.holds.insert(
+            "work-repair".into(),
+            router_acp::planner_capacity::Hold {
+                plan_id: "work-repair".into(),
+                reason: router_acp::planner_capacity::RECONCILIATION.into(),
+                detail: "automatic admission required reconciliation".into(),
+                expires_at_ms: (last + 2000) * 1000,
+            },
+        );
+        run.works
+            .get_mut("work-repair")
+            .unwrap()
+            .reconciliation
+            .required = false;
+        Ok(())
+    })
+    .unwrap();
+    let mut run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        router_acp::planner_capacity::unheld_candidates(&run, (last + 200) * 1000).len(),
+        1
+    );
+    assert!(router_acp::planner_capacity::awaiting_reconciliation(&run).is_empty());
+    run.capacity.holds.get_mut("work-repair").unwrap().reason = "dependency".into();
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, (last + 200) * 1000).is_empty());
+    run.capacity.holds.get_mut("work-repair").unwrap().reason =
+        router_acp::planner_capacity::RECONCILIATION.into();
+    run.works.remove("work-repair");
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, (last + 200) * 1000).is_empty());
+}
+
 /// Live 2026-11-15: an adopted run's reconcile wake named 119 works, about 30
 /// of them live; the rest were old records a newer work on the same plan had
 /// already carried on. The parent dismissed the whole list as stale and left 48
