@@ -59,7 +59,9 @@ pub const RESUME_BACKOFF_SECS: [i64; 3] = [30, 120, 300];
 pub const SAME_FAILURE_LIMIT: u32 = 3;
 /// The prompt a worker that stopped early is resumed with.
 pub const CONTINUE_PROMPT: &str = "Your work is not finished: continue until its required checks \
-     pass and you record the finished receipt; poll your own branch build in the turn. Never \
+     pass and you record the finished receipt. Read your own branch build once; if it is still \
+     pending, use the repository's waiting handoff with its exact CI identity so the observer \
+     can wake you on a change. Never \
      wait for a staging or production deploy: releases are the parent's, so a worker whose \
      branch is pushed and green reports its artifact and hands back.";
 /// Handoff kinds that ask the parent for something only it can give. Any

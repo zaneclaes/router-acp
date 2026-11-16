@@ -1248,6 +1248,10 @@ new allocations and different leases cannot be migrated this way. The allocation
 request advertises `completion_contract_recovery: true` so hosts do not enable this
 recovery for older routers that ignore the receipt. Ordinary readmission and
 reconciliation still cannot change the admitted version.
+Audit freshness starts when the host answers, so time spent collecting observations
+does not immediately expire a pending CI wait. Recovery prompts use the repository's
+exact CI handoff instead of asking workers to poll within a turn; failed, changed,
+missing or genuinely stale observations retain normal recovery.
 See [durable planner progress](docs/planner-throughput.md).
 An `implement` command that overlaps a previous router's drain records a pending
 handoff. The ordinary capacity cycle retries after owner exit before new work can

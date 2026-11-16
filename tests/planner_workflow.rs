@@ -6303,6 +6303,31 @@ async fn parent_finalization_is_host_verified_and_release_proofs_remain_required
 }
 
 #[tokio::test]
+async fn audit_freshness_starts_when_the_host_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("log");
+    std::fs::write(&reply, json!({"defects":[],"observations":{}}).to_string()).unwrap();
+    let f = fixture(|cfg| audit_host(cfg, format!("sleep 1.03; {}", audit_script(&reply, &log))));
+    admit(&f.shared, work("work-1"));
+    let now = chrono::Utc::now().timestamp();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now).await;
+    let audit = planner_workflow::load(&f.shared, SID)
+        .unwrap()
+        .unwrap()
+        .capacity
+        .audit
+        .unwrap();
+    assert!(audit.ok);
+    // This tests clock origin, not speed: any slower host must still pass.
+    assert!(
+        audit.at_ms >= now * 1000 + 1000,
+        "a new answer was aged by time spent waiting for the host: {}",
+        audit.at_ms
+    );
+}
+
+#[tokio::test]
 async fn audit_observations_wake_once_per_change_and_never_complete_work() {
     let tmp = tempfile::tempdir().unwrap();
     let reply = tmp.path().join("reply");

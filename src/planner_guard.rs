@@ -436,9 +436,15 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if !due {
         return;
     }
+    let started = std::time::Instant::now();
     let Some(answer) = audit(shared, sid, &run, now_ms, false, None).await else {
         return;
     };
+    // Freshness begins at the answer. A slow host must not return a snapshot
+    // already stale enough to restart workers parked on its pending CI result.
+    // Keep the caller's clock and whole-second resolution for deterministic ticks.
+    let answered_at_ms =
+        now_ms.saturating_add((started.elapsed().as_secs() as i64).saturating_mul(1000));
     let observations = answer
         .as_ref()
         .ok()
@@ -446,7 +452,7 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
         .unwrap_or_default();
     let snapshot = match answer {
         Ok(reply) => AuditSnapshot {
-            at_ms: now_ms,
+            at_ms: answered_at_ms,
             ok: true,
             error: None,
             defects: reply.defects,
@@ -454,7 +460,7 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
             completed_guides: reply.completed_guides,
         },
         Err(error) => AuditSnapshot {
-            at_ms: now_ms,
+            at_ms: answered_at_ms,
             ok: false,
             error: Some(error),
             defects: Vec::new(),
