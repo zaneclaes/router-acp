@@ -7058,9 +7058,28 @@ async fn turn_end_excludes_commands_and_wake_acknowledgment_resolves_input() {
 
 #[tokio::test]
 async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_records() {
-    for stale_queue in [false, true] {
+    for (stale_queue, owned, acknowledgment) in [
+        (false, false, "wake"),
+        (true, false, "wake"),
+        (false, true, "wake"),
+        (true, true, "input"),
+        (false, true, "reply"),
+    ] {
         let f = fixture(|_| {});
         authorize(&f.shared);
+        if owned {
+            planner_workflow::operate(
+                &f.shared,
+                SID,
+                None,
+                Operation::Admit {
+                    key: "admit-owner".into(),
+                    work: work("original-owner"),
+                },
+            )
+            .await
+            .unwrap();
+        }
         let request = input_request(
             Some("old-message"),
             "previously handled operator request",
@@ -7074,6 +7093,10 @@ async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_rec
         );
         planner_workflow::observe_input(&f.shared, SID, &pending).unwrap();
         planner_workflow::mutate(&f.shared, SID, |run| {
+            if owned {
+                // Assigned before the old parent exited; never delivered to the child.
+                run.inputs.get_mut("old-message").unwrap().owner = Some("original-owner".into());
+            }
             run.parent_queue.push(planner_workflow::QueuedParentInput {
                 input_id: "never-delivered".into(),
                 request: pending.clone(),
@@ -7127,23 +7150,49 @@ async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_rec
             text.text
                 .contains("acknowledge it, do not answer or act on it again")
         );
+        let ack = || Operation::AcknowledgeWake {
+            key: "ack-history-once".into(),
+            wake_id: "input:old-message".into(),
+        };
+        assert!(
+            planner_workflow::operate(&f.shared, "next", None, ack())
+                .await
+                .is_err(),
+            "adoption is not delivery to the new parent"
+        );
         planner_workflow::queue_delivery(&f.shared, "next", "next", "next", ids.clone());
         planner_workflow::confirm_delivery(&f.shared, "next").unwrap();
-        planner_workflow::operate(
-            &f.shared,
-            "next",
-            None,
-            Operation::AcknowledgeWake {
-                key: "ack-history-once".into(),
-                wake_id: "input:old-message".into(),
-            },
-        )
-        .await
-        .unwrap();
+        if acknowledgment == "reply" {
+            planner_workflow::acknowledge_answered_inputs(&f.shared, "next", true).unwrap();
+        } else {
+            let operation = if acknowledgment == "input" {
+                Operation::AcknowledgeInput {
+                    key: "ack-history-once".into(),
+                    input_id: "old-message".into(),
+                    owner: None,
+                }
+            } else {
+                ack()
+            };
+            planner_workflow::operate(&f.shared, "next", None, operation)
+                .await
+                .unwrap();
+        }
         let run = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
         assert!(
             run.inputs["old-message"].acknowledged && run.wakes["input:old-message"].acknowledged
         );
+        assert_eq!(
+            run.inputs["old-message"].owner.as_deref(),
+            owned.then_some("original-owner")
+        );
+        assert!(
+            !run.inputs["old-message"]
+                .delivered_to
+                .contains("original-owner"),
+            "parent reconciliation must not invent child delivery"
+        );
+        assert!(!run.inputs["never-delivered"].acknowledged);
         assert!(
             planner_workflow::parent_input_blocks(&f.shared, "next", &ids)
                 .unwrap()

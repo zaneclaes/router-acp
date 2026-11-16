@@ -453,6 +453,13 @@ automatic execution. Resume requires the exact parent identity. `/plan` pauses
 new dispatch while preserving running assignments. `/implement` explicitly
 resumes admitted execution. An empty runnable queue is not completion.
 
+After adoption, historical input is replayed to the new parent for receipt
+reconciliation. Once that replay is delivered, an explicit acknowledgment or a
+normally answered parent turn closes its input and wake records while retaining
+the original work owner. This does not claim delivery to that worker, complete
+its work, or acknowledge an undelivered request. Current corrections still
+require delivery to their assigned owner.
+
 Native Resume restores the durable phase and coordinator role before opening a fresh adapter.
 Effective effort remains unavailable until the adapter or provider confirms it.
 Close retains the run and its assignments. Delete requires reconciled assigned work, inputs,

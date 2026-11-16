@@ -352,10 +352,19 @@ fn acknowledge_input(
         return Ok(()); // already explicitly reconciled by withdrawal
     }
     let input = run.inputs.get_mut(id).ok_or("unknown input receipt")?;
+    // Adoption replays historical input to the parent for receipt reconciliation,
+    // even when the old run assigned it to a work that never received it. Keep
+    // that owner, but use the actual replay delivery; never invent child delivery.
+    let parent_replay = input.replayed_from.is_some() && input.delivered_to.contains(sid);
+    let owner = if parent_replay && owner.is_none() {
+        input.owner.clone()
+    } else {
+        owner
+    };
     if input.owner.is_some() && input.owner != owner {
         return Err("input correction must retain its original work owner".into());
     }
-    if !input.delivered_to.contains(owner.as_deref().unwrap_or(sid)) {
+    if !parent_replay && !input.delivered_to.contains(owner.as_deref().unwrap_or(sid)) {
         return Err(
             "original input and attachments have no delivery receipt for this owner".into(),
         );
@@ -1325,7 +1334,7 @@ pub fn acknowledge_answered_inputs(
         run.inputs.get(id).is_some_and(|input| {
             !run.commands.contains(id)
                 && !input.resolved()
-                && input.owner.is_none()
+                && (input.owner.is_none() || input.replayed_from.is_some())
                 && input.delivered_to.contains(sid)
         })
     };
