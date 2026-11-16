@@ -6176,6 +6176,99 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
     select().await.unwrap(); // identical operation replay needs no new authority
 }
 
+#[tokio::test]
+async fn release_batch_target_comes_from_host_without_qualifying_unfinished_work() {
+    use router_acp::planner_release::{Checkpoint, Stage};
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(),
+                "read -r request; case \"$request\" in *release-selection-check*) cat \"$1\";; *) echo '{\"verified_action\":\"release\"}';; esac".into(),
+                "fixture".into(), reply.display().to_string()],
+            timeout_ms: 5000,
+        });
+    });
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let mut waiting = run.works["work-1"].clone();
+        waiting.spec.work_id = "waiting".into();
+        run.works.insert("waiting".into(), waiting);
+        let mut unfinished = run.works["work-1"].clone();
+        unfinished.spec.work_id = "unfinished".into();
+        unfinished.finish = None;
+        run.works.insert("unfinished".into(), unfinished);
+        Ok(())
+    })
+    .unwrap();
+    let checkpoint = Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: BTreeMap::from([("work-1".into(), revision)]),
+        replaces: None,
+        evidence: BTreeMap::from([
+            ("selection".into(), "round.md".into()),
+            ("release_batch_target".into(), "1".into()),
+        ]),
+    };
+    let select = |checkpoint: Checkpoint| {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Release {
+                key: "selection".into(),
+                release_id: "single".into(),
+                checkpoint,
+            },
+        )
+    };
+    // Caller evidence cannot override the default; malformed host policy fails closed.
+    for target in [
+        None,
+        Some(json!(2)),
+        Some(json!(0)),
+        Some(json!(-1)),
+        Some(json!("1")),
+    ] {
+        let mut response = json!({"verified_action":"release-selection-check"});
+        if let Some(target) = target {
+            response["release_batch_target"] = target;
+        }
+        std::fs::write(&reply, serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(select(checkpoint.clone()).await.is_err());
+        assert!(
+            planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .releases
+                .is_empty()
+        );
+    }
+    std::fs::write(
+        &reply,
+        serde_json::to_vec(&json!({
+            "verified_action":"release-selection-check", "release_batch_target":1
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut unfinished = checkpoint.clone();
+    unfinished.works = BTreeMap::from([("unfinished".into(), checkpoint.revision.clone())]);
+    assert!(select(unfinished).await.is_err());
+    let mut held = checkpoint.clone();
+    held.evidence
+        .insert("repair-hold".into(), "repair-hold:fixture:date".into());
+    assert!(select(held).await.is_err());
+    select(checkpoint).await.unwrap();
+    let saved = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(saved.releases["single"].works.len(), 1);
+    assert_eq!(saved.releases["single"].stage(), Stage::Selected);
+    assert!(saved.works["work-1"].integration.is_none());
+    assert_eq!(saved.works["waiting"].status, WorkStatus::Finished);
+}
+
 // Staging 2026-10-21: six corrective rounds in a row each carried one repair
 // while 50 accepted heads waited, so the "clean round after a corrective"
 // never came and nothing reached production.

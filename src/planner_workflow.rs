@@ -2233,7 +2233,8 @@ async fn operate_once(
             let cwd = shared
                 .with_session(sid, |session| session.cwd.clone())
                 .ok_or("unknown planner session")?;
-            let attestation = if checkpoint.stage == crate::planner_release::Stage::Selected
+            let (attestation, batch_target) = if checkpoint.stage
+                == crate::planner_release::Stage::Selected
                 && !run.releases.contains_key(&release_id)
             {
                 // Construct the authority request from durable state, not caller
@@ -2267,7 +2268,8 @@ async fn operate_once(
                     }),
                 )
                 .await?;
-                reply
+                let batch_target = crate::planner_release::batch_target_from_host(&reply)?;
+                let attestation = reply
                     .get("selection_attestation")
                     .filter(|v| !v.is_null())
                     .map(|v| {
@@ -2276,16 +2278,21 @@ async fn operate_once(
                         )
                         .map_err(|e| format!("invalid host selection attestation: {e}"))
                     })
-                    .transpose()?
+                    .transpose()?;
+                (attestation, batch_target)
             } else {
-                None
+                (
+                    None,
+                    crate::planner_release::batch_target_from_host(&Value::Null)?,
+                )
             };
-            crate::planner_release::record_in_checkout_attested(
+            crate::planner_release::record_in_checkout_with_policy(
                 &mut run,
                 &release_id,
                 &checkpoint,
                 &cwd,
                 attestation.as_ref().map(|a| (sid, a)),
+                batch_target,
             )
             .await?;
             let mut check = value.clone();
