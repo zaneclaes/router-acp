@@ -375,13 +375,16 @@ notification `_router/shutdown_progress` with
    an adapter that declines it is cancelled with recorded state preserved. Each active
    worker has `drain_timeout_secs` (default 20) to stop. No commits, pushes or CI waits.
 3. After the children stop, `saving`, then the shutdown host gets
-   `{"event":"shutdown","session_id","cwd","run_status","works","holds"}`
+   `{"event":"shutdown","session_id","cwd","run_status","works","holds","continuation"}`
    (`run_status` is the status before the drain) and answers
    `{"saved":[paths],"summary":"…"}`: `saved` carries the paths, with the
    summary as its message. A failure is reported as `failed` with the error,
    and the drain goes on.
    The host should only save recorded state, without fresh audits or network work.
-4. The parent, if loaded, updates its configured continuation (default
+   A host that also saves the configured continuation may return `continuation_saved: true`
+   and include that exact path in `saved`. The router then skips the model update;
+   a flag without the saved path, an old host or a failed save retains the fallback.
+4. Otherwise the parent, if loaded, updates its configured continuation (default
    `Docs/CONTINUE.md`) from the final recorded state in one brief turn. It must not
    start children, audit, build, commit, push or wait for CI. An existing parent turn
    is interrupted first. The final update has a 30-second bound; on timeout the router

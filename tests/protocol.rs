@@ -15842,6 +15842,59 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
     .await;
 }
 
+#[tokio::test]
+async fn shutdown_host_saved_continuation_needs_no_model_turn() {
+    for saved in [true, false] {
+        let state = temp_state_file("shutdown-host-continuation");
+        let log = temp_log("shutdown-host-continuation");
+        let repo = planner_wire_repository();
+        let input = repo.path().join("shutdown-input.json");
+        let reply = serde_json::json!({"saved": if saved {vec!["notes/resume.md"]} else {vec![]},
+            "continuation_saved": true, "summary": "saved recorded state"});
+        let script = format!("cat > '{}'; printf '%s' '{reply}'", input.display());
+        let yaml = planner_gate_yaml(&state, &log, "").replace(
+            "  planner:\n",
+            &format!("  planner:\n    continuation: notes/resume.md\n    shutdown: {{ command: /bin/sh, args: [\"-c\", {}] }}\n",
+                serde_json::to_string(&script).unwrap()),
+        );
+        run_test_shared(yaml, async |cx, _observed, shared| {
+            let sid = open_planner_parent(&cx, &repo).await?;
+            let prompts_before = read_log(&log)
+                .iter()
+                .filter(|e| e["event"] == "prompt")
+                .count();
+            router_acp::planner_shutdown::request(&shared, &serde_json::json!({"sessionId":sid}))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    != router_acp::planner_workflow::RunStatus::Paused
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("shutdown did not finish");
+            let asked: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&input).unwrap()).unwrap();
+            assert_eq!(asked["continuation"], "notes/resume.md");
+            let prompts_after = read_log(&log)
+                .iter()
+                .filter(|e| e["event"] == "prompt")
+                .count();
+            assert_eq!(
+                prompts_after - prompts_before,
+                usize::from(!saved),
+                "a host must explicitly save the configured continuation to replace the model turn"
+            );
+            Ok(())
+        })
+        .await;
+    }
+}
+
 /// A planner repository whose router-owned wake turns (the `review-work`
 /// role) block until `release` exists, honoring `session/cancel`.
 fn preempt_repository(release: &std::path::Path) -> tempfile::TempDir {

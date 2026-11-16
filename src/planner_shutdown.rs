@@ -11,7 +11,7 @@
 //!    ended attempts are already recorded and never get a new turn;
 //! 3. saves the final state through `routers.planner.shutdown` (`saving`,
 //!    then `saved` or `failed`; a failed save does not stop the drain);
-//! 4. prompts the parent once to update its continuation from that final state;
+//! 4. prompts the parent only if the host did not save its continuation;
 //! 5. sets the run `paused` (`drained`), which the next `/implement` resumes.
 //!
 //! A router that dies mid-drain leaves the run `draining`; `/implement`
@@ -258,9 +258,11 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
         Ok(None) => Err("planner run disappeared".into()),
         Err(error) => Err(error),
     };
+    let mut continuation_saved = false;
     match result {
-        Ok((paths, summary)) => {
+        Ok((paths, summary, saved_continuation)) => {
             saved = paths;
+            continuation_saved = saved_continuation;
             notify(shared, sid, "saved", &summary, &saved, &workers);
         }
         Err(error) => notify(
@@ -272,7 +274,7 @@ pub async fn run_drain(shared: &Arc<Shared>, sid: &str) {
             &workers,
         ),
     }
-    if matches!(prior, RunStatus::Running | RunStatus::Draining) {
+    if !continuation_saved && matches!(prior, RunStatus::Running | RunStatus::Draining) {
         let outcome = prompt_parent(shared, sid, &saved, &workers).await;
         notify(shared, sid, "draining", &outcome, &saved, &workers);
     }
@@ -315,18 +317,21 @@ async fn save_state(
     run: &PlannerRun,
     prior: RunStatus,
     cfg: &crate::config::PlannerShutdownConfig,
-) -> Result<(Vec<String>, String), String> {
+) -> Result<(Vec<String>, String, bool), String> {
     let Some(command) = &cfg.command else {
         return Ok((
             Vec::new(),
             "native run state is persisted; no additional shutdown host is configured".into(),
+            false,
         ));
     };
     let cwd = shared
         .with_session(sid, |s| s.cwd.clone())
         .ok_or("the parent session is not loaded")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let continuation = &shared.cfg.routers.planner.continuation;
     let input = json!({"event":"shutdown","session_id":sid,"cwd":cwd,"run_status":prior,
+        "continuation": continuation,
         "works":planner_guard::works_json(run),"holds":planner_guard::active_holds(run, now_ms)});
     let out = planner_guard::run_host(
         "shutdown host",
@@ -342,7 +347,7 @@ async fn save_state(
     }
     let reply: Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("shutdown host returned invalid JSON: {e}"))?;
-    let paths = reply
+    let paths: Vec<String> = reply
         .get("saved")
         .and_then(Value::as_array)
         .map(|a| {
@@ -357,7 +362,11 @@ async fn save_state(
         .and_then(Value::as_str)
         .unwrap_or("resume state saved")
         .to_string();
-    Ok((paths, summary))
+    // An opt-in host can write the checkpoint without a model round trip. A flag
+    // alone is insufficient: it must report the exact configured path as saved.
+    let continuation_saved = reply.get("continuation_saved").and_then(Value::as_bool) == Some(true)
+        && paths.contains(continuation);
+    Ok((paths, summary, continuation_saved))
 }
 
 /// One short final continuation update, with cancellation on timeout.

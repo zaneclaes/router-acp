@@ -655,7 +655,9 @@ second prompt or cancel an in-flight tool. Foreign parents, stale planner attemp
 without a unique linked child are refused. Original planner `input_ids` still use the normal
 owner follow-up at a turn boundary and are never silently consumed by this route.
 Planner shutdown interrupts only active children to save state, then saves the final
-checkpoint and asks the parent for one brief continuation update. Ended attempts and idle
+checkpoint. A shutdown host can save the configured continuation and report its path with
+`continuation_saved: true`, completing the save without another model turn. Otherwise the
+router asks the parent for one brief continuation update. Ended attempts and idle
 keep-open sessions never receive shutdown prompts. An adapter that declines the interrupt
 is cancelled with its already recorded state preserved. Shutdown never asks for commits,
 pushes, builds or audits. The default child grace is 20 seconds; the parent's final update
