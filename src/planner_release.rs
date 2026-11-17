@@ -75,7 +75,7 @@ fn evidence_key(stage: Stage) -> &'static str {
 }
 
 pub fn record(run: &mut PlannerRun, id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
-    record_with_carried(run, id, checkpoint, &BTreeSet::new(), false)
+    record_with_carried(run, id, checkpoint, &BTreeSet::new(), false, ROUND_LIMIT)
 }
 
 /// Ephemeral repository-host attestation. No MCP argument deserializes this
@@ -153,8 +153,8 @@ pub fn validate_attestation(
     Ok(())
 }
 
-/// Only repository-observed ancestry can exempt a head from batching. This does
-/// not integrate the work, discharge its proofs, or qualify a selected head.
+/// Repository-observed ancestry exempts already carried heads from batching.
+/// This does not integrate work, discharge proofs, or qualify selected heads.
 pub async fn record_in_checkout(
     run: &mut PlannerRun,
     id: &str,
@@ -171,13 +171,33 @@ pub async fn record_in_checkout_attested(
     checkout: &Path,
     authority: Option<(&str, &SelectionAttestation)>,
 ) -> Result<(), String> {
+    record_in_checkout_with_policy(run, id, checkpoint, checkout, authority, ROUND_LIMIT).await
+}
+
+/// Batch fill is repository policy, supplied only by the trusted selection host.
+/// It does not qualify selected revisions or bypass holds and ordered checkpoints.
+pub async fn record_in_checkout_with_policy(
+    run: &mut PlannerRun,
+    id: &str,
+    checkpoint: &Checkpoint,
+    checkout: &Path,
+    authority: Option<(&str, &SelectionAttestation)>,
+    batch_target: usize,
+) -> Result<(), String> {
+    if batch_target == 0 {
+        return Err("release batch target must be positive".into());
+    }
     if let Some((sid, attestation)) = authority {
         validate_attestation(run, sid, id, checkpoint, attestation)?;
     } else if checkpoint.evidence.contains_key("repair-hold") && !run.releases.contains_key(id) {
         return Err("repair hold requires a trusted repository-host attestation".into());
     }
     let mut carried = BTreeSet::new();
-    if checkpoint.stage == Stage::Selected && !run.releases.contains_key(id) {
+    if checkpoint.stage == Stage::Selected
+        && !run.releases.contains_key(id)
+        && checkpoint.works.len() < batch_target
+        && authority.is_none()
+    {
         // Pin one actual remote tip and require its commit locally. A stale
         // tracking ref, missing object, failed read or unknown ancestry grants
         // no exemption. Never fetch or mutate repository refs here.
@@ -206,7 +226,25 @@ pub async fn record_in_checkout_attested(
             }
         }
     }
-    record_with_carried(run, id, checkpoint, &carried, authority.is_some())
+    record_with_carried(
+        run,
+        id,
+        checkpoint,
+        &carried,
+        authority.is_some(),
+        batch_target,
+    )
+}
+
+pub fn batch_target_from_host(reply: &Value) -> Result<usize, String> {
+    match reply.get("release_batch_target") {
+        None => Ok(ROUND_LIMIT),
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| "invalid host release_batch_target: expected a positive integer".into()),
+    }
 }
 
 async fn git_read(checkout: &Path, args: &[&str]) -> Option<String> {
@@ -233,6 +271,7 @@ fn record_with_carried(
     checkpoint: &Checkpoint,
     carried: &BTreeSet<String>,
     held: bool,
+    batch_target: usize,
 ) -> Result<(), String> {
     if id.trim().is_empty() || !full_sha(&checkpoint.revision) {
         return Err("release checkpoint requires a release id and full revision SHA".into());
@@ -427,7 +466,7 @@ fn record_with_carried(
         }
     }
     let waiting = waiting_heads(run, checkpoint, carried);
-    if !held && checkpoint.works.len() < ROUND_LIMIT && !waiting.is_empty() {
+    if !held && checkpoint.works.len() < batch_target && !waiting.is_empty() {
         let oldest = waiting
             .iter()
             .take(5)
@@ -438,7 +477,7 @@ fn record_with_carried(
             "release selection under-batches: {} accepted finished heads would wait another round \
              (oldest: {oldest}). A ready head waits at most one round, and only the first corrective \
              round after a failure may isolate its repair. Carry them oldest first, up to \
-             {ROUND_LIMIT} works, or record `deferred:<work>` selection evidence naming the merge \
+             {batch_target} works, or record `deferred:<work>` selection evidence naming the merge \
              conflict that sends one back to its worker",
             waiting.len()
         ));
@@ -458,7 +497,7 @@ fn record_with_carried(
     Ok(())
 }
 
-/// A clean round carries every releasable head, up to this many works.
+/// Default batch fill for hosts that supply no repository-specific target.
 const ROUND_LIMIT: usize = 12;
 
 /// Releasable heads a new selection leaves out, oldest first. Only the first

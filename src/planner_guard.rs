@@ -205,6 +205,10 @@ pub struct SessionRuntime {
     pub steering: bool,
     /// Session-wide throttle, retained across parent turn boundaries.
     pub last_steer: Option<std::time::Instant>,
+    /// When each queued item last cancelled a router-owned turn because
+    /// steering was declined (`crate::planner_wake::preempt_allowed`).
+    /// Retained across turns: the cancel is what ends the turn.
+    pub turn_cancels: HashMap<String, (std::time::Instant, u32)>,
     /// Each work's latest child session (process key, downstream session id).
     pub children: HashMap<String, (crate::downstream::ProcessKey, String)>,
     pub drain: Option<crate::planner_shutdown::Drain>,
@@ -346,6 +350,12 @@ pub fn works_json(run: &PlannerRun) -> Vec<Value> {
             json!({"work_id":id,"plan_id":w.spec.plan_id,"status":w.status,
                 "external_id":w.spec.external_id,
                 "attempt_active":w.attempt.as_ref().is_some_and(|attempt| !attempt.ended),
+                // A host that tells the parent to dispatch a work must know it
+                // first needs the parent's `reconcile`.
+                "reconciliation_required":w.reconciliation.required,
+                // A dependency wait is not idle capacity the parent can refill.
+                // Reuse the dispatch gate, including exact accepted-source dependencies.
+                "dependencies_ready":planner_workflow::dependencies_ready(run, w).is_ok(),
                 "waiting_build_revision":planner_capacity::waiting_on_build(run, w, now)
                     .then(|| &run.observations[&format!("ci:{id}")].revision),
                 "revision":w.artifact.as_ref().map(|a| &a.revision)})
@@ -429,9 +439,15 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if !due {
         return;
     }
+    let started = std::time::Instant::now();
     let Some(answer) = audit(shared, sid, &run, now_ms, false, None).await else {
         return;
     };
+    // Freshness begins at the answer. A slow host must not return a snapshot
+    // already stale enough to restart workers parked on its pending CI result.
+    // Keep the caller's clock and whole-second resolution for deterministic ticks.
+    let answered_at_ms =
+        now_ms.saturating_add((started.elapsed().as_secs() as i64).saturating_mul(1000));
     let observations = answer
         .as_ref()
         .ok()
@@ -439,7 +455,7 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
         .unwrap_or_default();
     let snapshot = match answer {
         Ok(reply) => AuditSnapshot {
-            at_ms: now_ms,
+            at_ms: answered_at_ms,
             ok: true,
             error: None,
             defects: reply.defects,
@@ -447,7 +463,7 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
             completed_guides: reply.completed_guides,
         },
         Err(error) => AuditSnapshot {
-            at_ms: now_ms,
+            at_ms: answered_at_ms,
             ok: false,
             error: Some(error),
             defects: Vec::new(),
@@ -1013,7 +1029,7 @@ pub fn child_may_continue(
         .ok()
         .flatten()
         .is_some_and(|run| {
-            matches!(run.status, RunStatus::Running | RunStatus::Draining)
+            run.status == RunStatus::Running
                 && run.works.get(&identity.work_id).is_some_and(|w| {
                     !w.paused
                         && w.attempt
@@ -1025,9 +1041,7 @@ pub fn child_may_continue(
 
 /// Wait out a planner child's continuation backoff (`continued` earlier
 /// continuations). `None`: stop continuing it (its run stopped, its work was
-/// paused or a drain cancelled it). `Some(Some(message))`: a shutdown drain's
-/// message, which goes at once instead of the host's. `Some(None)`: send the
-/// host's message.
+/// paused or is draining). `Some(None)`: send the host's message.
 pub async fn child_continuation(
     shared: &Shared,
     sid: &str,
@@ -1040,11 +1054,6 @@ pub async fn child_continuation(
     loop {
         if !child_may_continue(shared, sid, identity) {
             return None;
-        }
-        if let Some(message) =
-            crate::planner_shutdown::take_injection(shared, sid, &identity.work_id)
-        {
-            return Some(Some(message));
         }
         if std::time::Instant::now() >= until {
             return Some(None);

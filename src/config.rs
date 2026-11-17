@@ -995,6 +995,13 @@ pub struct AgentConfig {
     /// run for delegated work. Off unless set.
     #[serde(default)]
     pub bypass_hook_trust: bool,
+    /// Codex adapters only: `false` writes `features.plugins = false` into each
+    /// runtime's `config.toml`. With plugins on, a Codex process whose shared
+    /// catalog cache is stale downloads the whole remote plugin catalog when it
+    /// starts (about 69 MB in Codex 0.159), and a router starts one process per
+    /// session. On unless set, which is Codex's own default.
+    #[serde(default = "default_true")]
+    pub plugins: bool,
     /// Most delegated sub-sessions this agent runs at once, beside the global
     /// `delegation.max_concurrent`. Each account seat gets its own limit, so
     /// adding accounts or agents adds delegate capacity. Unset: only the
@@ -1672,7 +1679,7 @@ pub struct PlannerShutdownConfig {
     pub args: Vec<String>,
     #[serde(default = "default_planner_host_slow_timeout_ms")]
     pub timeout_ms: u64,
-    /// How long one live worker gets to commit, push and stop before it is
+    /// How long one live worker gets to save its state and stop before it is
     /// cancelled.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
@@ -1698,7 +1705,7 @@ fn default_audit_interval_secs() -> u64 {
 }
 
 fn default_drain_timeout_secs() -> u64 {
-    900
+    20
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2705,7 +2712,7 @@ impl Config {
             let Some(model) = CandidateId::parse(key).and_then(|id| self.model_config(&id)) else {
                 // A family shorthand pins one of that family's model ids.
                 let (scope, family) = match key.split_once('/') {
-                    Some((scope, family)) => (Some(scope), family.as_ref()),
+                    Some((scope, family)) => (Some(scope), family),
                     None => (None, key.as_str()),
                 };
                 let pins_a_member = self.agents.iter().any(|agent| {

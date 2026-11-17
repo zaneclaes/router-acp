@@ -6,7 +6,7 @@
 //! unambiguous (or an adapter-provided session marker identifies one active
 //! prompt); ambiguous traffic passes through unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -83,6 +83,9 @@ pub struct LlmProxyRuntime {
     policy: Mutex<HashMap<String, RequestPolicyState>>,
     next_registration: AtomicU64,
     client: reqwest::Client,
+    /// Upstream base URLs that refused compression and accepted the same body plain.
+    /// A refusal must not disable compression for another provider or endpoint.
+    compression_refused: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for LlmProxyRuntime {
@@ -133,6 +136,7 @@ impl LlmProxyRuntime {
             policy: Mutex::new(HashMap::new()),
             next_registration: AtomicU64::new(1),
             client,
+            compression_refused: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -607,14 +611,91 @@ async fn proxy_request(
     }
     let request_id = format!("llm-{}", uuid::Uuid::new_v4());
     let started = Instant::now();
+    let compression_allowed = parsed.is_some()
+        && !state
+            .runtime
+            .compression_refused
+            .lock()
+            .unwrap()
+            .contains(&target.config.upstream_base_url);
+    let compressed = compression_allowed
+        .then(|| {
+            compressed_request_body(
+                &target.config,
+                &parts.method,
+                &rest,
+                &outbound_headers,
+                &outbound_body,
+            )
+        })
+        .flatten();
+    let sent_compressed = compressed.is_some();
+    let sent_bytes = compressed
+        .as_ref()
+        .map_or(outbound_body.len(), |body| body.bytes.len());
+    let encoding = compressed.as_ref().map(|body| body.encoding);
     let first_request = build_upstream_request(
         &state.runtime.client,
         &parts.method,
         upstream_url.clone(),
         &outbound_headers,
-        outbound_body.clone(),
+        compressed.map_or_else(|| outbound_body.clone(), |body| body.bytes),
+        encoding,
     );
-    let mut upstream = match first_request.send().await {
+    let mut first_response = first_request.send().await;
+    if sent_compressed {
+        tracing::debug!(
+            target: "router_acp::request_compression",
+            agent = %target.agent,
+            original_bytes = outbound_body.len(),
+            sent_bytes,
+            encoding,
+            status = ?first_response.as_ref().ok().map(|r| r.status().as_u16()),
+            "compressed inference request completed"
+        );
+    }
+    // An upstream that cannot read the compressed body answers 400 or 415
+    // before any model runs. Send the same request plain, once; if that is
+    // accepted, the refusal was the encoding, and later requests go plain.
+    // This runs before every other error path, so a refused encoding is never
+    // mistaken for a rejected model or a rejected pin.
+    if sent_compressed
+        && let Ok(response) = &first_response
+        && matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        )
+    {
+        let refused = response.status();
+        let plain = build_upstream_request(
+            &state.runtime.client,
+            &parts.method,
+            upstream_url.clone(),
+            &outbound_headers,
+            outbound_body.clone(),
+            None,
+        )
+        .send()
+        .await;
+        if let Ok(response) = &plain
+            && response.status().is_success()
+        {
+            state
+                .runtime
+                .compression_refused
+                .lock()
+                .unwrap()
+                .insert(target.config.upstream_base_url.clone());
+            tracing::warn!(
+                target = %target.key,
+                %refused,
+                encoding,
+                "upstream refused a compressed request body; sending plain bodies to this upstream from now on"
+            );
+        }
+        first_response = plain;
+    }
+    let mut upstream = match first_response {
         Ok(response) => response,
         Err(err) => {
             let completion = start_request_record(
@@ -681,6 +762,7 @@ async fn proxy_request(
                     upstream_url.clone(),
                     &outbound_headers,
                     outbound_body,
+                    None,
                 )
                 .send()
                 .await
@@ -787,6 +869,7 @@ async fn proxy_request(
                 upstream_url,
                 &retry_headers,
                 body.to_vec(),
+                None,
             )
             .send()
             .await;
@@ -952,20 +1035,75 @@ async fn proxy_request(
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "cannot build proxy response"))
 }
 
+/// Bodies below this size are sent as they are: the saving would not pay for
+/// the compression.
+const COMPRESSION_MIN_BODY_BYTES: usize = 4096;
+
+struct EncodedBody {
+    encoding: &'static str,
+    bytes: Vec<u8>,
+}
+
+/// Compress large inference requests from Codex, Claude and Grok. Codex's
+/// custom provider loses its native zstd encoding. Grok accepts zstd, while
+/// Claude accepts gzip and rejects zstd. Unsupported upstreams fall back above.
+/// Never wrap an adapter's existing encoding or compress non-inference calls.
+fn compressed_request_body(
+    config: &AgentLlmProxyConfig,
+    method: &Method,
+    rest: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<EncodedBody> {
+    let encoding = if config.codex_chatgpt_provider {
+        "zstd"
+    } else {
+        match config.base_url_env.as_str() {
+            "ANTHROPIC_BASE_URL" => "gzip",
+            "GROK_CLI_CHAT_PROXY_BASE_URL" | "GROK_MODELS_BASE_URL" => "zstd",
+            _ => return None,
+        }
+    };
+    if method != Method::POST
+        || !is_inference_endpoint(config.protocol, rest)
+        || body.len() < COMPRESSION_MIN_BODY_BYTES
+        || headers
+            .get_all("content-encoding")
+            .iter()
+            .any(|value| value != "identity")
+    {
+        return None;
+    }
+    let bytes = if encoding == "zstd" {
+        zstd::bulk::compress(body, 3).ok()?
+    } else {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(body).ok()?;
+        encoder.finish().ok()?
+    };
+    (bytes.len() < body.len()).then_some(EncodedBody { encoding, bytes })
+}
+
 fn build_upstream_request(
     client: &reqwest::Client,
     method: &Method,
     url: reqwest::Url,
     headers: &HeaderMap,
     body: Vec<u8>,
+    content_encoding: Option<&'static str>,
 ) -> reqwest::RequestBuilder {
     let mut request = client
         .request(method.clone(), url)
         .header("accept-encoding", "identity")
         .body(body);
+    if let Some(encoding) = content_encoding {
+        request = request.header("content-encoding", encoding);
+    }
     for (name, value) in headers {
         if !is_hop_by_hop(name.as_str())
             && !matches!(name.as_str(), "host" | "content-length" | "accept-encoding")
+            && !(content_encoding.is_some() && name.as_str() == "content-encoding")
         {
             request = request.header(name, value);
         }
@@ -1173,6 +1311,7 @@ async fn reject_pinned_rewrite(
 fn is_request_shape_rejection(detail: &str) -> bool {
     let lower = detail.to_lowercase();
     lower.contains("not supported on this model")
+        || (lower.contains("thinking.type.") && lower.contains("not supported for this model"))
         || lower.contains("requires a model that supports")
         || lower.contains("role 'system'")
         || lower.contains("unexpected role")
@@ -1316,9 +1455,10 @@ fn upstream_url(target: &ProxyTarget, rest: &str, incoming: &Uri) -> Result<reqw
 fn is_inference_endpoint(protocol: LlmWireProtocol, path: &str) -> bool {
     let path = path.trim_end_matches('/');
     match protocol {
-        LlmWireProtocol::Anthropic => path.ends_with("/messages"),
+        LlmWireProtocol::Anthropic => path == "messages" || path.ends_with("/messages"),
         LlmWireProtocol::Openai => {
-            path.ends_with("/responses")
+            matches!(path, "responses" | "chat/completions" | "completions")
+                || path.ends_with("/responses")
                 || path.ends_with("/chat/completions")
                 || path.ends_with("/completions")
         }
@@ -3342,6 +3482,296 @@ agents:
     }
 
     #[test]
+    fn inference_compression_preserves_bodies_and_skips_ineligible_requests() {
+        let codex = AgentLlmProxyConfig {
+            protocol: LlmWireProtocol::Openai,
+            base_url_env: "OPENAI_BASE_URL".into(),
+            upstream_base_url: "https://chatgpt.com/backend-api/codex".into(),
+            codex_chatgpt_provider: true,
+        };
+        let other = AgentLlmProxyConfig {
+            codex_chatgpt_provider: false,
+            ..codex.clone()
+        };
+        // A conversation resent in full: repetitive JSON well over the floor.
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-test",
+            "input": (0..400).map(|turn| json!({"role": "user", "content": format!("turn {turn}: read the file and report what changed")})).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+
+        let headers = HeaderMap::new();
+        let compress = |config: &AgentLlmProxyConfig, method: &Method, path: &str, body: &[u8]| {
+            compressed_request_body(config, method, path, &headers, body)
+        };
+        let compressed = compress(&codex, &Method::POST, "responses", &body).unwrap();
+        assert!(
+            compressed.bytes.len() * 4 < body.len(),
+            "{} of {}",
+            compressed.bytes.len(),
+            body.len()
+        );
+        assert_eq!(
+            zstd::bulk::decompress(&compressed.bytes, body.len()).unwrap(),
+            body
+        );
+
+        for (env, protocol, path, encoding) in [
+            (
+                "ANTHROPIC_BASE_URL",
+                LlmWireProtocol::Anthropic,
+                "v1/messages",
+                "gzip",
+            ),
+            (
+                "GROK_CLI_CHAT_PROXY_BASE_URL",
+                LlmWireProtocol::Openai,
+                "chat/completions",
+                "zstd",
+            ),
+            (
+                "GROK_MODELS_BASE_URL",
+                LlmWireProtocol::Openai,
+                "chat/completions",
+                "zstd",
+            ),
+        ] {
+            let config = AgentLlmProxyConfig {
+                base_url_env: env.into(),
+                protocol,
+                ..other.clone()
+            };
+            let encoded = compress(&config, &Method::POST, path, &body).unwrap();
+            assert_eq!(encoded.encoding, encoding);
+            let decoded = if encoding == "zstd" {
+                zstd::bulk::decompress(&encoded.bytes, body.len()).unwrap()
+            } else {
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(encoded.bytes.as_slice()),
+                    &mut decoded,
+                )
+                .unwrap();
+                decoded
+            };
+            assert_eq!(decoded, body);
+        }
+
+        assert!(compress(&other, &Method::POST, "responses", &body).is_none());
+        assert!(compress(&codex, &Method::GET, "responses", &body).is_none());
+        assert!(compress(&codex, &Method::POST, "uploads", &body).is_none());
+        assert!(
+            compress(
+                &codex,
+                &Method::POST,
+                "responses",
+                br#"{"model":"gpt-test"}"#
+            )
+            .is_none()
+        );
+        let mut encoded_headers = HeaderMap::new();
+        encoded_headers.insert("content-encoding", "gzip".parse().unwrap());
+        assert!(
+            compressed_request_body(&codex, &Method::POST, "responses", &encoded_headers, &body)
+                .is_none()
+        );
+
+        let client = reqwest::Client::new();
+        let url = reqwest::Url::parse("http://127.0.0.1:1/responses").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "identity".parse().unwrap());
+        headers.insert("x-kept", "yes".parse().unwrap());
+        let sent = build_upstream_request(
+            &client,
+            &Method::POST,
+            url.clone(),
+            &headers,
+            compressed.bytes,
+            Some("zstd"),
+        )
+        .build()
+        .unwrap();
+        let encodings: Vec<_> = sent.headers().get_all("content-encoding").iter().collect();
+        assert_eq!(encodings, ["zstd"]);
+        assert_eq!(sent.headers()["x-kept"], "yes");
+        let plain = build_upstream_request(&client, &Method::POST, url, &headers, body, None)
+            .build()
+            .unwrap();
+        assert_eq!(plain.headers()["content-encoding"], "identity");
+    }
+
+    #[tokio::test]
+    async fn proxy_compression_fallback_is_scoped_and_requires_plain_success() {
+        #[derive(Clone, Debug)]
+        struct Seen {
+            path: String,
+            encoding: Option<String>,
+            body: Vec<u8>,
+        }
+        type Calls = Arc<Mutex<Vec<Seen>>>;
+        async fn upstream(State(calls): State<Calls>, request: Request<Body>) -> Response<Body> {
+            let (parts, body) = request.into_parts();
+            assert_eq!(parts.headers["authorization"], "Bearer fixture-only");
+            assert_eq!(parts.headers["content-type"], "application/json");
+            let encoding = parts
+                .headers
+                .get("content-encoding")
+                .map(|v| v.to_str().unwrap().to_owned());
+            let wire = to_bytes(body, 1_000_000).await.unwrap();
+            let body = if let Some(encoding) = encoding.as_deref() {
+                let decoded = if encoding == "zstd" {
+                    zstd::bulk::decompress(&wire, 1_000_000).unwrap()
+                } else {
+                    assert_eq!(encoding, "gzip");
+                    let mut decoded = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut flate2::read::GzDecoder::new(wire.as_ref()),
+                        &mut decoded,
+                    )
+                    .unwrap();
+                    decoded
+                };
+                assert!(wire.len() < decoded.len() / 4);
+                decoded
+            } else {
+                wire.to_vec()
+            };
+            let path = parts.uri.path().to_owned();
+            let reject_encoding =
+                path.starts_with("/grok/") || parts.headers.contains_key("x-transient");
+            let status = if parts.headers.contains_key("x-invalid") {
+                StatusCode::BAD_REQUEST
+            } else if reject_encoding && encoding.is_some() {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            } else if parts.headers.contains_key("x-transient") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            calls.lock().unwrap().push(Seen {
+                path,
+                encoding,
+                body,
+            });
+            Response::builder()
+                .status(status)
+                .body(Body::from("fixture reply"))
+                .unwrap()
+        }
+
+        let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().fallback(upstream).with_state(calls.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::from_yaml(&format!(
+            "state_file: {}\nagents:\n  - name: fixture\n    command: {{ type: stdio, command: mock-agent }}\n    model_selection: {{ type: config-option }}\n    models: [{{ id: fixture, cost_rank: 1 }}]\n",
+            dir.path().join("state.db").display()
+        )).unwrap();
+        config.llm_proxy.enabled = true;
+        let shared = Shared::new(config).unwrap();
+        let state = ProxyServerState {
+            runtime: shared.llm_proxy.clone(),
+            shared,
+        };
+        for (name, env, protocol, codex) in [
+            (
+                "claude",
+                "ANTHROPIC_BASE_URL",
+                LlmWireProtocol::Anthropic,
+                false,
+            ),
+            (
+                "grok",
+                "GROK_CLI_CHAT_PROXY_BASE_URL",
+                LlmWireProtocol::Openai,
+                false,
+            ),
+            (
+                "grok-api",
+                "GROK_MODELS_BASE_URL",
+                LlmWireProtocol::Openai,
+                false,
+            ),
+            ("codex", "OPENAI_BASE_URL", LlmWireProtocol::Openai, true),
+        ] {
+            state.runtime.targets_by_token.lock().unwrap().insert(
+                name.into(),
+                ProxyTarget {
+                    key: ProcessKey(name.into()),
+                    agent: "fixture".into(),
+                    config: AgentLlmProxyConfig {
+                        protocol,
+                        base_url_env: env.into(),
+                        upstream_base_url: format!("http://{address}/{name}"),
+                        codex_chatgpt_provider: codex,
+                    },
+                },
+            );
+        }
+        let body = serde_json::to_vec(&json!({"model":"fixture", "messages":[
+            {"role":"user","content":"a long conversation with completed tool results. ".repeat(500)}
+        ]})).unwrap();
+        for (name, extra, expected, encodings) in [
+            ("claude", "x-ok", StatusCode::OK, vec![Some("gzip")]),
+            ("grok", "x-ok", StatusCode::OK, vec![Some("zstd"), None]),
+            ("grok", "x-ok", StatusCode::OK, vec![None]),
+            ("grok-api", "x-ok", StatusCode::OK, vec![Some("zstd")]),
+            ("codex", "x-ok", StatusCode::OK, vec![Some("zstd")]),
+            (
+                "claude",
+                "x-invalid",
+                StatusCode::BAD_REQUEST,
+                vec![Some("gzip"), None],
+            ),
+            (
+                "claude",
+                "x-transient",
+                StatusCode::SERVICE_UNAVAILABLE,
+                vec![Some("gzip"), None],
+            ),
+            ("claude", "x-ok", StatusCode::OK, vec![Some("gzip")]),
+        ] {
+            calls.lock().unwrap().clear();
+            let endpoint = if name == "claude" {
+                "v1/messages"
+            } else if name == "codex" {
+                "responses"
+            } else {
+                "chat/completions"
+            };
+            let rest = format!("{name}/{endpoint}");
+            let request = Request::builder()
+                .method(Method::POST)
+                .header("authorization", "Bearer fixture-only")
+                .header("content-type", "application/json")
+                .header(extra, "true")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let response = proxy_request(state.clone(), name.into(), rest.clone(), request).await;
+            assert_eq!(response.status(), expected, "{name} {extra}");
+            assert_eq!(
+                to_bytes(response.into_body(), 1024).await.unwrap(),
+                "fixture reply"
+            );
+            let seen = calls.lock().unwrap();
+            assert_eq!(
+                seen.iter()
+                    .map(|r| r.encoding.as_deref())
+                    .collect::<Vec<_>>(),
+                encodings,
+                "{name} {extra}"
+            );
+            for request in seen.iter() {
+                assert_eq!(request.body, body, "{name} {extra}");
+                assert_eq!(request.path, format!("/{rest}"));
+            }
+        }
+        server.abort();
+    }
+
+    #[test]
     fn codex_proxy_env_installs_http_provider_without_losing_config() {
         let env = codex_proxy_env(
             vec![
@@ -4039,12 +4469,18 @@ agents:
         assert!(is_request_shape_rejection(
             "role 'system' is not supported on this model"
         ));
+        assert!(is_request_shape_rejection(
+            "\"thinking.type.disabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."
+        ));
         assert!(!is_request_shape_rejection(
             "Claude Code 2.1.246 does not support this model; version 2.1.251 or newer \
              is required. Run `claude update`."
         ));
         assert!(!is_request_shape_rejection(
             "model: claude-opus-4-6 not found"
+        ));
+        assert!(!is_request_shape_rejection(
+            "thinking.type.disabled model not found"
         ));
     }
 
@@ -4234,6 +4670,15 @@ pinned_versions:
             State(seen): State<Seen>,
             axum::Json(body): axum::Json<Value>,
         ) -> Response<Body> {
+            if body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"\"thinking.type.disabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."}}"#,
+                    ))
+                    .unwrap();
+            }
             let model = body["model"].as_str().unwrap_or("").to_string();
             let has_system_turn = body["messages"]
                 .as_array()
@@ -4383,7 +4828,36 @@ pinned_versions:
             "user notified that the pin survives: {notice}"
         );
 
-        // (d) The adapter's healed retry — same alias, no system turn — is
+        // A rejected thinking option is also a request-shape error. The live
+        // provider spells this "for this model", not "on this model".
+        let disabled = post(
+            proxy_base.clone(),
+            json!({
+                "model": "claude-opus-5",
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "continue"}]
+            }),
+        )
+        .await;
+        assert_eq!(disabled.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            disabled
+                .text()
+                .await
+                .unwrap()
+                .contains("thinking.type.disabled")
+        );
+        assert!(
+            shared
+                .headroom
+                .lock()
+                .unwrap()
+                .usage_cordon(&pinned)
+                .is_none(),
+            "a rejected thinking option must not remove the model from service"
+        );
+
+        // (d) The adapter's healed retry — same alias, no rejected option — is
         //     served by the pinned version itself, not by an alternate.
         drop(turn);
         let _turn2 = shared.llm_proxy.begin_turn(

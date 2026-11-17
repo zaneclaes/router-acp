@@ -58,8 +58,13 @@ This is intentionally **not** a token-router/LiteLLM architecture. Subscription 
 
 ## Install & quick start
 
+Stdio adapters start in their own Unix session and process group. They retain
+group-wide teardown, but inherit no controlling terminal from Kory or another
+client. A shell's terminal operation therefore cannot stop the adapter and all
+its tools with a background-terminal `SIGTTOU` signal during a failover.
+
 ```sh
-cargo install --path .              # or: cargo build --release
+cargo install --path . --locked     # or: cargo build --release --locked
 router-acp check-config --config router.yaml
 router-acp serve --config router.yaml
 ```
@@ -109,7 +114,7 @@ Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
 watchdog. The router has no resource-guard authority over Kory/goose or the
 supervisor's process tree.
 
-`cargo install --path .` also installs `router-resource-run`. Explicitly wrap a
+`cargo install --path . --locked` also installs `router-resource-run`. Explicitly wrap a
 worker build/tool with `router-resource-run -- <command> [arguments]` to contain
 that command and its descendants. Its detached watcher follows process birth
 identities and owned groups across reparenting; its root is always the runner
@@ -420,6 +425,10 @@ Per-class quality scores, coding tiers/percentiles, and context windows live on 
 
 ACP routing normally sees one `session/prompt`; a coding agent may make hundreds of provider calls while executing it. The optional `llm_proxy` interposes those calls. router-acp binds a loopback-only HTTP listener before spawning adapters, replaces each configured adapter's inference base URL, and forwards the original method, path, application headers (including authorization), body, and streamed response. It requests an identity-encoded upstream response so usage can be accounted while streaming; only an inference request's top-level `model` field may change.
 
+Large JSON inference requests use gzip for Claude (`ANTHROPIC_BASE_URL`), and zstd for Codex's ChatGPT provider and both Grok overrides (`GROK_CLI_CHAT_PROXY_BASE_URL`, `GROK_MODELS_BASE_URL`), when compression reduces the body size. Bodies below 4 KiB, already-encoded bodies, and non-inference calls pass through without added compression. If an upstream rejects a compressed request with HTTP 400 or 415, the proxy retries the same body uncompressed once. Only a successful plain retry disables compression for that upstream base URL until the router restarts; other upstreams retain compression. This preserves compatibility with endpoints that do not accept the encoding, but those endpoints receive no compression savings. Response streaming remains unchanged.
+
+For transport verification, `RUST_LOG=off,router_acp::request_compression=debug` reports the agent, original and compressed byte counts, and upstream HTTP status for compressed attempts, without request content or credentials. Installing an updated binary affects newly started router processes; restart an existing client session to use it.
+
 Requests stay on the ACP session's pinned candidate. The proxy moves a request to another model in one case: the pin is out of plan budget (cordoned, quarantined, or seat-exhausted). Then the request goes to the strongest compatible same-agent model that still has budget. If no such model exists, the pin stands. The proxy never switches models to save cost. The per-request cost policy (routine demotion, difficulty escalation, verdict expiry, dwell) was removed: measured on live traffic, it rarely saved money and sometimes moved requests sideways onto pricier models. `routine_streak`, `minimum_dwell_requests`, `verdict_ttl_requests` and `verdict_ttl_secs` are still accepted so old configs load, and a warning names any that are set; they have no effect.
 
 A failover target must fit the estimated request plus requested output within `context_window_fraction` of its context window. An alternate whose window is unknown is never selected. `api_model` maps an ACP selector alias such as `opus[1m]` to the exact provider API model id used for rewrites.
@@ -643,6 +652,21 @@ startup; a refused claim returns directly to the caller. Live planner workers re
 wakes and are never held in `delegate_await`, but a completed background failure can be
 collected and records a parent wake. `delegate_result` also reports failed or queued jobs
 before a child session exists. A queued job is not proof that a worker is making progress.
+
+`delegate_followup` also accepts a running `b-…` job id. It queues an agent-origin correction
+named for the owning parent through the existing session-input delivery path, preserving the
+worker and its current attempt. The reply confirms queuing, not delivery; it does not start a
+second prompt or cancel an in-flight tool. Foreign parents, stale planner attempts and jobs
+without a unique linked child are refused. Original planner `input_ids` still use the normal
+owner follow-up at a turn boundary and are never silently consumed by this route.
+Planner shutdown interrupts only active children to save state, then saves the final
+checkpoint. A shutdown host can save the configured continuation and report its path with
+`continuation_saved: true`, completing the save without another model turn. Otherwise the
+router asks the parent for one brief continuation update. Ended attempts and idle
+keep-open sessions never receive shutdown prompts. An adapter that declines the interrupt
+is cancelled with its already recorded state preserved. Shutdown never asks for commits,
+pushes, builds or audits. The default child grace is 20 seconds; the parent's final update
+is bounded at 30 seconds and is cancelled if it overruns.
 
 ### Host-directed workers
 
@@ -1050,6 +1074,13 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `pinned_versions` | `{}` | Version pinning: `agent/model-id` → `default` or one of that model's `versions[].api_model`. Routing never sees it — the candidate keeps its id in every pool, directive, glob and state row — and the per-request proxy sends the pinned version on the wire, priced (`versions[].pricing`) and scored (the entry in its provider's `data/providers/<name>.yaml` whose `id` is the pinned model id) as that version. The routing disclosure adds a `pinned version <api_model>` note. A key that is not a declared model, or a version the model does not declare, fails the load. |
 | — pin rejected by the provider | – | When the provider rejects the pinned model's `api_model` (HTTP 400/404 — a version gated behind a newer client, a retired id), the router does **not** fall back to whatever the downstream alias would have served: the session is attributed and priced as the pinned version, so serving a different one silently would be a lie. Instead the provider's error is returned to the adapter verbatim (its message is usually actionable), the session gets a notice, and the candidate is cordoned for `headroom.cordon_default_secs` with the provider's reason — so the picker shows it unavailable, automatic routing drops it, and the next turn routes elsewhere instead of paying the same failing round trip again. Rejections of a router-chosen **alternate** keep the original retry-unchanged recovery: there the pinned model is what the adapter asked for anyway. For a version whose provider-file entry says `system_turns: false` (Opus 4.6/4.7, Sonnet 4.6), the proxy folds Claude Code's mid-conversation `role: "system"` turns into user turns and drops the `mid-conversation-system` / `per-turn-control` beta tokens before sending, so the pinned version is never asked for a feature it lacks. A 400 that still rejects a **feature of the request** rather than the model (`… is not supported on this model`, a structured tool-addition turn the proxy cannot fold, `cache_control`) is relayed but does **not** cordon: the adapter re-sends without the feature and the pinned version serves that retry. |
 
+The request-feature distinction also covers the provider's wording
+`"thinking.type.disabled" is not supported for this model`. That response
+does not remove the model from service. The error reaches the adapter unchanged;
+the router does not enable thinking or change the selected model to hide it.
+A corrected request can use the same pin. Missing-model and client-version
+rejections still cordon the model.
+
 ### Delegation
 
 | Key | Default | Meaning |
@@ -1064,6 +1095,7 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 | `delegation.native_subagents` | `forbid` | `allow` removes the ban on provider-native subagent tools from the injected delegation directive. |
 | `delegation.lifecycle_hook` | unset | `{ command, args, timeout_ms, max_continuations }` run with a JSON `delegate_start` / `delegate_turn_end` / `delegate_stop` / `parent_repinned` event on stdin; a failed start refuses the delegate, exit 2 at a turn end sends the worker back. See [Host-directed workers](#host-directed-workers). |
 | `agents[].max_delegates` | unset | Concurrent delegates for this agent (each account seat separately), beside `delegation.max_concurrent`. |
+| `agents[].plugins` | `true` | Codex adapters only. `false` writes `features.plugins = false` into every runtime's `config.toml`. With plugins on, a Codex process that finds the shared catalog cache stale downloads the whole remote plugin catalog at startup (about 69 MB in Codex 0.159), and the router starts one process per session. |
 | `ROUTER_ACP_MCP_CATALOGS` (env) | unset | JSON seed for `delegate_mcp_catalogs` when no client connection can ever send the `router-acp/delegate_mcp_catalogs` notification. Fails open on absent/malformed content. |
 
 ### Per-request LLM proxy
@@ -1233,6 +1265,17 @@ Planner Resume also restores the durable phase, coordinator role, and assignment
 Adopted unfinished assignments require scope/source reconciliation before dispatch.
 That fence applies to each affected assignment: independent capacity checks and
 release reminders continue under the normal ownership and dependency gates.
+An allocator can return its persisted `completion_contract_version`. On refresh of
+the same recorded workspace and lease, version 2 recovers an omitted native field
+and preserves the prior assignment in reconciliation history. Explicit versions,
+new allocations and different leases cannot be migrated this way. The allocation
+request advertises `completion_contract_recovery: true` so hosts do not enable this
+recovery for older routers that ignore the receipt. Ordinary readmission and
+reconciliation still cannot change the admitted version.
+Audit freshness starts when the host answers, so time spent collecting observations
+does not immediately expire a pending CI wait. Recovery prompts use the repository's
+exact CI handoff instead of asking workers to poll within a turn; failed, changed,
+missing or genuinely stale observations retain normal recovery.
 See [durable planner progress](docs/planner-throughput.md).
 An `implement` command that overlaps a previous router's drain records a pending
 handoff. The ordinary capacity cycle retries after owner exit before new work can

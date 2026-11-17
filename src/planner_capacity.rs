@@ -59,7 +59,9 @@ pub const RESUME_BACKOFF_SECS: [i64; 3] = [30, 120, 300];
 pub const SAME_FAILURE_LIMIT: u32 = 3;
 /// The prompt a worker that stopped early is resumed with.
 pub const CONTINUE_PROMPT: &str = "Your work is not finished: continue until its required checks \
-     pass and you record the finished receipt; poll your own branch build in the turn. Never \
+     pass and you record the finished receipt. Read your own branch build once; if it is still \
+     pending, use the repository's waiting handoff with its exact CI identity so the observer \
+     can wake you on a change. Never \
      wait for a staging or production deploy: releases are the parent's, so a worker whose \
      branch is pushed and green reports its artifact and hands back.";
 /// Handoff kinds that ask the parent for something only it can give. Any
@@ -222,6 +224,7 @@ fn open(run: &PlannerRun, work_id: &str) -> bool {
         None => true,
         Some(w) => {
             !w.paused
+                && !w.reconciliation.required
                 && w.attempt.as_ref().is_none_or(|a| a.ended)
                 && (w.status == WorkStatus::Admitted
                     || (w.status == WorkStatus::Interrupted && w.workspace.is_none()))
@@ -233,7 +236,14 @@ fn hold_for<'a>(run: &'a PlannerRun, candidate: &Candidate, now_ms: i64) -> Opti
     [&candidate.work.plan_id, &candidate.work.work_id]
         .into_iter()
         .filter_map(|id| run.capacity.holds.get(id.as_str()))
-        .find(|h| h.expires_at_ms > now_ms)
+        .find(|h| {
+            h.expires_at_ms > now_ms
+                && !(h.reason == RECONCILIATION
+                    && run
+                        .works
+                        .get(&candidate.work.work_id)
+                        .is_some_and(|w| !w.reconciliation.required))
+        })
 }
 
 /// The host's candidates that still need a slot and no unexpired hold covers,
@@ -929,11 +939,7 @@ async fn auto_admit(
         {
             Ok(_) => admitted.push(work_id),
             Err(error) => {
-                let reason = if error.contains("dependencies") {
-                    "dependency"
-                } else {
-                    "disk-floor"
-                };
+                let reason = start_refusal_reason(&error);
                 let detail = format!("router auto-admission of {work_id} refused: {error}");
                 let plan_id = candidate.work.plan_id.clone();
                 let _ = planner_workflow::mutate(shared, sid, |run| {
@@ -996,13 +1002,40 @@ async fn auto_admit(
     crate::session::notify_user(shared, sid, format!("router-acp · {reason}"));
 }
 
+/// The hold reason for a worker start the router's own auto-admission was
+/// refused. A refusal that waits on the parent's `reconcile` is named so: it was
+/// once filed as `disk-floor`, and a parent reading "disk-floor" with hundreds of
+/// GiB free took the whole hold list for noise and left the slots empty for
+/// hours. Router-written only; a parent still records holds through
+/// [`HOLD_REASONS`].
+pub fn start_refusal_reason(error: &str) -> &'static str {
+    if error.contains("reconciliation required") {
+        RECONCILIATION
+    } else if error.contains("dependencies") {
+        "dependency"
+    } else {
+        "disk-floor"
+    }
+}
+
+/// A router-written hold: the work waits on the parent's planner_workflow `reconcile`.
+pub const RECONCILIATION: &str = "reconciliation";
+
 /// Work ids that could run now but for the parent's reconciliation: no live
 /// attempt, a status the router would resume, and `reconciliation.required`.
-pub(crate) fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
+/// A work another work on the same plan has already carried past admission is
+/// superseded, not waiting: listing it buried the few real ones (one adopted
+/// run named 119 works, about 30 of them live) and the parent dismissed the
+/// whole wake as stale.
+pub fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
     use planner_workflow::WorkStatus;
+    let same_plan = |a: &planner_workflow::Work, b: &planner_workflow::Work| {
+        a.spec.plan_id == b.spec.plan_id
+            || (a.spec.external_id.is_some() && a.spec.external_id == b.spec.external_id)
+    };
     run.works
         .iter()
-        .filter(|(_, work)| {
+        .filter(|(id, work)| {
             work.reconciliation.required
                 && matches!(
                     work.status,
@@ -1012,6 +1045,11 @@ pub(crate) fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
                         | WorkStatus::Accepted
                 )
                 && work.attempt.as_ref().is_none_or(|attempt| attempt.ended)
+                && !run.works.iter().any(|(other_id, other)| {
+                    other_id != *id
+                        && same_plan(work, other)
+                        && !matches!(other.status, WorkStatus::Admitted | WorkStatus::Retired)
+                })
         })
         .map(|(id, _)| id.clone())
         .collect()

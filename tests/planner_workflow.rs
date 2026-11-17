@@ -216,6 +216,43 @@ async fn status_execution_context_is_unpaginated_and_requires_human_admission() 
 }
 
 #[test]
+fn audit_dependency_readiness_follows_the_native_dependency_gate() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    admit(&f.shared, work("base"));
+    let mut dependent = work("dependent");
+    dependent.dependencies = vec!["base".into()];
+    admit(&f.shared, dependent);
+    let mut run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let ready = |run: &planner_workflow::PlannerRun, id: &str| {
+        router_acp::planner_guard::works_json(run)
+            .into_iter()
+            .find(|row| row["work_id"] == id)
+            .unwrap()["dependencies_ready"]
+            .as_bool()
+    };
+    assert_eq!(ready(&run, "base"), Some(true));
+    assert_eq!(ready(&run, "dependent"), Some(false));
+    run.works.get_mut("base").unwrap().status = WorkStatus::Integrated;
+    run.works
+        .get_mut("dependent")
+        .unwrap()
+        .reconciliation
+        .required = true;
+    assert_eq!(
+        ready(&run, "dependent"),
+        Some(true),
+        "reconciliation is a separate prerequisite"
+    );
+    run.works.remove("base");
+    assert_eq!(
+        ready(&run, "dependent"),
+        Some(false),
+        "a missing dependency cannot enable dispatch"
+    );
+}
+
+#[test]
 fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
     let f = fixture(|_| {});
     authorize(&f.shared);
@@ -2349,18 +2386,19 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
             .success()
     );
     let receipt = tmp.path().join("workspace.json");
-    let write_receipt = |lease: &str, cache: &str| {
+    let write_receipt = |lease: &str, cache: &str, version: Option<u32>| {
         std::fs::write(
             &receipt,
             serde_json::to_vec(&json!({
                 "path": workspace, "lease": lease,
-                "environment": {"CHORDZY_HOOK_CACHE": cache}
+                "environment": {"CHORDZY_HOOK_CACHE": cache},
+                "completion_contract_version": version
             }))
             .unwrap(),
         )
         .unwrap();
     };
-    write_receipt("stable", "/old/cache");
+    write_receipt("stable", "/old/cache", None);
     let shared = shared_for(&repo, &state_path, |cfg| {
         cfg.routers.planner.workspace = Some(PlannerWorkspaceConfig {
             command: "/bin/sh".into(),
@@ -2371,6 +2409,12 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         });
     });
     admit(&shared, work("work-1"));
+    write_receipt("stable", "/old/cache", Some(2));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(error.contains("without the same existing lease"), "{error}");
+    write_receipt("stable", "/old/cache", None);
     let first = planner_workflow::begin_work(&shared, SID, "work-1")
         .await
         .unwrap();
@@ -2382,7 +2426,7 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         planner_workflow::save(&shared, SID, &mut run).unwrap();
     };
     interrupt();
-    write_receipt("stable", "/physical/current/cache");
+    write_receipt("stable", "/physical/current/cache", Some(2));
     let second = planner_workflow::begin_work(&shared, SID, "work-1")
         .await
         .unwrap();
@@ -2392,8 +2436,66 @@ async fn resumed_workspace_refreshes_tool_environment_without_moving_source() {
         "/physical/current/cache"
     );
     assert_eq!(first.1.lease, second.1.lease);
+    let recovered = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    assert_eq!(
+        recovered.works["work-1"].spec.completion_contract_version,
+        Some(2)
+    );
+    assert_eq!(
+        recovered.works["work-1"]
+            .reconciliation
+            .prior_specs
+            .last()
+            .unwrap()
+            .completion_contract_version,
+        None
+    );
     interrupt();
-    write_receipt("different-lease", "/physical/current/cache");
+    write_receipt("stable", "/physical/current/cache", Some(1));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("cannot change an explicit completion contract"),
+        "{error}"
+    );
+    assert_eq!(
+        planner_workflow::load(&shared, SID).unwrap().unwrap().works["work-1"]
+            .spec
+            .completion_contract_version,
+        Some(2)
+    );
+    let mut explicit_legacy = planner_workflow::load(&shared, SID).unwrap().unwrap();
+    explicit_legacy
+        .works
+        .get_mut("work-1")
+        .unwrap()
+        .spec
+        .completion_contract_version = Some(1);
+    planner_workflow::save(&shared, SID, &mut explicit_legacy).unwrap();
+    write_receipt("stable", "/physical/current/cache", Some(2));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("cannot change an explicit completion contract"),
+        "{error}"
+    );
+    assert_eq!(
+        planner_workflow::load(&shared, SID).unwrap().unwrap().works["work-1"]
+            .spec
+            .completion_contract_version,
+        Some(1)
+    );
+    write_receipt("stable", "/physical/current/cache", Some(3));
+    let error = planner_workflow::begin_work(&shared, SID, "work-1")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("unsupported completion contract version"),
+        "{error}"
+    );
+    write_receipt("different-lease", "/physical/current/cache", Some(2));
     let error = planner_workflow::begin_work(&shared, SID, "work-1")
         .await
         .unwrap_err();
@@ -3805,6 +3907,152 @@ fn unlinked_background_job_names_a_claim_missing_from_the_run() {
     );
 }
 
+#[tokio::test]
+async fn running_background_followup_queues_named_input_without_a_second_worker() {
+    use router_acp::delegate_mcp::{DelegateFollowupArgs, run_delegate_followup};
+    let f = fixture(|_| {});
+    admit(&f.shared, work("design-jam"));
+    let (identity, _, child_id, _) = planner_workflow::begin_work(&f.shared, SID, "design-jam")
+        .await
+        .unwrap();
+    let child = format!("{SID}::delegate-running");
+    f.shared.with_session(SID, |session| {
+        session.delegates.push(router_acp::session::DelegateHandle {
+            process_key: router_acp::downstream::ProcessKey("live-process".into()),
+            downstream_sid: "down-running".into(),
+        })
+    });
+    f.shared.state.lock().unwrap().upsert(
+        format!("{SID}::delegate-old"),
+        PersistedSession {
+            agent: "test".into(),
+            model: "model".into(),
+            downstream_session_id: "down-old".into(),
+            cwd: f.repo.clone(),
+            kind: "delegate".into(),
+            parent_session_id: Some(SID.into()),
+            routing: Some(json!({"worker_id": child_id, "background_id": "b-running"})),
+            ..PersistedSession::default()
+        },
+    );
+    f.shared.state.lock().unwrap().upsert(
+        child.clone(),
+        PersistedSession {
+            agent: "test".into(),
+            model: "model".into(),
+            downstream_session_id: "down-running".into(),
+            cwd: f.repo.clone(),
+            kind: "delegate".into(),
+            parent_session_id: Some(SID.into()),
+            routing: Some(json!({"worker_id": child_id, "background_id": "b-running"})),
+            ..PersistedSession::default()
+        },
+    );
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-running".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "repair".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: true,
+            claim: Some(router_acp::session::PlannerJobClaim {
+                work_id: identity.work_id.clone(),
+                attempt_id: identity.attempt_id.clone(),
+                child_id,
+            }),
+            resume_of: None,
+        },
+    );
+    let args = || DelegateFollowupArgs {
+        delegate_id: "b-running".into(),
+        message: "Inspect the failed required job.".into(),
+        ..DelegateFollowupArgs::default()
+    };
+    let response = run_delegate_followup(&f.shared, SID, args()).await.unwrap();
+    assert!(
+        response.contains("Queued") && response.contains(&child),
+        "{response}"
+    );
+    let response = run_delegate_followup(&f.shared, SID, args()).await.unwrap();
+    assert!(response.contains("Queued"), "{response}");
+    assert_eq!(f.shared.background_delegates.lock().unwrap().len(), 1);
+    let inputs = router_acp::session_input::list(&f.shared.state.lock().unwrap(), &child).unwrap();
+    assert_eq!(inputs.len(), 2);
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input.queued && !input.delivered && input.origin == "agent")
+    );
+    for input in &inputs {
+        let (_, value) = f
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .session_input(&child, &input.input_id)
+            .unwrap()
+            .unwrap();
+        let input: router_acp::session_input::SessionInput = serde_json::from_value(value).unwrap();
+        assert_eq!(input.sender.as_deref(), Some("parent session"));
+        assert_eq!(input.text, "Inspect the failed required job.");
+        assert!(!input.interrupt);
+    }
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let attempt = run.works["design-jam"].attempt.as_ref().unwrap();
+    assert_eq!(attempt.id, identity.attempt_id);
+    assert!(!attempt.ended);
+    assert!(
+        run_delegate_followup(&f.shared, "foreign-parent", args())
+            .await
+            .is_err()
+    );
+    let mut receipts = args();
+    receipts.input_ids = vec!["operator-original".into()];
+    assert!(
+        run_delegate_followup(&f.shared, SID, receipts)
+            .await
+            .is_err()
+    );
+    f.shared
+        .background_delegates
+        .lock()
+        .unwrap()
+        .get_mut("b-running")
+        .unwrap()
+        .claim
+        .as_mut()
+        .unwrap()
+        .attempt_id = "stale-attempt".into();
+    assert!(run_delegate_followup(&f.shared, SID, args()).await.is_err());
+    assert_eq!(
+        router_acp::session_input::list(&f.shared.state.lock().unwrap(), &child)
+            .unwrap()
+            .len(),
+        2
+    );
+    f.shared.background_delegates.lock().unwrap().insert(
+        "b-unlinked".into(),
+        router_acp::session::BackgroundDelegate {
+            parent_sid: SID.into(),
+            summary: "starting".into(),
+            started: std::time::Instant::now(),
+            result: None,
+            planner: false,
+            claim: None,
+            resume_of: None,
+        },
+    );
+    let mut unlinked = args();
+    unlinked.delegate_id = "b-unlinked".into();
+    assert!(
+        run_delegate_followup(&f.shared, SID, unlinked)
+            .await
+            .unwrap_err()
+            .contains("no unique linked child")
+    );
+}
+
 #[test]
 fn follow_up_background_job_reports_the_open_child_session() {
     let f = fixture(|_| {});
@@ -4151,6 +4399,152 @@ async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them()
     assert!(
         run.capacity.unfilled_since.is_none(),
         "no waiting work, no unfilled condition"
+    );
+}
+
+/// A host may reoffer an admitted assignment after adoption. It still needs
+/// reconciliation, so it must raise recovery rather than attempt auto-admission.
+#[tokio::test]
+async fn reoffered_adopted_candidate_waits_for_reconcile_before_admission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = host_script(&["repair"], &tmp.path().join("stdin.json"));
+    let f = fixture(|cfg| capacity_host(cfg, script, 1, 5));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    admit(
+        shared,
+        serde_json::from_value(candidate_json("repair")["work"].clone()).unwrap(),
+    );
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works
+            .get_mut("work-repair")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 30).await;
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(wakes.len(), 1);
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(!router_acp::planner_capacity::awaiting_reconciliation(&run).is_empty());
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, (last + 61) * 1000).is_empty());
+    deliver_all(shared);
+    tick(shared, last + 200).await;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(run.capacity.auto_admit_runs, 0);
+    assert!(run.works["work-repair"].reconciliation.required);
+    assert_eq!(run.works.len(), 1);
+    planner_workflow::mutate(shared, SID, |run| {
+        // An older router may already have held the failed auto-admission.
+        // Successful reconciliation must clear this prerequisite immediately.
+        run.capacity.holds.insert(
+            "work-repair".into(),
+            router_acp::planner_capacity::Hold {
+                plan_id: "work-repair".into(),
+                reason: router_acp::planner_capacity::RECONCILIATION.into(),
+                detail: "automatic admission required reconciliation".into(),
+                expires_at_ms: (last + 2000) * 1000,
+            },
+        );
+        run.works
+            .get_mut("work-repair")
+            .unwrap()
+            .reconciliation
+            .required = false;
+        Ok(())
+    })
+    .unwrap();
+    let mut run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert_eq!(
+        router_acp::planner_capacity::unheld_candidates(&run, (last + 200) * 1000).len(),
+        1
+    );
+    assert!(router_acp::planner_capacity::awaiting_reconciliation(&run).is_empty());
+    run.capacity.holds.get_mut("work-repair").unwrap().reason = "dependency".into();
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, (last + 200) * 1000).is_empty());
+    run.capacity.holds.get_mut("work-repair").unwrap().reason =
+        router_acp::planner_capacity::RECONCILIATION.into();
+    run.works.remove("work-repair");
+    assert!(router_acp::planner_capacity::unheld_candidates(&run, (last + 200) * 1000).is_empty());
+}
+
+/// Live 2026-11-15: an adopted run's reconcile wake named 119 works, about 30
+/// of them live; the rest were old records a newer work on the same plan had
+/// already carried on. The parent dismissed the whole list as stale and left 48
+/// of 50 slots empty for seven hours. A superseded record is not named; the host
+/// is told which works need a reconcile; a reconcile refusal is labelled so.
+#[tokio::test]
+async fn a_reconcile_wake_names_only_works_no_sibling_has_carried_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stdin = tmp.path().join("stdin.json");
+    let script = host_script(&[], &stdin);
+    let f = fixture(|cfg| capacity_host(cfg, script, 1, 5));
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    let on = |id: &str, plan: &str| WorkSpec {
+        plan_id: plan.into(),
+        external_id: Some(plan.into()),
+        ..work(id)
+    };
+    admit(shared, on("plan-a-old", "plan-a"));
+    admit(shared, on("plan-a-new", "plan-a"));
+    admit(shared, on("plan-b-sole", "plan-b"));
+    planner_workflow::mutate(shared, SID, |run| {
+        for id in ["plan-a-old", "plan-b-sole"] {
+            let work = run.works.get_mut(id).unwrap();
+            work.status = planner_workflow::WorkStatus::Interrupted;
+            work.reconciliation.required = true;
+        }
+        run.works.get_mut("plan-a-new").unwrap().status = planner_workflow::WorkStatus::Finished;
+        Ok(())
+    })
+    .unwrap();
+    let last = parent_turn_ended(shared);
+    tick(shared, last + 61).await;
+    let wakes = wakes_with(shared, "capacity:");
+    assert_eq!(
+        wakes.len(),
+        1,
+        "the sole waiting work keeps the condition open"
+    );
+    let reason = &wakes[0].1.reason;
+    assert!(reason.contains("plan-b-sole"), "{reason}");
+    assert!(
+        !reason.contains("plan-a-old"),
+        "a record its sibling carried on is not waiting: {reason}"
+    );
+    let request = std::fs::read_to_string(&stdin).unwrap();
+    assert!(
+        request.contains("\"reconciliation_required\":true"),
+        "the host is told which works need a reconcile: {request}"
+    );
+    // Negative control: with no sibling past admission, both are named.
+    planner_workflow::mutate(shared, SID, |run| {
+        run.works.get_mut("plan-a-new").unwrap().status = planner_workflow::WorkStatus::Admitted;
+        Ok(())
+    })
+    .unwrap();
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    let waiting = router_acp::planner_capacity::awaiting_reconciliation(&run);
+    assert!(waiting.contains(&"plan-a-old".to_string()), "{waiting:?}");
+    assert!(waiting.contains(&"plan-b-sole".to_string()), "{waiting:?}");
+
+    use router_acp::planner_capacity::start_refusal_reason;
+    assert_eq!(
+        start_refusal_reason(
+            "parent reconciliation required: record current scope and preserved source with planner_workflow reconcile before resuming"
+        ),
+        "reconciliation"
+    );
+    assert_eq!(
+        start_refusal_reason("unmet dependencies: plan-b"),
+        "dependency"
     );
 }
 
@@ -5965,6 +6359,99 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
     select().await.unwrap(); // identical operation replay needs no new authority
 }
 
+#[tokio::test]
+async fn release_batch_target_comes_from_host_without_qualifying_unfinished_work() {
+    use router_acp::planner_release::{Checkpoint, Stage};
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(),
+                "read -r request; case \"$request\" in *release-selection-check*) cat \"$1\";; *) echo '{\"verified_action\":\"release\"}';; esac".into(),
+                "fixture".into(), reply.display().to_string()],
+            timeout_ms: 5000,
+        });
+    });
+    let revision = finished_work(&f.shared).await;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let mut waiting = run.works["work-1"].clone();
+        waiting.spec.work_id = "waiting".into();
+        run.works.insert("waiting".into(), waiting);
+        let mut unfinished = run.works["work-1"].clone();
+        unfinished.spec.work_id = "unfinished".into();
+        unfinished.finish = None;
+        run.works.insert("unfinished".into(), unfinished);
+        Ok(())
+    })
+    .unwrap();
+    let checkpoint = Checkpoint {
+        stage: Stage::Selected,
+        revision: revision.clone(),
+        works: BTreeMap::from([("work-1".into(), revision)]),
+        replaces: None,
+        evidence: BTreeMap::from([
+            ("selection".into(), "round.md".into()),
+            ("release_batch_target".into(), "1".into()),
+        ]),
+    };
+    let select = |checkpoint: Checkpoint| {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Release {
+                key: "selection".into(),
+                release_id: "single".into(),
+                checkpoint,
+            },
+        )
+    };
+    // Caller evidence cannot override the default; malformed host policy fails closed.
+    for target in [
+        None,
+        Some(json!(2)),
+        Some(json!(0)),
+        Some(json!(-1)),
+        Some(json!("1")),
+    ] {
+        let mut response = json!({"verified_action":"release-selection-check"});
+        if let Some(target) = target {
+            response["release_batch_target"] = target;
+        }
+        std::fs::write(&reply, serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(select(checkpoint.clone()).await.is_err());
+        assert!(
+            planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .releases
+                .is_empty()
+        );
+    }
+    std::fs::write(
+        &reply,
+        serde_json::to_vec(&json!({
+            "verified_action":"release-selection-check", "release_batch_target":1
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut unfinished = checkpoint.clone();
+    unfinished.works = BTreeMap::from([("unfinished".into(), checkpoint.revision.clone())]);
+    assert!(select(unfinished).await.is_err());
+    let mut held = checkpoint.clone();
+    held.evidence
+        .insert("repair-hold".into(), "repair-hold:fixture:date".into());
+    assert!(select(held).await.is_err());
+    select(checkpoint).await.unwrap();
+    let saved = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(saved.releases["single"].works.len(), 1);
+    assert_eq!(saved.releases["single"].stage(), Stage::Selected);
+    assert!(saved.works["work-1"].integration.is_none());
+    assert_eq!(saved.works["waiting"].status, WorkStatus::Finished);
+}
+
 // Staging 2026-10-21: six corrective rounds in a row each carried one repair
 // while 50 accepted heads waited, so the "clean round after a corrective"
 // never came and nothing reached production.
@@ -6159,6 +6646,31 @@ async fn parent_finalization_is_host_verified_and_release_proofs_remain_required
     assert_eq!(
         run.works["work-1"].reason.as_deref(),
         Some("population gate remains in owning guide")
+    );
+}
+
+#[tokio::test]
+async fn audit_freshness_starts_when_the_host_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("log");
+    std::fs::write(&reply, json!({"defects":[],"observations":{}}).to_string()).unwrap();
+    let f = fixture(|cfg| audit_host(cfg, format!("sleep 1.03; {}", audit_script(&reply, &log))));
+    admit(&f.shared, work("work-1"));
+    let now = chrono::Utc::now().timestamp();
+    router_acp::planner_guard::audit_tick(&f.shared, SID, now).await;
+    let audit = planner_workflow::load(&f.shared, SID)
+        .unwrap()
+        .unwrap()
+        .capacity
+        .audit
+        .unwrap();
+    assert!(audit.ok);
+    // This tests clock origin, not speed: any slower host must still pass.
+    assert!(
+        audit.at_ms >= now * 1000 + 1000,
+        "a new answer was aged by time spent waiting for the host: {}",
+        audit.at_ms
     );
 }
 
@@ -6983,9 +7495,28 @@ async fn turn_end_excludes_commands_and_wake_acknowledgment_resolves_input() {
 
 #[tokio::test]
 async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_records() {
-    for stale_queue in [false, true] {
+    for (stale_queue, owned, acknowledgment) in [
+        (false, false, "wake"),
+        (true, false, "wake"),
+        (false, true, "wake"),
+        (true, true, "input"),
+        (false, true, "reply"),
+    ] {
         let f = fixture(|_| {});
         authorize(&f.shared);
+        if owned {
+            planner_workflow::operate(
+                &f.shared,
+                SID,
+                None,
+                Operation::Admit {
+                    key: "admit-owner".into(),
+                    work: work("original-owner"),
+                },
+            )
+            .await
+            .unwrap();
+        }
         let request = input_request(
             Some("old-message"),
             "previously handled operator request",
@@ -6999,6 +7530,10 @@ async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_rec
         );
         planner_workflow::observe_input(&f.shared, SID, &pending).unwrap();
         planner_workflow::mutate(&f.shared, SID, |run| {
+            if owned {
+                // Assigned before the old parent exited; never delivered to the child.
+                run.inputs.get_mut("old-message").unwrap().owner = Some("original-owner".into());
+            }
             run.parent_queue.push(planner_workflow::QueuedParentInput {
                 input_id: "never-delivered".into(),
                 request: pending.clone(),
@@ -7052,23 +7587,49 @@ async fn adopted_input_is_historical_and_one_wake_acknowledgment_closes_both_rec
             text.text
                 .contains("acknowledge it, do not answer or act on it again")
         );
+        let ack = || Operation::AcknowledgeWake {
+            key: "ack-history-once".into(),
+            wake_id: "input:old-message".into(),
+        };
+        assert!(
+            planner_workflow::operate(&f.shared, "next", None, ack())
+                .await
+                .is_err(),
+            "adoption is not delivery to the new parent"
+        );
         planner_workflow::queue_delivery(&f.shared, "next", "next", "next", ids.clone());
         planner_workflow::confirm_delivery(&f.shared, "next").unwrap();
-        planner_workflow::operate(
-            &f.shared,
-            "next",
-            None,
-            Operation::AcknowledgeWake {
-                key: "ack-history-once".into(),
-                wake_id: "input:old-message".into(),
-            },
-        )
-        .await
-        .unwrap();
+        if acknowledgment == "reply" {
+            planner_workflow::acknowledge_answered_inputs(&f.shared, "next", true).unwrap();
+        } else {
+            let operation = if acknowledgment == "input" {
+                Operation::AcknowledgeInput {
+                    key: "ack-history-once".into(),
+                    input_id: "old-message".into(),
+                    owner: None,
+                }
+            } else {
+                ack()
+            };
+            planner_workflow::operate(&f.shared, "next", None, operation)
+                .await
+                .unwrap();
+        }
         let run = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
         assert!(
             run.inputs["old-message"].acknowledged && run.wakes["input:old-message"].acknowledged
         );
+        assert_eq!(
+            run.inputs["old-message"].owner.as_deref(),
+            owned.then_some("original-owner")
+        );
+        assert!(
+            !run.inputs["old-message"]
+                .delivered_to
+                .contains("original-owner"),
+            "parent reconciliation must not invent child delivery"
+        );
+        assert!(!run.inputs["never-delivered"].acknowledged);
         assert!(
             planner_workflow::parent_input_blocks(&f.shared, "next", &ids)
                 .unwrap()
@@ -7784,7 +8345,10 @@ async fn a_planner_child_may_keep_continuing_until_its_run_or_attempt_stops() {
     let may = || router_acp::planner_guard::child_may_continue(shared, SID, &identity);
     assert!(may());
     set_status(shared, RunStatus::Draining);
-    assert!(may(), "a drain lets a worker finish committing and pushing");
+    assert!(
+        !may(),
+        "a drain saves the existing turn; it must not launch another continuation"
+    );
     set_status(shared, RunStatus::Paused);
     assert!(!may());
     set_status(shared, RunStatus::Running);
@@ -8522,7 +9086,7 @@ async fn run_reaches(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds() {
+async fn shutdown_interrupts_an_operator_turn_instead_of_waiting_for_it() {
     let f = fixture(|_| {});
     authorize(&f.shared);
     pin_parent(&f.shared);
@@ -8534,18 +9098,18 @@ async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds(
             .filter(|p| {
                 p["message"]
                     .as_str()
-                    .is_some_and(|m| m.contains("waiting for the parent's shutdown handoff"))
+                    .is_some_and(|m| m.contains("interrupting the parent turn"))
             })
             .count()
     };
-    tokio::time::timeout(std::time::Duration::from_secs(33), async {
-        while waiting() < 2 {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while waiting() < 1 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("shutdown remains visible while an operator turn is busy");
-    assert!(!router_acp::planner_preempt::preempted(&f.shared, SID));
+    .expect("shutdown interrupts an existing parent turn immediately");
+    assert!(router_acp::planner_preempt::preempted(&f.shared, SID));
     assert!(
         !router_acp::planner_shutdown::progress(&f.shared, SID)
             .iter()
@@ -8555,6 +9119,35 @@ async fn shutdown_waits_for_an_operator_turn_with_progress_every_thirty_seconds(
     );
     f.shared.with_session(SID, |s| s.prompt_activity = 0);
     run_reaches(&f.shared, RunStatus::Paused).await;
+}
+
+#[tokio::test]
+async fn shutdown_with_only_ended_attempts_never_restarts_them() {
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("already-recorded"));
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "already-recorded")
+        .await
+        .unwrap();
+    planner_workflow::attempt_ended(shared, SID, &identity, None, "waiting for CI".into(), false)
+        .unwrap();
+    let before =
+        planner_workflow::load(shared, SID).unwrap().unwrap().works["already-recorded"].clone();
+    router_acp::planner_shutdown::request(shared, &json!({"sessionId":SID})).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_reaches(shared, RunStatus::Paused),
+    )
+    .await
+    .expect("zero live children must not wait for a drain timeout");
+    let after =
+        planner_workflow::load(shared, SID).unwrap().unwrap().works["already-recorded"].clone();
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+    let updates = router_acp::planner_shutdown::progress(shared, SID);
+    assert!(updates.iter().all(|p| p["workersTotal"] == 0));
 }
 
 #[tokio::test]
@@ -8581,8 +9174,8 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     planner_workflow::begin_work(shared, SID, "work-1")
         .await
         .unwrap();
-    // work-2 is idle on an open sub-session: it gets the shutdown follow-up
-    // (which fails at once here: its agent process is gone).
+    // work-2 is idle on an open sub-session: its state is already recorded;
+    // shutdown must not start a follow-up or alter its attempt.
     let (second, _, _, _) = planner_workflow::begin_work(shared, SID, "work-2")
         .await
         .unwrap();
@@ -8619,6 +9212,10 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     let reply = planner_shutdown::request(shared, &json!({"sessionId": SID})).unwrap();
     assert_eq!(reply, json!({"accepted":true}));
     run_reaches(shared, RunStatus::Draining).await;
+    assert!(
+        planner_workflow::begin_followup(shared, SID, &second).is_err(),
+        "even an explicit follow-up cannot revive an idle child during shutdown"
+    );
     assert_eq!(
         planner_shutdown::request(shared, &json!({"sessionId": SID})).unwrap(),
         json!({"accepted":true}),
@@ -8674,35 +9271,43 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
         .iter()
         .map(|p| p["phase"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(phases[..2], ["saving", "saved"], "{phases:?}");
+    let save_index = phases.iter().position(|p| *p == "saving").unwrap();
+    assert!(save_index > 0, "children stop before saving: {phases:?}");
+    assert_eq!(phases[save_index + 1], "saved");
     assert_eq!(*phases.last().unwrap(), "drained", "{phases:?}");
-    assert!(phases[2..phases.len() - 1].iter().all(|p| *p == "draining"));
     assert_eq!(
-        progress[1]["saved"],
+        progress[save_index + 1]["saved"],
         json!([
             "Docs/Plans/data/implementation/resume.md",
             ".scratch/router-host/shutdown/x.json"
         ])
     );
     assert_eq!(
-        progress[1]["message"],
+        progress[save_index + 1]["message"],
         "3 works, 1 with unpushed or uncommitted source"
     );
     assert!(
-        progress[2]["message"]
+        progress[save_index + 2]["message"]
             .as_str()
             .unwrap()
             .contains("not loaded"),
         "an unloaded parent is not prompted: {}",
-        progress[2]
+        progress[save_index + 2]
     );
     let done = progress.last().unwrap();
-    assert_eq!(done["workersTotal"], 2);
-    assert_eq!(done["workersStopped"], 2);
+    assert_eq!(done["workersTotal"], 1);
+    assert_eq!(done["workersStopped"], 1);
     assert_eq!(
         done["workers"],
-        json!([{"workId":"work-1","status":"cancelled"},{"workId":"work-2","status":"stopped"}])
+        json!([{"workId":"work-1","status":"cancelled"}])
     );
+    let idle = planner_workflow::load(shared, SID).unwrap().unwrap().works["work-2"]
+        .attempt
+        .clone()
+        .unwrap();
+    assert_eq!(idle.id, second.attempt_id);
+    assert!(idle.ended);
+    assert_eq!(shared.live_delegates.lock().unwrap()["d-2"].turns, 1);
     let asked: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
     assert_eq!(asked["event"], "shutdown");
@@ -8737,13 +9342,8 @@ async fn a_failed_resume_save_is_reported_and_the_drain_still_finishes() {
     router_acp::planner_shutdown::request(shared, &json!({"sessionId": SID})).unwrap();
     run_reaches(shared, RunStatus::Paused).await;
     let progress = router_acp::planner_shutdown::progress(shared, SID);
-    assert_eq!(progress[1]["phase"], "failed");
-    assert!(
-        progress[1]["message"]
-            .as_str()
-            .unwrap()
-            .contains("disk full")
-    );
+    let failed = progress.iter().find(|p| p["phase"] == "failed").unwrap();
+    assert!(failed["message"].as_str().unwrap().contains("disk full"));
     assert_eq!(progress.last().unwrap()["phase"], "drained");
 }
 
@@ -9258,6 +9858,128 @@ fn assert_lossless_transfer(shared: &Arc<Shared>, into: &str, revision: &str) {
     assert!(old.works.is_empty() && old.releases.is_empty());
     assert!(old.capacity.holds.is_empty() && old.parent_queue.is_empty());
     assert!(old.wakes["ci:work-1"].acknowledged);
+}
+
+#[tokio::test]
+async fn adoption_recomputes_capacity_wakes_and_busy_parent_recovery() {
+    let mut dependent = candidate_json("dependent");
+    dependent["work"]["dependencies"] = json!(["admitted-later"]);
+    let reply = json!({"candidates": [
+        candidate_json("held"), dependent, candidate_json("independent")
+    ]});
+    let f = fixture(|cfg| {
+        cfg.delegation.max_concurrent = 3;
+        capacity_host(
+            cfg,
+            format!("cat >/dev/null; printf '%s' '{reply}'"),
+            1_000,
+            120,
+        );
+    });
+    let shared = &f.shared;
+    let revision = finished_work(shared).await;
+    admit(shared, work("admitted-later"));
+    seed_transferable_state(shared, &revision);
+    planner_workflow::mutate(shared, SID, |run| {
+        run.capacity.last_wake_at = 1;
+        run.capacity.unfilled_wakes = 5;
+        run.works
+            .get_mut("admitted-later")
+            .unwrap()
+            .reconciliation
+            .required = true;
+        run.wakes.insert(
+            "capacity:old".into(),
+            planner_workflow::Wake {
+                reason: "capacity: stale inventory from the previous owner".into(),
+                work_id: SID.into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    pin_parent(shared);
+    let pin = shared.with_session(SID, |s| s.pin.clone()).unwrap();
+    receiving_run(shared, "next");
+    shared.with_session("next", |s| {
+        s.pin = pin;
+        s.prompt_activity = 1;
+    });
+    unload_parent(shared);
+    lease(shared, None, 0);
+    let start = quiet_after(shared);
+    router_acp::planner_adopt::adopt_at(shared.as_ref(), SID, "next", start).unwrap();
+    assert_lossless_transfer(shared, "next", &revision);
+    let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+    assert!(
+        run.wakes["capacity:old"].acknowledged,
+        "the previous inventory must not suppress the new owner's capacity clock"
+    );
+    router_acp::planner_capacity::tick(shared, "next", start).await;
+    assert_eq!(
+        planner_workflow::load(shared, "next")
+            .unwrap()
+            .unwrap()
+            .capacity
+            .last_wake_at,
+        0,
+        "queued operator input still takes precedence"
+    );
+    // Simulate the normal delivery of that operator turn before capacity resumes.
+    planner_workflow::mutate(shared, "next", |run| {
+        run.parent_queue.clear();
+        run.inputs.get_mut("queued-input").unwrap().acknowledged = true;
+        run.wakes
+            .get_mut("input:queued-input")
+            .unwrap()
+            .acknowledged = true;
+        Ok(())
+    })
+    .unwrap();
+    shared.state.lock().unwrap().log(
+        "next",
+        &router_acp::state::LogEntry {
+            ts: Some(start),
+            kind: "tool_call".into(),
+            role: "agent".into(),
+            summary: "parent processing the operator turn".into(),
+            ..Default::default()
+        },
+    );
+    for elapsed in [1, 61, 120, 180] {
+        router_acp::planner_capacity::tick(shared, "next", start + elapsed).await;
+        let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+        assert!(
+            !run.works.contains_key("work-independent"),
+            "too early at {elapsed}"
+        );
+    }
+    let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+    assert!(run.capacity.last_wake_at >= start);
+    assert!(
+        run.wakes
+            .iter()
+            .any(|(id, wake)| id.starts_with("capacity:")
+                && !wake.acknowledged
+                && wake.reason.contains("work-independent"))
+    );
+    router_acp::planner_capacity::tick(shared, "next", start + 182).await;
+    let run = planner_workflow::load(shared, "next").unwrap().unwrap();
+    assert!(
+        run.works["work-independent"].attempt.is_some(),
+        "busy parent recovered"
+    );
+    assert!(
+        !run.works.contains_key("work-held"),
+        "adopted hold still applies"
+    );
+    assert!(
+        run.works["work-dependent"].attempt.is_none(),
+        "dependency still applies"
+    );
+    assert!(run.works["admitted-later"].reconciliation.required);
+    assert!(run.works["admitted-later"].attempt.is_none());
 }
 
 #[tokio::test]

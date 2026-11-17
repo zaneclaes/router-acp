@@ -71,6 +71,14 @@ human implementation command and durable command ledger, never caller evidence.
 It must explicitly return
 `verified_action: release-selection-check`. An active repair hold must be checked
 even if the caller omitted it; an older/unavailable host fails closed.
+The reply may supply `release_batch_target`, a positive integer controlling the
+minimum batch fill when other finished heads wait. Without it, the target remains
+twelve. This is repository policy from the configured host, never caller evidence;
+for example a repository admitting one proven head at a time returns one. It is
+not a maximum or a qualification waiver: permitted riders may accompany that head,
+and exact finished revisions, dependencies, holds and every release gate still apply.
+Malformed values fail closed. The host's final release check retains repository
+admission authority; reducing the target cannot itself admit or deploy anything.
 The host may return `selection_attestation` containing `session_id`, `run_revision`,
 `release_id`, `candidate`, `hold_input_id`, `human_input_id`, `repairs` and `allowed`
 (both work-to-full-SHA maps). This is host output only, never a planner argument.

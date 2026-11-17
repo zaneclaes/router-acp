@@ -445,6 +445,10 @@ can reconcile that same work identity with its corrected brief and preserved sou
 revision. Reconciliation retries the normal allocator and verifies source custody
 before accepting the assignment. A work that already has a workspace must retain
 and restore that original workspace; reconciliation never replaces it.
+If the capacity host reoffers an adopted assignment that still requires reconciliation,
+the router names that prerequisite in its capacity wake instead of attempting automatic
+admission. Once reconciliation succeeds, the same candidate becomes eligible normally,
+even if a previous automatic admission left a reconciliation hold. Other holds remain in force.
 
 Pending input, original attachments, accepted revisions, finishing/integration
 receipts, and wake acknowledgements persist in SQLite. An idle-parent wake has
@@ -452,6 +456,13 @@ bounded retries and cannot infer approval. Disconnecting or cancelling stops
 automatic execution. Resume requires the exact parent identity. `/plan` pauses
 new dispatch while preserving running assignments. `/implement` explicitly
 resumes admitted execution. An empty runnable queue is not completion.
+
+After adoption, historical input is replayed to the new parent for receipt
+reconciliation. Once that replay is delivered, an explicit acknowledgment or a
+normally answered parent turn closes its input and wake records while retaining
+the original work owner. This does not claim delivery to that worker, complete
+its work, or acknowledge an undelivered request. Current corrections still
+require delivery to their assigned owner.
 
 Native Resume restores the durable phase and coordinator role before opening a fresh adapter.
 Effective effort remains unavailable until the adapter or provider confirms it.

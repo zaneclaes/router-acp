@@ -145,7 +145,7 @@ pub fn stdio_lines() -> Lines<BoxSink, BoxStream> {
 }
 
 /// PIDs of live downstream agent processes. Each is spawned as its own
-/// process-group leader (`process_group(0)`), so its PID doubles as a group
+/// session and process-group leader, so its PID doubles as a group
 /// id. `kill_on_drop` handles the normal path, but it does NOT run when the
 /// router is terminated by a signal (goose's Ctrl+C) or when the tokio runtime
 /// tears down on exit — leaving a runaway agent that can keep editing and even
@@ -231,6 +231,22 @@ pub fn router_env() -> &'static [(String, String)] {
     ROUTER_ENV.get().map(Vec::as_slice).unwrap_or_default()
 }
 
+#[cfg(unix)]
+fn isolate_downstream(cmd: &mut tokio::process::Command) {
+    // A group alone retains the client's controlling terminal: a descendant's
+    // terminal ioctl can SIGTTOU-stop the entire adapter and its cancel handler.
+    // setsid also creates the group used by the existing teardown registry.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 impl<R: Role> ConnectTo<R> for ProcessTransport {
     async fn connect_to(
         self,
@@ -242,11 +258,10 @@ impl<R: Role> ConnectTo<R> for ProcessTransport {
             .stdout(ProcessStdio::piped())
             .stderr(ProcessStdio::piped())
             .kill_on_drop(true);
-        // Own process group so we can kill the agent AND its subprocesses (the
-        // Bash it runs) as a unit on shutdown — and so a stray terminal signal
-        // doesn't half-terminate it outside our control.
+        // Own session/group: no controlling terminal, and shutdown still reaps
+        // the agent and its subprocesses as a unit.
         #[cfg(unix)]
-        cmd.process_group(0);
+        isolate_downstream(&mut cmd);
         if self.scrub_auth_env
             || self.name.contains('@')
             || crate::accounts::isolated_environment(&self.env)
@@ -382,6 +397,47 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downstream_has_no_controlling_terminal_and_keeps_its_own_group() {
+        if std::env::var_os("ROUTER_TEST_DETACHED_SESSION").is_some() {
+            unsafe {
+                assert_eq!(
+                    libc::getsid(0),
+                    libc::getpid(),
+                    "adapter inherited the terminal session"
+                );
+                assert_eq!(
+                    libc::getpgrp(),
+                    libc::getpid(),
+                    "adapter lost its teardown group"
+                );
+                let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                if tty >= 0 {
+                    libc::close(tty);
+                }
+                assert!(tty < 0, "stdio adapter retained a controlling terminal");
+            }
+            return;
+        }
+        let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "transport::tests::downstream_has_no_controlling_terminal_and_keeps_its_own_group",
+            "--nocapture",
+        ])
+        .env("ROUTER_TEST_DETACHED_SESSION", "1")
+        .stdin(ProcessStdio::null())
+        .kill_on_drop(true);
+        isolate_downstream(&mut cmd);
+        let output = cmd.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]

@@ -263,6 +263,10 @@ pub struct CompletionRecord {
 pub struct Workspace {
     pub path: PathBuf,
     pub lease: String,
+    /// Trusted allocator's persisted contract. A matching resumed lease can
+    /// recover an omitted native field; it cannot change an explicit version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_contract_version: Option<u32>,
     /// Host allocator supplies per-child runtime context, never model prose.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
@@ -352,10 +356,19 @@ fn acknowledge_input(
         return Ok(()); // already explicitly reconciled by withdrawal
     }
     let input = run.inputs.get_mut(id).ok_or("unknown input receipt")?;
+    // Adoption replays historical input to the parent for receipt reconciliation,
+    // even when the old run assigned it to a work that never received it. Keep
+    // that owner, but use the actual replay delivery; never invent child delivery.
+    let parent_replay = input.replayed_from.is_some() && input.delivered_to.contains(sid);
+    let owner = if parent_replay && owner.is_none() {
+        input.owner.clone()
+    } else {
+        owner
+    };
     if input.owner.is_some() && input.owner != owner {
         return Err("input correction must retain its original work owner".into());
     }
-    if !input.delivered_to.contains(owner.as_deref().unwrap_or(sid)) {
+    if !parent_replay && !input.delivered_to.contains(owner.as_deref().unwrap_or(sid)) {
         return Err(
             "original input and attachments have no delivery receipt for this owner".into(),
         );
@@ -1325,7 +1338,7 @@ pub fn acknowledge_answered_inputs(
         run.inputs.get(id).is_some_and(|input| {
             !run.commands.contains(id)
                 && !input.resolved()
-                && input.owner.is_none()
+                && (input.owner.is_none() || input.replayed_from.is_some())
                 && input.delivered_to.contains(sid)
         })
     };
@@ -2220,7 +2233,8 @@ async fn operate_once(
             let cwd = shared
                 .with_session(sid, |session| session.cwd.clone())
                 .ok_or("unknown planner session")?;
-            let attestation = if checkpoint.stage == crate::planner_release::Stage::Selected
+            let (attestation, batch_target) = if checkpoint.stage
+                == crate::planner_release::Stage::Selected
                 && !run.releases.contains_key(&release_id)
             {
                 // Construct the authority request from durable state, not caller
@@ -2254,7 +2268,8 @@ async fn operate_once(
                     }),
                 )
                 .await?;
-                reply
+                let batch_target = crate::planner_release::batch_target_from_host(&reply)?;
+                let attestation = reply
                     .get("selection_attestation")
                     .filter(|v| !v.is_null())
                     .map(|v| {
@@ -2263,16 +2278,21 @@ async fn operate_once(
                         )
                         .map_err(|e| format!("invalid host selection attestation: {e}"))
                     })
-                    .transpose()?
+                    .transpose()?;
+                (attestation, batch_target)
             } else {
-                None
+                (
+                    None,
+                    crate::planner_release::batch_target_from_host(&Value::Null)?,
+                )
             };
-            crate::planner_release::record_in_checkout_attested(
+            crate::planner_release::record_in_checkout_with_policy(
                 &mut run,
                 &release_id,
                 &checkpoint,
                 &cwd,
                 attestation.as_ref().map(|a| (sid, a)),
+                batch_target,
             )
             .await?;
             let mut check = value.clone();
@@ -2742,6 +2762,7 @@ async fn begin_work_once(
             None => allocate_workspace(shared, sid, &snapshot, &run.policy).await?,
         };
         workspace_available(&workspace)?;
+        allocator_contract_recovery(&snapshot, &workspace)?;
         shared.state.lock().unwrap().claim_planner_workspace(
             &workspace.path,
             sid,
@@ -2774,12 +2795,17 @@ async fn begin_work_once(
         let suspended =
             run.status != RunStatus::Running || run.phase != PlannerPhase::Implementation;
         let work = run.works.get_mut(work_id).ok_or("assignment disappeared")?;
+        let recovered_contract = allocator_contract_recovery(work, &workspace)?;
         let attempt = work
             .attempt
             .as_mut()
             .ok_or("allocation attempt disappeared")?;
         if attempt.id != attempt_id {
             return Err("workspace allocation lost its ownership fence".into());
+        }
+        if let Some(version) = recovered_contract {
+            work.reconciliation.prior_specs.push(work.spec.clone());
+            work.spec.completion_contract_version = Some(version);
         }
         work.workspace = Some(workspace.clone());
         if suspended {
@@ -2853,7 +2879,8 @@ async fn allocate_workspace(
             .spawn()
             .map_err(|e| format!("workspace allocator failed to start: {e}"))?;
         let mut stdin = child.stdin.take().ok_or("allocator stdin missing")?;
-        stdin.write_all(json!({"event":"planner_allocate","session_id":sid,"work":work.spec,"child_id":work.child_id}).to_string().as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.write_all(json!({"event":"planner_allocate","session_id":sid,"work":work.spec,"child_id":work.child_id,
+            "completion_contract_recovery":true}).to_string().as_bytes()).await.map_err(|e| e.to_string())?;
         drop(stdin);
         let output = tokio::time::timeout(
             std::time::Duration::from_millis(allocator.timeout_ms),
@@ -2909,6 +2936,7 @@ async fn allocate_workspace(
         Workspace {
             path,
             lease: work.child_id.clone(),
+            completion_contract_version: None,
             environment: BTreeMap::new(),
             mcp_servers: Vec::new(),
         }
@@ -2926,9 +2954,31 @@ async fn allocate_workspace(
     Ok(Workspace {
         path,
         lease: workspace.lease,
+        completion_contract_version: workspace.completion_contract_version,
         environment: workspace.environment,
         mcp_servers: workspace.mcp_servers,
     })
+}
+
+fn allocator_contract_recovery(work: &Work, workspace: &Workspace) -> Result<Option<u32>, String> {
+    let Some(version) = workspace.completion_contract_version else {
+        return Ok(None);
+    };
+    if !matches!(version, 1 | 2) {
+        return Err("allocator returned an unsupported completion contract version".into());
+    }
+    if work.spec.completion_contract_version.unwrap_or(1) == version {
+        return Ok(None);
+    }
+    if work.spec.completion_contract_version.is_none()
+        && version == 2
+        && work.workspace.as_ref().is_some_and(|previous| {
+            previous.path == workspace.path && previous.lease == workspace.lease
+        })
+    {
+        return Ok(Some(2));
+    }
+    Err("allocator cannot change an explicit completion contract or recover it without the same existing lease".into())
 }
 
 /// Keep the handoff a planner worker just recorded on its own attempt, so the
@@ -3073,10 +3123,8 @@ pub fn begin_followup(
 ) -> Result<String, String> {
     let mut context = String::new();
     mutate(shared, sid, |run| {
-        // A drain's shutdown follow-up is the one turn a draining run gives.
-        if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
-            || run.phase != PlannerPhase::Implementation
-        {
+        // Shutdown interrupts existing turns; it never revives an idle child.
+        if run.status != RunStatus::Running || run.phase != PlannerPhase::Implementation {
             return Err("planner run is suspended".into());
         }
         let work = run
