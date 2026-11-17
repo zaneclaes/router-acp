@@ -640,6 +640,7 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
     // An unchanged delivered audit must not repeatedly interrupt an active
     // repair or release. Idle parents retain the existing repeat cadence.
     if release_audit
+        && !pending_wake(run, prefix)
         && shared
             .with_session(sid, |session| session.prompt_activity > 0)
             .unwrap_or(false)

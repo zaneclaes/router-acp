@@ -7940,7 +7940,7 @@ async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
     // A claimed delivery keeps its evidence until its owner releases the claim.
     planner_workflow::mutate(&f.shared, SID, |run| {
         let wake = run.wakes.get_mut(&original[0].0).unwrap();
-        (wake.claim_pid, wake.claim_started_at_ms) = planner_workflow::process_identity();
+        wake.claim_pid = std::process::id();
         Ok(())
     })
     .unwrap();
@@ -7979,6 +7979,21 @@ async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
     parent_tool_activity(&f.shared, start + 305);
     tick(&f.shared, start + 305).await;
     assert_eq!(wakes_with(&f.shared, "audit:release:").len(), changed.len());
+    std::fs::write(
+        &reply,
+        response("READY_TRANSITION", "changed routine census"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 366);
+    tick(&f.shared, start + 366).await;
+    let recurring = wakes_with(&f.shared, "audit:release:");
+    let pending: Vec<_> = recurring
+        .iter()
+        .filter(|(_, wake)| !wake.acknowledged)
+        .collect();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].1.reason.contains("READY_TRANSITION"));
+    assert_ne!(pending[0].0, original[0].0);
     assert!(
         planner_workflow::load(&f.shared, SID)
             .unwrap()
