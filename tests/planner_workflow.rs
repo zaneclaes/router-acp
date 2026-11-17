@@ -281,6 +281,15 @@ fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
         !active(&run),
         "a stale running label hid the absence of an active repair attempt"
     );
+    assert_eq!(
+        router_acp::planner_guard::works_json(&run)[0]["paused"],
+        false
+    );
+    run.works.get_mut("release-repair").unwrap().paused = true;
+    assert_eq!(
+        router_acp::planner_guard::works_json(&run)[0]["paused"],
+        true
+    );
 }
 
 #[test]
