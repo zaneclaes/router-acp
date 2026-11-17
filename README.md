@@ -698,6 +698,8 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   transition while environments are healthy, including inside a long implementation turn.
   This is delivery metadata, not permission to admit, dispatch, deploy or bypass a gate.
   Continuous parent activity cannot hide changed findings behind routine branch wakes.
+  A changed urgent audit supersedes an unclaimed obsolete audit wake, even if that wake
+  was never acknowledged. The earlier evidence stays recorded; a claimed delivery stays protected.
   Unchanged delivered findings do not repeatedly interrupt active work. Automatic steering waits
   for in-flight tools to finish so adapter interruption cannot masquerade as a user refusing an edit;
   direct operator input keeps its interruption authority. Recovery clears audit urgency;

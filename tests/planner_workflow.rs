@@ -7916,7 +7916,8 @@ async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
                 {"code":"ROUTINE_CENSUS", "detail":census}],
             "observations": {"ci:staging": {"revision":current_revision(&f.repo),
                 "reference":"staging", "state":"passed", "evidence":"fixture"}}
-        }).to_string()
+        })
+        .to_string()
     };
     std::fs::write(&reply, response("READY_TRANSITION", "first census")).unwrap();
     let start = parent_turn_ended(&f.shared);
@@ -7927,23 +7928,64 @@ async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
     let original = wakes_with(&f.shared, "audit:release:");
     assert_eq!(original.len(), 1);
     assert!(!original[0].1.acknowledged);
-    std::fs::write(&reply, response("READY_TRANSITION", "changed routine census")).unwrap();
+    std::fs::write(
+        &reply,
+        response("READY_TRANSITION", "changed routine census"),
+    )
+    .unwrap();
     parent_tool_activity(&f.shared, start + 122);
     tick(&f.shared, start + 122).await;
     assert_eq!(wakes_with(&f.shared, "audit:release:").len(), 1);
 
-    // No acknowledgment arrived. A new release obligation must still be deliverable.
-    std::fs::write(&reply, response("NEXT_TRANSITION", "changed routine census")).unwrap();
+    // A claimed delivery keeps its evidence until its owner releases the claim.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let wake = run.wakes.get_mut(&original[0].0).unwrap();
+        (wake.claim_pid, wake.claim_started_at_ms) = planner_workflow::process_identity();
+        Ok(())
+    })
+    .unwrap();
+    std::fs::write(
+        &reply,
+        response("NEXT_TRANSITION", "changed routine census"),
+    )
+    .unwrap();
     parent_tool_activity(&f.shared, start + 183);
     tick(&f.shared, start + 183).await;
+    assert_eq!(wakes_with(&f.shared, "audit:release:").len(), 1);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let wake = run.wakes.get_mut(&original[0].0).unwrap();
+        wake.claim_pid = 0;
+        wake.claim_started_at_ms = 0;
+        Ok(())
+    })
+    .unwrap();
+    // No acknowledgment arrived. A new release obligation must still be deliverable.
+    parent_tool_activity(&f.shared, start + 244);
+    tick(&f.shared, start + 244).await;
     let changed = wakes_with(&f.shared, "audit:release:");
-    let pending: Vec<_> = changed.iter().filter(|(_, wake)| !wake.acknowledged).collect();
+    let pending: Vec<_> = changed
+        .iter()
+        .filter(|(_, wake)| !wake.acknowledged)
+        .collect();
     assert_eq!(pending.len(), 1);
     assert!(pending[0].1.reason.contains("NEXT_TRANSITION"));
     assert!(!pending[0].1.reason.contains("READY_TRANSITION"));
     assert_ne!(pending[0].0, original[0].0);
-    assert!(changed.iter().any(|(id, wake)| id == &original[0].0 && wake.acknowledged));
-    assert!(planner_workflow::load(&f.shared, SID).unwrap().unwrap().works.is_empty());
+    assert!(
+        changed
+            .iter()
+            .any(|(id, wake)| id == &original[0].0 && wake.acknowledged)
+    );
+    parent_tool_activity(&f.shared, start + 305);
+    tick(&f.shared, start + 305).await;
+    assert_eq!(wakes_with(&f.shared, "audit:release:").len(), changed.len());
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty()
+    );
 }
 
 #[tokio::test]

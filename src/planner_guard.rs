@@ -601,7 +601,7 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
     } else {
         last.max(run.capacity.last_audit_wake_at)
     };
-    if pending_wake(run, prefix)
+    if (!release_audit && pending_wake(run, prefix))
         || (!release_audit && pending_wake(run, "gate:"))
         || now - last < wait
     {
@@ -651,8 +651,20 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         return;
     }
     let _ = planner_workflow::mutate(shared, sid, |run| {
-        if pending_wake(run, prefix) {
+        // Keep an unchanged notification and any claimed delivery. An unclaimed,
+        // obsolete urgent wake must not hide a different current obligation just
+        // because the parent has not acknowledged the earlier one yet.
+        if run.wakes.iter().any(|(id, wake)| {
+            id.starts_with(prefix)
+                && !wake.acknowledged
+                && (!release_audit || wake.reason == reason || wake.claim_pid != 0)
+        }) {
             return Ok(());
+        }
+        for (id, wake) in &mut run.wakes {
+            if id.starts_with(prefix) && !wake.acknowledged {
+                wake.acknowledged = true;
+            }
         }
         run.capacity.last_audit_wake_at = now;
         insert_wake(run, prefix, sid, reason.clone());

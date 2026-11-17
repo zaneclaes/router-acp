@@ -301,6 +301,12 @@ block (`audit`, `audit_findings`, `audit_configured`), and every wake's census
 names the defect codes. While the audit has defects, full worker slots no
 longer excuse the 20-minute heartbeat.
 
+Urgent audit findings also reach a busy parent. If they change while an older audit wake
+is unacknowledged, the router supersedes that unclaimed wake and queues the current
+finding. Claimed deliveries retain their evidence, unchanged findings do not repeat
+during active work, and routine census changes do not replace a healthy release wake.
+This changes notification delivery only; host admission and proof requirements still apply.
+
 ## Turn-end gate
 
 When the parent's turn ends while the audit (taken after that turn ended) has
