@@ -7902,6 +7902,51 @@ fn set_status(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test]
+async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    pin_parent(&f.shared);
+    f.shared.with_session(SID, |s| s.prompt_activity = 1);
+    let response = |code: &str, census: &str| {
+        json!({
+            "defects": [{"code":code, "detail":"qualified transition is due", "urgent":true},
+                {"code":"ROUTINE_CENSUS", "detail":census}],
+            "observations": {"ci:staging": {"revision":current_revision(&f.repo),
+                "reference":"staging", "state":"passed", "evidence":"fixture"}}
+        }).to_string()
+    };
+    std::fs::write(&reply, response("READY_TRANSITION", "first census")).unwrap();
+    let start = parent_turn_ended(&f.shared);
+    router_acp::planner_guard::audit_tick(&f.shared, SID, start).await;
+    deliver_all(&f.shared);
+    parent_tool_activity(&f.shared, start + 61);
+    tick(&f.shared, start + 61).await;
+    let original = wakes_with(&f.shared, "audit:release:");
+    assert_eq!(original.len(), 1);
+    assert!(!original[0].1.acknowledged);
+    std::fs::write(&reply, response("READY_TRANSITION", "changed routine census")).unwrap();
+    parent_tool_activity(&f.shared, start + 122);
+    tick(&f.shared, start + 122).await;
+    assert_eq!(wakes_with(&f.shared, "audit:release:").len(), 1);
+
+    // No acknowledgment arrived. A new release obligation must still be deliverable.
+    std::fs::write(&reply, response("NEXT_TRANSITION", "changed routine census")).unwrap();
+    parent_tool_activity(&f.shared, start + 183);
+    tick(&f.shared, start + 183).await;
+    let changed = wakes_with(&f.shared, "audit:release:");
+    let pending: Vec<_> = changed.iter().filter(|(_, wake)| !wake.acknowledged).collect();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].1.reason.contains("NEXT_TRANSITION"));
+    assert!(!pending[0].1.reason.contains("READY_TRANSITION"));
+    assert_ne!(pending[0].0, original[0].0);
+    assert!(changed.iter().any(|(id, wake)| id == &original[0].0 && wake.acknowledged));
+    assert!(planner_workflow::load(&f.shared, SID).unwrap().unwrap().works.is_empty());
+}
+
+#[tokio::test]
 async fn host_urgent_audit_reaches_busy_parent_without_a_failed_environment() {
     let tmp = tempfile::tempdir().unwrap();
     let reply = tmp.path().join("reply");
