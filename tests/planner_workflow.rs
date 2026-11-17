@@ -7853,6 +7853,69 @@ fn set_status(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test]
+async fn host_urgent_audit_reaches_busy_parent_without_a_failed_environment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    pin_parent(&f.shared);
+    f.shared.with_session(SID, |s| s.prompt_activity = 1);
+    let response = |urgent: bool| {
+        json!({
+        "defects": [{"code":"READY_TRANSITION", "detail":"qualified next transition is due", "urgent":urgent},
+            {"code":"ROUTINE_CENSUS", "detail":"routine status"}],
+        "observations": {"ci:staging": {"revision":current_revision(&f.repo),
+            "reference":"staging", "state":"passed", "evidence":"ci-result.json"}}
+    }).to_string()
+    };
+    std::fs::write(&reply, response(true)).unwrap();
+    let start = parent_turn_ended(&f.shared);
+    router_acp::planner_guard::audit_tick(&f.shared, SID, start).await;
+    deliver_all(&f.shared);
+    parent_tool_activity(&f.shared, start + 61);
+    tick(&f.shared, start + 61).await;
+    let wakes = wakes_with(&f.shared, "audit:release:");
+    assert_eq!(
+        wakes.len(),
+        1,
+        "a host's urgent transition must not wait for a red environment"
+    );
+    assert!(wakes[0].1.reason.contains("READY_TRANSITION"));
+    assert!(!wakes[0].1.reason.contains("ROUTINE_CENSUS"));
+    deliver_all(&f.shared);
+    std::fs::write(
+        &reply,
+        response(true).replace("routine status", "updated routine status"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 122);
+    tick(&f.shared, start + 122).await;
+    assert_eq!(
+        wakes_with(&f.shared, "audit:release:").len(),
+        1,
+        "unchanged findings must not keep interrupting active work"
+    );
+    std::fs::write(&reply, response(false)).unwrap();
+    parent_tool_activity(&f.shared, start + 183);
+    tick(&f.shared, start + 183).await;
+    assert!(
+        wakes_with(&f.shared, "audit:release:")
+            .iter()
+            .all(|(_, wake)| wake.acknowledged),
+        "a withdrawn urgency must not retain permission to interrupt"
+    );
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty(),
+        "audit delivery must not create, dispatch or admit work"
+    );
+}
+
+#[tokio::test]
 async fn failed_environment_audit_reaches_a_continuously_busy_parent() {
     let tmp = tempfile::tempdir().unwrap();
     let reply = tmp.path().join("reply");

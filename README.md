@@ -694,11 +694,14 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   the router ends its own turn and delivers the durable handoff next. Operator turns, approval
   waits, acknowledged or already-claimed deliveries and superseded attempts stay protected.
   While staging or production has a failed build, audit findings use that same urgent path.
+  A successful repository audit may also set `urgent: true` on a defect to deliver a due
+  transition while environments are healthy, including inside a long implementation turn.
+  This is delivery metadata, not permission to admit, dispatch, deploy or bypass a gate.
   Continuous parent activity cannot hide changed findings behind routine branch wakes.
   Unchanged delivered findings do not repeatedly interrupt active work. Automatic steering waits
   for in-flight tools to finish so adapter interruption cannot masquerade as a user refusing an edit;
   direct operator input keeps its interruption authority. Recovery clears audit urgency;
-  ordinary audits retain their idle cadence.
+  withdrawing the host's urgency clears it too; ordinary audits retain their idle cadence.
 
   The parent capacity census and host work snapshots use the same fresh exact-head CI wait
   as automatic recovery. A parked owner is shown as waiting for CI, not awaiting retry;

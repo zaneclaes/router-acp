@@ -16352,6 +16352,15 @@ async fn model_shorthand_preempts_router_owned_turn_and_resumes_its_wake_on_the_
 /// that turn; ordinary wakes still wait for its end and nothing cancels it.
 #[tokio::test]
 async fn failed_environment_is_steered_into_the_running_implement_command_turn() {
+    audit_or_failure_reaches_implement_command(false).await;
+}
+
+#[tokio::test]
+async fn host_urgent_audit_is_steered_into_the_running_implement_command_turn() {
+    audit_or_failure_reaches_implement_command(true).await;
+}
+
+async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
     use router_acp::planner_workflow::{self as workflow, Wake};
     let state = temp_state_file("command-turn-steer");
     let log = temp_log("command-turn-steer");
@@ -16407,12 +16416,20 @@ async fn failed_environment_is_steered_into_the_running_implement_command_turn()
                             router_acp::planner_guard::Observation {
                                 revision: "a".repeat(40),
                                 reference: "staging".into(),
-                                state: router_acp::planner_guard::ObservationState::Failed,
+                                state: if host_urgent { router_acp::planner_guard::ObservationState::Passed }
+                                    else { router_acp::planner_guard::ObservationState::Failed },
                                 evidence: "fixture-build".into(),
                             },
                         );
+                        if host_urgent {
+                            run.capacity.audit = Some(serde_json::from_value(serde_json::json!({
+                                "at_ms": chrono::Utc::now().timestamp_millis(), "ok": true,
+                                "defects": [{"code":"READY_TRANSITION", "detail":"next qualified transition", "urgent":true}]
+                            })).unwrap());
+                        }
                         run.wakes.insert(
-                            "observation:ci-job-failures:staging".into(),
+                            if host_urgent { "audit:release:fixture".into() }
+                                else { "observation:ci-job-failures:staging".into() },
                             Wake {
                                 work_id: sid.clone(),
                                 reason: "STAGING-FAILED-FIXTURE".into(),
@@ -17025,20 +17042,34 @@ async fn queued_agent_input_does_not_preempt_an_operator_turn() {
 
 #[tokio::test]
 async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_turn() {
-    urgent_parent_wake_respects_operator_turn(false, false).await;
+    urgent_parent_wake_respects_operator_turn(false, false, false).await;
 }
 
 #[tokio::test]
 async fn release_audit_reaches_busy_router_parent_but_preserves_operator_turn() {
-    urgent_parent_wake_respects_operator_turn(true, false).await;
+    urgent_parent_wake_respects_operator_turn(true, false, false).await;
 }
 
 #[tokio::test]
 async fn automatic_ownership_steering_waits_for_the_active_edit_to_finish() {
-    urgent_parent_wake_respects_operator_turn(false, true).await;
+    urgent_parent_wake_respects_operator_turn(false, true, false).await;
 }
 
-async fn urgent_parent_wake_respects_operator_turn(release_audit: bool, protect_tool: bool) {
+#[tokio::test]
+async fn host_urgent_audit_reaches_busy_parent_with_healthy_environments() {
+    urgent_parent_wake_respects_operator_turn(true, false, true).await;
+}
+
+#[tokio::test]
+async fn host_urgent_audit_waits_for_the_active_edit_to_finish() {
+    urgent_parent_wake_respects_operator_turn(true, true, true).await;
+}
+
+async fn urgent_parent_wake_respects_operator_turn(
+    release_audit: bool,
+    protect_tool: bool,
+    host_urgent: bool,
+) {
     use router_acp::planner_workflow::{self as workflow, Attempt, Wake, WorkStatus};
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     for operator_turn in [false, true] {
@@ -17081,9 +17112,16 @@ async fn urgent_parent_wake_respects_operator_turn(release_audit: bool, protect_
                 if release_audit {
                     run.observations.insert("ci:staging".into(), router_acp::planner_guard::Observation {
                         revision: "a".repeat(40), reference: "staging".into(),
-                        state: router_acp::planner_guard::ObservationState::Failed,
+                        state: if host_urgent { router_acp::planner_guard::ObservationState::Passed }
+                            else { router_acp::planner_guard::ObservationState::Failed },
                         evidence: "fixture-build".into(),
                     });
+                    if host_urgent {
+                        run.capacity.audit = Some(serde_json::from_value(serde_json::json!({
+                            "at_ms": chrono::Utc::now().timestamp_millis(), "ok": true,
+                            "defects": [{"code":"READY_TRANSITION", "detail":"next qualified transition", "urgent":true}]
+                        })).unwrap());
+                    }
                 }
                 let work = run.works.get_mut("work-1").unwrap();
                 work.status = WorkStatus::Interrupted;

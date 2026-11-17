@@ -290,15 +290,14 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         && !interrupt
         && !key.starts_with("capacity:")
         && !key.starts_with("input:")
-        && !((environment_wake(&key)
-            || key.starts_with("release:")
-            || key.starts_with("audit:release:"))
+        && !((environment_wake(&key) || key.starts_with("release:"))
             && failed_environment(&run.observations))
+        && !(key.starts_with("audit:release:") && crate::planner_guard::urgent_audit(run))
     {
         return;
     }
     let release_audit = key.starts_with("audit:release:");
-    if release_audit && !failed_environment(&run.observations) {
+    if release_audit && !crate::planner_guard::urgent_audit(run) {
         return;
     }
     let ownership = run
@@ -401,7 +400,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                 .flatten()
                 .filter(|current| {
                     current.status == RunStatus::Running
-                        && (!release_audit || failed_environment(&current.observations))
+                        && (!release_audit || crate::planner_guard::urgent_audit(current))
                         && current.approval_waits.is_empty()
                         && current
                             .parent_queue

@@ -58,6 +58,9 @@ pub struct Defect {
     pub code: String,
     #[serde(default)]
     pub detail: String,
+    /// The repository owns transition policy; the router only delivers urgency.
+    #[serde(default)]
+    pub urgent: bool,
 }
 
 /// The audit host's last answer.
@@ -524,13 +527,22 @@ fn insert_wake(run: &mut PlannerRun, prefix: &str, sid: &str, reason: String) {
 /// An idle parent with open audit findings gets an `audit:` wake after
 /// `wake_after_secs`, and another every `wake_after_secs` while they remain,
 /// with no limit. Failed environments use the same path during busy coordination,
-/// with an independent repeat clock and release priority. Ordinary findings still
+/// and host-declared urgent transitions use an independent repeat clock and release priority. Ordinary findings still
 /// wait for idleness; a pending turn-end gate already carries them.
+pub(crate) fn urgent_audit(run: &PlannerRun) -> bool {
+    crate::planner_wake::failed_environment(&run.observations)
+        || run
+            .capacity
+            .audit
+            .as_ref()
+            .is_some_and(|audit| audit.ok && audit.defects.iter().any(|defect| defect.urgent))
+}
+
 pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: i64) {
     if !audit_configured(shared) {
         return;
     }
-    let release_audit = crate::planner_wake::failed_environment(&run.observations);
+    let release_audit = urgent_audit(run);
     if !release_audit && pending_wake(run, "audit:release:") {
         let _ = planner_workflow::mutate(shared, sid, |run| {
             for (id, wake) in &mut run.wakes {
@@ -541,7 +553,28 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             Ok(())
         });
     }
-    let findings = audit_findings(run);
+    // A changing routine census must not continually re-interrupt an unchanged
+    // urgent transition. Ordinary findings still remain in the audit snapshot
+    // and turn-end gate; only the host-declared urgent subset goes mid-turn.
+    let findings = if !crate::planner_wake::failed_environment(&run.observations)
+        && run
+            .capacity
+            .audit
+            .as_ref()
+            .is_some_and(|audit| audit.ok && audit.defects.iter().any(|defect| defect.urgent))
+    {
+        run.capacity
+            .audit
+            .as_ref()
+            .unwrap()
+            .defects
+            .iter()
+            .filter(|defect| defect.urgent)
+            .map(|defect| format!("{}: {}", defect.code, defect.detail))
+            .collect()
+    } else {
+        audit_findings(run)
+    };
     if findings.is_empty() {
         if pending_wake(run, "audit:") {
             let _ = planner_workflow::mutate(shared, sid, |run| {

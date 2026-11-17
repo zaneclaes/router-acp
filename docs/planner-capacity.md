@@ -92,6 +92,13 @@ every 30 minutes after, so a parked run is never silent.
 
 ## Capacity wakes
 
+Audit defects accept an optional `urgent` boolean (default false). A successful host audit
+uses it for transitions that must reach a continuously busy implementation parent even while
+environment builds are healthy. These share the existing release-audit delivery priority,
+tool-boundary protection and unchanged-finding deduplication. Removing the flag withdraws
+that priority. Urgency never selects work or satisfies a release gate; repository policy stays
+in the host, and ordinary defects keep their idle cadence.
+
 Parent wake delivery gives staging/production build, failed-job and smoke observations
 and release checkpoints priority over ordinary WIP build observations, reviews and refill.
 An unfinished release (including a failed deploy, corrective selection and owed disposition)
