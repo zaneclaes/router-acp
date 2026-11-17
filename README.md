@@ -58,6 +58,11 @@ This is intentionally **not** a token-router/LiteLLM architecture. Subscription 
 
 ## Install & quick start
 
+Stdio adapters start in their own Unix session and process group. They retain
+group-wide teardown, but inherit no controlling terminal from Kory or another
+client. A shell's terminal operation therefore cannot stop the adapter and all
+its tools with a background-terminal `SIGTTOU` signal during a failover.
+
 ```sh
 cargo install --path . --locked     # or: cargo build --release --locked
 router-acp check-config --config router.yaml
