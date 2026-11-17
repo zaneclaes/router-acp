@@ -7199,6 +7199,55 @@ async fn obsolete_worker_retirement_is_verified_terminal_and_not_integration() {
 }
 
 #[tokio::test]
+async fn retirement_supplies_the_successor_from_the_same_durable_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let captured = temp.path().join("request.json");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "cat > '{}'; echo '{{\"verified_action\":\"retire\"}}'",
+                    captured.display()
+                ),
+            ],
+            timeout_ms: 5_000,
+        });
+    });
+    admit(&f.shared, work("old"));
+    admit(&f.shared, work("successor"));
+    let operation = |id: &str| Operation::Retire {
+        key: format!("retire-via-{id}"),
+        work_id: "old".into(),
+        reason: "successor preserves the scope; host checks source".into(),
+        evidence: BTreeMap::from([("superseded-by".into(), id.into())]),
+    };
+    for invalid in ["old", "missing"] {
+        assert!(
+            planner_workflow::operate(&f.shared, SID, None, operation(invalid))
+                .await
+                .is_err()
+        );
+        assert!(!captured.exists(), "invalid identity reached the host");
+    }
+    planner_workflow::operate(&f.shared, SID, None, operation("successor"))
+        .await
+        .unwrap();
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(captured).unwrap()).unwrap();
+    assert_eq!(request["assignment"]["spec"]["work_id"], "old");
+    assert_eq!(
+        request["successor_assignment"]["spec"]["work_id"],
+        "successor"
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["old"].status, WorkStatus::Retired);
+    assert_eq!(run.works["successor"].status, WorkStatus::Admitted);
+    assert!(run.works["old"].integration.is_none());
+}
+
+#[tokio::test]
 async fn implement_retries_adoption_after_the_previous_router_finishes_draining() {
     use router_acp::planner_adopt;
     let f = fixture(|_| {});

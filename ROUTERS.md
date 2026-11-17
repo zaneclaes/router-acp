@@ -450,6 +450,14 @@ the router names that prerequisite in its capacity wake instead of attempting au
 admission. Once reconciliation succeeds, the same candidate becomes eligible normally,
 even if a previous automatic admission left a reconciliation hold. Other holds remain in force.
 
+For an obsolete identity whose scope has a successor, `retire` may name
+`evidence: {"superseded-by": "<work-id>"}`. The router supplies both assignments
+from the same durable run to the integration-check host; caller-supplied assignment
+details are not authority. The host decides whether the successor preserves the
+repository's scope and source. Self references and unknown successors are refused.
+An approved retirement ends only the old identity: it does not integrate its work,
+finish the successor, delete source, or remove the guide.
+
 Pending input, original attachments, accepted revisions, finishing/integration
 receipts, and wake acknowledgements persist in SQLite. An idle-parent wake has
 bounded retries and cannot infer approval. Disconnecting or cancelling stops

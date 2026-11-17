@@ -1775,6 +1775,20 @@ async fn operate_once(
             }
             let mut check = value.clone();
             check["assignment"] = serde_json::to_value(work).map_err(|e| e.to_string())?;
+            // The repository decides whether another assignment preserves the old scope
+            // and source. Supply that assignment from this run, never from caller prose.
+            check["successor_assignment"] = Value::Null;
+            if let Some(successor_id) = evidence.get("superseded-by") {
+                if successor_id == &work_id {
+                    return Err("retirement successor must be another work identity".into());
+                }
+                let successor = run
+                    .works
+                    .get(successor_id)
+                    .ok_or("retirement successor is not an assignment in this run")?;
+                check["successor_assignment"] =
+                    serde_json::to_value(successor).map_err(|e| e.to_string())?;
+            }
             crate::planner_guard::integrate_check(shared, sid, &check).await?;
             let work = run.works.get_mut(&work_id).unwrap();
             work.status = WorkStatus::Retired;
