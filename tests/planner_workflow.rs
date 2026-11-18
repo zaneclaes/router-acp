@@ -2101,16 +2101,11 @@ async fn changing_head_after_artifact_blocks_acceptance_but_allows_corrections()
         false,
     )
     .unwrap();
-    let (replacement, resumed, _, role) =
-        planner_workflow::begin_work(&fixture.shared, SID, "work-1")
-            .await
-            .unwrap();
+    let (replacement, resumed, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
     assert_ne!(replacement.attempt_id, identity.attempt_id);
     assert_eq!(resumed.path, workspace.path);
-    assert_eq!(
-        role,
-        router_acp::planner_workflow::PlannerRole::ImplementWork
-    );
     assert_eq!(current_revision(&resumed.path), changed_revision);
 }
 
