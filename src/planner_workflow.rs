@@ -3371,6 +3371,7 @@ mod adoption_custody_tests {
             checks: BTreeMap::new(),
             evidence: vec![],
             unresolved: vec![],
+            integration_requirements: BTreeMap::new(),
         });
         work
     }
