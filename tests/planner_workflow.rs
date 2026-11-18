@@ -1191,6 +1191,77 @@ fn implementation_resume_keeps_failed_environment_priority_and_operator_argument
     }
 }
 
+#[test]
+fn adopted_command_refresh_preserves_concurrent_state_and_input_authority() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    let f = fixture(|_| {});
+    let original = input_request(Some("resume"), "/implement admitted scope only", false);
+    let mut admitted = original.clone();
+    planner_workflow::user_command(&f.shared, SID, &mut admitted).unwrap();
+    // Adoption changes the next role after the command was already admitted.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.observations.insert(
+            "ci:production".into(),
+            Observation {
+                revision: "a".repeat(40),
+                reference: "production".into(),
+                state: ObservationState::Failed,
+                evidence: "deployment failed".into(),
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    let mut concurrent = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let mut refreshed = original.clone();
+    planner_workflow::reshape_admitted_command(&f.shared, SID, &original, &mut refreshed).unwrap();
+    assert_eq!(
+        refreshed.meta.as_ref().unwrap()["router_acp"]["planner_role"],
+        "integrate-plan"
+    );
+    assert!(refreshed.prompt.iter().any(|block| matches!(block,
+        ContentBlock::Text(text) if text.text.contains("Arguments: admitted scope only"))));
+    // Refresh is a read, so a writer that loaded before it can still commit.
+    concurrent
+        .receipts
+        .insert("concurrent-audit".into(), "retained".into());
+    planner_workflow::save(&f.shared, SID, &mut concurrent).unwrap();
+    let revision = concurrent.revision;
+    let altered = input_request(Some("resume"), "/implement different scope", false);
+    assert!(
+        planner_workflow::reshape_admitted_command(&f.shared, SID, &altered, &mut original.clone())
+            .is_err()
+    );
+    let unknown = input_request(Some("unknown"), "/implement admitted scope only", false);
+    assert!(
+        planner_workflow::reshape_admitted_command(&f.shared, SID, &unknown, &mut unknown.clone())
+            .is_err()
+    );
+    // Ordinary replay must still be refused; refresh cannot admit a command.
+    assert!(planner_workflow::user_command(&f.shared, SID, &mut original.clone()).is_err());
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .revision,
+        revision
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_workflow::reshape_admitted_command(
+            &f.shared,
+            SID,
+            &original,
+            &mut original.clone()
+        )
+        .is_err()
+    );
+}
+
 /// Adoption moves every work into the adopting run and marks the old run
 /// superseded, but the workspace claims stay under the old session. The adopting
 /// run must take each claim over; a live run's claim on its own work is kept.

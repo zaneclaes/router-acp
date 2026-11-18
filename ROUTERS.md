@@ -465,6 +465,10 @@ automatic execution. Resume requires the exact parent identity. `/plan` pauses
 new dispatch while preserving running assignments. `/implement` explicitly
 resumes admitted execution. An empty runnable queue is not completion.
 
+The first implementation prompt refreshes its role from the adopted state without
+re-admitting its command or rewriting the run. Background audit and lifecycle writes
+cannot starve that read; the original input identity and scope remain required.
+
 After adoption, historical input is replayed to the new parent for receipt
 reconciliation. Once that replay is delivered, an explicit acknowledgment or a
 normally answered parent turn closes its input and wake records while retaining

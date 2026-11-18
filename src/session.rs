@@ -11201,12 +11201,11 @@ fn prepare_parent_prompt_inner(
                         .get_or_insert_with(Default::default)
                         .entry("router_acp")
                         .or_insert_with(|| json!({}))["input_id"] = json!(input_id);
-                    crate::planner_workflow::user_command_from_original(
+                    crate::planner_workflow::reshape_admitted_command(
                         &shared,
                         &router_sid,
                         &original_req,
                         &mut admitted_command,
-                        true,
                     )
                     .map_err(|error| AcpError::internal_error().data(error))?;
                     req = admitted_command;

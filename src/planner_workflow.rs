@@ -873,7 +873,7 @@ fn user_command_once(
     req: &mut PromptRequest,
     queued: bool,
 ) -> Result<Option<PlannerPhase>, String> {
-    let Some(LeadingCommand { phase, block, args }) = leading_command(req) else {
+    let Some(LeadingCommand { phase, args, .. }) = leading_command(req) else {
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
@@ -948,7 +948,68 @@ fn user_command_once(
         run.execution_request = Some(display_text(original));
         run.execution_input_id = Some(input_id.clone());
     }
-    let role = crate::planner_wake::parent_role(&run, true, &[]);
+    shape_command(shared, sid, &mut run, req, &input_id)?;
+    save(shared, sid, &mut run)?;
+    shared.with_session(sid, |s| s.coordinator |= run.coordinator);
+    let entrypoint_name = match phase {
+        PlannerPhase::Planning => "plan",
+        PlannerPhase::Implementation => "implement",
+    };
+    let typed = format!("{entrypoint_name} {args}");
+    shared.with_session(sid, |s| {
+        s.planner_command_text = Some(typed.trim_end().to_string());
+        s.planner_explicit_phase = Some(phase);
+    });
+    Ok(Some(phase))
+}
+
+/// Refresh an already admitted command after adoption. This reads the new
+/// parent's role without re-admitting input or writing the adopted run: its
+/// audit and lifecycle writers must not contend with presentation of a prompt.
+pub fn reshape_admitted_command(
+    shared: &Arc<Shared>,
+    sid: &str,
+    original: &PromptRequest,
+    req: &mut PromptRequest,
+) -> Result<(), String> {
+    let Some(LeadingCommand { phase, .. }) = leading_command(req) else {
+        return Err("admitted command is missing its command text".into());
+    };
+    let mut run = load(shared, sid)?.ok_or("planner run missing")?;
+    let input_id = prompt_input_id(req)
+        .ok_or("admitted command has no input identity")?
+        .to_string();
+    if run.status != RunStatus::Running
+        || run.phase != phase
+        || !run.commands.contains(&input_id)
+        || !run.inputs.contains_key(&input_id)
+        || run.execution_input_id.as_deref() != Some(&input_id)
+    {
+        return Err("command is not the running planner's admitted implementation input".into());
+    }
+    let mut original = original.clone();
+    if prompt_input_id(&original).is_none() {
+        original.meta = req.meta.clone();
+    }
+    if prompt_input_id(&original) != Some(input_id.as_str()) {
+        return Err("admitted command input identity changed".into());
+    }
+    // Validate without reapplying admission side effects, including clearing
+    // human holds that may have arrived with the adopted state.
+    validate_input(&run.inputs[&input_id], &input_receipt(&original))?;
+    shape_command(shared, sid, &mut run, req, &input_id)
+}
+
+fn shape_command(
+    shared: &Arc<Shared>,
+    sid: &str,
+    run: &mut PlannerRun,
+    req: &mut PromptRequest,
+    input_id: &str,
+) -> Result<(), String> {
+    let LeadingCommand { phase, block, args } =
+        leading_command(req).ok_or("admitted command is missing its command text")?;
+    let role = crate::planner_wake::parent_role(run, true, &[]);
     let entrypoint_name = match phase {
         PlannerPhase::Planning => "plan",
         PlannerPhase::Implementation => "implement",
@@ -970,7 +1031,7 @@ fn user_command_once(
             ));
         } else {
             instructions.push_str("\nThe explicit repository implementation entrypoint is retained for worker assignments. Continue with the parent role above.");
-            run.policy_entrypoint(&input_id, &skill);
+            run.policy_entrypoint(input_id, &skill);
         }
     }
     if let Some(roadmap) = &run.policy.roadmap {
@@ -987,14 +1048,7 @@ fn user_command_once(
     let router_meta = meta.entry("router_acp").or_insert_with(|| json!({}));
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
-    save(shared, sid, &mut run)?;
-    shared.with_session(sid, |s| s.coordinator |= run.coordinator);
-    let typed = format!("{entrypoint_name} {args}");
-    shared.with_session(sid, |s| {
-        s.planner_command_text = Some(typed.trim_end().to_string());
-        s.planner_explicit_phase = Some(phase);
-    });
-    Ok(Some(phase))
+    Ok(())
 }
 
 fn display_text(req: &PromptRequest) -> String {
@@ -1020,9 +1074,22 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let human = human_prompt(req);
-    let receipt = InputReceipt {
-        origin: if human {
+    let receipt = input_receipt(req);
+    if let Some(previous) = run.inputs.get(&id) {
+        validate_input(previous, &receipt)?;
+    } else {
+        run.inputs.insert(id.clone(), receipt);
+    }
+    // The human spoke: lift an awaiting-human hold on every input path.
+    if human_prompt(req) {
+        crate::planner_capacity::clear_human_hold(run);
+    }
+    Ok(id)
+}
+
+fn input_receipt(req: &PromptRequest) -> InputReceipt {
+    InputReceipt {
+        origin: if human_prompt(req) {
             "human"
         } else if delegated_approval(req) {
             "coordinator"
@@ -1041,26 +1108,17 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         owner: None,
         acknowledged: false,
         delivered_to: BTreeSet::new(),
-    };
-    if let Some(previous) = run.inputs.get(&id) {
-        if previous.text != receipt.text
-            || previous.attachments != receipt.attachments
-            || previous.origin != receipt.origin
-        {
-            return Err("input identity already names a different original message".into());
-        }
-    } else {
-        run.inputs.insert(id.clone(), receipt);
     }
-    // The human spoke: an `awaiting-human` hold waits for exactly this, on
-    // whichever path their words arrive (their own turn, a steer into a
-    // router-owned turn, or the durable queue). LESSON (2026-10-27): only the
-    // own-turn path cleared it, so a steered "continue" left a run parked for
-    // ten hours with every wake, heartbeat and capacity tick silenced.
-    if human {
-        crate::planner_capacity::clear_human_hold(run);
+}
+
+fn validate_input(previous: &InputReceipt, receipt: &InputReceipt) -> Result<(), String> {
+    if previous.text != receipt.text
+        || previous.attachments != receipt.attachments
+        || previous.origin != receipt.origin
+    {
+        return Err("input identity already names a different original message".into());
     }
-    Ok(id)
+    Ok(())
 }
 
 impl PlannerRun {
