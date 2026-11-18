@@ -2649,6 +2649,65 @@ fn continuation_role(work: &Work) -> PlannerRole {
     }
 }
 
+/// Adoption after a router restart: a work whose custody is verifiably
+/// unchanged needs no parent reconciliation. The 2026-11-18 restart marked all
+/// 117 adopted works, and the parent spent hours reconciling them one call at a
+/// time while the run sat at 0-3 of 50 workers. Custody is unchanged when no
+/// attempt is still alive, the workspace is a clean git tree, and a submitted
+/// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
+/// live) is still marked, so the parent reconciles exactly what could be lost.
+pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
+    let mut probe = work.clone();
+    mark_reconciliation_required(&mut probe);
+    if !probe.reconciliation.required || work.reconciliation.required {
+        // Not a work adoption would mark, or already owed: unchanged.
+        *work = probe;
+        return;
+    }
+    match adopted_custody_head(work) {
+        Some(head) => {
+            work.reconciliation.source_revision = Some(head);
+            work.reconciliation.evidence =
+                vec!["router: clean workspace with unchanged HEAD at adoption".into()];
+        }
+        None => mark_reconciliation_required(work),
+    }
+}
+
+/// The workspace HEAD when adoption can verify unchanged custody, else None.
+pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
+    if work.attempt.as_ref().is_some_and(|a| !a.ended && owner_alive(a)) {
+        return None;
+    }
+    let path = &work.workspace.as_ref()?.path;
+    if !path.is_dir() {
+        return None;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    if !git(&["status", "--porcelain", "--untracked-files=normal"])?.is_empty() {
+        return None;
+    }
+    let head = git(&["rev-parse", "HEAD"])?;
+    if head.len() != 40 {
+        return None;
+    }
+    if let Some(artifact) = &work.artifact
+        && artifact.revision != head
+    {
+        return None;
+    }
+    Some(head)
+}
+
 pub(crate) fn mark_reconciliation_required(work: &mut Work) {
     if matches!(
         work.status,
@@ -3278,6 +3337,85 @@ fn acknowledge_attempt_notifications(run: &mut PlannerRun, work_id: &str) {
         {
             wake.acknowledged = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod adoption_custody_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn work(dir: &std::path::Path, artifact: Option<&str>) -> Work {
+        let mut work: Work = serde_json::from_value(serde_json::json!({
+            "spec": {"work_id": "w", "plan_id": "p", "scope": "s", "external_id": null},
+            "child_id": "c", "status": "interrupted",
+            "workspace": {"path": dir, "lease": "l"},
+            "attempt": null, "artifact": null, "review": null, "finish": null,
+            "integration": null, "reason": null, "last_output": null
+        }))
+        .expect("work fixture");
+        work.artifact = artifact.map(|revision| Artifact {
+            revision: revision.into(),
+            changed_paths: vec![],
+            checks: BTreeMap::new(),
+            evidence: vec![],
+            unresolved: vec![],
+        });
+        work
+    }
+
+    /// 2026-11-18: a restart marked all 117 adopted works for one-by-one
+    /// reconciliation. A clean tree whose HEAD is its artifact is resumable at
+    /// once; dirty, moved or missing custody is still owed reconciliation.
+    #[test]
+    fn adoption_reconciles_only_custody_that_could_be_lost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        git(path, &["init", "-q"]);
+        std::fs::write(path.join("a.txt"), "a").unwrap();
+        git(path, &["add", "a.txt"]);
+        git(path, &["-c", "user.name=f", "-c", "user.email=f@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "a"]);
+        let head = String::from_utf8(
+            std::process::Command::new("git").arg("-C").arg(path).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let mut clean = work(path, Some(&head));
+        mark_adopted_reconciliation(&mut clean);
+        assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
+        assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+
+        let mut moved = work(path, Some(&"0".repeat(40)));
+        mark_adopted_reconciliation(&mut moved);
+        assert!(moved.reconciliation.required, "a HEAD past its artifact was not marked");
+
+        std::fs::write(path.join("b.txt"), "uncommitted").unwrap();
+        let mut dirty = work(path, Some(&head));
+        mark_adopted_reconciliation(&mut dirty);
+        assert!(dirty.reconciliation.required, "a dirty tree was not marked");
+
+        let mut missing = work(&path.join("gone"), None);
+        mark_adopted_reconciliation(&mut missing);
+        assert!(missing.reconciliation.required, "a missing tree was not marked");
+
+        let mut finished = work(path, Some(&head));
+        finished.status = WorkStatus::Finished;
+        mark_adopted_reconciliation(&mut finished);
+        assert!(!finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
+            "a finished work was touched");
     }
 }
 
