@@ -468,6 +468,8 @@ resumes admitted execution. An empty runnable queue is not completion.
 The first implementation prompt refreshes its role from the adopted state without
 re-admitting its command or rewriting the run. Background audit and lifecycle writes
 cannot starve that read; the original input identity and scope remain required.
+Queued messages remain saved during shutdown and after the run pauses. They cannot
+start a parent turn until the run resumes; delivery rechecks this when claiming input.
 
 After adoption, historical input is replayed to the new parent for receipt
 reconciliation. Once that replay is delivered, an explicit acknowledgment or a

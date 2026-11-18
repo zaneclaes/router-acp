@@ -166,10 +166,9 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 }
                 // Planner wakes never give up: an undelivered or unanswered
                 // wake is retried on a capped backoff, not dropped.
-                if !run.approval_waits.is_empty()
-                    || (!queued_input
-                        && (run.status != RunStatus::Running
-                            || !run.wakes.values().any(|w| !w.acknowledged)))
+                if run.status != RunStatus::Running
+                    || !run.approval_waits.is_empty()
+                    || (!queued_input && !run.wakes.values().any(|w| !w.acknowledged))
                 {
                     continue;
                 }
@@ -1090,6 +1089,9 @@ pub(crate) fn parent_role(
 
 async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     let run = planner_workflow::load(shared, sid)?.ok_or("planner state missing")?;
+    if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
+        return Ok(());
+    }
     if let Some(input) = run.parent_queue.first() {
         if planner_workflow::human_prompt(&input.request) {
             // Actual operator turns stay protected; monitor input does not.
@@ -1243,16 +1245,21 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     result.map(|_| ()).map_err(|e| e.to_string())
 }
 
-async fn deliver_queued_input(
+fn claim_queued_input(
     shared: &Arc<Shared>,
     sid: &str,
-    input: planner_workflow::QueuedParentInput,
-) -> Result<(), String> {
+    input: &planner_workflow::QueuedParentInput,
+) -> Result<(planner_workflow::PlannerRun, bool), String> {
     let agent_input = !planner_workflow::human_prompt(&input.request);
     let wake_id = format!("input:{}", input.input_id);
     let (pid, started) = planner_workflow::process_identity();
     let mut first_announcement = false;
     let claimed = planner_workflow::mutate(shared, sid, |run| {
+        // Shutdown can begin after the idle loop's read. A queued message
+        // survives the drain; it does not authorize resuming the paused run.
+        if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
+            return Err("planner input waits for a resumed running session".into());
+        }
         if run
             .inputs
             .get(&input.input_id)
@@ -1287,6 +1294,18 @@ async fn deliver_queued_input(
         wake.announced |= agent_input;
         Ok(())
     })?;
+    Ok((claimed, first_announcement))
+}
+
+async fn deliver_queued_input(
+    shared: &Arc<Shared>,
+    sid: &str,
+    input: planner_workflow::QueuedParentInput,
+) -> Result<(), String> {
+    let agent_input = !planner_workflow::human_prompt(&input.request);
+    let wake_id = format!("input:{}", input.input_id);
+    let (pid, started) = planner_workflow::process_identity();
+    let (claimed, first_announcement) = claim_queued_input(shared, sid, &input)?;
     if agent_input {
         let attempt = claimed.wakes.get(&wake_id).map_or(1, |w| w.deliveries);
         crate::external_message::announce(
@@ -1350,6 +1369,81 @@ async fn deliver_queued_input(
 mod steer_tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
+
+    #[tokio::test]
+    async fn shutdown_retains_queued_input_without_claiming_or_delivering_it() {
+        use crate::config::Config;
+        use crate::session::RouterSession;
+        use crate::state::PersistedSession;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::from_yaml(&format!(
+            "router: planner\nstate_file: {}\nagents:\n  - name: test\n    command:\n      type: stdio\n      command: /bin/true\n    model_selection:\n      type: config-option\n    models:\n      - id: model\n        cost_rank: 1\n",
+            serde_json::to_string(&tmp.path().join("state.db")).unwrap()
+        )).unwrap();
+        let shared = Shared::new(cfg.clone()).unwrap();
+        let sid = "shutdown-queue";
+        let persisted = PersistedSession {
+            agent: "test".into(),
+            model: "model".into(),
+            downstream_session_id: "downstream".into(),
+            cwd: tmp.path().into(),
+            kind: "primary".into(),
+            ..Default::default()
+        };
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .upsert(sid.into(), persisted.clone());
+        shared.sessions.lock().unwrap().insert(
+            sid.into(),
+            RouterSession::rehydrated(&cfg, &persisted, vec![]),
+        );
+        let request = PromptRequest::new(sid, vec![ContentBlock::from("retain this correction")])
+            .meta(
+                serde_json::from_value(
+                    json!({"router_acp": {"input_id": "correction", "agent_origin": true}}),
+                )
+                .ok(),
+            );
+        planner_workflow::enqueue_parent_input(&shared, sid, &request).unwrap();
+        let input = planner_workflow::load(&shared, sid)
+            .unwrap()
+            .unwrap()
+            .parent_queue[0]
+            .clone();
+        for state in [
+            RunStatus::Draining,
+            RunStatus::Paused,
+            RunStatus::Cancelled,
+            RunStatus::Superseded,
+        ] {
+            planner_workflow::mutate(&shared, sid, |run| {
+                run.status = state;
+                Ok(())
+            })
+            .unwrap();
+            let before = planner_workflow::load(&shared, sid).unwrap().unwrap();
+            deliver(&shared, sid).await.unwrap();
+            // Also exercise a delivery scheduled before shutdown changed state.
+            assert!(claim_queued_input(&shared, sid, &input).is_err());
+            let after = planner_workflow::load(&shared, sid).unwrap().unwrap();
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.parent_queue[0].input_id, "correction");
+            assert_eq!(after.wakes["input:correction"].deliveries, 0);
+            assert!(!after.inputs["correction"].acknowledged);
+        }
+        // Explicit resumption makes the same retained input deliverable once.
+        planner_workflow::mutate(&shared, sid, |run| {
+            run.status = RunStatus::Running;
+            Ok(())
+        })
+        .unwrap();
+        let (claimed, announcement) = claim_queued_input(&shared, sid, &input).unwrap();
+        assert!(announcement);
+        assert_eq!(claimed.wakes["input:correction"].deliveries, 1);
+        assert!(claim_queued_input(&shared, sid, &input).is_err());
+    }
 
     fn pending_steer(
         queue: &[planner_workflow::QueuedParentInput],
