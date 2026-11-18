@@ -7013,6 +7013,11 @@ async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_p
         RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
     );
     planner_workflow::ensure(&f.shared, "next").unwrap();
+    // Adoption now marks only custody that could be lost (a clean tree at its
+    // recorded HEAD resumes at once; `adoption_custody_tests`). Uncommitted
+    // source in the retried work's tree is such custody.
+    let retry_tree = source.works["retry"].workspace.as_ref().unwrap().path.clone();
+    std::fs::write(retry_tree.join("uncommitted-adoption-source.txt"), "unsaved").unwrap();
     {
         let store = f.shared.state.lock().unwrap();
         planner_adopt::adopt(&*store, SID, "next").unwrap();
