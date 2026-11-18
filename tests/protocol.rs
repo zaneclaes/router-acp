@@ -14587,6 +14587,7 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
     let state = temp_state_file("planner-cancel-idle");
     let log = temp_log("planner-cancel-idle");
     let repo = planner_wire_repository();
+    let release = repo.path().join("release-worker");
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
         init(&cx).await?;
@@ -14602,11 +14603,13 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
             &cx,
             &sid,
             &format!(
-                "{}DELEGATE_WORK:work-1:finish this bounded turn",
-                planner_admit_wire_prompt()
+                "{}DELEGATE_WORK:work-1:WAIT_FILE:{}",
+                planner_admit_wire_prompt(),
+                release.display()
             ),
         )
         .await?;
+        wait_for_mock_prompt(&log, &format!("\nWAIT_FILE:{}", release.display())).await;
         assert!(!shared.live_delegates.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
         let attempt = router_acp::planner_workflow::load(&shared, &sid)
@@ -14628,7 +14631,9 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
         assert!(run.works["work-1"].workspace.is_some());
         let after = run.works["work-1"].attempt.as_ref().unwrap();
         let before = attempt.as_ref().unwrap();
+        assert!(!before.ended, "the cancellation control needs a live worker");
         assert_eq!((&after.id, after.ended), (&before.id, before.ended));
+        std::fs::write(&release, "continue").unwrap();
         // A run an older router paused, with a stale permission wait, resumes
         // on the person's next message, even a plain question.
         router_acp::planner_workflow::mutate(&shared, &sid, |run| {
