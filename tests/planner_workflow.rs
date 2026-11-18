@@ -2034,7 +2034,7 @@ async fn required_checks_and_missing_evidence_block_acceptance_and_integration()
 }
 
 #[tokio::test]
-async fn changing_head_after_artifact_invalidates_review() {
+async fn changing_head_after_artifact_blocks_acceptance_but_allows_corrections() {
     let fixture = fixture(|_| {});
     admit(&fixture.shared, work("work-1"));
     let (identity, workspace, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
@@ -2060,6 +2060,7 @@ async fn changing_head_after_artifact_invalidates_review() {
         &workspace.path,
         &["commit", "--quiet", "-m", "changed-head"],
     );
+    let changed_revision = current_revision(&workspace.path);
     let error = planner_workflow::operate(
         &fixture.shared,
         SID,
@@ -2067,7 +2068,7 @@ async fn changing_head_after_artifact_invalidates_review() {
         Operation::Review {
             key: "review-after-head-change".into(),
             work_id: "work-1".into(),
-            revision,
+            revision: revision.clone(),
             accepted: true,
             evidence: vec!["review.txt".into()],
             corrections: None,
@@ -2076,6 +2077,41 @@ async fn changing_head_after_artifact_invalidates_review() {
     .await
     .unwrap_err();
     assert!(error.contains("HEAD changed"), "{error}");
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Review {
+            key: "correct-after-head-change".into(),
+            work_id: "work-1".into(),
+            revision,
+            accepted: false,
+            evidence: vec!["workspace-head-comparison.txt".into()],
+            corrections: Some("Submit an artifact and proof for the current workspace".into()),
+        },
+    )
+    .await
+    .unwrap();
+    planner_workflow::attempt_ended(
+        &fixture.shared,
+        SID,
+        &identity,
+        None,
+        "returned for fresh proof".into(),
+        false,
+    )
+    .unwrap();
+    let (replacement, resumed, _, role) =
+        planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+            .await
+            .unwrap();
+    assert_ne!(replacement.attempt_id, identity.attempt_id);
+    assert_eq!(resumed.path, workspace.path);
+    assert_eq!(
+        role,
+        router_acp::planner_workflow::PlannerRole::ImplementWork
+    );
+    assert_eq!(current_revision(&resumed.path), changed_revision);
 }
 
 #[tokio::test]

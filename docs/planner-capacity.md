@@ -199,6 +199,10 @@ record a parent wake and remain readable through `delegate_result`, even without
 session row. `delegate_await` collects completed failures without waiting on live planner
 jobs. A rejected review still needs explicit dispatch of its correction; verify the owning
 attempt and actual activity instead of repeating the initial background acknowledgment.
+Acceptance requires the submitted revision to match the clean workspace. Rejection
+still targets the recorded artifact but may return a changed workspace for corrections;
+otherwise a moved HEAD would make both review and redispatch impossible. The replacement
+attempt must submit fresh evidence before acceptance or integration.
 Host work rows include the persisted `paused` state alongside `attempt_active`, so an
 audit can distinguish a forgotten correction dispatch from a child deliberately stopped
 by the client. This projection does not resume the child or change dispatch permission.

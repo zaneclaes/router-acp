@@ -2155,11 +2155,16 @@ async fn operate_once(
             {
                 return Err("review refers to a stale artifact or invalid lifecycle state".into());
             }
-            verify_revision(
-                &work.workspace.as_ref().ok_or("workspace missing")?.path,
-                &revision,
-            )
-            .await?;
+            // Acceptance proves this exact workspace. Rejection must also
+            // work after it changes, so the owner can submit fresh evidence.
+            // The recorded artifact identity above still fences stale reviews.
+            if accepted {
+                verify_revision(
+                    &work.workspace.as_ref().ok_or("workspace missing")?.path,
+                    &revision,
+                )
+                .await?;
+            }
             if evidence.is_empty() || evidence.iter().any(|v| !valid_evidence(v)) {
                 return Err("review requires independent evidence".into());
             }
