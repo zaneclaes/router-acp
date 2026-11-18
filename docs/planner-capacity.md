@@ -470,6 +470,10 @@ capacity census as `{"status":"running","live":2,"admissible":7}`. An unknown
 capacity-host answer gives `admissible:null`. Kory uses it after a turn cancellation
 and before exit: cancelling a parent turn leaves the run's admission and recovery
 loops active. Shutdown drains; exit disconnects and cuts workers off.
+The same distinction holds inside every delegate wait, opening, follow-up and
+failover: interrupting a parent turn preserves its durable planner workers.
+Ordinary delegates still stop with their parent turn. Explicit child stop,
+shutdown drain and parent-session closure still stop planner workers.
 
 A turn that delivers wakes (child, heartbeat, capacity, audit, in-flight,
 gate) is router-owned (`src/planner_preempt.rs`). Operator input never waits

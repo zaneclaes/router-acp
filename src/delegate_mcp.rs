@@ -1642,10 +1642,7 @@ async fn run_delegate_task_inner(
         .map(|c| c.cost_rank)
         .ok_or("parent candidate unknown")?;
 
-    if shared
-        .with_session(router_sid, |s| s.cancelled)
-        .unwrap_or(false)
-    {
+    if parent_stops_delegate(shared, router_sid, args.planner_identity.is_some()) {
         return Err("parent session was cancelled".to_string());
     }
 
@@ -2149,11 +2146,9 @@ async fn run_delegate_task_inner(
                     },
                 );
 
-                // If the parent was cancelled while we were opening, cancel
-                // immediately instead of running the subtask.
-                if shared
-                    .with_session(router_sid, |s| s.cancelled)
-                    .unwrap_or(true)
+                // Planner children outlive parent turns; explicit run/child
+                // stops still prevent a newly opened worker from starting.
+                if parent_stops_delegate(shared, router_sid, args.planner_identity.is_some())
                     || args.planner_identity.as_ref().is_some_and(|identity| {
                         crate::planner_workflow::load(shared, router_sid)
                             .ok()
@@ -2672,6 +2667,20 @@ pub(crate) fn delegate_turn_running(shared: &Shared, sub_sid: &str) -> bool {
     shared.delegate_turns.lock().unwrap().contains_key(sub_sid)
 }
 
+/// A planner worker belongs to the durable run, not the current parent turn.
+/// Session closure still stops every delegate; drain and child-stop use their
+/// own explicit cancellation paths.
+fn parent_stops_delegate(shared: &Shared, parent_sid: &str, planner_worker: bool) -> bool {
+    parent_turn_stops_delegate(
+        shared.with_session(parent_sid, |session| session.cancelled),
+        planner_worker,
+    )
+}
+
+fn parent_turn_stops_delegate(parent_cancelled: Option<bool>, planner_worker: bool) -> bool {
+    parent_cancelled.is_none_or(|cancelled| cancelled && !planner_worker)
+}
+
 /// Send one delegate prompt and wait for its reply, unless the sub-session
 /// goes silent past the stall limits. Then the turn is cancelled and fails
 /// with the reason, so its planner attempt ends and wakes the parent instead
@@ -2692,10 +2701,7 @@ async fn prompt_unless_stalled(
             "router_delegate_unavailable": true, "reason": reason,
         }))
     };
-    if shared
-        .with_session(parent_sid, |s| s.cancelled)
-        .unwrap_or(true)
-    {
+    if parent_stops_delegate(shared, parent_sid, planner_parent.is_some()) {
         return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
             StopReason::Cancelled,
         ));
@@ -2713,10 +2719,7 @@ async fn prompt_unless_stalled(
             result = &mut reply => return result,
             _ = tick.tick() => {}
         }
-        if shared
-            .with_session(parent_sid, |s| s.cancelled)
-            .unwrap_or(true)
-        {
+        if parent_stops_delegate(shared, parent_sid, planner_parent.is_some()) {
             let _ = conn.send_notification(CancelNotification::new(downstream_sid.clone()));
             return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
                 StopReason::Cancelled,
@@ -2740,10 +2743,7 @@ fn delegate_failover(
     args: &DelegateTaskArgs,
     error: &AcpError,
 ) -> Option<DelegateTaskArgs> {
-    if shared
-        .with_session(parent_sid, |s| s.cancelled)
-        .unwrap_or(true)
-    {
+    if parent_stops_delegate(shared, parent_sid, args.planner_identity.is_some()) {
         return None;
     }
     let reason = if error
@@ -3395,10 +3395,7 @@ async fn run_delegate_followup_inner(
     // A new turn starts: its handoff is whatever the worker records now.
     shared.worker_handoffs.lock().unwrap().remove(&worker_id);
 
-    if shared
-        .with_session(router_sid, |s| s.cancelled)
-        .unwrap_or(false)
-    {
+    if parent_stops_delegate(shared, router_sid, args.planner_identity.is_some()) {
         return Err("parent session was cancelled".to_string());
     }
     let Some(conn) = shared.target_conn(&process_key) else {
@@ -3690,6 +3687,16 @@ pub async fn run_helper(socket: &Path, token: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_interrupt_preserves_only_durable_workers_and_close_stops_everyone() {
+        assert!(!parent_turn_stops_delegate(Some(true), true));
+        assert!(parent_turn_stops_delegate(Some(true), false));
+        for planner_worker in [false, true] {
+            assert!(!parent_turn_stops_delegate(Some(false), planner_worker));
+            assert!(parent_turn_stops_delegate(None, planner_worker));
+        }
+    }
 
     #[test]
     fn strips_only_the_delegate_server() {
