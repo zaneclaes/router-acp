@@ -315,6 +315,11 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     }
     let deliveries = run.wakes.get(&key).map_or(0, |w| w.deliveries);
+    // Inputs are steered once by id; a wake is recorded with its content (`steer_mark`).
+    let mark = match run.wakes.get(&key) {
+        Some(wake) if !key.starts_with("input:") => steer_mark(&key, &wake.reason),
+        _ => key.clone(),
+    };
     let announced = queued.map(|input| {
         (
             input.input_id.clone(),
@@ -341,7 +346,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
             rt.steering = false;
             if injected && (rt.router_turn || rt.command_turn) {
-                rt.steered.insert(key.clone());
+                rt.steered.insert(mark.clone());
             }
         });
         if injected {
@@ -581,7 +586,7 @@ pub(crate) fn pending_steer(
                     || id.starts_with("observation:ci-job-failures")
                     || id.starts_with("capacity:")
                     || ownership_handoff(id, w, works))
-                && !steered.contains(*id)
+                && !steered.contains(&steer_mark(id, &w.reason))
                 && !claimed(w, id)
         })
         .min_by_key(|(id, wake)| {
@@ -599,6 +604,19 @@ pub(crate) fn pending_steer(
             wake.work_id, wake.reason
         ),
     ))
+}
+
+/// The record of a steered wake: its id and the content it carried. A wake that
+/// re-arms with new content (a failed-jobs observation naming new failures) is
+/// steerable again in the same turn; an unchanged one is steered once. A
+/// parent's router turn can last hours while its managed background watcher
+/// parks, so an id-only record kept every later failure of the same build out
+/// until the turn ended.
+pub(crate) fn steer_mark(id: &str, reason: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    reason.hash(&mut hasher);
+    format!("{id}#{:016x}", hasher.finish())
 }
 
 /// A planner worker's sub-session is kept open after its turn so the same
@@ -1993,6 +2011,24 @@ mod steer_tests {
         assert!(text.starts_with("[Router steer] This is router text, not operator input."));
     }
 
+    /// A parent's router turn can last hours (its managed background watcher parks
+    /// inside it). The same failed-jobs observation re-armed with new failures is
+    /// steered again; unchanged, it is steered once.
+    #[test]
+    fn rearmed_job_failures_are_steered_again_in_the_same_turn() {
+        let id = "observation:ci-job-failures:staging".to_string();
+        let first = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43"))]);
+        let (key, _) = pending_steer(&[], &first, &HashSet::new()).expect("first failures steer");
+        let steered = HashSet::from([super::steer_mark(&key, "job failures: web 01a1efee-6e43")]);
+        assert!(pending_steer(&[], &first, &steered).is_none(), "an unchanged wake steered twice");
+        let rearmed = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"))]);
+        assert_eq!(
+            pending_steer(&[], &rearmed, &steered).map(|(k, _)| k),
+            Some(id),
+            "new failures of the same build never reached the running parent"
+        );
+    }
+
     #[test]
     fn capacity_wake_reaches_busy_parent_once_without_steering_routine_observations() {
         let mut wakes = BTreeMap::from([
@@ -2009,7 +2045,7 @@ mod steer_tests {
             pending_steer(&[], &wakes, &HashSet::new()).expect("capacity must reach busy parent");
         assert_eq!(id, "capacity:1");
         assert!(text.starts_with("[Router steer] This is router text, not operator input."));
-        assert!(pending_steer(&[], &wakes, &HashSet::from([id])).is_none());
+        assert!(pending_steer(&[], &wakes, &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])).is_none());
         wakes.insert("release:ready".to_string(), wake("release transition"));
         assert_eq!(
             pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,
