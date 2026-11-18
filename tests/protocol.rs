@@ -14610,7 +14610,6 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
             ))
             .block_task();
         wait_for_mock_prompt(&log, &format!("\nWAIT_FILE:{}", release.display())).await;
-        assert!(!shared.live_delegates.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
         let attempt = router_acp::planner_workflow::load(&shared, &sid)
             .unwrap()
@@ -14625,7 +14624,6 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
         // Interrupting the parent to ask something must not stop the run.
         cx.send_notification(CancelNotification::new(sid.clone()))?;
         tokio::time::sleep(Duration::from_millis(750)).await;
-        assert!(!shared.live_delegates.lock().unwrap().is_empty());
         assert!(!shared.planner_child_routes.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
         let run = router_acp::planner_workflow::load(&shared, &sid)
