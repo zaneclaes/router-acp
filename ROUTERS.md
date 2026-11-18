@@ -470,6 +470,9 @@ re-admitting its command or rewriting the run. Background audit and lifecycle wr
 cannot starve that read; the original input identity and scope remain required.
 Queued messages remain saved during shutdown and after the run pauses. They cannot
 start a parent turn until the run resumes; delivery rechecks this when claiming input.
+While a running parent waits on a managed terminal, eligible planner steering uses
+that wait's interrupt channel. Urgent audit findings and queued corrections can therefore
+resume the parent even though its downstream model turn has already ended.
 
 After adoption, historical input is replayed to the new parent for receipt
 reconciliation. Once that replay is delivered, an explicit acknowledgment or a

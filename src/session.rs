@@ -6452,9 +6452,9 @@ async fn wait_for_managed_backgrounds(
     Ok(Some(match outcome {
         BackgroundWait::Steered(prompt) => {
             let mut blocks = vec![ContentBlock::from(format!(
-                "[router-acp managed background interrupted]\nThe user sent a message while this \
-                 turn waited on background terminal(s) {}. router-acp stopped them. Answer the \
-                 user; start a new watcher only if it is still needed.\nUser message:",
+                "[router-acp managed background interrupted]\nNew input arrived while this \
+                 turn waited on background terminal(s) {}. router-acp stopped them. Handle the \
+                 input according to its recorded origin; start a new watcher only if it is still needed.\nInput:",
                 terminal_ids.join(", ")
             ))];
             blocks.extend(prompt);

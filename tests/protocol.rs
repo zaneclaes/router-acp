@@ -1048,6 +1048,62 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
     .await;
 }
 
+#[tokio::test]
+async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt() {
+    let state = temp_state_file("planner-managed-steer");
+    // SAFETY: every helper-enabled test uses the same executable.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let pending = park_on_managed_background(&cx, &observed, &sid).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !shared
+                .background_interrupts
+                .lock()
+                .unwrap()
+                .contains_key(&sid)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the managed wait did not register its interrupt");
+        assert!(
+            router_acp::planner_preempt::steer(
+                &shared,
+                &sid,
+                &[ContentBlock::from(
+                    "[Router audit] eligible work needs reconciliation"
+                )]
+            )
+            .await
+        );
+        let response = pending.await.expect("parked prompt task")?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(
+            agent_text(&observed, &sid)
+                .contains("[Router audit] eligible work needs reconciliation")
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.terminal_kills,
+            vec!["managed-terminal-1".to_string()]
+        );
+        assert_eq!(
+            observed.terminal_releases,
+            vec!["managed-terminal-1".to_string()]
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// The live failure: a child parked on a deploy watcher got its parent's
 /// message as an agent-origin `session/prompt`. The router queued it behind
 /// the parked turn and answered at once with an empty turn, so every message
