@@ -3869,6 +3869,9 @@ pub struct PromptDirectives {
     pub version: Option<String>,
     /// `[router: phase=planning|implementation]` — planner phase override.
     pub phase: Option<crate::config::PlannerPhase>,
+    /// `[router: skill=<pattern>]` — steer by a configured `skill_routing`
+    /// rule. The tag is stripped. The pattern is stored as written.
+    pub skill: Option<String>,
 }
 
 /// Parse (and strip) every active routing directive in the prompt. Several tags
@@ -3894,6 +3897,7 @@ pub fn parse_prompt_directives(
         into.effort = next.effort.or(into.effort.take());
         into.version = next.version.or(into.version.take());
         into.phase = next.phase.or(into.phase.take());
+        into.skill = next.skill.or(into.skill.take());
     }
     Ok(merged.map(|directives| (directives, remaining)))
 }
@@ -4009,6 +4013,24 @@ fn candidate_reference(value: &str) -> Option<CandidateId> {
     })
 }
 
+/// A `skill=` value names one `skill_routing` pattern. Empty and punctuation
+/// fail here. Whether that pattern is configured is checked at apply time.
+fn skill_route_pattern(value: &str) -> Result<String, String> {
+    let pattern = value.trim();
+    if pattern.is_empty() {
+        return Err("directive skill must name a skill_routing pattern".into());
+    }
+    if !pattern
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "directive skill `{pattern}` must be letters, digits, hyphen, or underscore"
+        ));
+    }
+    Ok(pattern.to_string())
+}
+
 /// Parse (and strip) the first active routing directive in the prompt.
 ///
 /// The directive is matched outside quoted code and history on any line of
@@ -4057,7 +4079,8 @@ fn parse_one_prompt_directive(
         }
         let Some((key, value)) = pair.split_once('=') else {
             return Err(format!(
-                "routing directive `{pair}` is not key=value (keys: candidate, strategy, exclude)"
+                "routing directive `{pair}` is not key=value \
+                 (keys: candidate, strategy, exclude, skill)"
             ));
         };
         let value = value.trim();
@@ -4119,11 +4142,14 @@ fn parse_one_prompt_directive(
                     }
                 });
             }
+            "skill" => {
+                directives.skill = Some(skill_route_pattern(value)?);
+            }
             other => {
                 return Err(format!(
                     "unknown routing directive key `{other}` \
                      (keys: candidate, prefer, switch, strategy, exclude, label, effort, version, \
-                     phase)"
+                     phase, skill)"
                 ));
             }
         }
@@ -10971,6 +10997,16 @@ fn prepare_parent_prompt_inner(
             directives.switch = directives.switch.map(|id| shared.seat_for(&id));
             explicit_routing = true;
             req = PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
+            // Fail a bad skill route before other directive writes. The commit
+            // runs after `candidate=`, so this route's order replaces that pick.
+            let named_skill = match directives.skill.as_deref() {
+                Some(pattern) => Some(
+                    resolve_named_skill_route(&shared, &router_sid, pattern).map_err(|msg| {
+                        AcpError::invalid_params().data(format!("invalid routing directive: {msg}"))
+                    })?,
+                ),
+                None => None,
+            };
             let pinned_now = shared
                 .with_session(&router_sid, |s| s.pin.is_some() || s.pinning)
                 .unwrap_or(false);
@@ -11083,6 +11119,9 @@ fn prepare_parent_prompt_inner(
                     }
                 })
                 .unwrap_or(false);
+            if let Some(pin) = named_skill {
+                commit_named_skill_route(&shared, &router_sid, pin);
+            }
             if applied {
                 tracing::info!(
                     session = router_sid,
@@ -11490,6 +11529,116 @@ fn detect_prompt_skill_route<'a>(
     } else {
         detect_skill_route(&shared.cfg, &req.prompt)
     }
+}
+
+/// The seat a `[router: skill=…]` directive will pin, resolved before any
+/// session write. `pattern` on the result is the configured spelling.
+#[derive(Debug)]
+struct NamedSkillPin {
+    pattern: String,
+    target: CandidateId,
+    handoff: HandoffStyle,
+}
+
+fn lookup_skill_route<'a>(
+    routes: &'a [SkillRoute],
+    pattern: &str,
+) -> Result<&'a SkillRoute, String> {
+    routes
+        .iter()
+        .find(|route| route.pattern.eq_ignore_ascii_case(pattern))
+        .ok_or_else(|| format!("unknown skill route `{pattern}`"))
+}
+
+/// Resolve `pattern` to that rule's [`select_route_target`]. An unknown
+/// pattern fails. A known pattern with no eligible seat fails too: keeping
+/// the classifier would pick a model outside the rule.
+fn resolve_named_skill_route(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    pattern: &str,
+) -> Result<NamedSkillPin, String> {
+    let route = lookup_skill_route(&shared.cfg.skill_routing, pattern)?;
+    let configured = route.pattern.clone();
+    let (class, excluded) = shared
+        .with_session(router_sid, |s| {
+            (
+                s.task_class.unwrap_or(TaskClass::CodingGeneral),
+                s.excluded.clone(),
+            )
+        })
+        .unwrap_or((TaskClass::CodingGeneral, Vec::new()));
+    let Some(target) = select_route_target(shared, route, class, &excluded) else {
+        return Err(format!("skill route `{configured}` has no available model"));
+    };
+    let handoff = if route.terse_handoff {
+        HandoffStyle::Terse
+    } else {
+        HandoffStyle::Full
+    };
+    Ok(NamedSkillPin {
+        pattern: configured,
+        target,
+        handoff,
+    })
+}
+
+/// Apply a resolved skill pin. A live pin that is not already the route's
+/// target switches to that target. An unpinned session takes the target as
+/// a skill override, replacing a same-prompt `candidate=` user pick.
+fn commit_named_skill_route(shared: &Arc<Shared>, router_sid: &str, pin: NamedSkillPin) {
+    let current = shared
+        .with_session(router_sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+        .flatten();
+    let pattern = pin.pattern;
+    let target = pin.target;
+    if current.as_ref() == Some(&target) {
+        shared.with_session(router_sid, |s| {
+            s.elevation = Some(format!("skill `{pattern}`"));
+            s.elevation_skill = Some(pattern);
+            s.quiet_turns = 0;
+            s.pending_switch = None;
+        });
+        return;
+    }
+    if current.is_some() {
+        shared.with_session(router_sid, |s| {
+            s.pending_switch = Some(SwitchRequest {
+                target: target.clone(),
+                reason: format!("skill `{pattern}` requires a {target}-class model"),
+                handoff: pin.handoff,
+                user_pick: false,
+            });
+            s.elevation = Some(format!("skill `{pattern}`"));
+            s.elevation_skill = Some(pattern.clone());
+            s.quiet_turns = 0;
+        });
+        tracing::info!(
+            session = router_sid,
+            skill = %pattern,
+            %target,
+            "skill directive switch queued"
+        );
+        return;
+    }
+    shared.with_session(router_sid, |s| {
+        s.candidate_override = Some(target.clone());
+        s.candidate_override_source = Some(OverrideSource::Skill(pattern.clone()));
+        s.elevation = Some(format!("skill `{pattern}`"));
+        s.elevation_skill = Some(pattern.clone());
+        s.quiet_turns = 0;
+    });
+    notify_user(
+        shared,
+        router_sid,
+        format!("router-acp · skill `{pattern}` steering this session to {target}"),
+    );
+    tracing::info!(
+        session = router_sid,
+        skill = %pattern,
+        %target,
+        "skill directive pin steered"
+    );
 }
 
 fn apply_skill_route(shared: &Arc<Shared>, router_sid: &str, route: &SkillRoute) {
@@ -12440,6 +12589,210 @@ mod directive_tests {
         assert_eq!(dir.prefer.unwrap().to_string(), "codex/gpt-5.5");
         assert_eq!(dir.switch.unwrap().to_string(), "claude/opus[1m]");
         assert_eq!(text(&stripped), "go");
+    }
+
+    #[test]
+    fn parses_and_strips_a_skill_directive() {
+        let prompt = vec![ContentBlock::from(
+            "[router: skill=review-opinion]\nReview the diff.".to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        assert_eq!(dir.skill.as_deref(), Some("review-opinion"));
+        let out = text(&stripped);
+        assert_eq!(out, "Review the diff.");
+        assert!(!out.contains("[router:"), "directive stripped: {out}");
+    }
+
+    #[test]
+    fn skill_directive_keeps_the_written_pattern() {
+        let prompt = vec![ContentBlock::from(
+            "[router: skill=Review-Opinion]\ngo".to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        // Stored as written. Lookup folds case against the configured rule.
+        assert_eq!(dir.skill.as_deref(), Some("Review-Opinion"));
+        assert!(!text(&stripped).contains("[router:"));
+        let later = vec![ContentBlock::from(
+            "[router: skill=Review-Opinion] [router: skill=review-gate]\ngo".to_string(),
+        )];
+        let (dir, stripped) = parse_prompt_directives(&later).unwrap().unwrap();
+        assert_eq!(dir.skill.as_deref(), Some("review-gate"));
+        assert!(!text(&stripped).contains("[router:"));
+    }
+
+    #[test]
+    fn rejects_an_empty_or_invalid_skill_directive() {
+        for body in [
+            "[router: skill=]\ngo",
+            "[router: skill=review opinion]\ngo",
+            "[router: skill=review/opinion]\ngo",
+        ] {
+            let prompt = vec![ContentBlock::from(body.to_string())];
+            assert!(parse_prompt_directives(&prompt).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn lookup_skill_route_matches_the_configured_pattern() {
+        let cfg = Config::from_yaml(
+            "router: auto\n\
+             skill_routing:\n\
+             \x20 - pattern: review-opinion\n\
+             \x20   selection: first-match\n\
+             \x20   candidates: [\"*grok*\", \"*opus*\"]\n\
+             agents:\n\
+             \x20 - name: grok\n\
+             \x20   command: { type: stdio, command: /bin/true }\n\
+             \x20   model_selection: { type: config-option }\n\
+             \x20   models:\n\
+             \x20     - { id: grok-4.7, display_name: Grok, cost_rank: 3 }\n",
+        )
+        .expect("valid config");
+        let route = lookup_skill_route(&cfg.skill_routing, "Review-Opinion").unwrap();
+        assert_eq!(route.pattern, "review-opinion");
+        assert_eq!(route.selection, RouteSelection::FirstMatch);
+        let err = lookup_skill_route(&cfg.skill_routing, "missing").unwrap_err();
+        assert!(err.contains("unknown skill route `missing`"), "{err}");
+    }
+
+    fn skill_route_shared(dir: &std::path::Path) -> Arc<Shared> {
+        let cfg = Config::from_yaml(&format!(
+            r#"
+state_file: {}
+router: auto
+skill_routing:
+  - pattern: review-gate
+    selection: first-match
+    candidates: ["*opus*", "*sol*", "*grok*"]
+agents:
+  - name: claude
+    command: {{type: stdio, command: /bin/true}}
+    model_selection: {{type: config-option}}
+    models: [{{id: opus, display_name: Opus, cost_rank: 5}}]
+"#,
+            dir.join("state.db").display()
+        ))
+        .unwrap();
+        Shared::new(cfg).unwrap()
+    }
+
+    #[test]
+    fn named_skill_route_fails_when_no_model_is_available() {
+        // The seat is declared but not connected, so select_route_target
+        // (first-match) has nobody eligible. The call fails closed.
+        let dir = tempfile::tempdir().unwrap();
+        let shared = skill_route_shared(dir.path());
+        let err = resolve_named_skill_route(&shared, "missing-session", "review-gate").unwrap_err();
+        assert!(
+            err.contains("skill route `review-gate` has no available model"),
+            "{err}"
+        );
+        let unknown = resolve_named_skill_route(&shared, "missing-session", "nope").unwrap_err();
+        assert!(unknown.contains("unknown skill route `nope`"), "{unknown}");
+    }
+
+    fn session_for(shared: &Shared, id: &str) {
+        let req = NewSessionRequest::new(std::path::PathBuf::from("/tmp"));
+        let session = RouterSession::new(&shared.cfg, &req);
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), session);
+    }
+
+    #[test]
+    fn skill_directive_commit_replaces_a_user_pick_and_switches_off_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = skill_route_shared(dir.path());
+        session_for(&shared, "open");
+        shared.with_session("open", |s| {
+            s.candidate_override = Some(CandidateId::new("claude", "opus"));
+            s.candidate_override_source = Some(OverrideSource::UserPick);
+        });
+        commit_named_skill_route(
+            &shared,
+            "open",
+            NamedSkillPin {
+                pattern: "review-opinion".into(),
+                target: CandidateId::new("grok", "grok-4.7"),
+                handoff: HandoffStyle::Full,
+            },
+        );
+        shared
+            .with_session("open", |s| {
+                assert_eq!(
+                    s.candidate_override.as_ref().unwrap().to_string(),
+                    "grok/grok-4.7"
+                );
+                assert_eq!(
+                    s.candidate_override_source,
+                    Some(OverrideSource::Skill("review-opinion".into()))
+                );
+                assert_eq!(s.elevation_skill.as_deref(), Some("review-opinion"));
+                assert!(s.pending_switch.is_none());
+            })
+            .unwrap();
+
+        session_for(&shared, "same");
+        shared.with_session("same", |s| {
+            s.pin = Some(PinInfo {
+                candidate: CandidateId::new("grok", "grok-4.7"),
+                process_key: ProcessKey("grok".into()),
+                downstream_sid: "down".into(),
+                available_modes: Vec::new(),
+            });
+            s.pending_switch = Some(SwitchRequest {
+                target: CandidateId::new("claude", "opus"),
+                reason: "leave".into(),
+                handoff: HandoffStyle::Full,
+                user_pick: true,
+            });
+        });
+        commit_named_skill_route(
+            &shared,
+            "same",
+            NamedSkillPin {
+                pattern: "review-opinion".into(),
+                target: CandidateId::new("grok", "grok-4.7"),
+                handoff: HandoffStyle::Full,
+            },
+        );
+        shared
+            .with_session("same", |s| {
+                assert_eq!(s.elevation_skill.as_deref(), Some("review-opinion"));
+                assert!(s.pending_switch.is_none(), "stay on the route target");
+            })
+            .unwrap();
+
+        session_for(&shared, "other");
+        shared.with_session("other", |s| {
+            s.pin = Some(PinInfo {
+                candidate: CandidateId::new("claude", "opus"),
+                process_key: ProcessKey("claude".into()),
+                downstream_sid: "down".into(),
+                available_modes: Vec::new(),
+            });
+        });
+        commit_named_skill_route(
+            &shared,
+            "other",
+            NamedSkillPin {
+                pattern: "review-gate".into(),
+                target: CandidateId::new("codex", "gpt-6.1-sol"),
+                handoff: HandoffStyle::Terse,
+            },
+        );
+        shared
+            .with_session("other", |s| {
+                let switch = s.pending_switch.as_ref().unwrap();
+                assert_eq!(switch.target.to_string(), "codex/gpt-6.1-sol");
+                assert!(!switch.user_pick);
+                assert_eq!(switch.handoff, HandoffStyle::Terse);
+                assert_eq!(s.elevation_skill.as_deref(), Some("review-gate"));
+                assert!(s.candidate_override.is_none());
+            })
+            .unwrap();
     }
 
     #[test]
