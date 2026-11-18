@@ -61,6 +61,10 @@ pub struct Defect {
     /// The repository owns transition policy; the router only delivers urgency.
     #[serde(default)]
     pub urgent: bool,
+    /// An actionable duty that must be resolved before acknowledging its audit
+    /// or gate wake. Repository policy owns eligibility, never model prose.
+    #[serde(default)]
+    pub blocks_acknowledgement: bool,
 }
 
 /// The audit host's last answer.
@@ -715,7 +719,18 @@ pub fn gate_tick(shared: &Shared, sid: &str, run: &PlannerRun, now: i64) {
         }
         return;
     }
-    let step = (run.capacity.gate.count as usize).min(GATE_BACKOFF_SECS.len() - 1);
+    let actionable = run.capacity.audit.as_ref().is_some_and(|audit| {
+        audit.ok
+            && audit
+                .defects
+                .iter()
+                .any(|defect| defect.blocks_acknowledgement)
+    });
+    let step = if actionable {
+        0
+    } else {
+        (run.capacity.gate.count as usize).min(GATE_BACKOFF_SECS.len() - 1)
+    };
     if now < ended_at + GATE_BACKOFF_SECS[step] || pending_wake(run, "gate:") {
         return;
     }
@@ -767,6 +782,54 @@ pub fn gate_tick(shared: &Shared, sid: &str, run: &PlannerRun, now: i64) {
     });
     if saved.is_ok() {
         judged(shared);
+    }
+}
+
+/// Audit/gate acknowledgement is resolution, not a way to dismiss an actionable
+/// repository duty. Always ask afresh: the old snapshot may predate the merge.
+pub async fn acknowledgement_check(
+    shared: &Shared,
+    sid: &str,
+    run: &PlannerRun,
+    wake_id: &str,
+) -> Result<(), String> {
+    if run.status != RunStatus::Running
+        || !(wake_id.starts_with("audit:") || wake_id.starts_with("gate:"))
+    {
+        return Ok(());
+    }
+    match audit(
+        shared,
+        sid,
+        run,
+        chrono::Utc::now().timestamp_millis(),
+        false,
+        None,
+    )
+    .await
+    {
+        None => Ok(()),
+        Some(Err(error)) => Err(format!(
+            "wake acknowledgement refused: audit evidence is unavailable ({error}); retain the duty and retry"
+        )),
+        Some(Ok(reply)) => {
+            let unresolved: Vec<_> = reply
+                .defects
+                .iter()
+                .filter(|defect| defect.blocks_acknowledgement)
+                .collect();
+            if unresolved.is_empty() {
+                return Ok(());
+            }
+            Err(format!(
+                "wake acknowledgement refused: actionable duties remain: {}. Resolve them first; waiting for another candidate is not resolution.",
+                unresolved
+                    .iter()
+                    .map(|defect| format!("{}: {}", defect.code, defect.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        }
     }
 }
 

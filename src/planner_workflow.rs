@@ -2422,6 +2422,7 @@ async fn operate_once(
             acknowledge_input(&mut run, sid, &input_id, owner)?;
         }
         Operation::AcknowledgeWake { wake_id, .. } => {
+            crate::planner_guard::acknowledgement_check(shared, sid, &run, &wake_id).await?;
             if let Some(id) = wake_id.strip_prefix("input:") {
                 let owner = run
                     .inputs

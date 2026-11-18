@@ -694,6 +694,12 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   the router ends its own turn and delivers the durable handoff next. Operator turns, approval
   waits, acknowledged or already-claimed deliveries and superseded attempts stay protected.
   While staging or production has a failed build, audit findings use that same urgent path.
+  Repository audits may set `blocks_acknowledgement: true` for an actionable duty.
+  The native acknowledgement hook re-runs the audit before accepting an `audit:` or
+  `gate:` wake acknowledgement and refuses while any such duty remains. Unknown audit
+  evidence also refuses acknowledgement. Ordinary worker and operator receipts stay
+  independent. A parent turn ending on an actionable duty is re-prompted immediately;
+  a pending build alone is not an actionable duty. Eligibility remains repository policy.
   A successful repository audit may also set `urgent: true` on a defect to deliver a due
   transition while environments are healthy, including inside a long implementation turn.
   This is delivery metadata, not permission to admit, dispatch, deploy or bypass a gate.

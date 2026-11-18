@@ -7982,6 +7982,83 @@ fn set_status(shared: &Arc<Shared>, status: RunStatus) {
 }
 
 #[tokio::test]
+async fn actionable_audit_cannot_be_acknowledged_until_fresh_evidence_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    for wake in ["audit:release:due", "gate:due", "worker:unrelated"] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.wakes.insert(
+                wake.into(),
+                planner_workflow::Wake {
+                    work_id: SID.into(),
+                    reason: "repository duty".into(),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    std::fs::write(
+        &reply,
+        json!({"defects":[{"code":"NEXT_MERGE_DUE", "blocks_acknowledgement":true}]}).to_string(),
+    )
+    .unwrap();
+    let ack = |wake: &str| Operation::AcknowledgeWake {
+        key: format!("ack-{wake}"),
+        wake_id: wake.into(),
+    };
+    for wake in ["audit:release:due", "gate:due"] {
+        assert!(
+            planner_workflow::operate(&f.shared, SID, None, ack(wake))
+                .await
+                .is_err()
+        );
+        assert!(
+            !planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .wakes[wake]
+                .acknowledged
+        );
+    }
+    planner_workflow::operate(&f.shared, SID, None, ack("worker:unrelated"))
+        .await
+        .unwrap();
+    assert_eq!(
+        host_calls(&log).len(),
+        2,
+        "ordinary receipt acknowledgement must not re-poll CI"
+    );
+    // A pending build is advisory to this guard; only actionable duties block.
+    std::fs::write(&reply, defects(&["CI_PENDING"])).unwrap();
+    planner_workflow::operate(&f.shared, SID, None, ack("audit:release:due"))
+        .await
+        .unwrap();
+    // Unknown evidence cannot silently dismiss a previously actionable gate.
+    std::fs::write(&reply, "not-json").unwrap();
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, ack("gate:due"))
+            .await
+            .is_err()
+    );
+    std::fs::write(&reply, defects(&[])).unwrap();
+    planner_workflow::operate(&f.shared, SID, None, ack("gate:due"))
+        .await
+        .unwrap();
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes["gate:due"]
+            .acknowledged
+    );
+}
+
+#[tokio::test]
 async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
     let tmp = tempfile::tempdir().unwrap();
     let reply = tmp.path().join("reply");
