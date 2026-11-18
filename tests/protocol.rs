@@ -14599,16 +14599,16 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
             .0
             .to_string();
         prompt_text(&cx, &sid, "/implement the cancellation test").await?;
-        prompt_text(
-            &cx,
-            &sid,
-            &format!(
-                "{}DELEGATE_WORK:work-1:WAIT_FILE:{}",
-                planner_admit_wire_prompt(),
-                release.display()
-            ),
-        )
-        .await?;
+        let active = cx
+            .send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from(format!(
+                    "{}DELEGATE_WORK:work-1:WAIT_FILE:{}",
+                    planner_admit_wire_prompt(),
+                    release.display()
+                ))],
+            ))
+            .block_task();
         wait_for_mock_prompt(&log, &format!("\nWAIT_FILE:{}", release.display())).await;
         assert!(!shared.live_delegates.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
@@ -14618,9 +14618,13 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
             .works["work-1"]
             .attempt
             .clone();
+        assert!(
+            !attempt.as_ref().unwrap().ended,
+            "the cancellation control needs a live worker"
+        );
         // Interrupting the parent to ask something must not stop the run.
         cx.send_notification(CancelNotification::new(sid.clone()))?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
         assert!(!shared.live_delegates.lock().unwrap().is_empty());
         assert!(!shared.planner_child_routes.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
@@ -14631,9 +14635,9 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
         assert!(run.works["work-1"].workspace.is_some());
         let after = run.works["work-1"].attempt.as_ref().unwrap();
         let before = attempt.as_ref().unwrap();
-        assert!(!before.ended, "the cancellation control needs a live worker");
         assert_eq!((&after.id, after.ended), (&before.id, before.ended));
         std::fs::write(&release, "continue").unwrap();
+        active.await?;
         // A run an older router paused, with a stale permission wait, resumes
         // on the person's next message, even a plain question.
         router_acp::planner_workflow::mutate(&shared, &sid, |run| {
