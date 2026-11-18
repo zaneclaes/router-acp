@@ -7199,9 +7199,14 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
     let old_notice = format!("handoff:{}", old.attempt_id);
     planner_workflow::mutate(&f.shared, SID, |run| {
         assert!(!run.wakes[&old_notice].acknowledged);
-        run.wakes.insert("audit:release:still-due".into(), planner_workflow::Wake {
-            work_id: SID.into(), reason: "release evidence still required".into(), ..Default::default()
-        });
+        run.wakes.insert(
+            "audit:release:still-due".into(),
+            planner_workflow::Wake {
+                work_id: SID.into(),
+                reason: "release evidence still required".into(),
+                ..Default::default()
+            },
+        );
         run.works
             .get_mut("handoff")
             .unwrap()
@@ -7231,10 +7236,14 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
             .contains("replayed")
     );
     let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
-    assert!(run.wakes[&old_notice].acknowledged,
-        "verified reconciliation must close the obsolete attempt notification before any new worker starts");
-    assert!(!run.wakes["audit:release:still-due"].acknowledged,
-        "source reconciliation cannot acknowledge a release duty");
+    assert!(
+        run.wakes[&old_notice].acknowledged,
+        "verified reconciliation must close the obsolete attempt notification before any new worker starts"
+    );
+    assert!(
+        !run.wakes["audit:release:still-due"].acknowledged,
+        "source reconciliation cannot acknowledge a release duty"
+    );
     assert_eq!(
         run.works["handoff"].reconciliation.prior_specs,
         vec![work("handoff")]
@@ -7247,9 +7256,14 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
     assert!(prompt.contains(&updated.scope) && prompt.contains(&revision));
     planner_workflow::attempt_ended(&f.shared, SID, &current, None, "interrupted".into(), false)
         .unwrap();
-    assert!(!planner_workflow::load(&f.shared, SID).unwrap().unwrap()
-        .wakes[&format!("handoff:{}", current.attempt_id)].acknowledged,
-        "the next attempt's interruption must still notify the parent");
+    assert!(
+        !planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes[&format!("handoff:{}", current.attempt_id)]
+            .acknowledged,
+        "the next attempt's interruption must still notify the parent"
+    );
     git(&workspace.path, &["reset", "--hard", "HEAD~1"]);
     assert!(
         planner_workflow::begin_work(&f.shared, SID, "handoff")

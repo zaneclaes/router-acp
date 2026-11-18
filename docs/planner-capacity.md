@@ -461,6 +461,11 @@ as acknowledged history so the next capacity tick recomputes the condition and
 starts the new owner's wake clock. Pending operator inputs, CI and work wakes
 remain pending; holds and reconciliation requirements still apply.
 
+Successful source reconciliation closes that work's obsolete child-attempt notices,
+as a successful resume already does. A dependency may delay the new attempt without
+replaying the old interruption. Refused reconciliation keeps its notices pending;
+new child events, CI observations, operator input and release/audit duties are unchanged.
+
 While adoption is pending, `audit:` and `gate:` wakes carry the recovery state
 (source run and the current blocker) instead of demanding admissions, the gate
 lists no capacity-host candidates, `admit` and dispatch of an identity still

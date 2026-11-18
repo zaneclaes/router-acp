@@ -2017,12 +2017,13 @@ async fn operate_once(
                 WorkStatus::Admitted
             };
             run.capacity.resumes.remove(&current.spec.work_id);
-            if let Some(wake) = run
-                .wakes
-                .get_mut(&format!("recovery:{}", current.spec.work_id))
-            {
+            let reconciled_work_id = current.spec.work_id.clone();
+            if let Some(wake) = run.wakes.get_mut(&format!("recovery:{reconciled_work_id}")) {
                 wake.acknowledged = true;
             }
+            // Reconciliation has verified and fenced the stopped attempt. Its
+            // old notification is handled even when a dependency delays dispatch.
+            acknowledge_attempt_notifications(&mut run, &reconciled_work_id);
         }
         Operation::Admit { work, .. } => {
             validate_work_spec(&work)?;
