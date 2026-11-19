@@ -107,6 +107,17 @@ pub fn preempted(shared: &Shared, sid: &str) -> bool {
 /// Steer operator input into the running router-owned turn. `true` when the
 /// downstream took it.
 pub async fn steer(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool {
+    // A managed wait has no active downstream prompt to steer. Use the same
+    // interrupt channel as native client input so urgent planner wakes and
+    // queued corrections can resume it instead of waiting for the watcher.
+    let parked = shared.background_interrupts.lock().unwrap().remove(sid);
+    if let Some(interrupt) = parked
+        && interrupt
+            .send(crate::session::BackgroundInterrupt::Steer(prompt.to_vec()))
+            .is_ok()
+    {
+        return true;
+    }
     let Some((conn, down_sid, _)) = shared.pinned_route(sid) else {
         return false;
     };

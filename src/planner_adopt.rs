@@ -453,7 +453,7 @@ fn merge(
             }
         } else {
             let mut adopted = work.clone();
-            crate::planner_workflow::mark_reconciliation_required(&mut adopted);
+            crate::planner_workflow::mark_adopted_reconciliation(&mut adopted);
             into.works.insert(id.clone(), adopted);
             if let Some(recovery) = from.capacity.resumes.get(id) {
                 into.capacity.resumes.insert(id.clone(), recovery.clone());

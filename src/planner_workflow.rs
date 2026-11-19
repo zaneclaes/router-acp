@@ -873,7 +873,7 @@ fn user_command_once(
     req: &mut PromptRequest,
     queued: bool,
 ) -> Result<Option<PlannerPhase>, String> {
-    let Some(LeadingCommand { phase, block, args }) = leading_command(req) else {
+    let Some(LeadingCommand { phase, args, .. }) = leading_command(req) else {
         return Ok(None);
     };
     let mut run = ensure(shared, sid)?;
@@ -948,7 +948,68 @@ fn user_command_once(
         run.execution_request = Some(display_text(original));
         run.execution_input_id = Some(input_id.clone());
     }
-    let role = crate::planner_wake::parent_role(&run, true, &[]);
+    shape_command(shared, sid, &mut run, req, &input_id)?;
+    save(shared, sid, &mut run)?;
+    shared.with_session(sid, |s| s.coordinator |= run.coordinator);
+    let entrypoint_name = match phase {
+        PlannerPhase::Planning => "plan",
+        PlannerPhase::Implementation => "implement",
+    };
+    let typed = format!("{entrypoint_name} {args}");
+    shared.with_session(sid, |s| {
+        s.planner_command_text = Some(typed.trim_end().to_string());
+        s.planner_explicit_phase = Some(phase);
+    });
+    Ok(Some(phase))
+}
+
+/// Refresh an already admitted command after adoption. This reads the new
+/// parent's role without re-admitting input or writing the adopted run: its
+/// audit and lifecycle writers must not contend with presentation of a prompt.
+pub fn reshape_admitted_command(
+    shared: &Arc<Shared>,
+    sid: &str,
+    original: &PromptRequest,
+    req: &mut PromptRequest,
+) -> Result<(), String> {
+    let Some(LeadingCommand { phase, .. }) = leading_command(req) else {
+        return Err("admitted command is missing its command text".into());
+    };
+    let mut run = load(shared, sid)?.ok_or("planner run missing")?;
+    let input_id = prompt_input_id(req)
+        .ok_or("admitted command has no input identity")?
+        .to_string();
+    if run.status != RunStatus::Running
+        || run.phase != phase
+        || !run.commands.contains(&input_id)
+        || !run.inputs.contains_key(&input_id)
+        || run.execution_input_id.as_deref() != Some(&input_id)
+    {
+        return Err("command is not the running planner's admitted implementation input".into());
+    }
+    let mut original = original.clone();
+    if prompt_input_id(&original).is_none() {
+        original.meta = req.meta.clone();
+    }
+    if prompt_input_id(&original) != Some(input_id.as_str()) {
+        return Err("admitted command input identity changed".into());
+    }
+    // Validate without reapplying admission side effects, including clearing
+    // human holds that may have arrived with the adopted state.
+    validate_input(&run.inputs[&input_id], &input_receipt(&original))?;
+    shape_command(shared, sid, &mut run, req, &input_id)
+}
+
+fn shape_command(
+    shared: &Arc<Shared>,
+    sid: &str,
+    run: &mut PlannerRun,
+    req: &mut PromptRequest,
+    input_id: &str,
+) -> Result<(), String> {
+    let LeadingCommand { phase, block, args } =
+        leading_command(req).ok_or("admitted command is missing its command text")?;
+    let role = crate::planner_wake::parent_role(run, true, &[]);
     let entrypoint_name = match phase {
         PlannerPhase::Planning => "plan",
         PlannerPhase::Implementation => "implement",
@@ -970,7 +1031,7 @@ fn user_command_once(
             ));
         } else {
             instructions.push_str("\nThe explicit repository implementation entrypoint is retained for worker assignments. Continue with the parent role above.");
-            run.policy_entrypoint(&input_id, &skill);
+            run.policy_entrypoint(input_id, &skill);
         }
     }
     if let Some(roadmap) = &run.policy.roadmap {
@@ -987,14 +1048,7 @@ fn user_command_once(
     let router_meta = meta.entry("router_acp").or_insert_with(|| json!({}));
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
-    save(shared, sid, &mut run)?;
-    shared.with_session(sid, |s| s.coordinator |= run.coordinator);
-    let typed = format!("{entrypoint_name} {args}");
-    shared.with_session(sid, |s| {
-        s.planner_command_text = Some(typed.trim_end().to_string());
-        s.planner_explicit_phase = Some(phase);
-    });
-    Ok(Some(phase))
+    Ok(())
 }
 
 fn display_text(req: &PromptRequest) -> String {
@@ -1020,9 +1074,22 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let human = human_prompt(req);
-    let receipt = InputReceipt {
-        origin: if human {
+    let receipt = input_receipt(req);
+    if let Some(previous) = run.inputs.get(&id) {
+        validate_input(previous, &receipt)?;
+    } else {
+        run.inputs.insert(id.clone(), receipt);
+    }
+    // The human spoke: lift an awaiting-human hold on every input path.
+    if human_prompt(req) {
+        crate::planner_capacity::clear_human_hold(run);
+    }
+    Ok(id)
+}
+
+fn input_receipt(req: &PromptRequest) -> InputReceipt {
+    InputReceipt {
+        origin: if human_prompt(req) {
             "human"
         } else if delegated_approval(req) {
             "coordinator"
@@ -1041,26 +1108,17 @@ pub(crate) fn record_input(run: &mut PlannerRun, req: &PromptRequest) -> Result<
         owner: None,
         acknowledged: false,
         delivered_to: BTreeSet::new(),
-    };
-    if let Some(previous) = run.inputs.get(&id) {
-        if previous.text != receipt.text
-            || previous.attachments != receipt.attachments
-            || previous.origin != receipt.origin
-        {
-            return Err("input identity already names a different original message".into());
-        }
-    } else {
-        run.inputs.insert(id.clone(), receipt);
     }
-    // The human spoke: an `awaiting-human` hold waits for exactly this, on
-    // whichever path their words arrive (their own turn, a steer into a
-    // router-owned turn, or the durable queue). LESSON (2026-10-27): only the
-    // own-turn path cleared it, so a steered "continue" left a run parked for
-    // ten hours with every wake, heartbeat and capacity tick silenced.
-    if human {
-        crate::planner_capacity::clear_human_hold(run);
+}
+
+fn validate_input(previous: &InputReceipt, receipt: &InputReceipt) -> Result<(), String> {
+    if previous.text != receipt.text
+        || previous.attachments != receipt.attachments
+        || previous.origin != receipt.origin
+    {
+        return Err("input identity already names a different original message".into());
     }
-    Ok(id)
+    Ok(())
 }
 
 impl PlannerRun {
@@ -1775,6 +1833,20 @@ async fn operate_once(
             }
             let mut check = value.clone();
             check["assignment"] = serde_json::to_value(work).map_err(|e| e.to_string())?;
+            // The repository decides whether another assignment preserves the old scope
+            // and source. Supply that assignment from this run, never from caller prose.
+            check["successor_assignment"] = Value::Null;
+            if let Some(successor_id) = evidence.get("superseded-by") {
+                if successor_id == &work_id {
+                    return Err("retirement successor must be another work identity".into());
+                }
+                let successor = run
+                    .works
+                    .get(successor_id)
+                    .ok_or("retirement successor is not an assignment in this run")?;
+                check["successor_assignment"] =
+                    serde_json::to_value(successor).map_err(|e| e.to_string())?;
+            }
             crate::planner_guard::integrate_check(shared, sid, &check).await?;
             let work = run.works.get_mut(&work_id).unwrap();
             work.status = WorkStatus::Retired;
@@ -1945,12 +2017,13 @@ async fn operate_once(
                 WorkStatus::Admitted
             };
             run.capacity.resumes.remove(&current.spec.work_id);
-            if let Some(wake) = run
-                .wakes
-                .get_mut(&format!("recovery:{}", current.spec.work_id))
-            {
+            let reconciled_work_id = current.spec.work_id.clone();
+            if let Some(wake) = run.wakes.get_mut(&format!("recovery:{reconciled_work_id}")) {
                 wake.acknowledged = true;
             }
+            // Reconciliation has verified and fenced the stopped attempt. Its
+            // old notification is handled even when a dependency delays dispatch.
+            acknowledge_attempt_notifications(&mut run, &reconciled_work_id);
         }
         Operation::Admit { work, .. } => {
             validate_work_spec(&work)?;
@@ -2083,11 +2156,16 @@ async fn operate_once(
             {
                 return Err("review refers to a stale artifact or invalid lifecycle state".into());
             }
-            verify_revision(
-                &work.workspace.as_ref().ok_or("workspace missing")?.path,
-                &revision,
-            )
-            .await?;
+            // Acceptance proves this exact workspace. Rejection must also
+            // work after it changes, so the owner can submit fresh evidence.
+            // The recorded artifact identity above still fences stale reviews.
+            if accepted {
+                verify_revision(
+                    &work.workspace.as_ref().ok_or("workspace missing")?.path,
+                    &revision,
+                )
+                .await?;
+            }
             if evidence.is_empty() || evidence.iter().any(|v| !valid_evidence(v)) {
                 return Err("review requires independent evidence".into());
             }
@@ -2350,6 +2428,7 @@ async fn operate_once(
             acknowledge_input(&mut run, sid, &input_id, owner)?;
         }
         Operation::AcknowledgeWake { wake_id, .. } => {
+            crate::planner_guard::acknowledgement_check(shared, sid, &run, &wake_id).await?;
             if let Some(id) = wake_id.strip_prefix("input:") {
                 let owner = run
                     .inputs
@@ -2568,6 +2647,65 @@ fn continuation_role(work: &Work) -> PlannerRole {
     } else {
         PlannerRole::ImplementWork
     }
+}
+
+/// Adoption after a router restart: a work whose custody is verifiably
+/// unchanged needs no parent reconciliation. The 2026-11-18 restart marked all
+/// 117 adopted works, and the parent spent hours reconciling them one call at a
+/// time while the run sat at 0-3 of 50 workers. Custody is unchanged when no
+/// attempt is still alive, the workspace is a clean git tree, and a submitted
+/// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
+/// live) is still marked, so the parent reconciles exactly what could be lost.
+pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
+    let mut probe = work.clone();
+    mark_reconciliation_required(&mut probe);
+    if !probe.reconciliation.required || work.reconciliation.required {
+        // Not a work adoption would mark, or already owed: unchanged.
+        *work = probe;
+        return;
+    }
+    match adopted_custody_head(work) {
+        Some(head) => {
+            work.reconciliation.source_revision = Some(head);
+            work.reconciliation.evidence =
+                vec!["router: clean workspace with unchanged HEAD at adoption".into()];
+        }
+        None => mark_reconciliation_required(work),
+    }
+}
+
+/// The workspace HEAD when adoption can verify unchanged custody, else None.
+pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
+    if work.attempt.as_ref().is_some_and(|a| !a.ended && owner_alive(a)) {
+        return None;
+    }
+    let path = &work.workspace.as_ref()?.path;
+    if !path.is_dir() {
+        return None;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    if !git(&["status", "--porcelain", "--untracked-files=normal"])?.is_empty() {
+        return None;
+    }
+    let head = git(&["rev-parse", "HEAD"])?;
+    if head.len() != 40 {
+        return None;
+    }
+    if let Some(artifact) = &work.artifact
+        && artifact.revision != head
+    {
+        return None;
+    }
+    Some(head)
 }
 
 pub(crate) fn mark_reconciliation_required(work: &mut Work) {
@@ -3199,6 +3337,86 @@ fn acknowledge_attempt_notifications(run: &mut PlannerRun, work_id: &str) {
         {
             wake.acknowledged = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod adoption_custody_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn work(dir: &std::path::Path, artifact: Option<&str>) -> Work {
+        let mut work: Work = serde_json::from_value(serde_json::json!({
+            "spec": {"work_id": "w", "plan_id": "p", "scope": "s", "external_id": null},
+            "child_id": "c", "status": "interrupted",
+            "workspace": {"path": dir, "lease": "l"},
+            "attempt": null, "artifact": null, "review": null, "finish": null,
+            "integration": null, "reason": null, "last_output": null
+        }))
+        .expect("work fixture");
+        work.artifact = artifact.map(|revision| Artifact {
+            revision: revision.into(),
+            changed_paths: vec![],
+            checks: BTreeMap::new(),
+            evidence: vec![],
+            unresolved: vec![],
+            integration_requirements: BTreeMap::new(),
+        });
+        work
+    }
+
+    /// 2026-11-18: a restart marked all 117 adopted works for one-by-one
+    /// reconciliation. A clean tree whose HEAD is its artifact is resumable at
+    /// once; dirty, moved or missing custody is still owed reconciliation.
+    #[test]
+    fn adoption_reconciles_only_custody_that_could_be_lost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        git(path, &["init", "-q"]);
+        std::fs::write(path.join("a.txt"), "a").unwrap();
+        git(path, &["add", "a.txt"]);
+        git(path, &["-c", "user.name=f", "-c", "user.email=f@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "a"]);
+        let head = String::from_utf8(
+            std::process::Command::new("git").arg("-C").arg(path).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let mut clean = work(path, Some(&head));
+        mark_adopted_reconciliation(&mut clean);
+        assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
+        assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+
+        let mut moved = work(path, Some(&"0".repeat(40)));
+        mark_adopted_reconciliation(&mut moved);
+        assert!(moved.reconciliation.required, "a HEAD past its artifact was not marked");
+
+        std::fs::write(path.join("b.txt"), "uncommitted").unwrap();
+        let mut dirty = work(path, Some(&head));
+        mark_adopted_reconciliation(&mut dirty);
+        assert!(dirty.reconciliation.required, "a dirty tree was not marked");
+
+        let mut missing = work(&path.join("gone"), None);
+        mark_adopted_reconciliation(&mut missing);
+        assert!(missing.reconciliation.required, "a missing tree was not marked");
+
+        let mut finished = work(path, Some(&head));
+        finished.status = WorkStatus::Finished;
+        mark_adopted_reconciliation(&mut finished);
+        assert!(!finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
+            "a finished work was touched");
     }
 }
 

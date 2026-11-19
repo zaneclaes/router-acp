@@ -92,6 +92,13 @@ every 30 minutes after, so a parked run is never silent.
 
 ## Capacity wakes
 
+Audit defects accept an optional `urgent` boolean (default false). A successful host audit
+uses it for transitions that must reach a continuously busy implementation parent even while
+environment builds are healthy. These share the existing release-audit delivery priority,
+tool-boundary protection and unchanged-finding deduplication. Removing the flag withdraws
+that priority. Urgency never selects work or satisfies a release gate; repository policy stays
+in the host, and ordinary defects keep their idle cadence.
+
 Parent wake delivery gives staging/production build, failed-job and smoke observations
 and release checkpoints priority over ordinary WIP build observations, reviews and refill.
 An unfinished release (including a failed deploy, corrective selection and owed disposition)
@@ -192,6 +199,13 @@ record a parent wake and remain readable through `delegate_result`, even without
 session row. `delegate_await` collects completed failures without waiting on live planner
 jobs. A rejected review still needs explicit dispatch of its correction; verify the owning
 attempt and actual activity instead of repeating the initial background acknowledgment.
+Acceptance requires the submitted revision to match the clean workspace. Rejection
+still targets the recorded artifact but may return a changed workspace for corrections;
+otherwise a moved HEAD would make both review and redispatch impossible. The replacement
+attempt must submit fresh evidence before acceptance or integration.
+Host work rows include the persisted `paused` state alongside `attempt_active`, so an
+audit can distinguish a forgotten correction dispatch from a child deliberately stopped
+by the client. This projection does not resume the child or change dispatch permission.
 
 Adopted assignments with `reconciliation.required` stay fenced until the parent reconciles
 their scope and source. Their recovery wakes do not stop capacity checks, independent
@@ -293,6 +307,12 @@ limit. `planner_workflow status` carries the last answer in its `capacity`
 block (`audit`, `audit_findings`, `audit_configured`), and every wake's census
 names the defect codes. While the audit has defects, full worker slots no
 longer excuse the 20-minute heartbeat.
+
+Urgent audit findings also reach a busy parent. If they change while an older audit wake
+is unacknowledged, the router supersedes that unclaimed wake and queues the current
+finding. Claimed deliveries retain their evidence, unchanged findings do not repeat
+during active work, and routine census changes do not replace a healthy release wake.
+This changes notification delivery only; host admission and proof requirements still apply.
 
 ## Turn-end gate
 
@@ -441,6 +461,11 @@ as acknowledged history so the next capacity tick recomputes the condition and
 starts the new owner's wake clock. Pending operator inputs, CI and work wakes
 remain pending; holds and reconciliation requirements still apply.
 
+Successful source reconciliation closes that work's obsolete child-attempt notices,
+as a successful resume already does. A dependency may delay the new attempt without
+replaying the old interruption. Refused reconciliation keeps its notices pending;
+new child events, CI observations, operator input and release/audit duties are unchanged.
+
 While adoption is pending, `audit:` and `gate:` wakes carry the recovery state
 (source run and the current blocker) instead of demanding admissions, the gate
 lists no capacity-host candidates, `admit` and dispatch of an identity still
@@ -454,6 +479,10 @@ capacity census as `{"status":"running","live":2,"admissible":7}`. An unknown
 capacity-host answer gives `admissible:null`. Kory uses it after a turn cancellation
 and before exit: cancelling a parent turn leaves the run's admission and recovery
 loops active. Shutdown drains; exit disconnects and cuts workers off.
+The same distinction holds inside every delegate wait, opening, follow-up and
+failover: interrupting a parent turn preserves its durable planner workers.
+Ordinary delegates still stop with their parent turn. Explicit child stop,
+shutdown drain and parent-session closure still stop planner workers.
 
 A turn that delivers wakes (child, heartbeat, capacity, audit, in-flight,
 gate) is router-owned (`src/planner_preempt.rs`). Operator input never waits

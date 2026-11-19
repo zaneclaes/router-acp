@@ -1048,6 +1048,62 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
     .await;
 }
 
+#[tokio::test]
+async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt() {
+    let state = temp_state_file("planner-managed-steer");
+    // SAFETY: every helper-enabled test uses the same executable.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let pending = park_on_managed_background(&cx, &observed, &sid).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !shared
+                .background_interrupts
+                .lock()
+                .unwrap()
+                .contains_key(&sid)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the managed wait did not register its interrupt");
+        assert!(
+            router_acp::planner_preempt::steer(
+                &shared,
+                &sid,
+                &[ContentBlock::from(
+                    "[Router audit] eligible work needs reconciliation"
+                )]
+            )
+            .await
+        );
+        let response = pending.await.expect("parked prompt task")?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(
+            agent_text(&observed, &sid)
+                .contains("[Router audit] eligible work needs reconciliation")
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.terminal_kills,
+            vec!["managed-terminal-1".to_string()]
+        );
+        assert_eq!(
+            observed.terminal_releases,
+            vec!["managed-terminal-1".to_string()]
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// The live failure: a child parked on a deploy watcher got its parent's
 /// message as an agent-origin `session/prompt`. The router queued it behind
 /// the parked turn and answered at once with an empty turn, so every message
@@ -14531,6 +14587,7 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
     let state = temp_state_file("planner-cancel-idle");
     let log = temp_log("planner-cancel-idle");
     let repo = planner_wire_repository();
+    let release = repo.path().join("release-worker");
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     run_test_shared(planner_wire_yaml(&state, &log), async |cx, _, shared| {
         init(&cx).await?;
@@ -14542,16 +14599,17 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
             .0
             .to_string();
         prompt_text(&cx, &sid, "/implement the cancellation test").await?;
-        prompt_text(
-            &cx,
-            &sid,
-            &format!(
-                "{}DELEGATE_WORK:work-1:finish this bounded turn",
-                planner_admit_wire_prompt()
-            ),
-        )
-        .await?;
-        assert!(!shared.live_delegates.lock().unwrap().is_empty());
+        let active = cx
+            .send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::from(format!(
+                    "{}DELEGATE_WORK:work-1:WAIT_FILE:{}",
+                    planner_admit_wire_prompt(),
+                    release.display()
+                ))],
+            ))
+            .block_task();
+        wait_for_mock_prompt(&log, &format!("\nWAIT_FILE:{}", release.display())).await;
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
         let attempt = router_acp::planner_workflow::load(&shared, &sid)
             .unwrap()
@@ -14559,10 +14617,13 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
             .works["work-1"]
             .attempt
             .clone();
+        assert!(
+            !attempt.as_ref().unwrap().ended,
+            "the cancellation control needs a live worker"
+        );
         // Interrupting the parent to ask something must not stop the run.
         cx.send_notification(CancelNotification::new(sid.clone()))?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(!shared.live_delegates.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(750)).await;
         assert!(!shared.planner_child_routes.lock().unwrap().is_empty());
         assert!(!shared.planner_child_targets.lock().unwrap().is_empty());
         let run = router_acp::planner_workflow::load(&shared, &sid)
@@ -14573,6 +14634,8 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
         let after = run.works["work-1"].attempt.as_ref().unwrap();
         let before = attempt.as_ref().unwrap();
         assert_eq!((&after.id, after.ended), (&before.id, before.ended));
+        std::fs::write(&release, "continue").unwrap();
+        active.await?;
         // A run an older router paused, with a stale permission wait, resumes
         // on the person's next message, even a plain question.
         router_acp::planner_workflow::mutate(&shared, &sid, |run| {
@@ -16352,6 +16415,15 @@ async fn model_shorthand_preempts_router_owned_turn_and_resumes_its_wake_on_the_
 /// that turn; ordinary wakes still wait for its end and nothing cancels it.
 #[tokio::test]
 async fn failed_environment_is_steered_into_the_running_implement_command_turn() {
+    audit_or_failure_reaches_implement_command(false).await;
+}
+
+#[tokio::test]
+async fn host_urgent_audit_is_steered_into_the_running_implement_command_turn() {
+    audit_or_failure_reaches_implement_command(true).await;
+}
+
+async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
     use router_acp::planner_workflow::{self as workflow, Wake};
     let state = temp_state_file("command-turn-steer");
     let log = temp_log("command-turn-steer");
@@ -16407,12 +16479,20 @@ async fn failed_environment_is_steered_into_the_running_implement_command_turn()
                             router_acp::planner_guard::Observation {
                                 revision: "a".repeat(40),
                                 reference: "staging".into(),
-                                state: router_acp::planner_guard::ObservationState::Failed,
+                                state: if host_urgent { router_acp::planner_guard::ObservationState::Passed }
+                                    else { router_acp::planner_guard::ObservationState::Failed },
                                 evidence: "fixture-build".into(),
                             },
                         );
+                        if host_urgent {
+                            run.capacity.audit = Some(serde_json::from_value(serde_json::json!({
+                                "at_ms": chrono::Utc::now().timestamp_millis(), "ok": true,
+                                "defects": [{"code":"READY_TRANSITION", "detail":"next qualified transition", "urgent":true}]
+                            })).unwrap());
+                        }
                         run.wakes.insert(
-                            "observation:ci-job-failures:staging".into(),
+                            if host_urgent { "audit:release:fixture".into() }
+                                else { "observation:ci-job-failures:staging".into() },
                             Wake {
                                 work_id: sid.clone(),
                                 reason: "STAGING-FAILED-FIXTURE".into(),
@@ -17025,20 +17105,34 @@ async fn queued_agent_input_does_not_preempt_an_operator_turn() {
 
 #[tokio::test]
 async fn ownership_handoff_reaches_busy_router_parent_but_preserves_operator_turn() {
-    urgent_parent_wake_respects_operator_turn(false, false).await;
+    urgent_parent_wake_respects_operator_turn(false, false, false).await;
 }
 
 #[tokio::test]
 async fn release_audit_reaches_busy_router_parent_but_preserves_operator_turn() {
-    urgent_parent_wake_respects_operator_turn(true, false).await;
+    urgent_parent_wake_respects_operator_turn(true, false, false).await;
 }
 
 #[tokio::test]
 async fn automatic_ownership_steering_waits_for_the_active_edit_to_finish() {
-    urgent_parent_wake_respects_operator_turn(false, true).await;
+    urgent_parent_wake_respects_operator_turn(false, true, false).await;
 }
 
-async fn urgent_parent_wake_respects_operator_turn(release_audit: bool, protect_tool: bool) {
+#[tokio::test]
+async fn host_urgent_audit_reaches_busy_parent_with_healthy_environments() {
+    urgent_parent_wake_respects_operator_turn(true, false, true).await;
+}
+
+#[tokio::test]
+async fn host_urgent_audit_waits_for_the_active_edit_to_finish() {
+    urgent_parent_wake_respects_operator_turn(true, true, true).await;
+}
+
+async fn urgent_parent_wake_respects_operator_turn(
+    release_audit: bool,
+    protect_tool: bool,
+    host_urgent: bool,
+) {
     use router_acp::planner_workflow::{self as workflow, Attempt, Wake, WorkStatus};
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
     for operator_turn in [false, true] {
@@ -17081,9 +17175,16 @@ async fn urgent_parent_wake_respects_operator_turn(release_audit: bool, protect_
                 if release_audit {
                     run.observations.insert("ci:staging".into(), router_acp::planner_guard::Observation {
                         revision: "a".repeat(40), reference: "staging".into(),
-                        state: router_acp::planner_guard::ObservationState::Failed,
+                        state: if host_urgent { router_acp::planner_guard::ObservationState::Passed }
+                            else { router_acp::planner_guard::ObservationState::Failed },
                         evidence: "fixture-build".into(),
                     });
+                    if host_urgent {
+                        run.capacity.audit = Some(serde_json::from_value(serde_json::json!({
+                            "at_ms": chrono::Utc::now().timestamp_millis(), "ok": true,
+                            "defects": [{"code":"READY_TRANSITION", "detail":"next qualified transition", "urgent":true}]
+                        })).unwrap());
+                    }
                 }
                 let work = run.works.get_mut("work-1").unwrap();
                 work.status = WorkStatus::Interrupted;

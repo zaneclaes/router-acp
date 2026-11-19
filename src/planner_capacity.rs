@@ -646,10 +646,10 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if run.status != RunStatus::Running {
         return;
     }
-    // Failed environment findings must reach coordination even if ordinary
+    // Failed environments and host-declared urgent findings reach coordination even if ordinary
     // worker wakes keep the parent busy continuously. This creates a wake only;
     // operator turns and queued input retain their existing delivery protections.
-    if crate::planner_wake::failed_environment(&run.observations)
+    if crate::planner_guard::urgent_audit(&run)
         || run
             .wakes
             .iter()

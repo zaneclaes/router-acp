@@ -450,12 +450,29 @@ the router names that prerequisite in its capacity wake instead of attempting au
 admission. Once reconciliation succeeds, the same candidate becomes eligible normally,
 even if a previous automatic admission left a reconciliation hold. Other holds remain in force.
 
+For an obsolete identity whose scope has a successor, `retire` may name
+`evidence: {"superseded-by": "<work-id>"}`. The router supplies both assignments
+from the same durable run to the integration-check host; caller-supplied assignment
+details are not authority. The host decides whether the successor preserves the
+repository's scope and source. Self references and unknown successors are refused.
+An approved retirement ends only the old identity: it does not integrate its work,
+finish the successor, delete source, or remove the guide.
+
 Pending input, original attachments, accepted revisions, finishing/integration
 receipts, and wake acknowledgements persist in SQLite. An idle-parent wake has
 bounded retries and cannot infer approval. Disconnecting or cancelling stops
 automatic execution. Resume requires the exact parent identity. `/plan` pauses
 new dispatch while preserving running assignments. `/implement` explicitly
 resumes admitted execution. An empty runnable queue is not completion.
+
+The first implementation prompt refreshes its role from the adopted state without
+re-admitting its command or rewriting the run. Background audit and lifecycle writes
+cannot starve that read; the original input identity and scope remain required.
+Queued messages remain saved during shutdown and after the run pauses. They cannot
+start a parent turn until the run resumes; delivery rechecks this when claiming input.
+While a running parent waits on a managed terminal, eligible planner steering uses
+that wait's interrupt channel. Urgent audit findings and queued corrections can therefore
+resume the parent even though its downstream model turn has already ended.
 
 After adoption, historical input is replayed to the new parent for receipt
 reconciliation. Once that replay is delivered, an explicit acknowledgment or a

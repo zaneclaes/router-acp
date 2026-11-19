@@ -281,6 +281,15 @@ fn audit_worker_activity_tracks_attempts_instead_of_stale_work_status() {
         !active(&run),
         "a stale running label hid the absence of an active repair attempt"
     );
+    assert_eq!(
+        router_acp::planner_guard::works_json(&run)[0]["paused"],
+        false
+    );
+    run.works.get_mut("release-repair").unwrap().paused = true;
+    assert_eq!(
+        router_acp::planner_guard::works_json(&run)[0]["paused"],
+        true
+    );
 }
 
 #[test]
@@ -1182,6 +1191,77 @@ fn implementation_resume_keeps_failed_environment_priority_and_operator_argument
     }
 }
 
+#[test]
+fn adopted_command_refresh_preserves_concurrent_state_and_input_authority() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    let f = fixture(|_| {});
+    let original = input_request(Some("resume"), "/implement admitted scope only", false);
+    let mut admitted = original.clone();
+    planner_workflow::user_command(&f.shared, SID, &mut admitted).unwrap();
+    // Adoption changes the next role after the command was already admitted.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.observations.insert(
+            "ci:production".into(),
+            Observation {
+                revision: "a".repeat(40),
+                reference: "production".into(),
+                state: ObservationState::Failed,
+                evidence: "deployment failed".into(),
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    let mut concurrent = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let mut refreshed = original.clone();
+    planner_workflow::reshape_admitted_command(&f.shared, SID, &original, &mut refreshed).unwrap();
+    assert_eq!(
+        refreshed.meta.as_ref().unwrap()["router_acp"]["planner_role"],
+        "integrate-plan"
+    );
+    assert!(refreshed.prompt.iter().any(|block| matches!(block,
+        ContentBlock::Text(text) if text.text.contains("Arguments: admitted scope only"))));
+    // Refresh is a read, so a writer that loaded before it can still commit.
+    concurrent
+        .receipts
+        .insert("concurrent-audit".into(), "retained".into());
+    planner_workflow::save(&f.shared, SID, &mut concurrent).unwrap();
+    let revision = concurrent.revision;
+    let altered = input_request(Some("resume"), "/implement different scope", false);
+    assert!(
+        planner_workflow::reshape_admitted_command(&f.shared, SID, &altered, &mut original.clone())
+            .is_err()
+    );
+    let unknown = input_request(Some("unknown"), "/implement admitted scope only", false);
+    assert!(
+        planner_workflow::reshape_admitted_command(&f.shared, SID, &unknown, &mut unknown.clone())
+            .is_err()
+    );
+    // Ordinary replay must still be refused; refresh cannot admit a command.
+    assert!(planner_workflow::user_command(&f.shared, SID, &mut original.clone()).is_err());
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .revision,
+        revision
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        planner_workflow::reshape_admitted_command(
+            &f.shared,
+            SID,
+            &original,
+            &mut original.clone()
+        )
+        .is_err()
+    );
+}
+
 /// Adoption moves every work into the adopting run and marks the old run
 /// superseded, but the workspace claims stay under the old session. The adopting
 /// run must take each claim over; a live run's claim on its own work is kept.
@@ -1954,7 +2034,7 @@ async fn required_checks_and_missing_evidence_block_acceptance_and_integration()
 }
 
 #[tokio::test]
-async fn changing_head_after_artifact_invalidates_review() {
+async fn changing_head_after_artifact_blocks_acceptance_but_allows_corrections() {
     let fixture = fixture(|_| {});
     admit(&fixture.shared, work("work-1"));
     let (identity, workspace, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
@@ -1980,6 +2060,7 @@ async fn changing_head_after_artifact_invalidates_review() {
         &workspace.path,
         &["commit", "--quiet", "-m", "changed-head"],
     );
+    let changed_revision = current_revision(&workspace.path);
     let error = planner_workflow::operate(
         &fixture.shared,
         SID,
@@ -1987,7 +2068,7 @@ async fn changing_head_after_artifact_invalidates_review() {
         Operation::Review {
             key: "review-after-head-change".into(),
             work_id: "work-1".into(),
-            revision,
+            revision: revision.clone(),
             accepted: true,
             evidence: vec!["review.txt".into()],
             corrections: None,
@@ -1996,6 +2077,36 @@ async fn changing_head_after_artifact_invalidates_review() {
     .await
     .unwrap_err();
     assert!(error.contains("HEAD changed"), "{error}");
+    planner_workflow::operate(
+        &fixture.shared,
+        SID,
+        None,
+        Operation::Review {
+            key: "correct-after-head-change".into(),
+            work_id: "work-1".into(),
+            revision,
+            accepted: false,
+            evidence: vec!["workspace-head-comparison.txt".into()],
+            corrections: Some("Submit an artifact and proof for the current workspace".into()),
+        },
+    )
+    .await
+    .unwrap();
+    planner_workflow::attempt_ended(
+        &fixture.shared,
+        SID,
+        &identity,
+        None,
+        "returned for fresh proof".into(),
+        false,
+    )
+    .unwrap();
+    let (replacement, resumed, _, _) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    assert_ne!(replacement.attempt_id, identity.attempt_id);
+    assert_eq!(resumed.path, workspace.path);
+    assert_eq!(current_revision(&resumed.path), changed_revision);
 }
 
 #[tokio::test]
@@ -6902,6 +7013,11 @@ async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_p
         RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
     );
     planner_workflow::ensure(&f.shared, "next").unwrap();
+    // Adoption now marks only custody that could be lost (a clean tree at its
+    // recorded HEAD resumes at once; `adoption_custody_tests`). Uncommitted
+    // source in the retried work's tree is such custody.
+    let retry_tree = source.works["retry"].workspace.as_ref().unwrap().path.clone();
+    std::fs::write(retry_tree.join("uncommitted-adoption-source.txt"), "unsaved").unwrap();
     {
         let store = f.shared.state.lock().unwrap();
         planner_adopt::adopt(&*store, SID, "next").unwrap();
@@ -7085,7 +7201,17 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
     );
     planner_workflow::attempt_ended(&f.shared, SID, &old, None, "interrupted".into(), false)
         .unwrap();
+    let old_notice = format!("handoff:{}", old.attempt_id);
     planner_workflow::mutate(&f.shared, SID, |run| {
+        assert!(!run.wakes[&old_notice].acknowledged);
+        run.wakes.insert(
+            "audit:release:still-due".into(),
+            planner_workflow::Wake {
+                work_id: SID.into(),
+                reason: "release evidence still required".into(),
+                ..Default::default()
+            },
+        );
         run.works
             .get_mut("handoff")
             .unwrap()
@@ -7115,6 +7241,14 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
             .contains("replayed")
     );
     let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(
+        run.wakes[&old_notice].acknowledged,
+        "verified reconciliation must close the obsolete attempt notification before any new worker starts"
+    );
+    assert!(
+        !run.wakes["audit:release:still-due"].acknowledged,
+        "source reconciliation cannot acknowledge a release duty"
+    );
     assert_eq!(
         run.works["handoff"].reconciliation.prior_specs,
         vec![work("handoff")]
@@ -7127,6 +7261,14 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
     assert!(prompt.contains(&updated.scope) && prompt.contains(&revision));
     planner_workflow::attempt_ended(&f.shared, SID, &current, None, "interrupted".into(), false)
         .unwrap();
+    assert!(
+        !planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes[&format!("handoff:{}", current.attempt_id)]
+            .acknowledged,
+        "the next attempt's interruption must still notify the parent"
+    );
     git(&workspace.path, &["reset", "--hard", "HEAD~1"]);
     assert!(
         planner_workflow::begin_work(&f.shared, SID, "handoff")
@@ -7196,6 +7338,55 @@ async fn obsolete_worker_retirement_is_verified_terminal_and_not_integration() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn retirement_supplies_the_successor_from_the_same_durable_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let captured = temp.path().join("request.json");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "cat > '{}'; echo '{{\"verified_action\":\"retire\"}}'",
+                    captured.display()
+                ),
+            ],
+            timeout_ms: 5_000,
+        });
+    });
+    admit(&f.shared, work("old"));
+    admit(&f.shared, work("successor"));
+    let operation = |id: &str| Operation::Retire {
+        key: format!("retire-via-{id}"),
+        work_id: "old".into(),
+        reason: "successor preserves the scope; host checks source".into(),
+        evidence: BTreeMap::from([("superseded-by".into(), id.into())]),
+    };
+    for invalid in ["old", "missing"] {
+        assert!(
+            planner_workflow::operate(&f.shared, SID, None, operation(invalid))
+                .await
+                .is_err()
+        );
+        assert!(!captured.exists(), "invalid identity reached the host");
+    }
+    planner_workflow::operate(&f.shared, SID, None, operation("successor"))
+        .await
+        .unwrap();
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(captured).unwrap()).unwrap();
+    assert_eq!(request["assignment"]["spec"]["work_id"], "old");
+    assert_eq!(
+        request["successor_assignment"]["spec"]["work_id"],
+        "successor"
+    );
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.works["old"].status, WorkStatus::Retired);
+    assert_eq!(run.works["successor"].status, WorkStatus::Admitted);
+    assert!(run.works["old"].integration.is_none());
 }
 
 #[tokio::test]
@@ -7850,6 +8041,248 @@ fn set_status(shared: &Arc<Shared>, status: RunStatus) {
         Ok(())
     })
     .unwrap();
+}
+
+#[tokio::test]
+async fn actionable_audit_cannot_be_acknowledged_until_fresh_evidence_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    for wake in ["audit:release:due", "gate:due", "worker:unrelated"] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.wakes.insert(
+                wake.into(),
+                planner_workflow::Wake {
+                    work_id: SID.into(),
+                    reason: "repository duty".into(),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    std::fs::write(
+        &reply,
+        json!({"defects":[{"code":"NEXT_MERGE_DUE", "blocks_acknowledgement":true}]}).to_string(),
+    )
+    .unwrap();
+    let ack = |wake: &str| Operation::AcknowledgeWake {
+        key: format!("ack-{wake}"),
+        wake_id: wake.into(),
+    };
+    for wake in ["audit:release:due", "gate:due"] {
+        assert!(
+            planner_workflow::operate(&f.shared, SID, None, ack(wake))
+                .await
+                .is_err()
+        );
+        assert!(
+            !planner_workflow::load(&f.shared, SID)
+                .unwrap()
+                .unwrap()
+                .wakes[wake]
+                .acknowledged
+        );
+    }
+    planner_workflow::operate(&f.shared, SID, None, ack("worker:unrelated"))
+        .await
+        .unwrap();
+    assert_eq!(
+        host_calls(&log).len(),
+        2,
+        "ordinary receipt acknowledgement must not re-poll CI"
+    );
+    // A pending build is advisory to this guard; only actionable duties block.
+    std::fs::write(&reply, defects(&["CI_PENDING"])).unwrap();
+    planner_workflow::operate(&f.shared, SID, None, ack("audit:release:due"))
+        .await
+        .unwrap();
+    // Unknown evidence cannot silently dismiss a previously actionable gate.
+    std::fs::write(&reply, "not-json").unwrap();
+    assert!(
+        planner_workflow::operate(&f.shared, SID, None, ack("gate:due"))
+            .await
+            .is_err()
+    );
+    std::fs::write(&reply, defects(&[])).unwrap();
+    planner_workflow::operate(&f.shared, SID, None, ack("gate:due"))
+        .await
+        .unwrap();
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .wakes["gate:due"]
+            .acknowledged
+    );
+}
+
+#[tokio::test]
+async fn changed_urgent_audit_replaces_an_unacknowledged_obsolete_wake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    pin_parent(&f.shared);
+    f.shared.with_session(SID, |s| s.prompt_activity = 1);
+    let response = |code: &str, census: &str| {
+        json!({
+            "defects": [{"code":code, "detail":"qualified transition is due", "urgent":true},
+                {"code":"ROUTINE_CENSUS", "detail":census}],
+            "observations": {"ci:staging": {"revision":current_revision(&f.repo),
+                "reference":"staging", "state":"passed", "evidence":"fixture"}}
+        })
+        .to_string()
+    };
+    std::fs::write(&reply, response("READY_TRANSITION", "first census")).unwrap();
+    let start = parent_turn_ended(&f.shared);
+    router_acp::planner_guard::audit_tick(&f.shared, SID, start).await;
+    deliver_all(&f.shared);
+    parent_tool_activity(&f.shared, start + 61);
+    tick(&f.shared, start + 61).await;
+    let original = wakes_with(&f.shared, "audit:release:");
+    assert_eq!(original.len(), 1);
+    assert!(!original[0].1.acknowledged);
+    std::fs::write(
+        &reply,
+        response("READY_TRANSITION", "changed routine census"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 122);
+    tick(&f.shared, start + 122).await;
+    assert_eq!(wakes_with(&f.shared, "audit:release:").len(), 1);
+
+    // A claimed delivery keeps its evidence until its owner releases the claim.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let wake = run.wakes.get_mut(&original[0].0).unwrap();
+        wake.claim_pid = std::process::id();
+        Ok(())
+    })
+    .unwrap();
+    std::fs::write(
+        &reply,
+        response("NEXT_TRANSITION", "changed routine census"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 183);
+    tick(&f.shared, start + 183).await;
+    assert_eq!(wakes_with(&f.shared, "audit:release:").len(), 1);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let wake = run.wakes.get_mut(&original[0].0).unwrap();
+        wake.claim_pid = 0;
+        wake.claim_started_at_ms = 0;
+        Ok(())
+    })
+    .unwrap();
+    // No acknowledgment arrived. A new release obligation must still be deliverable.
+    parent_tool_activity(&f.shared, start + 244);
+    tick(&f.shared, start + 244).await;
+    let changed = wakes_with(&f.shared, "audit:release:");
+    let pending: Vec<_> = changed
+        .iter()
+        .filter(|(_, wake)| !wake.acknowledged)
+        .collect();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].1.reason.contains("NEXT_TRANSITION"));
+    assert!(!pending[0].1.reason.contains("READY_TRANSITION"));
+    assert_ne!(pending[0].0, original[0].0);
+    assert!(
+        changed
+            .iter()
+            .any(|(id, wake)| id == &original[0].0 && wake.acknowledged)
+    );
+    parent_tool_activity(&f.shared, start + 305);
+    tick(&f.shared, start + 305).await;
+    assert_eq!(wakes_with(&f.shared, "audit:release:").len(), changed.len());
+    std::fs::write(
+        &reply,
+        response("READY_TRANSITION", "changed routine census"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 366);
+    tick(&f.shared, start + 366).await;
+    let recurring = wakes_with(&f.shared, "audit:release:");
+    let pending: Vec<_> = recurring
+        .iter()
+        .filter(|(_, wake)| !wake.acknowledged)
+        .collect();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].1.reason.contains("READY_TRANSITION"));
+    assert_ne!(pending[0].0, original[0].0);
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn host_urgent_audit_reaches_busy_parent_without_a_failed_environment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = tmp.path().join("reply");
+    let log = tmp.path().join("audit-log");
+    let f = fixture(|cfg| audit_host(cfg, audit_script(&reply, &log)));
+    authorize(&f.shared);
+    pin_parent(&f.shared);
+    f.shared.with_session(SID, |s| s.prompt_activity = 1);
+    let response = |urgent: bool| {
+        json!({
+        "defects": [{"code":"READY_TRANSITION", "detail":"qualified next transition is due", "urgent":urgent},
+            {"code":"ROUTINE_CENSUS", "detail":"routine status"}],
+        "observations": {"ci:staging": {"revision":current_revision(&f.repo),
+            "reference":"staging", "state":"passed", "evidence":"ci-result.json"}}
+    }).to_string()
+    };
+    std::fs::write(&reply, response(true)).unwrap();
+    let start = parent_turn_ended(&f.shared);
+    router_acp::planner_guard::audit_tick(&f.shared, SID, start).await;
+    deliver_all(&f.shared);
+    parent_tool_activity(&f.shared, start + 61);
+    tick(&f.shared, start + 61).await;
+    let wakes = wakes_with(&f.shared, "audit:release:");
+    assert_eq!(
+        wakes.len(),
+        1,
+        "a host's urgent transition must not wait for a red environment"
+    );
+    assert!(wakes[0].1.reason.contains("READY_TRANSITION"));
+    assert!(!wakes[0].1.reason.contains("ROUTINE_CENSUS"));
+    deliver_all(&f.shared);
+    std::fs::write(
+        &reply,
+        response(true).replace("routine status", "updated routine status"),
+    )
+    .unwrap();
+    parent_tool_activity(&f.shared, start + 122);
+    tick(&f.shared, start + 122).await;
+    assert_eq!(
+        wakes_with(&f.shared, "audit:release:").len(),
+        1,
+        "unchanged findings must not keep interrupting active work"
+    );
+    std::fs::write(&reply, response(false)).unwrap();
+    parent_tool_activity(&f.shared, start + 183);
+    tick(&f.shared, start + 183).await;
+    assert!(
+        wakes_with(&f.shared, "audit:release:")
+            .iter()
+            .all(|(_, wake)| wake.acknowledged),
+        "a withdrawn urgency must not retain permission to interrupt"
+    );
+    assert!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .works
+            .is_empty(),
+        "audit delivery must not create, dispatch or admit work"
+    );
 }
 
 #[tokio::test]

@@ -286,6 +286,10 @@ pub struct RouterSession {
     /// Score-table quality of the current pin for `task_class` — the base of
     /// the session confidence estimate.
     pub pinned_quality: f64,
+    /// The candidate a failover re-pin moved this session away from. A
+    /// transient outage must not strand a session on its fallback: once this
+    /// candidate is eligible again, the next turn boundary switches back.
+    pub failover_from: Option<CandidateId>,
     /// The session's classified task class (set at pin), for choosing an
     /// upgrade target.
     pub task_class: Option<crate::candidate::TaskClass>,
@@ -520,6 +524,7 @@ impl RouterSession {
             turn_last_text_start: 0,
             delegates: Vec::new(),
             pinned_quality: 0.0,
+            failover_from: None,
             task_class: saved_class,
             task_complexity: saved_complexity,
             struggle: 0.0,
@@ -625,6 +630,7 @@ impl RouterSession {
             turn_last_text_start: 0,
             delegates: Vec::new(),
             pinned_quality: 0.0,
+            failover_from: None,
             task_class: None,
             task_complexity: 0.0,
             struggle: 0.0,
@@ -5508,6 +5514,16 @@ async fn pin_ranked(
                 republish_session_title(shared, router_sid);
                 // A failover re-pin moved the parent to a new provider session.
                 if let Some(previous) = previous_pin {
+                    // Remember where it came from, once, so the turn-end failback
+                    // can return when that candidate recovers; landing back on it
+                    // clears the record.
+                    shared.with_session(router_sid, |s| {
+                        if s.failover_from.as_ref() == Some(&candidate) {
+                            s.failover_from = None;
+                        } else if previous.candidate != candidate && s.failover_from.is_none() {
+                            s.failover_from = Some(previous.candidate.clone());
+                        }
+                    });
                     report_repin(
                         shared,
                         router_sid,
@@ -6478,9 +6494,9 @@ async fn wait_for_managed_backgrounds(
     Ok(Some(match outcome {
         BackgroundWait::Steered(prompt) => {
             let mut blocks = vec![ContentBlock::from(format!(
-                "[router-acp managed background interrupted]\nThe user sent a message while this \
-                 turn waited on background terminal(s) {}. router-acp stopped them. Answer the \
-                 user; start a new watcher only if it is still needed.\nUser message:",
+                "[router-acp managed background interrupted]\nNew input arrived while this \
+                 turn waited on background terminal(s) {}. router-acp stopped them. Handle the \
+                 input according to its recorded origin; start a new watcher only if it is still needed.\nInput:",
                 terminal_ids.join(", ")
             ))];
             blocks.extend(prompt);
@@ -8636,6 +8652,30 @@ fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
 /// round) must still be able to climb onto the higher one.
 /// So when nothing clears the margin, fall back to the best strictly-better
 /// candidate instead of returning nothing.
+/// The candidate a failover moved this session away from, when it is eligible
+/// again (not cordoned, quarantined or excluded) and no switch is already
+/// pending. None while the session still sits on it or it remains unavailable.
+fn failback_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
+    let (origin, current, class, excluded, pending) = shared.with_session(router_sid, |s| {
+        (
+            s.failover_from.clone(),
+            s.pin.as_ref().map(|p| p.candidate.clone()),
+            s.task_class.unwrap_or(TaskClass::CodingGeneral),
+            s.excluded.clone(),
+            s.pending_switch.is_some(),
+        )
+    })?;
+    let origin = origin?;
+    if pending || current.is_none() || current.as_ref() == Some(&origin) {
+        return None;
+    }
+    let eligible = shared
+        .eligible_views(&RequiredCaps::default(), class)
+        .iter()
+        .any(|v| v.id == origin && !view_excluded(v, &excluded));
+    (eligible && !shared.coordinator_blocks(router_sid, &origin)).then_some(origin)
+}
+
 fn upgrade_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
     ranked_upgrade_target(shared, router_sid).filter(|t| !shared.coordinator_blocks(router_sid, t))
 }
@@ -8836,6 +8876,25 @@ fn update_confidence_and_maybe_upgrade(
         }
     });
     maybe_demote(shared, router_sid);
+
+    // Failback (Chordzy, 2026-11-19): a five-minute Opus `session/new` timeout
+    // failed the implement-all parent over to grok-4.7, and the pin held for
+    // over 90 minutes after Opus recovered (229 Opus requests by other sessions
+    // in the next half hour). The coordinator then misread its own release
+    // rules and malformed planner_workflow calls. Return to the candidate the
+    // failover left as soon as it is eligible again, at this turn boundary.
+    if let Some(target) = failback_target(shared, router_sid) {
+        shared.with_session(router_sid, |s| {
+            s.pending_switch = Some(SwitchRequest {
+                target: target.clone(),
+                reason: "failback: the candidate a failover left is eligible again".to_string(),
+                handoff: HandoffStyle::Full,
+                user_pick: false,
+            });
+            s.failover_from = None;
+        });
+        return;
+    }
 
     // The `escalation` router uses its own post-turn triggers instead of the
     // confidence-threshold auto-upgrade.
@@ -11240,12 +11299,11 @@ fn prepare_parent_prompt_inner(
                         .get_or_insert_with(Default::default)
                         .entry("router_acp")
                         .or_insert_with(|| json!({}))["input_id"] = json!(input_id);
-                    crate::planner_workflow::user_command_from_original(
+                    crate::planner_workflow::reshape_admitted_command(
                         &shared,
                         &router_sid,
                         &original_req,
                         &mut admitted_command,
-                        true,
                     )
                     .map_err(|error| AcpError::internal_error().data(error))?;
                     req = admitted_command;
