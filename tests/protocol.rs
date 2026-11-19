@@ -15864,7 +15864,7 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             })
             .await;
             assert!(paused.is_ok(), "the drain never paused the run");
-            wait_for_mock_prompt(&log, "Shutdown requested by the operator").await;
+            wait_for_mock_prompt(&log, "Session restart (router lifecycle, not a stop of the run)").await;
             assert!(mock_prompts(&log, "Shutdown requested: interrupt").is_empty(),
                 "a shutdown interrupt must not start another child turn");
             let progress = router_acp::planner_shutdown::progress(&shared, &sid);

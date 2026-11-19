@@ -60,10 +60,13 @@ pub fn status(shared: &Shared, params: &Value) -> Result<Value, String> {
 /// (default the Markdown layout's `Docs/CONTINUE.md`), never a fixed project path.
 pub fn parent_prompt(planner: &crate::config::PlannerRouterConfig) -> String {
     format!(
-        "Shutdown requested by the operator: the live children have stopped. Update {} now \
-         with their final recorded state and the exact resume point. Use the state already \
-         recorded; do not start or resume children, audit, build, commit, push, or wait for CI. \
-         Make this one brief state-saving turn, then stop.",
+        "Session restart (router lifecycle, not a stop of the run): the live children have \
+         stopped so this process can exit. Update {} now with their final recorded state and the \
+         exact resume point. For this one turn only, use the state already recorded; do not start \
+         or resume children, audit, build, commit, push, or wait for CI. This turn's limits end \
+         with it. The next session resumes the whole run normally, so never record or treat this \
+         as an operator instruction to stop or to wait for permission. Make this one brief \
+         state-saving turn, then end it.",
         planner.continuation
     )
 }
