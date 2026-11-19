@@ -111,18 +111,17 @@ impl RouterStrategy for PlannerStrategy {
             }
         }
 
-        // 3. Graceful fallback: if the filtered pool is empty, rank the
-        //    full candidate set via AutoStrategy and note the degradation.
+        // 3. An empty pool is an error, never a reason to route outside it.
+        //    Chordzy 2026-11-19: with Opus at its weekly limit and codex/grok
+        //    failing verification, this used to rank the full candidate set
+        //    and ran implement-all workers on Fable and Sonnet, which the
+        //    operator's implementation_candidates exclude, at heavy cost.
         if pool.is_empty() {
-            let mut result = self.auto.rank(ctx, candidates)?;
-            let note = format!(
-                "planner: no {} candidates available; full-pool fallback",
+            return Err(RouteError(format!(
+                "planner: no {} candidate is routeable{difficulty_tag}; refusing to route outside \
+                 the configured pool {primary:?} (check account limits and candidate verification)",
                 phase_label(phase)
-            );
-            for r in &mut result {
-                r.reason = format!("{note} · {}", r.reason);
-            }
-            return Ok(result);
+            )));
         }
 
         // 4. Delegate ranking to AutoStrategy.
@@ -406,20 +405,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_pool_falls_back_to_full_ranking() {
+    fn empty_pool_refuses_instead_of_routing_outside_it() {
+        // 2026-11-19: the old full-pool fallback put implementation workers on models
+        // the operator's pool excludes.
         let cfg = PlannerRouterConfig {
             planning_candidates: vec!["*nonexistent*".into()],
             ..planner_cfg()
         };
         let s = PlannerStrategy::new(cfg, auto_cfg(), 0.1);
         let ctx = ctx_with_phase(PlannerPhase::Planning, 0.5);
-        let ranked = s.rank(&ctx, &pool()).unwrap();
-        assert!(!ranked.is_empty());
-        assert!(
-            ranked[0].reason.contains("full-pool fallback"),
-            "{}",
-            ranked[0].reason
-        );
+        let err = s.rank(&ctx, &pool()).unwrap_err();
+        assert!(err.0.contains("refusing to route outside"), "{}", err.0);
+        let cfg = PlannerRouterConfig {
+            implementation_candidates: vec!["*nonexistent*".into()],
+            ..planner_cfg()
+        };
+        let s = PlannerStrategy::new(cfg, auto_cfg(), 0.1);
+        let ctx = ctx_with_phase(PlannerPhase::Implementation, 0.5);
+        assert!(s.rank(&ctx, &pool()).is_err(), "an empty implementation pool routed elsewhere");
     }
 
     fn ctx_with_difficulty(difficulty: PlannerDifficulty) -> RouteContext {
