@@ -97,6 +97,17 @@ impl RouterStrategy for PlannerStrategy {
                 .collect();
             difficulty_tag.push_str(" (empty subset; full planning pool)");
         }
+        // A planning turn may still fail over into the configured
+        // implementation pool (coordinators refuse that upstream), never
+        // outside both pools.
+        if pool.is_empty() && phase == PlannerPhase::Planning {
+            pool = candidates
+                .iter()
+                .filter(|c| matches_any(c, &cfg.implementation_candidates))
+                .cloned()
+                .collect();
+            difficulty_tag.push_str(" (planning pool empty; implementation pool)");
+        }
 
         // 2. Apply per-model phase boosts.
         for view in &mut pool {
@@ -410,6 +421,7 @@ mod tests {
         // the operator's pool excludes.
         let cfg = PlannerRouterConfig {
             planning_candidates: vec!["*nonexistent*".into()],
+            implementation_candidates: vec!["*nonexistent*".into()],
             ..planner_cfg()
         };
         let s = PlannerStrategy::new(cfg, auto_cfg(), 0.1);

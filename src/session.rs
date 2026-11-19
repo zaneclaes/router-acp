@@ -4213,6 +4213,10 @@ pub(crate) fn planning_pool_exclusions(shared: &Arc<Shared>, excluded: &[String]
     for candidate in candidates.iter().filter(|c| shared.in_planning_pool(&c.id)) {
         let cause = if is_excluded(&candidate.id, excluded) {
             "excluded for this session".to_string()
+        } else if let Some(why) = shared.auth_rejection(&candidate.id.agent) {
+            // Startup skips a rejected account, so its status stays Unverified;
+            // "not yet probed" hid a sign-in the operator has to redo.
+            format!("sign-in rejected ({why}); run /login for this account")
         } else {
             match &candidate.status {
                 CandidateStatus::Routeable => candidate_unavailable_reason(shared, &candidate.id, false)

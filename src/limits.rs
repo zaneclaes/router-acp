@@ -198,6 +198,11 @@ pub fn is_local_adapter_failure(lower: &str) -> bool {
         || lower.contains("never received")
         || lower.contains("peer disconnected")
         || lower.contains("broken pipe")
+        // The router's own `session/new` deadline on one account's adapter
+        // (session.rs) is that process being busy, not the provider: Chordzy
+        // 2026-11-19 cordoned Opus on every account from these while Sonnet on
+        // the same adapter kept routing.
+        || (lower.contains("session/new on ") && lower.contains("timed out"))
 }
 
 /// The start of a Codex transport failure printed as reply text (see
@@ -417,6 +422,15 @@ mod tests {
 
     fn at(now_epoch: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(now_epoch)
+    }
+
+    #[test]
+    fn a_session_new_timeout_on_one_adapter_is_local_not_a_provider_outage() {
+        let msg = "internal error: \"session/new on claude@2a62/claude-opus-5-5 timed out\"";
+        assert!(is_local_adapter_failure(msg));
+        assert!(is_outage_text(msg), "it still counts toward this account's quarantine");
+        // A provider timeout reported by the model is not the router's deadline.
+        assert!(!is_local_adapter_failure("upstream request timed out (503)"));
     }
 
     fn parse(text: &str, now_epoch: u64) -> Option<u64> {
