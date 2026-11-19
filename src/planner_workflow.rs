@@ -2657,11 +2657,24 @@ fn continuation_role(work: &Work) -> PlannerRole {
 /// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
 /// live) is still marked, so the parent reconciles exactly what could be lost.
 pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
+    mark_adopted_reconciliation_by(work, None);
+}
+
+/// As `mark_adopted_reconciliation`, but once `deadline` has passed no more
+/// custody is probed: the work is marked as before this optimization. Chordzy
+/// 2026-11-19: with the operator's global `core.fsmonitor=true` every probed
+/// tree started a daemon, and adopting 830 works took 5 min 42 s while Kory
+/// sat at a blank screen. Adoption must stay bounded on any host.
+pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<std::time::Instant>) {
     let mut probe = work.clone();
     mark_reconciliation_required(&mut probe);
     if !probe.reconciliation.required || work.reconciliation.required {
         // Not a work adoption would mark, or already owed: unchanged.
         *work = probe;
+        return;
+    }
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        mark_reconciliation_required(work);
         return;
     }
     match adopted_custody_head(work) {
@@ -2683,9 +2696,12 @@ pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
     if !path.is_dir() {
         return None;
     }
+    // A read only: no fsmonitor daemon (a global `core.fsmonitor=true` starts
+    // one per tree) and no optional index lock (a killed status strands it).
     let git = |args: &[&str]| {
         std::process::Command::new("git")
-            .arg("-C")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["-c", "core.fsmonitor=false", "-C"])
             .arg(path)
             .args(args)
             .output()
@@ -3398,6 +3414,12 @@ mod adoption_custody_tests {
         mark_adopted_reconciliation(&mut clean);
         assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
         assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+
+        // 2026-11-19: past the adoption budget nothing is probed; the work reconciles as before.
+        let mut late = work(path, Some(&head));
+        mark_adopted_reconciliation_by(&mut late, Some(std::time::Instant::now()));
+        assert!(late.reconciliation.required && late.reconciliation.source_revision.is_none(),
+            "a work past the custody budget was probed instead of marked");
 
         let mut moved = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation(&mut moved);

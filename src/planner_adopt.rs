@@ -439,6 +439,9 @@ fn merge(
     if into.completed_guides_at_start.is_none() {
         into.completed_guides_at_start = from.completed_guides_at_start.clone();
     }
+    // Custody probes share one budget so adoption never holds a parent's start
+    // for minutes on a slow host; works past it reconcile as before.
+    let custody_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     for (id, work) in &from.works {
         if let Some(existing) = into.works.get(id) {
             if existing.child_id == work.child_id
@@ -453,7 +456,7 @@ fn merge(
             }
         } else {
             let mut adopted = work.clone();
-            crate::planner_workflow::mark_adopted_reconciliation(&mut adopted);
+            crate::planner_workflow::mark_adopted_reconciliation_by(&mut adopted, Some(custody_deadline));
             into.works.insert(id.clone(), adopted);
             if let Some(recovery) = from.capacity.resumes.get(id) {
                 into.capacity.resumes.insert(id.clone(), recovery.clone());
