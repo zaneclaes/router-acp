@@ -10196,6 +10196,13 @@ fn on_initialize(
             .cloned()
             .collect();
         futures::future::join_all(live.iter().map(|k| probe_target(&task_shared, k))).await;
+        let sweep_shared = task_shared.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SIGNED_IN_SWEEP).await;
+                refresh_signed_in_targets(&sweep_shared).await;
+            }
+        });
 
         let routeable = task_shared.routeable_candidates();
         let auth_pending = task_shared.has_auth_pending();
@@ -10427,6 +10434,57 @@ async fn refresh_provider_targets(shared: &Arc<Shared>, provider: &str) {
         })
         .collect();
     for key in keys {
+        if let Err(err) = crate::downstream::restart_after_repair(shared, &key).await {
+            tracing::warn!(target = %key, %err, "signed-in target did not refresh");
+        }
+    }
+}
+
+/// How often a running router looks for accounts signed in since it started.
+const SIGNED_IN_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Start and probe every target whose account is now signed in but still unroutable.
+/// Startup skips a rejected or never-signed-in account, and only a client asking for
+/// `refresh_provider` re-probed one afterwards. On Chordzy 2026-11-19, a sign-in made in
+/// another session left the running router routing only to one account while two
+/// others were signed in and available.
+pub(crate) async fn refresh_signed_in_targets(shared: &Arc<Shared>) {
+    let in_login: HashSet<String> = shared.account_login.lock().unwrap().clone();
+    let agents = shared.agent_configs();
+    let keys: Vec<ProcessKey> = shared
+        .target_keys()
+        .into_iter()
+        .filter(|key| {
+            let Some(spec) = shared.target_spec(key) else {
+                return false;
+            };
+            let Some(agent) = agents.iter().find(|a| a.name == spec.agent_name) else {
+                return false;
+            };
+            if agent.account_disabled || in_login.contains(&agent.name) {
+                return false;
+            }
+            if crate::accounts::provider(agent).is_none()
+                || !matches!(
+                    crate::credentials::availability(agent),
+                    crate::auth::AuthAvailability::Authenticated
+                )
+            {
+                return false;
+            }
+            shared.candidates.lock().unwrap().iter().any(|candidate| {
+                candidate.process_key == *key
+                    && matches!(
+                        candidate.status,
+                        CandidateStatus::AuthPending
+                            | CandidateStatus::Unverified
+                            | CandidateStatus::Down(_)
+                    )
+            })
+        })
+        .collect();
+    for key in keys {
+        tracing::info!(target = %key, "account signed in since startup: starting its target");
         if let Err(err) = crate::downstream::restart_after_repair(shared, &key).await {
             tracing::warn!(target = %key, %err, "signed-in target did not refresh");
         }
