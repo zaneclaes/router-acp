@@ -10150,37 +10150,7 @@ fn on_initialize(
             .filter(|k| task_shared.target_conn(k).is_some())
             .cloned()
             .collect();
-        // Chordzy 2026-11-19: codex and grok hung their initialize/probe for the whole
-        // 120 s timeout on every start, and Kory showed a blank screen that long while
-        // Claude was verified in seconds. Probe all at once; once any candidate is
-        // routeable, wait at most STARTUP_PROBE_GRACE for the rest. Probes still running
-        // continue in their own tasks and make their candidates routeable when they finish.
-        {
-            use futures::StreamExt;
-            const STARTUP_PROBE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
-            let mut probes: futures::stream::FuturesUnordered<_> = live
-                .iter()
-                .map(|k| {
-                    let (s, k) = (task_shared.clone(), k.clone());
-                    tokio::spawn(async move { probe_target(&s, &k).await })
-                })
-                .collect();
-            let mut first_ready: Option<std::time::Instant> = None;
-            loop {
-                // Until one is routeable, each probe's own probe_timeout_ms bounds the wait.
-                let wait = first_ready.map_or(std::time::Duration::from_secs(24 * 3600), |t| {
-                    STARTUP_PROBE_GRACE.saturating_sub(t.elapsed())
-                });
-                match tokio::time::timeout(wait, probes.next()).await {
-                    Ok(Some(_)) => {
-                        if first_ready.is_none() && !task_shared.routeable_candidates().is_empty() {
-                            first_ready = Some(std::time::Instant::now());
-                        }
-                    }
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
+        futures::future::join_all(live.iter().map(|k| probe_target(&task_shared, k))).await;
 
         let routeable = task_shared.routeable_candidates();
         let auth_pending = task_shared.has_auth_pending();
