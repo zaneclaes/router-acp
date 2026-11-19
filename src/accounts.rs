@@ -1538,9 +1538,33 @@ async fn finish_login(
                 }
                 // Device-auth commands poll themselves; Claude waits for stdin.
                 if flow.provider == "claude" && !code_sent {
-                    let Some(code) =
-                        ask(shared, sid, "Paste the Claude authorization code", &[]).await?
-                    else {
+                    // Claude's sign-in page may redirect to the CLI's own localhost
+                    // listener and show no code at all ("return to the CLI"); the
+                    // CLI then finishes by itself. Chordzy 2026-11-19: the router
+                    // kept waiting for a paste nobody could make, and cancelling
+                    // that empty prompt killed a login that had already worked.
+                    let finished = async {
+                        loop {
+                            let changed = flow.changed.notified();
+                            if matches!(
+                                *flow.status.lock().unwrap(),
+                                LoginStatus::Success(_) | LoginStatus::Error(_)
+                            ) {
+                                break;
+                            }
+                            changed.await;
+                        }
+                    };
+                    let answer = tokio::select! {
+                        answer = ask(
+                            shared,
+                            sid,
+                            "Paste the Claude authorization code. If the browser says to return to the CLI, there is no code: sign-in finishes by itself.",
+                            &[],
+                        ) => answer?,
+                        () = finished => continue,
+                    };
+                    let Some(code) = answer else {
                         flow.cancel.cancel();
                         shared.account_flows.lock().unwrap().remove(sid);
                         return Ok(());
