@@ -2675,6 +2675,8 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
     }
     if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
         mark_reconciliation_required(work);
+        // `finish_deferred_custody` checks it after the parent has started.
+        work.reconciliation.evidence = vec![DEFERRED_CUSTODY.into()];
         return;
     }
     match adopted_custody_head(work) {
@@ -2684,6 +2686,39 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
                 vec!["router: clean workspace with unchanged HEAD at adoption".into()];
         }
         None => mark_reconciliation_required(work),
+    }
+}
+
+/// Evidence on a work whose custody check the adoption budget cut off.
+pub(crate) const DEFERRED_CUSTODY: &str = "router: custody check deferred past the adoption budget";
+
+/// Works whose custody check adoption deferred, oldest identity first, at most `limit`.
+pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> Vec<(String, Work)> {
+    works
+        .iter()
+        .filter(|(_, w)| {
+            w.reconciliation.required
+                && w.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY)
+        })
+        .take(limit)
+        .map(|(id, w)| (id.clone(), w.clone()))
+        .collect()
+}
+
+/// Apply a deferred custody result: a clean, unchanged workspace needs no parent
+/// reconciliation (the same judgment adoption makes); anything else stays owed.
+pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
+    if !work.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY) {
+        return;
+    }
+    match head {
+        Some(head) => {
+            work.reconciliation.required = false;
+            work.reconciliation.source_revision = Some(head);
+            work.reconciliation.evidence =
+                vec!["router: clean workspace with unchanged HEAD after adoption".into()];
+        }
+        None => work.reconciliation.evidence.clear(),
     }
 }
 
@@ -3420,6 +3455,18 @@ mod adoption_custody_tests {
         mark_adopted_reconciliation_by(&mut late, Some(std::time::Instant::now()));
         assert!(late.reconciliation.required && late.reconciliation.source_revision.is_none(),
             "a work past the custody budget was probed instead of marked");
+        // The deferred check finishes later and clears it exactly as adoption would have.
+        let works = BTreeMap::from([("late".to_string(), late.clone())]);
+        let deferred = deferred_custody(&works, 50);
+        assert_eq!(deferred.len(), 1, "a deferred work was not listed for the background check");
+        settle_deferred_custody(&mut late, adopted_custody_head(&deferred[0].1));
+        assert!(!late.reconciliation.required, "a clean deferred work stayed owed");
+        assert_eq!(late.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        // A deferred work whose custody is not clean stays owed, and is not rechecked.
+        let mut owed = work(path, Some(&"0".repeat(40)));
+        mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));
+        settle_deferred_custody(&mut owed, adopted_custody_head(&owed.clone()));
+        assert!(owed.reconciliation.required && owed.reconciliation.evidence.is_empty());
 
         let mut moved = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation(&mut moved);

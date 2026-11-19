@@ -136,6 +136,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 ) {
                     tracing::warn!(session = sid, %error, "planner ownership heartbeat not saved");
                 }
+                finish_deferred_custody(&shared, &sid, &run);
                 // A missed stop caused by router death is reconciled before
                 // parent work resumes. Never infer that the child survived.
                 for (id, work) in &run.works {
@@ -222,6 +223,50 @@ fn superseded_notice(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Pl
     if fresh {
         crate::session::notify_user(shared, sid, notice);
     }
+}
+
+/// One batch of deferred custody checks at a time, process-wide.
+static DEFERRED_CUSTODY_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const DEFERRED_CUSTODY_BATCH: usize = 50;
+
+/// Finish the custody checks adoption's 30 s budget cut off, off the critical path.
+/// Chordzy 2026-11-19: after each Kory restart about 100 of 830 adopted works stayed
+/// `reconcile-required` only because the budget ran out, and the parent reconciled
+/// them by hand for over an hour while 3 to 19 of 50 workers ran. A clean, unchanged
+/// workspace is cleared exactly as adoption would have; anything else stays owed.
+fn finish_deferred_custody(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
+    use std::sync::atomic::Ordering;
+    let batch = planner_workflow::deferred_custody(&run.works, DEFERRED_CUSTODY_BATCH);
+    if batch.is_empty() || DEFERRED_CUSTODY_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let shared = shared.clone();
+    let sid = sid.to_string();
+    tokio::spawn(async move {
+        let checked = tokio::task::spawn_blocking(move || {
+            batch
+                .into_iter()
+                .map(|(id, work)| (id, planner_workflow::adopted_custody_head(&work)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let cleared = checked.iter().filter(|(_, head)| head.is_some()).count();
+        let saved = planner_workflow::mutate(&shared, &sid, |run| {
+            for (id, head) in &checked {
+                if let Some(work) = run.works.get_mut(id) {
+                    planner_workflow::settle_deferred_custody(work, head.clone());
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = saved {
+            tracing::warn!(session = sid, %error, "deferred custody results not saved");
+        } else {
+            tracing::info!(session = sid, checked = checked.len(), cleared, "deferred adoption custody checked");
+        }
+        DEFERRED_CUSTODY_RUNNING.store(false, Ordering::SeqCst);
+    });
 }
 
 /// A router-owned turn is in flight and something actionable is pending. A
