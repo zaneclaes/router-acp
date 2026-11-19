@@ -2690,7 +2690,10 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
     // earlier restarts persisted on clean, unchanged trees (auth-server-v2), and the parent reconciled
     // them by hand after every restart. Never-started work has no custody at all: an admitted work with
     // no attempt and no tree was owed only because a workspace path had been reserved.
-    if work.attempt.is_none() && work.workspace.as_ref().is_some_and(|w| !w.path.exists()) {
+    if work.status == WorkStatus::Admitted
+        && work.attempt.is_none()
+        && work.workspace.as_ref().is_some_and(|w| !w.path.exists())
+    {
         work.reconciliation.required = false;
         work.reconciliation.evidence = vec!["router: never started; nothing in custody".into()];
         return;
@@ -3493,6 +3496,7 @@ mod adoption_custody_tests {
         assert!(!owed_clean.reconciliation.required, "an owed work on a clean tree stayed owed");
         // A never-started work whose reserved tree does not exist has nothing in custody.
         let mut never = work(&path.join("never-created"), None);
+        never.status = WorkStatus::Admitted;
         mark_adopted_reconciliation_by(&mut never, None);
         assert!(!never.reconciliation.required, "a never-started work without a tree was owed");
         // A deferred work whose custody is not clean stays owed, and is not rechecked.
