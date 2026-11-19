@@ -3795,6 +3795,7 @@ pub fn close_downstream_session(shared: &Arc<Shared>, key: &ProcessKey, downstre
 fn git_head(cwd: &std::path::Path) -> (Option<String>, Option<String>) {
     let run = |args: &[&str]| -> Option<String> {
         let out = std::process::Command::new("git")
+            .args(crate::planner_workflow::NO_FSMONITOR)
             .arg("-C")
             .arg(cwd)
             .args(args)

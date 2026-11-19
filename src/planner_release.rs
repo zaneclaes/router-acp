@@ -250,6 +250,7 @@ pub fn batch_target_from_host(reply: &Value) -> Result<usize, String> {
 async fn git_read(checkout: &Path, args: &[&str]) -> Option<String> {
     let mut command = tokio::process::Command::new("git");
     command
+        .args(crate::planner_workflow::NO_FSMONITOR)
         .arg("-C")
         .arg(checkout)
         .args(args)

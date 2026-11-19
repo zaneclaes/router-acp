@@ -2525,8 +2525,15 @@ async fn operate_once(
     Ok(json!({"revision":run.revision,"next_role":next_role,"instructions":next_role.map(|r| run.policy.instructions(r))}).to_string())
 }
 
+/// Every router git call runs without fsmonitor. Chordzy 2026-11-19: a host-wide
+/// `core.fsmonitor=true` started a daemon per worktree, and two router git calls on
+/// worker trees waited on one for 22 minutes. That hung the parent's `planner_workflow`
+/// call and held a worktree's index.lock.
+pub(crate) const NO_FSMONITOR: [&str; 2] = ["-c", "core.fsmonitor=false"];
+
 async fn git(path: &Path, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
+        .args(NO_FSMONITOR)
         .arg("-C")
         .arg(path)
         .args(args)
@@ -3099,6 +3106,7 @@ async fn allocate_workspace(
             .map_err(|e| e.to_string())?;
         if !path.exists() {
             let output = tokio::process::Command::new("git")
+                .args(NO_FSMONITOR)
                 .args(["clone", "--no-hardlinks", "--quiet"])
                 .arg(&cwd)
                 .arg(&path)
