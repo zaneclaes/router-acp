@@ -604,7 +604,7 @@ fails.
   (uv tool). Verified model ids (July 2026): claude offers `default, haiku,
   sonnet, sonnet[1m], opus[1m], claude-fable-5[1m]`; codex offers `gpt-5.4-mini,
   gpt-5.4, gpt-5.5`, and the shipped codex preset also carries `gpt-5.6-{luna,terra,sol}`,
-  `gpt-6-{luna,sol}`, `gpt-6.1-sol` and `gpt-6-astra` (OpenAI's flagship above the Sol
+  `gpt-6-{luna,sol}`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6-astra` and `gpt-6.2-astra` (OpenAI's flagship above the Sol
   family, scored from its own DeepSWE v1.1 evidence under `*gpt-6-astra*`; a model
   enabled in a preset needs its full `data/` contract or `tests/model_contract.rs` and
   `scripts/update_models.py --validate-only` fail). **grok** (`@xai-official/grok` v0.2.106): `grok agent stdio`
