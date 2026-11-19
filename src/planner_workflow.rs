@@ -922,8 +922,14 @@ fn user_command_once(
             run.prior_policies
                 .push(std::mem::replace(&mut run.policy, policy));
         }
+        // Custody-aware, as adoption is. Chordzy 2026-11-19: this blanket mark re-owed
+        // all 104 works adoption had just verified clean, so after every Kory restart
+        // the parent reconciled about 100 works by hand while 1 to 19 of 50 workers ran.
+        // A clean, unchanged tree needs nothing; the budget's remainder is checked by
+        // the background custody pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         for work in run.works.values_mut() {
-            mark_reconciliation_required(work);
+            mark_adopted_reconciliation_by(work, Some(deadline));
         }
     }
     run.phase = phase;
