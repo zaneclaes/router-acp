@@ -441,7 +441,12 @@ fn merge(
     }
     // Custody probes share one budget so adoption never holds a parent's start
     // for minutes on a slow host; works past it reconcile as before.
-    let custody_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // No custody probe inside the merge: `adopt_at` reruns the merge in a save loop that
+    // retries when the destination's revision moves, and the destination's own heartbeat
+    // moves it. On Chordzy 2026-11-19, a 30 s probe per merge lost every save race, and
+    // 867 works sat claimed but unadopted for over 10 minutes. Every markable work is
+    // deferred at once, and `finish_deferred_custody` probes them after adoption.
+    let custody_deadline = std::time::Instant::now();
     for (id, work) in &from.works {
         if let Some(existing) = into.works.get(id) {
             if existing.child_id == work.child_id

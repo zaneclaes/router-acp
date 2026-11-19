@@ -925,9 +925,10 @@ fn user_command_once(
         // Custody-aware, as adoption is. Chordzy 2026-11-19: this blanket mark re-owed
         // all 104 works adoption had just verified clean, so after every Kory restart
         // the parent reconciled about 100 works by hand while 1 to 19 of 50 workers ran.
-        // A clean, unchanged tree needs nothing; the budget's remainder is checked by
-        // the background custody pass.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // A clean, unchanged tree needs nothing. No probe runs here (this can run inside
+        // a save-retry loop, like adoption's merge): every markable work is deferred at
+        // once, and the background custody pass checks it.
+        let deadline = std::time::Instant::now();
         for work in run.works.values_mut() {
             mark_adopted_reconciliation_by(work, Some(deadline));
         }
