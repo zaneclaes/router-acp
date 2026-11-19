@@ -708,6 +708,9 @@ pub struct Shared {
     pub candidates: Mutex<Vec<CandidateRuntime>>,
     sid_map: Mutex<HashMap<(ProcessKey, String), DownstreamRoute>>,
     pub delegate_tokens: Mutex<HashMap<String, crate::delegate_mcp::DelegateBinding>>,
+    /// Delegate tokens whose helper has connected. A planner parent whose
+    /// current token never connected has no router tools (Chordzy 2026-11-19).
+    pub delegate_connected: Mutex<std::collections::HashSet<String>>,
     /// Delegate sub-sessions kept alive for follow-up turns (`keep_open`),
     /// keyed by the short `delegate_id` returned to the parent.
     pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
@@ -878,6 +881,7 @@ impl Shared {
             candidates: Mutex::new(candidates),
             sid_map: Mutex::new(HashMap::new()),
             delegate_tokens: Mutex::new(HashMap::new()),
+            delegate_connected: Mutex::new(std::collections::HashSet::new()),
             live_delegates: Mutex::new(HashMap::new()),
             background_delegates: Mutex::new(HashMap::new()),
             background_notify: tokio::sync::Notify::new(),
@@ -8652,6 +8656,31 @@ fn session_confidence(shared: &Arc<Shared>, router_sid: &str) -> f64 {
 /// round) must still be able to climb onto the higher one.
 /// So when nothing clears the margin, fall back to the best strictly-better
 /// candidate instead of returning nothing.
+/// For a planner parent whose current delegate token never connected (its
+/// provider session has no router tools), the best other eligible candidate.
+fn toolless_parent_target(shared: &Arc<Shared>, router_sid: &str) -> Option<CandidateId> {
+    let (planner, token, current, class, excluded, pending) = shared.with_session(router_sid, |s| {
+        (
+            s.strategy == StrategyKind::Planner,
+            s.delegate_token.clone(),
+            s.pin.as_ref().map(|p| p.candidate.clone()),
+            s.task_class.unwrap_or(TaskClass::CodingGeneral),
+            s.excluded.clone(),
+            s.pending_switch.is_some(),
+        )
+    })?;
+    let (token, current) = (token?, current?);
+    if !planner || pending || shared.delegate_connected.lock().unwrap().contains(&token) {
+        return None;
+    }
+    shared
+        .eligible_views(&RequiredCaps::default(), class)
+        .into_iter()
+        .filter(|v| v.id != current && !view_excluded(v, &excluded) && !shared.coordinator_blocks(router_sid, &v.id))
+        .max_by(|a, b| a.quality.partial_cmp(&b.quality).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|v| v.id)
+}
+
 /// The candidate a failover moved this session away from, when it is eligible
 /// again (not cordoned, quarantined or excluded) and no switch is already
 /// pending. None while the session still sits on it or it remains unavailable.
@@ -8892,6 +8921,27 @@ fn update_confidence_and_maybe_upgrade(
                 user_pick: false,
             });
             s.failover_from = None;
+        });
+        return;
+    }
+
+    // Toolless parent (Chordzy, 2026-11-19): after a 15:07Z re-pin the implement-all
+    // parent's provider session never connected its router-delegate helper, so for
+    // 30+ minutes it had no planner_workflow or delegate_task and 45 of 50 worker
+    // slots sat empty. A planner parent whose current token never connected moves to
+    // a fresh provider session on another eligible candidate (the failback above
+    // brings it home once its original is eligible).
+    if let Some(target) = toolless_parent_target(shared, router_sid) {
+        shared.with_session(router_sid, |s| {
+            if s.failover_from.is_none() {
+                s.failover_from = s.pin.as_ref().map(|p| p.candidate.clone());
+            }
+            s.pending_switch = Some(SwitchRequest {
+                target: target.clone(),
+                reason: "re-open: this provider session never connected its router tools".to_string(),
+                handoff: HandoffStyle::Full,
+                user_pick: false,
+            });
         });
         return;
     }

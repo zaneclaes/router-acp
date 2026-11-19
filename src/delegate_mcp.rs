@@ -758,6 +758,7 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
         .get(token)
         .cloned()
         .ok_or("unknown delegate token")?;
+    shared.delegate_connected.lock().unwrap().insert(token.to_string());
     let router_sid = binding.router_sid;
     let delegation_enabled = binding.delegation_enabled;
     // A `router-worker` connection serves only the worker's own tools.
