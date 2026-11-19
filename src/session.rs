@@ -8670,8 +8670,13 @@ fn toolless_parent_target(shared: &Arc<Shared>, router_sid: &str) -> Option<Cand
         )
     })?;
     let (token, current) = (token?, current?);
-    if !planner || pending || shared.delegate_connected.lock().unwrap().contains(&token) {
-        return None;
+    {
+        // Only where helpers demonstrably connect in this process (every live worker
+        // uses one); a host or fixture where none ever connects proves nothing.
+        let connected = shared.delegate_connected.lock().unwrap();
+        if !planner || pending || connected.is_empty() || connected.contains(&token) {
+            return None;
+        }
     }
     shared
         .eligible_views(&RequiredCaps::default(), class)
