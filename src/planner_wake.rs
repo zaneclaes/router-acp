@@ -536,9 +536,15 @@ pub(crate) fn pending_steer(
     };
     // An interrupting input (`send-input --interrupt`) is steered ahead of
     // older queued corrections; each still reaches its boundary in order.
+    // Skip one a live delivery already claims: Chordzy 2026-11-19, an earlier
+    // interrupt that had become the running turn's own prompt stayed claimed
+    // until that 25-minute turn ended, and a later interrupt behind it was
+    // never steered.
     let interrupting = queue.iter().filter(unacknowledged).find(|input| {
+        let key = format!("input:{}", input.input_id);
         crate::external_message::interrupt_of(&input.request)
-            && !steered.contains(&format!("input:{}", input.input_id))
+            && !steered.contains(&key)
+            && !wakes.get(&key).is_some_and(|w| claimed(w, &key))
     });
     if let Some(input) = interrupting.or_else(|| queue.iter().find(unacknowledged)) {
         let key = format!("input:{}", input.input_id);
@@ -1597,6 +1603,30 @@ mod steer_tests {
             pending_steer(&queue, &wakes, &HashSet::new()).unwrap().0,
             "input:pending"
         );
+    }
+
+    /// Chordzy 2026-11-19: the first interrupt became the running turn's own prompt
+    /// and stayed claimed by the live router; a later interrupt must still be steered.
+    #[test]
+    fn a_claimed_interrupt_does_not_shadow_a_later_one() {
+        fn urgent(id: &str) -> planner_workflow::QueuedParentInput {
+            let mut item = input(id, true);
+            item.request = PromptRequest::new("s".to_string(), vec![ContentBlock::from(id.to_string())])
+                .meta(serde_json::from_value(json!({"router_acp": {
+                    "agent_origin": true, "input_id": id, "interrupt": true
+                }})).ok());
+            item
+        }
+        let queue = vec![urgent("first"), urgent("second")];
+        let wakes = BTreeMap::from([(
+            "input:first".into(),
+            planner_workflow::Wake {
+                claim_pid: std::process::id(),
+                claim_started_at_ms: planner_workflow::process_identity().1,
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(pending_steer(&queue, &wakes, &HashSet::new()).unwrap().0, "input:second");
     }
 
     /// `send-input --interrupt`: steered ahead of an older queued correction,
