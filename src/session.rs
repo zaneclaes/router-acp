@@ -1184,6 +1184,21 @@ impl Shared {
             .insert((key.clone(), downstream_sid.to_string()), route);
     }
 
+    /// True when the process serving `candidate` still has a live routed session.
+    pub fn process_serving_sessions(&self, candidate: &CandidateId) -> bool {
+        let Some(key) = self
+            .candidates
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| &c.id == candidate)
+            .map(|c| c.process_key.clone())
+        else {
+            return false;
+        };
+        self.sid_map.lock().unwrap().keys().any(|(k, _)| *k == key)
+    }
+
     pub fn unregister_route(&self, key: &ProcessKey, downstream_sid: &str) {
         self.sid_map
             .lock()
@@ -4195,6 +4210,12 @@ fn prompt_is_empty(prompt: &[ContentBlock]) -> bool {
 
 /// True when a candidate matches any exclusion pattern (an agent name or a
 /// candidate-id glob).
+/// The router's own `session/new` deadline (`open_downstream_session`), not a provider error.
+fn is_session_new_timeout(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("session/new on ") && lower.contains("timed out")
+}
+
 fn is_excluded(candidate: &CandidateId, patterns: &[String]) -> bool {
     let full = candidate.to_string();
     patterns
@@ -4670,13 +4691,21 @@ pub(crate) fn apply_failure(
                 shared.publish_config_options();
                 return reason;
             }
-            shared
-                .headroom
-                .lock()
-                .unwrap()
-                .record_pre_prompt_failure(candidate);
             let mut msg = format!("{err}");
             msg.truncate(160);
+            // A `session/new` deadline on an adapter that is still serving other
+            // sessions is that process being busy, not down. Chordzy 2026-11-19:
+            // with one Opus seat left, such strikes quarantined it and stopped
+            // the parent and every worker at once. Process death and a probe
+            // failure still mark the target; only this strike is skipped.
+            let busy = is_session_new_timeout(&msg) && shared.process_serving_sessions(candidate);
+            if !busy {
+                shared
+                    .headroom
+                    .lock()
+                    .unwrap()
+                    .record_pre_prompt_failure(candidate);
+            }
             // A provider outage takes the model down on every account; a
             // local adapter failure only concerns this process.
             if !crate::limits::is_local_adapter_failure(&msg.to_lowercase()) {
@@ -6099,6 +6128,18 @@ fn build_delegation_instructions(policy: crate::config::NativeSubagentPolicy) ->
          file edits. Give each delegate a complete brief, verify its result, and \
          integrate it yourself. {native} If no suitable subtask exists, continue directly."
     )
+}
+
+#[cfg(test)]
+mod session_new_timeout_tests {
+    #[test]
+    fn only_the_routers_own_session_new_deadline_matches() {
+        assert!(super::is_session_new_timeout(
+            "Internal error: \"session/new on claude@a/claude-opus-5-5 timed out\""
+        ));
+        assert!(!super::is_session_new_timeout("upstream request timed out"));
+        assert!(!super::is_session_new_timeout("session/new on claude@a/x failed"));
+    }
 }
 
 #[cfg(test)]
