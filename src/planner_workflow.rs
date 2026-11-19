@@ -3465,7 +3465,8 @@ mod adoption_custody_tests {
         // A deferred work whose custody is not clean stays owed, and is not rechecked.
         let mut owed = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));
-        settle_deferred_custody(&mut owed, adopted_custody_head(&owed.clone()));
+        let owed_head = adopted_custody_head(&owed);
+        settle_deferred_custody(&mut owed, owed_head);
         assert!(owed.reconciliation.required && owed.reconciliation.evidence.is_empty());
 
         let mut moved = work(path, Some(&"0".repeat(40)));
