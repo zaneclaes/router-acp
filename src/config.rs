@@ -3076,13 +3076,24 @@ agents:
                 model: model.into(),
             })
         };
-        for old in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-sol"] {
+        for old in [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+        ] {
             assert!(
                 !eligible("codex@one", old),
                 "{old} is superseded and must be explicit-only"
             );
         }
-        for latest in ["gpt-6-luna", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+        for latest in [
+            "gpt-6-luna",
+            "gpt-6.2-sol",
+            "gpt-5.6-terra",
+            "gpt-6.2-astra",
+        ] {
             assert!(
                 eligible("codex@one", latest),
                 "{latest} is its family's latest"

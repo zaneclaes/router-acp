@@ -121,6 +121,26 @@ models:
     default_quality: 1.80
     quality: { UiTweak: 1.80, BugFix: 2.17, Feature: 1.80, Refactor: 2.17, Algorithms: 2.03, Architecture: 1.80, Research: 1.57, Writing: 1.80, Ops: 1.80, CodingGeneral: 2.02 }
   sol:
+  - version: 6.2
+    id: gpt-6.2-sol
+    display_name: GPT-6.2 Sol
+    cost_rank: 5
+    # Released 2026-11-17 at 6.1 Sol's rates. Requests over 272k input tokens
+    # bill $4/$15.
+    pricing: { input_per_mtok: 2.0, output_per_mtok: 10.0, cache_read_per_mtok: 0.1 }
+    # Vals' own runs at max effort (model page, 2026-11-18). OpenAI published no
+    # DeepSWE or Terminal-Bench 2.1 row for 6.2 Sol.
+    evidence:
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 87.62, source: "https://www.vals.ai/models/openai_gpt-6.2-sol" }
+      - { benchmark: Terminal-Bench-4.0, result: 60.61, source: "https://www.vals.ai/models/openai_gpt-6.2-sol" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 58.57, source: "https://www.vals.ai/models/openai_gpt-6.2-sol" }
+    rank_exception: >-
+      GPT-6.2 Sol is $2/$10 (0.05x cache). Same Sol-rank-5 hold as gpt-6.1-sol: list-price ranking would spend Sol-class capability on everyday work.
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 2.78
+    quality: { UiTweak: 2.78, BugFix: 2.78, Feature: 2.78, Refactor: 2.78, Algorithms: 2.78, Architecture: 2.78, Research: 2.98, Writing: 2.78, Ops: 2.78, CodingGeneral: 2.78 }
   - version: 6.1
     id: gpt-6.1-sol
     display_name: GPT-6.1 Sol
@@ -186,6 +206,24 @@ models:
     # GPT-6 Astra (2026-09-03): OpenAI's flagship above the Sol line. One
     # published row with anchors here (DeepSWE v1.1 74.1), so every class
     # carries the aggregate.
+  - version: 6.2
+    id: gpt-6.2-astra
+    display_name: GPT-6.2 Astra
+    cost_rank: 5
+    # Released 2026-11-17, 20% below GPT-6 Astra. Requests over 272k input
+    # tokens bill $16/$60.
+    pricing: { input_per_mtok: 8.0, output_per_mtok: 40.0, cache_read_per_mtok: 0.4 }
+    # Vals' own runs at max effort (model page, 2026-11-18). OpenAI published no
+    # DeepSWE or Terminal-Bench 2.1 row for 6.2 Astra.
+    evidence:
+      - { benchmark: Vibe-Code-Bench-v1.1, result: 89.90, source: "https://www.vals.ai/models/openai_gpt-6.2-astra" }
+      - { benchmark: Terminal-Bench-4.0, result: 63.13, source: "https://www.vals.ai/models/openai_gpt-6.2-astra" }
+      - { benchmark: Terminal-Bench-Science-0.1, result: 71.43, source: "https://www.vals.ai/models/openai_gpt-6.2-astra" }
+    context_window: 1050000
+    max_output_tokens: 128000
+    effort_levels: [low, medium, high, xhigh, max]
+    default_quality: 3.04
+    quality: { UiTweak: 3.04, BugFix: 3.04, Feature: 3.04, Refactor: 3.04, Algorithms: 3.04, Architecture: 3.04, Research: 3.22, Writing: 3.04, Ops: 3.04, CodingGeneral: 3.04 }
   - version: 6
     id: gpt-6-astra
     display_name: GPT-6 Astra
