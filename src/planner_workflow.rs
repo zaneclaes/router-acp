@@ -2681,9 +2681,18 @@ pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
 pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<std::time::Instant>) {
     let mut probe = work.clone();
     mark_reconciliation_required(&mut probe);
-    if !probe.reconciliation.required || work.reconciliation.required {
-        // Not a work adoption would mark, or already owed: unchanged.
+    if !probe.reconciliation.required {
+        // Not a work adoption would mark: unchanged.
         *work = probe;
+        return;
+    }
+    // A work already owed is checked again rather than kept owed. Chordzy 2026-11-19: owed marks from
+    // earlier restarts persisted on clean, unchanged trees (auth-server-v2), and the parent reconciled
+    // them by hand after every restart. Never-started work has no custody at all: an admitted work with
+    // no attempt and no tree was owed only because a workspace path had been reserved.
+    if work.attempt.is_none() && work.workspace.as_ref().is_some_and(|w| !w.path.exists()) {
+        work.reconciliation.required = false;
+        work.reconciliation.evidence = vec!["router: never started; nothing in custody".into()];
         return;
     }
     if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -2694,6 +2703,7 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
     }
     match adopted_custody_head(work) {
         Some(head) => {
+            work.reconciliation.required = false;
             work.reconciliation.source_revision = Some(head);
             work.reconciliation.evidence =
                 vec!["router: clean workspace with unchanged HEAD at adoption".into()];
@@ -3476,6 +3486,15 @@ mod adoption_custody_tests {
         settle_deferred_custody(&mut late, adopted_custody_head(&deferred[0].1));
         assert!(!late.reconciliation.required, "a clean deferred work stayed owed");
         assert_eq!(late.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        // 2026-11-19: a work already owed on a clean, unchanged tree is checked again and cleared.
+        let mut owed_clean = work(path, Some(&head));
+        owed_clean.reconciliation.required = true;
+        mark_adopted_reconciliation_by(&mut owed_clean, None);
+        assert!(!owed_clean.reconciliation.required, "an owed work on a clean tree stayed owed");
+        // A never-started work whose reserved tree does not exist has nothing in custody.
+        let mut never = work(&path.join("never-created"), None);
+        mark_adopted_reconciliation_by(&mut never, None);
+        assert!(!never.reconciliation.required, "a never-started work without a tree was owed");
         // A deferred work whose custody is not clean stays owed, and is not rechecked.
         let mut owed = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));
