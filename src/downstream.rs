@@ -198,6 +198,19 @@ fn codex_hook_trust_env(env: &mut Vec<(String, String)>) {
     ));
 }
 
+/// Claude Code's MCP server startup deadline (ms) for the router's own helper servers. Chordzy
+/// 2026-11-20: under load (about 50 sessions) workers' `router-worker` helper missed the default
+/// deadline ("router-worker failed to connect", CONNECT_TIMEOUT), so the worker ran without its
+/// handoff tools. An explicit value in the account's env or the router's environment wins.
+const MCP_STARTUP_TIMEOUT_MS: &str = "120000";
+
+fn mcp_startup_timeout_env(env: &mut Vec<(String, String)>) {
+    if env.iter().any(|(name, _)| name == "MCP_TIMEOUT") || std::env::var_os("MCP_TIMEOUT").is_some() {
+        return;
+    }
+    env.push(("MCP_TIMEOUT".into(), MCP_STARTUP_TIMEOUT_MS.into()));
+}
+
 /// Spawn the downstream process and its client connection as a contained
 /// task on the upstream connection. Failures are recorded in shared state
 /// instead of tearing down the router.
@@ -223,6 +236,9 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
             }
             if crate::accounts::provider(agent) == Some("codex") && agent.bypass_hook_trust {
                 codex_hook_trust_env(&mut acp_agent.env);
+            }
+            if crate::accounts::provider(agent) == Some("claude") {
+                mcp_startup_timeout_env(&mut acp_agent.env);
             }
             crate::credentials::runtime(agent, &mut acp_agent.env)
                 .await
@@ -794,6 +810,19 @@ pub fn verify_model_selected(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn claude_adapters_get_a_long_mcp_startup_timeout_unless_one_is_set() {
+        if std::env::var_os("MCP_TIMEOUT").is_some() {
+            return; // the host's own value wins and is inherited as-is
+        }
+        let mut env = Vec::new();
+        mcp_startup_timeout_env(&mut env);
+        assert_eq!(env, vec![("MCP_TIMEOUT".to_string(), MCP_STARTUP_TIMEOUT_MS.to_string())]);
+        let mut explicit = vec![("MCP_TIMEOUT".to_string(), "5000".to_string())];
+        mcp_startup_timeout_env(&mut explicit);
+        assert_eq!(explicit, vec![("MCP_TIMEOUT".to_string(), "5000".to_string())]);
+    }
     use agent_client_protocol::schema::v1::{SessionConfigSelectGroup, SessionConfigSelectOption};
 
     fn spawn_config_yaml() -> &'static str {
