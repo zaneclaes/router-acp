@@ -2964,7 +2964,18 @@ pub(crate) fn toolless_workers(
     if connected.is_empty() {
         return Vec::new();
     }
-    let minted = shared.worker_token_minted.lock().unwrap().clone();
+    // A worker token this sweep never saw minted (registered by another path) starts its grace now,
+    // so it is judged too rather than ignored forever.
+    let minted = {
+        let mut minted = shared.worker_token_minted.lock().unwrap();
+        let now = std::time::Instant::now();
+        for (token, binding) in shared.delegate_tokens.lock().unwrap().iter() {
+            if binding.worker.is_some() {
+                minted.entry(token.clone()).or_insert(now);
+            }
+        }
+        minted.clone()
+    };
     shared
         .delegate_tokens
         .lock()
