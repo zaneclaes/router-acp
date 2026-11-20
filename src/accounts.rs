@@ -717,6 +717,38 @@ pub(crate) async fn ask(
     }
 }
 
+/// The Claude code prompt. The field is optional so a blank Enter is an answer: a
+/// client such as Kory declines a blank *required* field, and the router read that
+/// decline as a cancel, which ended a login the browser had already completed.
+/// `None` only for a cancel or decline; an accepted blank is `Some("")`.
+async fn ask_code(shared: &Arc<Shared>, sid: &str, title: &str) -> Result<Option<String>, AcpError> {
+    let property = StringPropertySchema::new().title(title.to_string());
+    let schema = ElicitationSchema::new().property("choice", property, false);
+    let request = CreateElicitationRequest::new(
+        ElicitationFormMode::new(ElicitationSessionScope::new(sid.to_string()), schema),
+        title.to_string(),
+    );
+    let response = shared
+        .upstream()
+        .ok_or_else(AcpError::internal_error)?
+        .send_request(request)
+        .block_task()
+        .await?;
+    Ok(match response.action {
+        ElicitationAction::Accept(answer) => Some(
+            answer
+                .content
+                .and_then(|v| v.get("choice").cloned())
+                .and_then(|v| match v {
+                    ElicitationContentValue::String(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    })
+}
+
 async fn ask_reserve(
     shared: &Arc<Shared>,
     sid: &str,
@@ -1091,6 +1123,18 @@ async fn handle(shared: &Arc<Shared>, sid: &str, command: &str) -> Result<(), Ac
             _ => emit(shared, sid, "Choose a listed number."),
         }
     }
+}
+
+const CLAUDE_CODE_PROMPT: &str = "Paste the Claude authorization code, or press Enter if the browser \
+     showed no code (\"return to the CLI\"); sign-in is then checked again.";
+/// How long a blank answer waits for the CLI to report the sign-in it received from the browser.
+const BLANK_CODE_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn login_done(flow: &LoginFlow) -> bool {
+    matches!(
+        *flow.status.lock().unwrap(),
+        LoginStatus::Success(_) | LoginStatus::Error(_)
+    )
 }
 
 fn valid_code(code: &str) -> bool {
@@ -1538,22 +1582,55 @@ async fn finish_login(
                 }
                 // Device-auth commands poll themselves; Claude waits for stdin.
                 if flow.provider == "claude" && !code_sent {
-                    let Some(code) =
-                        ask(shared, sid, "Paste the Claude authorization code", &[]).await?
-                    else {
-                        flow.cancel.cancel();
-                        shared.account_flows.lock().unwrap().remove(sid);
-                        return Ok(());
+                    // Claude's sign-in page may redirect to the CLI's own localhost
+                    // listener and show no code at all ("return to the CLI"); the
+                    // CLI then finishes by itself. Chordzy 2026-11-19: the router
+                    // kept waiting for a paste nobody could make, and cancelling
+                    // that empty prompt killed a login that had already worked.
+                    // Operator, 2026-11-19: the prompt says Enter with no code is fine, a
+                    // blank answer is accepted, and either way the sign-in state is checked
+                    // again; while it is not signed in, the prompt comes back.
+                    let finished = || async {
+                        loop {
+                            let changed = flow.changed.notified();
+                            if login_done(&flow) {
+                                break;
+                            }
+                            changed.await;
+                        }
                     };
-                    if !valid_code(&code) {
-                        flow.cancel.cancel();
-                        return Err(AcpError::invalid_params().data("Invalid authorization code"));
+                    let mut prompt = CLAUDE_CODE_PROMPT.to_string();
+                    loop {
+                        let answer = tokio::select! {
+                            answer = ask_code(shared, sid, &prompt) => answer?,
+                            () = finished() => break,
+                        };
+                        let Some(code) = answer else {
+                            flow.cancel.cancel();
+                            shared.account_flows.lock().unwrap().remove(sid);
+                            return Ok(());
+                        };
+                        let code = code.trim().to_string();
+                        if code.is_empty() {
+                            // The browser may have handed the sign-in straight to the CLI.
+                            let _ = tokio::time::timeout(BLANK_CODE_SETTLE, finished()).await;
+                            if login_done(&flow) {
+                                break;
+                            }
+                            prompt = format!("Not signed in yet. {CLAUDE_CODE_PROMPT}");
+                            continue;
+                        }
+                        if !valid_code(&code) {
+                            prompt = format!("That is not an authorization code. {CLAUDE_CODE_PROMPT}");
+                            continue;
+                        }
+                        flow.input
+                            .send(code)
+                            .await
+                            .map_err(|_| AcpError::internal_error().data("Login ended"))?;
+                        code_sent = true;
+                        break;
                     }
-                    flow.input
-                        .send(code)
-                        .await
-                        .map_err(|_| AcpError::internal_error().data("Login ended"))?;
-                    code_sent = true;
                 }
             }
             _ => {}

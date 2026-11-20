@@ -380,6 +380,38 @@ pub fn live_owner(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -
     None
 }
 
+/// A paused run is still draining only while an unfinished attempt has a live owner. An attempt
+/// whose router exited can never finish its drain, so it is adopted like any orphan (Chordzy
+/// 2026-11-20 09:18Z: a restart's adoption waited on a dead router's attempts and the new parent
+/// could admit nothing).
+fn paused_drain_pending<'a>(
+    attempts: impl IntoIterator<Item = &'a crate::planner_workflow::Attempt>,
+) -> bool {
+    attempts
+        .into_iter()
+        .any(|attempt| !attempt.ended && crate::planner_workflow::owner_alive(attempt))
+}
+
+#[cfg(test)]
+mod paused_drain_tests {
+    use crate::planner_workflow::Attempt;
+
+    fn attempt(router_pid: u32, router_started_at_ms: u64, ended: bool) -> Attempt {
+        Attempt { id: "a".into(), router_pid, router_started_at_ms, delegate_id: None, ended }
+    }
+
+    #[test]
+    fn only_a_live_owners_unfinished_attempt_holds_a_paused_runs_adoption() {
+        let (pid, started) = crate::planner_workflow::process_identity();
+        assert!(super::paused_drain_pending([&attempt(pid, started, false)]));
+        // A dead router (no pid) or a finished attempt holds nothing.
+        assert!(!super::paused_drain_pending([&attempt(0, 0, false)]));
+        assert!(!super::paused_drain_pending([&attempt(pid, started, true)]));
+        // Same pid, other start: a reused pid is not the owner.
+        assert!(!super::paused_drain_pending([&attempt(pid, started.wrapping_add(1), false)]));
+    }
+}
+
 fn adoptable(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Result<(), String> {
     if !matches!(
         run.status,
@@ -391,10 +423,7 @@ fn adoptable(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Res
         ));
     }
     if run.status == RunStatus::Paused
-        && run
-            .works
-            .values()
-            .any(|work| work.attempt.as_ref().is_some_and(|attempt| !attempt.ended))
+        && paused_drain_pending(run.works.values().filter_map(|work| work.attempt.as_ref()))
     {
         return Err(format!(
             "paused planner run {sid} still has unfinished attempts; finish its drain first"
@@ -439,6 +468,14 @@ fn merge(
     if into.completed_guides_at_start.is_none() {
         into.completed_guides_at_start = from.completed_guides_at_start.clone();
     }
+    // Custody probes share one budget so adoption never holds a parent's start
+    // for minutes on a slow host; works past it reconcile as before.
+    // No custody probe inside the merge: `adopt_at` reruns the merge in a save loop that
+    // retries when the destination's revision moves, and the destination's own heartbeat
+    // moves it. On Chordzy 2026-11-19, a 30 s probe per merge lost every save race, and
+    // 867 works sat claimed but unadopted for over 10 minutes. Every markable work is
+    // deferred at once, and `finish_deferred_custody` probes them after adoption.
+    let custody_deadline = std::time::Instant::now();
     for (id, work) in &from.works {
         if let Some(existing) = into.works.get(id) {
             if existing.child_id == work.child_id
@@ -453,7 +490,7 @@ fn merge(
             }
         } else {
             let mut adopted = work.clone();
-            crate::planner_workflow::mark_adopted_reconciliation(&mut adopted);
+            crate::planner_workflow::mark_adopted_reconciliation_by(&mut adopted, Some(custody_deadline));
             into.works.insert(id.clone(), adopted);
             if let Some(recovery) = from.capacity.resumes.get(id) {
                 into.capacity.resumes.insert(id.clone(), recovery.clone());
@@ -462,10 +499,14 @@ fn merge(
         }
     }
     for (id, release) in &from.releases {
-        if release
-            .works
-            .keys()
-            .any(|work| report.conflicting_works.contains(work))
+        // A finished release names its works only as history: an old round's work id that the
+        // destination has since re-admitted must not strand every other work (Chordzy 2026-11-20:
+        // the abandoned round-20261022l blocked adoption of 878 works).
+        if release_in_flight(release)
+            && release
+                .works
+                .keys()
+                .any(|work| report.conflicting_works.contains(work))
         {
             return Err(format!(
                 "release {id} includes a conflicting work identity; reconcile it before adoption"
@@ -749,6 +790,10 @@ pub fn adopt_at(
         }
     }
     let report = report.ok_or("the new run stayed contended; rerun adopt-run to finish")?;
+    // The adopted run may itself have been waiting to adopt an older run (Chordzy 2026-11-20 09:43Z:
+    // a restart adopted the previous, empty run and dropped its pending handoff of the run holding
+    // all 878 works). That handoff continues in the adopter.
+    let chained = chained_adoption(&from, from_sid, into_sid);
     for _ in 0..16 {
         let mut from = store
             .load(from_sid)?
@@ -756,7 +801,18 @@ pub fn adopt_at(
         retire(&mut from, &report);
         match store.save(from_sid, &mut from) {
             Ok(()) => {
-                adoption_pending(store, into_sid, None, &report.summary())?;
+                match chained.as_deref() {
+                    Some(older) => adoption_pending(
+                        store,
+                        into_sid,
+                        Some(older),
+                        &format!(
+                            "{} Continuing the adoption of planner run {older} that {from_sid} was awaiting; the capacity cycle retries every 15 seconds.",
+                            report.summary()
+                        ),
+                    )?,
+                    None => adoption_pending(store, into_sid, None, &report.summary())?,
+                }
                 return Ok(report);
             }
             Err(e) if concurrent(&e) => continue,
@@ -766,6 +822,56 @@ pub fn adopt_at(
     Err(format!(
         "adopted into {into_sid}, but retiring {from_sid} stayed contended; rerun adopt-run to finish"
     ))
+}
+
+/// A release still moving toward production; finished ones (passed, failed, abandoned,
+/// disposed or superseded) are history.
+fn release_in_flight(release: &crate::planner_release::Release) -> bool {
+    use crate::planner_release::Stage;
+    release.active() && release.stage() < Stage::ProductionPassed
+}
+
+#[cfg(test)]
+mod release_in_flight_tests {
+    use crate::planner_release::{Checkpoint, Release, Stage};
+
+    fn release(stage: Option<Stage>) -> Release {
+        Release {
+            candidate: "c".repeat(40),
+            works: Default::default(),
+            checkpoints: stage
+                .map(|stage| Checkpoint {
+                    stage,
+                    revision: "c".repeat(40),
+                    works: Default::default(),
+                    replaces: None,
+                    evidence: Default::default(),
+                })
+                .into_iter()
+                .collect(),
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn only_an_unfinished_release_blocks_adoption_on_a_conflicting_work() {
+        assert!(super::release_in_flight(&release(None)));
+        assert!(super::release_in_flight(&release(Some(Stage::StagingPassed))));
+        for done in [Stage::ProductionPassed, Stage::Failed, Stage::Abandoned, Stage::Disposed] {
+            assert!(!super::release_in_flight(&release(Some(done))), "{done:?}");
+        }
+        let mut superseded = release(Some(Stage::StagingDeployed));
+        superseded.superseded_by = Some("next".into());
+        assert!(!super::release_in_flight(&superseded));
+    }
+}
+
+/// The handoff an adopted run was still waiting on, which its adopter takes over.
+fn chained_adoption(from: &PlannerRun, from_sid: &str, into_sid: &str) -> Option<String> {
+    from.capacity
+        .pending_adoption
+        .clone()
+        .filter(|older| older != into_sid && older != from_sid)
 }
 
 /// Content a claimed source still holds for its adopter: the claim happened,

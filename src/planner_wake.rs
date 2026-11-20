@@ -136,6 +136,8 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 ) {
                     tracing::warn!(session = sid, %error, "planner ownership heartbeat not saved");
                 }
+                finish_deferred_custody(&shared, &sid, &run);
+                restart_toolless_workers(&shared, &sid);
                 // A missed stop caused by router death is reconciled before
                 // parent work resumes. Never infer that the child survived.
                 for (id, work) in &run.works {
@@ -222,6 +224,74 @@ fn superseded_notice(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Pl
     if fresh {
         crate::session::notify_user(shared, sid, notice);
     }
+}
+
+/// End the attempt of each worker whose `router-worker` helper never connected, so the
+/// work is resumed with a fresh connection instead of running toolless (it cannot call
+/// `worker_handoff`). Durable work and its tree are kept; only the process stops.
+fn restart_toolless_workers(shared: &Arc<Shared>, sid: &str) {
+    for (router_sid, child, identity) in crate::delegate_mcp::toolless_workers(shared) {
+        if router_sid != sid {
+            continue;
+        }
+        tracing::warn!(session = sid, child, work = identity.work_id, "router-worker never connected; restarting the worker");
+        crate::planner_client::stop_child(shared, sid, &child);
+        let _ = planner_workflow::attempt_ended(
+            shared,
+            sid,
+            &identity,
+            None,
+            "Router: this worker's router-worker tools never connected, so it could not hand off. Resume it; the new attempt gets a fresh connection.".into(),
+            true,
+        );
+    }
+    let live: std::collections::HashSet<String> =
+        shared.delegate_tokens.lock().unwrap().keys().cloned().collect();
+    shared.worker_token_minted.lock().unwrap().retain(|token, _| live.contains(token));
+}
+
+/// One batch of deferred custody checks at a time, process-wide.
+static DEFERRED_CUSTODY_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const DEFERRED_CUSTODY_BATCH: usize = 50;
+
+/// Finish the custody checks adoption's 30 s budget cut off, off the critical path.
+/// Chordzy 2026-11-19: after each Kory restart about 100 of 830 adopted works stayed
+/// `reconcile-required` only because the budget ran out, and the parent reconciled
+/// them by hand for over an hour while 3 to 19 of 50 workers ran. A clean, unchanged
+/// workspace is cleared exactly as adoption would have; anything else stays owed.
+fn finish_deferred_custody(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::PlannerRun) {
+    use std::sync::atomic::Ordering;
+    let batch = planner_workflow::deferred_custody(&run.works, DEFERRED_CUSTODY_BATCH);
+    if batch.is_empty() || DEFERRED_CUSTODY_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let shared = shared.clone();
+    let sid = sid.to_string();
+    tokio::spawn(async move {
+        let checked = tokio::task::spawn_blocking(move || {
+            batch
+                .into_iter()
+                .map(|(id, work)| (id, planner_workflow::adopted_custody_head(&work)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let cleared = checked.iter().filter(|(_, head)| head.is_some()).count();
+        let saved = planner_workflow::mutate(&shared, &sid, |run| {
+            for (id, head) in &checked {
+                if let Some(work) = run.works.get_mut(id) {
+                    planner_workflow::settle_deferred_custody(work, head.clone());
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = saved {
+            tracing::warn!(session = sid, %error, "deferred custody results not saved");
+        } else {
+            tracing::info!(session = sid, checked = checked.len(), cleared, "deferred adoption custody checked");
+        }
+        DEFERRED_CUSTODY_RUNNING.store(false, Ordering::SeqCst);
+    });
 }
 
 /// A router-owned turn is in flight and something actionable is pending. A
@@ -536,9 +606,15 @@ pub(crate) fn pending_steer(
     };
     // An interrupting input (`send-input --interrupt`) is steered ahead of
     // older queued corrections; each still reaches its boundary in order.
+    // Skip one a live delivery already claims: Chordzy 2026-11-19, an earlier
+    // interrupt that had become the running turn's own prompt stayed claimed
+    // until that 25-minute turn ended, and a later interrupt behind it was
+    // never steered.
     let interrupting = queue.iter().filter(unacknowledged).find(|input| {
+        let key = format!("input:{}", input.input_id);
         crate::external_message::interrupt_of(&input.request)
-            && !steered.contains(&format!("input:{}", input.input_id))
+            && !steered.contains(&key)
+            && !wakes.get(&key).is_some_and(|w| claimed(w, &key))
     });
     if let Some(input) = interrupting.or_else(|| queue.iter().find(unacknowledged)) {
         let key = format!("input:{}", input.input_id);
@@ -1597,6 +1673,30 @@ mod steer_tests {
             pending_steer(&queue, &wakes, &HashSet::new()).unwrap().0,
             "input:pending"
         );
+    }
+
+    /// Chordzy 2026-11-19: the first interrupt became the running turn's own prompt
+    /// and stayed claimed by the live router; a later interrupt must still be steered.
+    #[test]
+    fn a_claimed_interrupt_does_not_shadow_a_later_one() {
+        fn urgent(id: &str) -> planner_workflow::QueuedParentInput {
+            let mut item = input(id, true);
+            item.request = PromptRequest::new("s".to_string(), vec![ContentBlock::from(id.to_string())])
+                .meta(serde_json::from_value(json!({"router_acp": {
+                    "agent_origin": true, "input_id": id, "interrupt": true
+                }})).ok());
+            item
+        }
+        let queue = vec![urgent("first"), urgent("second")];
+        let wakes = BTreeMap::from([(
+            "input:first".into(),
+            planner_workflow::Wake {
+                claim_pid: std::process::id(),
+                claim_started_at_ms: planner_workflow::process_identity().1,
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(pending_steer(&queue, &wakes, &HashSet::new()).unwrap().0, "input:second");
     }
 
     /// `send-input --interrupt`: steered ahead of an older queued correction,

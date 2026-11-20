@@ -922,8 +922,15 @@ fn user_command_once(
             run.prior_policies
                 .push(std::mem::replace(&mut run.policy, policy));
         }
+        // Custody-aware, as adoption is. Chordzy 2026-11-19: this blanket mark re-owed
+        // all 104 works adoption had just verified clean, so after every Kory restart
+        // the parent reconciled about 100 works by hand while 1 to 19 of 50 workers ran.
+        // A clean, unchanged tree needs nothing. No probe runs here (this can run inside
+        // a save-retry loop, like adoption's merge): every markable work is deferred at
+        // once, and the background custody pass checks it.
+        let deadline = std::time::Instant::now();
         for work in run.works.values_mut() {
-            mark_reconciliation_required(work);
+            mark_adopted_reconciliation_by(work, Some(deadline));
         }
     }
     run.phase = phase;
@@ -2525,8 +2532,15 @@ async fn operate_once(
     Ok(json!({"revision":run.revision,"next_role":next_role,"instructions":next_role.map(|r| run.policy.instructions(r))}).to_string())
 }
 
+/// Every router git call runs without fsmonitor. Chordzy 2026-11-19: a host-wide
+/// `core.fsmonitor=true` started a daemon per worktree, and two router git calls on
+/// worker trees waited on one for 22 minutes. That hung the parent's `planner_workflow`
+/// call and held a worktree's index.lock.
+pub(crate) const NO_FSMONITOR: [&str; 2] = ["-c", "core.fsmonitor=false"];
+
 async fn git(path: &Path, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
+        .args(NO_FSMONITOR)
         .arg("-C")
         .arg(path)
         .args(args)
@@ -2657,20 +2671,81 @@ fn continuation_role(work: &Work) -> PlannerRole {
 /// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
 /// live) is still marked, so the parent reconciles exactly what could be lost.
 pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
+    mark_adopted_reconciliation_by(work, None);
+}
+
+/// As `mark_adopted_reconciliation`, but once `deadline` has passed no more
+/// custody is probed: the work is marked as before this optimization. Chordzy
+/// 2026-11-19: with the operator's global `core.fsmonitor=true` every probed
+/// tree started a daemon, and adopting 830 works took 5 min 42 s while Kory
+/// sat at a blank screen. Adoption must stay bounded on any host.
+pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<std::time::Instant>) {
     let mut probe = work.clone();
     mark_reconciliation_required(&mut probe);
-    if !probe.reconciliation.required || work.reconciliation.required {
-        // Not a work adoption would mark, or already owed: unchanged.
+    if !probe.reconciliation.required {
+        // Not a work adoption would mark: unchanged.
         *work = probe;
+        return;
+    }
+    // A work already owed is checked again rather than kept owed. Chordzy 2026-11-19: owed marks from
+    // earlier restarts persisted on clean, unchanged trees (auth-server-v2), and the parent reconciled
+    // them by hand after every restart. Never-started work has no custody at all: an admitted work with
+    // no attempt and no tree was owed only because a workspace path had been reserved.
+    if work.status == WorkStatus::Admitted
+        && work.attempt.is_none()
+        && work.workspace.as_ref().is_some_and(|w| !w.path.exists())
+    {
+        work.reconciliation.required = false;
+        work.reconciliation.evidence = vec!["router: never started; nothing in custody".into()];
+        return;
+    }
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        mark_reconciliation_required(work);
+        // `finish_deferred_custody` checks it after the parent has started.
+        work.reconciliation.evidence = vec![DEFERRED_CUSTODY.into()];
         return;
     }
     match adopted_custody_head(work) {
         Some(head) => {
+            work.reconciliation.required = false;
             work.reconciliation.source_revision = Some(head);
             work.reconciliation.evidence =
                 vec!["router: clean workspace with unchanged HEAD at adoption".into()];
         }
         None => mark_reconciliation_required(work),
+    }
+}
+
+/// Evidence on a work whose custody check the adoption budget cut off.
+pub(crate) const DEFERRED_CUSTODY: &str = "router: custody check deferred past the adoption budget";
+
+/// Works whose custody check adoption deferred, oldest identity first, at most `limit`.
+pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> Vec<(String, Work)> {
+    works
+        .iter()
+        .filter(|(_, w)| {
+            w.reconciliation.required
+                && w.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY)
+        })
+        .take(limit)
+        .map(|(id, w)| (id.clone(), w.clone()))
+        .collect()
+}
+
+/// Apply a deferred custody result: a clean, unchanged workspace needs no parent
+/// reconciliation (the same judgment adoption makes); anything else stays owed.
+pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
+    if !work.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY) {
+        return;
+    }
+    match head {
+        Some(head) => {
+            work.reconciliation.required = false;
+            work.reconciliation.source_revision = Some(head);
+            work.reconciliation.evidence =
+                vec!["router: clean workspace with unchanged HEAD after adoption".into()];
+        }
+        None => work.reconciliation.evidence.clear(),
     }
 }
 
@@ -2683,9 +2758,12 @@ pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
     if !path.is_dir() {
         return None;
     }
+    // A read only: no fsmonitor daemon (a global `core.fsmonitor=true` starts
+    // one per tree) and no optional index lock (a killed status strands it).
     let git = |args: &[&str]| {
         std::process::Command::new("git")
-            .arg("-C")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["-c", "core.fsmonitor=false", "-C"])
             .arg(path)
             .args(args)
             .output()
@@ -3048,6 +3126,7 @@ async fn allocate_workspace(
             .map_err(|e| e.to_string())?;
         if !path.exists() {
             let output = tokio::process::Command::new("git")
+                .args(NO_FSMONITOR)
                 .args(["clone", "--no-hardlinks", "--quiet"])
                 .arg(&cwd)
                 .arg(&path)
@@ -3398,6 +3477,35 @@ mod adoption_custody_tests {
         mark_adopted_reconciliation(&mut clean);
         assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
         assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+
+        // 2026-11-19: past the adoption budget nothing is probed; the work reconciles as before.
+        let mut late = work(path, Some(&head));
+        mark_adopted_reconciliation_by(&mut late, Some(std::time::Instant::now()));
+        assert!(late.reconciliation.required && late.reconciliation.source_revision.is_none(),
+            "a work past the custody budget was probed instead of marked");
+        // The deferred check finishes later and clears it exactly as adoption would have.
+        let works = BTreeMap::from([("late".to_string(), late.clone())]);
+        let deferred = deferred_custody(&works, 50);
+        assert_eq!(deferred.len(), 1, "a deferred work was not listed for the background check");
+        settle_deferred_custody(&mut late, adopted_custody_head(&deferred[0].1));
+        assert!(!late.reconciliation.required, "a clean deferred work stayed owed");
+        assert_eq!(late.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        // 2026-11-19: a work already owed on a clean, unchanged tree is checked again and cleared.
+        let mut owed_clean = work(path, Some(&head));
+        owed_clean.reconciliation.required = true;
+        mark_adopted_reconciliation_by(&mut owed_clean, None);
+        assert!(!owed_clean.reconciliation.required, "an owed work on a clean tree stayed owed");
+        // A never-started work whose reserved tree does not exist has nothing in custody.
+        let mut never = work(&path.join("never-created"), None);
+        never.status = WorkStatus::Admitted;
+        mark_adopted_reconciliation_by(&mut never, None);
+        assert!(!never.reconciliation.required, "a never-started work without a tree was owed");
+        // A deferred work whose custody is not clean stays owed, and is not rechecked.
+        let mut owed = work(path, Some(&"0".repeat(40)));
+        mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));
+        let owed_head = adopted_custody_head(&owed);
+        settle_deferred_custody(&mut owed, owed_head);
+        assert!(owed.reconciliation.required && owed.reconciliation.evidence.is_empty());
 
         let mut moved = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation(&mut moved);

@@ -7863,6 +7863,45 @@ async fn adoption_skips_resolved_inputs_even_when_old_wakes_and_queue_entries_re
     assert!(next.parent_queue.is_empty() && report.operator_inputs.is_empty());
 }
 
+// Chordzy 2026-11-20 09:43Z: a restart adopted the previous run, which was itself still waiting to
+// adopt the run holding every work; that pending handoff was dropped and 878 works were stranded.
+#[tokio::test]
+async fn adopting_a_run_continues_the_adoption_it_was_awaiting() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let store = StateStore::load(
+        &f.state_path,
+        Retention {
+            max_age: std::time::Duration::MAX,
+        },
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.capacity.pending_adoption = Some("older".into());
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let persisted = store.get(SID).unwrap();
+    store.upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    planner_workflow::mutate(&f.shared, "next", |run| {
+        run.capacity.pending_adoption = None;
+        Ok(())
+    })
+    .unwrap();
+    router_acp::planner_adopt::adopt(&store, SID, "next").unwrap();
+    let next = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    assert_eq!(next.capacity.pending_adoption.as_deref(), Some("older"));
+    assert!(next.wakes["adoption:handoff"].reason.contains("older"));
+}
+
 #[tokio::test]
 async fn explicit_implement_adopts_a_cleanly_drained_run_without_losing_accepted_work() {
     use router_acp::planner_adopt;

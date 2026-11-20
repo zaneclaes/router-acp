@@ -758,6 +758,7 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
         .get(token)
         .cloned()
         .ok_or("unknown delegate token")?;
+    shared.delegate_connected.lock().unwrap().insert(token.to_string());
     let router_sid = binding.router_sid;
     let delegation_enabled = binding.delegation_enabled;
     // A `router-worker` connection serves only the worker's own tools.
@@ -2934,6 +2935,11 @@ fn worker_server_entry(
             worker: Some(worker),
         },
     );
+    shared
+        .worker_token_minted
+        .lock()
+        .unwrap()
+        .insert(token.clone(), std::time::Instant::now());
     let stdio = McpServerStdio::new(WORKER_SERVER_NAME, exe).args(vec![
         "mcp-delegate".to_string(),
         "--socket".to_string(),
@@ -2942,6 +2948,54 @@ fn worker_server_entry(
         token.clone(),
     ]);
     Some((McpServer::Stdio(stdio), token))
+}
+
+/// How long a worker may run before its `router-worker` helper must have connected: the token
+/// is minted before `session/new`, so the grace covers the whole start deadline plus the helper's
+/// own MCP connection. Chordzy 2026-11-20: with slow starts allowed 300 s, a fixed 120 s grace
+/// ended 17 healthy workers that were still starting.
+fn worker_tools_grace(session_new_deadline_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(session_new_deadline_ms.max(120_000)) + std::time::Duration::from_secs(120)
+}
+
+/// Workers whose `router-worker` helper never connected: (router session, worker id, identity).
+/// Chordzy 2026-11-20: after a busy restart several workers logged "router-worker failed to
+/// connect", ran on for over two hours unable to call `worker_handoff`, and held their slots.
+pub(crate) fn toolless_workers(
+    shared: &Shared,
+) -> Vec<(String, String, crate::planner_workflow::WorkerIdentity)> {
+    let connected = shared.delegate_connected.lock().unwrap().clone();
+    // Only where helpers demonstrably connect in this process (as for the parent).
+    if connected.is_empty() {
+        return Vec::new();
+    }
+    let grace = worker_tools_grace(shared.cfg.probe_timeout_ms);
+    // A worker token this sweep never saw minted (registered by another path) starts its grace now,
+    // so it is judged too rather than ignored forever.
+    let minted = {
+        let mut minted = shared.worker_token_minted.lock().unwrap();
+        let now = std::time::Instant::now();
+        for (token, binding) in shared.delegate_tokens.lock().unwrap().iter() {
+            if binding.worker.is_some() {
+                minted.entry(token.clone()).or_insert(now);
+            }
+        }
+        minted.clone()
+    };
+    shared
+        .delegate_tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(token, _)| {
+            !connected.contains(*token)
+                && minted.get(*token).is_some_and(|at| at.elapsed() >= grace)
+        })
+        .filter_map(|(_, b)| {
+            let w = b.worker.as_ref()?;
+            Some((b.router_sid.clone(), w.worker_id.clone(), w.planner.clone()?))
+        })
+        .collect()
 }
 
 /// Forget one delegate's `router-worker` token.
@@ -3687,6 +3741,15 @@ pub async fn run_helper(socket: &Path, token: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_keeps_its_tools_grace_for_the_whole_start_deadline() {
+        // The token is minted before session/new, so a worker still starting is never toolless.
+        assert!(worker_tools_grace(300_000) > std::time::Duration::from_millis(300_000));
+        assert_eq!(worker_tools_grace(300_000), std::time::Duration::from_secs(420));
+        // Never shorter than the original 120 s window plus the helper's connection.
+        assert_eq!(worker_tools_grace(30_000), std::time::Duration::from_secs(240));
+    }
 
     #[test]
     fn parent_interrupt_preserves_only_durable_workers_and_close_stops_everyone() {

@@ -1055,7 +1055,7 @@ pub fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
         .collect()
 }
 
-fn recovery_prerequisite(run: &PlannerRun, work: &planner_workflow::Work) -> Option<String> {
+pub(crate) fn recovery_prerequisite(run: &PlannerRun, work: &planner_workflow::Work) -> Option<String> {
     if work.reconciliation.required {
         return Some("parent reconciliation required: record current scope and preserved source with planner_workflow reconcile".into());
     }
@@ -1075,6 +1075,27 @@ fn failure_fingerprint(work: &planner_workflow::Work, prerequisite: &Option<Stri
         })
         .to_string(),
     )
+}
+
+/// A worker that never got a session (the adapter's `session/new` timed out, a probe failed, the
+/// downstream closed) failed on the provider side, not on its work: the same message every time is
+/// not evidence the work is stuck. Chordzy 2026-11-20: session/new timeouts suspended automatic
+/// recovery for every work they hit, and the run sat at 1 of 50 workers after the cause was fixed.
+fn transient_start_failure(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        let lower = reason.to_ascii_lowercase();
+        (lower.contains("session/new on ") && lower.contains("timed out"))
+            || lower.contains("failed its probe")
+            || lower.contains("downstream connection closed")
+    })
+}
+
+/// A suspension this sweep made for unchanged failures (not a recorded prerequisite).
+fn suspended_for_repeats(state: &Resume) -> bool {
+    state
+        .suspended
+        .as_deref()
+        .is_some_and(|reason| reason.contains("consecutive unchanged failures"))
 }
 
 fn stopped_early(work: &planner_workflow::Work) -> bool {
@@ -1180,10 +1201,14 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
         // A worker parked on its own exact build is waiting, not failing: while the observer cannot see that build
         // (a failed or stale read records Unknown), it is resumed with backoff but never counted toward suspension.
         let parked = prerequisite.is_none() && parked_on_own_build(run, work);
+        // A provider-side start failure is retried with backoff but never counted toward suspension, and a
+        // suspension it caused earlier is lifted.
+        let transient = prerequisite.is_none() && transient_start_failure(work.reason.as_deref());
+        let rearm = transient && state.is_some_and(suspended_for_repeats);
         let fingerprint = failure_fingerprint(work, &prerequisite);
         let changed = state.is_none_or(|s| s.failure_fingerprint.as_ref() != Some(&fingerprint));
-        if changed || state.is_some_and(|s| s.due_at.is_none() && s.suspended.is_none()) {
-            let count = if changed || parked {
+        if changed || rearm || state.is_some_and(|s| s.due_at.is_none() && s.suspended.is_none()) {
+            let count = if changed || parked || transient {
                 1
             } else {
                 state.map_or(1, |s| s.same_failure_count.saturating_add(1))
@@ -1357,4 +1382,38 @@ fn inflight_wake(
         );
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod transient_start_tests {
+    use super::{suspended_for_repeats, transient_start_failure, Resume};
+
+    #[test]
+    fn provider_start_failures_never_count_toward_suspension() {
+        assert!(transient_start_failure(Some(
+            "child turn failed: claude@fea5/claude-opus-5-5: Internal error: \"session/new on claude@fea5/claude-opus-5-5 timed out\""
+        )));
+        assert!(transient_start_failure(Some(
+            "cannot start codex@d16a/gpt-6.2-sol: it failed its probe: target planner-1"
+        )));
+        assert!(transient_start_failure(Some("downstream connection closed")));
+        // A work's own failure is evidence and still counts.
+        assert!(!transient_start_failure(Some("Development build 12501 failed: 1 failed attempt")));
+        assert!(!transient_start_failure(None));
+    }
+
+    #[test]
+    fn only_a_repeat_suspension_is_lifted_not_a_recorded_prerequisite() {
+        let repeats = Resume {
+            suspended: Some("3 consecutive unchanged failures; reconcile this work's evidence".into()),
+            ..Default::default()
+        };
+        let prerequisite = Resume {
+            suspended: Some("waiting on staging build 12606".into()),
+            ..Default::default()
+        };
+        assert!(suspended_for_repeats(&repeats));
+        assert!(!suspended_for_repeats(&prerequisite));
+        assert!(!suspended_for_repeats(&Resume::default()));
+    }
 }

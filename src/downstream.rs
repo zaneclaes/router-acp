@@ -198,6 +198,36 @@ fn codex_hook_trust_env(env: &mut Vec<(String, String)>) {
     ));
 }
 
+/// Claude Code's MCP server startup deadline (ms) for the router's own helper servers. Chordzy
+/// 2026-11-20: under load (about 50 sessions) workers' `router-worker` helper missed the default
+/// deadline ("router-worker failed to connect", CONNECT_TIMEOUT), so the worker ran without its
+/// handoff tools. An explicit value in the account's env or the router's environment wins.
+///
+/// It must stay well under the router's own `session/new` deadline (`probe_timeout_ms`): the
+/// adapter answers `session/new` only after its MCP servers start, so a 120 s MCP deadline equal to
+/// the 120 s `session/new` deadline turned one slow server into "session/new … timed out" on every
+/// dispatch (Chordzy 2026-11-20 08:20Z onward, about 6 of 50 workers live).
+fn mcp_startup_timeout_ms(session_new_deadline_ms: u64) -> u64 {
+    session_new_deadline_ms.saturating_sub(30_000).clamp(30_000, 90_000)
+}
+
+/// Claude Code connects stdio MCP servers in batches (default 3), so one slow server per batch
+/// adds a whole MCP deadline to `session/new`: a worker session with six or more servers could
+/// spend two deadlines and miss the router's. All of a session's servers connect in one batch.
+const MCP_CONNECTION_BATCH_SIZE: &str = "16";
+
+fn mcp_startup_timeout_env(env: &mut Vec<(String, String)>, session_new_deadline_ms: u64) {
+    let unset = |env: &Vec<(String, String)>, name: &str| {
+        !env.iter().any(|(set, _)| set == name) && std::env::var_os(name).is_none()
+    };
+    if unset(env, "MCP_SERVER_CONNECTION_BATCH_SIZE") {
+        env.push(("MCP_SERVER_CONNECTION_BATCH_SIZE".into(), MCP_CONNECTION_BATCH_SIZE.into()));
+    }
+    if unset(env, "MCP_TIMEOUT") {
+        env.push(("MCP_TIMEOUT".into(), mcp_startup_timeout_ms(session_new_deadline_ms).to_string()));
+    }
+}
+
 /// Spawn the downstream process and its client connection as a contained
 /// task on the upstream connection. Failures are recorded in shared state
 /// instead of tearing down the router.
@@ -223,6 +253,9 @@ pub async fn start_downstream(shared: &Arc<Shared>, key: &ProcessKey) -> Result<
             }
             if crate::accounts::provider(agent) == Some("codex") && agent.bypass_hook_trust {
                 codex_hook_trust_env(&mut acp_agent.env);
+            }
+            if crate::accounts::provider(agent) == Some("claude") {
+                mcp_startup_timeout_env(&mut acp_agent.env, shared.cfg.probe_timeout_ms);
             }
             crate::credentials::runtime(agent, &mut acp_agent.env)
                 .await
@@ -794,6 +827,38 @@ pub fn verify_model_selected(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn claude_adapters_get_a_long_mcp_startup_timeout_unless_one_is_set() {
+        if std::env::var_os("MCP_TIMEOUT").is_some() || std::env::var_os("MCP_SERVER_CONNECTION_BATCH_SIZE").is_some() {
+            return; // the host's own value wins and is inherited as-is
+        }
+        let mut env = Vec::new();
+        mcp_startup_timeout_env(&mut env, 120_000);
+        assert_eq!(
+            env,
+            vec![
+                ("MCP_SERVER_CONNECTION_BATCH_SIZE".to_string(), MCP_CONNECTION_BATCH_SIZE.to_string()),
+                ("MCP_TIMEOUT".to_string(), "90000".to_string())
+            ]
+        );
+        // Always 30 s under the session/new deadline, never under Claude's own 30 s floor.
+        assert!(mcp_startup_timeout_ms(120_000) < 120_000);
+        assert_eq!(mcp_startup_timeout_ms(60_000), 30_000);
+        assert_eq!(mcp_startup_timeout_ms(600_000), 90_000);
+        let mut explicit = vec![
+            ("MCP_TIMEOUT".to_string(), "5000".to_string()),
+            ("MCP_SERVER_CONNECTION_BATCH_SIZE".to_string(), "2".to_string()),
+        ];
+        mcp_startup_timeout_env(&mut explicit, 120_000);
+        assert_eq!(
+            explicit,
+            vec![
+                ("MCP_TIMEOUT".to_string(), "5000".to_string()),
+                ("MCP_SERVER_CONNECTION_BATCH_SIZE".to_string(), "2".to_string())
+            ]
+        );
+    }
     use agent_client_protocol::schema::v1::{SessionConfigSelectGroup, SessionConfigSelectOption};
 
     fn spawn_config_yaml() -> &'static str {
