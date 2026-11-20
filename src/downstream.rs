@@ -211,11 +211,21 @@ fn mcp_startup_timeout_ms(session_new_deadline_ms: u64) -> u64 {
     session_new_deadline_ms.saturating_sub(30_000).clamp(30_000, 90_000)
 }
 
+/// Claude Code connects stdio MCP servers in batches (default 3), so one slow server per batch
+/// adds a whole MCP deadline to `session/new`: a worker session with six or more servers could
+/// spend two deadlines and miss the router's. All of a session's servers connect in one batch.
+const MCP_CONNECTION_BATCH_SIZE: &str = "16";
+
 fn mcp_startup_timeout_env(env: &mut Vec<(String, String)>, session_new_deadline_ms: u64) {
-    if env.iter().any(|(name, _)| name == "MCP_TIMEOUT") || std::env::var_os("MCP_TIMEOUT").is_some() {
-        return;
+    let unset = |env: &Vec<(String, String)>, name: &str| {
+        !env.iter().any(|(set, _)| set == name) && std::env::var_os(name).is_none()
+    };
+    if unset(env, "MCP_SERVER_CONNECTION_BATCH_SIZE") {
+        env.push(("MCP_SERVER_CONNECTION_BATCH_SIZE".into(), MCP_CONNECTION_BATCH_SIZE.into()));
     }
-    env.push(("MCP_TIMEOUT".into(), mcp_startup_timeout_ms(session_new_deadline_ms).to_string()));
+    if unset(env, "MCP_TIMEOUT") {
+        env.push(("MCP_TIMEOUT".into(), mcp_startup_timeout_ms(session_new_deadline_ms).to_string()));
+    }
 }
 
 /// Spawn the downstream process and its client connection as a contained
@@ -820,19 +830,34 @@ mod tests {
 
     #[test]
     fn claude_adapters_get_a_long_mcp_startup_timeout_unless_one_is_set() {
-        if std::env::var_os("MCP_TIMEOUT").is_some() {
+        if std::env::var_os("MCP_TIMEOUT").is_some() || std::env::var_os("MCP_SERVER_CONNECTION_BATCH_SIZE").is_some() {
             return; // the host's own value wins and is inherited as-is
         }
         let mut env = Vec::new();
         mcp_startup_timeout_env(&mut env, 120_000);
-        assert_eq!(env, vec![("MCP_TIMEOUT".to_string(), "90000".to_string())]);
+        assert_eq!(
+            env,
+            vec![
+                ("MCP_SERVER_CONNECTION_BATCH_SIZE".to_string(), MCP_CONNECTION_BATCH_SIZE.to_string()),
+                ("MCP_TIMEOUT".to_string(), "90000".to_string())
+            ]
+        );
         // Always 30 s under the session/new deadline, never under Claude's own 30 s floor.
         assert!(mcp_startup_timeout_ms(120_000) < 120_000);
         assert_eq!(mcp_startup_timeout_ms(60_000), 30_000);
         assert_eq!(mcp_startup_timeout_ms(600_000), 90_000);
-        let mut explicit = vec![("MCP_TIMEOUT".to_string(), "5000".to_string())];
+        let mut explicit = vec![
+            ("MCP_TIMEOUT".to_string(), "5000".to_string()),
+            ("MCP_SERVER_CONNECTION_BATCH_SIZE".to_string(), "2".to_string()),
+        ];
         mcp_startup_timeout_env(&mut explicit, 120_000);
-        assert_eq!(explicit, vec![("MCP_TIMEOUT".to_string(), "5000".to_string())]);
+        assert_eq!(
+            explicit,
+            vec![
+                ("MCP_TIMEOUT".to_string(), "5000".to_string()),
+                ("MCP_SERVER_CONNECTION_BATCH_SIZE".to_string(), "2".to_string())
+            ]
+        );
     }
     use agent_client_protocol::schema::v1::{SessionConfigSelectGroup, SessionConfigSelectOption};
 
