@@ -499,10 +499,14 @@ fn merge(
         }
     }
     for (id, release) in &from.releases {
-        if release
-            .works
-            .keys()
-            .any(|work| report.conflicting_works.contains(work))
+        // A finished release names its works only as history: an old round's work id that the
+        // destination has since re-admitted must not strand every other work (Chordzy 2026-11-20:
+        // the abandoned round-20261022l blocked adoption of 878 works).
+        if release_in_flight(release)
+            && release
+                .works
+                .keys()
+                .any(|work| report.conflicting_works.contains(work))
         {
             return Err(format!(
                 "release {id} includes a conflicting work identity; reconcile it before adoption"
@@ -818,6 +822,48 @@ pub fn adopt_at(
     Err(format!(
         "adopted into {into_sid}, but retiring {from_sid} stayed contended; rerun adopt-run to finish"
     ))
+}
+
+/// A release still moving toward production; finished ones (passed, failed, abandoned,
+/// disposed or superseded) are history.
+fn release_in_flight(release: &crate::planner_release::Release) -> bool {
+    use crate::planner_release::Stage;
+    release.active() && release.stage() < Stage::ProductionPassed
+}
+
+#[cfg(test)]
+mod release_in_flight_tests {
+    use crate::planner_release::{Checkpoint, Release, Stage};
+
+    fn release(stage: Option<Stage>) -> Release {
+        Release {
+            candidate: "c".repeat(40),
+            works: Default::default(),
+            checkpoints: stage
+                .map(|stage| Checkpoint {
+                    stage,
+                    revision: "c".repeat(40),
+                    works: Default::default(),
+                    replaces: None,
+                    evidence: Default::default(),
+                })
+                .into_iter()
+                .collect(),
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn only_an_unfinished_release_blocks_adoption_on_a_conflicting_work() {
+        assert!(super::release_in_flight(&release(None)));
+        assert!(super::release_in_flight(&release(Some(Stage::StagingPassed))));
+        for done in [Stage::ProductionPassed, Stage::Failed, Stage::Abandoned, Stage::Disposed] {
+            assert!(!super::release_in_flight(&release(Some(done))), "{done:?}");
+        }
+        let mut superseded = release(Some(Stage::StagingDeployed));
+        superseded.superseded_by = Some("next".into());
+        assert!(!super::release_in_flight(&superseded));
+    }
 }
 
 /// The handoff an adopted run was still waiting on, which its adopter takes over.
