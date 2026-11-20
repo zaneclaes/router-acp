@@ -1055,7 +1055,7 @@ pub fn awaiting_reconciliation(run: &PlannerRun) -> Vec<String> {
         .collect()
 }
 
-fn recovery_prerequisite(run: &PlannerRun, work: &planner_workflow::Work) -> Option<String> {
+pub(crate) fn recovery_prerequisite(run: &PlannerRun, work: &planner_workflow::Work) -> Option<String> {
     if work.reconciliation.required {
         return Some("parent reconciliation required: record current scope and preserved source with planner_workflow reconcile".into());
     }

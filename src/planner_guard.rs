@@ -364,6 +364,10 @@ pub fn works_json(run: &PlannerRun) -> Vec<Value> {
                 // A dependency wait is not idle capacity the parent can refill.
                 // Reuse the dispatch gate, including exact accepted-source dependencies.
                 "dependencies_ready":planner_workflow::dependencies_ready(run, w).is_ok(),
+                // The host counts dispatchable capacity only from this field. It was never sent,
+                // so the parent read "dispatch-ready=0" and left all 50 slots empty while it
+                // waited on release builds (Chordzy 2026-11-20). Same gate as recovery dispatch.
+                "dispatch_ready":planner_capacity::recovery_prerequisite(run, w).is_none(),
                 "waiting_build_revision":planner_capacity::waiting_on_build(run, w, now)
                     .then(|| &run.observations[&format!("ci:{id}")].revision),
                 "revision":w.artifact.as_ref().map(|a| &a.revision)})
