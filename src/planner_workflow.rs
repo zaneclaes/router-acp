@@ -2680,6 +2680,7 @@ fn continuation_role(work: &Work) -> PlannerRole {
 /// attempt is still alive, the workspace is a clean git tree, and a submitted
 /// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
 /// live) is still marked, so the parent reconciles exactly what could be lost.
+#[cfg(test)]
 pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
     mark_adopted_reconciliation_by(work, None);
 }
