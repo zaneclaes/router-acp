@@ -15824,6 +15824,14 @@ async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
         let attempt = before.works["work-1"].attempt.as_ref().unwrap().id.clone();
         let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
         let old_token = shared.with_session(&sid, |s| s.delegate_token.clone()).flatten().unwrap();
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.continuation = Some(router_acp::planner_workflow::ContinuationNote {
+                text: "resume note before the backstop".into(),
+                saved_at_ms: 1,
+                session_id: sid.clone(),
+            });
+            Ok(())
+        }).unwrap();
         prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
@@ -15841,8 +15849,13 @@ async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
         let current = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
         assert_eq!(current.process_key, pin.process_key, "handoff must not restart the shared adapter");
         assert_eq!(current.candidate, pin.candidate);
-        let continuation = std::fs::read_to_string(repo.path().join("repo/Docs/CONTINUE.md")).unwrap();
-        assert!(continuation.lines().count() <= 60);
+        // No continuation file is configured: nothing is written to the working
+        // tree, and the replacement parent is seeded from the state database.
+        assert!(!repo.path().join("repo/Docs/CONTINUE.md").exists());
+        assert!(after.checkpoint.is_some());
+        let seeded = wait_for_mock_prompt(&log, "Router-owned hot handoff").await;
+        assert!(seeded.iter().any(|event| event.to_string().contains("resume note before the backstop")),
+            "the replacement parent was not given the database resume note");
         assert!(router_acp::planner_shutdown::progress(&shared, &sid).is_empty());
         std::fs::write(&release, "complete the original attempt").unwrap();
         Ok(())
@@ -16091,7 +16104,10 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             })
             .await;
             assert!(paused.is_ok(), "the drain never paused the run");
-            assert!(repo.path().join("repo/Docs/CONTINUE.md").is_file());
+            assert!(!repo.path().join("repo/Docs/CONTINUE.md").exists(),
+                "shutdown without a configured continuation file writes nothing to the working tree");
+            assert_eq!(router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap()
+                .checkpoint.as_ref().map(|c| c.event.as_str()), Some("shutdown"));
             assert!(mock_prompts(&log, "Shutdown requested: interrupt").is_empty(),
                 "a shutdown interrupt must not start another child turn");
             let progress = router_acp::planner_shutdown::progress(&shared, &sid);
@@ -16110,7 +16126,7 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
                 serde_json::json!([{"workId": "work-1", "status": "stopped"}])
             );
             assert!(progress.iter().any(|p| p["phase"] == "saved" &&
-                p["saved"].as_array().is_some_and(|paths| paths.iter().any(|path| path == "Docs/CONTINUE.md"))));
+                p["message"].as_str().is_some_and(|m| m.contains("state database"))));
 
             // The next `/implement` resumes the paused run.
             prompt_text(&cx, &sid, "/implement resume after the shutdown").await?;
@@ -16216,8 +16232,8 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
             let parent_prompt =
                 router_acp::planner_shutdown::parent_prompt(&shared.cfg.routers.planner);
             assert!(
-                parent_prompt.contains("Docs/CONTINUE.md"),
-                "the Markdown default: {parent_prompt}"
+                parent_prompt.contains("record-continuation"),
+                "the database default: {parent_prompt}"
             );
             tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
@@ -16240,7 +16256,19 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
                 mock_prompts(&log, &parent_prompt).is_empty(),
                 "deterministic export needs no model turn"
             );
-            assert!(repo.path().join("repo/Docs/CONTINUE.md").is_file());
+            assert!(
+                !repo.path().join("repo/Docs/CONTINUE.md").exists(),
+                "shutdown without a configured continuation file writes nothing to the working tree"
+            );
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| c.event.as_str()),
+                Some("shutdown")
+            );
             assert!(
                 !release.exists(),
                 "the original router turn could only end by cancellation"
@@ -18294,16 +18322,19 @@ async fn questions_false_refuses_only_implementation_runs_and_uses_the_plugged_b
     .await;
 }
 
-/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the default.
+/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the
+/// default. With no `continuation` file, the resume point lives in the state database.
 #[test]
-fn the_default_blockers_and_continuation_are_the_markdown_layouts() {
+fn the_default_blockers_are_markdown_and_the_continuation_is_the_database() {
     let planner = router_acp::config::PlannerRouterConfig::default();
     assert!(
         planner.questions,
         "every session asks unless a project opts out"
     );
     assert!(router_acp::session::no_questions_instruction(&planner).contains("Docs/BLOCKED.md"));
-    assert!(router_acp::planner_shutdown::parent_prompt(&planner).contains("Docs/CONTINUE.md"));
+    assert!(planner.continuation.is_none());
+    let prompt = router_acp::planner_shutdown::parent_prompt(&planner);
+    assert!(prompt.contains("record-continuation") && !prompt.contains("Docs/CONTINUE.md"));
 }
 
 fn dead_router() -> router_acp::planner_workflow::RunOwner {

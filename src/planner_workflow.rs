@@ -66,6 +66,52 @@ pub struct PlannerRun {
     /// The session that adopted this run's works, holds, queue and wakes.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// The parent's resume point, kept in the state database with the run when
+    /// `routers.planner.continuation` names no file. Adoption carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationNote>,
+    /// The last deterministic checkpoint (live, handoff or shutdown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointReceipt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContinuationNote {
+    pub text: String,
+    pub saved_at_ms: i64,
+    /// The session whose parent recorded it.
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointReceipt {
+    pub event: String,
+    pub run_revision: u64,
+    pub saved_at_ms: i64,
+}
+
+/// Longest resume note the parent may record.
+pub const CONTINUATION_LIMIT: usize = 20_000;
+
+/// Where the parent records its resume point: the configured file, or the
+/// `record-continuation` action that stores it in the state database.
+pub fn continuation_target(planner: &crate::config::PlannerRouterConfig) -> String {
+    match &planner.continuation {
+        Some(path) => path.clone(),
+        None => "the run's resume note (planner_workflow `record-continuation` with `text`)".into(),
+    }
+}
+
+/// The database resume note for a resumed or replacement parent, if any.
+pub fn continuation_brief(run: &PlannerRun) -> Option<String> {
+    let note = run.continuation.as_ref()?;
+    let saved = chrono::DateTime::from_timestamp_millis(note.saved_at_ms)
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_default();
+    Some(format!(
+        "Recorded resume note (saved {saved} by parent {}; current planner_workflow state wins over it):\n{}",
+        note.session_id, note.text
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +636,11 @@ pub enum Operation {
         key: String,
         queue_evidence: String,
     },
+    /// Parent records its exact resume point in the state database.
+    RecordContinuation {
+        key: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +781,8 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         owner: Some(RunOwner::current()),
         owner_heartbeat_at: chrono::Utc::now().timestamp(),
         superseded_by: None,
+        continuation: None,
+        checkpoint: None,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -1564,14 +1617,14 @@ pub fn input_blocks(
 pub fn tool_definition() -> Value {
     json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
-            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete","record-continuation"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
             "release_id":{"type":"string"}, "checkpoint":{"type":"object"},
             "plan_id":{"type":"string"}, "detail":{"type":"string"},
             "key":{"type":"string"}, "work":{"type":"object"}, "work_id":{"type":"string"}, "attempt_id":{"type":"string"},
             "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"object","additionalProperties":{"type":"string"}}]},
             "corrections":{"type":["string","null"]}, "receipt":{"type":"object"}, "status":{"type":"string"}, "reason":{"type":"string"},
-            "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "offset":{"type":"integer","minimum":0}
+            "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "text":{"type":"string","description":"record-continuation: the parent's exact resume point, stored with the run"}, "offset":{"type":"integer","minimum":0}
         }, "required":["action"] } })
 }
 
@@ -1762,6 +1815,8 @@ async fn operate_once(
         }
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
             "handoff":actor.is_none().then(|| crate::planner_handoff::status(shared, sid)),
+            "continuation":actor.is_none().then_some(run.continuation.as_ref()).flatten(),
+            "checkpoint":actor.is_none().then_some(run.checkpoint.as_ref()).flatten(),
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
             "execution":actor.is_none().then(|| execution_context(&run)).flatten(),
             "capacity":capacity,
@@ -1809,7 +1864,7 @@ async fn operate_once(
         return Err(format!(
             "run is shutting down: admit nothing; record the exact resume point in {} and your \
              registers, then end your turn",
-            shared.cfg.routers.planner.continuation
+            continuation_target(&shared.cfg.routers.planner)
         ));
     }
     if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
@@ -2458,6 +2513,19 @@ async fn operate_once(
                 .get_mut(&wake_id)
                 .ok_or("unknown wake receipt")?
                 .acknowledged = true;
+        }
+        Operation::RecordContinuation { text, .. } => {
+            let text = text.trim();
+            if text.is_empty() || text.chars().count() > CONTINUATION_LIMIT {
+                return Err(format!(
+                    "record-continuation requires 1 to {CONTINUATION_LIMIT} characters of text"
+                ));
+            }
+            run.continuation = Some(ContinuationNote {
+                text: text.to_string(),
+                saved_at_ms: chrono::Utc::now().timestamp_millis(),
+                session_id: sid.to_string(),
+            });
         }
         Operation::Hold {
             plan_id,

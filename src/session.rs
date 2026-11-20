@@ -11525,6 +11525,14 @@ fn prepare_parent_prompt_inner(
                     let summary = report.summary();
                     tracing::warn!(session = router_sid, from = report.from, "{summary}");
                     notify_user(&shared, &router_sid, format!("router-acp · {summary}"));
+                    let note = crate::planner_workflow::load(&shared, &router_sid)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .and_then(crate::planner_workflow::continuation_brief);
+                    if let Some(note) = note {
+                        req.prompt.push(ContentBlock::from(format!("[router-acp · {note}]")));
+                    }
                     req.prompt.push(ContentBlock::from(format!(
                         "[router-acp · {summary}. Those works are now this run's. Follow the selected \
                          parent role's priority; reconcile each assignment through planner_workflow \

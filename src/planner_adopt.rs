@@ -598,6 +598,14 @@ fn merge(
         report.wakes.push(wake_id);
         report.operator_inputs.push(id.clone());
     }
+    // The database resume note travels with the run; the newer note wins.
+    if from.continuation.as_ref().is_some_and(|note| {
+        into.continuation
+            .as_ref()
+            .is_none_or(|current| current.saved_at_ms < note.saved_at_ms)
+    }) {
+        into.continuation = from.continuation.clone();
+    }
     // Queued operator input runs first, in its original order, ahead of the
     // new run's own queue.
     let mut front = Vec::new();

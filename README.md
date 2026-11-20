@@ -729,16 +729,26 @@ is asynchronous; cutover's 60-second budget excludes waiting for a safe boundary
 and the next ordinary model response. Failed preparation/export keeps the old
 parent and retries. No outgoing LLM summary, worker drain or adoption is run.
 
-The shutdown host receives `event: checkpoint | handoff | shutdown`, `run_revision`
-and `native_state` alongside its existing works/holds/continuation fields. It must
-save the exact configured continuation atomically and report `continuation_saved`
-plus that path in `saved`. Without a custom host, enabled handoffs use the native
-exporter (`checkpoints/` beside the configured state database, and the configured continuation). Live exports
-and `/shutdown` share a serialized writer; shutdown still drains and pauses.
-Native exports keep stable current files and preserve prior human/agent notes
-without recursively copying generated checkpoints. State DB records remain
-authoritative over snapshots; the new parent fetches targeted current state
-instead of loading the entire old conversation or every historical work.
+Live checkpoints, hot handoffs and `/shutdown` share one serialized save path;
+shutdown still drains and pauses. Every event records a `checkpoint` receipt
+(`event`, `run_revision`, `saved_at_ms`) with the run in the state database.
+
+`routers.planner.continuation` is unset by default. Then nothing is written to the
+working tree: the parent records its exact resume point with
+`planner_workflow` `record-continuation` (`text`), which is stored with the run.
+`planner_workflow status` returns it, adoption by a later `/implement` carries it
+(the newer note wins) and shows it to the adopting parent, and a hot handoff seeds
+the replacement parent with it. Set `continuation` to a repository-relative file
+to opt into a file instead; without a custom host the native exporter then writes
+that file plus `checkpoints/` beside the state database.
+
+A custom shutdown host receives `event: checkpoint | handoff | shutdown`,
+`run_revision` and `native_state` alongside its existing works/holds/continuation
+fields (`continuation` is null when unset). With a configured file it must save
+that file atomically and report `continuation_saved` plus that path in `saved`.
+State DB records remain authoritative over snapshots; the new parent fetches
+targeted current state instead of loading the entire old conversation or every
+historical work.
 
 Updating the executable does not change an already running router. Older builds
 reject the new YAML key, so activate the block only after upgrading the loaded

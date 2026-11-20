@@ -165,9 +165,6 @@ impl Drop for ToolActivity {
 }
 
 impl Runtime {
-    pub(crate) fn enabled(&self) -> bool {
-        self.policy.as_ref().is_some_and(|p| p.enabled)
-    }
     fn at(&self, percent: u8) -> bool {
         self.size > 0 && u128::from(self.used) * 100 >= u128::from(self.size) * u128::from(percent)
     }
@@ -747,12 +744,23 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     if !still_current {
         return Err("parent route changed".into());
     }
-    let seed = format!(
-        "Router-owned hot handoff. Same logical parent {sid}; existing children, custody, queues and watchers are still running. Do not run /implement, adopt, drain or relaunch them. Read {} and use planner_workflow status for current state before mutation. Checkpoint revision {} is a snapshot, not authority over newer events. Saved paths: {}. Continue the existing authorized run using its current role policy; do not replay transcript history.",
-        shared.cfg.routers.planner.continuation,
+    let source = match &shared.cfg.routers.planner.continuation {
+        Some(path) => format!("Read {path} and use"),
+        None => "Run state and the resume note are in the router state database; use".into(),
+    };
+    let mut seed = format!(
+        "Router-owned hot handoff. Same logical parent {sid}; existing children, custody, queues and watchers are still running. Do not run /implement, adopt, drain or relaunch them. {source} planner_workflow status for current state before mutation. Checkpoint revision {} is a snapshot, not authority over newer events. Saved paths: {}. Continue the existing authorized run using its current role policy; do not replay transcript history.",
         run.revision,
-        paths.join(", ")
+        if paths.is_empty() {
+            "none".to_string()
+        } else {
+            paths.join(", ")
+        }
     );
+    if let Some(note) = planner_workflow::continuation_brief(&latest) {
+        seed.push_str("\n\n");
+        seed.push_str(&note);
+    }
     let bootstrap_chars = seed.chars().count();
     // Schedule a continuation before changing the route. A failed persistence
     // leaves the old parent available to reconcile this idempotent wake.

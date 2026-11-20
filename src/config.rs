@@ -258,10 +258,6 @@ fn default_planner_blockers() -> String {
     "Docs/BLOCKED.md".into()
 }
 
-fn default_planner_continuation() -> String {
-    "Docs/CONTINUE.md".into()
-}
-
 fn default_max_concurrent() -> usize {
     3
 }
@@ -1437,11 +1433,11 @@ pub struct PlannerRouterConfig {
     /// other planner setting. Default: the Markdown layout's `Docs/BLOCKED.md`.
     #[serde(default = "default_planner_blockers")]
     pub blockers: String,
-    /// Where a run's parent writes its exact resume point when the operator
-    /// requests a shutdown. Pluggable; default: the Markdown layout's
-    /// `Docs/CONTINUE.md`.
-    #[serde(default = "default_planner_continuation")]
-    pub continuation: String,
+    /// Optional repository-relative file for a run's resume point. Unset (the
+    /// default), the resume point lives in the router's state database with the
+    /// run itself and nothing is written to the working tree.
+    #[serde(default)]
+    pub continuation: Option<String>,
     #[serde(default, rename = "create-plan")]
     pub create_plan: PlannerSkillConfig,
     #[serde(default, rename = "select-plan")]
@@ -1537,7 +1533,7 @@ impl Default for PlannerRouterConfig {
             roadmap: None,
             questions: true,
             blockers: default_planner_blockers(),
-            continuation: default_planner_continuation(),
+            continuation: None,
             create_plan: PlannerSkillConfig::default(),
             select_plan: PlannerSkillConfig::default(),
             implement_work: PlannerSkillConfig::default(),

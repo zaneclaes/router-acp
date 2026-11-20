@@ -6999,6 +6999,81 @@ async fn a_fresh_exact_ci_observation_parks_a_wait_without_spawning_a_retry() {
 }
 
 #[tokio::test]
+async fn resume_note_is_stored_with_the_run_and_carried_by_adoption() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let record = |key: &str, text: &str| {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::RecordContinuation {
+                key: key.into(),
+                text: text.into(),
+            },
+        )
+    };
+    assert!(
+        record("empty", "   ").await.is_err(),
+        "an empty note is refused"
+    );
+    record("note-1", "resume at the review of work-1")
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        status["continuation"]["text"],
+        "resume at the review of work-1"
+    );
+    assert_eq!(status["continuation"]["session_id"], SID);
+
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    {
+        let store = f.shared.state.lock().unwrap();
+        router_acp::planner_adopt::adopt(&*store, SID, "next").unwrap();
+    }
+    let adopted = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    let note = adopted
+        .continuation
+        .as_ref()
+        .expect("adoption dropped the resume note");
+    assert_eq!(note.text, "resume at the review of work-1");
+    let brief = planner_workflow::continuation_brief(&adopted).unwrap();
+    assert!(brief.contains("resume at the review of work-1"), "{brief}");
+}
+
+#[tokio::test]
 async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_progress() {
     use router_acp::planner_adopt::{self, RunStore};
     use router_acp::planner_release::{self, Checkpoint, Stage};
@@ -9678,6 +9753,8 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     let script = format!("cat > '{}'; printf '%s' '{answer}'", stdin.display());
     let fixture = fixture(|cfg| {
         cfg.delegation.max_concurrent = 3;
+        // A configured file the host does not report saving: the parent is prompted.
+        cfg.routers.planner.continuation = Some("Docs/CONTINUE.md".into());
         cfg.routers.planner.shutdown = Some(PlannerShutdownConfig {
             command: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
