@@ -15924,6 +15924,98 @@ async fn planner_handoff_failed_checkpoint_keeps_the_parent_usable() {
     .await;
 }
 
+#[tokio::test]
+async fn planner_handoff_opportunity_requires_a_new_observed_revision() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    use router_acp::planner_workflow::{self, Operation};
+    let state = temp_state_file("planner-handoff-opportunity");
+    let log = temp_log("planner-handoff-opportunity");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        observation_revisions: [host:staging]\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        planner_workflow::mutate(&shared, &sid, |run| {
+            run.observations.insert(
+                "host:staging".into(),
+                Observation {
+                    revision: "old-observed-head".into(),
+                    reference: "staging".into(),
+                    state: ObservationState::Pending,
+                    evidence: "host fixture".into(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let old_pin = shared
+            .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+            .unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:750/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let text = planner_workflow::operate(
+                    &shared,
+                    &sid,
+                    None,
+                    Operation::Status {
+                        offset: 0,
+                        work_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if status["handoff"]["prepared"] == true {
+                    assert!(
+                        status["handoff"]["due"].is_null(),
+                        "initial census is not an opportunity"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("standby was not prepared");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+                .unwrap(),
+            old_pin
+        );
+        planner_workflow::mutate(&shared, &sid, |run| {
+            run.observations.get_mut("host:staging").unwrap().revision = "new-pushed-head".into();
+            Ok(())
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != old_pin)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("75% opportunity did not replace the parent");
+        Ok(())
+    })
+    .await;
+}
+
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
 /// parent records its resume point, a mid-turn worker gets a queued shutdown
 /// notice before its turn ends, then stops, and the run ends paused for the next

@@ -348,6 +348,11 @@ pub(crate) async fn save_checkpoint(
                 .ok_or("parent missing")?;
             return crate::planner_handoff::native_checkpoint(
                 &cwd,
+                shared
+                    .cfg
+                    .state_file
+                    .parent()
+                    .ok_or("state file has no directory")?,
                 sid,
                 &shared.cfg.routers.planner.continuation,
                 run,

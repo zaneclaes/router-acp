@@ -684,7 +684,7 @@ routers:
       prewarm_percent: 65
       opportunity_percent: 75
       backstop_percent: 95
-      prepare_timeout_seconds: 60
+      prepare_timeout_seconds: 300   # old parent keeps working during preparation
       cutover_timeout_seconds: 60
       retry_seconds: 60
       checkpoint_interval_seconds: 30
@@ -728,7 +728,7 @@ The shutdown host receives `event: checkpoint | handoff | shutdown`, `run_revisi
 and `native_state` alongside its existing works/holds/continuation fields. It must
 save the exact configured continuation atomically and report `continuation_saved`
 plus that path in `saved`. Without a custom host, enabled handoffs use the native
-exporter (`.router-acp/checkpoints/` and the configured continuation). Live exports
+exporter (`checkpoints/` beside the configured state database, and the configured continuation). Live exports
 and `/shutdown` share a serialized writer; shutdown still drains and pauses.
 Native exports keep stable current files and preserve prior human/agent notes
 without recursively copying generated checkpoints. State DB records remain

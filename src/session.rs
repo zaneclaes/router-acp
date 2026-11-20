@@ -3738,7 +3738,6 @@ pub(crate) async fn open_downstream_session_at(
     // set_config_option response is authoritative; no notification needed.
     if selection == SelectionKind::ConfigOption {
         let Some(config_id) = config_id else {
-            cleanup_failed_session(shared, &key, &conn, &downstream_sid);
             return Err(AcpError::internal_error()
                 .data(format!("no model config option discovered for {candidate}")));
         };
@@ -3765,14 +3764,12 @@ pub(crate) async fn open_downstream_session_at(
                 if let Err(msg) =
                     verify_model_selected(&set_resp.config_options, &config_id, &downstream_model)
                 {
-                    cleanup_failed_session(shared, &key, &conn, &downstream_sid);
                     return Err(AcpError::internal_error()
                         .data(format!("model verification failed for {candidate}: {msg}")));
                 }
                 config_options = set_resp.config_options;
             }
             Err(err) => {
-                cleanup_failed_session(shared, &key, &conn, &downstream_sid);
                 return Err(err);
             }
         }

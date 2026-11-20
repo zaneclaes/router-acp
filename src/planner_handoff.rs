@@ -67,7 +67,7 @@ impl Default for Policy {
             prewarm_percent: 65,
             opportunity_percent: 75,
             backstop_percent: 95,
-            prepare_timeout_seconds: 60,
+            prepare_timeout_seconds: 300,
             cutover_timeout_seconds: 60,
             retry_seconds: 60,
             checkpoint_interval_seconds: 30,
@@ -288,6 +288,8 @@ fn error(shared: &Arc<Shared>, sid: &str, message: &str) {
 /// Returns true only while the parent route is reserved for a bounded cutover.
 pub(crate) fn tick(shared: &Arc<Shared>, sid: &str, run: &PlannerRun) -> bool {
     if !run.parent_role() || run.status != RunStatus::Running {
+        let prepared = shared.with_session(sid, |s| s.parent_handoff.prepared.take());
+        drop(prepared);
         return false;
     }
     let now = Instant::now();
@@ -394,10 +396,18 @@ pub(crate) fn tick(shared: &Arc<Shared>, sid: &str, run: &PlannerRun) -> bool {
             .await;
             match result {
                 Ok(Ok(prepared)) => {
+                    let running = planner_workflow::load(&shared, &sid)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|run| run.status == RunStatus::Running);
+                    let mut prepared = Some(prepared);
                     shared.with_session(&sid, |s| {
                         s.parent_handoff.preparing = false;
-                        s.parent_handoff.prepared = Some(prepared);
+                        if running && s.parent_handoff.policy.as_ref().is_some_and(|p| p.enabled) {
+                            s.parent_handoff.prepared = prepared.take();
+                        }
                     });
+                    drop(prepared);
                 }
                 _ => {
                     shared.with_session(&sid, |s| {
@@ -596,6 +606,7 @@ async fn checkpoint(
 /// host. Stable, atomic files bound disk usage; history stays in the state DB.
 pub(crate) fn native_checkpoint(
     cwd: &std::path::Path,
+    state_directory: &std::path::Path,
     sid: &str,
     continuation: &str,
     run: &PlannerRun,
@@ -610,8 +621,8 @@ pub(crate) fn native_checkpoint(
     {
         return Err("continuation must be a repository-relative file".into());
     }
-    let directory = cwd
-        .join(".router-acp/checkpoints")
+    let directory = state_directory
+        .join("checkpoints")
         .join(crate::planner_skills::content_hash(sid));
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let file = cwd.join(relative);
@@ -742,6 +753,9 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     // Schedule a continuation before changing the route. A failed persistence
     // leaves the old parent available to reconcile this idempotent wake.
     planner_workflow::mutate(shared, sid, |run| {
+        if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
+            return Err("run stopped or is awaiting approval".into());
+        }
         run.wakes.insert(format!("handoff:{}", prepared.opened.downstream_sid), planner_workflow::Wake { reason: "Reconcile the current run and deterministic continuation after a pending context handoff".into(), ..Default::default() });
         Ok(())
     })?;
@@ -804,6 +818,10 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         s.delegate_token = Some(prepared.token.clone());
         s.pending_context = Some(seed);
         s.pending_history.clear();
+        s.delegation_directive_active = false;
+        if shared.cfg.delegation.inject_prompt {
+            s.pending_delegation_directive = Some(prepared.old.candidate.clone());
+        }
         s.native_effort_options = prepared.opened.config_options.clone();
         session::refresh_pinned_effort(&shared.runtime_config(), &shared.scores, s);
         s.parent_handoff.receipt = Some(HandoffReceipt {
