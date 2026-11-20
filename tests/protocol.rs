@@ -14645,9 +14645,21 @@ async fn planner_parent_cancel_stops_only_the_parent_turn() {
         })
         .unwrap();
         prompt_text(&cx, &sid, "what is the worker doing?").await?;
-        let run = router_acp::planner_workflow::load(&shared, &sid)
+        // Under load a router wake turn can hold the parent when the message arrives; the
+        // message is then queued and the run resumes when it is delivered, after prompt_text
+        // returns. Wait for that delivery (bounded) instead of reading the status at once.
+        let mut run = router_acp::planner_workflow::load(&shared, &sid)
             .unwrap()
             .unwrap();
+        for _ in 0..100 {
+            if run.status == router_acp::planner_workflow::RunStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            run = router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap();
+        }
         assert_eq!(run.status, router_acp::planner_workflow::RunStatus::Running);
         assert!(run.approval_waits.is_empty());
         Ok(())
