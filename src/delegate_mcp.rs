@@ -2950,8 +2950,13 @@ fn worker_server_entry(
     Some((McpServer::Stdio(stdio), token))
 }
 
-/// How long a worker may run before its `router-worker` helper must have connected.
-const WORKER_TOOLS_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a worker may run before its `router-worker` helper must have connected: the token
+/// is minted before `session/new`, so the grace covers the whole start deadline plus the helper's
+/// own MCP connection. Chordzy 2026-11-20: with slow starts allowed 300 s, a fixed 120 s grace
+/// ended 17 healthy workers that were still starting.
+fn worker_tools_grace(session_new_deadline_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(session_new_deadline_ms.max(120_000)) + std::time::Duration::from_secs(120)
+}
 
 /// Workers whose `router-worker` helper never connected: (router session, worker id, identity).
 /// Chordzy 2026-11-20: after a busy restart several workers logged "router-worker failed to
@@ -2964,6 +2969,7 @@ pub(crate) fn toolless_workers(
     if connected.is_empty() {
         return Vec::new();
     }
+    let grace = worker_tools_grace(shared.cfg.probe_timeout_ms);
     // A worker token this sweep never saw minted (registered by another path) starts its grace now,
     // so it is judged too rather than ignored forever.
     let minted = {
@@ -2983,7 +2989,7 @@ pub(crate) fn toolless_workers(
         .iter()
         .filter(|(token, _)| {
             !connected.contains(*token)
-                && minted.get(*token).is_some_and(|at| at.elapsed() >= WORKER_TOOLS_GRACE)
+                && minted.get(*token).is_some_and(|at| at.elapsed() >= grace)
         })
         .filter_map(|(_, b)| {
             let w = b.worker.as_ref()?;
@@ -3735,6 +3741,15 @@ pub async fn run_helper(socket: &Path, token: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_keeps_its_tools_grace_for_the_whole_start_deadline() {
+        // The token is minted before session/new, so a worker still starting is never toolless.
+        assert!(worker_tools_grace(300_000) > std::time::Duration::from_millis(300_000));
+        assert_eq!(worker_tools_grace(300_000), std::time::Duration::from_secs(420));
+        // Never shorter than the original 120 s window plus the helper's connection.
+        assert_eq!(worker_tools_grace(30_000), std::time::Duration::from_secs(240));
+    }
 
     #[test]
     fn parent_interrupt_preserves_only_durable_workers_and_close_stops_everyone() {
