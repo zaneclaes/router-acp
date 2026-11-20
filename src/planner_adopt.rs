@@ -786,6 +786,10 @@ pub fn adopt_at(
         }
     }
     let report = report.ok_or("the new run stayed contended; rerun adopt-run to finish")?;
+    // The adopted run may itself have been waiting to adopt an older run (Chordzy 2026-11-20 09:43Z:
+    // a restart adopted the previous, empty run and dropped its pending handoff of the run holding
+    // all 878 works). That handoff continues in the adopter.
+    let chained = chained_adoption(&from, from_sid, into_sid);
     for _ in 0..16 {
         let mut from = store
             .load(from_sid)?
@@ -793,7 +797,18 @@ pub fn adopt_at(
         retire(&mut from, &report);
         match store.save(from_sid, &mut from) {
             Ok(()) => {
-                adoption_pending(store, into_sid, None, &report.summary())?;
+                match chained.as_deref() {
+                    Some(older) => adoption_pending(
+                        store,
+                        into_sid,
+                        Some(older),
+                        &format!(
+                            "{} Continuing the adoption of planner run {older} that {from_sid} was awaiting; the capacity cycle retries every 15 seconds.",
+                            report.summary()
+                        ),
+                    )?,
+                    None => adoption_pending(store, into_sid, None, &report.summary())?,
+                }
                 return Ok(report);
             }
             Err(e) if concurrent(&e) => continue,
@@ -803,6 +818,14 @@ pub fn adopt_at(
     Err(format!(
         "adopted into {into_sid}, but retiring {from_sid} stayed contended; rerun adopt-run to finish"
     ))
+}
+
+/// The handoff an adopted run was still waiting on, which its adopter takes over.
+fn chained_adoption(from: &PlannerRun, from_sid: &str, into_sid: &str) -> Option<String> {
+    from.capacity
+        .pending_adoption
+        .clone()
+        .filter(|older| older != into_sid && older != from_sid)
 }
 
 /// Content a claimed source still holds for its adopter: the claim happened,
