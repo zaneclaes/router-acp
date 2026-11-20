@@ -1201,6 +1201,15 @@ pub(crate) fn parent_handoff(req: &PromptRequest) -> bool {
 
 const PLANNER_HANDOFF_TAG: &str = "[planner-handoff]";
 
+fn resume_human_input(shared: &Shared, sid: &str, run: &mut PlannerRun) {
+    if matches!(run.status, RunStatus::Complete | RunStatus::Paused)
+        || stale_drain(shared, sid, run.status)
+    {
+        run.approval_waits.clear();
+        run.status = RunStatus::Running;
+    }
+}
+
 pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Result<(), String> {
     if load(shared, sid)?.is_none() {
         return Ok(());
@@ -1224,13 +1233,7 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         if human {
             crate::planner_capacity::clear_human_hold(run);
         }
-        if human
-            && (matches!(run.status, RunStatus::Complete | RunStatus::Paused)
-                || stale_drain(shared, sid, run.status))
-        {
-            run.approval_waits.clear();
-            run.status = RunStatus::Running;
-        }
+        if human { resume_human_input(shared, sid, run); }
         let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
             Some(record_input(run, req)?)
         } else {
@@ -1343,6 +1346,11 @@ pub fn record_steered_input(
     }
     let mut input_id = String::new();
     mutate(shared, sid, |run| {
+        // Steering is another delivery path for the same human input. A parent
+        // turn can still be settling when a paused run receives its follow-up.
+        if human_prompt(req) {
+            resume_human_input(shared, sid, run);
+        }
         input_id = record_input(run, req)?;
         if let Some(input) = run.inputs.get_mut(&input_id) {
             input.delivered_to.insert(sid.to_string());
@@ -2681,7 +2689,10 @@ pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
 /// 2026-11-19: with the operator's global `core.fsmonitor=true` every probed
 /// tree started a daemon, and adopting 830 works took 5 min 42 s while Kory
 /// sat at a blank screen. Adoption must stay bounded on any host.
-pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<std::time::Instant>) {
+pub(crate) fn mark_adopted_reconciliation_by(
+    work: &mut Work,
+    deadline: Option<std::time::Instant>,
+) {
     let mut probe = work.clone();
     mark_reconciliation_required(&mut probe);
     if !probe.reconciliation.required {
@@ -2722,12 +2733,18 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
 pub(crate) const DEFERRED_CUSTODY: &str = "router: custody check deferred past the adoption budget";
 
 /// Works whose custody check adoption deferred, oldest identity first, at most `limit`.
-pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> Vec<(String, Work)> {
+pub(crate) fn deferred_custody(
+    works: &BTreeMap<String, Work>,
+    limit: usize,
+) -> Vec<(String, Work)> {
     works
         .iter()
         .filter(|(_, w)| {
             w.reconciliation.required
-                && w.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY)
+                && w.reconciliation
+                    .evidence
+                    .iter()
+                    .any(|e| e == DEFERRED_CUSTODY)
         })
         .take(limit)
         .map(|(id, w)| (id.clone(), w.clone()))
@@ -2737,7 +2754,12 @@ pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> 
 /// Apply a deferred custody result: a clean, unchanged workspace needs no parent
 /// reconciliation (the same judgment adoption makes); anything else stays owed.
 pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
-    if !work.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY) {
+    if !work
+        .reconciliation
+        .evidence
+        .iter()
+        .any(|e| e == DEFERRED_CUSTODY)
+    {
         return;
     }
     match head {
@@ -3512,25 +3534,43 @@ mod adoption_custody_tests {
         // 2026-11-19: past the adoption budget nothing is probed; the work reconciles as before.
         let mut late = work(path, Some(&head));
         mark_adopted_reconciliation_by(&mut late, Some(std::time::Instant::now()));
-        assert!(late.reconciliation.required && late.reconciliation.source_revision.is_none(),
-            "a work past the custody budget was probed instead of marked");
+        assert!(
+            late.reconciliation.required && late.reconciliation.source_revision.is_none(),
+            "a work past the custody budget was probed instead of marked"
+        );
         // The deferred check finishes later and clears it exactly as adoption would have.
         let works = BTreeMap::from([("late".to_string(), late.clone())]);
         let deferred = deferred_custody(&works, 50);
-        assert_eq!(deferred.len(), 1, "a deferred work was not listed for the background check");
+        assert_eq!(
+            deferred.len(),
+            1,
+            "a deferred work was not listed for the background check"
+        );
         settle_deferred_custody(&mut late, adopted_custody_head(&deferred[0].1));
-        assert!(!late.reconciliation.required, "a clean deferred work stayed owed");
-        assert_eq!(late.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        assert!(
+            !late.reconciliation.required,
+            "a clean deferred work stayed owed"
+        );
+        assert_eq!(
+            late.reconciliation.source_revision.as_deref(),
+            Some(head.as_str())
+        );
         // 2026-11-19: a work already owed on a clean, unchanged tree is checked again and cleared.
         let mut owed_clean = work(path, Some(&head));
         owed_clean.reconciliation.required = true;
         mark_adopted_reconciliation_by(&mut owed_clean, None);
-        assert!(!owed_clean.reconciliation.required, "an owed work on a clean tree stayed owed");
+        assert!(
+            !owed_clean.reconciliation.required,
+            "an owed work on a clean tree stayed owed"
+        );
         // A never-started work whose reserved tree does not exist has nothing in custody.
         let mut never = work(&path.join("never-created"), None);
         never.status = WorkStatus::Admitted;
         mark_adopted_reconciliation_by(&mut never, None);
-        assert!(!never.reconciliation.required, "a never-started work without a tree was owed");
+        assert!(
+            !never.reconciliation.required,
+            "a never-started work without a tree was owed"
+        );
         // A deferred work whose custody is not clean stays owed, and is not rechecked.
         let mut owed = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));

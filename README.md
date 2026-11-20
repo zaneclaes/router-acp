@@ -680,7 +680,7 @@ overrides individual settings through the normal configuration merge:
 routers:
   planner:
     handoff:
-      enabled: true                 # default false; explicitly opt in
+      enabled: true                 # default; false disables automatic handoffs
       prewarm_percent: 65
       opportunity_percent: 75
       backstop_percent: 95
@@ -690,8 +690,8 @@ routers:
       checkpoint_interval_seconds: 30
       opportunities:
         operations: [review, integrate, disposition]
-        release_stages: [staging-deployed, staging-passed, production-merged, production-passed]
-        observation_revisions: ["ci:staging"] # optional host-defined key
+        release_stages: []          # optional repository-selected checkpoint labels
+        observation_revisions: []  # optional repository-host observation keys
 ```
 
 Occupancy is the adapter's current ACP `usage_update.used / size`, never lifetime
@@ -702,6 +702,11 @@ tool or approval. A new observation revision counts only after an initial
 baseline. Missing usage capacity cannot be guessed; no threshold is inferred.
 Policy is reloaded through the normal config/overlay reader every five seconds.
 Invalid configuration defers replacement and retains the live parent.
+The built-in opportunities are successful integrate/disposition operations. Release
+labels and observation keys are empty by default; deployment-specific names belong
+in the repository overlay. An opportunity checks occupancy when the event occurs:
+an event below the threshold is not saved to trigger a later refresh. Once due, a
+request stays pending until a safe boundary, even if provider compaction lowers usage.
 `planner_workflow status` exposes handoff preparation, the pending reason, errors,
 and the last receipt's before/first-after context usage, bootstrap character count
 and cutover duration. These are observations, not claims about billable tokens or

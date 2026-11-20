@@ -154,6 +154,8 @@ providers:
     preference: 0.1
 
 routers:
+  # Planner handoffs default on; override thresholds/opportunities under
+  # planner.handoff. Deployment labels belong in each project's overlay.
   static:
     candidate: claude/sonnet
   auto:

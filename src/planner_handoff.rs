@@ -30,8 +30,10 @@ pub struct Policy {
 #[serde(default, deny_unknown_fields)]
 pub struct Opportunities {
     pub operations: Vec<OperationPoint>,
-    pub release_stages: Vec<crate::planner_release::Stage>,
-    /// Host-authoritative observation keys, e.g. ci:staging. A new nonempty
+    /// Opaque labels from verified release checkpoints; the repository chooses
+    /// its lifecycle labels. The router supplies no deployment-stage defaults.
+    pub release_stages: Vec<String>,
+    /// Host-authoritative observation keys. A new nonempty
     /// revision after the initial baseline is an opportunity, not a CI verdict.
     pub observation_revisions: Vec<String>,
 }
@@ -46,15 +48,9 @@ pub enum OperationPoint {
 
 impl Default for Opportunities {
     fn default() -> Self {
-        use crate::planner_release::Stage;
         Self {
             operations: vec![OperationPoint::Integrate, OperationPoint::Disposition],
-            release_stages: vec![
-                Stage::StagingDeployed,
-                Stage::StagingPassed,
-                Stage::ProductionMerged,
-                Stage::ProductionPassed,
-            ],
+            release_stages: Vec::new(),
             observation_revisions: Vec::new(),
         }
     }
@@ -63,7 +59,7 @@ impl Default for Opportunities {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             prewarm_percent: 65,
             opportunity_percent: 75,
             backstop_percent: 95,
@@ -169,6 +165,9 @@ impl Drop for ToolActivity {
 }
 
 impl Runtime {
+    pub(crate) fn enabled(&self) -> bool {
+        self.policy.as_ref().is_some_and(|p| p.enabled)
+    }
     fn at(&self, percent: u8) -> bool {
         self.size > 0 && u128::from(self.used) * 100 >= u128::from(self.size) * u128::from(percent)
     }
@@ -245,7 +244,8 @@ pub(crate) fn operated(shared: &Shared, sid: &str, operation: &Operation) {
         };
         let eligible = point.is_some_and(|point| p.opportunities.operations.contains(&point))
             || matches!(operation, Operation::Release { checkpoint, .. }
-                if p.opportunities.release_stages.contains(&checkpoint.stage));
+                if serde_json::to_value(checkpoint.stage).ok().and_then(|stage| stage.as_str().map(str::to_string))
+                    .is_some_and(|stage| p.opportunities.release_stages.contains(&stage)));
         if eligible {
             h.opportunity("committed planner transition".into());
         }
@@ -716,6 +716,10 @@ fn save_continuously(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, policy: 
 
 async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     let started = Instant::now();
+    let reason = shared
+        .with_session(sid, |s| s.parent_handoff.due.clone())
+        .flatten()
+        .unwrap_or_else(|| "context threshold".into());
     let run = planner_workflow::load(shared, sid)?.ok_or("run missing")?;
     if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
         return Err("run is not available for handoff".into());
@@ -865,7 +869,10 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     session::notify_user(
         shared,
         sid,
-        "router-acp · parent context refreshed; existing children and watchers retained",
+        format!(
+            "router-acp · parent context refreshed — {reason}; model {}; existing children and watchers retained",
+            prepared.old.candidate
+        ),
     );
     Ok(())
 }

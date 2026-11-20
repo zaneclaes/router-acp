@@ -447,6 +447,43 @@ async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
     );
 }
 
+#[test]
+fn steered_human_followup_resumes_paused_state_without_duplicating_input() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        run.approval_waits.insert("old-permission".into());
+        Ok(())
+    })
+    .unwrap();
+    let mut monitor = input_request(Some("monitor"), "check current progress", false);
+    monitor.meta =
+        serde_json::from_value(json!({"router_acp":{"input_id":"monitor","agent_origin":true}}))
+            .ok();
+    planner_workflow::record_steered_input(&f.shared, SID, &monitor).unwrap();
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Paused
+    );
+    let human = input_request(Some("human"), "what is the worker doing?", false);
+    planner_workflow::record_steered_input(&f.shared, SID, &human).unwrap();
+    planner_workflow::record_steered_input(&f.shared, SID, &human).unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert!(run.approval_waits.is_empty());
+    assert_eq!(
+        run.inputs
+            .values()
+            .filter(|input| input.text == "what is the worker doing?")
+            .count(),
+        1
+    );
+}
+
 fn input_wakes(shared: &Arc<Shared>) -> Vec<String> {
     let run = planner_workflow::load(shared, SID).unwrap().unwrap();
     run.wakes

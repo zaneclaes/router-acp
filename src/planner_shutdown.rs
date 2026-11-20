@@ -342,7 +342,12 @@ pub(crate) async fn save_checkpoint(
         return Err("checkpoint deferred because the run is stopping".into());
     }
     let Some(command) = &cfg.command else {
-        if shared.runtime_config().routers.planner.handoff.enabled || event != "shutdown" {
+        if shared
+            .with_session(sid, |s| s.parent_handoff.enabled())
+            .unwrap_or(false)
+            || shared.runtime_config().routers.planner.handoff.enabled
+            || event != "shutdown"
+        {
             let cwd = shared
                 .with_session(sid, |s| s.cwd.clone())
                 .ok_or("parent missing")?;

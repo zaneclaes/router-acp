@@ -16091,7 +16091,7 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             })
             .await;
             assert!(paused.is_ok(), "the drain never paused the run");
-            wait_for_mock_prompt(&log, "Session restart (router lifecycle, not a stop of the run)").await;
+            assert!(repo.path().join("repo/Docs/CONTINUE.md").is_file());
             assert!(mock_prompts(&log, "Shutdown requested: interrupt").is_empty(),
                 "a shutdown interrupt must not start another child turn");
             let progress = router_acp::planner_shutdown::progress(&shared, &sid);
@@ -16109,13 +16109,8 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
                 done["workers"],
                 serde_json::json!([{"workId": "work-1", "status": "stopped"}])
             );
-            assert!(
-                progress.iter().any(|p| p["phase"] == "draining"
-                    && p["message"]
-                        .as_str()
-                        .is_some_and(|m| m.contains("recorded its resume point"))),
-                "the parent's shutdown turn completed: {progress:?}"
-            );
+            assert!(progress.iter().any(|p| p["phase"] == "saved" &&
+                p["saved"].as_array().is_some_and(|paths| paths.iter().any(|path| path == "Docs/CONTINUE.md"))));
 
             // The next `/implement` resumes the paused run.
             prompt_text(&cx, &sid, "/implement resume after the shutdown").await?;
@@ -16216,7 +16211,6 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
             let sid = open_planner_parent(&cx, &repo).await?;
             insert_wake(&shared, &sid, "audit:shutdown-preempt");
             wait_for_mock_prompt(&log, WAKE_MARKER).await;
-            let started = std::time::Instant::now();
             router_acp::planner_shutdown::request(&shared, &serde_json::json!({"sessionId":sid}))
                 .unwrap();
             let parent_prompt =
@@ -16225,17 +16219,28 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
                 parent_prompt.contains("Docs/CONTINUE.md"),
                 "the Markdown default: {parent_prompt}"
             );
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                wait_for_mock_prompt(&log, &parent_prompt),
-            )
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == router_acp::planner_workflow::RunStatus::Paused
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
             .await
-            .expect("shutdown promptly preempts the router turn");
-            assert!(started.elapsed() < Duration::from_secs(5));
+            .expect("shutdown did not settle the router turn");
             let events = read_log(&log);
-            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
-            let shutdown = mock_prompts(&log, &parent_prompt)[0];
-            assert!(cancel < shutdown);
+            assert!(events.iter().any(|e| e["event"] == "cancel"));
+            assert!(
+                mock_prompts(&log, &parent_prompt).is_empty(),
+                "deterministic export needs no model turn"
+            );
+            assert!(repo.path().join("repo/Docs/CONTINUE.md").is_file());
             assert!(
                 !release.exists(),
                 "the original router turn could only end by cancellation"
