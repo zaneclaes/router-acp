@@ -15801,6 +15801,55 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
     .await;
 }
 
+/// A fresh downstream parent must retain the same live worker, logical run and
+/// watcher state. No shutdown/adoption or outgoing summary prompt is involved.
+#[tokio::test]
+async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
+    let state = temp_state_file("planner-handoff");
+    let log = temp_log("planner-handoff");
+    let repo = planner_wire_repository();
+    let release = repo.path().join("release-worker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo"))).block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let task = format!("{}MCP_CALL:router-delegate delegate_task {}", planner_admit_wire_prompt(),
+            serde_json::json!({"work_id":"work-1","task":format!("WAIT_FILE:{}",release.display()),"background":true}));
+        prompt_text(&cx, &sid, &task).await?;
+        wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+        let before = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        let attempt = before.works["work-1"].attempt.as_ref().unwrap().id.clone();
+        let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let old_token = shared.with_session(&sid, |s| s.delegate_token.clone()).flatten().unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != pin.downstream_sid).unwrap_or(false) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("backstop did not replace the parent");
+        let after = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        assert_eq!(after.status, router_acp::planner_workflow::RunStatus::Running);
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.works["work-1"].attempt.as_ref().unwrap().id, attempt);
+        assert!(!after.works["work-1"].attempt.as_ref().unwrap().ended);
+        assert!(!shared.delegate_tokens.lock().unwrap().contains_key(&old_token));
+        assert!(shared.route_for(&pin.process_key, &pin.downstream_sid).is_none());
+        let current = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        assert_eq!(current.process_key, pin.process_key, "handoff must not restart the shared adapter");
+        assert_eq!(current.candidate, pin.candidate);
+        let continuation = std::fs::read_to_string(repo.path().join("repo/Docs/CONTINUE.md")).unwrap();
+        assert!(continuation.contains("Live checkpoint"));
+        assert!(continuation.lines().count() <= 60);
+        assert!(router_acp::planner_shutdown::progress(&shared, &sid).is_empty());
+        std::fs::write(&release, "complete the original attempt").unwrap();
+        Ok(())
+    }).await;
+}
+
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
 /// parent records its resume point, a mid-turn worker gets a queued shutdown
 /// notice before its turn ends, then stops, and the run ends paused for the next

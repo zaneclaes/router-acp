@@ -670,6 +670,64 @@ is cancelled with its already recorded state preserved. Shutdown never asks for 
 pushes, builds or audits. The default child grace is 20 seconds; the parent's final update
 is bounded at 30 seconds and is cancelled if it overruns.
 
+### Automatic parent-context handoffs
+
+`routers.planner.handoff` is a native router feature shared by Claude and Codex
+ACP adapters. Configure it in `router.yaml`; a project's `.router-acp/router.yaml`
+overrides individual settings through the normal configuration merge:
+
+```yaml
+routers:
+  planner:
+    handoff:
+      enabled: true                 # default false; explicitly opt in
+      prewarm_percent: 65
+      opportunity_percent: 75
+      backstop_percent: 95
+      prepare_timeout_seconds: 60
+      cutover_timeout_seconds: 60
+      retry_seconds: 60
+      checkpoint_interval_seconds: 30
+      opportunities:
+        operations: [review, integrate, disposition]
+        release_stages: [staging-deployed, staging-passed, production-merged, production-passed]
+        observation_revisions: ["ci:staging"] # optional host-defined key
+```
+
+Occupancy is the adapter's current ACP `usage_update.used / size`, never lifetime
+tokens or transcript bytes. A successfully committed configured transition at
+75% requests refresh; 95% requests it without any opportunity. Requests remain
+pending across provider compaction and wait for an idle parent with no active
+tool or approval. A new observation revision counts only after an initial
+baseline. Missing usage capacity cannot be guessed; no threshold is inferred.
+Policy is reloaded through the normal config/overlay reader every five seconds.
+Invalid configuration defers replacement and retains the live parent.
+
+At 65% the router opens an unprompted standby conversation on the existing
+adapter, verifies model/mode, and gives it inactive router tool credentials.
+Cutover exports a deterministic checkpoint through the existing shutdown host,
+then replaces only the downstream parent pin and fences the retired credentials
+and route. Workers, watchers, logical run identity, operation receipts and queues
+are retained. Input arriving during export queues for the new parent. Preparation
+is asynchronous; cutover's 60-second budget excludes waiting for a safe boundary
+and the next ordinary model response. Failed preparation/export keeps the old
+parent and retries. No outgoing LLM summary, worker drain or adoption is run.
+
+The shutdown host receives `event: checkpoint | handoff | shutdown`, `run_revision`
+and `native_state` alongside its existing works/holds/continuation fields. It must
+save the exact configured continuation atomically and report `continuation_saved`
+plus that path in `saved`. Without a custom host, enabled handoffs use the native
+exporter (`.router-acp/checkpoints/` and the configured continuation). Live exports
+and `/shutdown` share a serialized writer; shutdown still drains and pauses.
+Native exports keep stable current files and preserve prior human/agent notes
+without recursively copying generated checkpoints. State DB records remain
+authoritative over snapshots; the new parent fetches targeted current state
+instead of loading the entire old conversation or every historical work.
+
+Updating the executable does not change an already running router. Older builds
+reject the new YAML key, so activate the block only after upgrading the loaded
+router. Subsequent policy tuning requires no restart.
+
 ### Host-directed workers
 
 Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:

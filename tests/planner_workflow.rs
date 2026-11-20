@@ -3609,6 +3609,7 @@ async fn closing_an_older_attempt_keeps_the_newer_attempts_worker_token() {
     let shared = &fixture.shared;
     let binding = || DelegateBinding {
         router_sid: SID.into(),
+        active: true,
         delegation_enabled: false,
         worker: Some(WorkerBinding {
             worker_id: "child-1".into(),
@@ -7016,8 +7017,17 @@ async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_p
     // Adoption now marks only custody that could be lost (a clean tree at its
     // recorded HEAD resumes at once; `adoption_custody_tests`). Uncommitted
     // source in the retried work's tree is such custody.
-    let retry_tree = source.works["retry"].workspace.as_ref().unwrap().path.clone();
-    std::fs::write(retry_tree.join("uncommitted-adoption-source.txt"), "unsaved").unwrap();
+    let retry_tree = source.works["retry"]
+        .workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    std::fs::write(
+        retry_tree.join("uncommitted-adoption-source.txt"),
+        "unsaved",
+    )
+    .unwrap();
     {
         let store = f.shared.state.lock().unwrap();
         planner_adopt::adopt(&*store, SID, "next").unwrap();

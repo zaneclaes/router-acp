@@ -321,7 +321,39 @@ async fn save_state(
     prior: RunStatus,
     cfg: &crate::config::PlannerShutdownConfig,
 ) -> Result<(Vec<String>, String, bool), String> {
+    save_checkpoint(shared, sid, run, prior, cfg, "shutdown").await
+}
+
+pub(crate) async fn save_checkpoint(
+    shared: &Shared,
+    sid: &str,
+    run: &PlannerRun,
+    prior: RunStatus,
+    cfg: &crate::config::PlannerShutdownConfig,
+    event: &str,
+) -> Result<(Vec<String>, String, bool), String> {
+    let lock = shared
+        .with_session(sid, |s| s.parent_handoff.checkpoint_lock.clone())
+        .ok_or("the parent session is not loaded")?;
+    let _checkpoint = lock.lock().await;
+    let current = crate::planner_workflow::load(shared, sid)?;
+    let run = current.as_ref().unwrap_or(run);
+    if event != "shutdown" && run.status != RunStatus::Running {
+        return Err("checkpoint deferred because the run is stopping".into());
+    }
     let Some(command) = &cfg.command else {
+        if shared.runtime_config().routers.planner.handoff.enabled || event != "shutdown" {
+            let cwd = shared
+                .with_session(sid, |s| s.cwd.clone())
+                .ok_or("parent missing")?;
+            return crate::planner_handoff::native_checkpoint(
+                &cwd,
+                sid,
+                &shared.cfg.routers.planner.continuation,
+                run,
+                event,
+            );
+        }
         return Ok((
             Vec::new(),
             "native run state is persisted; no additional shutdown host is configured".into(),
@@ -333,7 +365,8 @@ async fn save_state(
         .ok_or("the parent session is not loaded")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let continuation = &shared.cfg.routers.planner.continuation;
-    let input = json!({"event":"shutdown","session_id":sid,"cwd":cwd,"run_status":prior,
+    let input = json!({"event":event,"session_id":sid,"cwd":cwd,"run_status":prior,
+        "run_revision":run.revision,"native_state":run,
         "continuation": continuation,
         "works":planner_guard::works_json(run),"holds":planner_guard::active_holds(run, now_ms)});
     let out = planner_guard::run_host(

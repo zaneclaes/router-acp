@@ -2519,6 +2519,7 @@ async fn operate_once(
     }
     run.receipts.insert(key.to_string(), fingerprint);
     save(shared, sid, &mut run)?;
+    crate::planner_handoff::operated(shared, sid, &operation);
     // Deliver the queued `work_finished` now rather than on the next flusher
     // tick; a host that refuses it keeps it queued, never this operation.
     if matches!(operation, Operation::Integrate { .. })
@@ -2751,7 +2752,11 @@ pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
 
 /// The workspace HEAD when adoption can verify unchanged custody, else None.
 pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
-    if work.attempt.as_ref().is_some_and(|a| !a.ended && owner_alive(a)) {
+    if work
+        .attempt
+        .as_ref()
+        .is_some_and(|a| !a.ended && owner_alive(a))
+    {
         return None;
     }
     let path = &work.workspace.as_ref()?.path;
@@ -3465,9 +3470,28 @@ mod adoption_custody_tests {
         git(path, &["init", "-q"]);
         std::fs::write(path.join("a.txt"), "a").unwrap();
         git(path, &["add", "a.txt"]);
-        git(path, &["-c", "user.name=f", "-c", "user.email=f@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "a"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        );
         let head = String::from_utf8(
-            std::process::Command::new("git").arg("-C").arg(path).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -3475,8 +3499,14 @@ mod adoption_custody_tests {
 
         let mut clean = work(path, Some(&head));
         mark_adopted_reconciliation(&mut clean);
-        assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
-        assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        assert!(
+            !clean.reconciliation.required,
+            "a clean tree at its artifact was marked"
+        );
+        assert_eq!(
+            clean.reconciliation.source_revision.as_deref(),
+            Some(head.as_str())
+        );
 
         // 2026-11-19: past the adoption budget nothing is probed; the work reconciles as before.
         let mut late = work(path, Some(&head));
@@ -3509,7 +3539,10 @@ mod adoption_custody_tests {
 
         let mut moved = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation(&mut moved);
-        assert!(moved.reconciliation.required, "a HEAD past its artifact was not marked");
+        assert!(
+            moved.reconciliation.required,
+            "a HEAD past its artifact was not marked"
+        );
 
         std::fs::write(path.join("b.txt"), "uncommitted").unwrap();
         let mut dirty = work(path, Some(&head));
@@ -3518,13 +3551,18 @@ mod adoption_custody_tests {
 
         let mut missing = work(&path.join("gone"), None);
         mark_adopted_reconciliation(&mut missing);
-        assert!(missing.reconciliation.required, "a missing tree was not marked");
+        assert!(
+            missing.reconciliation.required,
+            "a missing tree was not marked"
+        );
 
         let mut finished = work(path, Some(&head));
         finished.status = WorkStatus::Finished;
         mark_adopted_reconciliation(&mut finished);
-        assert!(!finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
-            "a finished work was touched");
+        assert!(
+            !finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
+            "a finished work was touched"
+        );
     }
 }
 

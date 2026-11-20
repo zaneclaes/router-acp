@@ -1480,6 +1480,9 @@ pub struct PlannerRouterConfig {
     /// drain bound. See `crate::planner_shutdown`.
     #[serde(default)]
     pub shutdown: Option<PlannerShutdownConfig>,
+    /// Hot parent-context replacement; project overlays override these fields.
+    #[serde(default)]
+    pub handoff: crate::planner_handoff::Policy,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1546,6 +1549,7 @@ impl Default for PlannerRouterConfig {
             audit: None,
             integrate_check: None,
             shutdown: None,
+            handoff: Default::default(),
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -2443,6 +2447,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.routers
+            .planner
+            .handoff
+            .validate()
+            .map_err(ConfigError)?;
         if self.agents.is_empty() {
             return Err(ConfigError(
                 "no agents configured; declare at least one agent with one model".into(),

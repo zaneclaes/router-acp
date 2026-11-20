@@ -32,6 +32,7 @@ impl PromptActivity {
                 // A cancel ends the turn it interrupted, not the run: once that
                 // turn is over, wakes resume with a fresh turn.
                 if s.prompt_activity != 0
+                    || s.parent_handoff.cutting_over
                     || s.pinning
                     || s.pin.is_none()
                     || s.capturing_summary.is_some()
@@ -158,6 +159,9 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 heartbeat(&shared, &sid, &run, now);
                 crate::planner_capacity::spawn_tick(&shared, &sid, now);
                 parked_notice(&shared, &sid, &run, now);
+                if crate::planner_handoff::tick(&shared, &sid, &run) {
+                    continue;
+                }
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
@@ -2120,8 +2124,14 @@ mod steer_tests {
         let first = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43"))]);
         let (key, _) = pending_steer(&[], &first, &HashSet::new()).expect("first failures steer");
         let steered = HashSet::from([super::steer_mark(&key, "job failures: web 01a1efee-6e43")]);
-        assert!(pending_steer(&[], &first, &steered).is_none(), "an unchanged wake steered twice");
-        let rearmed = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"))]);
+        assert!(
+            pending_steer(&[], &first, &steered).is_none(),
+            "an unchanged wake steered twice"
+        );
+        let rearmed = BTreeMap::from([(
+            id.clone(),
+            wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"),
+        )]);
         assert_eq!(
             pending_steer(&[], &rearmed, &steered).map(|(k, _)| k),
             Some(id),
@@ -2145,7 +2155,14 @@ mod steer_tests {
             pending_steer(&[], &wakes, &HashSet::new()).expect("capacity must reach busy parent");
         assert_eq!(id, "capacity:1");
         assert!(text.starts_with("[Router steer] This is router text, not operator input."));
-        assert!(pending_steer(&[], &wakes, &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])).is_none());
+        assert!(
+            pending_steer(
+                &[],
+                &wakes,
+                &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])
+            )
+            .is_none()
+        );
         wakes.insert("release:ready".to_string(), wake("release transition"));
         assert_eq!(
             pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,
