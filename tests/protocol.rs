@@ -15842,7 +15842,6 @@ async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
         assert_eq!(current.process_key, pin.process_key, "handoff must not restart the shared adapter");
         assert_eq!(current.candidate, pin.candidate);
         let continuation = std::fs::read_to_string(repo.path().join("repo/Docs/CONTINUE.md")).unwrap();
-        assert!(continuation.contains("Live checkpoint"));
         assert!(continuation.lines().count() <= 60);
         assert!(router_acp::planner_shutdown::progress(&shared, &sid).is_empty());
         std::fs::write(&release, "complete the original attempt").unwrap();

@@ -207,6 +207,18 @@ pub(crate) fn operated(shared: &Shared, sid: &str, operation: &Operation) {
     });
 }
 
+pub(crate) fn status(shared: &Shared, sid: &str) -> serde_json::Value {
+    shared
+        .with_session(sid, |s| {
+            let h = &s.parent_handoff;
+            json!({"enabled":h.policy.as_ref().is_some_and(|p| p.enabled),
+            "used":h.used,"capacity":h.size,"usage_known":h.size > 0,
+            "due":h.due,"preparing":h.preparing,"prepared":h.prepared.is_some(),
+            "cutting_over":h.cutting_over,"last_error":h.last_error})
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn error(shared: &Arc<Shared>, sid: &str, message: &str) {
     let changed = shared
         .with_session(sid, |s| {
@@ -679,6 +691,12 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         run.revision,
         paths.join(", ")
     );
+    // Schedule a continuation before changing the route. A failed persistence
+    // leaves the old parent available to reconcile this idempotent wake.
+    planner_workflow::mutate(shared, sid, |run| {
+        run.wakes.insert(format!("handoff:{}", prepared.opened.downstream_sid), planner_workflow::Wake { reason: "Reconcile the current run and deterministic continuation after a pending context handoff".into(), ..Default::default() });
+        Ok(())
+    })?;
     // Everything after this point is synchronous. Input queues while the fence
     // is held; callbacks from the old route are unregistered before activation.
     let mut persisted = shared
@@ -689,6 +707,24 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         .ok_or("parent persistence missing")?;
     persisted.prior_session_id = Some(prepared.old.downstream_sid.clone());
     persisted.downstream_session_id = prepared.opened.downstream_sid.clone();
+    let mut routing = persisted.routing.take().unwrap_or_else(|| json!({}));
+    routing["parent_handoff"] = json!({"checkpoint_revision":run.revision,
+        "from":prepared.old.downstream_sid,"to":prepared.opened.downstream_sid});
+    persisted.routing = Some(routing);
+    if !shared
+        .delegate_tokens
+        .lock()
+        .unwrap()
+        .contains_key(&prepared.token)
+    {
+        return Err("standby credentials expired".into());
+    }
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert_checked(sid.into(), persisted)
+        .map_err(|e| e.to_string())?;
     if !crate::delegate_mcp::activate_parent_token(shared, sid, &prepared.token) {
         return Err("standby credentials expired".into());
     }
@@ -728,20 +764,31 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         s.parent_handoff.retry_at = None;
         s.parent_handoff.last_error = None;
     });
-    shared.state.lock().unwrap().upsert(sid.into(), persisted);
     prepared.committed = true;
     session::close_downstream_session(
         shared,
         &prepared.old.process_key,
         &prepared.old.downstream_sid,
     );
-    // A refresh itself must schedule the new parent even if the outgoing turn
-    // acknowledged its last wake; queue insertion merges with concurrent work.
-    planner_workflow::mutate(shared, sid, |run| {
-        run.wakes.insert(format!("handoff:{}", prepared.opened.downstream_sid), planner_workflow::Wake { reason: "Continue after a router-owned context handoff; reconcile the current run and checkpoint".into(), ..Default::default() });
-        Ok(())
-    })?;
-    shared.state.lock().unwrap().patch_session_routing(sid, &json!({"parent_handoff":{"checkpoint_revision":run.revision,"from":prepared.old.downstream_sid,"to":prepared.opened.downstream_sid}}))?;
+    let (router_pid, router_started_at_ms) = crate::delegate_hook::process_identity();
+    crate::delegate_hook::deliver(
+        shared,
+        &crate::delegate_hook::RepinEvent {
+            event: "parent_repinned",
+            parent_router_session_id: sid.into(),
+            previous_downstream_session_id: prepared.old.downstream_sid.clone(),
+            previous_candidate: prepared.old.candidate.to_string(),
+            downstream_session_id: prepared.opened.downstream_sid.clone(),
+            candidate: prepared.old.candidate.to_string(),
+            lineage: session::agent_lineage(
+                &shared.runtime_config(),
+                &prepared.old.candidate.agent,
+            ),
+            reason: "deterministic context handoff".into(),
+            router_pid,
+            router_started_at_ms,
+        },
+    );
     session::notify_user(
         shared,
         sid,

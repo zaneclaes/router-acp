@@ -1753,6 +1753,7 @@ async fn operate_once(
             });
         }
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
+            "handoff":actor.is_none().then(|| crate::planner_handoff::status(shared, sid)),
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
             "execution":actor.is_none().then(|| execution_context(&run)).flatten(),
             "capacity":capacity,
