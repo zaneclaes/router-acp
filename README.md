@@ -702,6 +702,17 @@ tool or approval. A new observation revision counts only after an initial
 baseline. Missing usage capacity cannot be guessed; no threshold is inferred.
 Policy is reloaded through the normal config/overlay reader every five seconds.
 Invalid configuration defers replacement and retains the live parent.
+`planner_workflow status` exposes handoff preparation, the pending reason, errors,
+and the last receipt's before/first-after context usage, bootstrap character count
+and cutover duration. These are observations, not claims about billable tokens or
+provider cache hits. The handoff packet does not contain the old transcript or a
+full historical work census; the ordinary current-role briefing is retained.
+
+Native `/compact` remains available through supporting adapters. This automatic
+mechanism uses a deterministic replacement because native compaction summarizes
+the old conversation and does not provide a portable checkpoint-replacement API.
+Opening a standby sends no LLM prompt. System/tool instructions may still incur
+provider input cost on the first new turn; cross-session cache reuse is not assumed.
 
 At 65% the router opens an unprompted standby conversation on the existing
 adapter, verifies model/mode, and gives it inactive router tool credentials.

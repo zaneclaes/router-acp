@@ -862,12 +862,28 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                 let shared = call_shared.clone();
                 let router_sid = call_sid.clone();
                 let worker = call_worker.clone();
+                let token = call_token.clone();
                 let authorized = shared.delegate_tokens.lock().unwrap()
                     .get(&call_token).is_some_and(|b| b.active);
                 async move {
                     if !authorized {
                         return responder.respond(text_result("parent binding is prepared or retired; tool call refused".into(), true));
                     }
+                    let activity = if worker.is_none() {
+                        let Some(activity) = crate::planner_handoff::ToolActivity::claim(&shared, &router_sid) else {
+                            return responder.respond(text_result("parent handoff is committing; tool call refused".into(), true));
+                        };
+                        Some(activity)
+                    } else { None };
+                    if !shared.delegate_tokens.lock().unwrap().get(&token).is_some_and(|b| b.active) {
+                        return responder.respond(text_result("parent binding retired before tool admission".into(), true));
+                    }
+                    // The responder outlives the spawned tool task. Cutover may
+                    // not overtake an asynchronous MCP mutation still running.
+                    let responder = responder.wrap_params(move |_, result| {
+                        drop(activity);
+                        result
+                    });
                     if req.name == crate::planner_workflow::TOOL_NAME {
                         if worker.as_ref().is_some_and(|w| w.planner.is_none()) {
                             return responder.respond(text_result("lightweight worker has no planner assignment".into(), true));

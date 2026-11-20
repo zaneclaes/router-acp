@@ -124,6 +124,48 @@ pub struct Runtime {
     last_save: Option<Instant>,
     observations: std::collections::BTreeMap<String, String>,
     last_error: Option<String>,
+    active_calls: usize,
+    receipt: Option<HandoffReceipt>,
+}
+
+#[derive(Serialize)]
+struct HandoffReceipt {
+    before_used: u64,
+    capacity: u64,
+    first_after_used: Option<u64>,
+    bootstrap_chars: usize,
+    cutover_ms: u128,
+}
+
+pub(crate) struct ToolActivity {
+    shared: Weak<Shared>,
+    sid: String,
+}
+impl ToolActivity {
+    pub(crate) fn claim(shared: &Arc<Shared>, sid: &str) -> Option<Self> {
+        shared
+            .with_session(sid, |s| {
+                if s.parent_handoff.cutting_over {
+                    return false;
+                }
+                s.parent_handoff.active_calls += 1;
+                true
+            })
+            .filter(|claimed| *claimed)
+            .map(|_| Self {
+                shared: Arc::downgrade(shared),
+                sid: sid.into(),
+            })
+    }
+}
+impl Drop for ToolActivity {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.with_session(&self.sid, |s| {
+                s.parent_handoff.active_calls = s.parent_handoff.active_calls.saturating_sub(1)
+            });
+        }
+    }
 }
 
 impl Runtime {
@@ -137,6 +179,9 @@ impl Runtime {
         }
         self.used = used;
         self.size = size;
+        if let Some(receipt) = &mut self.receipt {
+            receipt.first_after_used.get_or_insert(used);
+        }
         if self
             .policy
             .as_ref()
@@ -214,7 +259,7 @@ pub(crate) fn status(shared: &Shared, sid: &str) -> serde_json::Value {
             json!({"enabled":h.policy.as_ref().is_some_and(|p| p.enabled),
             "used":h.used,"capacity":h.size,"usage_known":h.size > 0,
             "due":h.due,"preparing":h.preparing,"prepared":h.prepared.is_some(),
-            "cutting_over":h.cutting_over,"last_error":h.last_error})
+            "cutting_over":h.cutting_over,"last_error":h.last_error,"last_handoff":h.receipt})
         })
         .unwrap_or(serde_json::Value::Null)
 }
@@ -376,6 +421,7 @@ pub(crate) fn tick(shared: &Arc<Shared>, sid: &str, run: &PlannerRun) -> bool {
                 let h = &mut s.parent_handoff;
                 if h.cutting_over
                     || h.saving
+                    || h.active_calls != 0
                     || h.due.is_none()
                     || h.prepared.is_none()
                     || h.retry_at.is_some_and(|at| at > now)
@@ -658,6 +704,7 @@ fn save_continuously(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, policy: 
 }
 
 async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
+    let started = Instant::now();
     let run = planner_workflow::load(shared, sid)?.ok_or("run missing")?;
     if run.status != RunStatus::Running || !run.approval_waits.is_empty() {
         return Err("run is not available for handoff".into());
@@ -691,6 +738,7 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         run.revision,
         paths.join(", ")
     );
+    let bootstrap_chars = seed.chars().count();
     // Schedule a continuation before changing the route. A failed persistence
     // leaves the old parent available to reconcile this idempotent wake.
     planner_workflow::mutate(shared, sid, |run| {
@@ -758,6 +806,13 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         s.pending_history.clear();
         s.native_effort_options = prepared.opened.config_options.clone();
         session::refresh_pinned_effort(&shared.runtime_config(), &shared.scores, s);
+        s.parent_handoff.receipt = Some(HandoffReceipt {
+            before_used: s.parent_handoff.used,
+            capacity: s.parent_handoff.size,
+            first_after_used: None,
+            bootstrap_chars,
+            cutover_ms: started.elapsed().as_millis(),
+        });
         s.parent_handoff.used = 0;
         s.parent_handoff.size = 0;
         s.parent_handoff.due = None;

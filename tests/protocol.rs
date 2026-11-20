@@ -15849,6 +15849,81 @@ async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
     }).await;
 }
 
+#[tokio::test]
+async fn planner_handoff_failed_checkpoint_keeps_the_parent_usable() {
+    let state = temp_state_file("planner-handoff-refused");
+    let log = temp_log("planner-handoff-refused");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff: {enabled: true}\n    shutdown:\n      command: /bin/sh\n      args: ['-c', 'cat >/dev/null; exit 2']\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let pin = shared
+            .with_session(&sid, |s| s.pin.clone())
+            .flatten()
+            .unwrap();
+        let token = shared
+            .with_session(&sid, |s| s.delegate_token.clone())
+            .flatten()
+            .unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(
+                    &shared,
+                    &sid,
+                    None,
+                    router_acp::planner_workflow::Operation::Status {
+                        offset: 0,
+                        work_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["last_error"].is_string() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("failed exporter did not finish its attempt");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+                .unwrap(),
+            pin.downstream_sid
+        );
+        assert!(shared.delegate_tokens.lock().unwrap()[&token].active);
+        assert!(
+            shared
+                .route_for(&pin.process_key, &pin.downstream_sid)
+                .is_some()
+        );
+        prompt_text(&cx, &sid, "TEXT:original parent still serves").await?;
+        wait_for_mock_prompt(&log, "original parent still serves").await;
+        assert_eq!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .status,
+            router_acp::planner_workflow::RunStatus::Running
+        );
+        Ok(())
+    })
+    .await;
+}
+
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
 /// parent records its resume point, a mid-turn worker gets a queued shutdown
 /// notice before its turn ends, then stops, and the run ends paused for the next
