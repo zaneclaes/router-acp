@@ -2935,6 +2935,11 @@ fn worker_server_entry(
             worker: Some(worker),
         },
     );
+    shared
+        .worker_token_minted
+        .lock()
+        .unwrap()
+        .insert(token.clone(), std::time::Instant::now());
     let stdio = McpServerStdio::new(WORKER_SERVER_NAME, exe).args(vec![
         "mcp-delegate".to_string(),
         "--socket".to_string(),
@@ -2943,6 +2948,37 @@ fn worker_server_entry(
         token.clone(),
     ]);
     Some((McpServer::Stdio(stdio), token))
+}
+
+/// How long a worker may run before its `router-worker` helper must have connected.
+const WORKER_TOOLS_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Workers whose `router-worker` helper never connected: (router session, worker id, identity).
+/// Chordzy 2026-11-20: after a busy restart several workers logged "router-worker failed to
+/// connect", ran on for over two hours unable to call `worker_handoff`, and held their slots.
+pub(crate) fn toolless_workers(
+    shared: &Shared,
+) -> Vec<(String, String, crate::planner_workflow::WorkerIdentity)> {
+    let connected = shared.delegate_connected.lock().unwrap().clone();
+    // Only where helpers demonstrably connect in this process (as for the parent).
+    if connected.is_empty() {
+        return Vec::new();
+    }
+    let minted = shared.worker_token_minted.lock().unwrap().clone();
+    shared
+        .delegate_tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(token, _)| {
+            !connected.contains(*token)
+                && minted.get(*token).is_some_and(|at| at.elapsed() >= WORKER_TOOLS_GRACE)
+        })
+        .filter_map(|(_, b)| {
+            let w = b.worker.as_ref()?;
+            Some((b.router_sid.clone(), w.worker_id.clone(), w.planner.clone()?))
+        })
+        .collect()
 }
 
 /// Forget one delegate's `router-worker` token.

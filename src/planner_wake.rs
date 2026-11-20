@@ -137,6 +137,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                     tracing::warn!(session = sid, %error, "planner ownership heartbeat not saved");
                 }
                 finish_deferred_custody(&shared, &sid, &run);
+                restart_toolless_workers(&shared, &sid);
                 // A missed stop caused by router death is reconciled before
                 // parent work resumes. Never infer that the child survived.
                 for (id, work) in &run.works {
@@ -223,6 +224,30 @@ fn superseded_notice(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Pl
     if fresh {
         crate::session::notify_user(shared, sid, notice);
     }
+}
+
+/// End the attempt of each worker whose `router-worker` helper never connected, so the
+/// work is resumed with a fresh connection instead of running toolless (it cannot call
+/// `worker_handoff`). Durable work and its tree are kept; only the process stops.
+fn restart_toolless_workers(shared: &Arc<Shared>, sid: &str) {
+    for (router_sid, child, identity) in crate::delegate_mcp::toolless_workers(shared) {
+        if router_sid != sid {
+            continue;
+        }
+        tracing::warn!(session = sid, child, work = identity.work_id, "router-worker never connected; restarting the worker");
+        crate::planner_client::stop_child(shared, sid, &child);
+        let _ = planner_workflow::attempt_ended(
+            shared,
+            sid,
+            &identity,
+            None,
+            "Router: this worker's router-worker tools never connected, so it could not hand off. Resume it; the new attempt gets a fresh connection.".into(),
+            true,
+        );
+    }
+    let live: std::collections::HashSet<String> =
+        shared.delegate_tokens.lock().unwrap().keys().cloned().collect();
+    shared.worker_token_minted.lock().unwrap().retain(|token, _| live.contains(token));
 }
 
 /// One batch of deferred custody checks at a time, process-wide.

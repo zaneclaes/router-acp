@@ -711,6 +711,9 @@ pub struct Shared {
     /// Delegate tokens whose helper has connected. A planner parent whose
     /// current token never connected has no router tools (Chordzy 2026-11-19).
     pub delegate_connected: Mutex<std::collections::HashSet<String>>,
+    /// When each `router-worker` token was minted, so a worker whose helper never
+    /// connected can be restarted instead of running toolless (Chordzy 2026-11-20).
+    pub worker_token_minted: Mutex<HashMap<String, std::time::Instant>>,
     /// Delegate sub-sessions kept alive for follow-up turns (`keep_open`),
     /// keyed by the short `delegate_id` returned to the parent.
     pub live_delegates: Mutex<HashMap<String, LiveDelegate>>,
@@ -882,6 +885,7 @@ impl Shared {
             sid_map: Mutex::new(HashMap::new()),
             delegate_tokens: Mutex::new(HashMap::new()),
             delegate_connected: Mutex::new(std::collections::HashSet::new()),
+            worker_token_minted: Mutex::new(HashMap::new()),
             live_delegates: Mutex::new(HashMap::new()),
             background_delegates: Mutex::new(HashMap::new()),
             background_notify: tokio::sync::Notify::new(),
