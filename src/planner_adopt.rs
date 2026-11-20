@@ -380,6 +380,38 @@ pub fn live_owner(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -
     None
 }
 
+/// A paused run is still draining only while an unfinished attempt has a live owner. An attempt
+/// whose router exited can never finish its drain, so it is adopted like any orphan (Chordzy
+/// 2026-11-20 09:18Z: a restart's adoption waited on a dead router's attempts and the new parent
+/// could admit nothing).
+fn paused_drain_pending<'a>(
+    attempts: impl IntoIterator<Item = &'a crate::planner_workflow::Attempt>,
+) -> bool {
+    attempts
+        .into_iter()
+        .any(|attempt| !attempt.ended && crate::planner_workflow::owner_alive(attempt))
+}
+
+#[cfg(test)]
+mod paused_drain_tests {
+    use crate::planner_workflow::Attempt;
+
+    fn attempt(router_pid: u32, router_started_at_ms: u64, ended: bool) -> Attempt {
+        Attempt { id: "a".into(), router_pid, router_started_at_ms, delegate_id: None, ended }
+    }
+
+    #[test]
+    fn only_a_live_owners_unfinished_attempt_holds_a_paused_runs_adoption() {
+        let (pid, started) = crate::planner_workflow::process_identity();
+        assert!(super::paused_drain_pending([&attempt(pid, started, false)]));
+        // A dead router (no pid) or a finished attempt holds nothing.
+        assert!(!super::paused_drain_pending([&attempt(0, 0, false)]));
+        assert!(!super::paused_drain_pending([&attempt(pid, started, true)]));
+        // Same pid, other start: a reused pid is not the owner.
+        assert!(!super::paused_drain_pending([&attempt(pid, started.wrapping_add(1), false)]));
+    }
+}
+
 fn adoptable(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Result<(), String> {
     if !matches!(
         run.status,
@@ -391,10 +423,7 @@ fn adoptable(store: &dyn RunStore, sid: &str, run: &PlannerRun, now: i64) -> Res
         ));
     }
     if run.status == RunStatus::Paused
-        && run
-            .works
-            .values()
-            .any(|work| work.attempt.as_ref().is_some_and(|attempt| !attempt.ended))
+        && paused_drain_pending(run.works.values().filter_map(|work| work.attempt.as_ref()))
     {
         return Err(format!(
             "paused planner run {sid} still has unfinished attempts; finish its drain first"
