@@ -1236,8 +1236,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             wake.claim_pid = pid;
             wake.claim_started_at_ms = started;
             wake.deliveries += 1;
-            wake.retry_after =
-                now + crate::planner_guard::planner_wake_retry_secs(wake.deliveries);
+            wake.retry_after = now + crate::planner_guard::planner_wake_retry_secs(wake.deliveries);
             ids.push(id.clone());
             if ids.len() == 32 {
                 break;

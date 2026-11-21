@@ -569,8 +569,9 @@ pub(crate) fn audit_wake_lines(
     findings: &[String],
     delivered: &BTreeSet<String>,
 ) -> (Vec<String>, usize) {
-    let (seen, fresh): (Vec<&String>, Vec<&String>) =
-        findings.iter().partition(|finding| delivered.contains(*finding));
+    let (seen, fresh): (Vec<&String>, Vec<&String>) = findings
+        .iter()
+        .partition(|finding| delivered.contains(*finding));
     let mut lines: Vec<String> = fresh.into_iter().cloned().collect();
     for finding in &seen {
         lines.push(match finding.char_indices().nth(AUDIT_REPEAT_CHARS) {
@@ -745,7 +746,11 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
     };
     // The same notice again backs off; any change goes at the ordinary cadence.
     if unchanged(run) {
-        let repeats = run.capacity.audit_delivered.as_ref().map_or(0, |d| d.repeats);
+        let repeats = run
+            .capacity
+            .audit_delivered
+            .as_ref()
+            .map_or(0, |d| d.repeats);
         if now - last < unchanged_audit_wait(wait, repeats) {
             return;
         }
@@ -785,7 +790,11 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             seen.extend(findings.iter().cloned());
         }
         let repeats = if same {
-            run.capacity.audit_delivered.as_ref().map_or(0, |d| d.repeats) + 1
+            run.capacity
+                .audit_delivered
+                .as_ref()
+                .map_or(0, |d| d.repeats)
+                + 1
         } else {
             0
         };
