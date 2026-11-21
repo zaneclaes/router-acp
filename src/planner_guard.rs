@@ -1360,7 +1360,7 @@ mod tests {
         assert!(long.starts_with(lines[1].trim_end_matches("… (unchanged)")));
         // A changed finding is new text, so it is delivered whole again.
         let changed = format!("{long} 2 of 5");
-        let (lines, repeated) = audit_wake_lines(&[changed.clone()], &delivered);
+        let (lines, repeated) = audit_wake_lines(std::slice::from_ref(&changed), &delivered);
         assert_eq!((lines, repeated), (vec![changed], 0));
     }
 }
