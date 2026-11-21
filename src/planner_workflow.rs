@@ -1922,7 +1922,7 @@ async fn operate_once(
             {
                 return Err("reconcile requires the owning attempt to stop first; never change a live worker's assignment".into());
             }
-            let mut memberships = run
+            let memberships: Vec<_> = run
                 .releases
                 .values()
                 .filter_map(|release| {
@@ -1931,8 +1931,8 @@ async fn operate_once(
                         .get(&work.work_id)
                         .map(|revision| (release.stage(), revision))
                 })
-                .peekable();
-            let historical_custody = !terminal_correction && memberships.peek().is_some();
+                .collect();
+            let historical_custody = !terminal_correction && !memberships.is_empty();
             if !terminal_correction
                 && (matches!(
                     existing.status,
@@ -1940,7 +1940,7 @@ async fn operate_once(
                         | WorkStatus::Integrated
                         | WorkStatus::Watching
                         | WorkStatus::Retired
-                ) || memberships.clone().any(|(stage, _)| {
+                ) || memberships.iter().any(|(stage, _)| {
                     !matches!(
                         stage,
                         crate::planner_release::Stage::Disposed
@@ -1960,7 +1960,7 @@ async fn operate_once(
                     .map(|artifact| &artifact.revision)
                     .or(existing.reconciliation.source_revision.as_ref());
                 if !recorded_source.map_or_else(
-                    || memberships.all(|(_, revision)| revision == &source_revision),
+                    || memberships.iter().all(|(_, revision)| *revision == &source_revision),
                     |revision| revision == &source_revision,
                 ) {
                     return Err(
