@@ -416,7 +416,11 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             return;
         }
         let blocks = vec![ContentBlock::from(text.clone())];
-        let injected = crate::planner_preempt::steer(&shared, &sid, &blocks).await;
+        let injected = if interrupt {
+            crate::planner_preempt::steer_interrupting(&shared, &sid, &blocks).await
+        } else {
+            crate::planner_preempt::steer(&shared, &sid, &blocks).await
+        };
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
             rt.steering = false;
             if injected && (rt.router_turn || rt.command_turn) {

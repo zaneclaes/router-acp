@@ -104,16 +104,35 @@ pub fn preempted(shared: &Shared, sid: &str) -> bool {
         .is_some_and(|rt| rt.preempted)
 }
 
-/// Steer operator input into the running router-owned turn. `true` when the
-/// downstream took it.
+/// Deliver an automatic wake without cancelling managed work. `true` when
+/// the downstream or parked turn took it.
 pub async fn steer(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool {
+    steer_with_background_policy(shared, sid, prompt, true).await
+}
+
+/// Operator input and explicitly interrupting messages retain cancellation
+/// authority over a turn's managed terminals.
+pub async fn steer_interrupting(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool {
+    steer_with_background_policy(shared, sid, prompt, false).await
+}
+
+async fn steer_with_background_policy(
+    shared: &Shared,
+    sid: &str,
+    prompt: &[ContentBlock],
+    preserve_backgrounds: bool,
+) -> bool {
     // A managed wait has no active downstream prompt to steer. Use the same
     // interrupt channel as native client input so urgent planner wakes and
     // queued corrections can resume it instead of waiting for the watcher.
     let parked = shared.background_interrupts.lock().unwrap().remove(sid);
     if let Some(interrupt) = parked
         && interrupt
-            .send(crate::session::BackgroundInterrupt::Steer(prompt.to_vec()))
+            .send(if preserve_backgrounds {
+                crate::session::BackgroundInterrupt::Wake(prompt.to_vec())
+            } else {
+                crate::session::BackgroundInterrupt::Steer(prompt.to_vec())
+            })
             .is_ok()
     {
         return true;

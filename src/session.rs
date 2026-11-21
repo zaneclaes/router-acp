@@ -6481,6 +6481,8 @@ async fn send_primary_prompt(
 pub enum BackgroundInterrupt {
     Cancel,
     Steer(Vec<ContentBlock>),
+    /// A router wake delivers work without cancelling existing operations.
+    Wake(Vec<ContentBlock>),
 }
 
 /// How a turn's wait on its managed terminals ended.
@@ -6490,6 +6492,8 @@ enum BackgroundWait {
     /// A user message arrived first. The terminals were stopped; resume the
     /// agent with this prompt.
     Steered(Vec<ContentBlock>),
+    /// An automatic wake arrived; keep the terminals owned for recollection.
+    Woken(Vec<ContentBlock>),
     /// The client cancelled the turn. The terminals were stopped.
     Cancelled,
 }
@@ -6568,6 +6572,7 @@ async fn wait_for_managed_backgrounds(
             result = waited => result,
             interrupt = interrupt_rx => Ok(match interrupt {
                 Ok(BackgroundInterrupt::Steer(prompt)) => BackgroundWait::Steered(prompt),
+                Ok(BackgroundInterrupt::Wake(prompt)) => BackgroundWait::Woken(prompt),
                 Ok(BackgroundInterrupt::Cancel) | Err(_) => BackgroundWait::Cancelled,
             }),
             () = async {
@@ -6592,6 +6597,23 @@ async fn wait_for_managed_backgrounds(
     }
     let outcome = outcome?;
     Ok(Some(match outcome {
+        BackgroundWait::Woken(prompt) => {
+            shared
+                .managed_backgrounds
+                .lock()
+                .unwrap()
+                .entry(router_sid.to_string())
+                .or_default()
+                .extend(terminal_ids.iter().cloned());
+            let mut blocks = vec![ContentBlock::from(format!(
+                "[router-acp managed background continues]\nAutomatic router input arrived while \
+                 terminal(s) {} remain owned and running. Handle the input; do not restart those \
+                 operations. Their completion will still be collected.\nInput:",
+                terminal_ids.join(", ")
+            ))];
+            blocks.extend(prompt);
+            BackgroundWait::Steered(blocks)
+        }
         BackgroundWait::Steered(prompt) => {
             let mut blocks = vec![ContentBlock::from(format!(
                 "[router-acp managed background interrupted]\nNew input arrived while this \
@@ -7443,7 +7465,7 @@ async fn run_primary_turn_inner(
                         attempt = 0;
                         continue;
                     }
-                    Ok(Some(BackgroundWait::Steered(prompt))) => {
+                    Ok(Some(BackgroundWait::Steered(prompt) | BackgroundWait::Woken(prompt))) => {
                         background_completion = Some(prompt);
                         continuing = false;
                         attempt = 0;
@@ -10810,7 +10832,7 @@ fn on_prompt(
             // steered.
             if !routing_control
                 && crate::planner_workflow::command(&req).is_none()
-                && crate::planner_preempt::steer(&shared, &router_sid, &steered).await
+                && crate::planner_preempt::steer_interrupting(&shared, &router_sid, &steered).await
             {
                 let recorded = crate::planner_workflow::record_steered_input(
                     &shared,

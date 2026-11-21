@@ -467,9 +467,7 @@ where
                             } else {
                                 TerminalExitStatus::new().signal("SIGTERM")
                             };
-                            responder.respond(WaitForTerminalExitResponse::new(
-                                exit,
-                            ))
+                            responder.respond(WaitForTerminalExitResponse::new(exit))
                         })
                     }
                 },
