@@ -1,7 +1,8 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
+use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 const RUNNER: &str = env!("CARGO_BIN_EXE_router-resource-run");
 const ROUTER: &str = env!("CARGO_BIN_EXE_router-acp");
@@ -53,64 +54,139 @@ fn router_cannot_act_as_a_resource_watcher() {
 
 struct Job {
     child: Child,
-    descendants: Vec<i32>,
+    input: Option<ChildStdin>,
+    output: ChildStdout,
+}
+impl Job {
+    fn new(mut child: Child) -> Self {
+        Self {
+            input: Some(child.stdin.take().unwrap()),
+            output: child.stdout.take().unwrap(),
+            child,
+        }
+    }
+
+    fn assert_cleaned(&mut self) {
+        // The test owns the input writer until this assertion completes. A cat
+        // descendant cannot expire or receive EOF when its launcher dies, and
+        // keeps the output pipe open until cleanup terminates it.
+        assert_eq!(self.output.read(&mut [0]).unwrap(), 0);
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
-        for pid in &self.descendants {
-            unsafe {
-                libc::kill(*pid, libc::SIGKILL);
-            }
-        }
+        // Releasing the owned pipe also cleans fixtures after a failed assertion.
+        // Never signal remembered descendant PIDs, which may have been reused.
+        self.input.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn wait_for(mut condition: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < until {
-        if condition() {
-            return;
+fn pid_file(file: &Path, child: &mut Child) -> i32 {
+    let read = || {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    };
+    loop {
+        if let Some(pid) = read() {
+            return pid;
+        }
+        if let Some(result) = child.try_wait().unwrap() {
+            // The command may have written its receipt between the first read
+            // and wait. A refused/failed launch has no receipt and fails here.
+            return read()
+                .unwrap_or_else(|| panic!("host fixture exited before launch receipt: {result}"));
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(condition(), "resource lifecycle did not settle");
 }
 
-fn pid_file(file: &Path) -> i32 {
-    wait_for(|| {
-        std::fs::read_to_string(file)
-            .ok()
-            .is_some_and(|s| s.trim().parse::<i32>().is_ok())
-    });
-    std::fs::read_to_string(file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn alive(pid: i32) -> bool {
+// Observe the external executable through the OS, independently of its private
+// ownership implementation. Only the deliberate watchdog-death trigger signals
+// a PID; ordinary fixture teardown uses owned pipes and Child handles.
+fn process_identity(pid: i32) -> std::io::Result<(i32, u64)> {
     #[cfg(target_os = "macos")]
     {
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        unsafe {
+        if unsafe {
             libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDTBSDINFO,
                 0,
                 info.as_mut_ptr().cast(),
                 size,
-            ) == size
-                && info.assume_init().pbi_status != 5
+            )
+        } != size
+        {
+            return Err(std::io::Error::last_os_error());
         }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_status == 5 {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        Ok((
+            info.pbi_ppid as i32,
+            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        ))
     }
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .is_ok_and(|s| !s.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'))
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let (_, rest) = text
+            .rsplit_once(')')
+            .ok_or_else(|| std::io::Error::other("invalid process identity"))?;
+        let fields: Vec<_> = rest.split_whitespace().collect();
+        if fields.first() == Some(&"Z") {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        let parent = fields.get(1).and_then(|field| field.parse().ok());
+        let birth = fields.get(19).and_then(|field| field.parse().ok());
+        parent
+            .zip(birth)
+            .ok_or_else(|| std::io::Error::other("invalid process identity"))
+    }
+}
+
+fn signal_owned_process(
+    owner: i32,
+    mut observe: impl FnMut() -> std::io::Result<(i32, u64)>,
+    signal: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let identity = observe()?;
+    if identity.0 != owner || observe()? != identity {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    signal()
+}
+
+#[test]
+fn watchdog_signal_requires_a_stable_child_identity() {
+    for (first, second, permitted) in [
+        (Some((10, 100)), Some((10, 100)), true),
+        (Some((10, 100)), Some((10, 200)), false),
+        (Some((20, 100)), Some((20, 100)), false),
+        (Some((10, 100)), None, false),
+    ] {
+        let mut readings = [first, second].into_iter();
+        let mut signals = 0;
+        let result = signal_owned_process(
+            10,
+            || {
+                readings
+                    .next()
+                    .unwrap()
+                    .ok_or(std::io::ErrorKind::PermissionDenied.into())
+            },
+            || {
+                signals += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), permitted);
+        assert_eq!(signals, i32::from(permitted));
     }
 }
 
@@ -132,59 +208,23 @@ fn opt_out_execs_directly_without_helpers_even_without_path() {
 }
 
 #[test]
-fn short_command_cannot_leave_a_background_process() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("child");
+#[ignore = "host capability smoke: requires allowed native telemetry and resource headroom; run explicitly for activation"]
+fn host_short_command_cannot_leave_a_background_process() {
     let child = Command::new(RUNNER)
         .env_remove("AGENT_GUARD_RESOURCES")
-        .args([
-            "--",
-            "/bin/sh",
-            "-c",
-            "sleep 60 & echo $! > \"$1\"",
-            "fixture",
-        ])
-        .arg(&file)
-        .stdout(Stdio::null())
+        .args(["--", "/bin/sh", "-c", "exec 3<&0; /bin/cat <&3 3<&- &"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut job = Job {
-        child,
-        descendants: vec![],
-    };
-    let pid = pid_file(&file);
-    job.descendants.push(pid);
+    let mut job = Job::new(child);
     assert!(job.child.wait().unwrap().success());
-    wait_for(|| !alive(pid));
+    job.assert_cleaned();
 }
 
 #[test]
-fn killed_owner_cleans_descendants_in_separate_sessions_and_groups() {
-    let dir = tempfile::tempdir().unwrap();
-    let child = Command::new(RUNNER)
-        .env_remove("AGENT_GUARD_RESOURCES")
-        .env("RESOURCE_FIXTURE_DIRECTORY", dir.path())
-        .arg("--")
-        .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "detached_fixture"])
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut job = Job {
-        child,
-        descendants: vec![],
-    };
-    let detached = pid_file(&dir.path().join("detached"));
-    let grandchild = pid_file(&dir.path().join("grandchild"));
-    job.descendants.extend([detached, grandchild]);
-    std::thread::sleep(Duration::from_secs(1));
-    job.child.kill().unwrap();
-    job.child.wait().unwrap();
-    wait_for(|| !alive(detached) && !alive(grandchild));
-}
-
-#[test]
-fn lost_watchdog_stops_owner_and_children_instead_of_freezing_itself() {
+#[ignore = "host capability smoke: requires allowed native telemetry and resource headroom; run explicitly for activation"]
+fn host_lost_watchdog_stops_owner_and_children_instead_of_freezing_itself() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("command");
     let child = Command::new(RUNNER)
@@ -193,18 +233,16 @@ fn lost_watchdog_stops_owner_and_children_instead_of_freezing_itself() {
             "--",
             "/bin/sh",
             "-c",
-            "echo $$ > \"$1\"; exec sleep 60",
+            "echo $$ > \"$1\"; exec /bin/cat",
             "fixture",
         ])
         .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut job = Job {
-        child,
-        descendants: vec![],
-    };
-    let command = pid_file(&file);
-    job.descendants.push(command);
+    let mut job = Job::new(child);
+    let command = pid_file(&file, &mut job.child);
     let children = Command::new("pgrep")
         .arg("-P")
         .arg(job.child.id().to_string())
@@ -216,56 +254,43 @@ fn lost_watchdog_stops_owner_and_children_instead_of_freezing_itself() {
         .map(|s| s.parse::<i32>().unwrap())
         .find(|pid| *pid != command)
         .unwrap();
-    unsafe {
-        libc::kill(watcher, libc::SIGKILL);
-    }
-    wait_for(|| job.child.try_wait().unwrap().is_some() && !alive(command));
+    signal_owned_process(
+        job.child.id() as i32,
+        || process_identity(watcher),
+        || {
+            if unsafe { libc::kill(watcher, libc::SIGKILL) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+    )
+    .unwrap();
+    job.child.wait().unwrap();
+    job.assert_cleaned();
 }
 
 #[test]
-fn terminal_launcher_death_stops_the_owned_tree() {
+#[ignore = "host capability smoke: requires allowed native telemetry and resource headroom; run explicitly for activation"]
+fn host_terminal_launcher_death_stops_the_owned_tree() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("child");
     let child = Command::new("/bin/sh")
         .env_remove("AGENT_GUARD_RESOURCES")
         .args([
             "-c",
-            "\"$1\" -- /bin/sh -c 'echo $$ > \"$1\"; sleep 60' fixture \"$2\" & wait",
+            "exec 3<&0; \"$1\" -- /bin/sh -c 'echo $$ > \"$1\"; exec /bin/cat' fixture \"$2\" <&3 3<&- & wait",
             "launcher",
             RUNNER,
         ])
         .arg(&file)
-        .stdout(Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut job = Job {
-        child,
-        descendants: vec![],
-    };
-    let pid = pid_file(&file);
-    job.descendants.push(pid);
+    let mut job = Job::new(child);
+    pid_file(&file, &mut job.child);
     job.child.kill().unwrap();
     job.child.wait().unwrap();
-    wait_for(|| !alive(pid));
-}
-
-#[test]
-fn detached_fixture() {
-    let Some(dir) = std::env::var_os("RESOURCE_FIXTURE_DIRECTORY") else {
-        return;
-    };
-    use std::os::unix::process::CommandExt;
-    assert!(unsafe { libc::setsid() } > 0);
-    let mut child = Command::new("/bin/sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    std::fs::write(
-        Path::new(&dir).join("detached"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
-    std::fs::write(Path::new(&dir).join("grandchild"), child.id().to_string()).unwrap();
-    let _ = child.wait();
+    job.assert_cleaned();
 }

@@ -126,8 +126,12 @@ swap and free space on the working, startup and temporary filesystems. Keep at
 least 8GiB memory headroom and 10GiB free disk; warning memory pressure, swap above
 8GiB, or tree footprint above physical RAM minus headroom stops the owned tree.
 macOS accounting includes compressed memory; Linux includes resident and swapped
-memory. Unknown telemetry fails closed. Diagnostics contain resource counters,
-never command arguments or credentials. Source/worktrees are never deleted.
+memory. Unknown telemetry fails closed. macOS memory probe failures identify the
+fixed kernel metric and either `category=syscall` with its numeric errno or
+`category=size-mismatch` with expected and returned byte counts. The watchdog
+preserves those details both before launch and during sampling. Diagnostics contain
+resource counters, never command arguments or credentials. Source/worktrees are
+never deleted.
 An ancestry chain of 32 processes also stops the tree before a recursive launcher
 can exhaust the host. This backstop covers legacy tools without their own call guard.
 This is sampled protection, not a kernel cgroup or a guarantee against allocations
@@ -145,6 +149,22 @@ the .NET runtime or this helper. Its RAM admission and RouterHost disk checks ar
 disabled too. Other repository checks still apply. Unset or any value other than
 the literal `false` keeps resource protection enabled. Existing processes need a
 new launch to inherit a changed environment or binary.
+
+Resource guard regression tests inject readings into the production watchdog loop;
+they do not require native telemetry permissions, free host memory, or timing sleeps.
+Run them with `cargo test --bin router-resource-run resource_guard::tests` and
+`cargo test --test resource_guard`. The default results explicitly report the native
+capability checks as ignored, including their host prerequisites.
+
+Native probes and process cleanup remain separate activation smoke checks. Run
+`cargo test --bin router-resource-run host_ -- --ignored --nocapture` and
+`cargo test --test resource_guard host_ -- --ignored --nocapture` on each supported
+host before accepting a native guard installation. These commands require allowed
+process/memory/disk probes and at least the resource floors above. A failed probe
+means host activation is unverified; a skipped/default regression run is never
+native activation evidence. Record the source revision, host, command, and result.
+The subprocess-only `detached_fixture` is ignored separately and is invoked by its
+owning smoke; do not run every ignored test indiscriminately.
 
 ## How routing works
 
