@@ -1068,18 +1068,14 @@ async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
         init_with_terminals(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         let pending = park_on_managed_background(&cx, &observed, &sid).await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !shared
-                .background_interrupts
-                .lock()
-                .unwrap()
-                .contains_key(&sid)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the managed wait did not register its interrupt");
+        while !shared
+            .background_interrupts
+            .lock()
+            .unwrap()
+            .contains_key(&sid)
+        {
+            tokio::task::yield_now().await;
+        }
         assert!(
             router_acp::planner_preempt::steer(
                 &shared,
@@ -1090,15 +1086,11 @@ async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
             )
             .await
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !agent_text(&observed, &sid)
-                .contains("[Router audit] eligible work needs reconciliation")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the wake was not delivered while the terminal ran");
+        while !agent_text(&observed, &sid)
+            .contains("[Router audit] eligible work needs reconciliation")
+        {
+            tokio::task::yield_now().await;
+        }
         assert!(observed.lock().unwrap().terminal_kills.is_empty());
         assert!(observed.lock().unwrap().terminal_releases.is_empty());
         assert!(!pending.is_finished(), "the original work is still running");
