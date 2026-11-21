@@ -53,6 +53,27 @@ pub fn wake_retry_secs(deliveries: u32) -> i64 {
     WAKE_RETRY_SECS[(deliveries.saturating_sub(1) as usize).min(WAKE_RETRY_SECS.len() - 1)]
 }
 
+/// Redelivery spacing of an unacknowledged durable planner wake (a recovery or child wake, never
+/// queued input): the input schedule, then 15 min, 30 min and hourly with no cap. Its text is
+/// unchanged; a new or changed condition is a new wake and goes at once. Chordzy 2026-11-20: 61
+/// recovery wakes the parent could not yet reconcile came back every 5 min (up to 42 deliveries
+/// each), a parent turn every couple of minutes repeating the same text.
+pub const PLANNER_WAKE_RETRY_SECS: [i64; 6] = [30, 120, 300, 900, 1800, 3600];
+
+pub fn planner_wake_retry_secs(deliveries: u32) -> i64 {
+    PLANNER_WAKE_RETRY_SECS
+        [(deliveries.saturating_sub(1) as usize).min(PLANNER_WAKE_RETRY_SECS.len() - 1)]
+}
+
+/// Longest spacing of an unchanged audit wake to an idle parent.
+pub const UNCHANGED_AUDIT_MAX_SECS: i64 = 900;
+
+/// Spacing of an audit wake whose full notice is unchanged after `repeats` identical sends:
+/// `wait`, doubled per repeat, at most 15 min. A changed notice resets it to `wait`.
+pub fn unchanged_audit_wait(wait: i64, repeats: u32) -> i64 {
+    (wait << repeats.min(5)).clamp(wait, UNCHANGED_AUDIT_MAX_SECS.max(wait))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Defect {
     pub code: String,
@@ -531,6 +552,9 @@ pub struct AuditDelivered {
     /// whatever form this context received it in.
     #[serde(default)]
     pub last_key: String,
+    /// Consecutive audit wakes sent with that same notice.
+    #[serde(default)]
+    pub repeats: u32,
 }
 
 /// Characters of an unchanged finding a repeated audit wake keeps.
@@ -706,7 +730,8 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             &lines,
             &format!(
                 "{repeated} finding(s) marked unchanged were delivered in full earlier in this \
-                 context and are shortened here.\n"
+                 context and are shortened here; planner_workflow status lists every finding \
+                 whole (capacity.audit_findings).\n"
             ),
         )
     } else {
@@ -718,6 +743,13 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             .as_ref()
             .is_some_and(|delivered| delivered.last_key == key)
     };
+    // The same notice again backs off; any change goes at the ordinary cadence.
+    if unchanged(run) {
+        let repeats = run.capacity.audit_delivered.as_ref().map_or(0, |d| d.repeats);
+        if now - last < unchanged_audit_wait(wait, repeats) {
+            return;
+        }
+    }
     // An unchanged delivered audit must not repeatedly interrupt an active
     // repair or release. Idle parents retain the existing repeat cadence.
     if release_audit
@@ -752,10 +784,16 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         if !unavailable && !context.is_empty() {
             seen.extend(findings.iter().cloned());
         }
+        let repeats = if same {
+            run.capacity.audit_delivered.as_ref().map_or(0, |d| d.repeats) + 1
+        } else {
+            0
+        };
         run.capacity.audit_delivered = Some(AuditDelivered {
             context: context.clone(),
             findings: seen,
             last_key: key.clone(),
+            repeats,
         });
         insert_wake(run, prefix, sid, reason.clone());
         Ok(())

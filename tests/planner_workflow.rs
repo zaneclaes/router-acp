@@ -8570,17 +8570,31 @@ async fn audit_defects_wake_the_idle_parent_whatever_the_free_slots_and_never_gi
     assert_eq!(host_calls(&log).len(), 2);
     assert_eq!(wakes_with(shared, "audit:").len(), 1, "not doubled");
 
+    // An unchanged notice backs off (60 s doubled per repeat, at most 15 min) and never gives up.
     let mut now = last + 71;
-    for delivered in 1..=6 {
+    for delivered in 1..=6u32 {
         deliver_all(shared);
-        now += 61;
+        let spacing = router_acp::planner_guard::unchanged_audit_wait(60, delivered - 1);
+        if spacing > 60 {
+            tick(shared, now + 61).await;
+            assert_eq!(
+                wakes_with(shared, "audit:").len(),
+                delivered as usize,
+                "an unchanged audit is not resent at the ordinary cadence after a repeat"
+            );
+        }
+        now += spacing + 1;
         tick(shared, now).await;
         assert_eq!(
             wakes_with(shared, "audit:").len(),
-            delivered + 1,
+            delivered as usize + 1,
             "no give-up"
         );
     }
+    assert_eq!(
+        [0, 1, 2, 3, 4, 9].map(|r| router_acp::planner_guard::unchanged_audit_wait(60, r)),
+        [60, 120, 240, 480, 900, 900]
+    );
     let status = status_json(shared).await;
     assert_eq!(status["capacity"]["audit"]["ok"], true);
     assert_eq!(
@@ -8763,10 +8777,15 @@ async fn a_parent_turn_end_with_a_free_slot_and_an_unheld_candidate_is_re_prompt
 
 #[tokio::test]
 async fn planner_wakes_are_never_dropped_after_any_number_of_deliveries() {
-    use router_acp::planner_guard::wake_retry_secs;
+    use router_acp::planner_guard::{planner_wake_retry_secs, wake_retry_secs};
     assert_eq!(
         [1, 2, 3, 4, 40].map(wake_retry_secs),
         [30, 120, 300, 300, 300]
+    );
+    // A durable planner wake keeps repeating, but an unchanged one backs off to hourly.
+    assert_eq!(
+        [1, 2, 3, 4, 5, 6, 40].map(planner_wake_retry_secs),
+        [30, 120, 300, 900, 1800, 3600, 3600]
     );
     let fixture = fixture(|_| {});
     let shared = &fixture.shared;
