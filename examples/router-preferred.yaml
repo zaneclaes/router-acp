@@ -91,6 +91,8 @@ routers:
   # apex_complexity (pure quality) can reach them for exceptionally hard
   # plans. Implementation workers stay Opus / Sol / Grok.
   planner:
+    # handoff: { enabled: false }  # opt out of automatic parent context refresh
+    # See README for generic opportunities; project-specific keys go in its overlay.
     profile: markdown
     # roadmap: ROADMAP.md
     # finish-work: { skill: ship-pr }  # requires this repository skill

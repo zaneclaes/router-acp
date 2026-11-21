@@ -66,6 +66,52 @@ pub struct PlannerRun {
     /// The session that adopted this run's works, holds, queue and wakes.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// The parent's resume point, kept in the state database with the run when
+    /// `routers.planner.continuation` names no file. Adoption carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationNote>,
+    /// The last deterministic checkpoint (live, handoff or shutdown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointReceipt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContinuationNote {
+    pub text: String,
+    pub saved_at_ms: i64,
+    /// The session whose parent recorded it.
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointReceipt {
+    pub event: String,
+    pub run_revision: u64,
+    pub saved_at_ms: i64,
+}
+
+/// Longest resume note the parent may record.
+pub const CONTINUATION_LIMIT: usize = 20_000;
+
+/// Where the parent records its resume point: the configured file, or the
+/// `record-continuation` action that stores it in the state database.
+pub fn continuation_target(planner: &crate::config::PlannerRouterConfig) -> String {
+    match &planner.continuation {
+        Some(path) => path.clone(),
+        None => "the run's resume note (planner_workflow `record-continuation` with `text`)".into(),
+    }
+}
+
+/// The database resume note for a resumed or replacement parent, if any.
+pub fn continuation_brief(run: &PlannerRun) -> Option<String> {
+    let note = run.continuation.as_ref()?;
+    let saved = chrono::DateTime::from_timestamp_millis(note.saved_at_ms)
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_default();
+    Some(format!(
+        "Recorded resume note (saved {saved} by parent {}; current planner_workflow state wins over it):\n{}",
+        note.session_id, note.text
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +636,11 @@ pub enum Operation {
         key: String,
         queue_evidence: String,
     },
+    /// Parent records its exact resume point in the state database.
+    RecordContinuation {
+        key: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +781,8 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         owner: Some(RunOwner::current()),
         owner_heartbeat_at: chrono::Utc::now().timestamp(),
         superseded_by: None,
+        continuation: None,
+        checkpoint: None,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -1201,6 +1254,15 @@ pub(crate) fn parent_handoff(req: &PromptRequest) -> bool {
 
 const PLANNER_HANDOFF_TAG: &str = "[planner-handoff]";
 
+fn resume_human_input(shared: &Shared, sid: &str, run: &mut PlannerRun) {
+    if matches!(run.status, RunStatus::Complete | RunStatus::Paused)
+        || stale_drain(shared, sid, run.status)
+    {
+        run.approval_waits.clear();
+        run.status = RunStatus::Running;
+    }
+}
+
 pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Result<(), String> {
     if load(shared, sid)?.is_none() {
         return Ok(());
@@ -1224,13 +1286,7 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         if human {
             crate::planner_capacity::clear_human_hold(run);
         }
-        if human
-            && (matches!(run.status, RunStatus::Complete | RunStatus::Paused)
-                || stale_drain(shared, sid, run.status))
-        {
-            run.approval_waits.clear();
-            run.status = RunStatus::Running;
-        }
+        if human { resume_human_input(shared, sid, run); }
         let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
             Some(record_input(run, req)?)
         } else {
@@ -1343,6 +1399,11 @@ pub fn record_steered_input(
     }
     let mut input_id = String::new();
     mutate(shared, sid, |run| {
+        // Steering is another delivery path for the same human input. A parent
+        // turn can still be settling when a paused run receives its follow-up.
+        if human_prompt(req) {
+            resume_human_input(shared, sid, run);
+        }
         input_id = record_input(run, req)?;
         if let Some(input) = run.inputs.get_mut(&input_id) {
             input.delivered_to.insert(sid.to_string());
@@ -1556,14 +1617,14 @@ pub fn input_blocks(
 pub fn tool_definition() -> Value {
     json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
-            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete","record-continuation"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
             "release_id":{"type":"string"}, "checkpoint":{"type":"object"},
             "plan_id":{"type":"string"}, "detail":{"type":"string"},
             "key":{"type":"string"}, "work":{"type":"object"}, "work_id":{"type":"string"}, "attempt_id":{"type":"string"},
             "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"object","additionalProperties":{"type":"string"}}]},
             "corrections":{"type":["string","null"]}, "receipt":{"type":"object"}, "status":{"type":"string"}, "reason":{"type":"string"},
-            "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "offset":{"type":"integer","minimum":0}
+            "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "text":{"type":"string","description":"record-continuation: the parent's exact resume point, stored with the run"}, "offset":{"type":"integer","minimum":0}
         }, "required":["action"] } })
 }
 
@@ -1753,6 +1814,9 @@ async fn operate_once(
             });
         }
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
+            "handoff":actor.is_none().then(|| crate::planner_handoff::status(shared, sid)),
+            "continuation":actor.is_none().then_some(run.continuation.as_ref()).flatten(),
+            "checkpoint":actor.is_none().then_some(run.checkpoint.as_ref()).flatten(),
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
             "execution":actor.is_none().then(|| execution_context(&run)).flatten(),
             "capacity":capacity,
@@ -1800,7 +1864,7 @@ async fn operate_once(
         return Err(format!(
             "run is shutting down: admit nothing; record the exact resume point in {} and your \
              registers, then end your turn",
-            shared.cfg.routers.planner.continuation
+            continuation_target(&shared.cfg.routers.planner)
         ));
     }
     if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
@@ -2450,6 +2514,19 @@ async fn operate_once(
                 .ok_or("unknown wake receipt")?
                 .acknowledged = true;
         }
+        Operation::RecordContinuation { text, .. } => {
+            let text = text.trim();
+            if text.is_empty() || text.chars().count() > CONTINUATION_LIMIT {
+                return Err(format!(
+                    "record-continuation requires 1 to {CONTINUATION_LIMIT} characters of text"
+                ));
+            }
+            run.continuation = Some(ContinuationNote {
+                text: text.to_string(),
+                saved_at_ms: chrono::Utc::now().timestamp_millis(),
+                session_id: sid.to_string(),
+            });
+        }
         Operation::Hold {
             plan_id,
             reason,
@@ -2519,6 +2596,7 @@ async fn operate_once(
     }
     run.receipts.insert(key.to_string(), fingerprint);
     save(shared, sid, &mut run)?;
+    crate::planner_handoff::operated(shared, sid, &operation);
     // Deliver the queued `work_finished` now rather than on the next flusher
     // tick; a host that refuses it keeps it queued, never this operation.
     if matches!(operation, Operation::Integrate { .. })
@@ -2670,6 +2748,7 @@ fn continuation_role(work: &Work) -> PlannerRole {
 /// attempt is still alive, the workspace is a clean git tree, and a submitted
 /// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
 /// live) is still marked, so the parent reconciles exactly what could be lost.
+#[cfg(test)]
 pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
     mark_adopted_reconciliation_by(work, None);
 }
@@ -2679,7 +2758,10 @@ pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
 /// 2026-11-19: with the operator's global `core.fsmonitor=true` every probed
 /// tree started a daemon, and adopting 830 works took 5 min 42 s while Kory
 /// sat at a blank screen. Adoption must stay bounded on any host.
-pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<std::time::Instant>) {
+pub(crate) fn mark_adopted_reconciliation_by(
+    work: &mut Work,
+    deadline: Option<std::time::Instant>,
+) {
     let mut probe = work.clone();
     mark_reconciliation_required(&mut probe);
     if !probe.reconciliation.required {
@@ -2720,12 +2802,18 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
 pub(crate) const DEFERRED_CUSTODY: &str = "router: custody check deferred past the adoption budget";
 
 /// Works whose custody check adoption deferred, oldest identity first, at most `limit`.
-pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> Vec<(String, Work)> {
+pub(crate) fn deferred_custody(
+    works: &BTreeMap<String, Work>,
+    limit: usize,
+) -> Vec<(String, Work)> {
     works
         .iter()
         .filter(|(_, w)| {
             w.reconciliation.required
-                && w.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY)
+                && w.reconciliation
+                    .evidence
+                    .iter()
+                    .any(|e| e == DEFERRED_CUSTODY)
         })
         .take(limit)
         .map(|(id, w)| (id.clone(), w.clone()))
@@ -2735,7 +2823,12 @@ pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> 
 /// Apply a deferred custody result: a clean, unchanged workspace needs no parent
 /// reconciliation (the same judgment adoption makes); anything else stays owed.
 pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
-    if !work.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY) {
+    if !work
+        .reconciliation
+        .evidence
+        .iter()
+        .any(|e| e == DEFERRED_CUSTODY)
+    {
         return;
     }
     match head {
@@ -2751,7 +2844,11 @@ pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
 
 /// The workspace HEAD when adoption can verify unchanged custody, else None.
 pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
-    if work.attempt.as_ref().is_some_and(|a| !a.ended && owner_alive(a)) {
+    if work
+        .attempt
+        .as_ref()
+        .is_some_and(|a| !a.ended && owner_alive(a))
+    {
         return None;
     }
     let path = &work.workspace.as_ref()?.path;
@@ -3465,9 +3562,28 @@ mod adoption_custody_tests {
         git(path, &["init", "-q"]);
         std::fs::write(path.join("a.txt"), "a").unwrap();
         git(path, &["add", "a.txt"]);
-        git(path, &["-c", "user.name=f", "-c", "user.email=f@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "a"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        );
         let head = String::from_utf8(
-            std::process::Command::new("git").arg("-C").arg(path).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -3475,31 +3591,55 @@ mod adoption_custody_tests {
 
         let mut clean = work(path, Some(&head));
         mark_adopted_reconciliation(&mut clean);
-        assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
-        assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        assert!(
+            !clean.reconciliation.required,
+            "a clean tree at its artifact was marked"
+        );
+        assert_eq!(
+            clean.reconciliation.source_revision.as_deref(),
+            Some(head.as_str())
+        );
 
         // 2026-11-19: past the adoption budget nothing is probed; the work reconciles as before.
         let mut late = work(path, Some(&head));
         mark_adopted_reconciliation_by(&mut late, Some(std::time::Instant::now()));
-        assert!(late.reconciliation.required && late.reconciliation.source_revision.is_none(),
-            "a work past the custody budget was probed instead of marked");
+        assert!(
+            late.reconciliation.required && late.reconciliation.source_revision.is_none(),
+            "a work past the custody budget was probed instead of marked"
+        );
         // The deferred check finishes later and clears it exactly as adoption would have.
         let works = BTreeMap::from([("late".to_string(), late.clone())]);
         let deferred = deferred_custody(&works, 50);
-        assert_eq!(deferred.len(), 1, "a deferred work was not listed for the background check");
+        assert_eq!(
+            deferred.len(),
+            1,
+            "a deferred work was not listed for the background check"
+        );
         settle_deferred_custody(&mut late, adopted_custody_head(&deferred[0].1));
-        assert!(!late.reconciliation.required, "a clean deferred work stayed owed");
-        assert_eq!(late.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        assert!(
+            !late.reconciliation.required,
+            "a clean deferred work stayed owed"
+        );
+        assert_eq!(
+            late.reconciliation.source_revision.as_deref(),
+            Some(head.as_str())
+        );
         // 2026-11-19: a work already owed on a clean, unchanged tree is checked again and cleared.
         let mut owed_clean = work(path, Some(&head));
         owed_clean.reconciliation.required = true;
         mark_adopted_reconciliation_by(&mut owed_clean, None);
-        assert!(!owed_clean.reconciliation.required, "an owed work on a clean tree stayed owed");
+        assert!(
+            !owed_clean.reconciliation.required,
+            "an owed work on a clean tree stayed owed"
+        );
         // A never-started work whose reserved tree does not exist has nothing in custody.
         let mut never = work(&path.join("never-created"), None);
         never.status = WorkStatus::Admitted;
         mark_adopted_reconciliation_by(&mut never, None);
-        assert!(!never.reconciliation.required, "a never-started work without a tree was owed");
+        assert!(
+            !never.reconciliation.required,
+            "a never-started work without a tree was owed"
+        );
         // A deferred work whose custody is not clean stays owed, and is not rechecked.
         let mut owed = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));
@@ -3509,7 +3649,10 @@ mod adoption_custody_tests {
 
         let mut moved = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation(&mut moved);
-        assert!(moved.reconciliation.required, "a HEAD past its artifact was not marked");
+        assert!(
+            moved.reconciliation.required,
+            "a HEAD past its artifact was not marked"
+        );
 
         std::fs::write(path.join("b.txt"), "uncommitted").unwrap();
         let mut dirty = work(path, Some(&head));
@@ -3518,13 +3661,18 @@ mod adoption_custody_tests {
 
         let mut missing = work(&path.join("gone"), None);
         mark_adopted_reconciliation(&mut missing);
-        assert!(missing.reconciliation.required, "a missing tree was not marked");
+        assert!(
+            missing.reconciliation.required,
+            "a missing tree was not marked"
+        );
 
         let mut finished = work(path, Some(&head));
         finished.status = WorkStatus::Finished;
         mark_adopted_reconciliation(&mut finished);
-        assert!(!finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
-            "a finished work was touched");
+        assert!(
+            !finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
+            "a finished work was touched"
+        );
     }
 }
 

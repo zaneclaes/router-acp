@@ -447,6 +447,43 @@ async fn parent_turn_end_requires_acknowledgment_of_delivered_input() {
     );
 }
 
+#[test]
+fn steered_human_followup_resumes_paused_state_without_duplicating_input() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        run.approval_waits.insert("old-permission".into());
+        Ok(())
+    })
+    .unwrap();
+    let mut monitor = input_request(Some("monitor"), "check current progress", false);
+    monitor.meta =
+        serde_json::from_value(json!({"router_acp":{"input_id":"monitor","agent_origin":true}}))
+            .ok();
+    planner_workflow::record_steered_input(&f.shared, SID, &monitor).unwrap();
+    assert_eq!(
+        planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Paused
+    );
+    let human = input_request(Some("human"), "what is the worker doing?", false);
+    planner_workflow::record_steered_input(&f.shared, SID, &human).unwrap();
+    planner_workflow::record_steered_input(&f.shared, SID, &human).unwrap();
+    let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    assert!(run.approval_waits.is_empty());
+    assert_eq!(
+        run.inputs
+            .values()
+            .filter(|input| input.text == "what is the worker doing?")
+            .count(),
+        1
+    );
+}
+
 fn input_wakes(shared: &Arc<Shared>) -> Vec<String> {
     let run = planner_workflow::load(shared, SID).unwrap().unwrap();
     run.wakes
@@ -3609,6 +3646,7 @@ async fn closing_an_older_attempt_keeps_the_newer_attempts_worker_token() {
     let shared = &fixture.shared;
     let binding = || DelegateBinding {
         router_sid: SID.into(),
+        active: true,
         delegation_enabled: false,
         worker: Some(WorkerBinding {
             worker_id: "child-1".into(),
@@ -6961,6 +6999,81 @@ async fn a_fresh_exact_ci_observation_parks_a_wait_without_spawning_a_retry() {
 }
 
 #[tokio::test]
+async fn resume_note_is_stored_with_the_run_and_carried_by_adoption() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    let record = |key: &str, text: &str| {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::RecordContinuation {
+                key: key.into(),
+                text: text.into(),
+            },
+        )
+    };
+    assert!(
+        record("empty", "   ").await.is_err(),
+        "an empty note is refused"
+    );
+    record("note-1", "resume at the review of work-1")
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        status["continuation"]["text"],
+        "resume at the review of work-1"
+    );
+    assert_eq!(status["continuation"]["session_id"], SID);
+
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert("next".into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        "next".into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, "next").unwrap();
+    {
+        let store = f.shared.state.lock().unwrap();
+        router_acp::planner_adopt::adopt(&*store, SID, "next").unwrap();
+    }
+    let adopted = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    let note = adopted
+        .continuation
+        .as_ref()
+        .expect("adoption dropped the resume note");
+    assert_eq!(note.text, "resume at the review of work-1");
+    let brief = planner_workflow::continuation_brief(&adopted).unwrap();
+    assert!(brief.contains("resume at the review of work-1"), "{brief}");
+}
+
+#[tokio::test]
 async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_progress() {
     use router_acp::planner_adopt::{self, RunStore};
     use router_acp::planner_release::{self, Checkpoint, Stage};
@@ -7016,8 +7129,17 @@ async fn adoption_preserves_release_checkpoints_recovery_and_newer_destination_p
     // Adoption now marks only custody that could be lost (a clean tree at its
     // recorded HEAD resumes at once; `adoption_custody_tests`). Uncommitted
     // source in the retried work's tree is such custody.
-    let retry_tree = source.works["retry"].workspace.as_ref().unwrap().path.clone();
-    std::fs::write(retry_tree.join("uncommitted-adoption-source.txt"), "unsaved").unwrap();
+    let retry_tree = source.works["retry"]
+        .workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    std::fs::write(
+        retry_tree.join("uncommitted-adoption-source.txt"),
+        "unsaved",
+    )
+    .unwrap();
     {
         let store = f.shared.state.lock().unwrap();
         planner_adopt::adopt(&*store, SID, "next").unwrap();
@@ -8448,17 +8570,31 @@ async fn audit_defects_wake_the_idle_parent_whatever_the_free_slots_and_never_gi
     assert_eq!(host_calls(&log).len(), 2);
     assert_eq!(wakes_with(shared, "audit:").len(), 1, "not doubled");
 
+    // An unchanged notice backs off (60 s doubled per repeat, at most 15 min) and never gives up.
     let mut now = last + 71;
-    for delivered in 1..=6 {
+    for delivered in 1..=6u32 {
         deliver_all(shared);
-        now += 61;
+        let spacing = router_acp::planner_guard::unchanged_audit_wait(60, delivered - 1);
+        if spacing > 60 {
+            tick(shared, now + 61).await;
+            assert_eq!(
+                wakes_with(shared, "audit:").len(),
+                delivered as usize,
+                "an unchanged audit is not resent at the ordinary cadence after a repeat"
+            );
+        }
+        now += spacing + 1;
         tick(shared, now).await;
         assert_eq!(
             wakes_with(shared, "audit:").len(),
-            delivered + 1,
+            delivered as usize + 1,
             "no give-up"
         );
     }
+    assert_eq!(
+        [0, 1, 2, 3, 4, 9].map(|r| router_acp::planner_guard::unchanged_audit_wait(60, r)),
+        [60, 120, 240, 480, 900, 900]
+    );
     let status = status_json(shared).await;
     assert_eq!(status["capacity"]["audit"]["ok"], true);
     assert_eq!(
@@ -8641,10 +8777,15 @@ async fn a_parent_turn_end_with_a_free_slot_and_an_unheld_candidate_is_re_prompt
 
 #[tokio::test]
 async fn planner_wakes_are_never_dropped_after_any_number_of_deliveries() {
-    use router_acp::planner_guard::wake_retry_secs;
+    use router_acp::planner_guard::{planner_wake_retry_secs, wake_retry_secs};
     assert_eq!(
         [1, 2, 3, 4, 40].map(wake_retry_secs),
         [30, 120, 300, 300, 300]
+    );
+    // A durable planner wake keeps repeating, but an unchanged one backs off to hourly.
+    assert_eq!(
+        [1, 2, 3, 4, 5, 6, 40].map(planner_wake_retry_secs),
+        [30, 120, 300, 900, 1800, 3600, 3600]
     );
     let fixture = fixture(|_| {});
     let shared = &fixture.shared;
@@ -9631,6 +9772,8 @@ async fn shutdown_saves_the_resume_state_stops_every_worker_and_pauses_the_run()
     let script = format!("cat > '{}'; printf '%s' '{answer}'", stdin.display());
     let fixture = fixture(|cfg| {
         cfg.delegation.max_concurrent = 3;
+        // A configured file the host does not report saving: the parent is prompted.
+        cfg.routers.planner.continuation = Some("Docs/CONTINUE.md".into());
         cfg.routers.planner.shutdown = Some(PlannerShutdownConfig {
             command: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
@@ -11002,4 +11145,150 @@ fn send_input_to_a_session_without_a_planner_run_is_durable_idempotent_and_withd
     // Once the session has a planner run, the command routes to the run's queue.
     authorize(&f.shared);
     assert!(session_input::planner_session(&store, SID).unwrap());
+}
+
+/// Adds a session (and its empty run) beside SID, as a restarted parent would have.
+fn sibling_run(f: &Fixture, sid: &str) {
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert(sid.into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        sid.into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, sid).unwrap();
+}
+
+/// SID holds two interrupted works with trees; the run `next` admitted its own copies first.
+/// `tree` keeps a tree on next's copy of "started" (the negative control).
+async fn split_admission_fixture() -> Fixture {
+    let f = fixture(|_| {});
+    let mut started = work("started");
+    started.external_id = Some("external-2".into());
+    for spec in [work("retry"), started] {
+        let id = spec.work_id.clone();
+        admit(&f.shared, spec);
+        let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, &id)
+            .await
+            .unwrap();
+        planner_workflow::attempt_ended(
+            &f.shared,
+            SID,
+            &identity,
+            None,
+            "router exited".into(),
+            false,
+        )
+        .unwrap();
+    }
+    let source = planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    assert!(source.works["retry"].workspace.is_some());
+    sibling_run(&f, "next");
+    planner_workflow::mutate(&f.shared, "next", |run| {
+        for id in ["retry", "started"] {
+            let mut copy = source.works[id].clone();
+            copy.child_id = format!("child-next-{id}");
+            copy.spec.scope = "resume the existing branch".into();
+            copy.reconciliation = Default::default();
+            if id == "retry" {
+                // Admitted, allocation refused: an ended attempt and no tree.
+                copy.workspace = None;
+            }
+            copy.status = WorkStatus::Interrupted;
+            run.works.insert(id.into(), copy);
+        }
+        Ok(())
+    })
+    .unwrap();
+    f
+}
+
+#[tokio::test]
+async fn adoption_gives_an_unstarted_duplicate_the_source_tree_identity() {
+    use router_acp::planner_adopt;
+    let f = split_admission_fixture().await;
+    let source = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let report = {
+        let store = f.shared.state.lock().unwrap();
+        planner_adopt::adopt(&*store, SID, "next").unwrap()
+    };
+    assert_eq!(report.conflicting_works, vec!["started".to_string()]);
+    let next = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    let retry = &next.works["retry"];
+    assert_eq!(retry.child_id, source.works["retry"].child_id);
+    assert_eq!(retry.spec, source.works["retry"].spec);
+    assert_eq!(
+        retry.workspace.as_ref().map(|w| (&w.path, &w.lease)),
+        source.works["retry"]
+            .workspace
+            .as_ref()
+            .map(|w| (&w.path, &w.lease))
+    );
+    assert!(
+        retry
+            .reconciliation
+            .prior_specs
+            .iter()
+            .any(|spec| spec.scope == "resume the existing branch")
+    );
+    // A destination copy that holds its own tree keeps its identity.
+    assert_eq!(next.works["started"].child_id, "child-next-started");
+    let left = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(!left.works.contains_key("retry"));
+    assert!(left.works.contains_key("started"));
+}
+
+#[tokio::test]
+async fn split_works_readopt_through_the_successor_chain_and_only_from_a_superseded_run() {
+    use router_acp::planner_adopt;
+    let f = split_admission_fixture().await;
+    sibling_run(&f, "mid");
+    let store = f.shared.state.lock().unwrap();
+    // A running source is adopted the ordinary way, never by --split-works.
+    assert!(planner_adopt::readopt_split_works(&*store, SID, "next").is_err());
+    // The split as routers before this fix left it: SID superseded by "mid", "mid" by "next",
+    // both works still with SID.
+    for (sid, by) in [(SID, "mid"), ("mid", "next")] {
+        let mut run = planner_adopt::RunStore::load(&*store, sid)
+            .unwrap()
+            .unwrap();
+        run.status = RunStatus::Superseded;
+        run.superseded_by = Some(by.into());
+        planner_adopt::RunStore::save(&*store, sid, &mut run).unwrap();
+    }
+    // A run outside the chain cannot take them.
+    assert!(planner_adopt::readopt_split_works(&*store, "mid", SID).is_err());
+    let report = planner_adopt::readopt_split_works(&*store, SID, "next").unwrap();
+    assert_eq!(
+        report
+            .works
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["retry"]
+    );
+    assert_eq!(report.conflicting_works, vec!["started".to_string()]);
+    let next = planner_adopt::RunStore::load(&*store, "next")
+        .unwrap()
+        .unwrap();
+    let left = planner_adopt::RunStore::load(&*store, SID)
+        .unwrap()
+        .unwrap();
+    assert!(next.works["retry"].workspace.is_some());
+    assert_eq!(next.works["started"].child_id, "child-next-started");
+    assert!(!left.works.contains_key("retry"));
+    assert!(left.works.contains_key("started"));
+    // Idempotent: nothing more moves.
+    let again = planner_adopt::readopt_split_works(&*store, SID, "next").unwrap();
+    assert!(again.works.is_empty());
 }

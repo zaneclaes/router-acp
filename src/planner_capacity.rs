@@ -122,6 +122,9 @@ pub struct CapacityState {
     pub audit: Option<crate::planner_guard::AuditSnapshot>,
     #[serde(default)]
     pub last_audit_wake_at: i64,
+    /// Audit findings already delivered in full to the current parent context.
+    #[serde(default)]
+    pub audit_delivered: Option<crate::planner_guard::AuditDelivered>,
     /// The parent turn-end gate's backoff.
     #[serde(default)]
     pub gate: crate::planner_guard::GateState,

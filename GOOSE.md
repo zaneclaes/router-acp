@@ -60,6 +60,16 @@ references it, by absolute path.
 
 ## 2. Create the router config
 
+Planner context handoffs are controlled by `routers.planner.handoff` in this
+configuration, with repository overrides in `.router-acp/router.yaml`. They are
+enabled by default (75% at configured opportunities, 95% without an opportunity).
+Use `enabled: false` to opt out. The same Kory session and its transcript remain;
+only the model's downstream context is replaced. The resume point lives in the router state
+database unless `routers.planner.continuation` names a file. Install a supporting router
+before adding these keys to configuration read by an older executable. See
+[the handoff configuration](README.md#automatic-parent-context-handoffs) for the
+preparation/cutover budgets and context-cost observations.
+
 Write `~/.config/router-acp/router.yaml`:
 
 ```yaml

@@ -561,7 +561,15 @@ async fn run_prompt(
             let _ = cx.send_notification(chunk(&session_id, "detached-after-cancel".to_string()));
             return Ok(());
         }
-        if line == "HANG_IGNORING_CANCEL" {
+        if let Some(value) = line.strip_prefix("CONTEXT:") {
+            let (used, size) = value.split_once('/').expect("CONTEXT:used/size");
+            let frame = UntypedMessage::new(
+                "session/update",
+                json!({"sessionId": session_id,
+                "update": {"sessionUpdate":"usage_update", "used":used.parse::<u64>().unwrap(), "size":size.parse::<u64>().unwrap()}}),
+            )?;
+            cx.send_notification(frame)?;
+        } else if line == "HANG_IGNORING_CANCEL" {
             // A wedged adapter: alive, silent, never answers, ignores cancel.
             mock.log(json!({"event": "hang", "sessionId": session_id}));
             std::future::pending::<()>().await;

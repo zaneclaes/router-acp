@@ -456,12 +456,18 @@ where
                             ));
                         }
                         cx.spawn(async move {
-                            while observed.lock().unwrap().terminal_kills.is_empty() {
+                            while {
+                                let state = observed.lock().unwrap();
+                                state.hang_terminal_waits && state.terminal_kills.is_empty()
+                            } {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
-                            responder.respond(WaitForTerminalExitResponse::new(
-                                TerminalExitStatus::new().signal("SIGTERM"),
-                            ))
+                            let exit = if observed.lock().unwrap().terminal_kills.is_empty() {
+                                TerminalExitStatus::new().exit_code(0)
+                            } else {
+                                TerminalExitStatus::new().signal("SIGTERM")
+                            };
+                            responder.respond(WaitForTerminalExitResponse::new(exit))
                         })
                     }
                 },
@@ -1049,7 +1055,7 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
 }
 
 #[tokio::test]
-async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt() {
+async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
     let state = temp_state_file("planner-managed-steer");
     // SAFETY: every helper-enabled test uses the same executable.
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
@@ -1062,18 +1068,14 @@ async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt(
         init_with_terminals(&cx).await?;
         let sid = new_session(&cx).await?.session_id.0.to_string();
         let pending = park_on_managed_background(&cx, &observed, &sid).await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !shared
-                .background_interrupts
-                .lock()
-                .unwrap()
-                .contains_key(&sid)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the managed wait did not register its interrupt");
+        while !shared
+            .background_interrupts
+            .lock()
+            .unwrap()
+            .contains_key(&sid)
+        {
+            tokio::task::yield_now().await;
+        }
         assert!(
             router_acp::planner_preempt::steer(
                 &shared,
@@ -1084,21 +1086,28 @@ async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt(
             )
             .await
         );
+        while !agent_text(&observed, &sid)
+            .contains("[Router audit] eligible work needs reconciliation")
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(observed.lock().unwrap().terminal_kills.is_empty());
+        assert!(observed.lock().unwrap().terminal_releases.is_empty());
+        assert!(!pending.is_finished(), "the original work is still running");
+        // The terminal may now finish. The resumed parent must collect that
+        // same operation, not start it again or lose its result after the wake.
+        observed.lock().unwrap().hang_terminal_waits = false;
         let response = pending.await.expect("parked prompt task")?;
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
             agent_text(&observed, &sid)
                 .contains("[Router audit] eligible work needs reconciliation")
         );
+        assert!(agent_text(&observed, &sid).contains("watch-fired"));
         let observed = observed.lock().unwrap();
-        assert_eq!(
-            observed.terminal_kills,
-            vec!["managed-terminal-1".to_string()]
-        );
-        assert_eq!(
-            observed.terminal_releases,
-            vec!["managed-terminal-1".to_string()]
-        );
+        assert_eq!(observed.terminal_creates.len(), 1);
+        assert!(observed.terminal_kills.is_empty());
+        assert!(observed.terminal_releases.is_empty());
         Ok(())
     })
     .await;
@@ -15801,6 +15810,234 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
     .await;
 }
 
+/// A fresh downstream parent must retain the same live worker, logical run and
+/// watcher state. No shutdown/adoption or outgoing summary prompt is involved.
+#[tokio::test]
+async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
+    let state = temp_state_file("planner-handoff");
+    let log = temp_log("planner-handoff");
+    let repo = planner_wire_repository();
+    let release = repo.path().join("release-worker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo"))).block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let task = format!("{}MCP_CALL:router-delegate delegate_task {}", planner_admit_wire_prompt(),
+            serde_json::json!({"work_id":"work-1","task":format!("WAIT_FILE:{}",release.display()),"background":true}));
+        prompt_text(&cx, &sid, &task).await?;
+        wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+        let before = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        let attempt = before.works["work-1"].attempt.as_ref().unwrap().id.clone();
+        let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let old_token = shared.with_session(&sid, |s| s.delegate_token.clone()).flatten().unwrap();
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.continuation = Some(router_acp::planner_workflow::ContinuationNote {
+                text: "resume note before the backstop".into(),
+                saved_at_ms: 1,
+                session_id: sid.clone(),
+            });
+            Ok(())
+        }).unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != pin.downstream_sid).unwrap_or(false) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("backstop did not replace the parent");
+        let after = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        assert_eq!(after.status, router_acp::planner_workflow::RunStatus::Running);
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.works["work-1"].attempt.as_ref().unwrap().id, attempt);
+        assert!(!after.works["work-1"].attempt.as_ref().unwrap().ended);
+        assert!(!shared.delegate_tokens.lock().unwrap().contains_key(&old_token));
+        assert!(shared.route_for(&pin.process_key, &pin.downstream_sid).is_none());
+        let current = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        assert_eq!(current.process_key, pin.process_key, "handoff must not restart the shared adapter");
+        assert_eq!(current.candidate, pin.candidate);
+        // No continuation file is configured: nothing is written to the working
+        // tree, and the replacement parent is seeded from the state database.
+        assert!(!repo.path().join("repo/Docs/CONTINUE.md").exists());
+        assert!(after.checkpoint.is_some());
+        let seeded = wait_for_mock_prompt(&log, "Router-owned hot handoff").await;
+        assert!(seeded.iter().any(|event| event.to_string().contains("resume note before the backstop")),
+            "the replacement parent was not given the database resume note");
+        assert!(router_acp::planner_shutdown::progress(&shared, &sid).is_empty());
+        std::fs::write(&release, "complete the original attempt").unwrap();
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn planner_handoff_failed_checkpoint_keeps_the_parent_usable() {
+    let state = temp_state_file("planner-handoff-refused");
+    let log = temp_log("planner-handoff-refused");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff: {enabled: true}\n    shutdown:\n      command: /bin/sh\n      args: ['-c', 'cat >/dev/null; exit 2']\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let pin = shared
+            .with_session(&sid, |s| s.pin.clone())
+            .flatten()
+            .unwrap();
+        let token = shared
+            .with_session(&sid, |s| s.delegate_token.clone())
+            .flatten()
+            .unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(
+                    &shared,
+                    &sid,
+                    None,
+                    router_acp::planner_workflow::Operation::Status {
+                        offset: 0,
+                        work_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["last_error"].is_string() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("failed exporter did not finish its attempt");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+                .unwrap(),
+            pin.downstream_sid
+        );
+        assert!(shared.delegate_tokens.lock().unwrap()[&token].active);
+        assert!(
+            shared
+                .route_for(&pin.process_key, &pin.downstream_sid)
+                .is_some()
+        );
+        prompt_text(&cx, &sid, "TEXT:original parent still serves").await?;
+        wait_for_mock_prompt(&log, "original parent still serves").await;
+        assert_eq!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .status,
+            router_acp::planner_workflow::RunStatus::Running
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_handoff_opportunity_requires_a_new_observed_revision() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    use router_acp::planner_workflow::{self, Operation};
+    let state = temp_state_file("planner-handoff-opportunity");
+    let log = temp_log("planner-handoff-opportunity");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        observation_revisions: [host:staging]\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        planner_workflow::mutate(&shared, &sid, |run| {
+            run.observations.insert(
+                "host:staging".into(),
+                Observation {
+                    revision: "old-observed-head".into(),
+                    reference: "staging".into(),
+                    state: ObservationState::Pending,
+                    evidence: "host fixture".into(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let old_pin = shared
+            .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+            .unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:750/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let text = planner_workflow::operate(
+                    &shared,
+                    &sid,
+                    None,
+                    Operation::Status {
+                        offset: 0,
+                        work_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if status["handoff"]["prepared"] == true {
+                    assert!(
+                        status["handoff"]["due"].is_null(),
+                        "initial census is not an opportunity"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("standby was not prepared");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+                .unwrap(),
+            old_pin
+        );
+        planner_workflow::mutate(&shared, &sid, |run| {
+            run.observations.get_mut("host:staging").unwrap().revision = "new-pushed-head".into();
+            Ok(())
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != old_pin)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("75% opportunity did not replace the parent");
+        Ok(())
+    })
+    .await;
+}
+
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
 /// parent records its resume point, a mid-turn worker gets a queued shutdown
 /// notice before its turn ends, then stops, and the run ends paused for the next
@@ -15876,7 +16113,10 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             })
             .await;
             assert!(paused.is_ok(), "the drain never paused the run");
-            wait_for_mock_prompt(&log, "Session restart (router lifecycle, not a stop of the run)").await;
+            assert!(!repo.path().join("repo/Docs/CONTINUE.md").exists(),
+                "shutdown without a configured continuation file writes nothing to the working tree");
+            assert_eq!(router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap()
+                .checkpoint.as_ref().map(|c| c.event.as_str()), Some("shutdown"));
             assert!(mock_prompts(&log, "Shutdown requested: interrupt").is_empty(),
                 "a shutdown interrupt must not start another child turn");
             let progress = router_acp::planner_shutdown::progress(&shared, &sid);
@@ -15894,13 +16134,8 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
                 done["workers"],
                 serde_json::json!([{"workId": "work-1", "status": "stopped"}])
             );
-            assert!(
-                progress.iter().any(|p| p["phase"] == "draining"
-                    && p["message"]
-                        .as_str()
-                        .is_some_and(|m| m.contains("recorded its resume point"))),
-                "the parent's shutdown turn completed: {progress:?}"
-            );
+            assert!(progress.iter().any(|p| p["phase"] == "saved" &&
+                p["message"].as_str().is_some_and(|m| m.contains("state database"))));
 
             // The next `/implement` resumes the paused run.
             prompt_text(&cx, &sid, "/implement resume after the shutdown").await?;
@@ -16001,26 +16236,48 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
             let sid = open_planner_parent(&cx, &repo).await?;
             insert_wake(&shared, &sid, "audit:shutdown-preempt");
             wait_for_mock_prompt(&log, WAKE_MARKER).await;
-            let started = std::time::Instant::now();
             router_acp::planner_shutdown::request(&shared, &serde_json::json!({"sessionId":sid}))
                 .unwrap();
             let parent_prompt =
                 router_acp::planner_shutdown::parent_prompt(&shared.cfg.routers.planner);
             assert!(
-                parent_prompt.contains("Docs/CONTINUE.md"),
-                "the Markdown default: {parent_prompt}"
+                parent_prompt.contains("record-continuation"),
+                "the database default: {parent_prompt}"
             );
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                wait_for_mock_prompt(&log, &parent_prompt),
-            )
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == router_acp::planner_workflow::RunStatus::Paused
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
             .await
-            .expect("shutdown promptly preempts the router turn");
-            assert!(started.elapsed() < Duration::from_secs(5));
+            .expect("shutdown did not settle the router turn");
             let events = read_log(&log);
-            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
-            let shutdown = mock_prompts(&log, &parent_prompt)[0];
-            assert!(cancel < shutdown);
+            assert!(events.iter().any(|e| e["event"] == "cancel"));
+            assert!(
+                mock_prompts(&log, &parent_prompt).is_empty(),
+                "deterministic export needs no model turn"
+            );
+            assert!(
+                !repo.path().join("repo/Docs/CONTINUE.md").exists(),
+                "shutdown without a configured continuation file writes nothing to the working tree"
+            );
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| c.event.as_str()),
+                Some("shutdown")
+            );
             assert!(
                 !release.exists(),
                 "the original router turn could only end by cancellation"
@@ -18074,16 +18331,19 @@ async fn questions_false_refuses_only_implementation_runs_and_uses_the_plugged_b
     .await;
 }
 
-/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the default.
+/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the
+/// default. With no `continuation` file, the resume point lives in the state database.
 #[test]
-fn the_default_blockers_and_continuation_are_the_markdown_layouts() {
+fn the_default_blockers_are_markdown_and_the_continuation_is_the_database() {
     let planner = router_acp::config::PlannerRouterConfig::default();
     assert!(
         planner.questions,
         "every session asks unless a project opts out"
     );
     assert!(router_acp::session::no_questions_instruction(&planner).contains("Docs/BLOCKED.md"));
-    assert!(router_acp::planner_shutdown::parent_prompt(&planner).contains("Docs/CONTINUE.md"));
+    assert!(planner.continuation.is_none());
+    let prompt = router_acp::planner_shutdown::parent_prompt(&planner);
+    assert!(prompt.contains("record-continuation") && !prompt.contains("Docs/CONTINUE.md"));
 }
 
 fn dead_router() -> router_acp::planner_workflow::RunOwner {

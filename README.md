@@ -126,8 +126,12 @@ swap and free space on the working, startup and temporary filesystems. Keep at
 least 8GiB memory headroom and 10GiB free disk; warning memory pressure, swap above
 8GiB, or tree footprint above physical RAM minus headroom stops the owned tree.
 macOS accounting includes compressed memory; Linux includes resident and swapped
-memory. Unknown telemetry fails closed. Diagnostics contain resource counters,
-never command arguments or credentials. Source/worktrees are never deleted.
+memory. Unknown telemetry fails closed. macOS memory probe failures identify the
+fixed kernel metric and either `category=syscall` with its numeric errno or
+`category=size-mismatch` with expected and returned byte counts. The watchdog
+preserves those details both before launch and during sampling. Diagnostics contain
+resource counters, never command arguments or credentials. Source/worktrees are
+never deleted.
 An ancestry chain of 32 processes also stops the tree before a recursive launcher
 can exhaust the host. This backstop covers legacy tools without their own call guard.
 This is sampled protection, not a kernel cgroup or a guarantee against allocations
@@ -145,6 +149,22 @@ the .NET runtime or this helper. Its RAM admission and RouterHost disk checks ar
 disabled too. Other repository checks still apply. Unset or any value other than
 the literal `false` keeps resource protection enabled. Existing processes need a
 new launch to inherit a changed environment or binary.
+
+Resource guard regression tests inject readings into the production watchdog loop;
+they do not require native telemetry permissions, free host memory, or timing sleeps.
+Run them with `cargo test --bin router-resource-run resource_guard::tests` and
+`cargo test --test resource_guard`. The default results explicitly report the native
+capability checks as ignored, including their host prerequisites.
+
+Native probes and process cleanup remain separate activation smoke checks. Run
+`cargo test --bin router-resource-run host_ -- --ignored --nocapture` and
+`cargo test --test resource_guard host_ -- --ignored --nocapture` on each supported
+host before accepting a native guard installation. These commands require allowed
+process/memory/disk probes and at least the resource floors above. A failed probe
+means host activation is unverified; a skipped/default regression run is never
+native activation evidence. Record the source revision, host, command, and result.
+The subprocess-only `detached_fixture` is ignored separately and is invoked by its
+owning smoke; do not run every ignored test indiscriminately.
 
 ## How routing works
 
@@ -669,6 +689,90 @@ keep-open sessions never receive shutdown prompts. An adapter that declines the 
 is cancelled with its already recorded state preserved. Shutdown never asks for commits,
 pushes, builds or audits. The default child grace is 20 seconds; the parent's final update
 is bounded at 30 seconds and is cancelled if it overruns.
+
+### Automatic parent-context handoffs
+
+`routers.planner.handoff` is a native router feature shared by Claude and Codex
+ACP adapters. Configure it in `router.yaml`; a project's `.router-acp/router.yaml`
+overrides individual settings through the normal configuration merge:
+
+```yaml
+routers:
+  planner:
+    handoff:
+      enabled: true                 # default; false disables automatic handoffs
+      prewarm_percent: 65
+      opportunity_percent: 75
+      backstop_percent: 95
+      prepare_timeout_seconds: 300   # old parent keeps working during preparation
+      cutover_timeout_seconds: 60
+      retry_seconds: 60
+      checkpoint_interval_seconds: 30
+      opportunities:
+        operations: [review, integrate, disposition]
+        release_stages: []          # optional repository-selected checkpoint labels
+        observation_revisions: []  # optional repository-host observation keys
+```
+
+Occupancy is the adapter's current ACP `usage_update.used / size`, never lifetime
+tokens or transcript bytes. A successfully committed configured transition at
+75% requests refresh; 95% requests it without any opportunity. Requests remain
+pending across provider compaction and wait for an idle parent with no active
+tool or approval. A new observation revision counts only after an initial
+baseline. Missing usage capacity cannot be guessed; no threshold is inferred.
+Policy is reloaded through the normal config/overlay reader every five seconds.
+Invalid configuration defers replacement and retains the live parent.
+The built-in opportunities are successful integrate/disposition operations. Release
+labels and observation keys are empty by default; deployment-specific names belong
+in the repository overlay. An opportunity checks occupancy when the event occurs:
+an event below the threshold is not saved to trigger a later refresh. Once due, a
+request stays pending until a safe boundary, even if provider compaction lowers usage.
+`planner_workflow status` exposes handoff preparation, the pending reason, errors,
+and the last receipt's before/first-after context usage, bootstrap character count
+and cutover duration. These are observations, not claims about billable tokens or
+provider cache hits. The handoff packet does not contain the old transcript or a
+full historical work census; the ordinary current-role briefing is retained.
+
+Native `/compact` remains available through supporting adapters. This automatic
+mechanism uses a deterministic replacement because native compaction summarizes
+the old conversation and does not provide a portable checkpoint-replacement API.
+Opening a standby sends no LLM prompt. System/tool instructions may still incur
+provider input cost on the first new turn; cross-session cache reuse is not assumed.
+
+At 65% the router opens an unprompted standby conversation on the existing
+adapter, verifies model/mode, and gives it inactive router tool credentials.
+Cutover exports a deterministic checkpoint through the existing shutdown host,
+then replaces only the downstream parent pin and fences the retired credentials
+and route. Workers, watchers, logical run identity, operation receipts and queues
+are retained. Input arriving during export queues for the new parent. Preparation
+is asynchronous; cutover's 60-second budget excludes waiting for a safe boundary
+and the next ordinary model response. Failed preparation/export keeps the old
+parent and retries. No outgoing LLM summary, worker drain or adoption is run.
+
+Live checkpoints, hot handoffs and `/shutdown` share one serialized save path;
+shutdown still drains and pauses. Every event records a `checkpoint` receipt
+(`event`, `run_revision`, `saved_at_ms`) with the run in the state database.
+
+`routers.planner.continuation` is unset by default. Then nothing is written to the
+working tree: the parent records its exact resume point with
+`planner_workflow` `record-continuation` (`text`), which is stored with the run.
+`planner_workflow status` returns it, adoption by a later `/implement` carries it
+(the newer note wins) and shows it to the adopting parent, and a hot handoff seeds
+the replacement parent with it. Set `continuation` to a repository-relative file
+to opt into a file instead; without a custom host the native exporter then writes
+that file plus `checkpoints/` beside the state database.
+
+A custom shutdown host receives `event: checkpoint | handoff | shutdown`,
+`run_revision` and `native_state` alongside its existing works/holds/continuation
+fields (`continuation` is null when unset). With a configured file it must save
+that file atomically and report `continuation_saved` plus that path in `saved`.
+State DB records remain authoritative over snapshots; the new parent fetches
+targeted current state instead of loading the entire old conversation or every
+historical work.
+
+Updating the executable does not change an already running router. Older builds
+reject the new YAML key, so activate the block only after upgrading the loaded
+router. Subsequent policy tuning requires no restart.
 
 ### Host-directed workers
 

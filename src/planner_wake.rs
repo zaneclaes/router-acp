@@ -32,6 +32,7 @@ impl PromptActivity {
                 // A cancel ends the turn it interrupted, not the run: once that
                 // turn is over, wakes resume with a fresh turn.
                 if s.prompt_activity != 0
+                    || s.parent_handoff.cutting_over
                     || s.pinning
                     || s.pin.is_none()
                     || s.capturing_summary.is_some()
@@ -158,6 +159,9 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 heartbeat(&shared, &sid, &run, now);
                 crate::planner_capacity::spawn_tick(&shared, &sid, now);
                 parked_notice(&shared, &sid, &run, now);
+                if crate::planner_handoff::tick(&shared, &sid, &run) {
+                    continue;
+                }
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
@@ -412,7 +416,11 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             return;
         }
         let blocks = vec![ContentBlock::from(text.clone())];
-        let injected = crate::planner_preempt::steer(&shared, &sid, &blocks).await;
+        let injected = if interrupt {
+            crate::planner_preempt::steer_interrupting(&shared, &sid, &blocks).await
+        } else {
+            crate::planner_preempt::steer(&shared, &sid, &blocks).await
+        };
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
             rt.steering = false;
             if injected && (rt.router_turn || rt.command_turn) {
@@ -1232,7 +1240,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             wake.claim_pid = pid;
             wake.claim_started_at_ms = started;
             wake.deliveries += 1;
-            wake.retry_after = now + crate::planner_guard::wake_retry_secs(wake.deliveries);
+            wake.retry_after = now + crate::planner_guard::planner_wake_retry_secs(wake.deliveries);
             ids.push(id.clone());
             if ids.len() == 32 {
                 break;
@@ -2120,8 +2128,14 @@ mod steer_tests {
         let first = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43"))]);
         let (key, _) = pending_steer(&[], &first, &HashSet::new()).expect("first failures steer");
         let steered = HashSet::from([super::steer_mark(&key, "job failures: web 01a1efee-6e43")]);
-        assert!(pending_steer(&[], &first, &steered).is_none(), "an unchanged wake steered twice");
-        let rearmed = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"))]);
+        assert!(
+            pending_steer(&[], &first, &steered).is_none(),
+            "an unchanged wake steered twice"
+        );
+        let rearmed = BTreeMap::from([(
+            id.clone(),
+            wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"),
+        )]);
         assert_eq!(
             pending_steer(&[], &rearmed, &steered).map(|(k, _)| k),
             Some(id),
@@ -2145,7 +2159,14 @@ mod steer_tests {
             pending_steer(&[], &wakes, &HashSet::new()).expect("capacity must reach busy parent");
         assert_eq!(id, "capacity:1");
         assert!(text.starts_with("[Router steer] This is router text, not operator input."));
-        assert!(pending_steer(&[], &wakes, &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])).is_none());
+        assert!(
+            pending_steer(
+                &[],
+                &wakes,
+                &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])
+            )
+            .is_none()
+        );
         wakes.insert("release:ready".to_string(), wake("release transition"));
         assert_eq!(
             pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,

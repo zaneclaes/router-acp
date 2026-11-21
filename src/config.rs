@@ -258,10 +258,6 @@ fn default_planner_blockers() -> String {
     "Docs/BLOCKED.md".into()
 }
 
-fn default_planner_continuation() -> String {
-    "Docs/CONTINUE.md".into()
-}
-
 fn default_max_concurrent() -> usize {
     3
 }
@@ -1437,11 +1433,11 @@ pub struct PlannerRouterConfig {
     /// other planner setting. Default: the Markdown layout's `Docs/BLOCKED.md`.
     #[serde(default = "default_planner_blockers")]
     pub blockers: String,
-    /// Where a run's parent writes its exact resume point when the operator
-    /// requests a shutdown. Pluggable; default: the Markdown layout's
-    /// `Docs/CONTINUE.md`.
-    #[serde(default = "default_planner_continuation")]
-    pub continuation: String,
+    /// Optional repository-relative file for a run's resume point. Unset (the
+    /// default), the resume point lives in the router's state database with the
+    /// run itself and nothing is written to the working tree.
+    #[serde(default)]
+    pub continuation: Option<String>,
     #[serde(default, rename = "create-plan")]
     pub create_plan: PlannerSkillConfig,
     #[serde(default, rename = "select-plan")]
@@ -1480,6 +1476,9 @@ pub struct PlannerRouterConfig {
     /// drain bound. See `crate::planner_shutdown`.
     #[serde(default)]
     pub shutdown: Option<PlannerShutdownConfig>,
+    /// Hot parent-context replacement; project overlays override these fields.
+    #[serde(default)]
+    pub handoff: crate::planner_handoff::Policy,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1534,7 +1533,7 @@ impl Default for PlannerRouterConfig {
             roadmap: None,
             questions: true,
             blockers: default_planner_blockers(),
-            continuation: default_planner_continuation(),
+            continuation: None,
             create_plan: PlannerSkillConfig::default(),
             select_plan: PlannerSkillConfig::default(),
             implement_work: PlannerSkillConfig::default(),
@@ -1546,6 +1545,7 @@ impl Default for PlannerRouterConfig {
             audit: None,
             integrate_check: None,
             shutdown: None,
+            handoff: Default::default(),
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -2443,6 +2443,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.routers
+            .planner
+            .handoff
+            .validate()
+            .map_err(ConfigError)?;
         if self.agents.is_empty() {
             return Err(ConfigError(
                 "no agents configured; declare at least one agent with one model".into(),

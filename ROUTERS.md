@@ -504,6 +504,15 @@ and exact Chordzy role templates, rollout, parity tests, drain, and rollback.
 
 ### Coordinator sessions
 
+Parent context refresh is enabled by default through `routers.planner.handoff`.
+Generic successful integrate/disposition operations are opportunity points: at
+75% current-window occupancy they request a hot context replacement. The 95%
+backstop requires no event. Repository overlays can select other operations,
+opaque release-checkpoint labels and host-observed revision keys; deployment
+names are not router defaults. Preparation happens while the original parent
+works; the idle-boundary cutover keeps the logical run, children and queues.
+See [policy and checkpoint details](README.md#automatic-parent-context-handoffs).
+
 A host marks a session that must only plan (an epic's parent that spawns
 and supervises implementation sessions) with
 `_meta.router_acp.session_role: "coordinator"` on `session/new` or any
