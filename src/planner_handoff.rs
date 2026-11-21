@@ -261,6 +261,14 @@ pub(crate) fn status(shared: &Shared, sid: &str) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// A failure's own text, cut to a notice-sized prefix (host output is already bounded by the host).
+fn bounded(text: &str) -> String {
+    match text.char_indices().nth(300) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    }
+}
+
 fn error(shared: &Arc<Shared>, sid: &str, message: &str) {
     let changed = shared
         .with_session(sid, |s| {
@@ -462,11 +470,16 @@ pub(crate) fn tick(shared: &Arc<Shared>, sid: &str, run: &PlannerRun) -> bool {
                 }
             });
             if !succeeded {
-                error(
-                    &shared,
-                    &sid,
-                    "checkpoint or cutover failed or exceeded its budget",
-                );
+                // Say why: Chordzy 2026-11-21 deferred 210 handoffs over ten hours on a host refusal
+                // ("live checkpoint requires the canonical continuation") that no notice showed.
+                let reason = match outcome {
+                    Ok(Err(e)) => format!("checkpoint or cutover failed: {}", bounded(&e)),
+                    _ => format!(
+                        "checkpoint or cutover exceeded its {} s budget",
+                        policy.cutover_timeout_seconds
+                    ),
+                };
+                error(&shared, &sid, &reason);
             }
         });
     } else {
@@ -697,16 +710,22 @@ fn save_continuously(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, policy: 
     let run = run.clone();
     let timeout = Duration::from_secs(policy.cutover_timeout_seconds);
     tokio::spawn(async move {
-        let success = matches!(
-            tokio::time::timeout(timeout, checkpoint(&shared, &sid, &run, "checkpoint")).await,
-            Ok(Ok(_))
-        );
+        let outcome =
+            tokio::time::timeout(timeout, checkpoint(&shared, &sid, &run, "checkpoint")).await;
+        let success = matches!(outcome, Ok(Ok(_)));
         shared.with_session(&sid, |s| {
             s.parent_handoff.saving = false;
             s.parent_handoff.dirty |= !success;
         });
         if !success {
-            error(&shared, &sid, "continuous checkpoint failed");
+            let reason = match outcome {
+                Ok(Err(e)) => format!("continuous checkpoint failed: {}", bounded(&e)),
+                _ => format!(
+                    "continuous checkpoint exceeded its {} s budget",
+                    timeout.as_secs()
+                ),
+            };
+            error(&shared, &sid, &reason);
         }
     });
 }
