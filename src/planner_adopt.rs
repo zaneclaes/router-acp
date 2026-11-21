@@ -397,7 +397,13 @@ mod paused_drain_tests {
     use crate::planner_workflow::Attempt;
 
     fn attempt(router_pid: u32, router_started_at_ms: u64, ended: bool) -> Attempt {
-        Attempt { id: "a".into(), router_pid, router_started_at_ms, delegate_id: None, ended }
+        Attempt {
+            id: "a".into(),
+            router_pid,
+            router_started_at_ms,
+            delegate_id: None,
+            ended,
+        }
     }
 
     #[test]
@@ -408,7 +414,11 @@ mod paused_drain_tests {
         assert!(!super::paused_drain_pending([&attempt(0, 0, false)]));
         assert!(!super::paused_drain_pending([&attempt(pid, started, true)]));
         // Same pid, other start: a reused pid is not the owner.
-        assert!(!super::paused_drain_pending([&attempt(pid, started.wrapping_add(1), false)]));
+        assert!(!super::paused_drain_pending([&attempt(
+            pid,
+            started.wrapping_add(1),
+            false
+        )]));
     }
 }
 
@@ -485,12 +495,22 @@ fn merge(
                 // The destination save may have survived a crash before the
                 // source was retired. Never overwrite its subsequent progress.
                 report.works.push((id.clone(), existing.status));
+            } else if source_identity_wins(existing, work) {
+                let adopted = take_source_identity(existing, work, custody_deadline);
+                into.works.insert(id.clone(), adopted);
+                if let Some(recovery) = from.capacity.resumes.get(id) {
+                    into.capacity.resumes.insert(id.clone(), recovery.clone());
+                }
+                report.works.push((id.clone(), work.status));
             } else {
                 report.conflicting_works.push(id.clone());
             }
         } else {
             let mut adopted = work.clone();
-            crate::planner_workflow::mark_adopted_reconciliation_by(&mut adopted, Some(custody_deadline));
+            crate::planner_workflow::mark_adopted_reconciliation_by(
+                &mut adopted,
+                Some(custody_deadline),
+            );
             into.works.insert(id.clone(), adopted);
             if let Some(recovery) = from.capacity.resumes.get(id) {
                 into.capacity.resumes.insert(id.clone(), recovery.clone());
@@ -682,6 +702,177 @@ fn merge(
     Ok(report)
 }
 
+/// The destination's copy of a work never started (no tree, no proof, no live attempt) while
+/// the source holds a tree for the same guide: the source's identity owns that tree's lease
+/// and completion contract, so it wins. Keeping the unstarted copy strands the tree: the
+/// allocator refuses the lease's v2 contract for a different child with no workspace (Chordzy
+/// 2026-11-20: spessasynth-v2 and other works could neither reconcile nor allocate).
+/// A destination copy with a tree, an explicit different contract or any progress stays.
+fn source_identity_wins(
+    existing: &crate::planner_workflow::Work,
+    source: &crate::planner_workflow::Work,
+) -> bool {
+    existing.workspace.is_none()
+        && existing.artifact.is_none()
+        && existing.review.is_none()
+        && existing.finish.is_none()
+        && existing.integration.is_none()
+        && existing
+            .attempt
+            .as_ref()
+            .is_none_or(|attempt| attempt.ended)
+        && source.workspace.is_some()
+        && existing.spec.external_id.is_some()
+        && existing.spec.external_id == source.spec.external_id
+        && existing
+            .spec
+            .completion_contract_version
+            .is_none_or(|version| source.spec.completion_contract_version == Some(version))
+}
+
+/// The source work, with the destination's unstarted admission kept as a prior spec.
+fn take_source_identity(
+    existing: &crate::planner_workflow::Work,
+    source: &crate::planner_workflow::Work,
+    custody_deadline: std::time::Instant,
+) -> crate::planner_workflow::Work {
+    let mut adopted = source.clone();
+    if existing.spec != adopted.spec && !adopted.reconciliation.prior_specs.contains(&existing.spec)
+    {
+        adopted
+            .reconciliation
+            .prior_specs
+            .push(existing.spec.clone());
+    }
+    crate::planner_workflow::mark_adopted_reconciliation_by(&mut adopted, Some(custody_deadline));
+    adopted
+}
+
+/// Finish an earlier adoption's works that stayed with `from_sid` only because `into_sid` (or a
+/// run between them) already held an unstarted copy ([`source_identity_wins`]). Moves works
+/// alone: that adoption already handed over the source's inputs, wakes and releases, and
+/// replaying them would resurrect history. `from_sid` must be superseded along a chain that
+/// ends at `into_sid`. Revision-checked and idempotent.
+pub fn readopt_split_works(
+    store: &dyn RunStore,
+    from_sid: &str,
+    into_sid: &str,
+) -> Result<AdoptReport, String> {
+    if from_sid == into_sid {
+        return Err("a run cannot adopt itself".into());
+    }
+    let from = store
+        .load(from_sid)?
+        .ok_or_else(|| format!("no planner run for session {from_sid}"))?;
+    if from.status != RunStatus::Superseded {
+        return Err(format!(
+            "planner run {from_sid} is not superseded; use adopt-run without --split-works"
+        ));
+    }
+    let mut next = from.superseded_by.clone();
+    let mut hops = 0;
+    while next.as_deref() != Some(into_sid) {
+        let Some(sid) = next else {
+            return Err(format!(
+                "planner run {from_sid} was not superseded by {into_sid}"
+            ));
+        };
+        hops += 1;
+        let run = store
+            .load(&sid)?
+            .filter(|run| run.status == RunStatus::Superseded && hops <= 4096)
+            .ok_or_else(|| {
+                format!(
+                    "planner run {from_sid}'s successor chain breaks at {sid} before {into_sid}"
+                )
+            })?;
+        next = run.superseded_by;
+    }
+    let mut report = AdoptReport {
+        from: from_sid.into(),
+        into: into_sid.into(),
+        ..Default::default()
+    };
+    let custody_deadline = std::time::Instant::now();
+    let mut saved = false;
+    for _ in 0..16 {
+        let mut into = store
+            .load(into_sid)?
+            .ok_or_else(|| format!("no planner run for session {into_sid}"))?;
+        if into.status == RunStatus::Superseded {
+            return Err(format!("planner run {into_sid} is itself superseded"));
+        }
+        report.works.clear();
+        report.conflicting_works.clear();
+        let mut changed = false;
+        for (id, work) in &from.works {
+            let Some(existing) = into.works.get(id) else {
+                report.conflicting_works.push(id.clone());
+                continue;
+            };
+            if existing.child_id == work.child_id
+                && (existing.spec == work.spec
+                    || existing.reconciliation.prior_specs.contains(&work.spec))
+            {
+                // Moved by an earlier run of this command that died before retiring the source.
+                report.works.push((id.clone(), existing.status));
+            } else if source_identity_wins(existing, work) {
+                let adopted = take_source_identity(existing, work, custody_deadline);
+                into.works.insert(id.clone(), adopted);
+                if let Some(recovery) = from.capacity.resumes.get(id) {
+                    into.capacity.resumes.insert(id.clone(), recovery.clone());
+                }
+                report.works.push((id.clone(), work.status));
+                changed = true;
+            } else {
+                report.conflicting_works.push(id.clone());
+            }
+        }
+        if !changed {
+            saved = true;
+            break;
+        }
+        match store.save(into_sid, &mut into) {
+            Ok(()) => {
+                saved = true;
+                break;
+            }
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if !saved {
+        return Err("the new run stayed contended; rerun adopt-run --split-works".into());
+    }
+    if report.works.is_empty() {
+        return Ok(report);
+    }
+    for _ in 0..16 {
+        let mut from = store
+            .load(from_sid)?
+            .ok_or_else(|| format!("planner run {from_sid} disappeared"))?;
+        for (id, _) in &report.works {
+            from.works.remove(id);
+            from.capacity.resumes.remove(id);
+        }
+        match store.save(from_sid, &mut from) {
+            Ok(()) => {
+                // Wake the parent to reconcile the moved works; keep any adoption it awaits.
+                let pending = store
+                    .load(into_sid)?
+                    .and_then(|run| run.capacity.pending_adoption);
+                adoption_pending(store, into_sid, pending.as_deref(), &report.summary())?;
+                return Ok(report);
+            }
+            Err(e) if concurrent(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "moved works into {into_sid}, but retiring them from {from_sid} stayed contended; rerun adopt-run --split-works"
+    ))
+}
+
 /// What stays with the superseded run: everything not moved.
 fn retire(from: &mut PlannerRun, report: &AdoptReport) {
     for (id, _) in &report.works {
@@ -864,8 +1055,15 @@ mod release_in_flight_tests {
     #[test]
     fn only_an_unfinished_release_blocks_adoption_on_a_conflicting_work() {
         assert!(super::release_in_flight(&release(None)));
-        assert!(super::release_in_flight(&release(Some(Stage::StagingPassed))));
-        for done in [Stage::ProductionPassed, Stage::Failed, Stage::Abandoned, Stage::Disposed] {
+        assert!(super::release_in_flight(&release(Some(
+            Stage::StagingPassed
+        ))));
+        for done in [
+            Stage::ProductionPassed,
+            Stage::Failed,
+            Stage::Abandoned,
+            Stage::Disposed,
+        ] {
             assert!(!super::release_in_flight(&release(Some(done))), "{done:?}");
         }
         let mut superseded = release(Some(Stage::StagingDeployed));

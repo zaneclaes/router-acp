@@ -288,6 +288,11 @@ enum Command {
         /// The router session id that takes it over.
         #[arg(long)]
         into: String,
+        /// Finish an earlier adoption instead: move only the works a superseded
+        /// `--from` kept because `--into` (or a run between them) held an
+        /// unstarted copy of the same guide while `--from` held its tree.
+        #[arg(long)]
+        split_works: bool,
     },
     /// Send an agent-origin message to any active router session, or inspect
     /// its delivery receipt. A planner parent takes it through its durable run
@@ -1141,15 +1146,24 @@ async fn run() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Command::AdoptRun { state, from, into } => {
+        Command::AdoptRun {
+            state,
+            from,
+            into,
+            split_works,
+        } => {
             // Never prune from this command (see Transcript).
             let never_prune = router_acp::state::Retention {
                 max_age: std::time::Duration::MAX,
             };
             let path = router_acp::config::expand_tilde(&state);
             let store = router_acp::state::StateStore::load(&path, never_prune);
-            let report = router_acp::planner_adopt::adopt(&store, &from, &into)
-                .map_err(anyhow::Error::msg)?;
+            let report = if split_works {
+                router_acp::planner_adopt::readopt_split_works(&store, &from, &into)
+            } else {
+                router_acp::planner_adopt::adopt(&store, &from, &into)
+            }
+            .map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             eprintln!("router-acp · {}", report.summary());
             Ok(())

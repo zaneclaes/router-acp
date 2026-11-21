@@ -11127,3 +11127,149 @@ fn send_input_to_a_session_without_a_planner_run_is_durable_idempotent_and_withd
     authorize(&f.shared);
     assert!(session_input::planner_session(&store, SID).unwrap());
 }
+
+/// Adds a session (and its empty run) beside SID, as a restarted parent would have.
+fn sibling_run(f: &Fixture, sid: &str) {
+    let persisted = f.shared.state.lock().unwrap().get(SID).unwrap();
+    f.shared
+        .state
+        .lock()
+        .unwrap()
+        .upsert(sid.into(), persisted.clone());
+    f.shared.sessions.lock().unwrap().insert(
+        sid.into(),
+        RouterSession::rehydrated(&f.shared.cfg, &persisted, Vec::new()),
+    );
+    planner_workflow::ensure(&f.shared, sid).unwrap();
+}
+
+/// SID holds two interrupted works with trees; the run `next` admitted its own copies first.
+/// `tree` keeps a tree on next's copy of "started" (the negative control).
+async fn split_admission_fixture() -> Fixture {
+    let f = fixture(|_| {});
+    let mut started = work("started");
+    started.external_id = Some("external-2".into());
+    for spec in [work("retry"), started] {
+        let id = spec.work_id.clone();
+        admit(&f.shared, spec);
+        let (identity, _, _, _) = planner_workflow::begin_work(&f.shared, SID, &id)
+            .await
+            .unwrap();
+        planner_workflow::attempt_ended(
+            &f.shared,
+            SID,
+            &identity,
+            None,
+            "router exited".into(),
+            false,
+        )
+        .unwrap();
+    }
+    let source = planner_workflow::mutate(&f.shared, SID, |run| {
+        run.owner = Some(planner_workflow::RunOwner {
+            pid: u32::MAX,
+            started_at_ms: 1,
+        });
+        Ok(())
+    })
+    .unwrap();
+    assert!(source.works["retry"].workspace.is_some());
+    sibling_run(&f, "next");
+    planner_workflow::mutate(&f.shared, "next", |run| {
+        for id in ["retry", "started"] {
+            let mut copy = source.works[id].clone();
+            copy.child_id = format!("child-next-{id}");
+            copy.spec.scope = "resume the existing branch".into();
+            copy.reconciliation = Default::default();
+            if id == "retry" {
+                // Admitted, allocation refused: an ended attempt and no tree.
+                copy.workspace = None;
+            }
+            copy.status = WorkStatus::Interrupted;
+            run.works.insert(id.into(), copy);
+        }
+        Ok(())
+    })
+    .unwrap();
+    f
+}
+
+#[tokio::test]
+async fn adoption_gives_an_unstarted_duplicate_the_source_tree_identity() {
+    use router_acp::planner_adopt;
+    let f = split_admission_fixture().await;
+    let source = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let report = {
+        let store = f.shared.state.lock().unwrap();
+        planner_adopt::adopt(&*store, SID, "next").unwrap()
+    };
+    assert_eq!(report.conflicting_works, vec!["started".to_string()]);
+    let next = planner_workflow::load(&f.shared, "next").unwrap().unwrap();
+    let retry = &next.works["retry"];
+    assert_eq!(retry.child_id, source.works["retry"].child_id);
+    assert_eq!(retry.spec, source.works["retry"].spec);
+    assert_eq!(
+        retry.workspace.as_ref().map(|w| (&w.path, &w.lease)),
+        source.works["retry"]
+            .workspace
+            .as_ref()
+            .map(|w| (&w.path, &w.lease))
+    );
+    assert!(
+        retry
+            .reconciliation
+            .prior_specs
+            .iter()
+            .any(|spec| spec.scope == "resume the existing branch")
+    );
+    // A destination copy that holds its own tree keeps its identity.
+    assert_eq!(next.works["started"].child_id, "child-next-started");
+    let left = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(!left.works.contains_key("retry"));
+    assert!(left.works.contains_key("started"));
+}
+
+#[tokio::test]
+async fn split_works_readopt_through_the_successor_chain_and_only_from_a_superseded_run() {
+    use router_acp::planner_adopt;
+    let f = split_admission_fixture().await;
+    sibling_run(&f, "mid");
+    let store = f.shared.state.lock().unwrap();
+    // A running source is adopted the ordinary way, never by --split-works.
+    assert!(planner_adopt::readopt_split_works(&*store, SID, "next").is_err());
+    // The split as routers before this fix left it: SID superseded by "mid", "mid" by "next",
+    // both works still with SID.
+    for (sid, by) in [(SID, "mid"), ("mid", "next")] {
+        let mut run = planner_adopt::RunStore::load(&*store, sid)
+            .unwrap()
+            .unwrap();
+        run.status = RunStatus::Superseded;
+        run.superseded_by = Some(by.into());
+        planner_adopt::RunStore::save(&*store, sid, &mut run).unwrap();
+    }
+    // A run outside the chain cannot take them.
+    assert!(planner_adopt::readopt_split_works(&*store, "mid", SID).is_err());
+    let report = planner_adopt::readopt_split_works(&*store, SID, "next").unwrap();
+    assert_eq!(
+        report
+            .works
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["retry"]
+    );
+    assert_eq!(report.conflicting_works, vec!["started".to_string()]);
+    let next = planner_adopt::RunStore::load(&*store, "next")
+        .unwrap()
+        .unwrap();
+    let left = planner_adopt::RunStore::load(&*store, SID)
+        .unwrap()
+        .unwrap();
+    assert!(next.works["retry"].workspace.is_some());
+    assert_eq!(next.works["started"].child_id, "child-next-started");
+    assert!(!left.works.contains_key("retry"));
+    assert!(left.works.contains_key("started"));
+    // Idempotent: nothing more moves.
+    let again = planner_adopt::readopt_split_works(&*store, SID, "next").unwrap();
+    assert!(again.works.is_empty());
+}
