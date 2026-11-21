@@ -1922,6 +1922,17 @@ async fn operate_once(
             {
                 return Err("reconcile requires the owning attempt to stop first; never change a live worker's assignment".into());
             }
+            let mut memberships = run
+                .releases
+                .values()
+                .filter_map(|release| {
+                    release
+                        .works
+                        .get(&work.work_id)
+                        .map(|revision| (release.stage(), revision))
+                })
+                .peekable();
+            let historical_custody = !terminal_correction && memberships.peek().is_some();
             if !terminal_correction
                 && (matches!(
                     existing.status,
@@ -1929,12 +1940,43 @@ async fn operate_once(
                         | WorkStatus::Integrated
                         | WorkStatus::Watching
                         | WorkStatus::Retired
-                ) || run
-                    .releases
-                    .values()
-                    .any(|release| release.works.contains_key(&work.work_id)))
+                ) || memberships.clone().any(|(stage, _)| {
+                    !matches!(
+                        stage,
+                        crate::planner_release::Stage::Disposed
+                            | crate::planner_release::Stage::Abandoned
+                    )
+                }))
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
+            }
+            if historical_custody {
+                if work != existing.spec || !existing.attempt.as_ref().is_some_and(|a| a.ended) {
+                    return Err("historical release custody requires the unchanged assignment and an ended attempt".into());
+                }
+                let recorded_source = existing
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| &artifact.revision)
+                    .or(existing.reconciliation.source_revision.as_ref());
+                if !recorded_source.map_or_else(
+                    || memberships.all(|(_, revision)| revision == &source_revision),
+                    |revision| revision == &source_revision,
+                ) {
+                    return Err(
+                        "historical release custody requires the exact preserved source revision"
+                            .into(),
+                    );
+                }
+                let workspace = existing
+                    .workspace
+                    .as_ref()
+                    .ok_or("historical release custody requires the existing worktree")?;
+                workspace_available(workspace)?;
+                verify_pushed_revision(&workspace.path, &source_revision).await?;
+                if let Some(prior_source) = existing.reconciliation.source_revision.as_deref() {
+                    verify_source_revision(&workspace.path, prior_source).await?;
+                }
             }
             if existing.handoff.as_ref().is_some_and(|handoff| {
                 matches!(
@@ -2544,6 +2586,7 @@ async fn git(path: &Path, args: &[&str]) -> Result<String, String> {
         .arg("-C")
         .arg(path)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -2561,14 +2604,48 @@ async fn verify_revision(path: &Path, revision: &str) -> Result<(), String> {
     if git(path, &["rev-parse", "HEAD"]).await? != revision {
         return Err("workspace HEAD changed; submit its current artifact for fresh review".into());
     }
-    if !git(path, &["status", "--porcelain", "--untracked-files=normal"])
-        .await?
-        .is_empty()
+    if !git(
+        path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ],
+    )
+    .await?
+    .is_empty()
     {
         return Err(
             "workspace has uncommitted changes; reviewed artifact is not the current workspace"
                 .into(),
         );
+    }
+    Ok(())
+}
+
+async fn verify_pushed_revision(path: &Path, revision: &str) -> Result<(), String> {
+    verify_revision(path, revision).await?;
+    const UNVERIFIED: &str = "historical release custody requires the exact origin branch tip";
+    let branch = git(path, &["symbolic-ref", "--quiet", "HEAD"])
+        .await
+        .ok()
+        .filter(|branch| branch.starts_with("refs/heads/"))
+        .ok_or(UNVERIFIED)?;
+    // Read the actual remote; a stale tracking ref can hide a changed branch.
+    let tip = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        git(
+            path,
+            &["ls-remote", "--exit-code", "--refs", "origin", &branch],
+        ),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .ok_or(UNVERIFIED)?;
+    if tip.split_once('\t') != Some((revision, branch.as_str())) {
+        return Err(UNVERIFIED.into());
     }
     Ok(())
 }

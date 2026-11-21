@@ -7279,6 +7279,170 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
 }
 
 #[tokio::test]
+async fn historical_release_membership_allows_only_exact_ended_custody_reconciliation() {
+    use router_acp::planner_release::{Checkpoint, Release, Stage};
+
+    let f = fixture(|_| {});
+    let spec = work("release-recovery");
+    admit(&f.shared, spec.clone());
+    let (attempt, workspace, _, _) = planner_workflow::begin_work(&f.shared, SID, &spec.work_id)
+        .await
+        .unwrap();
+    let path = &workspace.path;
+    let source = git(path, &["rev-parse", "HEAD"]);
+    let branch = git(path, &["symbolic-ref", "HEAD"]);
+    let release = |stage| {
+        let works = BTreeMap::from([(spec.work_id.clone(), source.clone())]);
+        Release {
+            candidate: source.clone(),
+            works: works.clone(),
+            checkpoints: vec![Checkpoint {
+                stage,
+                revision: source.clone(),
+                works,
+                replaces: None,
+                evidence: BTreeMap::from([("fixture".into(), "release-receipt.md".into())]),
+            }],
+            superseded_by: None,
+        }
+    };
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases
+            .insert("disposed".into(), release(Stage::Disposed));
+        run.releases
+            .insert("abandoned".into(), release(Stage::Abandoned));
+        run.works
+            .get_mut(&spec.work_id)
+            .unwrap()
+            .reconciliation
+            .required = true;
+        Ok(())
+    })
+    .unwrap();
+    let reconcile = |key: &str, work: WorkSpec, source_revision: String| {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Reconcile {
+                key: key.into(),
+                work,
+                source_revision,
+                evidence: vec!["preserved-source.md".into()],
+            },
+        )
+    };
+    git(
+        path,
+        &["push", "--quiet", "origin", &format!("HEAD:{branch}")],
+    );
+    assert!(
+        reconcile("live", spec.clone(), source.clone())
+            .await
+            .is_err()
+    );
+    planner_workflow::attempt_ended(&f.shared, SID, &attempt, None, "interrupted".into(), false)
+        .unwrap();
+
+    for (name, stage) in [("active", Stage::StagingPassed), ("failed", Stage::Failed)] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.releases.insert(name.into(), release(stage));
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            reconcile(name, spec.clone(), source.clone()).await.is_err(),
+            "{name}"
+        );
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.releases.remove(name);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let mut changed_spec = spec.clone();
+    changed_spec.scope.push_str("; additional work");
+    assert!(
+        reconcile("changed-brief", changed_spec, source.clone())
+            .await
+            .is_err()
+    );
+    std::fs::write(path.join("uncommitted.txt"), "local work").unwrap();
+    assert!(
+        reconcile("dirty", spec.clone(), source.clone())
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(path.join("uncommitted.txt")).unwrap();
+
+    git(
+        path,
+        &[
+            "-c",
+            "user.name=Planner Test",
+            "-c",
+            "user.email=planner-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "different revision",
+        ],
+    );
+    let changed_source = git(path, &["rev-parse", "HEAD"]);
+    // Advance the real remote through a different checkout. The worktree's
+    // tracking ref still shows the original push.
+    git(
+        &f.repo,
+        &["fetch", "--quiet", path.to_str().unwrap(), "HEAD"],
+    );
+    git(
+        &f.repo,
+        &["push", "--quiet", "origin", &format!("FETCH_HEAD:{branch}")],
+    );
+    assert!(
+        reconcile("changed-source", spec.clone(), changed_source)
+            .await
+            .is_err()
+    );
+    git(path, &["reset", "--hard", &source]);
+    assert!(
+        reconcile("remote-drift", spec.clone(), source.clone())
+            .await
+            .is_err()
+    );
+    git(
+        path,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            &format!("HEAD:{branch}"),
+        ],
+    );
+
+    let before = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(before.works[&spec.work_id].reconciliation.required);
+    reconcile("preserved", spec.clone(), source.clone())
+        .await
+        .unwrap();
+    let after = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(before.releases, after.releases);
+    let work = &after.works[&spec.work_id];
+    assert_eq!(work.spec, spec);
+    assert!(!work.reconciliation.required);
+    assert_eq!(work.reconciliation.source_revision, Some(source));
+    let (next, _, _, _) = planner_workflow::begin_work(&f.shared, SID, &spec.work_id)
+        .await
+        .unwrap();
+    assert_ne!(next.attempt_id, attempt.attempt_id);
+}
+
+#[tokio::test]
 async fn obsolete_worker_retirement_is_verified_terminal_and_not_integration() {
     let temp = tempfile::tempdir().unwrap();
     let verdict = temp.path().join("verdict");
