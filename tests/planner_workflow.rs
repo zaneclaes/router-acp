@@ -7289,16 +7289,36 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
         .await
         .unwrap();
     let path = &workspace.path;
-    let source = git(path, &["rev-parse", "HEAD"]);
+    let released = current_revision(path);
+    let commit = |message: &str| {
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=Planner Test",
+                "-c",
+                "user.email=planner-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+        current_revision(path)
+    };
+    let source = commit("preserved source after release");
     let branch = git(path, &["symbolic-ref", "HEAD"]);
-    let release = |stage| {
-        let works = BTreeMap::from([(spec.work_id.clone(), source.clone())]);
+    let release = |stage, revision: &str| {
+        let works = BTreeMap::from([(spec.work_id.clone(), revision.to_owned())]);
         Release {
-            candidate: source.clone(),
+            candidate: revision.into(),
             works: works.clone(),
             checkpoints: vec![Checkpoint {
                 stage,
-                revision: source.clone(),
+                revision: revision.into(),
                 works,
                 replaces: None,
                 evidence: BTreeMap::from([("fixture".into(), "release-receipt.md".into())]),
@@ -7308,14 +7328,13 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
     };
     planner_workflow::mutate(&f.shared, SID, |run| {
         run.releases
-            .insert("disposed".into(), release(Stage::Disposed));
+            .insert("disposed".into(), release(Stage::Disposed, &released));
         run.releases
-            .insert("abandoned".into(), release(Stage::Abandoned));
-        run.works
-            .get_mut(&spec.work_id)
-            .unwrap()
-            .reconciliation
-            .required = true;
+            .insert("abandoned".into(), release(Stage::Abandoned, &released));
+        let work = run.works.get_mut(&spec.work_id).unwrap();
+        work.artifact = Some(artifact(&released));
+        work.reconciliation.source_revision = Some(source.clone());
+        work.reconciliation.required = true;
         Ok(())
     })
     .unwrap();
@@ -7346,7 +7365,7 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
 
     for (name, stage) in [("active", Stage::StagingPassed), ("failed", Stage::Failed)] {
         planner_workflow::mutate(&f.shared, SID, |run| {
-            run.releases.insert(name.into(), release(stage));
+            run.releases.insert(name.into(), release(stage, &released));
             Ok(())
         })
         .unwrap();
@@ -7376,23 +7395,7 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
     );
     std::fs::remove_file(path.join("uncommitted.txt")).unwrap();
 
-    git(
-        path,
-        &[
-            "-c",
-            "user.name=Planner Test",
-            "-c",
-            "user.email=planner-test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "-m",
-            "different revision",
-        ],
-    );
-    let changed_source = git(path, &["rev-parse", "HEAD"]);
+    let changed_source = commit("different revision");
     // Advance the real remote through a different checkout. The worktree's
     // tracking ref still shows the original push.
     git(
@@ -7404,7 +7407,7 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
         &["push", "--quiet", "origin", &format!("FETCH_HEAD:{branch}")],
     );
     assert!(
-        reconcile("changed-source", spec.clone(), changed_source)
+        reconcile("changed-source", spec.clone(), changed_source.clone())
             .await
             .is_err()
     );
@@ -7425,21 +7428,64 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
         ],
     );
 
+    // A clean pushed tip and a source pin do not resolve a competing artifact
+    // that the closed rounds cannot account for.
+    let competing = changed_source;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works.get_mut(&spec.work_id).unwrap().artifact = Some(artifact(&competing));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        reconcile("conflicting-artifact", spec.clone(), source.clone())
+            .await
+            .unwrap_err()
+            .contains("conflicting artifact and source")
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases
+            .insert("competing".into(), release(Stage::Disposed, &competing));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        reconcile("uncarried-artifact", spec.clone(), source.clone())
+            .await
+            .unwrap_err()
+            .contains("would drop the released artifact")
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases.remove("competing");
+        run.works.get_mut(&spec.work_id).unwrap().artifact = Some(artifact(&released));
+        Ok(())
+    })
+    .unwrap();
+
     let before = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
     assert!(before.works[&spec.work_id].reconciliation.required);
     reconcile("preserved", spec.clone(), source.clone())
         .await
         .unwrap();
     let after = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
-    assert_eq!(before.releases, after.releases);
     let work = &after.works[&spec.work_id];
     assert_eq!(work.spec, spec);
     assert!(!work.reconciliation.required);
     assert_eq!(work.reconciliation.source_revision, Some(source));
-    let (next, _, _, _) = planner_workflow::begin_work(&f.shared, SID, &spec.work_id)
+    assert!(
+        work.artifact.is_none(),
+        "the old artifact cannot qualify the new source"
+    );
+    let (next, resumed, _, _) = planner_workflow::begin_work(&f.shared, SID, &spec.work_id)
         .await
         .unwrap();
     assert_ne!(next.attempt_id, attempt.attempt_id);
+    assert_eq!(resumed.path, workspace.path);
+    let resumed_run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_vec(&before.releases).unwrap(),
+        serde_json::to_vec(&resumed_run.releases).unwrap(),
+        "resuming from the current source must leave every release receipt byte-for-byte unchanged"
+    );
 }
 
 #[tokio::test]

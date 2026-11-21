@@ -1954,13 +1954,34 @@ async fn operate_once(
                 if work != existing.spec || !existing.attempt.as_ref().is_some_and(|a| a.ended) {
                     return Err("historical release custody requires the unchanged assignment and an ended attempt".into());
                 }
-                let recorded_source = existing
+                let artifact_revision = existing
                     .artifact
                     .as_ref()
-                    .map(|artifact| &artifact.revision)
-                    .or(existing.reconciliation.source_revision.as_ref());
+                    .map(|artifact| &artifact.revision);
+                let pinned_source = existing.reconciliation.source_revision.as_ref();
+                let older_artifact = artifact_revision
+                    .zip(pinned_source)
+                    .filter(|(artifact, pinned)| artifact != pinned)
+                    .map(|(artifact, _)| artifact);
+                // A preserved source pin can supersede a historical artifact,
+                // but cannot arbitrate between two claims to current custody.
+                if older_artifact.is_some_and(|artifact| {
+                    !memberships
+                        .iter()
+                        .any(|(_, revision)| *revision == artifact)
+                }) {
+                    return Err(
+                        "historical release custody has conflicting artifact and source revisions"
+                            .into(),
+                    );
+                }
+                let recorded_source = pinned_source.or(artifact_revision);
                 if !recorded_source.map_or_else(
-                    || memberships.iter().all(|(_, revision)| *revision == &source_revision),
+                    || {
+                        memberships
+                            .iter()
+                            .all(|(_, revision)| *revision == &source_revision)
+                    },
                     |revision| revision == &source_revision,
                 ) {
                     return Err(
@@ -1974,8 +1995,13 @@ async fn operate_once(
                     .ok_or("historical release custody requires the existing worktree")?;
                 workspace_available(workspace)?;
                 verify_pushed_revision(&workspace.path, &source_revision).await?;
-                if let Some(prior_source) = existing.reconciliation.source_revision.as_deref() {
-                    verify_source_revision(&workspace.path, prior_source).await?;
+                if let Some(artifact) = older_artifact {
+                    verify_source_revision(&workspace.path, artifact)
+                        .await
+                        .map_err(|_| {
+                            "historical release custody would drop the released artifact revision"
+                                .to_string()
+                        })?;
                 }
             }
             if existing.handoff.as_ref().is_some_and(|handoff| {
