@@ -456,11 +456,19 @@ where
                             ));
                         }
                         cx.spawn(async move {
-                            while observed.lock().unwrap().terminal_kills.is_empty() {
+                            while {
+                                let state = observed.lock().unwrap();
+                                state.hang_terminal_waits && state.terminal_kills.is_empty()
+                            } {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
+                            let exit = if observed.lock().unwrap().terminal_kills.is_empty() {
+                                TerminalExitStatus::new().exit_code(0)
+                            } else {
+                                TerminalExitStatus::new().signal("SIGTERM")
+                            };
                             responder.respond(WaitForTerminalExitResponse::new(
-                                TerminalExitStatus::new().signal("SIGTERM"),
+                                exit,
                             ))
                         })
                     }
@@ -1049,7 +1057,7 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
 }
 
 #[tokio::test]
-async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt() {
+async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
     let state = temp_state_file("planner-managed-steer");
     // SAFETY: every helper-enabled test uses the same executable.
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
@@ -1084,21 +1092,32 @@ async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt(
             )
             .await
         );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !agent_text(&observed, &sid)
+                .contains("[Router audit] eligible work needs reconciliation")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the wake was not delivered while the terminal ran");
+        assert!(observed.lock().unwrap().terminal_kills.is_empty());
+        assert!(observed.lock().unwrap().terminal_releases.is_empty());
+        assert!(!pending.is_finished(), "the original work is still running");
+        // The terminal may now finish. The resumed parent must collect that
+        // same operation, not start it again or lose its result after the wake.
+        observed.lock().unwrap().hang_terminal_waits = false;
         let response = pending.await.expect("parked prompt task")?;
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
             agent_text(&observed, &sid)
                 .contains("[Router audit] eligible work needs reconciliation")
         );
+        assert!(agent_text(&observed, &sid).contains("watch-fired"));
         let observed = observed.lock().unwrap();
-        assert_eq!(
-            observed.terminal_kills,
-            vec!["managed-terminal-1".to_string()]
-        );
-        assert_eq!(
-            observed.terminal_releases,
-            vec!["managed-terminal-1".to_string()]
-        );
+        assert_eq!(observed.terminal_creates.len(), 1);
+        assert!(observed.terminal_kills.is_empty());
+        assert!(observed.terminal_releases.is_empty());
         Ok(())
     })
     .await;
