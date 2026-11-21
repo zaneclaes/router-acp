@@ -727,7 +727,12 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   after the old run is paused and its recorded process identity is verified dead.
   Missing owner evidence, malformed attempts, a live owner or a running run keep the claim fenced.
 
-  Parent delivery batches retain every recovery wake, but recovery notices for already
+  A blocked or watching assignment keeps its source custody fence but does not generate
+  recovery prompts while it waits. Older recovery notices remain in the ledger and are
+  skipped during delivery. Changed prerequisite observations and explicit input still
+  reach the parent, and runnable work still goes through custody checks.
+
+  Parent delivery prioritizes actionable recovery wakes. Recovery notices for already
   accepted or finished work follow stopped-work recovery and fresh artifact review. They
   still precede capacity/refill reminders. A large adopted backlog therefore cannot fill
   the 32-wake batch with old acknowledgments and hide a newly qualified repair; source

@@ -108,6 +108,20 @@ pub enum RunStatus {
 }
 
 impl PlannerRun {
+    /// Recovery notices on a dormant disposition are historical until the
+    /// work becomes runnable again. Keep the notice and the source fence.
+    fn dormant_recovery_wake(&self, id: &str) -> bool {
+        id.strip_prefix("recovery:")
+            .and_then(|work_id| self.works.get(work_id))
+            .is_some_and(|work| work.status.dormant_disposition())
+    }
+
+    pub(crate) fn pending_wakes(&self) -> impl Iterator<Item = (&String, &Wake)> {
+        self.wakes
+            .iter()
+            .filter(|(id, wake)| !wake.acknowledged && !self.dormant_recovery_wake(id))
+    }
+
     /// The session is this run's durable parent and keeps the planning pool.
     /// Runs recorded before the parent role was stored are recognized by an
     /// execution request that an implementation command or the accepted-plan
@@ -208,6 +222,12 @@ pub enum WorkStatus {
     Blocked,
     Watching,
     Interrupted,
+}
+
+impl WorkStatus {
+    pub(crate) fn dormant_disposition(self) -> bool {
+        matches!(self, Self::Blocked | Self::Watching)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1729,7 +1749,7 @@ async fn operate_once(
         let wakes = run
             .wakes
             .iter()
-            .filter(|(_, w)| visible(&w.work_id))
+            .filter(|(id, w)| visible(&w.work_id) && !run.dormant_recovery_wake(id))
             .skip(offset)
             .take(32)
             .collect::<BTreeMap<_, _>>();
@@ -2967,7 +2987,10 @@ pub fn progress(run: &PlannerRun) -> Value {
         "awaiting_review":run.works.values().filter(|w| w.status == WorkStatus::ReviewPending).count(),
         "awaiting_integration":run.works.values().filter(|w| w.status == WorkStatus::Finished).count(),
         "integrated":run.works.values().filter(|w| w.status == WorkStatus::Integrated).count(),
-        "recovery_required":run.capacity.resumes.iter().filter(|(_, r)| r.suspended.is_some()).map(|(id, _)| id).collect::<Vec<_>>()})
+        "recovery_required":run.capacity.resumes.iter().filter(|(id, r)| {
+            r.suspended.is_some()
+                && !run.works.get(*id).is_some_and(|work| work.status.dormant_disposition())
+        }).map(|(id, _)| id).collect::<Vec<_>>()})
 }
 
 pub async fn begin_work(

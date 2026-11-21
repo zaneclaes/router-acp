@@ -4513,6 +4513,118 @@ async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them()
     );
 }
 
+#[tokio::test]
+async fn dormant_dispositions_keep_custody_without_requesting_automatic_recovery() {
+    use planner_workflow::WorkStatus::{Blocked, Interrupted, Watching};
+
+    let f = fixture(|_| {});
+    let shared = &f.shared;
+    authorize(shared);
+    for (id, status) in [
+        ("watch", Watching),
+        ("blocked", Blocked),
+        ("repair", Interrupted),
+    ] {
+        admit(shared, work(id));
+        planner_workflow::mutate(shared, SID, |run| {
+            let work = run.works.get_mut(id).unwrap();
+            work.status = status;
+            work.reason = Some("external prerequisite".into());
+            work.reconciliation.required = true;
+            Ok(())
+        })
+        .unwrap();
+    }
+    tick(shared, parent_turn_ended(shared) + 1).await;
+    let wakes = wakes_with(shared, "recovery:");
+    assert!(wakes.iter().any(|(id, _)| id == "recovery:repair"));
+    assert!(
+        !wakes
+            .iter()
+            .any(|(id, _)| id == "recovery:watch" || id == "recovery:blocked")
+    );
+    for id in ["watch", "blocked"] {
+        let error = planner_workflow::begin_work(shared, SID, id)
+            .await
+            .unwrap_err();
+        assert!(error.contains("reconciliation required"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn stale_dormant_recovery_is_hidden_without_hiding_changed_prerequisites() {
+    use planner_workflow::Wake;
+
+    let f = fixture(|_| {});
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    admit(shared, work("watch"));
+    planner_workflow::mutate(shared, SID, |run| {
+        let watching = run.works.get_mut("watch").unwrap();
+        watching.status = WorkStatus::Watching;
+        watching.reason = Some("waiting for external access".into());
+        watching.reconciliation.required = true;
+        run.wakes.insert(
+            "recovery:watch".into(),
+            Wake {
+                work_id: "watch".into(),
+                reason: "reconcile the adopted assignment".into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    let now = parent_turn_ended(shared) + 3600;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_wake::heartbeat(shared, SID, &run, now);
+    assert!(
+        !wakes_with(shared, "heartbeat:").is_empty(),
+        "stale recovery cannot displace an independent heartbeat"
+    );
+    planner_workflow::mutate(shared, SID, |run| {
+        for (id, reason) in [
+            (
+                "observation:external-access",
+                "external access is now available",
+            ),
+            ("release:round", "release has reached its next checkpoint"),
+        ] {
+            run.wakes.insert(
+                id.into(),
+                Wake {
+                    work_id: "watch".into(),
+                    reason: reason.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(status["wakes"].get("recovery:watch").is_none());
+    assert!(status["wakes"].get("observation:external-access").is_some());
+    assert!(status["wakes"].get("release:round").is_some());
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(!run.wakes["recovery:watch"].acknowledged);
+    assert!(run.works["watch"].reconciliation.required);
+}
+
 /// A host may reoffer an admitted assignment after adoption. It still needs
 /// reconciliation, so it must raise recovery rather than attempt auto-admission.
 #[tokio::test]
