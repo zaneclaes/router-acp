@@ -527,6 +527,10 @@ fn pending_wake(run: &PlannerRun, prefix: &str) -> bool {
 pub struct AuditDelivered {
     pub context: String,
     pub findings: BTreeSet<String>,
+    /// The unshortened notice of the last audit wake, so an unchanged audit is recognized
+    /// whatever form this context received it in.
+    #[serde(default)]
+    pub last_key: String,
 }
 
 /// Characters of an unchanged finding a repeated audit wake keeps.
@@ -663,42 +667,56 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         .map(|delivered| delivered.findings.clone())
         .unwrap_or_default();
     let (lines, repeated) = audit_wake_lines(&findings, &delivered);
-    let reason = if unavailable {
-        format!(
-            "audit: the audit host is UNAVAILABLE: {}. An unavailable audit is never a clean \
-             one: fix the host (its command, exit status and JSON) now; `complete` is refused \
-             until it answers. This wake repeats every {wait} s.",
-            run.capacity
-                .audit
-                .as_ref()
-                .and_then(|a| a.error.as_deref())
-                .unwrap_or("no answer")
+    let compose = |lines: &[String], note: &str| {
+        let reason = if unavailable {
+            format!(
+                "audit: the audit host is UNAVAILABLE: {}. An unavailable audit is never a clean \
+                 one: fix the host (its command, exit status and JSON) now; `complete` is refused \
+                 until it answers. This wake repeats every {wait} s.",
+                run.capacity
+                    .audit
+                    .as_ref()
+                    .and_then(|a| a.error.as_deref())
+                    .unwrap_or("no answer")
+            )
+        } else {
+            format!(
+                "audit: the run auditor reports {} defect(s) the native implement-all watcher \
+                 would not let this run sit on:\n- {}\n{note}Each is a defect in this run, not a \
+                 state to wait in: act on every one now (start the release or smoke it owes, \
+                 record the disposition, fix the root or disk). This wake repeats every {wait} s \
+                 while any remains.",
+                findings.len(),
+                lines.join("\n- ")
+            )
+        };
+        // While ownership recovery is pending, the parent cannot admit or dispatch
+        // the inventory that answers these findings; say so instead of demanding
+        // actions the run refuses.
+        match crate::planner_adopt::pending_notice(run) {
+            Some(notice) => format!("{reason}\n{notice}"),
+            None => reason,
+        }
+    };
+    // `key` is the unshortened notice: whether an audit is unchanged never depends on what
+    // this context has already seen. `reason` is what the parent receives.
+    let key = compose(&findings, "");
+    let reason = if repeated > 0 {
+        compose(
+            &lines,
+            &format!(
+                "{repeated} finding(s) marked unchanged were delivered in full earlier in this \
+                 context and are shortened here.\n"
+            ),
         )
     } else {
-        format!(
-            "audit: the run auditor reports {} defect(s) the native implement-all watcher \
-             would not let this run sit on:\n- {}\n{}Each is a defect in this run, not a state to \
-             wait in: act on every one now (start the release or smoke it owes, record the \
-             disposition, fix the root or disk). This wake repeats every {wait} s while any \
-             remains.",
-            findings.len(),
-            lines.join("\n- "),
-            if repeated > 0 {
-                format!(
-                    "{repeated} finding(s) marked unchanged were delivered in full earlier in this \
-                     context and are shortened here.\n"
-                )
-            } else {
-                String::new()
-            }
-        )
+        key.clone()
     };
-    // While ownership recovery is pending, the parent cannot admit or dispatch
-    // the inventory that answers these findings; say so instead of demanding
-    // actions the run refuses.
-    let reason = match crate::planner_adopt::pending_notice(run) {
-        Some(notice) => format!("{reason}\n{notice}"),
-        None => reason,
+    let unchanged = |run: &PlannerRun| {
+        run.capacity
+            .audit_delivered
+            .as_ref()
+            .is_some_and(|delivered| delivered.last_key == key)
     };
     // An unchanged delivered audit must not repeatedly interrupt an active
     // repair or release. Idle parents retain the existing repeat cadence.
@@ -707,10 +725,8 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         && shared
             .with_session(sid, |session| session.prompt_activity > 0)
             .unwrap_or(false)
-        && run
-            .wakes
-            .iter()
-            .any(|(id, wake)| id.starts_with(prefix) && wake.reason == reason)
+        && run.wakes.keys().any(|id| id.starts_with(prefix))
+        && unchanged(run)
     {
         return;
     }
@@ -718,10 +734,11 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         // Keep an unchanged notification and any claimed delivery. An unclaimed,
         // obsolete urgent wake must not hide a different current obligation just
         // because the parent has not acknowledged the earlier one yet.
+        let same = unchanged(run);
         if run.wakes.iter().any(|(id, wake)| {
             id.starts_with(prefix)
                 && !wake.acknowledged
-                && (!release_audit || wake.reason == reason || wake.claim_pid != 0)
+                && (!release_audit || same || wake.claim_pid != 0)
         }) {
             return Ok(());
         }
@@ -731,14 +748,15 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             }
         }
         run.capacity.last_audit_wake_at = now;
+        let mut seen = delivered.clone();
         if !unavailable && !context.is_empty() {
-            let mut seen = delivered.clone();
             seen.extend(findings.iter().cloned());
-            run.capacity.audit_delivered = Some(AuditDelivered {
-                context: context.clone(),
-                findings: seen,
-            });
         }
+        run.capacity.audit_delivered = Some(AuditDelivered {
+            context: context.clone(),
+            findings: seen,
+            last_key: key.clone(),
+        });
         insert_wake(run, prefix, sid, reason.clone());
         Ok(())
     });
