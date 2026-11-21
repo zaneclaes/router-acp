@@ -4513,6 +4513,118 @@ async fn works_waiting_only_on_reconcile_raise_a_capacity_wake_that_names_them()
     );
 }
 
+#[tokio::test]
+async fn dormant_dispositions_keep_custody_without_requesting_automatic_recovery() {
+    use planner_workflow::WorkStatus::{Blocked, Interrupted, Watching};
+
+    let f = fixture(|_| {});
+    let shared = &f.shared;
+    authorize(shared);
+    for (id, status) in [
+        ("watch", Watching),
+        ("blocked", Blocked),
+        ("repair", Interrupted),
+    ] {
+        admit(shared, work(id));
+        planner_workflow::mutate(shared, SID, |run| {
+            let work = run.works.get_mut(id).unwrap();
+            work.status = status;
+            work.reason = Some("external prerequisite".into());
+            work.reconciliation.required = true;
+            Ok(())
+        })
+        .unwrap();
+    }
+    tick(shared, parent_turn_ended(shared) + 1).await;
+    let wakes = wakes_with(shared, "recovery:");
+    assert!(wakes.iter().any(|(id, _)| id == "recovery:repair"));
+    assert!(
+        !wakes
+            .iter()
+            .any(|(id, _)| id == "recovery:watch" || id == "recovery:blocked")
+    );
+    for id in ["watch", "blocked"] {
+        let error = planner_workflow::begin_work(shared, SID, id)
+            .await
+            .unwrap_err();
+        assert!(error.contains("reconciliation required"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn stale_dormant_recovery_is_hidden_without_hiding_changed_prerequisites() {
+    use planner_workflow::Wake;
+
+    let f = fixture(|_| {});
+    let shared = &f.shared;
+    authorize(shared);
+    pin_parent(shared);
+    admit(shared, work("watch"));
+    planner_workflow::mutate(shared, SID, |run| {
+        let watching = run.works.get_mut("watch").unwrap();
+        watching.status = WorkStatus::Watching;
+        watching.reason = Some("waiting for external access".into());
+        watching.reconciliation.required = true;
+        run.wakes.insert(
+            "recovery:watch".into(),
+            Wake {
+                work_id: "watch".into(),
+                reason: "reconcile the adopted assignment".into(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    })
+    .unwrap();
+    let now = parent_turn_ended(shared) + 3600;
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    router_acp::planner_wake::heartbeat(shared, SID, &run, now);
+    assert!(
+        !wakes_with(shared, "heartbeat:").is_empty(),
+        "stale recovery cannot displace an independent heartbeat"
+    );
+    planner_workflow::mutate(shared, SID, |run| {
+        for (id, reason) in [
+            (
+                "observation:external-access",
+                "external access is now available",
+            ),
+            ("release:round", "release has reached its next checkpoint"),
+        ] {
+            run.wakes.insert(
+                id.into(),
+                Wake {
+                    work_id: "watch".into(),
+                    reason: reason.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(
+            shared,
+            SID,
+            None,
+            Operation::Status {
+                offset: 0,
+                work_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(status["wakes"].get("recovery:watch").is_none());
+    assert!(status["wakes"].get("observation:external-access").is_some());
+    assert!(status["wakes"].get("release:round").is_some());
+    let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+    assert!(!run.wakes["recovery:watch"].acknowledged);
+    assert!(run.works["watch"].reconciliation.required);
+}
+
 /// A host may reoffer an admitted assignment after adoption. It still needs
 /// reconciliation, so it must raise recovery rather than attempt auto-admission.
 #[tokio::test]
@@ -7275,6 +7387,216 @@ async fn reconciliation_fences_old_briefs_and_pins_transferred_source() {
             .await
             .unwrap_err()
             .contains("reconciled source is not carried")
+    );
+}
+
+#[tokio::test]
+async fn historical_release_membership_allows_only_exact_ended_custody_reconciliation() {
+    use router_acp::planner_release::{Checkpoint, Release, Stage};
+
+    let f = fixture(|_| {});
+    let spec = work("release-recovery");
+    admit(&f.shared, spec.clone());
+    let (attempt, workspace, _, _) = planner_workflow::begin_work(&f.shared, SID, &spec.work_id)
+        .await
+        .unwrap();
+    let path = &workspace.path;
+    let released = current_revision(path);
+    let commit = |message: &str| {
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=Planner Test",
+                "-c",
+                "user.email=planner-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+        current_revision(path)
+    };
+    let source = commit("preserved source after release");
+    let branch = git(path, &["symbolic-ref", "HEAD"]);
+    let release = |stage, revision: &str| {
+        let works = BTreeMap::from([(spec.work_id.clone(), revision.to_owned())]);
+        Release {
+            candidate: revision.into(),
+            works: works.clone(),
+            checkpoints: vec![Checkpoint {
+                stage,
+                revision: revision.into(),
+                works,
+                replaces: None,
+                evidence: BTreeMap::from([("fixture".into(), "release-receipt.md".into())]),
+            }],
+            superseded_by: None,
+        }
+    };
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases
+            .insert("disposed".into(), release(Stage::Disposed, &released));
+        run.releases
+            .insert("abandoned".into(), release(Stage::Abandoned, &released));
+        let work = run.works.get_mut(&spec.work_id).unwrap();
+        work.artifact = Some(artifact(&released));
+        work.reconciliation.source_revision = Some(source.clone());
+        work.reconciliation.required = true;
+        Ok(())
+    })
+    .unwrap();
+    let reconcile = |key: &str, work: WorkSpec, source_revision: String| {
+        planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Reconcile {
+                key: key.into(),
+                work,
+                source_revision,
+                evidence: vec!["preserved-source.md".into()],
+            },
+        )
+    };
+    git(
+        path,
+        &["push", "--quiet", "origin", &format!("HEAD:{branch}")],
+    );
+    assert!(
+        reconcile("live", spec.clone(), source.clone())
+            .await
+            .is_err()
+    );
+    planner_workflow::attempt_ended(&f.shared, SID, &attempt, None, "interrupted".into(), false)
+        .unwrap();
+
+    for (name, stage) in [("active", Stage::StagingPassed), ("failed", Stage::Failed)] {
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.releases.insert(name.into(), release(stage, &released));
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            reconcile(name, spec.clone(), source.clone()).await.is_err(),
+            "{name}"
+        );
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            run.releases.remove(name);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let mut changed_spec = spec.clone();
+    changed_spec.scope.push_str("; additional work");
+    assert!(
+        reconcile("changed-brief", changed_spec, source.clone())
+            .await
+            .is_err()
+    );
+    std::fs::write(path.join("uncommitted.txt"), "local work").unwrap();
+    assert!(
+        reconcile("dirty", spec.clone(), source.clone())
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(path.join("uncommitted.txt")).unwrap();
+
+    let changed_source = commit("different revision");
+    // Advance the real remote through a different checkout. The worktree's
+    // tracking ref still shows the original push.
+    git(
+        &f.repo,
+        &["fetch", "--quiet", path.to_str().unwrap(), "HEAD"],
+    );
+    git(
+        &f.repo,
+        &["push", "--quiet", "origin", &format!("FETCH_HEAD:{branch}")],
+    );
+    assert!(
+        reconcile("changed-source", spec.clone(), changed_source.clone())
+            .await
+            .is_err()
+    );
+    git(path, &["reset", "--hard", &source]);
+    assert!(
+        reconcile("remote-drift", spec.clone(), source.clone())
+            .await
+            .is_err()
+    );
+    git(
+        path,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            &format!("HEAD:{branch}"),
+        ],
+    );
+
+    // A clean pushed tip and a source pin do not resolve a competing artifact
+    // that the closed rounds cannot account for.
+    let competing = changed_source;
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.works.get_mut(&spec.work_id).unwrap().artifact = Some(artifact(&competing));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        reconcile("conflicting-artifact", spec.clone(), source.clone())
+            .await
+            .unwrap_err()
+            .contains("conflicting artifact and source")
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases
+            .insert("competing".into(), release(Stage::Disposed, &competing));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        reconcile("uncarried-artifact", spec.clone(), source.clone())
+            .await
+            .unwrap_err()
+            .contains("would drop the released artifact")
+    );
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.releases.remove("competing");
+        run.works.get_mut(&spec.work_id).unwrap().artifact = Some(artifact(&released));
+        Ok(())
+    })
+    .unwrap();
+
+    let before = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert!(before.works[&spec.work_id].reconciliation.required);
+    reconcile("preserved", spec.clone(), source.clone())
+        .await
+        .unwrap();
+    let after = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let work = &after.works[&spec.work_id];
+    assert_eq!(work.spec, spec);
+    assert!(!work.reconciliation.required);
+    assert_eq!(work.reconciliation.source_revision, Some(source));
+    assert!(
+        work.artifact.is_none(),
+        "the old artifact cannot qualify the new source"
+    );
+    let (next, resumed, _, _) = planner_workflow::begin_work(&f.shared, SID, &spec.work_id)
+        .await
+        .unwrap();
+    assert_ne!(next.attempt_id, attempt.attempt_id);
+    assert_eq!(resumed.path, workspace.path);
+    let resumed_run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_vec(&before.releases).unwrap(),
+        serde_json::to_vec(&resumed_run.releases).unwrap(),
+        "resuming from the current source must leave every release receipt byte-for-byte unchanged"
     );
 }
 
