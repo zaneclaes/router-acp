@@ -10,6 +10,64 @@ use crate::planner_skills::PlannerRole;
 use crate::planner_workflow::{self, RunStatus, WorkerIdentity};
 use crate::session::Shared;
 
+/// Evidence of the wake loop's actual decision, not a reconstruction from
+/// delivery counters. A pending wake may legitimately wait for a tool or turn.
+#[derive(Clone, serde::Serialize)]
+pub struct DeliveryObservation {
+    owner_pid: u32,
+    owner_started_at_ms: u64,
+    at: i64,
+    eligible_since: Option<i64>,
+    reason: String,
+    wake: Option<String>,
+}
+
+impl DeliveryObservation {
+    fn next(previous: Option<&Self>, reason: &str, eligible: Option<&str>, now: i64) -> Self {
+        let (owner_pid, owner_started_at_ms) = planner_workflow::process_identity();
+        Self {
+            owner_pid,
+            owner_started_at_ms,
+            at: now,
+            eligible_since: eligible.map(|key| {
+                previous
+                    .filter(|old| old.wake.as_deref() == Some(key))
+                    .and_then(|old| old.eligible_since)
+                    .unwrap_or(now)
+            }),
+            reason: reason.into(),
+            wake: eligible.map(str::to_string),
+        }
+    }
+}
+
+fn observe_delivery(shared: &Shared, sid: &str, reason: &str, eligible: Option<&str>) {
+    let now = chrono::Utc::now().timestamp();
+    let observation = crate::planner_guard::with_runtime(shared, sid, |rt| {
+        let old = rt.wake_delivery_observation.as_ref();
+        let next = DeliveryObservation::next(old, reason, eligible, now);
+        if old.is_some_and(|old| {
+            old.reason == next.reason && old.wake == next.wake && now - old.at < 30
+        }) {
+            return None;
+        }
+        rt.wake_delivery_observation = Some(next.clone());
+        Some(next)
+    });
+    if let Some(observation) = observation {
+        shared.state.lock().unwrap().log(
+            sid,
+            &crate::state::LogEntry {
+                kind: "planner_wake_observation".into(),
+                role: "router".into(),
+                summary: reason.into(),
+                detail: Some(serde_json::to_value(observation).expect("scalar wake observation")),
+                ..Default::default()
+            },
+        );
+    }
+}
+
 pub(crate) struct PromptActivity {
     shared: Arc<Shared>,
     sid: String,
@@ -160,6 +218,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 crate::planner_capacity::spawn_tick(&shared, &sid, now);
                 parked_notice(&shared, &sid, &run, now);
                 if crate::planner_handoff::tick(&shared, &sid, &run) {
+                    observe_delivery(&shared, &sid, "context-handoff", None);
                     continue;
                 }
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
@@ -168,6 +227,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                         .is_some_and(|wake| wake.retry_after <= chrono::Utc::now().timestamp())
                 });
                 if !run.parent_queue.is_empty() && !queued_input {
+                    observe_delivery(&shared, &sid, "input-backoff", None);
                     continue;
                 }
                 // Planner wakes never give up: an undelivered or unanswered
@@ -176,12 +236,14 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                     || !run.approval_waits.is_empty()
                     || (!queued_input && !run.wakes.values().any(|w| !w.acknowledged))
                 {
+                    observe_delivery(&shared, &sid, "run-or-approval-gate", None);
                     continue;
                 }
                 let Some(activity) = PromptActivity::idle(&shared, &sid) else {
                     steer_pending(&shared, &sid, &run);
                     continue;
                 };
+                observe_delivery(&shared, &sid, "idle-dispatch-started", None);
                 // Agent corrections, like wakes, must yield to live operator
                 // input. Only an actual operator request owns a protected turn.
                 let router_owned = run
@@ -332,11 +394,13 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let command_turn = !crate::planner_preempt::router_turn_in_flight(shared, sid)
         && crate::planner_guard::with_runtime(shared, sid, |rt| rt.command_turn);
     if !(crate::planner_preempt::router_turn_in_flight(shared, sid) || command_turn) {
+        observe_delivery(shared, sid, "protected-turn", None);
         return;
     }
     let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
     let Some((key, text)) = pending_steer(&run.parent_queue, &run.wakes, &steered, &run.works)
     else {
+        observe_delivery(shared, sid, "no-pending-steer", None);
         return;
     };
     let queued = key
@@ -349,6 +413,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let interrupt =
         queued.is_some_and(|input| crate::external_message::interrupt_of(&input.request));
     if !interrupt && crate::planner_watchdog::tools_in_flight(shared, sid) {
+        observe_delivery(shared, sid, "tools-in-flight", None);
         return;
     }
     // Inside the operator's `/implement` turn only the deployment obligation
@@ -367,10 +432,12 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             && failed_environment(&run.observations))
         && !(key.starts_with("audit:release:") && crate::planner_guard::urgent_audit(run))
     {
+        observe_delivery(shared, sid, "command-turn-gate", None);
         return;
     }
     let release_audit = key.starts_with("audit:release:");
     if release_audit && !crate::planner_guard::urgent_audit(run) {
+        observe_delivery(shared, sid, "audit-not-urgent", None);
         return;
     }
     let ownership = run
@@ -386,8 +453,10 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         claim_steer(rt, std::time::Instant::now())
     });
     if !claimed {
+        observe_delivery(shared, sid, "steer-in-flight-or-backoff", Some(&key));
         return;
     }
+    observe_delivery(shared, sid, "steer-attempt", Some(&key));
     let deliveries = run.wakes.get(&key).map_or(0, |w| w.deliveries);
     // Inputs are steered once by id; a wake is recorded with its content (`steer_mark`).
     let mark = match run.wakes.get(&key) {
@@ -1472,6 +1541,26 @@ mod steer_tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
 
+    #[test]
+    fn deferred_wakes_do_not_inherit_an_older_delivery_deadline() {
+        let eligible = DeliveryObservation::next(None, "steer-attempt", Some("capacity:a"), 100);
+        let retry = DeliveryObservation::next(
+            Some(&eligible),
+            "steer-in-flight-or-backoff",
+            Some("capacity:a"),
+            200,
+        );
+        assert_eq!(retry.eligible_since, Some(100));
+        let waiting = DeliveryObservation::next(Some(&retry), "tools-in-flight", None, 300);
+        assert_eq!(waiting.eligible_since, None);
+        let resumed =
+            DeliveryObservation::next(Some(&waiting), "steer-attempt", Some("capacity:a"), 400);
+        assert_eq!(resumed.eligible_since, Some(400));
+        let replacement =
+            DeliveryObservation::next(Some(&resumed), "steer-attempt", Some("capacity:b"), 500);
+        assert_eq!(replacement.eligible_since, Some(500));
+    }
+
     #[tokio::test]
     async fn shutdown_retains_queued_input_without_claiming_or_delivering_it() {
         use crate::config::Config;
@@ -1541,6 +1630,51 @@ mod steer_tests {
             Ok(())
         })
         .unwrap();
+        let running = planner_workflow::load(&shared, sid).unwrap().unwrap();
+        crate::planner_preempt::begin_router_turn(&shared, sid);
+        crate::planner_watchdog::note_update(
+            &shared,
+            sid,
+            &json!({"update": {
+                "sessionUpdate": "tool_call", "toolCallId": "proof", "status": "in_progress"
+            }}),
+        );
+        steer_pending(&shared, sid, &running);
+        assert!(crate::planner_guard::with_runtime(&shared, sid, |rt| rt
+            .wake_delivery_observation
+            .as_ref()
+            .unwrap()
+            .eligible_since
+            .is_none()));
+        crate::planner_watchdog::note_update(
+            &shared,
+            sid,
+            &json!({"update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "proof", "status": "completed"
+            }}),
+        );
+        // Keep this test on the synchronous delivery decision; an outstanding
+        // attempt defers retry, but the actionable correction stays visible.
+        crate::planner_guard::with_runtime(&shared, sid, |rt| {
+            rt.steering = true;
+        });
+        steer_pending(&shared, sid, &running);
+        assert!(crate::planner_guard::with_runtime(&shared, sid, |rt| rt
+            .wake_delivery_observation
+            .as_ref()
+            .unwrap()
+            .eligible_since
+            .is_some()));
+        crate::planner_guard::with_runtime(&shared, sid, |rt| {
+            rt.steered.insert("input:correction".into());
+        });
+        steer_pending(&shared, sid, &running);
+        assert!(crate::planner_guard::with_runtime(&shared, sid, |rt| rt
+            .wake_delivery_observation
+            .as_ref()
+            .unwrap()
+            .eligible_since
+            .is_none()));
         let (claimed, announcement) = claim_queued_input(&shared, sid, &input).unwrap();
         assert!(announcement);
         assert_eq!(claimed.wakes["input:correction"].deliveries, 1);

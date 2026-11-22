@@ -233,6 +233,8 @@ pub struct SessionRuntime {
     pub steering: bool,
     /// Session-wide throttle, retained across parent turn boundaries.
     pub last_steer: Option<std::time::Instant>,
+    /// Last safe wake-loop decision emitted for external health observers.
+    pub wake_delivery_observation: Option<crate::planner_wake::DeliveryObservation>,
     /// When each queued item last cancelled a router-owned turn because
     /// steering was declined (`crate::planner_wake::preempt_allowed`).
     /// Retained across turns: the cancel is what ends the turn.

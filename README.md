@@ -108,6 +108,14 @@ updating Kory Code. Keep source builds for development and testing.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
+Planner health readers can inspect `planner_wake_observation` session-log events.
+They report the wake loop's current decision, owning process identity, observation
+time and the time the selected wake became continuously eligible for steering.
+Tool waits, protected turns and items already steered are deferred work, not
+delivery failures. The loop refreshes unchanged decisions every 30 seconds;
+missing or stale observations mean eligibility is unknown. Wake bodies and
+operator messages are excluded from this evidence.
+
 ### Worker command resource protection
 
 Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
