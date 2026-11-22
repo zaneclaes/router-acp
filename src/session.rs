@@ -8197,8 +8197,13 @@ pub(crate) fn first_eligible_candidate(
         .map(|(v, _)| v.id.clone())
 }
 
-/// Pick the FIRST `patterns` entry that has any eligible candidate behind it,
-/// resolving ties *within* that one glob by preference-adjusted quality.
+/// Pick the FIRST `patterns` entry that has any eligible candidate behind it.
+///
+/// Within that glob the highest `quality + preference` wins. Equal scores
+/// spread across processes: [`process_spread_salt`] is the process id, so
+/// one process keeps one seat for its whole life, and another process can
+/// keep a different seat. One-shot review routers therefore do not all pin
+/// the last config entry. A long-lived process stays on one seat.
 ///
 /// The counterpart of `first_eligible_candidate`, which maxes quality across
 /// the whole list and so treats list order as a mere tie-break. Here order is
@@ -8220,17 +8225,49 @@ fn first_matching_pattern_candidate(
         excluded,
         |view| patterns.iter().any(|pattern| view_matches(pattern, view)),
     );
+    first_matching_pattern_from_views(patterns, &views, process_spread_salt())
+        .map(|view| view.id.clone())
+}
+
+/// Process-stable salt for a tied first-match seat. A fresh `serve` process
+/// gets a new id, so parallel one-shot completions spread. One process does
+/// not move between turns.
+fn process_spread_salt() -> u64 {
+    u64::from(std::process::id())
+}
+
+/// Stable rank of one candidate under `salt`. Not a secret. The same salt
+/// always ranks a candidate the same way.
+fn spread_rank(salt: u64, id: &CandidateId) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64 ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for byte in id.to_string().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+fn first_match_view<'a>(
+    views: impl Iterator<Item = &'a CandidateView>,
+    salt: u64,
+) -> Option<&'a CandidateView> {
+    views.max_by(|a, b| {
+        (a.quality + a.preference)
+            .partial_cmp(&(b.quality + b.preference))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| spread_rank(salt, &a.id).cmp(&spread_rank(salt, &b.id)))
+            .then(b.config_index.cmp(&a.config_index))
+    })
+}
+
+/// Glob order, then the within-glob pick. `views` is already the eligible pool.
+fn first_matching_pattern_from_views<'a>(
+    patterns: &[String],
+    views: &'a [CandidateView],
+    salt: u64,
+) -> Option<&'a CandidateView> {
     patterns.iter().find_map(|pat| {
-        views
-            .iter()
-            .filter(|v| view_matches(pat, v))
-            .max_by(|a, b| {
-                (a.quality + a.preference)
-                    .partial_cmp(&(b.quality + b.preference))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(b.config_index.cmp(&a.config_index))
-            })
-            .map(|v| v.id.clone())
+        first_match_view(views.iter().filter(|view| view_matches(pat, view)), salt)
     })
 }
 
@@ -13321,5 +13358,140 @@ agents:
         );
         // Text outside code is preserved.
         assert!(strip_code_spans("run ship-pr now").contains("ship-pr"));
+    }
+}
+
+#[cfg(test)]
+mod first_match_spread_tests {
+    use super::{first_matching_pattern_from_views, process_spread_salt};
+    use crate::candidate::{CandidateId, CodingTier};
+    use crate::strategies::CandidateView;
+    use std::collections::BTreeSet;
+
+    fn seat(
+        agent: &str,
+        model: &str,
+        index: usize,
+        quality: f64,
+        preference: f64,
+    ) -> CandidateView {
+        CandidateView {
+            id: CandidateId::new(agent, model),
+            cost_rank: 3,
+            config_index: index,
+            quality,
+            coding_tier: CodingTier::High,
+            headroom: 1.0,
+            plan_headroom: None,
+            on_overage: false,
+            preference,
+        }
+    }
+
+    fn patterns(globs: &[&str]) -> Vec<String> {
+        globs.iter().map(|glob| (*glob).to_string()).collect()
+    }
+
+    #[test]
+    fn equal_accounts_spread_across_salts_and_one_salt_is_stable() {
+        let views = vec![
+            seat("grok@aaa", "grok-4.7", 0, 2.0, 0.0),
+            seat("grok@bbb", "grok-4.7", 1, 2.0, 0.0),
+            seat("grok@ccc", "grok-4.7", 2, 2.0, 0.0),
+        ];
+        let pats = patterns(&["*grok*"]);
+        let mut seen = BTreeSet::new();
+        for salt in 0..256u64 {
+            let first = first_matching_pattern_from_views(&pats, &views, salt)
+                .unwrap()
+                .id
+                .clone();
+            let again = first_matching_pattern_from_views(&pats, &views, salt)
+                .unwrap()
+                .id
+                .clone();
+            assert_eq!(first, again, "salt {salt} moved");
+            seen.insert(first.to_string());
+        }
+        assert_eq!(seen.len(), 3, "salts only reached {seen:?}");
+    }
+
+    #[test]
+    fn higher_quality_beats_every_salt() {
+        let views = vec![
+            seat("grok@aaa", "grok-4.6", 0, 1.5, 0.0),
+            seat("grok@bbb", "grok-4.7", 1, 2.0, 0.0),
+            seat("grok@ccc", "grok-4.7", 9, 2.0, 0.0),
+        ];
+        let pats = patterns(&["*grok*"]);
+        for salt in 0..32u64 {
+            let id = &first_matching_pattern_from_views(&pats, &views, salt)
+                .unwrap()
+                .id;
+            assert_eq!(id.model, "grok-4.7", "{salt} picked {id}");
+        }
+    }
+
+    #[test]
+    fn higher_preference_beats_every_salt() {
+        let views = vec![
+            seat("grok@aaa", "grok-4.7", 0, 2.0, 0.2),
+            seat("grok@bbb", "grok-4.7", 5, 2.0, 0.0),
+        ];
+        let pats = patterns(&["*grok*"]);
+        for salt in 0..32u64 {
+            let id = &first_matching_pattern_from_views(&pats, &views, salt)
+                .unwrap()
+                .id;
+            assert_eq!(id.agent, "grok@aaa", "{salt} picked {id}");
+        }
+    }
+
+    #[test]
+    fn first_glob_wins_when_a_later_glob_scores_higher() {
+        let views = vec![
+            seat("grok@aaa", "grok-4.7", 0, 1.0, 0.0),
+            seat("claude", "opus", 1, 3.0, 0.0),
+        ];
+        let pats = patterns(&["*grok*", "*opus*"]);
+        let id = &first_matching_pattern_from_views(&pats, &views, 7)
+            .unwrap()
+            .id;
+        assert_eq!(id.agent, "grok@aaa");
+    }
+
+    #[test]
+    fn empty_glob_falls_through() {
+        let views = vec![seat("claude", "opus", 0, 3.0, 0.0)];
+        let pats = patterns(&["*grok*", "*opus*"]);
+        let id = &first_matching_pattern_from_views(&pats, &views, 1)
+            .unwrap()
+            .id;
+        assert_eq!(id.agent, "claude");
+    }
+
+    #[test]
+    fn tied_pick_is_not_always_the_last_config_index() {
+        let views = vec![
+            seat("grok@aaa", "grok-4.7", 0, 2.0, 0.0),
+            seat("grok@zzz", "grok-4.7", 99, 2.0, 0.0),
+        ];
+        let pats = patterns(&["*grok*"]);
+        let mut low_index_won = false;
+        for salt in 0..64u64 {
+            let id = &first_matching_pattern_from_views(&pats, &views, salt)
+                .unwrap()
+                .id;
+            if id.agent == "grok@aaa" {
+                low_index_won = true;
+            }
+        }
+        assert!(low_index_won, "config index 0 never won a tie");
+    }
+
+    #[test]
+    fn process_salt_stays_put_for_this_process() {
+        assert_eq!(process_spread_salt(), process_spread_salt());
+        assert_eq!(process_spread_salt(), u64::from(std::process::id()));
     }
 }
