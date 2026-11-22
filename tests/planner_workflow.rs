@@ -5324,7 +5324,7 @@ async fn unchanged_worker_failures_suspend_retries_without_stopping_other_work()
 }
 
 /// A worker parked on its own exact build is waiting, not failing. When the observer cannot read that build (an
-/// Unknown observation after a failed or stale read), the worker is resumed with backoff but never suspended
+/// Unknown or older-revision observation), the worker is resumed with backoff but never suspended
 /// (2026-11-09: engraver-release-v2 and r9409 were suspended while their full builds 9433/9435 ran).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_parked_on_its_own_unobserved_build_is_never_suspended() {
@@ -5334,14 +5334,18 @@ async fn a_worker_parked_on_its_own_unobserved_build_is_never_suspended() {
     admit(shared, work("work-1"));
     pin_parent(shared);
     let revision = "5daa9247ff9f60be1913e5a388027e6566cb4cd2";
-    let park = |shared: &std::sync::Arc<router_acp::session::Shared>| {
+    let park = |shared: &std::sync::Arc<router_acp::session::Shared>, round| {
         planner_workflow::mutate(shared, SID, |run| {
             run.observations.insert(
                 "ci:work-1".into(),
                 Observation {
-                    revision: revision.into(),
+                    revision: if round < 3 { "older-build" } else { revision }.into(),
                     reference: "wip/work-1".into(),
-                    state: ObservationState::Unknown,
+                    state: if round < 3 {
+                        ObservationState::Failed
+                    } else {
+                        ObservationState::Unknown
+                    },
                     evidence: "read failed".into(),
                 },
             );
@@ -5350,7 +5354,7 @@ async fn a_worker_parked_on_its_own_unobserved_build_is_never_suspended() {
         .unwrap();
     };
     let mut now = chrono::Utc::now().timestamp() + 10_000;
-    for _ in 0..5 {
+    for round in 0..5 {
         let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
             .await
             .unwrap();
@@ -5366,7 +5370,7 @@ async fn a_worker_parked_on_its_own_unobserved_build_is_never_suspended() {
         .unwrap();
         planner_workflow::attempt_ended(shared, SID, &identity, None, "waiting".into(), false)
             .unwrap();
-        park(shared);
+        park(shared, round);
         tick(shared, now).await;
         let run = planner_workflow::load(shared, SID).unwrap().unwrap();
         let state = run.capacity.resumes.get("work-1").cloned().unwrap();
@@ -5382,6 +5386,82 @@ async fn a_worker_parked_on_its_own_unobserved_build_is_never_suspended() {
         now += 100_000;
         tick(shared, now).await;
         attempt_settled(shared, "work-1").await;
+    }
+}
+
+#[tokio::test]
+async fn a_waiting_build_rearms_repeat_suspension_only_without_its_terminal_result() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    let fixture = fixture(|_| {});
+    let shared = &fixture.shared;
+    admit(shared, work("work-1"));
+    let (identity, _, _, _) = planner_workflow::begin_work(shared, SID, "work-1")
+        .await
+        .unwrap();
+    let revision = "5daa9247ff9f60be1913e5a388027e6566cb4cd2";
+    planner_workflow::record_handoff(
+        shared,
+        SID,
+        &identity,
+        router_acp::delegate_hook::Handoff {
+            kind: "waiting".into(),
+            message: format!("own build running ci:work-1@{revision}"),
+        },
+    )
+    .unwrap();
+    planner_workflow::attempt_ended(shared, SID, &identity, None, "waiting".into(), false).unwrap();
+    let now = chrono::Utc::now().timestamp() + 10_000;
+    tick(shared, now).await;
+    // Replay persisted suspension from three normal waits while the audit still
+    // named an older build. No model is pinned, so ticks only schedule recovery.
+    for (observed_revision, verdict, should_resume) in [
+        ("older-build", ObservationState::Failed, true),
+        ("older-build", ObservationState::Passed, true),
+        (revision, ObservationState::Unknown, true),
+        (revision, ObservationState::Pending, true),
+        (revision, ObservationState::Failed, false),
+        (revision, ObservationState::Passed, false),
+    ] {
+        planner_workflow::mutate(shared, SID, |run| {
+            run.capacity.audit = Some(router_acp::planner_guard::AuditSnapshot {
+                at_ms: now * 1000,
+                ok: true,
+                error: None,
+                defects: vec![],
+                observed: ["ci:work-1".into()].into(),
+                completed_guides: None,
+            });
+            run.observations.insert(
+                "ci:work-1".into(),
+                Observation {
+                    revision: observed_revision.into(),
+                    reference: "wip/work-1".into(),
+                    state: verdict,
+                    evidence: "fixture build result".into(),
+                },
+            );
+            let state = run.capacity.resumes.get_mut("work-1").unwrap();
+            state.same_failure_count = 3;
+            state.suspended = Some("3 consecutive unchanged failures".into());
+            state.due_at = None;
+            run.wakes.insert(
+                "recovery:work-1".into(),
+                planner_workflow::Wake {
+                    work_id: "work-1".into(),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        tick(shared, now + 1).await;
+        let run = planner_workflow::load(shared, SID).unwrap().unwrap();
+        let state = &run.capacity.resumes["work-1"];
+        assert_eq!(state.suspended.is_none(), should_resume);
+        assert_eq!(state.due_at.is_some(), should_resume);
+        assert_eq!(run.wakes["recovery:work-1"].acknowledged, should_resume);
+        assert!(run.works["work-1"].artifact.is_none());
+        assert!(run.works["work-1"].finish.is_none());
     }
 }
 
