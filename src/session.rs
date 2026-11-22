@@ -1472,6 +1472,28 @@ impl Shared {
             explicit_pick,
             excluded,
             None,
+            true,
+            matches,
+        )
+    }
+
+    /// Eligible seats for one first-match glob. Cordon, auth, exhaustion, and
+    /// the included-plan gate still apply. Account drain order does not, so a
+    /// tied process-id spread can land on a later healthy sibling.
+    fn eligible_views_for_spread(
+        &self,
+        class: TaskClass,
+        excluded: &[String],
+        matches: impl Fn(&CandidateView) -> bool,
+    ) -> Vec<CandidateView> {
+        self.eligible_views_core(
+            &RequiredCaps::default(),
+            class,
+            None,
+            false,
+            excluded,
+            None,
+            false,
             matches,
         )
     }
@@ -1491,6 +1513,7 @@ impl Shared {
             false,
             &[],
             Some(id),
+            true,
             |_| true,
         )
         .into_iter()
@@ -1523,6 +1546,7 @@ impl Shared {
         explicit_pick: bool,
         excluded: &[String],
         serving: Option<&CandidateId>,
+        collapse_account_priority: bool,
         matches: impl Fn(&CandidateView) -> bool,
     ) -> Vec<CandidateView> {
         let candidates = self.routeable_candidates_inner(explicit_pick);
@@ -1646,7 +1670,7 @@ impl Shared {
             });
         }
         views.retain(matches);
-        crate::accounts::prioritize(&mut views, &cfg.agents, admit);
+        crate::accounts::prioritize(&mut views, &cfg.agents, admit, collapse_account_priority);
         if !self.cfg.availability_preference.enabled {
             for view in &mut views {
                 view.plan_headroom = None;
@@ -8202,8 +8226,11 @@ pub(crate) fn first_eligible_candidate(
 /// Within that glob the highest `quality + preference` wins. Equal scores
 /// spread across processes: [`process_spread_salt`] is the process id, so
 /// one process keeps one seat for its whole life, and another process can
-/// keep a different seat. One-shot review routers therefore do not all pin
-/// the last config entry. A long-lived process stays on one seat.
+/// keep a different seat. Healthy sibling accounts stay in this pool.
+/// Account priority does not remove them. A cordon, an auth rejection,
+/// exhaustion, or an included plan that leaves another seat on paid overage
+/// still removes a seat. Auto routing and best-quality routes still drain
+/// the lowest account priority first. A long-lived process stays on one seat.
 ///
 /// The counterpart of `first_eligible_candidate`, which maxes quality across
 /// the whole list and so treats list order as a mere tie-break. Here order is
@@ -8217,14 +8244,9 @@ fn first_matching_pattern_candidate(
     class: TaskClass,
     excluded: &[String],
 ) -> Option<CandidateId> {
-    let views = shared.eligible_views_filtered(
-        &RequiredCaps::default(),
-        class,
-        None,
-        false,
-        excluded,
-        |view| patterns.iter().any(|pattern| view_matches(pattern, view)),
-    );
+    let views = shared.eligible_views_for_spread(class, excluded, |view| {
+        patterns.iter().any(|pattern| view_matches(pattern, view))
+    });
     first_matching_pattern_from_views(patterns, &views, process_spread_salt())
         .map(|view| view.id.clone())
 }
@@ -13493,5 +13515,70 @@ mod first_match_spread_tests {
     fn process_salt_stays_put_for_this_process() {
         assert_eq!(process_spread_salt(), process_spread_salt());
         assert_eq!(process_spread_salt(), u64::from(std::process::id()));
+    }
+
+    fn account(name: &str, priority: u32) -> crate::config::AgentConfig {
+        serde_yaml::from_str(&format!(
+            "name: {name}\n\
+             account_priority: {priority}\n\
+             command:\n  type: stdio\n  command: mock\n\
+             model_selection:\n  type: config-option\n\
+             models:\n  - {{id: grok-4.7, cost_rank: 1}}\n"
+        ))
+        .expect("agent")
+    }
+
+    #[test]
+    fn drain_order_keeps_one_account_and_spread_keeps_every_healthy_sibling() {
+        let agents = vec![
+            account("grok@aaa", 1),
+            account("grok@bbb", 2),
+            account("grok@ccc", 3),
+        ];
+        let views = vec![
+            seat("grok@aaa", "grok-4.7", 0, 2.0, 0.0),
+            seat("grok@bbb", "grok-4.7", 1, 2.0, 0.0),
+            seat("grok@ccc", "grok-4.7", 2, 2.0, 0.0),
+        ];
+        let mut drained = views.clone();
+        crate::accounts::prioritize(&mut drained, &agents, None, true);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id.agent, "grok@aaa");
+
+        let mut spread = views.clone();
+        crate::accounts::prioritize(&mut spread, &agents, None, false);
+        assert_eq!(spread.len(), 3);
+        let pats = patterns(&["*grok*"]);
+        let mut seen = BTreeSet::new();
+        for salt in 0..256u64 {
+            seen.insert(
+                first_matching_pattern_from_views(&pats, &spread, salt)
+                    .unwrap()
+                    .id
+                    .agent
+                    .clone(),
+            );
+        }
+        assert_eq!(seen.len(), 3, "{seen:?}");
+    }
+
+    #[test]
+    fn spread_still_skips_overage_while_an_included_plan_remains() {
+        let agents = vec![
+            account("grok@aaa", 1),
+            account("grok@bbb", 2),
+            account("grok@ccc", 3),
+        ];
+        let mut included = seat("grok@aaa", "grok-4.7", 0, 2.0, 0.0);
+        included.plan_headroom = Some(0.4);
+        let mut later = seat("grok@bbb", "grok-4.7", 1, 2.0, 0.0);
+        later.on_overage = true;
+        later.plan_headroom = Some(0.0);
+        let mut last = seat("grok@ccc", "grok-4.7", 2, 2.0, 0.0);
+        last.on_overage = true;
+        let mut views = vec![included, later, last];
+        crate::accounts::prioritize(&mut views, &agents, None, false);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id.agent, "grok@aaa");
     }
 }
