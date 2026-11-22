@@ -249,10 +249,16 @@ fn accounts(shared: &Arc<Shared>, group: &str) -> Vec<AgentConfig> {
 
 /// Account order is an eligibility gate, before any strategy's utility math.
 /// An explicit account pick may override order, while cordons still apply.
+///
+/// `collapse_priority` keeps only the lowest `account_priority` in each
+/// provider group. First-match passes `false`: a process-id spread has to see
+/// every healthy sibling. Included-plan seats still outrank paid overage
+/// either way. Auto routing and best-quality routes pass `true`.
 pub fn prioritize(
     views: &mut Vec<CandidateView>,
     agents: &[AgentConfig],
     admit: Option<&CandidateId>,
+    collapse_priority: bool,
 ) {
     let group = |agent: &AgentConfig| {
         provider(agent)
@@ -273,6 +279,9 @@ pub fn prioritize(
                 .find(|a| a.name == v.id.agent)
                 .is_some_and(|a| included.contains(&group(a)))
     });
+    if !collapse_priority {
+        return;
+    }
     let mut first: HashMap<String, u32> = HashMap::new();
     for agent in agents {
         if let Some(priority) = agent.account_priority
