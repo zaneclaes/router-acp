@@ -1511,11 +1511,14 @@ pub(crate) fn execution_context(run: &PlannerRun) -> Option<Value> {
     {
         // Keep typed scope, without replaying an entire expanded skill on each wake.
         return Some(json!({"input_id":id,"origin":input.origin,
-            "command":"implement","arguments":command.args}));
+            "command":"implement","arguments":command.args,
+            "run_status":run.status,"run_revision":run.revision,
+            "last_checkpoint":run.checkpoint}));
     }
     if parent_handoff(&request) {
         return Some(json!({"input_id":id,"origin":input.origin,
-            "request":input.text}));
+            "request":input.text,"run_status":run.status,
+            "run_revision":run.revision,"last_checkpoint":run.checkpoint}));
     }
     None
 }

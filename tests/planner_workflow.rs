@@ -215,6 +215,33 @@ async fn status_execution_context_is_unpaginated_and_requires_human_admission() 
     }
 }
 
+#[tokio::test]
+async fn execution_context_distinguishes_resumed_run_from_shutdown_checkpoint() {
+    let f = fixture(|_| {});
+    authorize(&f.shared);
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        run.status = RunStatus::Paused;
+        run.checkpoint = Some(planner_workflow::CheckpointReceipt {
+            event: "shutdown".into(), run_revision: run.revision, saved_at_ms: 1234,
+        });
+        Ok(())
+    }).unwrap();
+    let paused = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+    let read = || planner_workflow::operate(&f.shared, SID, None,
+        Operation::Status { offset: 0, work_id: None });
+    let before: serde_json::Value = serde_json::from_str(&read().await.unwrap()).unwrap();
+    assert_eq!(before["execution"]["run_status"], "paused");
+    let mut resume = PromptRequest::new(SID, vec![ContentBlock::from("implement")]);
+    planner_workflow::user_command(&f.shared, SID, &mut resume).unwrap();
+    let after: serde_json::Value = serde_json::from_str(&read().await.unwrap()).unwrap();
+    assert_eq!(after["execution"]["run_status"], "running");
+    assert!(after["execution"]["run_revision"].as_u64().unwrap() > paused.revision);
+    assert_ne!(after["execution"]["input_id"], before["execution"]["input_id"]);
+    assert_eq!(after["execution"]["last_checkpoint"], before["execution"]["last_checkpoint"]);
+    assert_eq!(after["execution"]["last_checkpoint"]["event"], "shutdown");
+    assert_eq!(after["execution"]["last_checkpoint"]["saved_at_ms"], 1234);
+}
+
 #[test]
 fn audit_dependency_readiness_follows_the_native_dependency_gate() {
     let f = fixture(|_| {});

@@ -1415,6 +1415,10 @@ fold or watcher cannot hold a later finished admission check's result; remaining
 operations stay owned across that continuation and automatic router wakes. A failed
 terminal wait or output RPC also retains ownership: the error is reported, and a
 subsequent turn collects the existing operations without restarting or killing them.
+Execution receipts exposed in status and wakes include the current run state and
+revision beside the historical checkpoint. A resumed run therefore remains
+distinguishable from its earlier shutdown without deleting recovery evidence or
+treating a wake as new operator authorization.
 Audit freshness starts when the host answers, so time spent collecting observations
 does not immediately expire a pending CI wait. Recovery prompts use the repository's
 exact CI handoff instead of asking workers to poll within a turn; failed, changed,
