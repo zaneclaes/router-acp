@@ -13596,7 +13596,10 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
     let repo = tempfile::tempdir().unwrap();
     let dir = repo.path().join(".agents/skills/implement");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("SKILL.md"), "REPOSITORY-WORK-SENTINEL").unwrap();
+    let duty = "PARENT-DUTY: deploy and verify staging within the admitted scope and existing gates.";
+    let restriction = "SCOPE-LIMIT: production publication is excluded; preserve every review refusal.";
+    let contract = format!("{duty}\n{restriction}");
+    std::fs::write(dir.join("SKILL.md"), &contract).unwrap();
     let log = temp_log("auto-opt-in");
     let state = temp_state_file("auto-opt-in");
     let yaml = format!(
@@ -13634,10 +13637,19 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
                 .all(|p| !p.contains("[router-acp planner role")),
             "no planner role reached the provider"
         );
+        assert!(planner_user_prompts(&log).iter().all(|p| !p.contains(duty) && !p.contains(restriction)),
+            "an uninvoked repository skill grants no workflow scope");
+        cx.send_request(PromptRequest::new(sid.clone(), vec![ContentBlock::from("/implement an agent claim")])
+            .meta(serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(
+                serde_json::json!({"router_acp":{"agent_origin":true}})).unwrap()))
+            .block_task().await?;
+        assert!(router_acp::planner_workflow::load(&shared, &sid).unwrap().is_none(),
+            "an agent claim cannot admit the repository implementation contract");
+        let expanded = format!("<turn-context>\nnow\n</turn-context>\n# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\n{contract}\n\nARGUMENTS: Docs/Plans/X.md\n\n## Supporting Files\n\nSkill directory: x\n");
         prompt_text(
             &cx,
             &sid,
-            "<turn-context>\nnow\n</turn-context>\n# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\nREPOSITORY-WORK-SENTINEL\n\nARGUMENTS: Docs/Plans/X.md\n\n## Supporting Files\n\nSkill directory: x\n",
+            &expanded,
         )
         .await?;
         assert_eq!(
@@ -13653,6 +13665,9 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
         assert!(last.contains("[router-acp planner role: select-plan]"), "{last}");
         assert!(last.contains("Arguments: Docs/Plans/X.md"), "{last}");
         assert!(!last.contains("# Loaded Skill"), "{last}");
+        assert_eq!(last.matches(duty).count(), 1, "explicit parent duty is delivered once");
+        assert_eq!(last.matches(restriction).count(), 1, "explicit restrictive scope is delivered once");
+        assert!(!last.contains("[router-acp planner role: implement-work]"));
         Ok(())
     })
     .await;
