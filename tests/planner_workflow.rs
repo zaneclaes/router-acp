@@ -218,8 +218,8 @@ async fn status_execution_context_is_unpaginated_and_requires_human_admission() 
 #[tokio::test]
 async fn execution_context_distinguishes_resumed_run_from_shutdown_checkpoint() {
     let f = fixture(|_| {});
-    let mut start = PromptRequest::new(SID, vec![ContentBlock::from("implement")]);
-    planner_workflow::user_command(&f.shared, SID, &mut start).unwrap();
+    let mut start = PromptRequest::new(SID, vec![ContentBlock::from("/implement")]);
+    assert!(planner_workflow::user_command(&f.shared, SID, &mut start).unwrap().is_some());
     planner_workflow::mutate(&f.shared, SID, |run| {
         run.status = RunStatus::Paused;
         run.checkpoint = Some(planner_workflow::CheckpointReceipt {
@@ -232,8 +232,8 @@ async fn execution_context_distinguishes_resumed_run_from_shutdown_checkpoint() 
         Operation::Status { offset: 0, work_id: None });
     let before: serde_json::Value = serde_json::from_str(&read().await.unwrap()).unwrap();
     assert_eq!(before["execution"]["run_status"], "paused");
-    let mut resume = PromptRequest::new(SID, vec![ContentBlock::from("implement")]);
-    planner_workflow::user_command(&f.shared, SID, &mut resume).unwrap();
+    let mut resume = PromptRequest::new(SID, vec![ContentBlock::from("/implement")]);
+    assert!(planner_workflow::user_command(&f.shared, SID, &mut resume).unwrap().is_some());
     let after: serde_json::Value = serde_json::from_str(&read().await.unwrap()).unwrap();
     assert_eq!(after["execution"]["run_status"], "running");
     assert!(after["execution"]["run_revision"].as_u64().unwrap() > paused.revision);
