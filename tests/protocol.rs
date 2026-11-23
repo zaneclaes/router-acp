@@ -16246,7 +16246,8 @@ async fn planner_handoff_backstop_interrupts_a_long_parent_turn() {
         prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
         let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
         // The mock's turn would hold for 60 s; the backstop must not wait for it.
-        let turn = prompt_text(&cx, &sid, &format!("CONTEXT:950/1000\nWAIT_FILE:{}", never.display()));
+        let long_turn = format!("CONTEXT:950/1000\nWAIT_FILE:{}", never.display());
+        let turn = prompt_text(&cx, &sid, &long_turn);
         let replaced = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != pin.downstream_sid).unwrap_or(false) { break; }
