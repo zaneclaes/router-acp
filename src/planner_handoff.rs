@@ -831,7 +831,13 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     routing["strategy"] = json!(prepared.selection.strategy.as_str());
     routing["reason"] = json!(prepared.selection.reason);
     routing["user_pick"] = json!(prepared.selection.user_pick);
-    routing["effort"] = json!(prepared.effort);
+    routing["effort"] = json!({
+        "requested": prepared.selection.effort.map(|level| level.as_str()),
+        "resolved": prepared.effort.as_ref().and_then(|e| e.resolved.map(|level| level.as_str())),
+        "provider_value": prepared.effort.as_ref().and_then(|e| e.provider_value.clone()),
+        "confirmed": prepared.effort.as_ref().is_some_and(|e| e.confirmed),
+        "explicit": prepared.selection.explicit_effort,
+    });
     routing["parent_handoff"] = json!({"checkpoint_revision":run.revision,
         "from":prepared.old.downstream_sid,"to":prepared.opened.downstream_sid});
     persisted.routing = Some(routing);

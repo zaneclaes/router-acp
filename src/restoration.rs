@@ -143,7 +143,7 @@ pub(crate) fn retarget_config(
     shared: &Shared, sid: &str, persisted: &mut crate::state::PersistedSession,
     candidate: &CandidateId, user_pick: bool,
 ) -> Result<(), String> {
-    let mut config = shared.with_session(sid, SessionConfig::capture).ok_or("parent session missing")?;
+    let mut config = shared.with_session(sid, |s| SessionConfig::capture(s)).ok_or("parent session missing")?;
     config.candidate = Some(candidate.to_string());
     config.candidate_user_pick = user_pick;
     persisted.session_config = Some(serde_json::to_value(config).map_err(|e| e.to_string())?);
