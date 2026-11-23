@@ -13876,6 +13876,7 @@ async fn coordinator_implement_command_changes_workflow_without_changing_planner
             .unwrap();
         assert!(run.coordinator);
         assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+
         coordinator_prompt(&cx, &sid, "/plan refine").await?;
         assert_eq!(
             router_acp::planner_workflow::load(&shared, &sid)
@@ -14412,6 +14413,20 @@ async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
         assert!(run.coordinator);
         assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
 
+        // The durable invocation must survive even after it no longer fits in
+        // the bounded conversation digest sent to a fresh adapter.
+        for index in 0..70 {
+            shared.state.lock().unwrap().log(
+                &sid,
+                &router_acp::state::LogEntry {
+                    kind: "agent_response".into(),
+                    role: "agent".into(),
+                    summary: format!("Completed unrelated inspection {index}"),
+                    ..Default::default()
+                },
+            );
+        }
+
         cx.send_request(CloseSessionRequest::new(sid.clone()))
             .block_task()
             .await?;
@@ -14467,6 +14482,27 @@ async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
             restored.3,
             "resume does not claim confirmed effective effort before pinning"
         );
+        let current = "Resume local preparation only; the earlier publication refusal still applies.";
+        prompt_text(&cx, &sid, current).await?;
+        let events = read_log(&log);
+        let forwarded = events[mock_prompts(&log, current)[0]]["text"]
+            .as_str()
+            .unwrap();
+        assert!(forwarded.contains("<resumed-conversation-context>"));
+        assert!(!forwarded.contains("[Original user command:"), "original invocation aged out of the digest");
+        let execution: serde_json::Value = serde_json::from_str(
+            forwarded.split("[Recorded human execution request]\n")
+                .nth(1)
+                .expect("fresh restored adapter receives durable execution context")
+                .lines().next().unwrap(),
+        ).unwrap();
+        assert_eq!(execution["input_id"], run.execution_input_id.as_deref().unwrap());
+        assert_eq!(execution["origin"], "human");
+        assert_eq!(execution["command"], "implement");
+        assert_eq!(execution["arguments"], "resume the durable planner run");
+        assert_eq!(execution["run_status"], "running");
+        assert!(execution["run_revision"].as_u64().unwrap() >= run.revision);
+        assert!(forwarded.contains(current), "current restriction is retained verbatim");
         Ok(())
     })
     .await;
