@@ -6636,7 +6636,7 @@ async fn wait_for_managed_backgrounds(
                 .unwrap()
                 .entry(router_sid.to_string())
                 .or_default()
-                .extend(terminal_ids.into_iter().filter(|id| id != &completed));
+                .extend(terminal_ids.iter().filter(|id| *id != &completed).cloned());
             BackgroundWait::Completed(report, completed)
         }
         BackgroundWait::Woken(prompt) => {
