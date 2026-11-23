@@ -114,6 +114,8 @@ pub struct Runtime {
     preparing: bool,
     prepared: Option<Prepared>,
     pub(crate) cutting_over: bool,
+    /// The backstop is cancelling the parent's running turn so the cutover can start.
+    interrupting: bool,
     retry_at: Option<Instant>,
     dirty: bool,
     saving: bool,
@@ -164,6 +166,53 @@ impl Drop for ToolActivity {
     }
 }
 
+const BACKSTOP: &str = "context backstop";
+
+/// The share of an adapter-reported context `size` the handoff may spend: the adapter compacts
+/// on its own at `agents[].compaction_percent` of it (100 when unset), and the handoff exists to
+/// supersede that compaction, so every handoff percentage is a percentage of this budget.
+pub(crate) fn compaction_budget(size: u64, compaction_percent: Option<u8>) -> u64 {
+    size.saturating_mul(u64::from(compaction_percent.unwrap_or(100).clamp(1, 100))) / 100
+}
+
+/// Feed the parent's context usage from an ACP `usage_update`, only when it comes from the
+/// parent's active pin. Other downstreams also route to the parent's session (a standby or an
+/// earlier pin), and their numbers overwrote the parent's: Chordzy 2026-11-23, a Claude update
+/// (53k of 1M) landed one second before the Codex parent compacted at 241k of 258k.
+pub(crate) fn observe_usage(
+    shared: &Shared,
+    sid: &str,
+    key: &crate::downstream::ProcessKey,
+    down_sid: &str,
+    params: &serde_json::Value,
+) {
+    let Some(update) = params
+        .get("update")
+        .filter(|u| u.get("sessionUpdate").and_then(|k| k.as_str()) == Some("usage_update"))
+    else {
+        return;
+    };
+    let (Some(used), Some(size)) = (
+        update.get("used").and_then(|v| v.as_u64()),
+        update.get("size").and_then(|v| v.as_u64()),
+    ) else {
+        return;
+    };
+    let Some(agent) = shared
+        .with_session(sid, |s| {
+            s.pin
+                .as_ref()
+                .filter(|pin| &pin.process_key == key && pin.downstream_sid == down_sid)
+                .map(|pin| pin.candidate.agent.clone())
+        })
+        .flatten()
+    else {
+        return;
+    };
+    let budget = compaction_budget(size, shared.compaction_percent(&agent));
+    shared.with_session(sid, |s| s.parent_handoff.usage(used, budget));
+}
+
 impl Runtime {
     fn at(&self, percent: u8) -> bool {
         self.size > 0 && u128::from(self.used) * 100 >= u128::from(self.size) * u128::from(percent)
@@ -184,8 +233,12 @@ impl Runtime {
             .is_some_and(|p| p.enabled && self.at(p.backstop_percent))
         {
             // Sticky: provider compaction cannot erase an already due handoff.
-            self.due = Some("context backstop".into());
+            self.due = Some(BACKSTOP.into());
         }
+    }
+
+    fn backstop_due(&self) -> bool {
+        self.due.as_deref() == Some(BACKSTOP)
     }
 
     fn opportunity(&mut self, reason: String) {
@@ -258,7 +311,8 @@ pub(crate) fn status(shared: &Shared, sid: &str) -> serde_json::Value {
             json!({"enabled":h.policy.as_ref().is_some_and(|p| p.enabled),
             "used":h.used,"capacity":h.size,"usage_known":h.size > 0,
             "due":h.due,"preparing":h.preparing,"prepared":h.prepared.is_some(),
-            "cutting_over":h.cutting_over,"last_error":h.last_error,"last_handoff":h.receipt})
+            "cutting_over":h.cutting_over,"interrupting":h.interrupting,
+            "last_error":h.last_error,"last_handoff":h.receipt})
         })
         .unwrap_or(serde_json::Value::Null)
 }
@@ -431,6 +485,38 @@ pub(crate) fn tick(shared: &Arc<Shared>, sid: &str, run: &PlannerRun) -> bool {
             }
         });
     }
+    // The backstop supersedes the adapter's own compaction, which runs mid-turn. Waiting for a
+    // turn boundary let a long Codex turn compact first (Chordzy 2026-11-23, twice), so a parent
+    // that reaches the backstop inside a turn is interrupted as soon as its standby is ready. The
+    // cancelled turn's wakes stay pending and go to the new parent.
+    let interrupt = shared
+        .with_session(sid, |s| {
+            let h = &mut s.parent_handoff;
+            if h.interrupting
+                || h.cutting_over
+                || !h.backstop_due()
+                || h.prepared.is_none()
+                || h.retry_at.is_some_and(|at| at > now)
+                || s.prompt_activity == 0
+            {
+                return false;
+            }
+            h.interrupting = true;
+            true
+        })
+        .unwrap_or(false);
+    if interrupt {
+        let shared = shared.clone();
+        let sid = sid.to_string();
+        tokio::spawn(async move {
+            tracing::warn!(session = sid, "context backstop reached mid-turn: interrupting the parent for its handoff");
+            let ended = crate::planner_preempt::preempt(&shared, &sid).await;
+            shared.with_session(&sid, |s| s.parent_handoff.interrupting = false);
+            if !ended {
+                error(&shared, &sid, "the parent turn did not end after the backstop interrupted it");
+            }
+        });
+    }
     let start = run.approval_waits.is_empty()
         && !crate::planner_watchdog::tools_in_flight(shared, sid)
         && shared
@@ -487,8 +573,11 @@ pub(crate) fn tick(shared: &Arc<Shared>, sid: &str, run: &PlannerRun) -> bool {
     } else {
         save_continuously(shared, sid, run, &policy);
     }
+    // An interrupted parent stays reserved: no new wake turn may start before its cutover.
     shared
-        .with_session(sid, |s| s.parent_handoff.cutting_over)
+        .with_session(sid, |s| {
+            s.parent_handoff.cutting_over || s.parent_handoff.interrupting
+        })
         .unwrap_or(false)
 }
 
@@ -978,6 +1067,26 @@ mod tests {
         assert!(h.due.is_some());
         h.usage(u64::MAX, u64::MAX);
         assert!(h.at(95));
+    }
+    /// 2026-11-23 (operator): "the handoff must happen before auto-compaction no matter what".
+    /// Codex compacted at a reported 238922 of 258400 (92.5%), below a 95% backstop of `size`.
+    #[test]
+    fn handoff_percentages_measure_the_adapter_compaction_budget() {
+        assert_eq!(compaction_budget(1000, None), 1000);
+        assert_eq!(compaction_budget(1000, Some(0)), 10);
+        let budget = compaction_budget(258_400, Some(92));
+        assert_eq!(budget, 237_728);
+        let mut h = Runtime {
+            policy: Some(Policy {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        h.usage(230_000, 258_400);
+        assert!(!h.backstop_due(), "89% of the raw size: the old measure never fired before compaction");
+        h.usage(230_000, budget);
+        assert!(h.backstop_due(), "97% of the compaction budget");
     }
     #[test]
     fn policy_rejects_bad_thresholds_and_unknown_points() {

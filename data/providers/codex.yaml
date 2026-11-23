@@ -50,6 +50,13 @@ mode_map:
   approve: agent
   chat: read-only
   preclass: read-only
+# Where Codex compacts on its own, as a share of the `size` codex-acp reports (the effective window,
+# 95% of the raw one). Codex clamps its auto-compaction limit to 90% of the raw window (94.7% of
+# `size`) and measures it on its own estimate, which runs ahead of the reported `used`. Chordzy
+# 2026-11-23, gpt-6.2-astra (size 258400): a reported 237824 did not compact, 238922 did (92.5%),
+# and so did 241120. So a 95% handoff backstop of `size` could never fire first. The handoff
+# percentages are measured against this budget instead.
+compaction_percent: 92
 lineage: codex
 discovery:
   retire_grace_releases: 1

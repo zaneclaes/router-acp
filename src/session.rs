@@ -930,6 +930,17 @@ impl Shared {
         self.account_config.lock().unwrap().agents.clone()
     }
 
+    /// `agents[].compaction_percent` of one agent, without cloning the agent list.
+    pub fn compaction_percent(&self, agent: &str) -> Option<u8> {
+        self.account_config
+            .lock()
+            .unwrap()
+            .agents
+            .iter()
+            .find(|a| a.name == agent)
+            .and_then(|a| a.compaction_percent)
+    }
+
     pub fn runtime_config(&self) -> Config {
         self.account_config.lock().unwrap().clone()
     }
@@ -2283,10 +2294,8 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
             })
         }
         "usage_update" => {
-            let used = update.get("used").and_then(|u| u.as_u64());
-            if let (Some(used), Some(size)) = (used, update.get("size").and_then(Value::as_u64)) {
-                shared.with_session(router_sid, |s| s.parent_handoff.usage(used, size));
-            }
+            // The parent handoff reads usage only from the active pin (`planner_handoff::observe_usage`
+            // at the primary route), never from this shared log, which also carries other downstreams.
             // The adapter reports authoritative cumulative cost in USD — capture
             // it instead of relying on text-estimated tokens.
             let cost = update
@@ -3184,6 +3193,13 @@ pub fn handle_downstream_dispatch(
                             }
                         }
                     }
+                    crate::planner_handoff::observe_usage(
+                        shared,
+                        &router_sid,
+                        key,
+                        &down_sid,
+                        msg.params(),
+                    );
                     // Log tool calls / usage updates for observability.
                     log_downstream_event(shared, &router_sid, msg.params());
                 }

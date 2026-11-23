@@ -16228,6 +16228,39 @@ async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
     }).await;
 }
 
+/// 2026-11-23 (operator): "the handoff must happen before auto-compaction no matter what". Codex
+/// compacts mid-turn, so a parent that reaches the backstop inside a long turn is interrupted and
+/// replaced instead of waiting for a turn boundary that comes after the compaction.
+#[tokio::test]
+async fn planner_handoff_backstop_interrupts_a_long_parent_turn() {
+    let state = temp_state_file("planner-handoff-interrupt");
+    let log = temp_log("planner-handoff-interrupt");
+    let repo = planner_wire_repository();
+    let never = repo.path().join("never-released");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo"))).block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        // The mock's turn would hold for 60 s; the backstop must not wait for it.
+        let turn = prompt_text(&cx, &sid, &format!("CONTEXT:950/1000\nWAIT_FILE:{}", never.display()));
+        let replaced = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != pin.downstream_sid).unwrap_or(false) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (reply, replaced) = tokio::join!(turn, replaced);
+        replaced.expect("the backstop waited for the long turn instead of interrupting it");
+        assert_eq!(reply?.stop_reason, StopReason::Cancelled);
+        assert!(!never.exists());
+        Ok(())
+    }).await;
+}
+
 #[tokio::test]
 async fn planner_handoff_failed_checkpoint_keeps_the_parent_usable() {
     let state = temp_state_file("planner-handoff-refused");

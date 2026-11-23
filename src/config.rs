@@ -966,6 +966,12 @@ pub struct AgentConfig {
     /// post-pin mode changes.
     #[serde(default)]
     pub mode_map: std::collections::HashMap<String, String>,
+    /// The share of the adapter-reported context `size` (ACP `usage_update`) at which the
+    /// adapter compacts on its own. A planner parent's context handoff percentages are measured
+    /// against this budget, not the raw size, so the handoff always runs before the adapter's
+    /// compaction. Unset means 100. The provider preset states each adapter's real point.
+    #[serde(default)]
+    pub compaction_percent: Option<u8>,
     /// Optional provider usage source for proactive cordoning (see
     /// `CordonConfig`). When set, the router periodically reads this provider's
     /// usage caps and cordons this agent's candidates that are exhausted.
@@ -2462,6 +2468,12 @@ impl Config {
         }
         let mut names = HashSet::new();
         for agent in &self.agents {
+            if agent.compaction_percent.is_some_and(|p| p == 0 || p > 100) {
+                return Err(ConfigError(format!(
+                    "agent `{}`: compaction_percent must be between 1 and 100",
+                    agent.name
+                )));
+            }
             for (window, reserve) in [
                 ("weekly", agent.reserve_capacity.weekly),
                 ("session", agent.reserve_capacity.session),
@@ -3080,6 +3092,17 @@ agents:
         assert_eq!(cleared.default_mode, None);
         let chat = Config::from_yaml("default_mode: chat\nagents:\n- name: codex@one\n").unwrap();
         assert_eq!(chat.default_mode.as_deref(), Some("chat"));
+    }
+
+    /// Codex compacts at about 92% of the size codex-acp reports; the preset says so, an agent
+    /// entry may override it, and an impossible value is refused.
+    #[test]
+    fn codex_preset_states_where_codex_compacts() {
+        let cfg = Config::from_yaml("agents:\n- name: codex@one\n").unwrap();
+        assert_eq!(cfg.agents[0].compaction_percent, Some(92));
+        let own = Config::from_yaml("agents:\n- name: codex@one\n  compaction_percent: 88\n").unwrap();
+        assert_eq!(own.agents[0].compaction_percent, Some(88));
+        assert!(Config::from_yaml("agents:\n- name: codex@one\n  compaction_percent: 101\n").is_err());
     }
 
     #[test]
