@@ -6638,7 +6638,7 @@ async fn wait_for_managed_backgrounds(
             // A transport failure says nothing about the operation's lifetime.
             // Keep it owned so the next turn can collect it without restarting it.
             shared.managed_backgrounds.lock().unwrap()
-                .entry(router_sid.to_string()).or_default().extend(terminal_ids);
+                .entry(router_sid.to_string()).or_default().extend(terminal_ids.iter().cloned());
             return Err(error);
         }
     };
