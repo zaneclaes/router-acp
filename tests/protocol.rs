@@ -16019,7 +16019,7 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
     .await;
 }
 
-fn parent_reranking_yaml(state: &Path, log: &Path) -> String {
+fn parent_reranking_yaml(state: &std::path::Path, log: &std::path::Path) -> String {
     format!("state_file: {}\nrouter: planner\ndelegation: {{ enabled: true, max_concurrent: 1 }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*', 'other/*']\n    implementation_candidates: ['plan/*']\n    model_boosts: [{{ pattern: '*opus*', planning: 2 }}]\n    handoff: {{ enabled: true, retry_seconds: 1 }}\nagents:\n{}{}",
         state.display(),
         agent_yaml("plan", &[("astra", 2)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1")]),
