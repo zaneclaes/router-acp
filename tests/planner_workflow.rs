@@ -218,7 +218,8 @@ async fn status_execution_context_is_unpaginated_and_requires_human_admission() 
 #[tokio::test]
 async fn execution_context_distinguishes_resumed_run_from_shutdown_checkpoint() {
     let f = fixture(|_| {});
-    authorize(&f.shared);
+    let mut start = PromptRequest::new(SID, vec![ContentBlock::from("implement")]);
+    planner_workflow::user_command(&f.shared, SID, &mut start).unwrap();
     planner_workflow::mutate(&f.shared, SID, |run| {
         run.status = RunStatus::Paused;
         run.checkpoint = Some(planner_workflow::CheckpointReceipt {
