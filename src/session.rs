@@ -2296,6 +2296,7 @@ fn log_downstream_event(shared: &Arc<Shared>, router_sid: &str, params: &serde_j
         "usage_update" => {
             // The parent handoff reads usage only from the active pin (`planner_handoff::observe_usage`
             // at the primary route), never from this shared log, which also carries other downstreams.
+            let used = update.get("used").and_then(|u| u.as_u64());
             // The adapter reports authoritative cumulative cost in USD — capture
             // it instead of relying on text-estimated tokens.
             let cost = update
