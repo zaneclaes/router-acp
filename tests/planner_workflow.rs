@@ -1132,6 +1132,53 @@ fn policy_snapshot_survives_policy_source_and_config_change() {
 }
 
 #[tokio::test]
+async fn worker_brief_preserves_current_custody_without_replaying_archived_specs() {
+    let fixture = fixture(|_| {});
+    let mut current = work("work-1");
+    current.scope = "Implement the current approved scope".into();
+    admit(&fixture.shared, current.clone());
+    let revision = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let mut archived = current.clone();
+    archived.scope = "superseded-assignment-content ".repeat(50_000);
+    planner_workflow::mutate(&fixture.shared, SID, |run| {
+        let reconciliation = &mut run.works.get_mut("work-1").unwrap().reconciliation;
+        reconciliation.source_revision = Some(revision.clone());
+        reconciliation.evidence = vec!["Preserve the reconciled product changes".into()];
+        reconciliation.prior_specs.push(archived.clone());
+        reconciliation
+            .prior_completions
+            .push(planner_workflow::CompletionRecord {
+                spec: archived.clone(),
+                status: WorkStatus::Integrated,
+                artifact: None,
+                review: None,
+                finish: None,
+                integration: None,
+            });
+        Ok(())
+    })
+    .unwrap();
+    let (_, _, _, instructions) = planner_workflow::begin_work(&fixture.shared, SID, "work-1")
+        .await
+        .unwrap();
+    assert!(instructions.contains(&current.scope));
+    assert!(instructions.contains(&revision));
+    assert!(instructions.contains("Preserve the reconciled product changes"));
+    assert!(!instructions.contains("superseded-assignment-content"));
+    // This is the adapter's actual input-size boundary, not a runtime budget.
+    assert!(instructions.chars().count() < 1_048_576);
+    let saved = planner_workflow::load(&fixture.shared, SID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.works["work-1"].spec, current);
+    let reconciliation = &saved.works["work-1"].reconciliation;
+    assert_eq!(reconciliation.prior_specs, vec![archived.clone()]);
+    assert_eq!(reconciliation.prior_completions.len(), 1);
+    assert_eq!(reconciliation.prior_completions[0].spec, archived);
+    assert_eq!(reconciliation.source_revision.as_ref(), Some(&revision));
+}
+
+#[tokio::test]
 async fn return_to_planning_preserves_active_work_but_stops_new_dispatch() {
     let fixture = fixture(|_| {});
     admit(&fixture.shared, work("work-1"));

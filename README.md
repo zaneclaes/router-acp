@@ -835,6 +835,11 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   completed native adoption does not write planner state, so that allocation cannot invalidate
   its own reconciliation revision on every retry. First adoption still uses the existing claim.
 
+  Worker assignment briefs carry the current scope, source revision and reconciliation
+  evidence. Superseded specifications and completion records remain in the planner ledger;
+  only their counts enter the brief. Resuming a repeatedly reconciled work therefore does
+  not replay its growing archive into the adapter's prompt or discard its source custody.
+
   A workspace claimed before its worker attempt starts can pass to a new coordinator
   after the old run is paused and its recorded process identity is verified dead.
   Missing owner evidence, malformed attempts, a live owner or a running run keep the claim fenced.

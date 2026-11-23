@@ -3154,7 +3154,17 @@ async fn begin_work_once(
         }
     }
     instructions.push_str(&format!("\n[Durable assignment]\nwork_id: {work_id}\nattempt_id: {attempt_id}\nchild_id: {}\nplan_id: {}\nAssigned scope: {}\nRequired checks: {:?}\nPrior evidence: {:?}\nPrior corrections: {:?}\nPrior output: {:?}\n", snapshot.child_id, snapshot.spec.plan_id, snapshot.spec.scope, snapshot.spec.required_checks, snapshot.artifact, snapshot.review, snapshot.last_output));
-    instructions.push_str(&format!("\n[Current source custody]\n{}\nThis current assignment supersedes older briefs. Preserve and carry its source revision; do not reset transferred changes as foreign work.\n", serde_json::to_string(&snapshot.reconciliation).map_err(|e| e.to_string())?));
+    // Superseded specifications and completion records stay in the durable ledger.
+    // Replaying that archive into every new assignment made a resumed worker's
+    // prompt exceed the adapter's input limit even though its current scope was small.
+    let custody = json!({
+        "required": snapshot.reconciliation.required,
+        "source_revision": snapshot.reconciliation.source_revision,
+        "evidence": snapshot.reconciliation.evidence,
+        "prior_spec_count": snapshot.reconciliation.prior_specs.len(),
+        "prior_completion_count": snapshot.reconciliation.prior_completions.len(),
+    });
+    instructions.push_str(&format!("\n[Current source custody]\n{custody}\nThis current assignment supersedes older briefs. Preserve and carry its source revision; do not reset transferred changes as foreign work. Superseded specifications and completion records remain in the planner ledger; they are not the current assignment.\n"));
     if role == PlannerRole::ImplementWork {
         instructions.push_str(&related_source_context(&run, &snapshot));
     }
