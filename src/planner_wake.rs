@@ -234,7 +234,7 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 // wake is retried on a capped backoff, not dropped.
                 if run.status != RunStatus::Running
                     || !run.approval_waits.is_empty()
-                    || (!queued_input && !run.wakes.values().any(|w| !w.acknowledged))
+                    || (!queued_input && run.pending_wakes().next().is_none())
                 {
                     observe_delivery(&shared, &sid, "run-or-approval-gate", None);
                     continue;
@@ -948,7 +948,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         || crate::planner_capacity::human_hold(run).is_some()
         || !run.approval_waits.is_empty()
         || !run.parent_queue.is_empty()
-        || run.wakes.values().any(|w| !w.acknowledged)
+        || run.pending_wakes().next().is_some()
         // Capacity wakes own an idle parent while the host lists unheld
         // candidates or cannot answer; the heartbeat stays for "no work".
         || crate::planner_capacity::supersedes_heartbeat(shared, run, now * 1000)
@@ -993,7 +993,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         idle / 60
     );
     let _ = planner_workflow::mutate(shared, sid, |run| {
-        if run.wakes.values().any(|w| !w.acknowledged) {
+        if run.pending_wakes().next().is_some() {
             return Ok(());
         }
         run.idle_heartbeats += 1;
@@ -1280,7 +1280,10 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         }
         // Keep every durable wake, but actionable release/review transitions
         // lead repetitive capacity reminders. Operator input always wins.
-        let mut ordered = run.wakes.keys().cloned().collect::<Vec<_>>();
+        let mut ordered = run
+            .pending_wakes()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
         ordered.sort_by_key(|id| {
             delivery_priority(
                 id,
@@ -1291,7 +1294,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         });
         for id in ordered {
             let wake = run.wakes.get_mut(&id).expect("listed above");
-            if wake.acknowledged || wake.retry_after > now {
+            if wake.retry_after > now {
                 continue;
             }
             if wake.claim_pid != 0 {

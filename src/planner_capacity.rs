@@ -663,12 +663,17 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     // Custody fences the affected assignment, not the entire queue. Keep its
     // recovery wake without starving independent capacity or release/audit wakes.
     // Admission and dispatch still enforce source ownership and dependencies.
-    if run.works.iter().any(|(id, work)| {
-        work.reconciliation.required && !run.wakes.contains_key(&format!("recovery:{id}"))
-    }) {
+    let needs_wake = |work: &planner_workflow::Work| {
+        work.reconciliation.required && !work.status.dormant_disposition()
+    };
+    if run
+        .works
+        .iter()
+        .any(|(id, work)| needs_wake(work) && !run.wakes.contains_key(&format!("recovery:{id}")))
+    {
         let _ = planner_workflow::mutate(shared, sid, |current| {
             for (id, work) in &current.works {
-                if work.reconciliation.required {
+                if needs_wake(work) {
                     current.wakes.entry(format!("recovery:{id}")).or_insert_with(|| Wake {
                         work_id: id.clone(),
                         reason: "Parent reconciliation required before resuming this adopted assignment: review current scope, source and CONTINUE, then record planner_workflow reconcile. Independent admissions and releases continue under their normal ownership, dependency and evidence gates.".into(),
@@ -1357,7 +1362,7 @@ fn inflight_wake(
         let due = !inflight.is_empty()
             && idle >= timing.wake_after_secs as i64
             && now - run.capacity.last_inflight_wake_at >= timing.inflight_wake_secs as i64
-            && !run.wakes.values().any(|w| !w.acknowledged);
+            && run.pending_wakes().next().is_none();
         due.then_some(inflight)
     };
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {

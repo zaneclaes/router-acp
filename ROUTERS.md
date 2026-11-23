@@ -445,6 +445,11 @@ can reconcile that same work identity with its corrected brief and preserved sou
 revision. Reconciliation retries the normal allocator and verifies source custody
 before accepting the assignment. A work that already has a workspace must retain
 and restore that original workspace; reconciliation never replaces it.
+An ended worker whose only release memberships are disposed or abandoned can
+resume its unchanged assignment from an exact, clean, pushed source revision.
+If a recorded source pin differs from the artifact, the artifact must belong to
+a closed round and its revision must be an ancestor of the pinned source.
+Reconciliation leaves the historical release receipts intact.
 If the capacity host reoffers an adopted assignment that still requires reconciliation,
 the router names that prerequisite in its capacity wake instead of attempting automatic
 admission. Once reconciliation succeeds, the same candidate becomes eligible normally,

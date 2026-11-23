@@ -19,6 +19,12 @@ specs, fences the old child and invalidates stale acceptance. Dispatch and artif
 source ancestry again. Both fresh and continued prompts include current scope and custody.
 Never treat a checkpoint note or copied files as an updated assignment.
 
+For unfinished work, a disposed or abandoned release is historical membership.
+The parent can reconcile custody after the old attempt ends if the WorkSpec is
+unchanged and the preserved revision is still the exact clean worktree HEAD and
+origin branch tip. Any membership in an open or failed round blocks this path.
+Reconciliation leaves release checkpoints and proof receipts intact.
+
 Parent `retire {key, work_id, reason, evidence}` is a terminal disposition for obsolete work,
 not successful integration. It requires an ended attempt, no frozen release membership and a
 host response `{"verified_action":"retire"}` after checking the trusted assignment and parent
