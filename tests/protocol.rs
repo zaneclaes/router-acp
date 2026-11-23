@@ -16019,6 +16019,87 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
     .await;
 }
 
+fn parent_reranking_yaml(state: &Path, log: &Path) -> String {
+    format!("state_file: {}\nrouter: planner\ndelegation: {{ enabled: true, max_concurrent: 1 }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*', 'other/*']\n    implementation_candidates: ['plan/*']\n    model_boosts: [{{ pattern: '*opus*', planning: 2 }}]\n    handoff: {{ enabled: true, retry_seconds: 1 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("plan", &[("astra", 2)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1")]),
+        agent_yaml("other", &[("opus", 1)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1")]))
+}
+
+#[tokio::test]
+async fn resumed_automatic_parent_reranks_recovered_models_and_honors_current_pick() {
+    for control in ["recovered", "cordoned", "incoming-pick"] {
+        let state = temp_state_file(&format!("parent-rerank-{control}"));
+        let log = temp_log(&format!("parent-rerank-{control}"));
+        let repo = planner_wire_repository();
+        run_test_shared(parent_reranking_yaml(&state, &log), async |cx, _, shared| {
+            init(&cx).await?;
+            let opus = CandidateId::new("other", "opus");
+            shared.headroom.lock().unwrap().set_usage_cordons(
+                [(opus.clone(), epic_cordon("temporarily unavailable"))].into_iter().collect());
+            let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task().await?.session_id.0.to_string();
+            prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+            assert_eq!(pinned(&shared, &sid), CandidateId::new("plan", "astra"));
+            assert!(!shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+            cx.send_request(CloseSessionRequest::new(sid.clone())).block_task().await?;
+            if control != "cordoned" {
+                shared.headroom.lock().unwrap().set_usage_cordons(Default::default());
+            }
+            cx.send_request(agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(), repo.path().join("repo"))).block_task().await?;
+            prompt_text(&cx, &sid, if control == "incoming-pick" {
+                "[router: candidate=plan/astra]\nContinue local review."
+            } else { "Continue local review." }).await?;
+            let expected = if control == "recovered" { opus } else { CandidateId::new("plan", "astra") };
+            assert_eq!(pinned(&shared, &sid), expected, "resume control: {control}");
+            assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+            Ok(())
+        }).await;
+    }
+}
+
+#[tokio::test]
+async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
+    let state = temp_state_file("parent-rerank-prewarm");
+    let log = temp_log("parent-rerank-prewarm");
+    let repo = planner_wire_repository();
+    run_test_shared(parent_reranking_yaml(&state, &log), async |cx, _, shared| {
+        init(&cx).await?;
+        let opus = CandidateId::new("other", "opus");
+        shared.headroom.lock().unwrap().set_usage_cordons(
+            [(opus.clone(), epic_cordon("temporarily unavailable"))].into_iter().collect());
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+        let old = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:700/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(&shared, &sid, None,
+                    router_acp::planner_workflow::Operation::Status { offset: 0, work_id: None }).await.unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["prepared"] == true { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("standby never prewarmed");
+        shared.headroom.lock().unwrap().set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != old.downstream_sid).unwrap() { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("handoff never completed");
+        assert_eq!(pinned(&shared, &sid), opus, "cutover must use current availability, not prewarm's old winner");
+        let persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        assert_eq!(persisted.agent, "other");
+        assert_eq!(persisted.model, "opus");
+        assert_eq!(persisted.prior_session_id.as_deref(), Some(old.downstream_sid.as_str()));
+        Ok(())
+    }).await;
+}
+
 /// A fresh downstream parent must retain the same live worker, logical run and
 /// watcher state. No shutdown/adoption or outgoing summary prompt is involved.
 #[tokio::test]
