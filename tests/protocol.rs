@@ -455,7 +455,7 @@ where
                         }
                         let held = {
                             let state = observed.lock().unwrap();
-                            state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0 == "managed-terminal-1"
+                            state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0.as_ref() == "managed-terminal-1"
                         };
                         if !held {
                             return responder.respond(WaitForTerminalExitResponse::new(
@@ -465,7 +465,7 @@ where
                         cx.spawn(async move {
                             while {
                                 let state = observed.lock().unwrap();
-                                (state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0 == "managed-terminal-1")
+                                (state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0.as_ref() == "managed-terminal-1")
                                     && state.terminal_kills.is_empty()
                             } {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
