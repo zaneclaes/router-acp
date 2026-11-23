@@ -1529,7 +1529,7 @@ pub(crate) fn execution_context(run: &PlannerRun) -> Option<Value> {
 pub(crate) fn execution_context_block(run: &PlannerRun) -> Option<ContentBlock> {
     let execution = execution_context(run)?;
     Some(ContentBlock::from(format!(
-        "[Recorded human execution request]\n{execution}\nThis turn carries the recorded admitted request; it is not a new operator instruction. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it. The run_status and run_revision are current native state; last_checkpoint is historical. A shutdown checkpoint does not by itself mean a subsequently resumed running run is still paused. Reconcile the latest admitted input and current state before applying a historical shutdown; preserve actual later operator stops and action refusals."
+        "[Recorded human execution request]\n{execution}\nThis record describes the previously admitted request; the record itself is not a new operator instruction. The current incoming request follows and retains its own original provenance. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it. The run_status and run_revision are current native state; last_checkpoint is historical. A shutdown checkpoint does not by itself mean a subsequently resumed running run is still paused. Reconcile the latest admitted input and current state before applying a historical shutdown; preserve actual later operator stops and action refusals."
     )))
 }
 
