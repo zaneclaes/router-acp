@@ -203,6 +203,8 @@ impl Runtime {
 struct Prepared {
     shared: Weak<Shared>,
     old: PinInfo,
+    selection: session::ParentHandoffPlan,
+    effort: Option<crate::candidate::EffortResolution>,
     opened: OpenedSession,
     token: String,
     mode: Option<String>,
@@ -526,13 +528,10 @@ async fn prepare_parent(shared: &Arc<Shared>, sid: &str) -> Result<Prepared, Str
         })
         .ok_or("parent missing")?;
     let old = old.ok_or("parent is unpinned")?;
-    // Use the already-running process. Never repair/restart a shared adapter.
-    if shared.target_conn(&old.process_key).is_none() {
-        return Err("adapter unavailable".into());
-    }
-    let mut servers = session::mcp_servers_without_parent(shared, sid, &old.candidate, &mcp)
+    let selection = session::parent_handoff_plan(shared, sid).await.map_err(|e| e.to_string())?;
+    let mut servers = session::mcp_servers_without_parent(shared, sid, &selection.candidate, &mcp)
         .map_err(|e| e.to_string())?;
-    let (server, token) = crate::delegate_mcp::prepared_parent_server(shared, sid, &old.candidate)
+    let (server, token) = crate::delegate_mcp::prepared_parent_server(shared, sid, &selection.candidate)
         .ok_or("parent tools unavailable")?;
     servers.push(server);
     let mut cleanup = TokenCleanup {
@@ -540,10 +539,9 @@ async fn prepare_parent(shared: &Arc<Shared>, sid: &str) -> Result<Prepared, Str
         token: token.clone(),
         retained: false,
     };
-    let opened = session::open_downstream_session_at(
+    let opened = session::open_downstream_session(
         shared,
-        &old.candidate,
-        old.process_key.clone(),
+        &selection.candidate,
         cwd,
         dirs,
         servers,
@@ -554,9 +552,11 @@ async fn prepare_parent(shared: &Arc<Shared>, sid: &str) -> Result<Prepared, Str
     )
     .await
     .map_err(|e| e.to_string())?;
-    let prepared = Prepared {
+    let mut prepared = Prepared {
         shared: Arc::downgrade(shared),
         old,
+        selection,
+        effort: None,
         opened,
         token,
         mode,
@@ -575,7 +575,7 @@ async fn prepare_parent(shared: &Arc<Shared>, sid: &str) -> Result<Prepared, Str
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let id = session::resolve_mode_id(shared, &prepared.old.candidate.agent, mode, &modes)
+        let id = session::resolve_mode_id(shared, &prepared.selection.candidate.agent, mode, &modes)
             .ok_or("standby does not support the active permission mode")?;
         prepared
             .opened
@@ -588,6 +588,10 @@ async fn prepare_parent(shared: &Arc<Shared>, sid: &str) -> Result<Prepared, Str
             .await
             .map_err(|e| e.to_string())?;
     }
+    let (_, effort, _) = session::opened_session_effort(shared, sid,
+        &prepared.selection.candidate, &prepared.selection.profile, &prepared.opened)
+        .await.map_err(|e| e.to_string())?;
+    prepared.effort = effort;
     Ok(prepared)
 }
 
@@ -741,7 +745,8 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         return Err("run is not available for handoff".into());
     }
     let paths = checkpoint(shared, sid, &run, "handoff").await?;
-    // Reload after export: children and watchers may have advanced during it.
+    let current = session::parent_handoff_plan(shared, sid).await.map_err(|e| e.to_string())?;
+    // Reload after export and availability refresh: children and watchers may have advanced.
     // Never save the old snapshot back over live state or require workers to stop.
     let latest = planner_workflow::load(shared, sid)?.ok_or("run missing")?;
     if latest.status != RunStatus::Running || !latest.approval_waits.is_empty() {
@@ -763,6 +768,11 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
     if !still_current {
         return Err("parent route changed".into());
     }
+    if current.candidate != prepared.selection.candidate || current.user_pick != prepared.selection.user_pick
+        || current.effort != prepared.selection.effort || current.explicit_effort != prepared.selection.explicit_effort {
+        return Err("current routing winner changed; preparing a new standby".into());
+    }
+    prepared.selection = current;
     let source = match &shared.cfg.routers.planner.continuation {
         Some(path) => format!("Read {path} and use"),
         None => "Run state and the resume note are in the router state database; use".into(),
@@ -799,11 +809,34 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         .get(sid)
         .ok_or("parent persistence missing")?;
     persisted.prior_session_id = Some(prepared.old.downstream_sid.clone());
+    persisted.agent = prepared.selection.candidate.agent.clone();
+    persisted.model = prepared.selection.candidate.model.clone();
     persisted.downstream_session_id = prepared.opened.downstream_sid.clone();
+    // Keep durable session metadata (including goals); only the previous
+    // routing decision's transient evidence is obsolete.
     let mut routing = persisted.routing.take().unwrap_or_else(|| json!({}));
+    if let Some(fields) = routing.as_object_mut() {
+        for key in ["note", "ticket_enrichment_chars", "failover", "skipped", "cordoned",
+            "usage_cordons", "availability", "excluded", "cordon_redirect"] {
+            fields.remove(key);
+        }
+    }
+    routing["class"] = json!(prepared.selection.profile.class.as_str());
+    routing["complexity"] = json!(prepared.selection.profile.complexity);
+    routing["languages"] = json!(prepared.selection.profile.languages);
+    routing["coordinator"] = json!(true);
+    routing["planner_phase"] = json!(latest.phase);
+    routing["weights"] = json!(prepared.selection.weights);
+    routing["candidate"] = json!(prepared.selection.candidate.to_string());
+    routing["strategy"] = json!(prepared.selection.strategy.as_str());
+    routing["reason"] = json!(prepared.selection.reason);
+    routing["user_pick"] = json!(prepared.selection.user_pick);
+    routing["effort"] = json!(prepared.effort);
     routing["parent_handoff"] = json!({"checkpoint_revision":run.revision,
         "from":prepared.old.downstream_sid,"to":prepared.opened.downstream_sid});
     persisted.routing = Some(routing);
+    crate::restoration::retarget_config(shared, sid, &mut persisted,
+        &prepared.selection.candidate, prepared.selection.user_pick)?;
     if !shared
         .delegate_tokens
         .lock()
@@ -829,9 +862,10 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             router_sid: sid.into(),
         },
     );
+    let pin_quality = shared.scores_for(sid, &prepared.selection.candidate).quality(prepared.selection.profile.class);
     shared.with_session(sid, |s| {
         s.pin = Some(PinInfo {
-            candidate: prepared.old.candidate.clone(),
+            candidate: prepared.selection.candidate.clone(),
             process_key: prepared.opened.process_key.clone(),
             downstream_sid: prepared.opened.downstream_sid.clone(),
             available_modes: prepared
@@ -847,14 +881,20 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
                 .unwrap_or_default(),
         });
         s.delegate_token = Some(prepared.token.clone());
+        s.pin_user_pick = prepared.selection.user_pick;
+        s.pinned_quality = pin_quality;
+        if !prepared.selection.user_pick {
+            s.candidate_override = None;
+            s.candidate_override_source = None;
+        }
         s.pending_context = Some(seed);
         s.pending_history.clear();
         s.delegation_directive_active = false;
         if shared.cfg.delegation.inject_prompt {
-            s.pending_delegation_directive = Some(prepared.old.candidate.clone());
+            s.pending_delegation_directive = Some(prepared.selection.candidate.clone());
         }
         s.native_effort_options = prepared.opened.config_options.clone();
-        session::refresh_pinned_effort(&shared.runtime_config(), &shared.scores, s);
+        s.resolved_effort = prepared.effort.clone();
         s.parent_handoff.receipt = Some(HandoffReceipt {
             before_used: s.parent_handoff.used,
             capacity: s.parent_handoff.size,
@@ -883,10 +923,10 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             previous_downstream_session_id: prepared.old.downstream_sid.clone(),
             previous_candidate: prepared.old.candidate.to_string(),
             downstream_session_id: prepared.opened.downstream_sid.clone(),
-            candidate: prepared.old.candidate.to_string(),
+            candidate: prepared.selection.candidate.to_string(),
             lineage: session::agent_lineage(
                 &shared.runtime_config(),
-                &prepared.old.candidate.agent,
+                &prepared.selection.candidate.agent,
             ),
             reason: "deterministic context handoff".into(),
             router_pid,
@@ -897,8 +937,8 @@ async fn cutover(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         shared,
         sid,
         format!(
-            "router-acp · parent context refreshed — {reason}; model {}; existing children and watchers retained",
-            prepared.old.candidate
+            "router-acp · parent context refreshed — {reason}; model {}; {}; existing children and watchers retained",
+            prepared.selection.candidate, prepared.selection.reason
         ),
     );
     Ok(())

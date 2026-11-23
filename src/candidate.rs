@@ -183,7 +183,7 @@ impl CodingTier {
 }
 
 /// Capabilities a prompt requires of the downstream agent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequiredCaps {
     pub image: bool,
     pub audio: bool,
@@ -191,6 +191,12 @@ pub struct RequiredCaps {
 }
 
 impl RequiredCaps {
+    pub fn include(&mut self, other: Self) {
+        self.image |= other.image;
+        self.audio |= other.audio;
+        self.embedded_context |= other.embedded_context;
+    }
+
     pub fn from_prompt(prompt: &[ContentBlock]) -> Self {
         let mut caps = Self::default();
         for block in prompt {

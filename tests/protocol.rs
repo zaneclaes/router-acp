@@ -16019,27 +16019,36 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
     .await;
 }
 
-fn parent_reranking_yaml(state: &std::path::Path, log: &std::path::Path) -> String {
+fn parent_reranking_yaml(state: &std::path::Path, log: &std::path::Path, opus_images: bool, opus_mode: &str) -> String {
+    let mut other_env = vec![("MOCK_LOG", log.to_str().unwrap()), ("MOCK_SESSION_MODES", opus_mode)];
+    if opus_images { other_env.push(("MOCK_CAPS_IMAGE", "1")); }
     format!("state_file: {}\nrouter: planner\ndelegation: {{ enabled: true, max_concurrent: 1 }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*', 'other/*']\n    implementation_candidates: ['plan/*']\n    model_boosts: [{{ pattern: '*opus*', planning: 2 }}]\n    handoff: {{ enabled: true, retry_seconds: 1 }}\nagents:\n{}{}",
         state.display(),
-        agent_yaml("plan", &[("astra", 2)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1")]),
-        agent_yaml("other", &[("opus", 1)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1")]))
+        agent_yaml("plan", &[("astra", 2)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1"), ("MOCK_SESSION_MODES", "auto")]),
+        agent_yaml("other", &[("opus", 1)], &other_env))
 }
 
 #[tokio::test]
 async fn resumed_automatic_parent_reranks_recovered_models_and_honors_current_pick() {
-    for control in ["recovered", "cordoned", "incoming-pick"] {
+    for control in ["recovered", "cordoned", "incoming-pick", "image"] {
         let state = temp_state_file(&format!("parent-rerank-{control}"));
         let log = temp_log(&format!("parent-rerank-{control}"));
         let repo = planner_wire_repository();
-        run_test_shared(parent_reranking_yaml(&state, &log), async |cx, _, shared| {
+        run_test_shared(parent_reranking_yaml(&state, &log, control != "image", "auto"), async |cx, _, shared| {
             init(&cx).await?;
             let opus = CandidateId::new("other", "opus");
             shared.headroom.lock().unwrap().set_usage_cordons(
                 [(opus.clone(), epic_cordon("temporarily unavailable"))].into_iter().collect());
             let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
                 .block_task().await?.session_id.0.to_string();
-            prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+            if control == "image" {
+                cx.send_request(PromptRequest::new(sid.clone(), vec![
+                    ContentBlock::from("/implement review this image"),
+                    ContentBlock::Image(ImageContent::new("aGk=", "image/png")),
+                ])).block_task().await?;
+            } else {
+                prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+            }
             assert_eq!(pinned(&shared, &sid), CandidateId::new("plan", "astra"));
             assert!(!shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
             cx.send_request(CloseSessionRequest::new(sid.clone())).block_task().await?;
@@ -16054,6 +16063,14 @@ async fn resumed_automatic_parent_reranks_recovered_models_and_honors_current_pi
             let expected = if control == "recovered" { opus } else { CandidateId::new("plan", "astra") };
             assert_eq!(pinned(&shared, &sid), expected, "resume control: {control}");
             assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+            if control == "image" {
+                let persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+                shared.with_session(&sid, |s| {
+                    assert!(s.required_prompt_caps.image);
+                    router_acp::restoration::restore_continued_config(s, &persisted).unwrap();
+                    assert!(!s.required_prompt_caps.image, "new work does not replay the old image");
+                });
+            }
             Ok(())
         }).await;
     }
@@ -16064,7 +16081,7 @@ async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
     let state = temp_state_file("parent-rerank-prewarm");
     let log = temp_log("parent-rerank-prewarm");
     let repo = planner_wire_repository();
-    run_test_shared(parent_reranking_yaml(&state, &log), async |cx, _, shared| {
+    run_test_shared(parent_reranking_yaml(&state, &log, true, "auto"), async |cx, _, shared| {
         init(&cx).await?;
         let opus = CandidateId::new("other", "opus");
         shared.headroom.lock().unwrap().set_usage_cordons(
@@ -16073,6 +16090,17 @@ async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
             .block_task().await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
         let old = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let goal = router_acp::goals::Goal {
+            objective: "Retain the completed local review".into(),
+            status: router_acp::goals::Status::Met, continuations: 0, kickoff: false,
+        };
+        shared.with_session(&sid, |s| s.goal = Some(goal.clone()));
+        {
+            let mut state = shared.state.lock().unwrap();
+            let mut saved = state.get(&sid).unwrap();
+            saved.routing.as_mut().unwrap()["goal"] = serde_json::to_value(&goal).unwrap();
+            state.upsert_checked(sid.clone(), saved).unwrap();
+        }
         prompt_text(&cx, &sid, "CONTEXT:700/1000").await?;
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
@@ -16093,9 +16121,48 @@ async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
         }).await.expect("handoff never completed");
         assert_eq!(pinned(&shared, &sid), opus, "cutover must use current availability, not prewarm's old winner");
         let persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        assert_eq!(persisted.routing.as_ref().unwrap()["goal"], serde_json::to_value(&goal).unwrap());
         assert_eq!(persisted.agent, "other");
         assert_eq!(persisted.model, "opus");
         assert_eq!(persisted.prior_session_id.as_deref(), Some(old.downstream_sid.as_str()));
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn parent_handoff_incompatible_permission_mode_keeps_original_parent() {
+    let state = temp_state_file("parent-rerank-mode-refusal");
+    let log = temp_log("parent-rerank-mode-refusal");
+    let repo = planner_wire_repository();
+    run_test_shared(parent_reranking_yaml(&state, &log, true, "read-only"), async |cx, _, shared| {
+        init(&cx).await?;
+        shared.headroom.lock().unwrap().set_usage_cordons(
+            [(CandidateId::new("other", "opus"), epic_cordon("temporarily unavailable"))].into_iter().collect());
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        cx.send_request(agent_client_protocol::schema::v1::SetSessionModeRequest::new(
+            sid.clone(), "auto".to_string())).block_task().await?;
+        prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+        let old = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let token = shared.with_session(&sid, |s| s.delegate_token.clone()).flatten().unwrap();
+        shared.headroom.lock().unwrap().set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(&shared, &sid, None,
+                    router_acp::planner_workflow::Operation::Status { offset: 0, work_id: None }).await.unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["last_error"].as_str().is_some_and(|e| e.contains("permission mode")) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("incompatible standby did not report its refusal");
+        assert_eq!(shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone()).unwrap(), old.downstream_sid);
+        assert!(shared.route_for(&old.process_key, &old.downstream_sid).is_some());
+        assert!(shared.delegate_tokens.lock().unwrap()[&token].active);
+        prompt_text(&cx, &sid, "TEXT:original parent still serves").await?;
+        wait_for_mock_prompt(&log, "original parent still serves").await;
+        assert_eq!(router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap().status,
+            router_acp::planner_workflow::RunStatus::Running);
         Ok(())
     }).await;
 }

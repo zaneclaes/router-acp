@@ -217,6 +217,7 @@ pub struct RouterSession {
     /// Opaque capability requirements returned by the first-prompt
     /// pre-classifier. Used only to resolve host-configured MCP catalogs.
     pub required_mcp_capabilities: Vec<String>,
+    pub required_prompt_caps: RequiredCaps,
     pub strategy: StrategyKind,
     pub candidate_override: Option<CandidateId>,
     /// Who set `candidate_override` (user or a skill route). Not persisted:
@@ -492,6 +493,7 @@ impl RouterSession {
             mcp_servers,
             delegate_mcp_catalogs: seeded_mcp_catalogs(),
             required_mcp_capabilities: Vec::new(),
+            required_prompt_caps: RequiredCaps::default(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -603,6 +605,7 @@ impl RouterSession {
             mcp_servers: req.mcp_servers.clone(),
             delegate_mcp_catalogs: seeded_mcp_catalogs(),
             required_mcp_capabilities: Vec::new(),
+            required_prompt_caps: RequiredCaps::default(),
             strategy: cfg.router,
             candidate_override: None,
             candidate_override_source: None,
@@ -5044,7 +5047,8 @@ async fn pin_session(
         Some(Some(profile)) => profile,
         _ => classify(&shared.cfg.classifier, &shared.rules, &input).await,
     };
-    let required = RequiredCaps::from_prompt(prompt);
+    let mut required = shared.with_session(router_sid, |s| s.required_prompt_caps).unwrap_or_default();
+    required.include(RequiredCaps::from_prompt(prompt));
     let excluded: Vec<CandidateId> = exclude.into_iter().cloned().collect();
     let RoutePlan {
         mut ranked,
@@ -5059,6 +5063,7 @@ async fn pin_session(
         required,
         &excluded,
         larger_context_than,
+        false,
     )?;
 
     note_pinned_versions(shared, router_sid, &mut ranked);
@@ -5095,6 +5100,66 @@ struct RoutePlan {
     cordons: Vec<(String, std::time::Duration, String)>,
 }
 
+pub(crate) struct ParentHandoffPlan {
+    pub candidate: CandidateId,
+    pub profile: crate::classifier::TaskProfile,
+    pub strategy: StrategyKind,
+    pub user_pick: bool,
+    pub reason: String,
+    pub effort: Option<EffortLevel>,
+    pub explicit_effort: bool,
+    pub weights: Value,
+}
+
+pub(crate) async fn opened_session_effort(
+    shared: &Arc<Shared>, sid: &str, candidate: &CandidateId,
+    profile: &crate::classifier::TaskProfile, opened: &OpenedSession,
+) -> Result<(Option<EffortLevel>, Option<EffortResolution>, bool), AcpError> {
+    let explicit = shared.with_session(sid, |s| s.effort_request).flatten();
+    let requested = session_effort(&shared.cfg, explicit,
+        profile.effort.filter(|level| *level != EffortLevel::Auto));
+    let mut resolved = requested.map(|level| {
+        let scores = shared.scores_for(sid, candidate);
+        if explicit.is_some() { scores.resolve_effort(level) }
+        else { scores.resolve_automatic_effort(level) }
+    });
+    if let Some(resolution) = &mut resolved {
+        apply_native_effort(shared, candidate, &opened.conn, &opened.downstream_sid,
+            &opened.config_options, resolution, explicit.is_some()).await?;
+    }
+    Ok((requested, resolved, explicit.is_some()))
+}
+
+/// Standby selection uses the normal route owner, without promoting a past
+/// automatic pin into a current explicit choice.
+pub(crate) async fn parent_handoff_plan(shared: &Arc<Shared>, sid: &str) -> Result<ParentHandoffPlan, AcpError> {
+    crate::auth::refresh_before_selection(shared).await;
+    revive_dead_targets(shared).await;
+    let (profile, required) = shared.with_session(sid, |s| {
+        let profile = s.preclass_profile.clone().unwrap_or_else(|| crate::classifier::TaskProfile {
+            class: s.task_class.unwrap_or(TaskClass::CodingGeneral),
+            complexity: s.task_complexity,
+            languages: cwd_language_fingerprint(&shared.rules, &s.cwd),
+            effort: None,
+        });
+        (profile, s.required_prompt_caps)
+    }).ok_or_else(|| AcpError::invalid_params().data("parent session missing"))?;
+    let mut plan = plan_route(shared, sid, &profile, required, &[], None, true)?;
+    note_pinned_versions(shared, sid, &mut plan.ranked);
+    let selected = plan.ranked.into_iter().next()
+        .ok_or_else(|| AcpError::internal_error().data("no parent handoff candidate"))?;
+    Ok(ParentHandoffPlan {
+        effort: session_effort(&shared.cfg, shared.with_session(sid, |s| s.effort_request).flatten(), profile.effort.filter(|level| *level != EffortLevel::Auto)),
+        explicit_effort: shared.with_session(sid, |s| s.effort_request.is_some()).unwrap_or(false),
+        user_pick: plan.picked.as_ref() == Some(&selected.candidate),
+        candidate: selected.candidate,
+        profile,
+        strategy: plan.strategy_kind,
+        reason: selected.reason,
+        weights: selected.weights,
+    })
+}
+
 /// Rank this session's candidates the way its active router does: the
 /// session's strategy (or `Static` for a live override), account order,
 /// cordons, coordinator pool, exclusions and preferences. `exclude` names
@@ -5110,6 +5175,7 @@ fn plan_route(
     required: RequiredCaps,
     exclude: &[CandidateId],
     larger_context_than: Option<u64>,
+    fresh_parent: bool,
 ) -> Result<RoutePlan, AcpError> {
     let (strategy, override_, override_source, effort_request, planner_phase) = shared
         .with_session(router_sid, |s| {
@@ -5135,6 +5201,11 @@ fn plan_route(
         .clone()
         .filter(|_| matches!(override_source, Some(OverrideSource::UserPick)))
         .or(resumed_pick);
+    let (override_, override_source) = if fresh_parent {
+        (human_pick.clone(), human_pick.as_ref().map(|_| OverrideSource::UserPick))
+    } else {
+        (override_, override_source)
+    };
     // A failover must not keep re-selecting the failed candidate even when
     // it was explicitly pinned via router.candidate.
     let override_ = override_.filter(|o| !exclude.contains(o));
@@ -5537,45 +5608,15 @@ async fn pin_ranked(
                 let pin_quality = shared
                     .scores_for(router_sid, &candidate)
                     .quality(profile.class);
-                let requested_effort = session_effort(
-                    &shared.cfg,
-                    shared
-                        .with_session(router_sid, |s| s.effort_request)
-                        .flatten(),
-                    profile.effort.filter(|level| *level != EffortLevel::Auto),
-                );
-                let explicit_effort = shared
-                    .with_session(router_sid, |s| s.effort_request.is_some())
-                    .unwrap_or(false);
-                let mut resolved_effort = requested_effort.map(|level| {
-                    let scores = shared.scores_for(router_sid, &candidate);
-                    if explicit_effort {
-                        scores.resolve_effort(level)
-                    } else {
-                        scores.resolve_automatic_effort(level)
-                    }
-                });
-                if let Some(resolution) = &mut resolved_effort
-                    && let Err(err) = apply_native_effort(
-                        shared,
-                        &candidate,
-                        &opened.conn,
-                        &opened.downstream_sid,
-                        &opened.config_options,
-                        resolution,
-                        explicit_effort,
-                    )
-                    .await
-                {
-                    cleanup_failed_session(
-                        shared,
-                        &opened.process_key,
-                        &opened.conn,
-                        &opened.downstream_sid,
-                    );
-                    crate::delegate_mcp::drop_parent_tokens(shared, router_sid);
-                    return Err(err);
-                }
+                let (requested_effort, resolved_effort, explicit_effort) =
+                    match opened_session_effort(shared, router_sid, &candidate, &profile, &opened).await {
+                        Ok(effort) => effort,
+                        Err(err) => {
+                            cleanup_failed_session(shared, &opened.process_key, &opened.conn, &opened.downstream_sid);
+                            crate::delegate_mcp::drop_parent_tokens(shared, router_sid);
+                            return Err(err);
+                        }
+                    };
                 let mode_to_apply = shared
                     .with_session(router_sid, |s| {
                         let previous = s.pin.replace(PinInfo {
@@ -6928,6 +6969,16 @@ async fn run_primary_turn_inner(
     cancellation: Option<RequestCancellation>,
 ) -> Result<PromptResponse, AcpError> {
     use crate::limits::{FailureClass, classify_failure};
+
+    let added_caps = RequiredCaps::from_prompt(&req.prompt);
+    let changed = shared.with_session(&router_sid, |s| {
+        let previous = s.required_prompt_caps;
+        s.required_prompt_caps.include(added_caps);
+        previous != s.required_prompt_caps
+    }).unwrap_or(false);
+    if changed {
+        crate::restoration::checkpoint(&shared, &router_sid)?;
+    }
 
     // Router-owned turns enter without dispatch_prompt. They still honor the
     // same live account and repository skill policy as ordinary client turns.
@@ -8478,6 +8529,7 @@ fn cordon_escape_target(
         RequiredCaps::default(),
         std::slice::from_ref(current),
         None,
+        false,
     ) {
         Ok(plan) => plan
             .ranked

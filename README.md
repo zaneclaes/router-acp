@@ -747,11 +747,17 @@ full historical work census; the ordinary current-role briefing is retained.
 Native `/compact` remains available through supporting adapters. This automatic
 mechanism uses a deterministic replacement because native compaction summarizes
 the old conversation and does not provide a portable checkpoint-replacement API.
+Restored automatic parents and hot handoffs use the normal planning selector with
+current availability, exclusions, capability requirements and model boosts. A prior
+automatic model is not an explicit selection; genuine user picks keep their normal
+semantics. Standby preparation verifies the selected model, effort and permission
+mode before replacing the parent. Cutover refreshes availability and re-prepares if
+the winner changed after prewarming; failure leaves the parent and workers running.
 Opening a standby sends no LLM prompt. System/tool instructions may still incur
 provider input cost on the first new turn; cross-session cache reuse is not assumed.
 
-At 65% the router opens an unprompted standby conversation on the existing
-adapter, verifies model/mode, and gives it inactive router tool credentials.
+At 65% the router opens an unprompted standby conversation on the selected
+adapter, verifies model/mode/effort, and gives it inactive router tool credentials.
 Cutover exports a deterministic checkpoint through the existing shutdown host,
 then replaces only the downstream parent pin and fences the retired credentials
 and route. Workers, watchers, logical run identity, operation receipts and queues
