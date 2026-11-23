@@ -232,6 +232,8 @@ struct Observed {
     /// Hold `terminal/wait_for_exit` open until the terminal is killed, like
     /// a long-running watcher.
     hang_terminal_waits: bool,
+    /// Hold only the first terminal so later results can prove independent delivery.
+    hang_first_terminal: bool,
     /// Answer `terminal/wait_for_exit` only after this long, like a watcher
     /// whose condition fires later.
     terminal_exit_after: Option<Duration>,
@@ -430,13 +432,14 @@ where
                             req.cwd,
                         ));
                         observed.lock().unwrap().terminal_create_meta.push(req.meta);
-                        responder.respond(CreateTerminalResponse::new("managed-terminal-1"))
+                        let id = format!("managed-terminal-{}", observed.lock().unwrap().terminal_creates.len());
+                        responder.respond(CreateTerminalResponse::new(id))
                     }
                 },
                 on_receive_request!(),
             )
             .on_receive_request(
-                move |_req: WaitForTerminalExitRequest,
+                move |req: WaitForTerminalExitRequest,
                       responder: Responder<WaitForTerminalExitResponse>,
                       cx: ConnectionTo<AgentPeer>| {
                     let observed = o_wait.clone();
@@ -450,7 +453,11 @@ where
                                 ))
                             });
                         }
-                        if !observed.lock().unwrap().hang_terminal_waits {
+                        let held = {
+                            let state = observed.lock().unwrap();
+                            state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0 == "managed-terminal-1"
+                        };
+                        if !held {
                             return responder.respond(WaitForTerminalExitResponse::new(
                                 TerminalExitStatus::new().exit_code(0),
                             ));
@@ -458,7 +465,8 @@ where
                         cx.spawn(async move {
                             while {
                                 let state = observed.lock().unwrap();
-                                state.hang_terminal_waits && state.terminal_kills.is_empty()
+                                (state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0 == "managed-terminal-1")
+                                    && state.terminal_kills.is_empty()
                             } {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
@@ -976,6 +984,46 @@ async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
         Ok(())
     })
     .await;
+}
+
+#[tokio::test]
+async fn managed_background_delivers_later_completion_before_first_terminal_exits() {
+    let state = temp_state_file("managed-background-independent-completion");
+    // SAFETY: every helper-enabled test uses the same executable.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        observed.lock().unwrap().hang_first_terminal = true;
+        let pending = tokio::spawn(cx.send_request(PromptRequest::new(
+            sid.clone(),
+            vec![ContentBlock::from("BACKGROUND_START:long-proof\nBACKGROUND_START:finished-check")],
+        )).block_task());
+        // The first terminal cannot finish until this test explicitly releases it.
+        // Delivery of the second result therefore proves there is no all-terminal barrier.
+        while !agent_text(&observed, &sid).contains("Terminal managed-terminal-2 exited") {
+            assert!(!pending.is_finished(), "prompt ended without delivering the completed check");
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut state = observed.lock().unwrap();
+            assert!(state.terminal_kills.is_empty());
+            assert!(state.terminal_releases.is_empty());
+            assert_eq!(state.terminal_creates.len(), 2);
+            state.hang_first_terminal = false;
+        }
+        assert_eq!(pending.await.expect("managed prompt")?.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("Terminal managed-terminal-1 exited"));
+        assert_eq!(text.matches("Terminal managed-terminal-2 exited").count(), 1);
+        assert!(observed.lock().unwrap().terminal_kills.is_empty());
+        Ok(())
+    }).await;
 }
 
 /// Start a turn that parks on a never-exiting managed terminal and return

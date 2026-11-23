@@ -6511,8 +6511,8 @@ pub enum BackgroundInterrupt {
 
 /// How a turn's wait on its managed terminals ended.
 enum BackgroundWait {
-    /// Every terminal exited; resume the agent with this report.
-    Completed(String),
+    /// One terminal exited; resume with its report and retain the others.
+    Completed(String, String),
     /// A user message arrived first. The terminals were stopped; resume the
     /// agent with this prompt.
     Steered(Vec<ContentBlock>),
@@ -6549,8 +6549,12 @@ async fn wait_for_managed_backgrounds(
         .with_session(router_sid, |s| s.cancelled)
         .unwrap_or(false);
     let waited = async {
-        let mut completions = Vec::with_capacity(terminal_ids.len());
+        use futures::StreamExt;
+        let mut pending = futures::stream::FuturesUnordered::new();
         for terminal_id in &terminal_ids {
+            let upstream = &upstream;
+            let cancellation = &cancellation;
+            pending.push(async move {
             let mut request = upstream.send_request(WaitForTerminalExitRequest::new(
                 router_sid.to_string(),
                 terminal_id.clone(),
@@ -6578,16 +6582,18 @@ async fn wait_for_managed_backgrounds(
                 })
                 .unwrap_or_else(|| "unknown status".to_string());
             let retained = output.output.trim();
-            completions.push(if retained.is_empty() {
+            let completion = if retained.is_empty() {
                 format!("Terminal {terminal_id} exited with {status}. No output was captured.")
             } else {
                 format!("Terminal {terminal_id} exited with {status}.\nOutput:\n{retained}")
+            };
+            Ok::<_, AcpError>(BackgroundWait::Completed(
+                format!("[router-acp managed background completed]\n{completion}\nContinue the original task now."),
+                terminal_id.clone(),
+            ))
             });
         }
-        Ok::<_, AcpError>(BackgroundWait::Completed(format!(
-            "[router-acp managed background completed]\n{}\nContinue the original task now.",
-            completions.join("\n\n")
-        )))
+        pending.next().await.expect("nonempty managed terminals")
     };
     let outcome = if cancelled_early {
         Ok(BackgroundWait::Cancelled)
@@ -6621,6 +6627,18 @@ async fn wait_for_managed_backgrounds(
     }
     let outcome = outcome?;
     Ok(Some(match outcome {
+        BackgroundWait::Completed(report, completed) => {
+            // A long-running watcher must not hide a later finished proof. Keep
+            // every other operation owned across this continuation and any wake.
+            shared
+                .managed_backgrounds
+                .lock()
+                .unwrap()
+                .entry(router_sid.to_string())
+                .or_default()
+                .extend(terminal_ids.into_iter().filter(|id| id != &completed));
+            BackgroundWait::Completed(report, completed)
+        }
         BackgroundWait::Woken(prompt) => {
             shared
                 .managed_backgrounds
@@ -7483,7 +7501,7 @@ async fn run_primary_turn_inner(
                     // starts a fresh failover budget: one upstream prompt can
                     // run for hours of background waits, and failures from
                     // earlier, already-recovered turns must not exhaust it.
-                    Ok(Some(BackgroundWait::Completed(completion))) => {
+                    Ok(Some(BackgroundWait::Completed(completion, _))) => {
                         background_completion = Some(vec![ContentBlock::from(completion)]);
                         continuing = false;
                         attempt = 0;
