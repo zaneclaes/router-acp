@@ -1424,6 +1424,13 @@ distinguishable from its earlier shutdown without replaying the expanded workflo
 changing role dispatch, overriding later restrictions or treating a continuation
 as new operator authorization. Existing action refusals and release gates remain
 in force.
+An explicit repository `plan` or `implement` invocation also carries that
+entrypoint's current contract alongside the selected parent role, including its
+duties and restrictive scope. Its canonical source is delivered once per command;
+the implementation receipt retains source and content identity for worker
+assignments. Parent and worker roles still determine which duties each performs.
+Uninvoked repository skills and agent-origin command claims grant no scope, and
+ordinary follow-up turns do not replay the entrypoint body.
 Audit freshness starts when the host answers, so time spent collecting observations
 does not immediately expire a pending CI wait. Recovery prompts use the repository's
 exact CI handoff instead of asking workers to poll within a turn; failed, changed,

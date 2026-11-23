@@ -1079,18 +1079,14 @@ fn shape_command(
         .ok_or("planner session missing")?;
     let entrypoint = crate::planner_skills::repository_skill(&cwd, entrypoint_name)?;
     let mut instructions = run.policy.instructions(role);
-    // The entrypoint is an explicit invocation, not an additional role lookup.
-    // Mapped identical files execute once under their owning role.
-    if let Some(skill) = entrypoint
-        && !run.policy.roles.values().any(|s| s.source == skill.source)
-    {
-        if phase == PlannerPhase::Planning {
-            instructions.push_str(&format!(
-                "\n[Explicit repository entrypoint: {}]\n{}",
-                skill.name, skill.text
-            ));
-        } else {
-            instructions.push_str("\nThe explicit repository implementation entrypoint is retained for worker assignments. Continue with the parent role above.");
+    // Role selection cannot discard the explicitly invoked workflow's scope
+    // or restrictions. Only the role actually being delivered can supply an
+    // identical source already; a worker role is not part of a parent prompt.
+    if let Some(skill) = entrypoint {
+        if skill.source != run.policy.roles[&role].source {
+            append_entrypoint(&mut instructions, &skill);
+        }
+        if phase == PlannerPhase::Implementation {
             run.policy_entrypoint(input_id, &skill);
         }
     }
@@ -1109,6 +1105,13 @@ fn shape_command(
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
     Ok(())
+}
+
+fn append_entrypoint(instructions: &mut String, skill: &ResolvedSkill) {
+    instructions.push_str(&format!(
+        "\n[Explicit repository entrypoint: {}]\nSource: {}\nContent hash: {}\nPreserve this invoked workflow's scope and restrictions; perform only duties belonging to the current role.\n{}",
+        skill.name, skill.source, skill.hash, skill.text
+    ));
 }
 
 fn display_text(req: &PromptRequest) -> String {
@@ -3159,10 +3162,7 @@ async fn begin_work_once(
     {
         let skill: ResolvedSkill = serde_json::from_str(text).map_err(|e| e.to_string())?;
         if skill.source != run.policy.roles[&role].source {
-            instructions.push_str(&format!(
-                "\n[Explicit repository entrypoint: {}]\n{}",
-                skill.name, skill.text
-            ));
+            append_entrypoint(&mut instructions, &skill);
         }
     }
     instructions.push_str(&format!("\n[Durable assignment]\nwork_id: {work_id}\nattempt_id: {attempt_id}\nchild_id: {}\nplan_id: {}\nAssigned scope: {}\nRequired checks: {:?}\nPrior evidence: {:?}\nPrior corrections: {:?}\nPrior output: {:?}\n", snapshot.child_id, snapshot.spec.plan_id, snapshot.spec.scope, snapshot.spec.required_checks, snapshot.artifact, snapshot.review, snapshot.last_output));

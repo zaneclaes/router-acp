@@ -150,6 +150,56 @@ fn authorize(shared: &Arc<Shared>) {
 }
 
 #[tokio::test]
+async fn explicit_entrypoint_scope_survives_parent_and_worker_role_mappings() {
+    for mapping in ["distinct", "parent", "worker"] {
+        let f = fixture(|cfg| {
+            if mapping == "parent" {
+                cfg.routers.planner.select_plan.skill = Some("implement".into());
+            } else if mapping == "worker" {
+                cfg.routers.planner.implement_work.skill = Some("implement".into());
+            }
+        });
+        let directory = f.repo.join(".agents/skills/implement");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("SKILL.md");
+        let duty = "Parent owns staging deployment and verification within existing gates.";
+        let restriction = "Production publication is excluded from this invocation.";
+        let contract = format!("{duty}\n{restriction}");
+        std::fs::write(&file, &contract).unwrap();
+        git(&f.repo, &["add", ".agents"]);
+        git(&f.repo, &["commit", "--quiet", "-m", "repository workflow"]);
+
+        let mut request = input_request(Some("explicit-contract"), "/implement plans/one.md", false);
+        planner_workflow::user_command(&f.shared, SID, &mut request).unwrap();
+        let parent = request.prompt.iter().filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join("\n");
+        assert!(parent.contains("[router-acp planner role: select-plan]"));
+        assert!(!parent.contains("[router-acp planner role: implement-work]"));
+        assert_eq!(parent.matches(duty).count(), 1, "parent mapping: {mapping}");
+        assert_eq!(parent.matches(restriction).count(), 1, "parent mapping: {mapping}");
+        let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+        let recorded: router_acp::planner_skills::ResolvedSkill =
+            serde_json::from_str(&run.receipts["entrypoint:explicit-contract"]).unwrap();
+        assert_eq!(recorded.source, file.canonicalize().unwrap().to_string_lossy());
+        assert_eq!(recorded.text, contract);
+
+        planner_workflow::operate(&f.shared, SID, None, Operation::Admit {
+            key: "admit-one".into(), work: work("work-one"),
+        }).await.unwrap();
+        let (identity, _, _, worker) = planner_workflow::begin_work(&f.shared, SID, "work-one")
+            .await.unwrap();
+        assert_eq!(identity.work_id, "work-one");
+        assert!(worker.contains("[router-acp planner role: implement-work]"));
+        assert!(!worker.contains("[router-acp planner role: select-plan]"));
+        assert!(worker.contains("work_id: work-one"));
+        assert_eq!(worker.matches(duty).count(), 1, "worker mapping: {mapping}");
+        assert_eq!(worker.matches(restriction).count(), 1, "worker mapping: {mapping}");
+    }
+}
+
+#[tokio::test]
 async fn status_execution_context_is_unpaginated_and_requires_human_admission() {
     let f = fixture(|_| {});
     let mut request = PromptRequest::new(

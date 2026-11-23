@@ -13668,6 +13668,11 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
         assert_eq!(last.matches(duty).count(), 1, "explicit parent duty is delivered once");
         assert_eq!(last.matches(restriction).count(), 1, "explicit restrictive scope is delivered once");
         assert!(!last.contains("[router-acp planner role: implement-work]"));
+        prompt_text(&cx, &sid, "Report local progress; retain all restrictions.").await?;
+        let delivered = planner_user_prompts(&log);
+        let followup = delivered.last().unwrap();
+        assert!(!followup.contains(duty) && !followup.contains(restriction),
+            "ordinary follow-up does not replay the entrypoint body");
         Ok(())
     })
     .await;
