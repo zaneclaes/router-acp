@@ -1083,7 +1083,8 @@ fn shape_command(
     // or restrictions. Only the role actually being delivered can supply an
     // identical source already; a worker role is not part of a parent prompt.
     if let Some(skill) = entrypoint {
-        if skill.source != run.policy.roles[&role].source {
+        let selected = &run.policy.roles[&role];
+        if skill.source != selected.source || skill.hash != selected.hash {
             append_entrypoint(&mut instructions, &skill);
         }
         if phase == PlannerPhase::Implementation {
@@ -3161,7 +3162,8 @@ async fn begin_work_once(
             .find(|(key, _)| key.starts_with("entrypoint:"))
     {
         let skill: ResolvedSkill = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if skill.source != run.policy.roles[&role].source {
+        let selected = &run.policy.roles[&role];
+        if skill.source != selected.source || skill.hash != selected.hash {
             append_entrypoint(&mut instructions, &skill);
         }
     }

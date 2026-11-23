@@ -1426,7 +1426,7 @@ as new operator authorization. Existing action refusals and release gates remain
 in force.
 An explicit repository `plan` or `implement` invocation also carries that
 entrypoint's current contract alongside the selected parent role, including its
-duties and restrictive scope. Its canonical source is delivered once per command;
+duties and restrictive scope. Identical source and content are delivered once per command;
 the implementation receipt retains source and content identity for worker
 assignments. Parent and worker roles still determine which duties each performs.
 Uninvoked repository skills and agent-origin command claims grant no scope, and

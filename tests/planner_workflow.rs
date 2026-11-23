@@ -200,6 +200,46 @@ async fn explicit_entrypoint_scope_survives_parent_and_worker_role_mappings() {
 }
 
 #[tokio::test]
+async fn changed_entrypoint_content_is_not_hidden_by_a_same_path_role_snapshot() {
+    for mapping in ["parent", "worker"] {
+        let f = fixture(|cfg| {
+            if mapping == "parent" {
+                cfg.routers.planner.select_plan.skill = Some("implement".into());
+            } else {
+                cfg.routers.planner.implement_work.skill = Some("implement".into());
+            }
+        });
+        let directory = f.repo.join(".agents/skills/implement");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("SKILL.md");
+        std::fs::write(&file, "Original workflow: inspect the assigned source.").unwrap();
+        let mut original = input_request(Some("a-original"), "/implement inspect", false);
+        planner_workflow::user_command(&f.shared, SID, &mut original).unwrap();
+        let policy = planner_workflow::load(&f.shared, SID).unwrap().unwrap().policy;
+
+        let current = "Current workflow restriction: local validation only; no publication.";
+        std::fs::write(&file, current).unwrap();
+        git(&f.repo, &["add", ".agents"]);
+        git(&f.repo, &["commit", "--quiet", "-m", "narrow repository workflow"]);
+        let mut request = input_request(Some("z-current"), "/implement local validation", false);
+        planner_workflow::user_command(&f.shared, SID, &mut request).unwrap();
+        let parent = request.prompt.iter().filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join("\n");
+        assert_eq!(parent.matches(current).count(), 1, "current contract on parent: {mapping}");
+        assert_eq!(planner_workflow::load(&f.shared, SID).unwrap().unwrap().policy, policy,
+            "an invocation does not silently replace the durable role snapshot");
+        planner_workflow::operate(&f.shared, SID, None, Operation::Admit {
+            key: "admit-narrow".into(), work: work("narrow"),
+        }).await.unwrap();
+        let (_, _, _, worker) = planner_workflow::begin_work(&f.shared, SID, "narrow")
+            .await.unwrap();
+        assert_eq!(worker.matches(current).count(), 1, "current contract on worker: {mapping}");
+    }
+}
+
+#[tokio::test]
 async fn status_execution_context_is_unpaginated_and_requires_human_admission() {
     let f = fixture(|_| {});
     let mut request = PromptRequest::new(
