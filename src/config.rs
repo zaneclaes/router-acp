@@ -1764,11 +1764,14 @@ pub struct Config {
     /// Skill → model-class routing rules.
     #[serde(default)]
     pub skill_routing: Vec<SkillRoute>,
-    /// The client session mode a session starts in when its client never sets one (e.g. `auto`),
-    /// mapped through `agents[].mode_map` like a client-requested mode. Unset leaves each downstream
-    /// in its own default. goose's router provider sends no mode, so without this a Codex session kept
-    /// its sandboxed default (no network) even under `GOOSE_MODE: auto`.
-    #[serde(default)]
+    /// The client session mode a session starts in when its client never sets one, mapped through
+    /// `agents[].mode_map` like a client-requested mode. Defaults to `auto`, the mode delegates
+    /// already get; `default_mode: null` leaves each downstream in its own default. goose's router
+    /// provider sends no mode, so with no default a Codex session stayed in codex-acp's `agent`
+    /// mode (on-request approvals through the Guardian auto-reviewer, no network). Guardian cannot
+    /// see an invocation that reaches Codex through router tools, so on 2026-11-23 it refused a
+    /// planner parent's every staging push as unauthorized and deadlocked the release all day.
+    #[serde(default = "default_session_mode")]
     pub default_mode: Option<String>,
     /// Version pinning, two forms. A family shorthand (`claude/haiku` or `haiku`) → one of that
     /// family's model ids pins the family: the shorthand resolves to that version and it is the
@@ -1999,6 +2002,10 @@ fn default_state_file() -> PathBuf {
 
 fn default_probe_timeout_ms() -> u64 {
     120_000
+}
+
+fn default_session_mode() -> Option<String> {
+    Some("auto".into())
 }
 
 /// Interpolate `$VAR` and `${VAR}` environment references in a string. Unknown
@@ -3061,6 +3068,18 @@ agents:
         display_name: Claude Sonnet
         cost_rank: 2
 "#
+    }
+
+    /// 2026-11-23 (operator): "`default_mode: auto` should be the router-acp default mode, and not
+    /// require a config override." A client that sends no mode gets `auto`; `null` opts out.
+    #[test]
+    fn default_mode_is_auto_unless_explicitly_cleared() {
+        let unset = Config::from_yaml("agents:\n- name: codex@one\n").unwrap();
+        assert_eq!(unset.default_mode.as_deref(), Some("auto"));
+        let cleared = Config::from_yaml("default_mode: null\nagents:\n- name: codex@one\n").unwrap();
+        assert_eq!(cleared.default_mode, None);
+        let chat = Config::from_yaml("default_mode: chat\nagents:\n- name: codex@one\n").unwrap();
+        assert_eq!(chat.default_mode.as_deref(), Some("chat"));
     }
 
     #[test]
