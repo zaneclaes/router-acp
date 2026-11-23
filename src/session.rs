@@ -7188,6 +7188,17 @@ async fn run_primary_turn_inner(
                 blocks.push(ContentBlock::from(ctx));
             }
             blocks.extend(history.clone());
+            // Load only this session's own durable run: workers must not
+            // inherit a parent's admitted scope. Reading at dispatch also
+            // keeps a restored/switching adapter independent of bounded history.
+            if let Some(run) = crate::planner_workflow::load(&shared, &router_sid)
+                .map_err(|e| {
+                    AcpError::internal_error().data(format!("cannot load execution context: {e}"))
+                })?
+                && let Some(context) = crate::planner_workflow::execution_context_block(&run)
+            {
+                blocks.push(context);
+            }
             if let Some(completion) = background_completion.take() {
                 blocks.extend(completion);
             } else if let Some(objective) = &goal_kickoff {

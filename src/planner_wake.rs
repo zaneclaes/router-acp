@@ -1344,11 +1344,6 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         inert_line(inert, &run.observations)
     );
     let mut blocks = vec![ContentBlock::from(text)];
-    if let Some(execution) = planner_workflow::execution_context(&run) {
-        blocks.push(ContentBlock::from(format!(
-            "[Recorded human execution request]\n{execution}\nThis router-owned wake continues that admitted request; it is not a new operator instruction. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it. The run_status and run_revision are current native state; last_checkpoint is historical. A shutdown checkpoint does not by itself mean a subsequently resumed running run is still paused. Reconcile the latest admitted input and current state before applying a historical shutdown; preserve actual later operator stops and action refusals."
-        )));
-    }
     blocks.extend(planner_workflow::parent_input_blocks(
         shared, sid, &input_ids,
     )?);

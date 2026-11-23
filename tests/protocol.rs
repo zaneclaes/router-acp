@@ -14426,6 +14426,14 @@ async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
                 },
             );
         }
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.checkpoint = Some(router_acp::planner_workflow::CheckpointReceipt {
+                event: "shutdown".into(),
+                run_revision: run.revision,
+                saved_at_ms: 1234,
+            });
+            Ok(())
+        }).unwrap();
 
         cx.send_request(CloseSessionRequest::new(sid.clone()))
             .block_task()
@@ -14502,7 +14510,44 @@ async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
         assert_eq!(execution["arguments"], "resume the durable planner run");
         assert_eq!(execution["run_status"], "running");
         assert!(execution["run_revision"].as_u64().unwrap() >= run.revision);
+        assert_eq!(execution["last_checkpoint"]["event"], "shutdown");
+        assert_eq!(execution["last_checkpoint"]["saved_at_ms"], 1234);
         assert!(forwarded.contains(current), "current restriction is retained verbatim");
+
+        // A model switch uses the same provenance even if a handoff summary
+        // happens to contain old context. Inspect the standalone router block.
+        let switched_request = "[router: switch=planner/haiku]\nReview locally; publication remains refused.";
+        prompt_text(&cx, &sid, switched_request).await?;
+        let events = read_log(&log);
+        let switched = &events[*mock_prompts(&log, "Review locally; publication remains refused.").last().unwrap()];
+        assert_eq!(switched["model"], "haiku");
+        let contexts = execution_blocks(switched);
+        assert_eq!(contexts.len(), 1, "one authoritative context block per dispatch");
+        assert_eq!(contexts[0]["input_id"], execution["input_id"]);
+        assert_eq!(contexts[0]["arguments"], execution["arguments"]);
+
+        // Acknowledged human scope can continue, but agent origin or an
+        // explicit withdrawal can never become human authority on dispatch.
+        let input_id = run.execution_input_id.as_ref().unwrap();
+        for control in ["agent", "withdrawn"] {
+            router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                run.inputs.get_mut(input_id).unwrap().origin =
+                    if control == "agent" { "agent" } else { "human" }.into();
+                if control == "withdrawn" {
+                    run.receipts.insert(format!("input-withdrawal:{input_id}"),
+                        serde_json::to_string(&router_acp::planner_workflow::InputWithdrawal {
+                            at_ms: 2, reason: "operator withdrew the scope".into(),
+                        }).unwrap());
+                }
+                Ok(())
+            }).unwrap();
+            let current = format!("Inspect current state for {control}; do not publish.");
+            prompt_text(&cx, &sid, &current).await?;
+            let events = read_log(&log);
+            let event = &events[*mock_prompts(&log, &current).last().unwrap()];
+            assert!(execution_blocks(event).is_empty(), "invalid source: {control}");
+            assert!(event["text"].as_str().unwrap().contains(&current));
+        }
         Ok(())
     })
     .await;
@@ -16548,6 +16593,19 @@ async fn adopted_input_delivers_historical_header_and_one_wake_ack_closes_both()
     }).await;
 }
 
+fn execution_blocks(event: &serde_json::Value) -> Vec<serde_json::Value> {
+    event["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| {
+            let text = block["text"].as_str()?;
+            let context = text.strip_prefix("[Recorded human execution request]\n")?;
+            Some(serde_json::from_str(context.lines().next().unwrap()).unwrap())
+        })
+        .collect()
+}
+
 fn mock_prompts(log: &PathBuf, marker: &str) -> Vec<usize> {
     read_log(log)
         .iter()
@@ -16671,6 +16729,7 @@ async fn planner_wake_carries_the_recorded_human_execution_request() {
             );
             assert!(text.contains("\"origin\":\"human\""));
             assert!(text.contains("later human restrictions"));
+            assert_eq!(execution_blocks(wake).len(), 1, "wake dispatch does not duplicate context");
             let run = workflow::load(&shared, &sid).unwrap().unwrap();
             assert!(run.inputs[&input_id].acknowledged);
             assert!(

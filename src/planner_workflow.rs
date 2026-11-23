@@ -1523,6 +1523,16 @@ pub(crate) fn execution_context(run: &PlannerRun) -> Option<Value> {
     None
 }
 
+/// The same validated provenance accompanies ordinary, restored and wake
+/// turns. This is current native state, not replayed conversation or a new
+/// human instruction; role dispatch and the incoming request stay intact.
+pub(crate) fn execution_context_block(run: &PlannerRun) -> Option<ContentBlock> {
+    let execution = execution_context(run)?;
+    Some(ContentBlock::from(format!(
+        "[Recorded human execution request]\n{execution}\nThis turn carries the recorded admitted request; it is not a new operator instruction. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it. The run_status and run_revision are current native state; last_checkpoint is historical. A shutdown checkpoint does not by itself mean a subsequently resumed running run is still paused. Reconcile the latest admitted input and current state before applying a historical shutdown; preserve actual later operator stops and action refusals."
+    )))
+}
+
 pub fn parent_input_blocks(
     shared: &Shared,
     sid: &str,
