@@ -1405,6 +1405,11 @@ new allocations and different leases cannot be migrated this way. The allocation
 request advertises `completion_contract_recovery: true` so hosts do not enable this
 recovery for older routers that ignore the receipt. Ordinary readmission and
 reconciliation still cannot change the admitted version.
+Finished and integrated assignments can be reopened for a bounded correction under
+their existing contract, including legacy records with an omitted version. This
+requires the same plan and guide, an ended attempt, changed scope, durable evidence
+and a source revision carried by the workspace. Prior completion and frozen release
+receipts remain historical; the corrected artifact needs fresh review and completion.
 Audit freshness starts when the host answers, so time spent collecting observations
 does not immediately expire a pending CI wait. Recovery prompts use the repository's
 exact CI handoff instead of asking workers to poll within a turn; failed, changed,

@@ -9227,9 +9227,15 @@ fn trusted_finish_fixture() -> Fixture {
 }
 
 #[tokio::test]
-async fn v2_terminal_correction_reuses_identity_and_preserves_frozen_release_proof() {
+async fn terminal_correction_reuses_identity_and_preserves_frozen_release_proof() {
+    for version in [None, Some(1), Some(2)] {
+        terminal_correction_preserves_proof(version).await;
+    }
+}
+
+async fn terminal_correction_preserves_proof(version: Option<u32>) {
     let fixture = trusted_finish_fixture();
-    let (identity, revision) = prepared_work(&fixture.shared, Some(2)).await;
+    let (identity, revision) = prepared_work(&fixture.shared, version).await;
     finish_prepared_work(&fixture.shared, &identity, &revision)
         .await
         .unwrap();
@@ -9259,7 +9265,7 @@ async fn v2_terminal_correction_reuses_identity_and_preserves_frozen_release_pro
     .unwrap();
 
     let mut correction = work("work-1");
-    correction.completion_contract_version = Some(2);
+    correction.completion_contract_version = version;
     correction.scope = "fix the bounded regression found after the accepted release".into();
     planner_workflow::operate(
         &fixture.shared,
@@ -9279,6 +9285,7 @@ async fn v2_terminal_correction_reuses_identity_and_preserves_frozen_release_pro
         .unwrap()
         .unwrap();
     let reopened = &run.works["work-1"];
+    assert_eq!(reopened.spec.completion_contract_version, version);
     assert_eq!(reopened.status, WorkStatus::Admitted);
     assert!(reopened.attempt.is_none());
     assert!(reopened.artifact.is_none());
@@ -9317,15 +9324,21 @@ async fn v2_terminal_correction_reuses_identity_and_preserves_frozen_release_pro
 }
 
 #[tokio::test]
-async fn v2_correction_refuses_wrong_identity_live_attempt_and_legacy_reopen() {
+async fn terminal_correction_refuses_wrong_identity_version_and_live_attempt() {
+    for version in [None, Some(1), Some(2)] {
+        terminal_correction_refuses_invalid_custody(version).await;
+    }
+}
+
+async fn terminal_correction_refuses_invalid_custody(version: Option<u32>) {
     let v2 = trusted_finish_fixture();
-    let (identity, revision) = prepared_work(&v2.shared, Some(2)).await;
+    let (identity, revision) = prepared_work(&v2.shared, version).await;
     finish_prepared_work(&v2.shared, &identity, &revision)
         .await
         .unwrap();
 
     let mut changed = work("work-1");
-    changed.completion_contract_version = Some(2);
+    changed.completion_contract_version = version;
     changed.scope = "a bounded correction".into();
     let error = planner_workflow::operate(
         &v2.shared,
@@ -9345,7 +9358,11 @@ async fn v2_correction_refuses_wrong_identity_live_attempt_and_legacy_reopen() {
     planner_workflow::attempt_ended(&v2.shared, SID, &identity, None, "done".into(), false)
         .unwrap();
     let mut wrong_version = changed.clone();
-    wrong_version.completion_contract_version = Some(1);
+    wrong_version.completion_contract_version = if version == Some(2) {
+        Some(1)
+    } else {
+        Some(2)
+    };
     let error = planner_workflow::operate(
         &v2.shared,
         SID,
@@ -9396,24 +9413,22 @@ async fn v2_correction_refuses_wrong_identity_live_attempt_and_legacy_reopen() {
     .unwrap_err();
     assert!(error.contains("retain its external guide"), "{error}");
 
-    let legacy = fixture(|_| {});
-    let legacy_revision = finished_work(&legacy.shared).await;
-    let mut legacy_correction = work("work-1");
-    legacy_correction.scope = "a bounded legacy correction".into();
+    let mut unchanged_scope = changed;
+    unchanged_scope.scope = work("work-1").scope;
     let error = planner_workflow::operate(
-        &legacy.shared,
+        &v2.shared,
         SID,
         None,
         Operation::Reconcile {
-            key: "legacy-terminal".into(),
-            work: legacy_correction,
-            source_revision: legacy_revision,
+            key: "unchanged-terminal-scope".into(),
+            work: unchanged_scope,
+            source_revision: revision,
             evidence: vec!["regression.md".into()],
         },
     )
     .await
     .unwrap_err();
-    assert!(error.contains("cannot rewrite finished work"), "{error}");
+    assert!(error.contains("changed bounded scope"), "{error}");
 }
 
 #[test]

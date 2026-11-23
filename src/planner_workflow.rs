@@ -288,7 +288,7 @@ pub struct Reconciliation {
     pub source_revision: Option<String>,
     pub evidence: Vec<String>,
     pub prior_specs: Vec<WorkSpec>,
-    /// Terminal v2 corrections retain the completed assignment's proof. A
+    /// Terminal corrections retain the completed assignment's proof. A
     /// correction is a new attempt for the same work identity, never a rewrite
     /// of the release record that accepted the earlier revision.
     #[serde(default)]
@@ -559,7 +559,7 @@ pub enum Operation {
         work: WorkSpec,
     },
     /// Explicit parent handoff of the current scope and preserved source after recovery,
-    /// or a bounded v2 correction that reopens its terminal identity.
+    /// or a bounded correction that reopens its terminal identity.
     Reconcile {
         key: String,
         work: WorkSpec,
@@ -1958,17 +1958,16 @@ async fn operate_once(
                     "reconcile cannot change the admitted completion contract version".into(),
                 );
             }
-            let terminal_correction = existing.spec.completion_contract_version == Some(2)
-                && matches!(
-                    existing.status,
-                    WorkStatus::Finished | WorkStatus::Integrated
-                );
+            let terminal_correction = matches!(
+                existing.status,
+                WorkStatus::Finished | WorkStatus::Integrated
+            );
             if terminal_correction
                 && (work.external_id != existing.spec.external_id
                     || work.scope == existing.spec.scope
                     || evidence.iter().any(|e| !valid_evidence(e)))
             {
-                return Err("v2 correction must retain its external guide and name a changed bounded scope with durable evidence".into());
+                return Err("correction must retain its external guide and name a changed bounded scope with durable evidence".into());
             }
             if terminal_correction
                 && existing
@@ -1976,7 +1975,7 @@ async fn operate_once(
                     .as_ref()
                     .is_some_and(|attempt| !attempt.ended)
             {
-                return Err("v2 correction requires the prior attempt to be ended before reopening the work identity".into());
+                return Err("correction requires the prior attempt to be ended before reopening the work identity".into());
             }
             if !terminal_correction
                 && existing
@@ -2029,7 +2028,7 @@ async fn operate_once(
                     allocate_workspace(shared, sid, &allocation, &run.policy).await?
                 }
                 // Integrated workspaces may already have been returned to the
-                // host. A v2 correction is explicitly reopening that same
+                // host. A correction is explicitly reopening that same
                 // identity, so restore a lease instead of treating the old
                 // historical path as current custody.
                 Some(_) => {
