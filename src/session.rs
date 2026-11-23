@@ -6536,7 +6536,14 @@ async fn wait_for_managed_backgrounds(
     if terminal_ids.is_empty() {
         return Ok(None);
     }
-    let upstream = shared.upstream().ok_or_else(AcpError::internal_error)?;
+    let upstream = match shared.upstream() {
+        Some(upstream) => upstream,
+        None => {
+            shared.managed_backgrounds.lock().unwrap()
+                .entry(router_sid.to_string()).or_default().extend(terminal_ids);
+            return Err(AcpError::internal_error());
+        }
+    };
     let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
     shared
         .background_interrupts
@@ -6625,7 +6632,16 @@ async fn wait_for_managed_backgrounds(
             stop_managed_background(&upstream, router_sid, terminal_id).await;
         }
     }
-    let outcome = outcome?;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A transport failure says nothing about the operation's lifetime.
+            // Keep it owned so the next turn can collect it without restarting it.
+            shared.managed_backgrounds.lock().unwrap()
+                .entry(router_sid.to_string()).or_default().extend(terminal_ids);
+            return Err(error);
+        }
+    };
     Ok(Some(match outcome {
         BackgroundWait::Completed(report, completed) => {
             // A long-running watcher must not hide a later finished proof. Keep

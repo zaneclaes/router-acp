@@ -234,6 +234,8 @@ struct Observed {
     hang_terminal_waits: bool,
     /// Hold only the first terminal so later results can prove independent delivery.
     hang_first_terminal: bool,
+    terminal_wait_failures: usize,
+    terminal_output_failures: usize,
     /// Answer `terminal/wait_for_exit` only after this long, like a watcher
     /// whose condition fires later.
     terminal_exit_after: Option<Duration>,
@@ -444,6 +446,13 @@ where
                       cx: ConnectionTo<AgentPeer>| {
                     let observed = o_wait.clone();
                     async move {
+                        {
+                            let mut state = observed.lock().unwrap();
+                            if state.terminal_wait_failures > 0 {
+                                state.terminal_wait_failures -= 1;
+                                return responder.respond_with_result(Err(AcpError::internal_error()));
+                            }
+                        }
                         let exit_after = observed.lock().unwrap().terminal_exit_after;
                         if let Some(after) = exit_after {
                             return cx.spawn(async move {
@@ -515,8 +524,16 @@ where
                 move |_req: TerminalOutputRequest,
                       responder: Responder<TerminalOutputResponse>,
                       _cx| {
-                    let extra = o_output.lock().unwrap().terminal_output.clone();
+                    let observed = o_output.clone();
                     async move {
+                        let extra = {
+                            let mut state = observed.lock().unwrap();
+                            if state.terminal_output_failures > 0 {
+                                state.terminal_output_failures -= 1;
+                                return responder.respond_with_result(Err(AcpError::internal_error()));
+                            }
+                            state.terminal_output.clone()
+                        };
                         let output = format!("watch-fired\n{}", extra.unwrap_or_default());
                         responder.respond(TerminalOutputResponse::new(output, false))
                     }
@@ -1024,6 +1041,49 @@ async fn managed_background_delivers_later_completion_before_first_terminal_exit
         assert!(observed.lock().unwrap().terminal_kills.is_empty());
         Ok(())
     }).await;
+}
+
+#[tokio::test]
+async fn managed_background_rpc_failure_retains_operations_for_next_turn() {
+    // Both wait and output failures must leave every operation collectable.
+    for fail_wait in [true, false] {
+        let state = temp_state_file("managed-background-rpc-recovery");
+        // SAFETY: every helper-enabled test uses the same executable.
+        unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+        let yaml = format!(
+            "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+            state.display(), agent_yaml("mock", &[("m1", 1)], &[])
+        );
+        run_test(yaml, async move |cx, observed| {
+            init_with_terminals(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            {
+                let mut state = observed.lock().unwrap();
+                state.hang_first_terminal = true;
+                if fail_wait { state.terminal_wait_failures = 1; }
+                else { state.terminal_output_failures = 1; }
+            }
+            assert!(prompt_text(&cx, &sid,
+                "BACKGROUND_START:running-operation\nBACKGROUND_START:finished-operation").await.is_err());
+            {
+                let mut state = observed.lock().unwrap();
+                assert_eq!(state.terminal_creates.len(), 2);
+                assert!(state.terminal_kills.is_empty());
+                assert!(state.terminal_releases.is_empty());
+                state.hang_first_terminal = false;
+            }
+            assert_eq!(prompt_text(&cx, &sid, "Collect the existing operations").await?.stop_reason,
+                StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert_eq!(text.matches("Terminal managed-terminal-1 exited").count(), 1);
+            assert_eq!(text.matches("Terminal managed-terminal-2 exited").count(), 1);
+            let state = observed.lock().unwrap();
+            assert_eq!(state.terminal_creates.len(), 2);
+            assert!(state.terminal_kills.is_empty());
+            assert!(state.terminal_releases.is_empty());
+            Ok(())
+        }).await;
+    }
 }
 
 /// Start a turn that parks on a never-exiting managed terminal and return
