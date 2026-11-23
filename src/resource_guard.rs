@@ -451,7 +451,7 @@ mod native {
         fn name(self) -> &'static std::ffi::CStr {
             match self {
                 Self::Total => c"hw.memsize",
-                Self::AvailablePercent => c"kern.memorystatus_level",
+                Self::AvailablePercent => c"memorystatus_get_level",
                 Self::Swap => c"vm.swapusage",
                 Self::Pressure => c"kern.memorystatus_vm_pressure_level",
             }
@@ -582,7 +582,20 @@ mod native {
     #[cfg(target_os = "macos")]
     pub fn resources(disks: &[PathBuf]) -> io::Result<Resources> {
         let total = sysctl::<u64>(MemoryMetric::Total)?;
-        let free = sysctl::<u32>(MemoryMetric::AvailablePercent)?;
+        // Use the same read-only interface as Apple's memory_pressure utility.
+        // The private kern.memorystatus_level sysctl is denied in managed sandboxes.
+        unsafe extern "C" {
+            fn memorystatus_get_level(level: *mut u32) -> libc::c_int;
+        }
+        let free = unsafe {
+            read_memory_metric::<u32>(MemoryMetric::AvailablePercent, |value, _| {
+                if memorystatus_get_level(value.as_mut_ptr()) != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })?
+        };
         if free > 100 {
             return Err(io::Error::other("invalid available memory percentage"));
         }

@@ -134,8 +134,11 @@ swap and free space on the working, startup and temporary filesystems. Keep at
 least 8GiB memory headroom and 10GiB free disk; warning memory pressure, swap above
 8GiB, or tree footprint above physical RAM minus headroom stops the owned tree.
 macOS accounting includes compressed memory; Linux includes resident and swapped
-memory. Unknown telemetry fails closed. macOS memory probe failures identify the
-fixed kernel metric and either `category=syscall` with its numeric errno or
+memory. Unknown telemetry fails closed. Available memory uses `memorystatus_get_level`,
+the same percentage read by Apple's `memory_pressure`; the private sysctl alias is
+not required. Pressure, swap and all resource floors remain independently enforced.
+Failures identify the fixed read-only API or kernel metric and either
+`category=syscall` with its numeric errno or
 `category=size-mismatch` with expected and returned byte counts. The watchdog
 preserves those details both before launch and during sampling. Diagnostics contain
 resource counters, never command arguments or credentials. Source/worktrees are
