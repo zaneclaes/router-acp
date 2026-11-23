@@ -16096,7 +16096,7 @@ async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
         };
         shared.with_session(&sid, |s| s.goal = Some(goal.clone()));
         {
-            let mut state = shared.state.lock().unwrap();
+            let state = shared.state.lock().unwrap();
             let mut saved = state.get(&sid).unwrap();
             saved.routing.as_mut().unwrap()["goal"] = serde_json::to_value(&goal).unwrap();
             state.upsert_checked(sid.clone(), saved).unwrap();
