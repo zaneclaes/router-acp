@@ -66,6 +66,52 @@ pub struct PlannerRun {
     /// The session that adopted this run's works, holds, queue and wakes.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// The parent's resume point, kept in the state database with the run when
+    /// `routers.planner.continuation` names no file. Adoption carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationNote>,
+    /// The last deterministic checkpoint (live, handoff or shutdown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointReceipt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContinuationNote {
+    pub text: String,
+    pub saved_at_ms: i64,
+    /// The session whose parent recorded it.
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointReceipt {
+    pub event: String,
+    pub run_revision: u64,
+    pub saved_at_ms: i64,
+}
+
+/// Longest resume note the parent may record.
+pub const CONTINUATION_LIMIT: usize = 20_000;
+
+/// Where the parent records its resume point: the configured file, or the
+/// `record-continuation` action that stores it in the state database.
+pub fn continuation_target(planner: &crate::config::PlannerRouterConfig) -> String {
+    match &planner.continuation {
+        Some(path) => path.clone(),
+        None => "the run's resume note (planner_workflow `record-continuation` with `text`)".into(),
+    }
+}
+
+/// The database resume note for a resumed or replacement parent, if any.
+pub fn continuation_brief(run: &PlannerRun) -> Option<String> {
+    let note = run.continuation.as_ref()?;
+    let saved = chrono::DateTime::from_timestamp_millis(note.saved_at_ms)
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_default();
+    Some(format!(
+        "Recorded resume note (saved {saved} by parent {}; current planner_workflow state wins over it):\n{}",
+        note.session_id, note.text
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +154,20 @@ pub enum RunStatus {
 }
 
 impl PlannerRun {
+    /// Recovery notices on a dormant disposition are historical until the
+    /// work becomes runnable again. Keep the notice and the source fence.
+    fn dormant_recovery_wake(&self, id: &str) -> bool {
+        id.strip_prefix("recovery:")
+            .and_then(|work_id| self.works.get(work_id))
+            .is_some_and(|work| work.status.dormant_disposition())
+    }
+
+    pub(crate) fn pending_wakes(&self) -> impl Iterator<Item = (&String, &Wake)> {
+        self.wakes
+            .iter()
+            .filter(|(id, wake)| !wake.acknowledged && !self.dormant_recovery_wake(id))
+    }
+
     /// The session is this run's durable parent and keeps the planning pool.
     /// Runs recorded before the parent role was stored are recognized by an
     /// execution request that an implementation command or the accepted-plan
@@ -210,6 +270,12 @@ pub enum WorkStatus {
     Interrupted,
 }
 
+impl WorkStatus {
+    pub(crate) fn dormant_disposition(self) -> bool {
+        matches!(self, Self::Blocked | Self::Watching)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Work {
     #[serde(default)]
@@ -242,7 +308,7 @@ pub struct Reconciliation {
     pub source_revision: Option<String>,
     pub evidence: Vec<String>,
     pub prior_specs: Vec<WorkSpec>,
-    /// Terminal v2 corrections retain the completed assignment's proof. A
+    /// Terminal corrections retain the completed assignment's proof. A
     /// correction is a new attempt for the same work identity, never a rewrite
     /// of the release record that accepted the earlier revision.
     #[serde(default)]
@@ -507,13 +573,15 @@ pub enum Operation {
         offset: usize,
         #[serde(default)]
         work_id: Option<String>,
+        #[serde(default)]
+        works_only: bool,
     },
     Admit {
         key: String,
         work: WorkSpec,
     },
     /// Explicit parent handoff of the current scope and preserved source after recovery,
-    /// or a bounded v2 correction that reopens its terminal identity.
+    /// or a bounded correction that reopens its terminal identity.
     Reconcile {
         key: String,
         work: WorkSpec,
@@ -589,6 +657,11 @@ pub enum Operation {
     Complete {
         key: String,
         queue_evidence: String,
+    },
+    /// Parent records its exact resume point in the state database.
+    RecordContinuation {
+        key: String,
+        text: String,
     },
 }
 
@@ -730,6 +803,8 @@ pub fn ensure(shared: &Shared, sid: &str) -> Result<PlannerRun, String> {
         owner: Some(RunOwner::current()),
         owner_heartbeat_at: chrono::Utc::now().timestamp(),
         superseded_by: None,
+        continuation: None,
+        checkpoint: None,
     };
     if let Err(e) = save(shared, sid, &mut run) {
         if concurrent(&e) {
@@ -1026,18 +1101,15 @@ fn shape_command(
         .ok_or("planner session missing")?;
     let entrypoint = crate::planner_skills::repository_skill(&cwd, entrypoint_name)?;
     let mut instructions = run.policy.instructions(role);
-    // The entrypoint is an explicit invocation, not an additional role lookup.
-    // Mapped identical files execute once under their owning role.
-    if let Some(skill) = entrypoint
-        && !run.policy.roles.values().any(|s| s.source == skill.source)
-    {
-        if phase == PlannerPhase::Planning {
-            instructions.push_str(&format!(
-                "\n[Explicit repository entrypoint: {}]\n{}",
-                skill.name, skill.text
-            ));
-        } else {
-            instructions.push_str("\nThe explicit repository implementation entrypoint is retained for worker assignments. Continue with the parent role above.");
+    // Role selection cannot discard the explicitly invoked workflow's scope
+    // or restrictions. Only the role actually being delivered can supply an
+    // identical source already; a worker role is not part of a parent prompt.
+    if let Some(skill) = entrypoint {
+        let selected = &run.policy.roles[&role];
+        if skill.source != selected.source || skill.hash != selected.hash {
+            append_entrypoint(&mut instructions, &skill);
+        }
+        if phase == PlannerPhase::Implementation {
             run.policy_entrypoint(input_id, &skill);
         }
     }
@@ -1056,6 +1128,13 @@ fn shape_command(
     router_meta["planner_role"] = json!(role);
     router_meta["planner_input_id"] = json!(input_id);
     Ok(())
+}
+
+fn append_entrypoint(instructions: &mut String, skill: &ResolvedSkill) {
+    instructions.push_str(&format!(
+        "\n[Explicit repository entrypoint: {}]\nSource: {}\nContent hash: {}\nPreserve this invoked workflow's scope and restrictions; perform only duties belonging to the current role.\n{}",
+        skill.name, skill.source, skill.hash, skill.text
+    ));
 }
 
 fn display_text(req: &PromptRequest) -> String {
@@ -1201,6 +1280,15 @@ pub(crate) fn parent_handoff(req: &PromptRequest) -> bool {
 
 const PLANNER_HANDOFF_TAG: &str = "[planner-handoff]";
 
+fn resume_human_input(shared: &Shared, sid: &str, run: &mut PlannerRun) {
+    if matches!(run.status, RunStatus::Complete | RunStatus::Paused)
+        || stale_drain(shared, sid, run.status)
+    {
+        run.approval_waits.clear();
+        run.status = RunStatus::Running;
+    }
+}
+
 pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Result<(), String> {
     if load(shared, sid)?.is_none() {
         return Ok(());
@@ -1224,13 +1312,7 @@ pub fn observe_input(shared: &Arc<Shared>, sid: &str, req: &PromptRequest) -> Re
         if human {
             crate::planner_capacity::clear_human_hold(run);
         }
-        if human
-            && (matches!(run.status, RunStatus::Complete | RunStatus::Paused)
-                || stale_drain(shared, sid, run.status))
-        {
-            run.approval_waits.clear();
-            run.status = RunStatus::Running;
-        }
+        if human { resume_human_input(shared, sid, run); }
         let input_id = if req.meta.as_ref().and_then(|m| m.get("router_acp")).and_then(|m| m.get("planner_input_id")).is_none() {
             Some(record_input(run, req)?)
         } else {
@@ -1343,6 +1425,11 @@ pub fn record_steered_input(
     }
     let mut input_id = String::new();
     mutate(shared, sid, |run| {
+        // Steering is another delivery path for the same human input. A parent
+        // turn can still be settling when a paused run receives its follow-up.
+        if human_prompt(req) {
+            resume_human_input(shared, sid, run);
+        }
         input_id = record_input(run, req)?;
         if let Some(input) = run.inputs.get_mut(&input_id) {
             input.delivered_to.insert(sid.to_string());
@@ -1450,13 +1537,26 @@ pub(crate) fn execution_context(run: &PlannerRun) -> Option<Value> {
     {
         // Keep typed scope, without replaying an entire expanded skill on each wake.
         return Some(json!({"input_id":id,"origin":input.origin,
-            "command":"implement","arguments":command.args}));
+            "command":"implement","arguments":command.args,
+            "run_status":run.status,"run_revision":run.revision,
+            "last_checkpoint":run.checkpoint}));
     }
     if parent_handoff(&request) {
         return Some(json!({"input_id":id,"origin":input.origin,
-            "request":input.text}));
+            "request":input.text,"run_status":run.status,
+            "run_revision":run.revision,"last_checkpoint":run.checkpoint}));
     }
     None
+}
+
+/// The same validated provenance accompanies ordinary, restored and wake
+/// turns. This is current native state, not replayed conversation or a new
+/// human instruction; role dispatch and the incoming request stay intact.
+pub(crate) fn execution_context_block(run: &PlannerRun) -> Option<ContentBlock> {
+    let execution = execution_context(run)?;
+    Some(ContentBlock::from(format!(
+        "[Recorded human execution request]\n{execution}\nThis record describes the previously admitted request; the record itself is not a new operator instruction. The current incoming request follows and retains its own original provenance. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it. The run_status and run_revision are current native state; last_checkpoint is historical. A shutdown checkpoint does not by itself mean a subsequently resumed running run is still paused. Reconcile the latest admitted input and current state before applying a historical shutdown; preserve actual later operator stops and action refusals."
+    )))
 }
 
 pub fn parent_input_blocks(
@@ -1556,14 +1656,15 @@ pub fn input_blocks(
 pub fn tool_definition() -> Value {
     json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
         "inputSchema": { "type": "object", "properties": {
-            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete"]},
+            "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete","record-continuation"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
             "release_id":{"type":"string"}, "checkpoint":{"type":"object"},
+            "works_only":{"type":"boolean", "description":"Status: read paged work records without repeating run-wide histories. Follow next_offset until null; matched_works counts only visible matching works."},
             "plan_id":{"type":"string"}, "detail":{"type":"string"},
             "key":{"type":"string"}, "work":{"type":"object"}, "work_id":{"type":"string"}, "attempt_id":{"type":"string"},
             "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"object","additionalProperties":{"type":"string"}}]},
             "corrections":{"type":["string","null"]}, "receipt":{"type":"object"}, "status":{"type":"string"}, "reason":{"type":"string"},
-            "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "offset":{"type":"integer","minimum":0}
+            "input_id":{"type":"string"}, "owner":{"type":["string","null"]}, "wake_id":{"type":"string"}, "queue_evidence":{"type":"string"}, "text":{"type":"string","description":"record-continuation: the parent's exact resume point, stored with the run"}, "offset":{"type":"integer","minimum":0}
         }, "required":["action"] } })
 }
 
@@ -1702,6 +1803,7 @@ async fn operate_once(
     if let Operation::Status {
         offset,
         ref work_id,
+        works_only,
     } = operation
     {
         let visible = |id: &str| {
@@ -1722,6 +1824,14 @@ async fn operate_once(
                 "unresolved":work.artifact.as_ref().map(|a| &a.unresolved),
                 "integration_requirements":work.artifact.as_ref().map(|a| &a.integration_requirements),"integration":work.integration,
                 "reason":work.reason.as_ref().map(|s| s.chars().take(500).collect::<String>())})).collect::<Vec<_>>();
+        if works_only {
+            let next = offset.saturating_add(works.len());
+            return serde_json::to_string(&json!({
+                "revision": run.revision, "works": works, "offset": offset,
+                "next_offset": (next < matched_works).then_some(next),
+                "matched_works": matched_works,
+            })).map_err(|e| e.to_string());
+        }
         let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id))
                 && work_id.as_ref().is_none_or(|wanted| input.owner.as_ref() == Some(wanted)))
             .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"replayed_from":input.replayed_from,"owner":input.owner,"acknowledged":input.acknowledged && crate::planner_input::withdrawal(&run, id).is_none(),"withdrawn":crate::planner_input::withdrawal(&run, id),
@@ -1729,7 +1839,7 @@ async fn operate_once(
         let wakes = run
             .wakes
             .iter()
-            .filter(|(_, w)| visible(&w.work_id))
+            .filter(|(id, w)| visible(&w.work_id) && !run.dormant_recovery_wake(id))
             .skip(offset)
             .take(32)
             .collect::<BTreeMap<_, _>>();
@@ -1753,6 +1863,9 @@ async fn operate_once(
             });
         }
         return serde_json::to_string(&json!({"revision":run.revision,"policy":run.policy.identity,"phase":run.phase,"status":run.status,
+            "handoff":actor.is_none().then(|| crate::planner_handoff::status(shared, sid)),
+            "continuation":actor.is_none().then_some(run.continuation.as_ref()).flatten(),
+            "checkpoint":actor.is_none().then_some(run.checkpoint.as_ref()).flatten(),
             "works":works,"inputs":inputs,"wakes":wakes,"approval_waits":run.approval_waits,
             "execution":actor.is_none().then(|| execution_context(&run)).flatten(),
             "capacity":capacity,
@@ -1800,7 +1913,7 @@ async fn operate_once(
         return Err(format!(
             "run is shutting down: admit nothing; record the exact resume point in {} and your \
              registers, then end your turn",
-            shared.cfg.routers.planner.continuation
+            continuation_target(&shared.cfg.routers.planner)
         ));
     }
     if !matches!(run.status, RunStatus::Running | RunStatus::Draining)
@@ -1894,17 +2007,16 @@ async fn operate_once(
                     "reconcile cannot change the admitted completion contract version".into(),
                 );
             }
-            let terminal_correction = existing.spec.completion_contract_version == Some(2)
-                && matches!(
-                    existing.status,
-                    WorkStatus::Finished | WorkStatus::Integrated
-                );
+            let terminal_correction = matches!(
+                existing.status,
+                WorkStatus::Finished | WorkStatus::Integrated
+            );
             if terminal_correction
                 && (work.external_id != existing.spec.external_id
                     || work.scope == existing.spec.scope
                     || evidence.iter().any(|e| !valid_evidence(e)))
             {
-                return Err("v2 correction must retain its external guide and name a changed bounded scope with durable evidence".into());
+                return Err("correction must retain its external guide and name a changed bounded scope with durable evidence".into());
             }
             if terminal_correction
                 && existing
@@ -1912,7 +2024,7 @@ async fn operate_once(
                     .as_ref()
                     .is_some_and(|attempt| !attempt.ended)
             {
-                return Err("v2 correction requires the prior attempt to be ended before reopening the work identity".into());
+                return Err("correction requires the prior attempt to be ended before reopening the work identity".into());
             }
             if !terminal_correction
                 && existing
@@ -1922,6 +2034,17 @@ async fn operate_once(
             {
                 return Err("reconcile requires the owning attempt to stop first; never change a live worker's assignment".into());
             }
+            let memberships: Vec<_> = run
+                .releases
+                .values()
+                .filter_map(|release| {
+                    release
+                        .works
+                        .get(&work.work_id)
+                        .map(|revision| (release.stage(), revision))
+                })
+                .collect();
+            let historical_custody = !terminal_correction && !memberships.is_empty();
             if !terminal_correction
                 && (matches!(
                     existing.status,
@@ -1929,12 +2052,69 @@ async fn operate_once(
                         | WorkStatus::Integrated
                         | WorkStatus::Watching
                         | WorkStatus::Retired
-                ) || run
-                    .releases
-                    .values()
-                    .any(|release| release.works.contains_key(&work.work_id)))
+                ) || memberships.iter().any(|(stage, _)| {
+                    !matches!(
+                        stage,
+                        crate::planner_release::Stage::Disposed
+                            | crate::planner_release::Stage::Abandoned
+                    )
+                }))
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
+            }
+            if historical_custody {
+                if work != existing.spec || !existing.attempt.as_ref().is_some_and(|a| a.ended) {
+                    return Err("historical release custody requires the unchanged assignment and an ended attempt".into());
+                }
+                let artifact_revision = existing
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| &artifact.revision);
+                let pinned_source = existing.reconciliation.source_revision.as_ref();
+                let older_artifact = artifact_revision
+                    .zip(pinned_source)
+                    .filter(|(artifact, pinned)| artifact != pinned)
+                    .map(|(artifact, _)| artifact);
+                // A preserved source pin can supersede a historical artifact,
+                // but cannot arbitrate between two claims to current custody.
+                if older_artifact.is_some_and(|artifact| {
+                    !memberships
+                        .iter()
+                        .any(|(_, revision)| *revision == artifact)
+                }) {
+                    return Err(
+                        "historical release custody has conflicting artifact and source revisions"
+                            .into(),
+                    );
+                }
+                let recorded_source = pinned_source.or(artifact_revision);
+                if !recorded_source.map_or_else(
+                    || {
+                        memberships
+                            .iter()
+                            .all(|(_, revision)| *revision == &source_revision)
+                    },
+                    |revision| revision == &source_revision,
+                ) {
+                    return Err(
+                        "historical release custody requires the exact preserved source revision"
+                            .into(),
+                    );
+                }
+                let workspace = existing
+                    .workspace
+                    .as_ref()
+                    .ok_or("historical release custody requires the existing worktree")?;
+                workspace_available(workspace)?;
+                verify_pushed_revision(&workspace.path, &source_revision).await?;
+                if let Some(artifact) = older_artifact {
+                    verify_source_revision(&workspace.path, artifact)
+                        .await
+                        .map_err(|_| {
+                            "historical release custody would drop the released artifact revision"
+                                .to_string()
+                        })?;
+                }
             }
             if existing.handoff.as_ref().is_some_and(|handoff| {
                 matches!(
@@ -1965,7 +2145,7 @@ async fn operate_once(
                     allocate_workspace(shared, sid, &allocation, &run.policy).await?
                 }
                 // Integrated workspaces may already have been returned to the
-                // host. A v2 correction is explicitly reopening that same
+                // host. A correction is explicitly reopening that same
                 // identity, so restore a lease instead of treating the old
                 // historical path as current custody.
                 Some(_) => {
@@ -2348,6 +2528,8 @@ async fn operate_once(
                             work.spec.external_id.as_ref().map(|plan| (id, plan))).collect::<BTreeMap<_, _>>(),
                         "artifact_revisions":run.works.iter().filter_map(|(id, work)|
                             work.artifact.as_ref().map(|artifact| (id, &artifact.revision))).collect::<BTreeMap<_, _>>(),
+                        "selected_works":checkpoint.works.keys().filter_map(|id|
+                            run.works.get(id).map(|work| (id, work))).collect::<BTreeMap<_, _>>(),
                         "source_dependencies":run.works.iter().map(|(id, work)|
                             (id, &work.spec.ready_dependencies)).collect::<BTreeMap<_, _>>()
                     }),
@@ -2450,6 +2632,19 @@ async fn operate_once(
                 .ok_or("unknown wake receipt")?
                 .acknowledged = true;
         }
+        Operation::RecordContinuation { text, .. } => {
+            let text = text.trim();
+            if text.is_empty() || text.chars().count() > CONTINUATION_LIMIT {
+                return Err(format!(
+                    "record-continuation requires 1 to {CONTINUATION_LIMIT} characters of text"
+                ));
+            }
+            run.continuation = Some(ContinuationNote {
+                text: text.to_string(),
+                saved_at_ms: chrono::Utc::now().timestamp_millis(),
+                session_id: sid.to_string(),
+            });
+        }
         Operation::Hold {
             plan_id,
             reason,
@@ -2519,6 +2714,7 @@ async fn operate_once(
     }
     run.receipts.insert(key.to_string(), fingerprint);
     save(shared, sid, &mut run)?;
+    crate::planner_handoff::operated(shared, sid, &operation);
     // Deliver the queued `work_finished` now rather than on the next flusher
     // tick; a host that refuses it keeps it queued, never this operation.
     if matches!(operation, Operation::Integrate { .. })
@@ -2544,6 +2740,7 @@ async fn git(path: &Path, args: &[&str]) -> Result<String, String> {
         .arg("-C")
         .arg(path)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -2561,14 +2758,48 @@ async fn verify_revision(path: &Path, revision: &str) -> Result<(), String> {
     if git(path, &["rev-parse", "HEAD"]).await? != revision {
         return Err("workspace HEAD changed; submit its current artifact for fresh review".into());
     }
-    if !git(path, &["status", "--porcelain", "--untracked-files=normal"])
-        .await?
-        .is_empty()
+    if !git(
+        path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ],
+    )
+    .await?
+    .is_empty()
     {
         return Err(
             "workspace has uncommitted changes; reviewed artifact is not the current workspace"
                 .into(),
         );
+    }
+    Ok(())
+}
+
+async fn verify_pushed_revision(path: &Path, revision: &str) -> Result<(), String> {
+    verify_revision(path, revision).await?;
+    const UNVERIFIED: &str = "historical release custody requires the exact origin branch tip";
+    let branch = git(path, &["symbolic-ref", "--quiet", "HEAD"])
+        .await
+        .ok()
+        .filter(|branch| branch.starts_with("refs/heads/"))
+        .ok_or(UNVERIFIED)?;
+    // Read the actual remote; a stale tracking ref can hide a changed branch.
+    let tip = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        git(
+            path,
+            &["ls-remote", "--exit-code", "--refs", "origin", &branch],
+        ),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .ok_or(UNVERIFIED)?;
+    if tip.split_once('\t') != Some((revision, branch.as_str())) {
+        return Err(UNVERIFIED.into());
     }
     Ok(())
 }
@@ -2670,6 +2901,7 @@ fn continuation_role(work: &Work) -> PlannerRole {
 /// attempt is still alive, the workspace is a clean git tree, and a submitted
 /// artifact is still exactly its HEAD. Anything else (dirty, moved, missing,
 /// live) is still marked, so the parent reconciles exactly what could be lost.
+#[cfg(test)]
 pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
     mark_adopted_reconciliation_by(work, None);
 }
@@ -2679,7 +2911,10 @@ pub(crate) fn mark_adopted_reconciliation(work: &mut Work) {
 /// 2026-11-19: with the operator's global `core.fsmonitor=true` every probed
 /// tree started a daemon, and adopting 830 works took 5 min 42 s while Kory
 /// sat at a blank screen. Adoption must stay bounded on any host.
-pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<std::time::Instant>) {
+pub(crate) fn mark_adopted_reconciliation_by(
+    work: &mut Work,
+    deadline: Option<std::time::Instant>,
+) {
     let mut probe = work.clone();
     mark_reconciliation_required(&mut probe);
     if !probe.reconciliation.required {
@@ -2720,12 +2955,18 @@ pub(crate) fn mark_adopted_reconciliation_by(work: &mut Work, deadline: Option<s
 pub(crate) const DEFERRED_CUSTODY: &str = "router: custody check deferred past the adoption budget";
 
 /// Works whose custody check adoption deferred, oldest identity first, at most `limit`.
-pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> Vec<(String, Work)> {
+pub(crate) fn deferred_custody(
+    works: &BTreeMap<String, Work>,
+    limit: usize,
+) -> Vec<(String, Work)> {
     works
         .iter()
         .filter(|(_, w)| {
             w.reconciliation.required
-                && w.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY)
+                && w.reconciliation
+                    .evidence
+                    .iter()
+                    .any(|e| e == DEFERRED_CUSTODY)
         })
         .take(limit)
         .map(|(id, w)| (id.clone(), w.clone()))
@@ -2735,7 +2976,12 @@ pub(crate) fn deferred_custody(works: &BTreeMap<String, Work>, limit: usize) -> 
 /// Apply a deferred custody result: a clean, unchanged workspace needs no parent
 /// reconciliation (the same judgment adoption makes); anything else stays owed.
 pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
-    if !work.reconciliation.evidence.iter().any(|e| e == DEFERRED_CUSTODY) {
+    if !work
+        .reconciliation
+        .evidence
+        .iter()
+        .any(|e| e == DEFERRED_CUSTODY)
+    {
         return;
     }
     match head {
@@ -2751,7 +2997,11 @@ pub(crate) fn settle_deferred_custody(work: &mut Work, head: Option<String>) {
 
 /// The workspace HEAD when adoption can verify unchanged custody, else None.
 pub(crate) fn adopted_custody_head(work: &Work) -> Option<String> {
-    if work.attempt.as_ref().is_some_and(|a| !a.ended && owner_alive(a)) {
+    if work
+        .attempt
+        .as_ref()
+        .is_some_and(|a| !a.ended && owner_alive(a))
+    {
         return None;
     }
     let path = &work.workspace.as_ref()?.path;
@@ -2864,7 +3114,10 @@ pub fn progress(run: &PlannerRun) -> Value {
         "awaiting_review":run.works.values().filter(|w| w.status == WorkStatus::ReviewPending).count(),
         "awaiting_integration":run.works.values().filter(|w| w.status == WorkStatus::Finished).count(),
         "integrated":run.works.values().filter(|w| w.status == WorkStatus::Integrated).count(),
-        "recovery_required":run.capacity.resumes.iter().filter(|(_, r)| r.suspended.is_some()).map(|(id, _)| id).collect::<Vec<_>>()})
+        "recovery_required":run.capacity.resumes.iter().filter(|(id, r)| {
+            r.suspended.is_some()
+                && !run.works.get(*id).is_some_and(|work| work.status.dormant_disposition())
+        }).map(|(id, _)| id).collect::<Vec<_>>()})
 }
 
 pub async fn begin_work(
@@ -3049,15 +3302,23 @@ async fn begin_work_once(
             .find(|(key, _)| key.starts_with("entrypoint:"))
     {
         let skill: ResolvedSkill = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if skill.source != run.policy.roles[&role].source {
-            instructions.push_str(&format!(
-                "\n[Explicit repository entrypoint: {}]\n{}",
-                skill.name, skill.text
-            ));
+        let selected = &run.policy.roles[&role];
+        if skill.source != selected.source || skill.hash != selected.hash {
+            append_entrypoint(&mut instructions, &skill);
         }
     }
     instructions.push_str(&format!("\n[Durable assignment]\nwork_id: {work_id}\nattempt_id: {attempt_id}\nchild_id: {}\nplan_id: {}\nAssigned scope: {}\nRequired checks: {:?}\nPrior evidence: {:?}\nPrior corrections: {:?}\nPrior output: {:?}\n", snapshot.child_id, snapshot.spec.plan_id, snapshot.spec.scope, snapshot.spec.required_checks, snapshot.artifact, snapshot.review, snapshot.last_output));
-    instructions.push_str(&format!("\n[Current source custody]\n{}\nThis current assignment supersedes older briefs. Preserve and carry its source revision; do not reset transferred changes as foreign work.\n", serde_json::to_string(&snapshot.reconciliation).map_err(|e| e.to_string())?));
+    // Superseded specifications and completion records stay in the durable ledger.
+    // Replaying that archive into every new assignment made a resumed worker's
+    // prompt exceed the adapter's input limit even though its current scope was small.
+    let custody = json!({
+        "required": snapshot.reconciliation.required,
+        "source_revision": snapshot.reconciliation.source_revision,
+        "evidence": snapshot.reconciliation.evidence,
+        "prior_spec_count": snapshot.reconciliation.prior_specs.len(),
+        "prior_completion_count": snapshot.reconciliation.prior_completions.len(),
+    });
+    instructions.push_str(&format!("\n[Current source custody]\n{custody}\nThis current assignment supersedes older briefs. Preserve and carry its source revision; do not reset transferred changes as foreign work. Superseded specifications and completion records remain in the planner ledger; they are not the current assignment.\n"));
     if role == PlannerRole::ImplementWork {
         instructions.push_str(&related_source_context(&run, &snapshot));
     }
@@ -3465,9 +3726,28 @@ mod adoption_custody_tests {
         git(path, &["init", "-q"]);
         std::fs::write(path.join("a.txt"), "a").unwrap();
         git(path, &["add", "a.txt"]);
-        git(path, &["-c", "user.name=f", "-c", "user.email=f@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "a"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        );
         let head = String::from_utf8(
-            std::process::Command::new("git").arg("-C").arg(path).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -3475,31 +3755,55 @@ mod adoption_custody_tests {
 
         let mut clean = work(path, Some(&head));
         mark_adopted_reconciliation(&mut clean);
-        assert!(!clean.reconciliation.required, "a clean tree at its artifact was marked");
-        assert_eq!(clean.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        assert!(
+            !clean.reconciliation.required,
+            "a clean tree at its artifact was marked"
+        );
+        assert_eq!(
+            clean.reconciliation.source_revision.as_deref(),
+            Some(head.as_str())
+        );
 
         // 2026-11-19: past the adoption budget nothing is probed; the work reconciles as before.
         let mut late = work(path, Some(&head));
         mark_adopted_reconciliation_by(&mut late, Some(std::time::Instant::now()));
-        assert!(late.reconciliation.required && late.reconciliation.source_revision.is_none(),
-            "a work past the custody budget was probed instead of marked");
+        assert!(
+            late.reconciliation.required && late.reconciliation.source_revision.is_none(),
+            "a work past the custody budget was probed instead of marked"
+        );
         // The deferred check finishes later and clears it exactly as adoption would have.
         let works = BTreeMap::from([("late".to_string(), late.clone())]);
         let deferred = deferred_custody(&works, 50);
-        assert_eq!(deferred.len(), 1, "a deferred work was not listed for the background check");
+        assert_eq!(
+            deferred.len(),
+            1,
+            "a deferred work was not listed for the background check"
+        );
         settle_deferred_custody(&mut late, adopted_custody_head(&deferred[0].1));
-        assert!(!late.reconciliation.required, "a clean deferred work stayed owed");
-        assert_eq!(late.reconciliation.source_revision.as_deref(), Some(head.as_str()));
+        assert!(
+            !late.reconciliation.required,
+            "a clean deferred work stayed owed"
+        );
+        assert_eq!(
+            late.reconciliation.source_revision.as_deref(),
+            Some(head.as_str())
+        );
         // 2026-11-19: a work already owed on a clean, unchanged tree is checked again and cleared.
         let mut owed_clean = work(path, Some(&head));
         owed_clean.reconciliation.required = true;
         mark_adopted_reconciliation_by(&mut owed_clean, None);
-        assert!(!owed_clean.reconciliation.required, "an owed work on a clean tree stayed owed");
+        assert!(
+            !owed_clean.reconciliation.required,
+            "an owed work on a clean tree stayed owed"
+        );
         // A never-started work whose reserved tree does not exist has nothing in custody.
         let mut never = work(&path.join("never-created"), None);
         never.status = WorkStatus::Admitted;
         mark_adopted_reconciliation_by(&mut never, None);
-        assert!(!never.reconciliation.required, "a never-started work without a tree was owed");
+        assert!(
+            !never.reconciliation.required,
+            "a never-started work without a tree was owed"
+        );
         // A deferred work whose custody is not clean stays owed, and is not rechecked.
         let mut owed = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation_by(&mut owed, Some(std::time::Instant::now()));
@@ -3509,7 +3813,10 @@ mod adoption_custody_tests {
 
         let mut moved = work(path, Some(&"0".repeat(40)));
         mark_adopted_reconciliation(&mut moved);
-        assert!(moved.reconciliation.required, "a HEAD past its artifact was not marked");
+        assert!(
+            moved.reconciliation.required,
+            "a HEAD past its artifact was not marked"
+        );
 
         std::fs::write(path.join("b.txt"), "uncommitted").unwrap();
         let mut dirty = work(path, Some(&head));
@@ -3518,13 +3825,18 @@ mod adoption_custody_tests {
 
         let mut missing = work(&path.join("gone"), None);
         mark_adopted_reconciliation(&mut missing);
-        assert!(missing.reconciliation.required, "a missing tree was not marked");
+        assert!(
+            missing.reconciliation.required,
+            "a missing tree was not marked"
+        );
 
         let mut finished = work(path, Some(&head));
         finished.status = WorkStatus::Finished;
         mark_adopted_reconciliation(&mut finished);
-        assert!(!finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
-            "a finished work was touched");
+        assert!(
+            !finished.reconciliation.required && finished.reconciliation.evidence.is_empty(),
+            "a finished work was touched"
+        );
     }
 }
 

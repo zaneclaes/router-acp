@@ -344,6 +344,10 @@ fn shape(value: &Value) -> Value {
 fn populate(store: &StateStore, parent: &str) {
     let child = format!("{parent}::delegate-down");
     store.upsert(parent.into(), session(None, "primary", "Parent", DAY_START));
+    store.save_planner_run(parent, 0, &json!({"works": {
+        "selected": {"artifact": {"revision": "artifact-sha", "integration_requirements": {"deployed-read": "Read the deployed result"}}},
+        "unselected": {"artifact": {"revision": "other-sha"}}
+    }})).unwrap();
     store.note_delegation_directive(parent);
     store.upsert(
         child.clone(),
@@ -394,6 +398,18 @@ fn v1_shapes_match_for_legacy_and_sharded_sessions() {
     let shard =
         StateLayout::new(&sharded_state).shard_path(&tag_for_cwd(&sharded.path().join("checkout")));
     assert!(shard.exists());
+
+    // Reuse the state/CLI fixture: read real obligations without replacing an owner.
+    let selected = query(&sharded_config, &["planner-works", "--session", &parent,
+        "--min-revision", "1", "--work", "selected"]);
+    assert_eq!(selected["data"]["session_id"], parent);
+    assert_eq!(selected["data"]["run_revision"], 1);
+    assert_eq!(selected["data"]["selected_works"]["selected"]["artifact"]["integration_requirements"]["deployed-read"], "Read the deployed result");
+    assert!(selected["data"]["selected_works"].get("unselected").is_none());
+    for (revision, work) in [("2", "selected"), ("1", "absent")] {
+        assert!(!run(&sharded_config, &["planner-works", "--session", &parent,
+            "--min-revision", revision, "--work", work]).status.success());
+    }
 
     let range = [
         "analytics".to_string(),

@@ -53,6 +53,27 @@ pub fn wake_retry_secs(deliveries: u32) -> i64 {
     WAKE_RETRY_SECS[(deliveries.saturating_sub(1) as usize).min(WAKE_RETRY_SECS.len() - 1)]
 }
 
+/// Redelivery spacing of an unacknowledged durable planner wake (a recovery or child wake, never
+/// queued input): the input schedule, then 15 min, 30 min and hourly with no cap. Its text is
+/// unchanged; a new or changed condition is a new wake and goes at once. Chordzy 2026-11-20: 61
+/// recovery wakes the parent could not yet reconcile came back every 5 min (up to 42 deliveries
+/// each), a parent turn every couple of minutes repeating the same text.
+pub const PLANNER_WAKE_RETRY_SECS: [i64; 6] = [30, 120, 300, 900, 1800, 3600];
+
+pub fn planner_wake_retry_secs(deliveries: u32) -> i64 {
+    PLANNER_WAKE_RETRY_SECS
+        [(deliveries.saturating_sub(1) as usize).min(PLANNER_WAKE_RETRY_SECS.len() - 1)]
+}
+
+/// Longest spacing of an unchanged audit wake to an idle parent.
+pub const UNCHANGED_AUDIT_MAX_SECS: i64 = 900;
+
+/// Spacing of an audit wake whose full notice is unchanged after `repeats` identical sends:
+/// `wait`, doubled per repeat, at most 15 min. A changed notice resets it to `wait`.
+pub fn unchanged_audit_wait(wait: i64, repeats: u32) -> i64 {
+    (wait << repeats.min(5)).clamp(wait, UNCHANGED_AUDIT_MAX_SECS.max(wait))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Defect {
     pub code: String,
@@ -212,6 +233,8 @@ pub struct SessionRuntime {
     pub steering: bool,
     /// Session-wide throttle, retained across parent turn boundaries.
     pub last_steer: Option<std::time::Instant>,
+    /// Last safe wake-loop decision emitted for external health observers.
+    pub wake_delivery_observation: Option<crate::planner_wake::DeliveryObservation>,
     /// When each queued item last cancelled a router-owned turn because
     /// steering was declined (`crate::planner_wake::preempt_allowed`).
     /// Retained across turns: the cancel is what ends the turn.
@@ -457,9 +480,12 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     };
     // Freshness begins at the answer. A slow host must not return a snapshot
     // already stale enough to restart workers parked on its pending CI result.
-    // Keep the caller's clock and whole-second resolution for deterministic ticks.
-    let answered_at_ms =
-        now_ms.saturating_add((started.elapsed().as_secs() as i64).saturating_mul(1000));
+    // Preserve the caller's logical clock (including monotonic host duration),
+    // but do not let a delayed capacity tick backdate a real host response.
+    // The tick may have awaited worker recovery before entering this call.
+    let answered_at_ms = now_ms
+        .saturating_add((started.elapsed().as_secs() as i64).saturating_mul(1000))
+        .max(chrono::Utc::now().timestamp().saturating_mul(1000));
     let observations = answer
         .as_ref()
         .ok()
@@ -520,6 +546,45 @@ fn pending_wake(run: &PlannerRun, prefix: &str) -> bool {
     run.wakes
         .iter()
         .any(|(id, w)| id.starts_with(prefix) && !w.acknowledged)
+}
+
+/// The audit findings one parent context (its downstream session) has received in full.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditDelivered {
+    pub context: String,
+    pub findings: BTreeSet<String>,
+    /// The unshortened notice of the last audit wake, so an unchanged audit is recognized
+    /// whatever form this context received it in.
+    #[serde(default)]
+    pub last_key: String,
+    /// Consecutive audit wakes sent with that same notice.
+    #[serde(default)]
+    pub repeats: u32,
+}
+
+/// Characters of an unchanged finding a repeated audit wake keeps.
+const AUDIT_REPEAT_CHARS: usize = 120;
+
+/// The finding lines of one audit wake, and how many were shortened. A finding the current parent
+/// context already received in full is cut to its first characters; new or changed findings stay
+/// whole and come first. Chordzy 2026-11-20: the whole list (about 27 kB, 36 of its lines unchanged
+/// flake findings) went out with every audit wake, roughly 900k tokens of router text in five hours,
+/// so the parent filled its 1M-token context and handed off about hourly.
+pub(crate) fn audit_wake_lines(
+    findings: &[String],
+    delivered: &BTreeSet<String>,
+) -> (Vec<String>, usize) {
+    let (seen, fresh): (Vec<&String>, Vec<&String>) = findings
+        .iter()
+        .partition(|finding| delivered.contains(*finding));
+    let mut lines: Vec<String> = fresh.into_iter().cloned().collect();
+    for finding in &seen {
+        lines.push(match finding.char_indices().nth(AUDIT_REPEAT_CHARS) {
+            Some((at, _)) => format!("{}… (unchanged)", &finding[..at]),
+            None => (*finding).clone(),
+        });
+    }
+    (lines, seen.len())
 }
 
 fn insert_wake(run: &mut PlannerRun, prefix: &str, sid: &str, reason: String) {
@@ -617,35 +682,84 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         return;
     }
     let unavailable = run.capacity.audit.as_ref().is_some_and(|a| !a.ok);
-    let reason = if unavailable {
-        format!(
-            "audit: the audit host is UNAVAILABLE: {}. An unavailable audit is never a clean \
-             one: fix the host (its command, exit status and JSON) now; `complete` is refused \
-             until it answers. This wake repeats every {wait} s.",
-            run.capacity
-                .audit
-                .as_ref()
-                .and_then(|a| a.error.as_deref())
-                .unwrap_or("no answer")
+    // A handoff opens a new downstream session, which has seen nothing yet.
+    let context = shared
+        .with_session(sid, |session| {
+            session.pin.as_ref().map(|pin| pin.downstream_sid.clone())
+        })
+        .flatten()
+        .unwrap_or_default();
+    let delivered = run
+        .capacity
+        .audit_delivered
+        .as_ref()
+        .filter(|delivered| !context.is_empty() && delivered.context == context)
+        .map(|delivered| delivered.findings.clone())
+        .unwrap_or_default();
+    let (lines, repeated) = audit_wake_lines(&findings, &delivered);
+    let compose = |lines: &[String], note: &str| {
+        let reason = if unavailable {
+            format!(
+                "audit: the audit host is UNAVAILABLE: {}. An unavailable audit is never a clean \
+                 one: fix the host (its command, exit status and JSON) now; `complete` is refused \
+                 until it answers. This wake repeats every {wait} s.",
+                run.capacity
+                    .audit
+                    .as_ref()
+                    .and_then(|a| a.error.as_deref())
+                    .unwrap_or("no answer")
+            )
+        } else {
+            format!(
+                "audit: the run auditor reports {} defect(s) the native implement-all watcher \
+                 would not let this run sit on:\n- {}\n{note}Each is a defect in this run, not a \
+                 state to wait in: act on every one now (start the release or smoke it owes, \
+                 record the disposition, fix the root or disk). This wake repeats every {wait} s \
+                 while any remains.",
+                findings.len(),
+                lines.join("\n- ")
+            )
+        };
+        // While ownership recovery is pending, the parent cannot admit or dispatch
+        // the inventory that answers these findings; say so instead of demanding
+        // actions the run refuses.
+        match crate::planner_adopt::pending_notice(run) {
+            Some(notice) => format!("{reason}\n{notice}"),
+            None => reason,
+        }
+    };
+    // `key` is the unshortened notice: whether an audit is unchanged never depends on what
+    // this context has already seen. `reason` is what the parent receives.
+    let key = compose(&findings, "");
+    let reason = if repeated > 0 {
+        compose(
+            &lines,
+            &format!(
+                "{repeated} finding(s) marked unchanged were delivered in full earlier in this \
+                 context and are shortened here; planner_workflow status lists every finding \
+                 whole (capacity.audit_findings).\n"
+            ),
         )
     } else {
-        format!(
-            "audit: the run auditor reports {} defect(s) the native implement-all watcher \
-             would not let this run sit on:\n- {}\nEach is a defect in this run, not a state to \
-             wait in: act on every one now (start the release or smoke it owes, record the \
-             disposition, fix the root or disk). This wake repeats every {wait} s while any \
-             remains.",
-            findings.len(),
-            findings.join("\n- ")
-        )
+        key.clone()
     };
-    // While ownership recovery is pending, the parent cannot admit or dispatch
-    // the inventory that answers these findings; say so instead of demanding
-    // actions the run refuses.
-    let reason = match crate::planner_adopt::pending_notice(run) {
-        Some(notice) => format!("{reason}\n{notice}"),
-        None => reason,
+    let unchanged = |run: &PlannerRun| {
+        run.capacity
+            .audit_delivered
+            .as_ref()
+            .is_some_and(|delivered| delivered.last_key == key)
     };
+    // The same notice again backs off; any change goes at the ordinary cadence.
+    if unchanged(run) {
+        let repeats = run
+            .capacity
+            .audit_delivered
+            .as_ref()
+            .map_or(0, |d| d.repeats);
+        if now - last < unchanged_audit_wait(wait, repeats) {
+            return;
+        }
+    }
     // An unchanged delivered audit must not repeatedly interrupt an active
     // repair or release. Idle parents retain the existing repeat cadence.
     if release_audit
@@ -653,10 +767,8 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         && shared
             .with_session(sid, |session| session.prompt_activity > 0)
             .unwrap_or(false)
-        && run
-            .wakes
-            .iter()
-            .any(|(id, wake)| id.starts_with(prefix) && wake.reason == reason)
+        && run.wakes.keys().any(|id| id.starts_with(prefix))
+        && unchanged(run)
     {
         return;
     }
@@ -664,10 +776,11 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
         // Keep an unchanged notification and any claimed delivery. An unclaimed,
         // obsolete urgent wake must not hide a different current obligation just
         // because the parent has not acknowledged the earlier one yet.
+        let same = unchanged(run);
         if run.wakes.iter().any(|(id, wake)| {
             id.starts_with(prefix)
                 && !wake.acknowledged
-                && (!release_audit || wake.reason == reason || wake.claim_pid != 0)
+                && (!release_audit || same || wake.claim_pid != 0)
         }) {
             return Ok(());
         }
@@ -677,6 +790,25 @@ pub fn audit_wake(shared: &Shared, sid: &str, run: &PlannerRun, now: i64, last: 
             }
         }
         run.capacity.last_audit_wake_at = now;
+        let mut seen = delivered.clone();
+        if !unavailable && !context.is_empty() {
+            seen.extend(findings.iter().cloned());
+        }
+        let repeats = if same {
+            run.capacity
+                .audit_delivered
+                .as_ref()
+                .map_or(0, |d| d.repeats)
+                + 1
+        } else {
+            0
+        };
+        run.capacity.audit_delivered = Some(AuditDelivered {
+            context: context.clone(),
+            findings: seen,
+            last_key: key.clone(),
+            repeats,
+        });
         insert_wake(run, prefix, sid, reason.clone());
         Ok(())
     });
@@ -1210,4 +1342,30 @@ pub fn status_fields(shared: &Shared, run: &PlannerRun) -> BTreeMap<&'static str
         ("gate", json!(run.capacity.gate)),
         ("native_adoption", json!(run.capacity.native_adoption)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_wake_shortens_only_findings_this_context_already_received() {
+        let long = format!("FLAKE_UNPROVEN: staging build 12606 {}", "x".repeat(300));
+        let findings = vec![long.clone(), "STAGING_IDLE: ready heads".to_string()];
+        // A fresh context (or one after a handoff) receives every finding whole.
+        let (lines, repeated) = audit_wake_lines(&findings, &BTreeSet::new());
+        assert_eq!((lines.clone(), repeated), (findings.clone(), 0));
+        // The same context later: the unchanged long finding is cut, a new one is whole and first.
+        let delivered: BTreeSet<String> = findings.iter().cloned().collect();
+        let next = vec![long.clone(), "IDLE_UNDER_LIMIT: live=2/50".to_string()];
+        let (lines, repeated) = audit_wake_lines(&next, &delivered);
+        assert_eq!(repeated, 1);
+        assert_eq!(lines[0], "IDLE_UNDER_LIMIT: live=2/50");
+        assert!(lines[1].ends_with("… (unchanged)") && lines[1].chars().count() < 140);
+        assert!(long.starts_with(lines[1].trim_end_matches("… (unchanged)")));
+        // A changed finding is new text, so it is delivered whole again.
+        let changed = format!("{long} 2 of 5");
+        let (lines, repeated) = audit_wake_lines(std::slice::from_ref(&changed), &delivered);
+        assert_eq!((lines, repeated), (vec![changed], 0));
+    }
 }

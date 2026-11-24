@@ -56,8 +56,8 @@ pub fn status(shared: &Shared, params: &Value) -> Result<Value, String> {
     };
     Ok(json!({"status":run.status,"live":capacity["live"],"admissible":admissible}))
 }
-/// Where the parent records its resume point is the pluggable `routers.planner.continuation`
-/// (default the Markdown layout's `Docs/CONTINUE.md`), never a fixed project path.
+/// Where the parent records its resume point: the optional `routers.planner.continuation`
+/// file, or (unset) the run's resume note in the state database.
 pub fn parent_prompt(planner: &crate::config::PlannerRouterConfig) -> String {
     format!(
         "Session restart (router lifecycle, not a stop of the run): the live children have \
@@ -67,7 +67,7 @@ pub fn parent_prompt(planner: &crate::config::PlannerRouterConfig) -> String {
          with it. The next session resumes the whole run normally, so never record or treat this \
          as an operator instruction to stop or to wait for permission. Make this one brief \
          state-saving turn, then end it.",
-        planner.continuation
+        crate::planner_workflow::continuation_target(planner)
     )
 }
 pub const WORKER_PROMPT: &str = "Shutdown requested: interrupt your current work, record your \
@@ -321,19 +321,68 @@ async fn save_state(
     prior: RunStatus,
     cfg: &crate::config::PlannerShutdownConfig,
 ) -> Result<(Vec<String>, String, bool), String> {
+    save_checkpoint(shared, sid, run, prior, cfg, "shutdown").await
+}
+
+pub(crate) async fn save_checkpoint(
+    shared: &Shared,
+    sid: &str,
+    run: &PlannerRun,
+    prior: RunStatus,
+    cfg: &crate::config::PlannerShutdownConfig,
+    event: &str,
+) -> Result<(Vec<String>, String, bool), String> {
+    let lock = shared
+        .with_session(sid, |s| s.parent_handoff.checkpoint_lock.clone())
+        .ok_or("the parent session is not loaded")?;
+    let _checkpoint = lock.lock().await;
+    let current = crate::planner_workflow::load(shared, sid)?;
+    let run = current.as_ref().unwrap_or(run);
+    if event != "shutdown" && run.status != RunStatus::Running {
+        return Err("checkpoint deferred because the run is stopping".into());
+    }
+    // Shutdown, live checkpoints and hot handoffs share this one path. Every
+    // event leaves the same receipt in the state database beside the run.
+    let receipt = crate::planner_workflow::CheckpointReceipt {
+        event: event.to_string(),
+        run_revision: run.revision,
+        saved_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let run = &crate::planner_workflow::mutate(shared, sid, |r| {
+        r.checkpoint = Some(receipt.clone());
+        Ok(())
+    })?;
+    let continuation = shared.cfg.routers.planner.continuation.clone();
     let Some(command) = &cfg.command else {
-        return Ok((
-            Vec::new(),
-            "native run state is persisted; no additional shutdown host is configured".into(),
-            false,
-        ));
+        let Some(path) = &continuation else {
+            return Ok((
+                Vec::new(),
+                "run state and resume note are saved in the router state database".into(),
+                true,
+            ));
+        };
+        let cwd = shared
+            .with_session(sid, |s| s.cwd.clone())
+            .ok_or("parent missing")?;
+        return crate::planner_handoff::native_checkpoint(
+            &cwd,
+            shared
+                .cfg
+                .state_file
+                .parent()
+                .ok_or("state file has no directory")?,
+            sid,
+            path,
+            run,
+            event,
+        );
     };
     let cwd = shared
         .with_session(sid, |s| s.cwd.clone())
         .ok_or("the parent session is not loaded")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let continuation = &shared.cfg.routers.planner.continuation;
-    let input = json!({"event":"shutdown","session_id":sid,"cwd":cwd,"run_status":prior,
+    let input = json!({"event":event,"session_id":sid,"cwd":cwd,"run_status":prior,
+        "run_revision":run.revision,"native_state":run,
         "continuation": continuation,
         "works":planner_guard::works_json(run),"holds":planner_guard::active_holds(run, now_ms)});
     let out = planner_guard::run_host(
@@ -367,8 +416,14 @@ async fn save_state(
         .to_string();
     // An opt-in host can write the checkpoint without a model round trip. A flag
     // alone is insufficient: it must report the exact configured path as saved.
-    let continuation_saved = reply.get("continuation_saved").and_then(Value::as_bool) == Some(true)
-        && paths.contains(continuation);
+    // Without a configured file the state database already holds the resume point.
+    let continuation_saved = match &continuation {
+        Some(path) => {
+            reply.get("continuation_saved").and_then(Value::as_bool) == Some(true)
+                && paths.contains(path)
+        }
+        None => true,
+    };
     Ok((paths, summary, continuation_saved))
 }
 

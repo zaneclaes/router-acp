@@ -288,6 +288,11 @@ enum Command {
         /// The router session id that takes it over.
         #[arg(long)]
         into: String,
+        /// Finish an earlier adoption instead: move only the works a superseded
+        /// `--from` kept because `--into` (or a run between them) held an
+        /// unstarted copy of the same guide while `--from` held its tree.
+        #[arg(long)]
+        split_works: bool,
     },
     /// Send an agent-origin message to any active router session, or inspect
     /// its delivery receipt. A planner parent takes it through its durable run
@@ -404,6 +409,15 @@ enum StateQueryCommand {
 
 #[derive(Subcommand)]
 enum StateQueryV1 {
+    /// Selected durable work records, without resuming or interrupting the owner.
+    PlannerWorks {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        min_revision: u64,
+        #[arg(long, required = true, num_args = 1..)]
+        work: Vec<String>,
+    },
     /// Session metadata, including its title when one exists. Look it up by
     /// router session id, or by the provider's own session id with
     /// --downstream (optionally narrowed by --agent).
@@ -1141,15 +1155,24 @@ async fn run() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Command::AdoptRun { state, from, into } => {
+        Command::AdoptRun {
+            state,
+            from,
+            into,
+            split_works,
+        } => {
             // Never prune from this command (see Transcript).
             let never_prune = router_acp::state::Retention {
                 max_age: std::time::Duration::MAX,
             };
             let path = router_acp::config::expand_tilde(&state);
             let store = router_acp::state::StateStore::load(&path, never_prune);
-            let report = router_acp::planner_adopt::adopt(&store, &from, &into)
-                .map_err(anyhow::Error::msg)?;
+            let report = if split_works {
+                router_acp::planner_adopt::readopt_split_works(&store, &from, &into)
+            } else {
+                router_acp::planner_adopt::adopt(&store, &from, &into)
+            }
+            .map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             eprintln!("router-acp · {}", report.summary());
             Ok(())
@@ -1229,6 +1252,23 @@ async fn run() -> anyhow::Result<()> {
             let store =
                 router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
             let (command, data) = match query {
+                StateQueryV1::PlannerWorks { session, min_revision, work } => {
+                    let (revision, document) = store.planner_run(&session)
+                        .map_err(anyhow::Error::msg)?
+                        .ok_or_else(|| anyhow::anyhow!("planner run is absent"))?;
+                    if revision < min_revision {
+                        return Err(anyhow::anyhow!("planner state predates the host request"));
+                    }
+                    let mut selected = serde_json::Map::new();
+                    for id in work {
+                        let value = document.get("works").and_then(|works| works.get(&id))
+                            .ok_or_else(|| anyhow::anyhow!("selected planner work is absent"))?;
+                        selected.insert(id, value.clone());
+                    }
+                    ("planner_works", serde_json::json!({
+                        "session_id": session, "run_revision": revision, "selected_works": selected,
+                    }))
+                }
                 StateQueryV1::Session {
                     session,
                     downstream,

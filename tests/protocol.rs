@@ -232,6 +232,10 @@ struct Observed {
     /// Hold `terminal/wait_for_exit` open until the terminal is killed, like
     /// a long-running watcher.
     hang_terminal_waits: bool,
+    /// Hold only the first terminal so later results can prove independent delivery.
+    hang_first_terminal: bool,
+    terminal_wait_failures: usize,
+    terminal_output_failures: usize,
     /// Answer `terminal/wait_for_exit` only after this long, like a watcher
     /// whose condition fires later.
     terminal_exit_after: Option<Duration>,
@@ -430,17 +434,25 @@ where
                             req.cwd,
                         ));
                         observed.lock().unwrap().terminal_create_meta.push(req.meta);
-                        responder.respond(CreateTerminalResponse::new("managed-terminal-1"))
+                        let id = format!("managed-terminal-{}", observed.lock().unwrap().terminal_creates.len());
+                        responder.respond(CreateTerminalResponse::new(id))
                     }
                 },
                 on_receive_request!(),
             )
             .on_receive_request(
-                move |_req: WaitForTerminalExitRequest,
+                move |req: WaitForTerminalExitRequest,
                       responder: Responder<WaitForTerminalExitResponse>,
                       cx: ConnectionTo<AgentPeer>| {
                     let observed = o_wait.clone();
                     async move {
+                        {
+                            let mut state = observed.lock().unwrap();
+                            if state.terminal_wait_failures > 0 {
+                                state.terminal_wait_failures -= 1;
+                                return responder.respond_with_result(Err(AcpError::internal_error()));
+                            }
+                        }
                         let exit_after = observed.lock().unwrap().terminal_exit_after;
                         if let Some(after) = exit_after {
                             return cx.spawn(async move {
@@ -450,18 +462,29 @@ where
                                 ))
                             });
                         }
-                        if !observed.lock().unwrap().hang_terminal_waits {
+                        let held = {
+                            let state = observed.lock().unwrap();
+                            state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0.as_ref() == "managed-terminal-1"
+                        };
+                        if !held {
                             return responder.respond(WaitForTerminalExitResponse::new(
                                 TerminalExitStatus::new().exit_code(0),
                             ));
                         }
                         cx.spawn(async move {
-                            while observed.lock().unwrap().terminal_kills.is_empty() {
+                            while {
+                                let state = observed.lock().unwrap();
+                                (state.hang_terminal_waits || state.hang_first_terminal && req.terminal_id.0.as_ref() == "managed-terminal-1")
+                                    && state.terminal_kills.is_empty()
+                            } {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
-                            responder.respond(WaitForTerminalExitResponse::new(
-                                TerminalExitStatus::new().signal("SIGTERM"),
-                            ))
+                            let exit = if observed.lock().unwrap().terminal_kills.is_empty() {
+                                TerminalExitStatus::new().exit_code(0)
+                            } else {
+                                TerminalExitStatus::new().signal("SIGTERM")
+                            };
+                            responder.respond(WaitForTerminalExitResponse::new(exit))
                         })
                     }
                 },
@@ -501,8 +524,16 @@ where
                 move |_req: TerminalOutputRequest,
                       responder: Responder<TerminalOutputResponse>,
                       _cx| {
-                    let extra = o_output.lock().unwrap().terminal_output.clone();
+                    let observed = o_output.clone();
                     async move {
+                        let extra = {
+                            let mut state = observed.lock().unwrap();
+                            if state.terminal_output_failures > 0 {
+                                state.terminal_output_failures -= 1;
+                                return responder.respond_with_result(Err(AcpError::internal_error()));
+                            }
+                            state.terminal_output.clone()
+                        };
                         let output = format!("watch-fired\n{}", extra.unwrap_or_default());
                         responder.respond(TerminalOutputResponse::new(output, false))
                     }
@@ -972,6 +1003,89 @@ async fn managed_background_tool_calls_upstream_terminal_without_delegation() {
     .await;
 }
 
+#[tokio::test]
+async fn managed_background_delivers_later_completion_before_first_terminal_exits() {
+    let state = temp_state_file("managed-background-independent-completion");
+    // SAFETY: every helper-enabled test uses the same executable.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("m1", 1)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init_with_terminals(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        observed.lock().unwrap().hang_first_terminal = true;
+        let pending = tokio::spawn(cx.send_request(PromptRequest::new(
+            sid.clone(),
+            vec![ContentBlock::from("BACKGROUND_START:long-proof\nBACKGROUND_START:finished-check")],
+        )).block_task());
+        // The first terminal cannot finish until this test explicitly releases it.
+        // Delivery of the second result therefore proves there is no all-terminal barrier.
+        while !agent_text(&observed, &sid).contains("Terminal managed-terminal-2 exited") {
+            assert!(!pending.is_finished(), "prompt ended without delivering the completed check");
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut state = observed.lock().unwrap();
+            assert!(state.terminal_kills.is_empty());
+            assert!(state.terminal_releases.is_empty());
+            assert_eq!(state.terminal_creates.len(), 2);
+            state.hang_first_terminal = false;
+        }
+        assert_eq!(pending.await.expect("managed prompt")?.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("Terminal managed-terminal-1 exited"));
+        assert_eq!(text.matches("Terminal managed-terminal-2 exited").count(), 1);
+        assert!(observed.lock().unwrap().terminal_kills.is_empty());
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn managed_background_rpc_failure_retains_operations_for_next_turn() {
+    // Both wait and output failures must leave every operation collectable.
+    for fail_wait in [true, false] {
+        let state = temp_state_file("managed-background-rpc-recovery");
+        // SAFETY: every helper-enabled test uses the same executable.
+        unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+        let yaml = format!(
+            "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+            state.display(), agent_yaml("mock", &[("m1", 1)], &[])
+        );
+        run_test(yaml, async move |cx, observed| {
+            init_with_terminals(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            {
+                let mut state = observed.lock().unwrap();
+                state.hang_first_terminal = true;
+                if fail_wait { state.terminal_wait_failures = 1; }
+                else { state.terminal_output_failures = 1; }
+            }
+            assert!(prompt_text(&cx, &sid,
+                "BACKGROUND_START:running-operation\nBACKGROUND_START:finished-operation").await.is_err());
+            {
+                let mut state = observed.lock().unwrap();
+                assert_eq!(state.terminal_creates.len(), 2);
+                assert!(state.terminal_kills.is_empty());
+                assert!(state.terminal_releases.is_empty());
+                state.hang_first_terminal = false;
+            }
+            assert_eq!(prompt_text(&cx, &sid, "Collect the existing operations").await?.stop_reason,
+                StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert_eq!(text.matches("Terminal managed-terminal-1 exited").count(), 1);
+            assert_eq!(text.matches("Terminal managed-terminal-2 exited").count(), 1);
+            let state = observed.lock().unwrap();
+            assert_eq!(state.terminal_creates.len(), 2);
+            assert!(state.terminal_kills.is_empty());
+            assert!(state.terminal_releases.is_empty());
+            Ok(())
+        }).await;
+    }
+}
+
 /// Start a turn that parks on a never-exiting managed terminal and return
 /// its pending prompt once the terminal exists.
 async fn park_on_managed_background(
@@ -1049,56 +1163,78 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
 }
 
 #[tokio::test]
-async fn planner_steer_reaches_managed_wait_without_an_active_downstream_prompt() {
+async fn ordinary_planner_wake_preserves_managed_work_and_collects_its_completion() {
     let state = temp_state_file("planner-managed-steer");
+    let log = temp_log("planner-managed-steer");
+    let repo = planner_wire_repository();
     // SAFETY: every helper-enabled test uses the same executable.
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
-        state.display(),
-        agent_yaml("mock", &[("m1", 1)], &[])
-    );
+    let yaml = planner_wire_yaml(&state, &log);
     run_test_shared(yaml, async |cx, observed, shared| {
         init_with_terminals(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement authorized test").await?;
         let pending = park_on_managed_background(&cx, &observed, &sid).await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !shared
-                .background_interrupts
-                .lock()
-                .unwrap()
-                .contains_key(&sid)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the managed wait did not register its interrupt");
-        assert!(
-            router_acp::planner_preempt::steer(
-                &shared,
-                &sid,
-                &[ContentBlock::from(
-                    "[Router audit] eligible work needs reconciliation"
-                )]
-            )
-            .await
-        );
+        while !shared
+            .background_interrupts
+            .lock()
+            .unwrap()
+            .contains_key(&sid)
+        {
+            tokio::task::yield_now().await;
+        }
+        router_acp::planner_preempt::begin_router_turn(&shared, &sid);
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.wakes.insert("worker:finished".into(), router_acp::planner_workflow::Wake {
+                work_id: "worker".into(),
+                reason: "worker result ready for reconciliation".into(),
+                ..Default::default()
+            });
+            Ok(())
+        }).unwrap();
+        wait_for_mock_prompt(&log, "worker result ready for reconciliation").await;
+        while !agent_text(&observed, &sid)
+            .contains("worker result ready for reconciliation")
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(observed.lock().unwrap().terminal_kills.is_empty());
+        assert!(observed.lock().unwrap().terminal_releases.is_empty());
+        assert!(!pending.is_finished(), "the original work is still running");
+        // The terminal may now finish. The resumed parent must collect that
+        // same operation, not start it again or lose its result after the wake.
+        observed.lock().unwrap().hang_terminal_waits = false;
         let response = pending.await.expect("parked prompt task")?;
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
             agent_text(&observed, &sid)
-                .contains("[Router audit] eligible work needs reconciliation")
+                .contains("worker result ready for reconciliation")
         );
+        assert!(agent_text(&observed, &sid).contains("watch-fired"));
+        // The monitor consumes this public lifecycle evidence, not model prose.
+        let lifecycle: Vec<_> = shared.state.lock().unwrap().log_for_all(&sid).unwrap()
+            .into_iter().filter(|e| e.kind == "managed_background_wait")
+            .map(|e| e.detail.expect("lifecycle metadata")).collect();
+        let wake = lifecycle.iter().position(|e| e["phase"] == "woken"
+            && e["wake"] == "worker:finished").expect("ordinary wake receipt");
+        let receipt = &lifecycle[wake];
+        assert_eq!(receipt["ordinary"], true);
+        assert!(lifecycle[..wake].iter().any(|e| e["phase"] == "parked"
+            && e["wait_id"] == receipt["wait_id"] && e["terminals"] == receipt["terminals"]));
+        let completed = lifecycle[wake + 1..].iter().find(|e| e["phase"] == "completed")
+            .expect("same operation is collected after the wake");
+        assert!(receipt["terminals"].as_array().unwrap().contains(&completed["terminal"]));
+        assert!(lifecycle[wake + 1..].iter().take_while(|e| e["phase"] != "completed")
+            .any(|e| e["phase"] == "parked" && e["wait_id"] == completed["wait_id"]
+                && e["terminals"].as_array().unwrap().contains(&completed["terminal"])));
+        assert_eq!(receipt["owner_pid"], completed["owner_pid"]);
+        assert_eq!(receipt["owner_started_at_ms"], completed["owner_started_at_ms"]);
+        assert!(receipt["owner_pid"].as_u64().unwrap() > 0);
         let observed = observed.lock().unwrap();
-        assert_eq!(
-            observed.terminal_kills,
-            vec!["managed-terminal-1".to_string()]
-        );
-        assert_eq!(
-            observed.terminal_releases,
-            vec!["managed-terminal-1".to_string()]
-        );
+        assert_eq!(observed.terminal_creates.len(), 1);
+        assert!(observed.terminal_kills.is_empty());
+        assert!(observed.terminal_releases.is_empty());
         Ok(())
     })
     .await;
@@ -13512,7 +13648,10 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
     let repo = tempfile::tempdir().unwrap();
     let dir = repo.path().join(".agents/skills/implement");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("SKILL.md"), "REPOSITORY-WORK-SENTINEL").unwrap();
+    let duty = "PARENT-DUTY: deploy and verify staging within the admitted scope and existing gates.";
+    let restriction = "SCOPE-LIMIT: production publication is excluded; preserve every review refusal.";
+    let contract = format!("{duty}\n{restriction}");
+    std::fs::write(dir.join("SKILL.md"), &contract).unwrap();
     let log = temp_log("auto-opt-in");
     let state = temp_state_file("auto-opt-in");
     let yaml = format!(
@@ -13550,10 +13689,19 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
                 .all(|p| !p.contains("[router-acp planner role")),
             "no planner role reached the provider"
         );
+        assert!(planner_user_prompts(&log).iter().all(|p| !p.contains(duty) && !p.contains(restriction)),
+            "an uninvoked repository skill grants no workflow scope");
+        cx.send_request(PromptRequest::new(sid.clone(), vec![ContentBlock::from("/implement an agent claim")])
+            .meta(serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(
+                serde_json::json!({"router_acp":{"agent_origin":true}})).unwrap()))
+            .block_task().await?;
+        assert!(router_acp::planner_workflow::load(&shared, &sid).unwrap().is_none(),
+            "an agent claim cannot admit the repository implementation contract");
+        let expanded = format!("<turn-context>\nnow\n</turn-context>\n# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\n{contract}\n\nARGUMENTS: Docs/Plans/X.md\n\n## Supporting Files\n\nSkill directory: x\n");
         prompt_text(
             &cx,
             &sid,
-            "<turn-context>\nnow\n</turn-context>\n# Loaded Skill: implement (skill)\nDescription.\n\n## Content\n\nREPOSITORY-WORK-SENTINEL\n\nARGUMENTS: Docs/Plans/X.md\n\n## Supporting Files\n\nSkill directory: x\n",
+            &expanded,
         )
         .await?;
         assert_eq!(
@@ -13569,6 +13717,14 @@ async fn an_explicit_command_opts_an_auto_session_into_the_planner_workflow() {
         assert!(last.contains("[router-acp planner role: select-plan]"), "{last}");
         assert!(last.contains("Arguments: Docs/Plans/X.md"), "{last}");
         assert!(!last.contains("# Loaded Skill"), "{last}");
+        assert_eq!(last.matches(duty).count(), 1, "explicit parent duty is delivered once");
+        assert_eq!(last.matches(restriction).count(), 1, "explicit restrictive scope is delivered once");
+        assert!(!last.contains("[router-acp planner role: implement-work]"));
+        prompt_text(&cx, &sid, "Report local progress; retain all restrictions.").await?;
+        let delivered = planner_user_prompts(&log);
+        let followup = delivered.last().unwrap();
+        assert!(!followup.contains(duty) && !followup.contains(restriction),
+            "ordinary follow-up does not replay the entrypoint body");
         Ok(())
     })
     .await;
@@ -13792,6 +13948,7 @@ async fn coordinator_implement_command_changes_workflow_without_changing_planner
             .unwrap();
         assert!(run.coordinator);
         assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
+
         coordinator_prompt(&cx, &sid, "/plan refine").await?;
         assert_eq!(
             router_acp::planner_workflow::load(&shared, &sid)
@@ -14328,6 +14485,28 @@ async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
         assert!(run.coordinator);
         assert_eq!(run.phase, router_acp::config::PlannerPhase::Implementation);
 
+        // The durable invocation must survive even after it no longer fits in
+        // the bounded conversation digest sent to a fresh adapter.
+        for index in 0..70 {
+            shared.state.lock().unwrap().log(
+                &sid,
+                &router_acp::state::LogEntry {
+                    kind: "agent_response".into(),
+                    role: "agent".into(),
+                    summary: format!("Completed unrelated inspection {index}"),
+                    ..Default::default()
+                },
+            );
+        }
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.checkpoint = Some(router_acp::planner_workflow::CheckpointReceipt {
+                event: "shutdown".into(),
+                run_revision: run.revision,
+                saved_at_ms: 1234,
+            });
+            Ok(())
+        }).unwrap();
+
         cx.send_request(CloseSessionRequest::new(sid.clone()))
             .block_task()
             .await?;
@@ -14383,6 +14562,64 @@ async fn planner_native_resume_restores_durable_role_before_lazy_pin() {
             restored.3,
             "resume does not claim confirmed effective effort before pinning"
         );
+        let current = "Resume local preparation only; the earlier publication refusal still applies.";
+        prompt_text(&cx, &sid, current).await?;
+        let events = read_log(&log);
+        let forwarded = events[mock_prompts(&log, current)[0]]["text"]
+            .as_str()
+            .unwrap();
+        assert!(forwarded.contains("<resumed-conversation-context>"));
+        assert!(!forwarded.contains("[Original user command:"), "original invocation aged out of the digest");
+        let execution: serde_json::Value = serde_json::from_str(
+            forwarded.split("[Recorded human execution request]\n")
+                .nth(1)
+                .expect("fresh restored adapter receives durable execution context")
+                .lines().next().unwrap(),
+        ).unwrap();
+        assert_eq!(execution["input_id"], run.execution_input_id.as_deref().unwrap());
+        assert_eq!(execution["origin"], "human");
+        assert_eq!(execution["command"], "implement");
+        assert_eq!(execution["arguments"], "resume the durable planner run");
+        assert_eq!(execution["run_status"], "running");
+        assert!(execution["run_revision"].as_u64().unwrap() >= run.revision);
+        assert_eq!(execution["last_checkpoint"]["event"], "shutdown");
+        assert_eq!(execution["last_checkpoint"]["saved_at_ms"], 1234);
+        assert!(forwarded.contains(current), "current restriction is retained verbatim");
+
+        // A model switch uses the same provenance even if a handoff summary
+        // happens to contain old context. Inspect the standalone router block.
+        let switched_request = "[router: switch=planner/haiku]\nReview locally; publication remains refused.";
+        prompt_text(&cx, &sid, switched_request).await?;
+        let events = read_log(&log);
+        let switched = &events[*mock_prompts(&log, "Review locally; publication remains refused.").last().unwrap()];
+        assert_eq!(switched["model"], "haiku");
+        let contexts = execution_blocks(switched);
+        assert_eq!(contexts.len(), 1, "one authoritative context block per dispatch");
+        assert_eq!(contexts[0]["input_id"], execution["input_id"]);
+        assert_eq!(contexts[0]["arguments"], execution["arguments"]);
+
+        // Acknowledged human scope can continue, but agent origin or an
+        // explicit withdrawal can never become human authority on dispatch.
+        let input_id = run.execution_input_id.as_ref().unwrap();
+        for control in ["agent", "withdrawn"] {
+            router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+                run.inputs.get_mut(input_id).unwrap().origin =
+                    if control == "agent" { "agent" } else { "human" }.into();
+                if control == "withdrawn" {
+                    run.receipts.insert(format!("input-withdrawal:{input_id}"),
+                        serde_json::to_string(&router_acp::planner_workflow::InputWithdrawal {
+                            at_ms: 2, reason: "operator withdrew the scope".into(),
+                        }).unwrap());
+                }
+                Ok(())
+            }).unwrap();
+            let current = format!("Inspect current state for {control}; do not publish.");
+            prompt_text(&cx, &sid, &current).await?;
+            let events = read_log(&log);
+            let event = &events[*mock_prompts(&log, &current).last().unwrap()];
+            assert!(execution_blocks(event).is_empty(), "invalid source: {control}");
+            assert!(event["text"].as_str().unwrap().contains(&current));
+        }
         Ok(())
     })
     .await;
@@ -15834,6 +16071,416 @@ async fn planner_child_with_only_hook_warnings_requires_reconciliation() {
     .await;
 }
 
+fn parent_reranking_yaml(state: &std::path::Path, log: &std::path::Path, opus_images: bool, opus_mode: &str) -> String {
+    let mut other_env = vec![("MOCK_LOG", log.to_str().unwrap()), ("MOCK_SESSION_MODES", opus_mode)];
+    if opus_images { other_env.push(("MOCK_CAPS_IMAGE", "1")); }
+    format!("state_file: {}\nrouter: planner\ndelegation: {{ enabled: true, max_concurrent: 1 }}\nrouters:\n  planner:\n    planning_candidates: ['plan/*', 'other/*']\n    implementation_candidates: ['plan/*']\n    model_boosts: [{{ pattern: '*opus*', planning: 2 }}]\n    handoff: {{ enabled: true, retry_seconds: 1 }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("plan", &[("astra", 2)], &[("MOCK_LOG", log.to_str().unwrap()), ("MOCK_CAPS_IMAGE", "1"), ("MOCK_SESSION_MODES", "auto")]),
+        agent_yaml("other", &[("opus", 1)], &other_env))
+}
+
+#[tokio::test]
+async fn resumed_automatic_parent_reranks_recovered_models_and_honors_current_pick() {
+    for control in ["recovered", "cordoned", "incoming-pick", "image"] {
+        let state = temp_state_file(&format!("parent-rerank-{control}"));
+        let log = temp_log(&format!("parent-rerank-{control}"));
+        let repo = planner_wire_repository();
+        run_test_shared(parent_reranking_yaml(&state, &log, control != "image", "auto"), async |cx, _, shared| {
+            init(&cx).await?;
+            let opus = CandidateId::new("other", "opus");
+            shared.headroom.lock().unwrap().set_usage_cordons(
+                [(opus.clone(), epic_cordon("temporarily unavailable"))].into_iter().collect());
+            let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+                .block_task().await?.session_id.0.to_string();
+            if control == "image" {
+                cx.send_request(PromptRequest::new(sid.clone(), vec![
+                    ContentBlock::from("/implement review this image"),
+                    ContentBlock::Image(ImageContent::new("aGk=", "image/png")),
+                ])).block_task().await?;
+            } else {
+                prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+            }
+            assert_eq!(pinned(&shared, &sid), CandidateId::new("plan", "astra"));
+            assert!(!shared.with_session(&sid, |s| s.pin_user_pick).unwrap());
+            cx.send_request(CloseSessionRequest::new(sid.clone())).block_task().await?;
+            if control != "cordoned" {
+                shared.headroom.lock().unwrap().set_usage_cordons(Default::default());
+            }
+            cx.send_request(agent_client_protocol::schema::v1::ResumeSessionRequest::new(
+                sid.clone(), repo.path().join("repo"))).block_task().await?;
+            prompt_text(&cx, &sid, if control == "incoming-pick" {
+                "[router: candidate=plan/astra]\nContinue local review."
+            } else { "Continue local review." }).await?;
+            let expected = if control == "recovered" { opus } else { CandidateId::new("plan", "astra") };
+            assert_eq!(pinned(&shared, &sid), expected, "resume control: {control}");
+            assert!(shared.with_session(&sid, |s| s.coordinator).unwrap());
+            if control == "image" {
+                let persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+                shared.with_session(&sid, |s| {
+                    assert!(s.required_prompt_caps.image);
+                    router_acp::restoration::restore_continued_config(s, &persisted).unwrap();
+                    assert!(!s.required_prompt_caps.image, "new work does not replay the old image");
+                });
+            }
+            Ok(())
+        }).await;
+    }
+}
+
+#[tokio::test]
+async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
+    let state = temp_state_file("parent-rerank-prewarm");
+    let log = temp_log("parent-rerank-prewarm");
+    let repo = planner_wire_repository();
+    run_test_shared(parent_reranking_yaml(&state, &log, true, "auto"), async |cx, _, shared| {
+        init(&cx).await?;
+        let opus = CandidateId::new("other", "opus");
+        shared.headroom.lock().unwrap().set_usage_cordons(
+            [(opus.clone(), epic_cordon("temporarily unavailable"))].into_iter().collect());
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+        let old = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let goal = router_acp::goals::Goal {
+            objective: "Retain the completed local review".into(),
+            status: router_acp::goals::Status::Met, continuations: 0, kickoff: false,
+        };
+        shared.with_session(&sid, |s| s.goal = Some(goal.clone()));
+        {
+            let state = shared.state.lock().unwrap();
+            let mut saved = state.get(&sid).unwrap();
+            saved.routing.as_mut().unwrap()["goal"] = serde_json::to_value(&goal).unwrap();
+            state.upsert_checked(sid.clone(), saved).unwrap();
+        }
+        prompt_text(&cx, &sid, "CONTEXT:700/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(&shared, &sid, None,
+                    router_acp::planner_workflow::Operation::Status { works_only: false, offset: 0, work_id: None }).await.unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["prepared"] == true { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("standby never prewarmed");
+        shared.headroom.lock().unwrap().set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != old.downstream_sid).unwrap() { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("handoff never completed");
+        assert_eq!(pinned(&shared, &sid), opus, "cutover must use current availability, not prewarm's old winner");
+        let persisted = shared.state.lock().unwrap().get(&sid).unwrap();
+        assert_eq!(persisted.routing.as_ref().unwrap()["goal"], serde_json::to_value(&goal).unwrap());
+        assert_eq!(persisted.agent, "other");
+        assert_eq!(persisted.model, "opus");
+        assert_eq!(persisted.prior_session_id.as_deref(), Some(old.downstream_sid.as_str()));
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn parent_handoff_incompatible_permission_mode_keeps_original_parent() {
+    let state = temp_state_file("parent-rerank-mode-refusal");
+    let log = temp_log("parent-rerank-mode-refusal");
+    let repo = planner_wire_repository();
+    run_test_shared(parent_reranking_yaml(&state, &log, true, "read-only"), async |cx, _, shared| {
+        init(&cx).await?;
+        shared.headroom.lock().unwrap().set_usage_cordons(
+            [(CandidateId::new("other", "opus"), epic_cordon("temporarily unavailable"))].into_iter().collect());
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        cx.send_request(agent_client_protocol::schema::v1::SetSessionModeRequest::new(
+            sid.clone(), "auto".to_string())).block_task().await?;
+        prompt_text(&cx, &sid, "/implement retain the admitted scope").await?;
+        let old = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let token = shared.with_session(&sid, |s| s.delegate_token.clone()).flatten().unwrap();
+        shared.headroom.lock().unwrap().set_usage_cordons(Default::default());
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(&shared, &sid, None,
+                    router_acp::planner_workflow::Operation::Status { works_only: false, offset: 0, work_id: None }).await.unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["last_error"].is_string() { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("incompatible standby did not report its refusal");
+        assert_eq!(shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone()).unwrap(), old.downstream_sid);
+        assert!(shared.route_for(&old.process_key, &old.downstream_sid).is_some());
+        assert!(shared.delegate_tokens.lock().unwrap()[&token].active);
+        prompt_text(&cx, &sid, "TEXT:original parent still serves").await?;
+        wait_for_mock_prompt(&log, "original parent still serves").await;
+        assert_eq!(router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap().status,
+            router_acp::planner_workflow::RunStatus::Running);
+        Ok(())
+    }).await;
+}
+
+/// A fresh downstream parent must retain the same live worker, logical run and
+/// watcher state. No shutdown/adoption or outgoing summary prompt is involved.
+#[tokio::test]
+async fn planner_handoff_backstop_preserves_live_worker_over_the_wire() {
+    let state = temp_state_file("planner-handoff");
+    let log = temp_log("planner-handoff");
+    let repo = planner_wire_repository();
+    let release = repo.path().join("release-worker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo"))).block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let task = format!("{}MCP_CALL:router-delegate delegate_task {}", planner_admit_wire_prompt(),
+            serde_json::json!({"work_id":"work-1","task":format!("WAIT_FILE:{}",release.display()),"background":true}));
+        prompt_text(&cx, &sid, &task).await?;
+        wait_for_mock_prompt(&log, "[Assignment briefing]").await;
+        let before = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        let attempt = before.works["work-1"].attempt.as_ref().unwrap().id.clone();
+        let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        let old_token = shared.with_session(&sid, |s| s.delegate_token.clone()).flatten().unwrap();
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.continuation = Some(router_acp::planner_workflow::ContinuationNote {
+                text: "resume note before the backstop".into(),
+                saved_at_ms: 1,
+                session_id: sid.clone(),
+            });
+            Ok(())
+        }).unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != pin.downstream_sid).unwrap_or(false) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("backstop did not replace the parent");
+        let after = router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap();
+        assert_eq!(after.status, router_acp::planner_workflow::RunStatus::Running);
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.works["work-1"].attempt.as_ref().unwrap().id, attempt);
+        assert!(!after.works["work-1"].attempt.as_ref().unwrap().ended);
+        assert!(!shared.delegate_tokens.lock().unwrap().contains_key(&old_token));
+        assert!(shared.route_for(&pin.process_key, &pin.downstream_sid).is_none());
+        let current = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        assert_eq!(current.process_key, pin.process_key, "handoff must not restart the shared adapter");
+        assert_eq!(current.candidate, pin.candidate);
+        // No continuation file is configured: nothing is written to the working
+        // tree, and the replacement parent is seeded from the state database.
+        assert!(!repo.path().join("repo/Docs/CONTINUE.md").exists());
+        assert!(after.checkpoint.is_some());
+        let seeded = wait_for_mock_prompt(&log, "Router-owned hot handoff").await;
+        assert!(seeded.iter().any(|event| event.to_string().contains("resume note before the backstop")),
+            "the replacement parent was not given the database resume note");
+        assert!(router_acp::planner_shutdown::progress(&shared, &sid).is_empty());
+        std::fs::write(&release, "complete the original attempt").unwrap();
+        Ok(())
+    }).await;
+}
+
+/// 2026-11-23 (operator): "the handoff must happen before auto-compaction no matter what". Codex
+/// compacts mid-turn, so a parent that reaches the backstop inside a long turn is interrupted and
+/// replaced instead of waiting for a turn boundary that comes after the compaction.
+#[tokio::test]
+async fn planner_handoff_backstop_interrupts_a_long_parent_turn() {
+    let state = temp_state_file("planner-handoff-interrupt");
+    let log = temp_log("planner-handoff-interrupt");
+    let repo = planner_wire_repository();
+    let never = repo.path().join("never-released");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo"))).block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let pin = shared.with_session(&sid, |s| s.pin.clone()).flatten().unwrap();
+        // The mock's turn would hold for 60 s; the backstop must not wait for it.
+        let long_turn = format!("CONTEXT:950/1000\nWAIT_FILE:{}", never.display());
+        let turn = prompt_text(&cx, &sid, &long_turn);
+        let replaced = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if shared.with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != pin.downstream_sid).unwrap_or(false) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (reply, replaced) = tokio::join!(turn, replaced);
+        replaced.expect("the backstop waited for the long turn instead of interrupting it");
+        assert_eq!(reply?.stop_reason, StopReason::Cancelled);
+        assert!(!never.exists());
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn planner_handoff_failed_checkpoint_keeps_the_parent_usable() {
+    let state = temp_state_file("planner-handoff-refused");
+    let log = temp_log("planner-handoff-refused");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff: {enabled: true}\n    shutdown:\n      command: /bin/sh\n      args: ['-c', 'cat >/dev/null; exit 2']\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        let pin = shared
+            .with_session(&sid, |s| s.pin.clone())
+            .flatten()
+            .unwrap();
+        let token = shared
+            .with_session(&sid, |s| s.delegate_token.clone())
+            .flatten()
+            .unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:950/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let status = router_acp::planner_workflow::operate(
+                    &shared,
+                    &sid,
+                    None,
+                    router_acp::planner_workflow::Operation::Status { works_only: false,
+                        offset: 0,
+                        work_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+                if status["handoff"]["last_error"].is_string() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("failed exporter did not finish its attempt");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+                .unwrap(),
+            pin.downstream_sid
+        );
+        assert!(shared.delegate_tokens.lock().unwrap()[&token].active);
+        assert!(
+            shared
+                .route_for(&pin.process_key, &pin.downstream_sid)
+                .is_some()
+        );
+        prompt_text(&cx, &sid, "TEXT:original parent still serves").await?;
+        wait_for_mock_prompt(&log, "original parent still serves").await;
+        assert_eq!(
+            router_acp::planner_workflow::load(&shared, &sid)
+                .unwrap()
+                .unwrap()
+                .status,
+            router_acp::planner_workflow::RunStatus::Running
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn planner_handoff_opportunity_requires_a_new_observed_revision() {
+    use router_acp::planner_guard::{Observation, ObservationState};
+    use router_acp::planner_workflow::{self, Operation};
+    let state = temp_state_file("planner-handoff-opportunity");
+    let log = temp_log("planner-handoff-opportunity");
+    let repo = planner_wire_repository();
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let yaml = planner_gate_yaml(&state, &log, "").replace("  planner:\n",
+        "  planner:\n    handoff:\n      enabled: true\n      opportunities:\n        observation_revisions: [host:staging]\n        operations: []\n        release_stages: []\n");
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = cx
+            .send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task()
+            .await?
+            .session_id
+            .0
+            .to_string();
+        prompt_text(&cx, &sid, "/implement prepare the assignment").await?;
+        planner_workflow::mutate(&shared, &sid, |run| {
+            run.observations.insert(
+                "host:staging".into(),
+                Observation {
+                    revision: "old-observed-head".into(),
+                    reference: "staging".into(),
+                    state: ObservationState::Pending,
+                    evidence: "host fixture".into(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let old_pin = shared
+            .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+            .unwrap();
+        prompt_text(&cx, &sid, "CONTEXT:750/1000").await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let text = planner_workflow::operate(
+                    &shared,
+                    &sid,
+                    None,
+                    Operation::Status { works_only: false,
+                        offset: 0,
+                        work_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if status["handoff"]["prepared"] == true {
+                    assert!(
+                        status["handoff"]["due"].is_null(),
+                        "initial census is not an opportunity"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("standby was not prepared");
+        assert_eq!(
+            shared
+                .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid.clone())
+                .unwrap(),
+            old_pin
+        );
+        planner_workflow::mutate(&shared, &sid, |run| {
+            run.observations.get_mut("host:staging").unwrap().revision = "new-pushed-head".into();
+            Ok(())
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if shared
+                    .with_session(&sid, |s| s.pin.as_ref().unwrap().downstream_sid != old_pin)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("75% opportunity did not replace the parent");
+        Ok(())
+    })
+    .await;
+}
+
 /// kory's `/shutdown`: `_router/planner_shutdown` is accepted at once, the
 /// parent records its resume point, a mid-turn worker gets a queued shutdown
 /// notice before its turn ends, then stops, and the run ends paused for the next
@@ -15909,7 +16556,10 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
             })
             .await;
             assert!(paused.is_ok(), "the drain never paused the run");
-            wait_for_mock_prompt(&log, "Session restart (router lifecycle, not a stop of the run)").await;
+            assert!(!repo.path().join("repo/Docs/CONTINUE.md").exists(),
+                "shutdown without a configured continuation file writes nothing to the working tree");
+            assert_eq!(router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap()
+                .checkpoint.as_ref().map(|c| c.event.as_str()), Some("shutdown"));
             assert!(mock_prompts(&log, "Shutdown requested: interrupt").is_empty(),
                 "a shutdown interrupt must not start another child turn");
             let progress = router_acp::planner_shutdown::progress(&shared, &sid);
@@ -15927,13 +16577,8 @@ async fn planner_shutdown_drains_a_live_worker_over_the_wire() {
                 done["workers"],
                 serde_json::json!([{"workId": "work-1", "status": "stopped"}])
             );
-            assert!(
-                progress.iter().any(|p| p["phase"] == "draining"
-                    && p["message"]
-                        .as_str()
-                        .is_some_and(|m| m.contains("recorded its resume point"))),
-                "the parent's shutdown turn completed: {progress:?}"
-            );
+            assert!(progress.iter().any(|p| p["phase"] == "saved" &&
+                p["message"].as_str().is_some_and(|m| m.contains("state database"))));
 
             // The next `/implement` resumes the paused run.
             prompt_text(&cx, &sid, "/implement resume after the shutdown").await?;
@@ -16034,26 +16679,48 @@ async fn planner_shutdown_preempts_a_router_owned_turn_within_seconds() {
             let sid = open_planner_parent(&cx, &repo).await?;
             insert_wake(&shared, &sid, "audit:shutdown-preempt");
             wait_for_mock_prompt(&log, WAKE_MARKER).await;
-            let started = std::time::Instant::now();
             router_acp::planner_shutdown::request(&shared, &serde_json::json!({"sessionId":sid}))
                 .unwrap();
             let parent_prompt =
                 router_acp::planner_shutdown::parent_prompt(&shared.cfg.routers.planner);
             assert!(
-                parent_prompt.contains("Docs/CONTINUE.md"),
-                "the Markdown default: {parent_prompt}"
+                parent_prompt.contains("record-continuation"),
+                "the database default: {parent_prompt}"
             );
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                wait_for_mock_prompt(&log, &parent_prompt),
-            )
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if router_acp::planner_workflow::load(&shared, &sid)
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == router_acp::planner_workflow::RunStatus::Paused
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
             .await
-            .expect("shutdown promptly preempts the router turn");
-            assert!(started.elapsed() < Duration::from_secs(5));
+            .expect("shutdown did not settle the router turn");
             let events = read_log(&log);
-            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
-            let shutdown = mock_prompts(&log, &parent_prompt)[0];
-            assert!(cancel < shutdown);
+            assert!(events.iter().any(|e| e["event"] == "cancel"));
+            assert!(
+                mock_prompts(&log, &parent_prompt).is_empty(),
+                "deterministic export needs no model turn"
+            );
+            assert!(
+                !repo.path().join("repo/Docs/CONTINUE.md").exists(),
+                "shutdown without a configured continuation file writes nothing to the working tree"
+            );
+            assert_eq!(
+                router_acp::planner_workflow::load(&shared, &sid)
+                    .unwrap()
+                    .unwrap()
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| c.event.as_str()),
+                Some("shutdown")
+            );
             assert!(
                 !release.exists(),
                 "the original router turn could only end by cancellation"
@@ -16180,6 +16847,19 @@ async fn adopted_input_delivers_historical_header_and_one_wake_ack_closes_both()
     }).await;
 }
 
+fn execution_blocks(event: &serde_json::Value) -> Vec<serde_json::Value> {
+    event["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| {
+            let text = block["text"].as_str()?;
+            let context = text.strip_prefix("[Recorded human execution request]\n")?;
+            Some(serde_json::from_str(context.lines().next().unwrap()).unwrap())
+        })
+        .collect()
+}
+
 fn mock_prompts(log: &PathBuf, marker: &str) -> Vec<usize> {
     read_log(log)
         .iter()
@@ -16303,6 +16983,7 @@ async fn planner_wake_carries_the_recorded_human_execution_request() {
             );
             assert!(text.contains("\"origin\":\"human\""));
             assert!(text.contains("later human restrictions"));
+            assert_eq!(execution_blocks(wake).len(), 1, "wake dispatch does not duplicate context");
             let run = workflow::load(&shared, &sid).unwrap().unwrap();
             assert!(run.inputs[&input_id].acknowledged);
             assert!(
@@ -16455,16 +17136,15 @@ async fn model_shorthand_preempts_router_owned_turn_and_resumes_its_wake_on_the_
     .await;
 }
 
-/// The operator's `/implement` is one long turn (live: 43 minutes admitting 50
-/// workers). A failed staging build observed during it reaches the parent in
-/// that turn; ordinary wakes still wait for its end and nothing cancels it.
+/// Audit and environment findings survive an active implementation command
+/// and reach its next boundary without interrupting the command.
 #[tokio::test]
-async fn failed_environment_is_steered_into_the_running_implement_command_turn() {
+async fn failed_environment_waits_for_implement_command_boundary() {
     audit_or_failure_reaches_implement_command(false).await;
 }
 
 #[tokio::test]
-async fn host_urgent_audit_is_steered_into_the_running_implement_command_turn() {
+async fn host_urgent_audit_waits_for_implement_command_boundary() {
     audit_or_failure_reaches_implement_command(true).await;
 }
 
@@ -16511,7 +17191,7 @@ async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
                         Ok(())
                     })
                     .unwrap();
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    wait_for_wake_boundary(&shared, &sid, "no-pending-steer").await;
                     assert!(
                         !read_log(&log)
                             .iter()
@@ -16547,28 +17227,17 @@ async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
                         Ok(())
                     })
                     .unwrap();
-                    for _ in 0..200 {
-                        if read_log(&log).iter().any(|e| e["event"] == "steer") {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                    wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
                     let events = read_log(&log);
-                    let steer = events
-                        .iter()
-                        .find(|e| e["event"] == "steer")
-                        .expect("the failed environment reached the running command turn");
-                    let params = steer["params"].to_string();
-                    assert!(params.contains("STAGING-FAILED-FIXTURE"), "{params}");
-                    assert!(!params.contains("ROUTINE-CHILD-WAKE"));
                     assert!(
-                        !events.iter().any(|e| e["event"] == "cancel"),
+                        !events.iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                         "never cancelled"
                     );
                     std::fs::write(&release, "").unwrap();
                 }
             );
             answer?;
+            wait_for_mock_prompt(&log, "STAGING-FAILED-FIXTURE").await;
             Ok(())
         },
     )
@@ -16576,10 +17245,9 @@ async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
     let _ = std::fs::remove_file(&release);
 }
 
-/// Idle worker capacity reaches the operator's long `/implement` turn too
-/// (2026-11-06: 0 children for an hour of one turn polling production).
+/// Capacity remains pending until the implementation command reaches a boundary.
 #[tokio::test]
-async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
+async fn capacity_wake_waits_for_implement_command_boundary() {
     use router_acp::planner_workflow::{self as workflow, Wake};
     let state = temp_state_file("command-turn-capacity");
     let log = temp_log("command-turn-capacity");
@@ -16622,30 +17290,16 @@ async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
                         Ok(())
                     })
                     .unwrap();
-                    let steered = || {
-                        read_log(&log).iter().any(|e| {
-                            e["event"] == "steer"
-                                && e["params"].to_string().contains("CAPACITY-FIXTURE")
-                        })
-                    };
-                    for _ in 0..200 {
-                        if steered() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                    wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
                     assert!(
-                        steered(),
-                        "the capacity wake reached the running command turn"
-                    );
-                    assert!(
-                        !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                        !read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                         "never cancelled"
                     );
                     std::fs::write(&release, "").unwrap();
                 }
             );
             answer?;
+            wait_for_mock_prompt(&log, "CAPACITY-FIXTURE").await;
             Ok(())
         },
     )
@@ -16653,11 +17307,9 @@ async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
     let _ = std::fs::remove_file(&release);
 }
 
-/// A queued input reaches the operator's long `/implement` turn at a tool
-/// boundary, without `--interrupt` and without a cancel (2026-11-10: a monitor
-/// correction waited over three hours inside one turn).
+/// Noninterrupting queued input follows the implementation command's boundary.
 #[tokio::test]
-async fn queued_input_is_steered_into_the_running_implement_command_turn() {
+async fn queued_input_waits_for_implement_command_boundary() {
     use router_acp::planner_workflow::{self as workflow, Wake};
     let state = temp_state_file("command-turn-input");
     let log = temp_log("command-turn-input");
@@ -16713,27 +17365,16 @@ async fn queued_input_is_steered_into_the_running_implement_command_turn() {
                         Ok(())
                     })
                     .unwrap();
-                    let steered = || {
-                        read_log(&log).iter().any(|e| {
-                            e["event"] == "steer"
-                                && e["params"].to_string().contains("MONITOR-INPUT-FIXTURE")
-                        })
-                    };
-                    for _ in 0..200 {
-                        if steered() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    assert!(steered(), "the queued input reached the running command turn");
+                    wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
                     assert!(
-                        !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                        !read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                         "never cancelled"
                     );
                     std::fs::write(&release, "").unwrap();
                 }
             );
             answer?;
+            wait_for_mock_prompt(&log, "MONITOR-INPUT-FIXTURE").await;
             Ok(())
         },
     )
@@ -17020,10 +17661,9 @@ async fn operator_input_cancels_a_router_owned_turn_and_runs_next_when_steering_
     let _ = std::fs::remove_file(&release);
 }
 
-/// An adapter may not implement mid-turn steering. An already queued agent
-/// correction must still reach the parent without waiting for an unbounded wake.
+/// An ordinary agent correction stays durable until the active turn ends.
 #[tokio::test]
-async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
+async fn queued_agent_input_waits_for_router_turn_boundary() {
     let state = temp_state_file("agent-input-declined-steer");
     let log = temp_log("agent-input-declined-steer");
     let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
@@ -17045,19 +17685,22 @@ async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
                 )
                 .unwrap();
             }
+            wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
+            assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
+            assert!(!router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap()
+                .inputs["agent-declined-steer"].acknowledged);
+            std::fs::write(&release, "").unwrap();
             tokio::time::timeout(
                 Duration::from_secs(8),
                 wait_for_mock_prompt(&log, "queued-fix-activated"),
             )
             .await
-            .expect("declined steering must not strand the queued agent input");
+            .expect("the ended turn must deliver the queued agent input");
             let events = read_log(&log);
             let wake = mock_prompts(&log, WAKE_MARKER)[0];
             let correction = mock_prompts(&log, "queued-fix-activated")[0];
-            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
-            assert!(wake < cancel && cancel < correction);
-            assert!(!release.exists());
-            std::fs::write(&release, "").unwrap();
+            assert!(wake < correction);
+            assert!(!events.iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
             for _ in 0..100 {
                 let run = router_acp::planner_workflow::load(&shared, &sid)
                     .unwrap()
@@ -17065,9 +17708,7 @@ async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
                 if run.inputs["agent-declined-steer"]
                     .delivered_to
                     .contains(&sid)
-                    && mock_prompts(&log, WAKE_MARKER)
-                        .iter()
-                        .any(|i| *i > correction)
+                    && run.parent_queue.is_empty()
                 {
                     break;
                 }
@@ -17083,11 +17724,6 @@ async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
             );
             assert!(run.parent_queue.is_empty());
             assert!(agent_text(&observed, &sid).contains("queued-fix-activated"));
-            assert!(
-                mock_prompts(&log, WAKE_MARKER)
-                    .iter()
-                    .any(|i| *i > correction)
-            );
             Ok(())
         },
     )
@@ -17173,6 +17809,19 @@ async fn host_urgent_audit_waits_for_the_active_edit_to_finish() {
     urgent_parent_wake_respects_operator_turn(true, true, true).await;
 }
 
+async fn wait_for_wake_boundary(shared: &router_acp::session::Shared, sid: &str, decision: &str) {
+    // Hang backstop only: observe an actual wake-loop decision, never grade elapsed time.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let observed = shared.planner_runtime.lock().unwrap().get(sid)
+                .and_then(|rt| rt.wake_delivery_observation.as_ref())
+                .is_some_and(|observation| serde_json::to_value(observation).unwrap()["reason"] == decision);
+            if observed { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("wake loop must observe the pending delivery boundary");
+}
+
 async fn urgent_parent_wake_respects_operator_turn(
     release_audit: bool,
     protect_tool: bool,
@@ -17242,23 +17891,28 @@ async fn urgent_parent_wake_respects_operator_turn(
                 Ok(())
             }).unwrap();
             if protect_tool && !operator_turn {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                wait_for_wake_boundary(&shared, &sid, "tools-in-flight").await;
                 assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                     "automatic steering must not interrupt an in-flight edit");
                 std::fs::write(&tool_release, "").unwrap();
                 wait_for_mock_event(&log, "completed_edit").await;
             }
             if let Some(operator) = operator {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                wait_for_wake_boundary(&shared, &sid, "protected-turn").await;
                 assert!(mock_prompts(&log, "OWNERSHIP-FIX").is_empty());
                 assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
                 std::fs::write(&hold, "").unwrap();
                 operator.await.unwrap()?;
+            } else {
+                wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
+                assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
+                    "even a tool-free active turn cannot safely receive an automatic adapter steer");
+                std::fs::write(&release, "").unwrap();
             }
             tokio::time::timeout(Duration::from_secs(8), wait_for_mock_prompt(&log, "OWNERSHIP-FIX"))
-                .await.expect("ownership handoff must reach the parent instead of waiting behind unrelated router work");
+                .await.expect("the pending handoff must reach the parent at its next turn boundary");
             let events = read_log(&log);
-            assert_eq!(events.iter().any(|e| e["event"] == "cancel"), !operator_turn);
+            assert!(!events.iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
             let run = workflow::load(&shared, &sid).unwrap().unwrap();
             if !release_audit {
                 assert!(!run.wakes[wake_id].acknowledged, "delivery is not reconciliation");
@@ -18107,16 +18761,19 @@ async fn questions_false_refuses_only_implementation_runs_and_uses_the_plugged_b
     .await;
 }
 
-/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the default.
+/// With `questions: false` and no `blockers`, the Markdown layout's `Docs/BLOCKED.md` is the
+/// default. With no `continuation` file, the resume point lives in the state database.
 #[test]
-fn the_default_blockers_and_continuation_are_the_markdown_layouts() {
+fn the_default_blockers_are_markdown_and_the_continuation_is_the_database() {
     let planner = router_acp::config::PlannerRouterConfig::default();
     assert!(
         planner.questions,
         "every session asks unless a project opts out"
     );
     assert!(router_acp::session::no_questions_instruction(&planner).contains("Docs/BLOCKED.md"));
-    assert!(router_acp::planner_shutdown::parent_prompt(&planner).contains("Docs/CONTINUE.md"));
+    assert!(planner.continuation.is_none());
+    let prompt = router_acp::planner_shutdown::parent_prompt(&planner);
+    assert!(prompt.contains("record-continuation") && !prompt.contains("Docs/CONTINUE.md"));
 }
 
 fn dead_router() -> router_acp::planner_workflow::RunOwner {

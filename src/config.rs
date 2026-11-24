@@ -258,10 +258,6 @@ fn default_planner_blockers() -> String {
     "Docs/BLOCKED.md".into()
 }
 
-fn default_planner_continuation() -> String {
-    "Docs/CONTINUE.md".into()
-}
-
 fn default_max_concurrent() -> usize {
     3
 }
@@ -970,6 +966,12 @@ pub struct AgentConfig {
     /// post-pin mode changes.
     #[serde(default)]
     pub mode_map: std::collections::HashMap<String, String>,
+    /// The share of the adapter-reported context `size` (ACP `usage_update`) at which the
+    /// adapter compacts on its own. A planner parent's context handoff percentages are measured
+    /// against this budget, not the raw size, so the handoff always runs before the adapter's
+    /// compaction. Unset means 100. The provider preset states each adapter's real point.
+    #[serde(default)]
+    pub compaction_percent: Option<u8>,
     /// Optional provider usage source for proactive cordoning (see
     /// `CordonConfig`). When set, the router periodically reads this provider's
     /// usage caps and cordons this agent's candidates that are exhausted.
@@ -1437,11 +1439,11 @@ pub struct PlannerRouterConfig {
     /// other planner setting. Default: the Markdown layout's `Docs/BLOCKED.md`.
     #[serde(default = "default_planner_blockers")]
     pub blockers: String,
-    /// Where a run's parent writes its exact resume point when the operator
-    /// requests a shutdown. Pluggable; default: the Markdown layout's
-    /// `Docs/CONTINUE.md`.
-    #[serde(default = "default_planner_continuation")]
-    pub continuation: String,
+    /// Optional repository-relative file for a run's resume point. Unset (the
+    /// default), the resume point lives in the router's state database with the
+    /// run itself and nothing is written to the working tree.
+    #[serde(default)]
+    pub continuation: Option<String>,
     #[serde(default, rename = "create-plan")]
     pub create_plan: PlannerSkillConfig,
     #[serde(default, rename = "select-plan")]
@@ -1480,6 +1482,9 @@ pub struct PlannerRouterConfig {
     /// drain bound. See `crate::planner_shutdown`.
     #[serde(default)]
     pub shutdown: Option<PlannerShutdownConfig>,
+    /// Hot parent-context replacement; project overlays override these fields.
+    #[serde(default)]
+    pub handoff: crate::planner_handoff::Policy,
     /// Candidate globs for the planning (frontier) phase.
     #[serde(default = "default_planning_candidates")]
     pub planning_candidates: Vec<String>,
@@ -1534,7 +1539,7 @@ impl Default for PlannerRouterConfig {
             roadmap: None,
             questions: true,
             blockers: default_planner_blockers(),
-            continuation: default_planner_continuation(),
+            continuation: None,
             create_plan: PlannerSkillConfig::default(),
             select_plan: PlannerSkillConfig::default(),
             implement_work: PlannerSkillConfig::default(),
@@ -1546,6 +1551,7 @@ impl Default for PlannerRouterConfig {
             audit: None,
             integrate_check: None,
             shutdown: None,
+            handoff: Default::default(),
             planning_candidates: default_planning_candidates(),
             implementation_candidates: default_implementation_candidates(),
             model_boosts: Vec::new(),
@@ -1764,11 +1770,14 @@ pub struct Config {
     /// Skill → model-class routing rules.
     #[serde(default)]
     pub skill_routing: Vec<SkillRoute>,
-    /// The client session mode a session starts in when its client never sets one (e.g. `auto`),
-    /// mapped through `agents[].mode_map` like a client-requested mode. Unset leaves each downstream
-    /// in its own default. goose's router provider sends no mode, so without this a Codex session kept
-    /// its sandboxed default (no network) even under `GOOSE_MODE: auto`.
-    #[serde(default)]
+    /// The client session mode a session starts in when its client never sets one, mapped through
+    /// `agents[].mode_map` like a client-requested mode. Defaults to `auto`, the mode delegates
+    /// already get; `default_mode: null` leaves each downstream in its own default. goose's router
+    /// provider sends no mode, so with no default a Codex session stayed in codex-acp's `agent`
+    /// mode (on-request approvals through the Guardian auto-reviewer, no network). Guardian cannot
+    /// see an invocation that reaches Codex through router tools, so on 2026-11-23 it refused a
+    /// planner parent's every staging push as unauthorized and deadlocked the release all day.
+    #[serde(default = "default_session_mode")]
     pub default_mode: Option<String>,
     /// Version pinning, two forms. A family shorthand (`claude/haiku` or `haiku`) → one of that
     /// family's model ids pins the family: the shorthand resolves to that version and it is the
@@ -1999,6 +2008,10 @@ fn default_state_file() -> PathBuf {
 
 fn default_probe_timeout_ms() -> u64 {
     120_000
+}
+
+fn default_session_mode() -> Option<String> {
+    Some("auto".into())
 }
 
 /// Interpolate `$VAR` and `${VAR}` environment references in a string. Unknown
@@ -2443,6 +2456,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.routers
+            .planner
+            .handoff
+            .validate()
+            .map_err(ConfigError)?;
         if self.agents.is_empty() {
             return Err(ConfigError(
                 "no agents configured; declare at least one agent with one model".into(),
@@ -2450,6 +2468,12 @@ impl Config {
         }
         let mut names = HashSet::new();
         for agent in &self.agents {
+            if agent.compaction_percent.is_some_and(|p| p == 0 || p > 100) {
+                return Err(ConfigError(format!(
+                    "agent `{}`: compaction_percent must be between 1 and 100",
+                    agent.name
+                )));
+            }
             for (window, reserve) in [
                 ("weekly", agent.reserve_capacity.weekly),
                 ("session", agent.reserve_capacity.session),
@@ -3056,6 +3080,29 @@ agents:
         display_name: Claude Sonnet
         cost_rank: 2
 "#
+    }
+
+    /// 2026-11-23 (operator): "`default_mode: auto` should be the router-acp default mode, and not
+    /// require a config override." A client that sends no mode gets `auto`; `null` opts out.
+    #[test]
+    fn default_mode_is_auto_unless_explicitly_cleared() {
+        let unset = Config::from_yaml("agents:\n- name: codex@one\n").unwrap();
+        assert_eq!(unset.default_mode.as_deref(), Some("auto"));
+        let cleared = Config::from_yaml("default_mode: null\nagents:\n- name: codex@one\n").unwrap();
+        assert_eq!(cleared.default_mode, None);
+        let chat = Config::from_yaml("default_mode: chat\nagents:\n- name: codex@one\n").unwrap();
+        assert_eq!(chat.default_mode.as_deref(), Some("chat"));
+    }
+
+    /// Codex compacts at about 92% of the size codex-acp reports; the preset says so, an agent
+    /// entry may override it, and an impossible value is refused.
+    #[test]
+    fn codex_preset_states_where_codex_compacts() {
+        let cfg = Config::from_yaml("agents:\n- name: codex@one\n").unwrap();
+        assert_eq!(cfg.agents[0].compaction_percent, Some(92));
+        let own = Config::from_yaml("agents:\n- name: codex@one\n  compaction_percent: 88\n").unwrap();
+        assert_eq!(own.agents[0].compaction_percent, Some(88));
+        assert!(Config::from_yaml("agents:\n- name: codex@one\n  compaction_percent: 101\n").is_err());
     }
 
     #[test]

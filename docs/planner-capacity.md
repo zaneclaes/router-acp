@@ -216,6 +216,10 @@ A waiting handoff can name `ci:<work_id>@<full SHA>` as a whitespace-delimited t
 A fresh matching pending observation parks it without a model turn. Terminal, missing,
 stale (two minutes) or failed observations restore normal reconciliation. Observations
 never supply branch qualification themselves.
+Only a terminal observation for the named revision counts toward repeated-failure
+suspension. An absent, unknown or different-revision observation keeps retries backed
+off without counting the wait as a failure, and clears a prior repeat suspension for
+that wait. Missing prerequisites and explicit holds remain in force.
 
 ## In-flight wakes
 

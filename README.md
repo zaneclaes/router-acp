@@ -108,6 +108,30 @@ updating Kory Code. Keep source builds for development and testing.
 
 Logging goes to stderr (stdout carries the ACP protocol): set `RUST_LOG=router_acp=debug` for verbose routing/model-discovery logs.
 
+Planner health readers can inspect `planner_wake_observation` session-log events.
+They report the wake loop's current decision, owning process identity, observation
+time and the time the selected wake became continuously eligible for steering.
+Tool waits, protected turns and items already steered are deferred work, not
+delivery failures. The loop refreshes unchanged decisions every 30 seconds;
+missing or stale observations mean eligibility is unknown. Wake bodies and
+operator messages are excluded from this evidence.
+
+A model parked on a managed background terminal can receive due ordinary worker
+and observation wakes through the existing terminal-preserving continuation.
+Automatic wakes wait for a parked or ended model turn; adapter steering can
+cancel tools that start after the router's latest tool update. Explicit operator
+input and interrupting messages retain steering authority. Backoff, live delivery custody,
+dormant recovery exclusions and per-turn deduplication still apply. If the terminal
+finishes before delivery, an ordinary wake remains queued for the next boundary;
+it does not interrupt the newly active model or restart the terminal.
+
+`managed_background_wait` session-log events expose the owning process, wait
+identity, terminal identities and parked/woken/completed/interrupted/unavailable
+phases. An automatic woken event carries the delivered wake identity; a later
+wait or completion of the same terminal establishes retained custody. Commands,
+terminal output and prompts are excluded. Missing events or a different owner
+cannot establish continuity.
+
 ### Worker command resource protection
 
 Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
@@ -126,8 +150,15 @@ swap and free space on the working, startup and temporary filesystems. Keep at
 least 8GiB memory headroom and 10GiB free disk; warning memory pressure, swap above
 8GiB, or tree footprint above physical RAM minus headroom stops the owned tree.
 macOS accounting includes compressed memory; Linux includes resident and swapped
-memory. Unknown telemetry fails closed. Diagnostics contain resource counters,
-never command arguments or credentials. Source/worktrees are never deleted.
+memory. Unknown telemetry fails closed. Available memory uses `memorystatus_get_level`,
+the same percentage read by Apple's `memory_pressure`; the private sysctl alias is
+not required. Pressure, swap and all resource floors remain independently enforced.
+Failures identify the fixed read-only API or kernel metric and either
+`category=syscall` with its numeric errno or
+`category=size-mismatch` with expected and returned byte counts. The watchdog
+preserves those details both before launch and during sampling. Diagnostics contain
+resource counters, never command arguments or credentials. Source/worktrees are
+never deleted.
 An ancestry chain of 32 processes also stops the tree before a recursive launcher
 can exhaust the host. This backstop covers legacy tools without their own call guard.
 This is sampled protection, not a kernel cgroup or a guarantee against allocations
@@ -145,6 +176,22 @@ the .NET runtime or this helper. Its RAM admission and RouterHost disk checks ar
 disabled too. Other repository checks still apply. Unset or any value other than
 the literal `false` keeps resource protection enabled. Existing processes need a
 new launch to inherit a changed environment or binary.
+
+Resource guard regression tests inject readings into the production watchdog loop;
+they do not require native telemetry permissions, free host memory, or timing sleeps.
+Run them with `cargo test --bin router-resource-run resource_guard::tests` and
+`cargo test --test resource_guard`. The default results explicitly report the native
+capability checks as ignored, including their host prerequisites.
+
+Native probes and process cleanup remain separate activation smoke checks. Run
+`cargo test --bin router-resource-run host_ -- --ignored --nocapture` and
+`cargo test --test resource_guard host_ -- --ignored --nocapture` on each supported
+host before accepting a native guard installation. These commands require allowed
+process/memory/disk probes and at least the resource floors above. A failed probe
+means host activation is unverified; a skipped/default regression run is never
+native activation evidence. Record the source revision, host, command, and result.
+The subprocess-only `detached_fixture` is ignored separately and is invoked by its
+owning smoke; do not run every ignored test indiscriminately.
 
 ## How routing works
 
@@ -550,6 +597,7 @@ router-acp state-query --config ~/.config/router-acp/router.yaml v1 analytics --
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 health
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegation-report
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 transcript --session rtr-…
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 planner-works --session rtr-… --min-revision 42 --work work-a work-b
 ```
 
 Every command prints one JSON object with `version: 1`, `command`, and `data`.
@@ -670,6 +718,96 @@ is cancelled with its already recorded state preserved. Shutdown never asks for 
 pushes, builds or audits. The default child grace is 20 seconds; the parent's final update
 is bounded at 30 seconds and is cancelled if it overruns.
 
+### Automatic parent-context handoffs
+
+`routers.planner.handoff` is a native router feature shared by Claude and Codex
+ACP adapters. Configure it in `router.yaml`; a project's `.router-acp/router.yaml`
+overrides individual settings through the normal configuration merge:
+
+```yaml
+routers:
+  planner:
+    handoff:
+      enabled: true                 # default; false disables automatic handoffs
+      prewarm_percent: 65
+      opportunity_percent: 75
+      backstop_percent: 95
+      prepare_timeout_seconds: 300   # old parent keeps working during preparation
+      cutover_timeout_seconds: 60
+      retry_seconds: 60
+      checkpoint_interval_seconds: 30
+      opportunities:
+        operations: [review, integrate, disposition]
+        release_stages: []          # optional repository-selected checkpoint labels
+        observation_revisions: []  # optional repository-host observation keys
+```
+
+Occupancy is the adapter's current ACP `usage_update.used / size`, never lifetime
+tokens or transcript bytes. A successfully committed configured transition at
+75% requests refresh; 95% requests it without any opportunity. Requests remain
+pending across provider compaction and wait for an idle parent with no active
+tool or approval. A new observation revision counts only after an initial
+baseline. Missing usage capacity cannot be guessed; no threshold is inferred.
+Policy is reloaded through the normal config/overlay reader every five seconds.
+Invalid configuration defers replacement and retains the live parent.
+The built-in opportunities are successful integrate/disposition operations. Release
+labels and observation keys are empty by default; deployment-specific names belong
+in the repository overlay. An opportunity checks occupancy when the event occurs:
+an event below the threshold is not saved to trigger a later refresh. Once due, a
+request stays pending until a safe boundary, even if provider compaction lowers usage.
+`planner_workflow status` exposes handoff preparation, the pending reason, errors,
+and the last receipt's before/first-after context usage, bootstrap character count
+and cutover duration. These are observations, not claims about billable tokens or
+provider cache hits. The handoff packet does not contain the old transcript or a
+full historical work census; the ordinary current-role briefing is retained.
+
+Native `/compact` remains available through supporting adapters. This automatic
+mechanism uses a deterministic replacement because native compaction summarizes
+the old conversation and does not provide a portable checkpoint-replacement API.
+Restored automatic parents and hot handoffs use the normal planning selector with
+current availability, exclusions, capability requirements and model boosts. A prior
+automatic model is not an explicit selection; genuine user picks keep their normal
+semantics. Standby preparation verifies the selected model, effort and permission
+mode before replacing the parent. Cutover refreshes availability and re-prepares if
+the winner changed after prewarming; failure leaves the parent and workers running.
+Opening a standby sends no LLM prompt. System/tool instructions may still incur
+provider input cost on the first new turn; cross-session cache reuse is not assumed.
+
+At 65% the router opens an unprompted standby conversation on the selected
+adapter, verifies model/mode/effort, and gives it inactive router tool credentials.
+Cutover exports a deterministic checkpoint through the existing shutdown host,
+then replaces only the downstream parent pin and fences the retired credentials
+and route. Workers, watchers, logical run identity, operation receipts and queues
+are retained. Input arriving during export queues for the new parent. Preparation
+is asynchronous; cutover's 60-second budget excludes waiting for a safe boundary
+and the next ordinary model response. Failed preparation/export keeps the old
+parent and retries. No outgoing LLM summary, worker drain or adoption is run.
+
+Live checkpoints, hot handoffs and `/shutdown` share one serialized save path;
+shutdown still drains and pauses. Every event records a `checkpoint` receipt
+(`event`, `run_revision`, `saved_at_ms`) with the run in the state database.
+
+`routers.planner.continuation` is unset by default. Then nothing is written to the
+working tree: the parent records its exact resume point with
+`planner_workflow` `record-continuation` (`text`), which is stored with the run.
+`planner_workflow status` returns it, adoption by a later `/implement` carries it
+(the newer note wins) and shows it to the adopting parent, and a hot handoff seeds
+the replacement parent with it. Set `continuation` to a repository-relative file
+to opt into a file instead; without a custom host the native exporter then writes
+that file plus `checkpoints/` beside the state database.
+
+A custom shutdown host receives `event: checkpoint | handoff | shutdown`,
+`run_revision` and `native_state` alongside its existing works/holds/continuation
+fields (`continuation` is null when unset). With a configured file it must save
+that file atomically and report `continuation_saved` plus that path in `saved`.
+State DB records remain authoritative over snapshots; the new parent fetches
+targeted current state instead of loading the entire old conversation or every
+historical work.
+
+Updating the executable does not change an already running router. Older builds
+reject the new YAML key, so activate the block only after upgrading the loaded
+router. Subsequent policy tuning requires no restart.
+
 ### Host-directed workers
 
 Some hosts run their own multi-agent workflow on top of the router: a parent on one model assigns whole tasks to long-running workers that must run on specific other models, answers their requests, and tracks every worker it starts. These opt-in settings and tools support that without changing default behavior:
@@ -692,8 +830,8 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   outstanding checks remain preserved; no acceptance or completion is inferred.
 
   An ended planner worker's current `ownership_requested` or `reassignment_required` handoff
-  reaches a busy router-owned parent through urgent steering. If the adapter declines steering,
-  the router ends its own turn and delivers the durable handoff next. Operator turns, approval
+  reaches a busy router-owned parent at its next parked or ended turn boundary.
+  Automatic delivery never cancels the active model turn. Operator turns, approval
   waits, acknowledged or already-claimed deliveries and superseded attempts stay protected.
   While staging or production has a failed build, audit findings use that same urgent path.
   Repository audits may set `blocks_acknowledgement: true` for an actionable duty.
@@ -708,10 +846,14 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   Continuous parent activity cannot hide changed findings behind routine branch wakes.
   A changed urgent audit supersedes an unclaimed obsolete audit wake, even if that wake
   was never acknowledged. The earlier evidence stays recorded; a claimed delivery stays protected.
-  Unchanged delivered findings do not repeatedly interrupt active work. Automatic steering waits
-  for in-flight tools to finish so adapter interruption cannot masquerade as a user refusing an edit;
+  Unchanged delivered findings do not repeatedly interrupt active work. Automatic delivery uses
+  the router's parked continuation or the next turn so adapter interruption cannot masquerade as a user refusing an edit;
   direct operator input keeps its interruption authority. Recovery clears audit urgency;
   withdrawing the host's urgency clears it too; ordinary audits retain their idle cadence.
+  Cancelling a parent turn ends that turn while its planner run, workers and later wakes continue.
+  Recovery prompts distinguish this from shutting down the run and do not treat a cancelled tool's
+  message as an operator stop instruction. Client cancellations are recorded as `client_turn_cancel`
+  in session logs, separately from router preemption, without recording prompt or tool bodies.
 
   The parent capacity census and host work snapshots use the same fresh exact-head CI wait
   as automatic recovery. A parked owner is shown as waiting for CI, not awaiting retry;
@@ -723,11 +865,21 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   completed native adoption does not write planner state, so that allocation cannot invalidate
   its own reconciliation revision on every retry. First adoption still uses the existing claim.
 
+  Worker assignment briefs carry the current scope, source revision and reconciliation
+  evidence. Superseded specifications and completion records remain in the planner ledger;
+  only their counts enter the brief. Resuming a repeatedly reconciled work therefore does
+  not replay its growing archive into the adapter's prompt or discard its source custody.
+
   A workspace claimed before its worker attempt starts can pass to a new coordinator
   after the old run is paused and its recorded process identity is verified dead.
   Missing owner evidence, malformed attempts, a live owner or a running run keep the claim fenced.
 
-  Parent delivery batches retain every recovery wake, but recovery notices for already
+  A blocked or watching assignment keeps its source custody fence but does not generate
+  recovery prompts while it waits. Older recovery notices remain in the ledger and are
+  skipped during delivery. Changed prerequisite observations and explicit input still
+  reach the parent, and runnable work still goes through custody checks.
+
+  Parent delivery prioritizes actionable recovery wakes. Recovery notices for already
   accepted or finished work follow stopped-work recovery and fresh artifact review. They
   still precede capacity/refill reminders. A large adopted backlog therefore cannot fill
   the 32-wake batch with old acknowledgments and hide a newly qualified repair; source
@@ -1285,8 +1437,36 @@ new allocations and different leases cannot be migrated this way. The allocation
 request advertises `completion_contract_recovery: true` so hosts do not enable this
 recovery for older routers that ignore the receipt. Ordinary readmission and
 reconciliation still cannot change the admitted version.
+Finished and integrated assignments can be reopened for a bounded correction under
+their existing contract, including legacy records with an omitted version. This
+requires the same plan and guide, an ended attempt, changed scope, durable evidence
+and a source revision carried by the workspace. Prior completion and frozen release
+receipts remain historical; the corrected artifact needs fresh review and completion.
+Managed background operations report each completion independently. A long-running
+fold or watcher cannot hold a later finished admission check's result; remaining
+operations stay owned across that continuation and automatic router wakes. A failed
+terminal wait or output RPC also retains ownership: the error is reported, and a
+subsequent turn collects the existing operations without restarting or killing them.
+Execution receipts exposed in status and ordinary parent prompts, including
+restored sessions, model switches and wakes, include the admitted human input's
+identity and typed scope, current run state and revision beside the historical
+checkpoint. They do not depend on the bounded conversation digest. Withdrawn or
+agent-origin inputs cannot supply that provenance. A resumed run remains
+distinguishable from its earlier shutdown without replaying the expanded workflow,
+changing role dispatch, overriding later restrictions or treating a continuation
+as new operator authorization. Existing action refusals and release gates remain
+in force.
+An explicit repository `plan` or `implement` invocation also carries that
+entrypoint's current contract alongside the selected parent role, including its
+duties and restrictive scope. Identical source and content are delivered once per command;
+the implementation receipt retains source and content identity for worker
+assignments. Parent and worker roles still determine which duties each performs.
+Uninvoked repository skills and agent-origin command claims grant no scope, and
+ordinary follow-up turns do not replay the entrypoint body.
 Audit freshness starts when the host answers, so time spent collecting observations
-does not immediately expire a pending CI wait. Recovery prompts use the repository's
+or recovering workers before the audit does not immediately expire a pending CI wait.
+The answer preserves the scheduling clock but is never dated before the current response time.
+Recovery prompts use the repository's
 exact CI handoff instead of asking workers to poll within a turn; failed, changed,
 missing or genuinely stale observations retain normal recovery.
 See [durable planner progress](docs/planner-throughput.md).

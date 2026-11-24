@@ -59,6 +59,8 @@ pub const WORKER_HANDOFF_TOOL_NAME: &str = "worker_handoff";
 #[derive(Clone, Debug)]
 pub struct DelegateBinding {
     pub router_sid: String,
+    /// A prewarmed parent may list tools but cannot call them before cutover.
+    pub active: bool,
     pub delegation_enabled: bool,
     /// Set for a `router-worker` connection: the delegate it serves.
     pub worker: Option<WorkerBinding>,
@@ -631,6 +633,23 @@ pub fn delegate_server_entry(
     router_sid: &str,
     candidate: &CandidateId,
 ) -> Option<McpServer> {
+    parent_server_entry(shared, router_sid, candidate, true).map(|(server, _)| server)
+}
+
+pub(crate) fn prepared_parent_server(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    candidate: &CandidateId,
+) -> Option<(McpServer, String)> {
+    parent_server_entry(shared, router_sid, candidate, false)
+}
+
+fn parent_server_entry(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    candidate: &CandidateId,
+    active: bool,
+) -> Option<(McpServer, String)> {
     let planner_session = shared
         .with_session(router_sid, |s| s.strategy == StrategyKind::Planner)
         .unwrap_or(false);
@@ -652,25 +671,45 @@ pub fn delegate_server_entry(
     // returns, and tools/list runs inside that call.
     let delegation_enabled = delegation_available(shared, candidate)
         || (planner_session && shared.cfg.delegation.enabled);
-    drop_parent_tokens(shared, router_sid);
+    if active {
+        drop_parent_tokens(shared, router_sid);
+    }
     shared.delegate_tokens.lock().unwrap().insert(
         token.clone(),
         DelegateBinding {
             router_sid: router_sid.to_string(),
+            active,
             delegation_enabled,
             worker: None,
         },
     );
-    shared.with_session(router_sid, |s| s.delegate_token = Some(token.clone()));
+    if active {
+        shared.with_session(router_sid, |s| s.delegate_token = Some(token.clone()));
+    }
 
     let stdio = McpServerStdio::new(DELEGATE_SERVER_NAME, exe).args(vec![
         "mcp-delegate".to_string(),
         "--socket".to_string(),
         socket.display().to_string(),
         "--token".to_string(),
-        token,
+        token.clone(),
     ]);
-    Some(McpServer::Stdio(stdio))
+    Some((McpServer::Stdio(stdio), token))
+}
+
+/// Existing helper connections recheck this map on every call, so revocation
+/// also fences already-connected old parents. Worker credentials are untouched.
+pub(crate) fn activate_parent_token(shared: &Shared, sid: &str, token: &str) -> bool {
+    let mut bindings = shared.delegate_tokens.lock().unwrap();
+    if !bindings
+        .get(token)
+        .is_some_and(|b| b.router_sid == sid && b.worker.is_none())
+    {
+        return false;
+    }
+    bindings.retain(|key, b| b.router_sid != sid || b.worker.is_some() || key == token);
+    bindings.get_mut(token).unwrap().active = true;
+    true
 }
 
 /// Strip the router's own delegate server from a session's MCP server list
@@ -769,6 +808,7 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
     let transport = ByteStreams::new(write_half.compat_write(), reader.compat());
 
     let call_shared = shared.clone();
+    let call_token = token.to_string();
     let call_sid = router_sid.clone();
     let call_worker = worker.clone();
     let planner_worker = worker.as_ref().is_some_and(|w| w.planner.is_some());
@@ -822,7 +862,28 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                 let shared = call_shared.clone();
                 let router_sid = call_sid.clone();
                 let worker = call_worker.clone();
+                let token = call_token.clone();
+                let authorized = shared.delegate_tokens.lock().unwrap()
+                    .get(&call_token).is_some_and(|b| b.active);
                 async move {
+                    if !authorized {
+                        return responder.respond(text_result("parent binding is prepared or retired; tool call refused".into(), true));
+                    }
+                    let activity = if worker.is_none() {
+                        let Some(activity) = crate::planner_handoff::ToolActivity::claim(&shared, &router_sid) else {
+                            return responder.respond(text_result("parent handoff is committing; tool call refused".into(), true));
+                        };
+                        Some(activity)
+                    } else { None };
+                    if !shared.delegate_tokens.lock().unwrap().get(&token).is_some_and(|b| b.active) {
+                        return responder.respond(text_result("parent binding retired before tool admission".into(), true));
+                    }
+                    // The responder outlives the spawned tool task. Cutover may
+                    // not overtake an asynchronous MCP mutation still running.
+                    let responder = responder.wrap_params(move |_, result| {
+                        drop(activity);
+                        result
+                    });
                     if req.name == crate::planner_workflow::TOOL_NAME {
                         if worker.as_ref().is_some_and(|w| w.planner.is_none()) {
                             return responder.respond(text_result("lightweight worker has no planner assignment".into(), true));
@@ -2932,6 +2993,7 @@ fn worker_server_entry(
         DelegateBinding {
             router_sid: router_sid.to_string(),
             delegation_enabled: false,
+            active: true,
             worker: Some(worker),
         },
     );

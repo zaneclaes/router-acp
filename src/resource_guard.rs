@@ -282,19 +282,87 @@ fn watch(
     let cwd = std::env::current_dir()?;
     // Both startup/swap and working filesystems must retain space, even with work on another volume.
     let disks = [cwd, PathBuf::from("/"), std::env::temp_dir()];
-    let initial = native::resources(&disks)?;
+    watch_with(
+        owner,
+        root,
+        (parent_pid, parent_birth),
+        std::process::id() as i32,
+        &mut NativeWatch { disks },
+    )
+}
+
+// Keep OS sampling and effects at one boundary. Tests supply readings directly;
+// installed runners have no environment variable or command for fake telemetry.
+trait WatchIo {
+    fn resources(&mut self) -> io::Result<Resources>;
+    fn processes(&mut self) -> io::Result<BTreeMap<i32, Process>>;
+    fn footprint(&mut self, process: &Process) -> io::Result<u64>;
+    fn control_closed(&mut self) -> io::Result<bool>;
+    fn ready(&mut self) -> io::Result<()>;
+    fn pause(&mut self);
+    fn stop(&mut self, tree: &mut Tree, excluded: i32);
+}
+
+struct NativeWatch {
+    disks: [PathBuf; 3],
+}
+
+impl WatchIo for NativeWatch {
+    fn resources(&mut self) -> io::Result<Resources> {
+        native::resources(&self.disks)
+    }
+    fn processes(&mut self) -> io::Result<BTreeMap<i32, Process>> {
+        native::processes()
+    }
+    fn footprint(&mut self, process: &Process) -> io::Result<u64> {
+        native::footprint(process)
+    }
+    fn control_closed(&mut self) -> io::Result<bool> {
+        let mut control = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut control, 1, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(control.revents != 0)
+    }
+    fn ready(&mut self) -> io::Result<()> {
+        io::stdout().write_all(b"R")?;
+        io::stdout().flush()
+    }
+    fn pause(&mut self) {
+        std::thread::sleep(INTERVAL);
+    }
+    fn stop(&mut self, tree: &mut Tree, excluded: i32) {
+        tree.stop(excluded);
+    }
+}
+
+fn watch_with(
+    owner: Process,
+    root: Process,
+    parent: (i32, u64),
+    me: i32,
+    host: &mut impl WatchIo,
+) -> io::Result<()> {
+    let owner_pid = owner.pid;
+    let owner_birth = owner.birth;
+    let root_pid = root.pid;
+    let root_birth = root.birth;
+    let (parent_pid, parent_birth) = parent;
+    let initial = host.resources()?;
     if initial.violation(0).is_some() {
         let _ = writeln!(io::stderr(), "AGENT_RESOURCES_BLOCKED: {initial:?}");
         return Err(io::Error::other("resource floor already exceeded"));
     }
-    let me = std::process::id() as i32;
     let mut entire = Tree::new(root);
     let mut owned = Tree::new(owner);
-    io::stdout().write_all(b"R")?;
-    io::stdout().flush()?;
+    host.ready()?;
     loop {
         let sample = (|| -> io::Result<_> {
-            let rows = native::processes()?;
+            let rows = host.processes()?;
             entire.refresh(&rows, me);
             owned.refresh(&rows, me);
             if entire.recursive_launch() {
@@ -309,23 +377,16 @@ fn watch(
             let parent_alive = rows
                 .get(&parent_pid)
                 .is_some_and(|p| p.birth == parent_birth);
-            let mut control = libc::pollfd {
-                fd: 0,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if unsafe { libc::poll(&mut control, 1, 0) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            let control_closed = host.control_closed()?;
             if !root_alive || !parent_alive {
                 return Ok(Some((true, "root exited")));
             }
-            if !owner_alive || control.revents != 0 {
+            if !owner_alive || control_closed {
                 return Ok(Some((false, "router exited")));
             }
-            let resources = native::resources(&disks)?;
+            let resources = host.resources()?;
             let footprint = entire.0.values().try_fold(0u64, |used, p| {
-                native::footprint(p).map(|n| used.saturating_add(n))
+                host.footprint(p).map(|n| used.saturating_add(n))
             })?;
             if let Some(reason) = resources.violation(footprint) {
                 let _ = writeln!(
@@ -337,23 +398,23 @@ fn watch(
             Ok(None)
         })();
         match sample {
-            Ok(None) => std::thread::sleep(INTERVAL),
+            Ok(None) => host.pause(),
             Ok(Some((all, _))) => {
                 if all {
-                    entire.stop(me);
+                    host.stop(&mut entire, me);
                 } else {
                     owned.0.remove(&owner_pid);
-                    owned.stop(owner_pid);
+                    host.stop(&mut owned, owner_pid);
                 }
                 return Ok(());
             }
-            Err(_) => {
+            Err(error) => {
                 let _ = writeln!(
                     io::stderr(),
-                    "AGENT_RESOURCES_STOPPED: resource telemetry unavailable"
+                    "AGENT_RESOURCES_STOPPED: resource telemetry unavailable: {error}"
                 );
-                entire.stop(me);
-                return Err(io::Error::other("resource telemetry unavailable"));
+                host.stop(&mut entire, me);
+                return Err(error);
             }
         }
     }
@@ -375,24 +436,79 @@ mod native {
         Ok((info.f_bavail as u64).saturating_mul(info.f_frsize as u64))
     }
 
-    #[cfg(target_os = "macos")]
-    fn sysctl<T: Copy>(name: &std::ffi::CStr) -> io::Result<T> {
+    // Only these fixed kernel metric names may appear in telemetry diagnostics.
+    #[cfg(any(target_os = "macos", test))]
+    #[derive(Clone, Copy)]
+    enum MemoryMetric {
+        Total,
+        AvailablePercent,
+        Swap,
+        Pressure,
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    impl MemoryMetric {
+        fn name(self) -> &'static std::ffi::CStr {
+            match self {
+                Self::Total => c"hw.memsize",
+                Self::AvailablePercent => c"memorystatus_get_level",
+                Self::Swap => c"vm.swapusage",
+                Self::Pressure => c"kern.memorystatus_vm_pressure_level",
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    // SAFETY: on success with the expected size, read must initialize a valid T.
+    unsafe fn read_memory_metric<T: Copy>(
+        metric: MemoryMetric,
+        read: impl FnOnce(&mut std::mem::MaybeUninit<T>, &mut usize) -> io::Result<()>,
+    ) -> io::Result<T> {
         let mut value = std::mem::MaybeUninit::<T>::uninit();
-        let mut size = std::mem::size_of::<T>();
-        if unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                value.as_mut_ptr().cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
+        let expected = std::mem::size_of::<T>();
+        let mut size = expected;
+        read(&mut value, &mut size).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "host memory telemetry unavailable: metric={} category=syscall errno={:?}",
+                    metric.name().to_string_lossy(),
+                    error.raw_os_error()
+                ),
             )
-        } != 0
-            || size != std::mem::size_of::<T>()
-        {
-            return Err(io::Error::other("host memory telemetry unavailable"));
+        })?;
+        if size != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "host memory telemetry unavailable: metric={} category=size-mismatch expected={expected} actual={size}",
+                    metric.name().to_string_lossy()
+                ),
+            ));
         }
         Ok(unsafe { value.assume_init() })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sysctl<T: Copy>(metric: MemoryMetric) -> io::Result<T> {
+        // The callers pair each allowlisted metric with its kernel ABI type.
+        unsafe {
+            read_memory_metric(metric, |value: &mut std::mem::MaybeUninit<T>, size| {
+                if libc::sysctlbyname(
+                    metric.name().as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    size,
+                    std::ptr::null_mut(),
+                    0,
+                ) != 0
+                {
+                    // Capture errno immediately, before formatting or any further OS call.
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -465,16 +581,29 @@ mod native {
 
     #[cfg(target_os = "macos")]
     pub fn resources(disks: &[PathBuf]) -> io::Result<Resources> {
-        let total = sysctl::<u64>(c"hw.memsize")?;
-        let free = sysctl::<u32>(c"kern.memorystatus_level")?;
+        let total = sysctl::<u64>(MemoryMetric::Total)?;
+        // Use the same read-only interface as Apple's memory_pressure utility.
+        // The private kern.memorystatus_level sysctl is denied in managed sandboxes.
+        unsafe extern "C" {
+            fn memorystatus_get_level(level: *mut u32) -> libc::c_int;
+        }
+        let free = unsafe {
+            read_memory_metric::<u32>(MemoryMetric::AvailablePercent, |value, _| {
+                if memorystatus_get_level(value.as_mut_ptr()) != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })?
+        };
         if free > 100 {
             return Err(io::Error::other("invalid available memory percentage"));
         }
-        let swap = sysctl::<libc::xsw_usage>(c"vm.swapusage")?;
+        let swap = sysctl::<libc::xsw_usage>(MemoryMetric::Swap)?;
         Ok(Resources {
             total,
             available: total / 100 * u64::from(free),
-            pressure: sysctl(c"kern.memorystatus_vm_pressure_level")?,
+            pressure: sysctl(MemoryMetric::Pressure)?,
             swap: swap.xsu_used,
             disk: disks
                 .iter()
@@ -569,6 +698,70 @@ mod native {
                 .min()
                 .unwrap_or(0),
         })
+    }
+    #[cfg(test)]
+    mod memory_tests {
+        use super::*;
+
+        #[test]
+        fn denied_memory_metric_reports_which_probe_failed_and_why() {
+            for metric in [
+                MemoryMetric::Total,
+                MemoryMetric::AvailablePercent,
+                MemoryMetric::Swap,
+                MemoryMetric::Pressure,
+            ] {
+                // This failure path never exposes the uninitialized value.
+                let error = unsafe {
+                    read_memory_metric::<u64>(metric, |_, size| {
+                        // A failed call may also change the length: errno takes precedence.
+                        *size = 0;
+                        Err(io::Error::from_raw_os_error(libc::EPERM))
+                    })
+                }
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                let receipt = error.to_string();
+                // These fields are the operator's diagnostic contract, not prose wording.
+                assert!(receipt.contains(&format!("metric={}", metric.name().to_string_lossy())));
+                assert!(receipt.contains("category=syscall"));
+                assert!(receipt.contains(&format!("errno=Some({})", libc::EPERM)));
+            }
+        }
+
+        #[test]
+        fn unexpected_memory_metric_size_is_rejected_before_reading_value() {
+            for actual in [0, 4, 16] {
+                // A mismatched length must fail before reading the value.
+                let error = unsafe {
+                    read_memory_metric::<u64>(MemoryMetric::Total, |_, size| {
+                        *size = actual;
+                        Ok(())
+                    })
+                }
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                let receipt = error.to_string();
+                assert!(receipt.contains("metric=hw.memsize"));
+                assert!(receipt.contains("category=size-mismatch"));
+                assert!(receipt.contains("expected=8"));
+                assert!(receipt.contains(&format!("actual={actual}")));
+                assert!(!receipt.contains("errno="));
+            }
+        }
+
+        #[test]
+        fn complete_memory_metric_preserves_the_sample() {
+            // Initialize the complete u64 as a successful native read would.
+            let value = unsafe {
+                read_memory_metric::<u64>(MemoryMetric::Total, |value, _| {
+                    value.write(64 * GIB);
+                    Ok(())
+                })
+            }
+            .unwrap();
+            assert_eq!(value, 64 * GIB);
+        }
     }
 }
 
@@ -667,11 +860,352 @@ mod tests {
     }
 
     #[test]
-    fn native_sampling_is_available_and_footprint_nonzero() {
+    #[ignore = "host capability smoke: requires native process/memory/disk telemetry; run explicitly for activation"]
+    fn host_native_sampling_is_available_and_footprint_nonzero() {
         let me = native::process(std::process::id() as i32).unwrap();
         assert_eq!(native::processes().unwrap().get(&me.pid), Some(&me));
         assert!(native::footprint(&me).unwrap() > 0);
         let r = native::resources(&[std::env::current_dir().unwrap()]).unwrap();
         assert!(r.total > 0 && r.disk > 0);
+    }
+
+    // This adapter retains every native read and cleanup effect. The successful
+    // sample's pause boundary replaces a timing guess with an observed event.
+    struct NativeOwner {
+        native: NativeWatch,
+        owner: std::process::Child,
+        // Held outside the killed tree until every cleanup assertion finishes.
+        _fixture_input: ChildStdin,
+        descendants: Vec<Process>,
+        owner_killed: bool,
+    }
+
+    impl Drop for NativeOwner {
+        fn drop(&mut self) {
+            for process in &self.descendants {
+                if native::process(process.pid).is_ok_and(|now| now.birth == process.birth) {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+            let _ = self.owner.kill();
+            let _ = self.owner.wait();
+        }
+    }
+
+    impl WatchIo for NativeOwner {
+        fn resources(&mut self) -> io::Result<Resources> {
+            self.native.resources()
+        }
+        fn processes(&mut self) -> io::Result<BTreeMap<i32, Process>> {
+            let rows = self.native.processes()?;
+            if !self.owner_killed {
+                for process in &self.descendants {
+                    assert_eq!(
+                        rows.get(&process.pid),
+                        Some(process),
+                        "host sample omitted a ready descendant"
+                    );
+                }
+            }
+            Ok(rows)
+        }
+        fn footprint(&mut self, process: &Process) -> io::Result<u64> {
+            self.native.footprint(process)
+        }
+        fn control_closed(&mut self) -> io::Result<bool> {
+            // The fixture keeps its control channel open; owner death is the event.
+            Ok(false)
+        }
+        fn ready(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn pause(&mut self) {
+            assert!(!self.owner_killed, "watchdog missed the exited owner");
+            self.owner.kill().unwrap();
+            self.owner.wait().unwrap();
+            self.owner_killed = true;
+        }
+        fn stop(&mut self, tree: &mut Tree, excluded: i32) {
+            self.native.stop(tree, excluded);
+        }
+    }
+
+    #[test]
+    #[ignore = "host capability smoke: requires native telemetry, resource headroom, and process signalling; run explicitly for activation"]
+    fn host_sampled_detached_descendants_are_cleaned_after_owner_death() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut owner = Command::new("/bin/sh")
+            .args(["-c", "exec 3<&0; \"$1\" --ignored --exact resource_guard::tests::detached_fixture --nocapture <&3 3<&- & wait", "fixture"])
+            .arg(std::env::current_exe().unwrap())
+            .env("RESOURCE_DETACHED_FIXTURE", "1")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let fixture_input = owner.stdin.take().unwrap();
+        let mut host = NativeOwner {
+            native: NativeWatch {
+                disks: [
+                    std::env::current_dir().unwrap(),
+                    PathBuf::from("/"),
+                    std::env::temp_dir(),
+                ],
+            },
+            owner,
+            _fixture_input: fixture_input,
+            descendants: vec![],
+            owner_killed: false,
+        };
+        let stdout = host.owner.stdout.take().unwrap();
+        let mut reader = io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "fixture exited before its ready receipt"
+            );
+            if let Some((_, pids)) = line.split_once("DETACHED_READY ") {
+                for pid in pids.split_whitespace() {
+                    host.descendants
+                        .push(native::process(pid.parse().unwrap()).unwrap());
+                }
+                break;
+            }
+        }
+        assert_eq!(host.descendants.len(), 2);
+        assert_ne!(host.descendants[0].group, host.owner.id() as i32);
+        assert_ne!(host.descendants[0].group, host.descendants[1].group);
+        let root = native::process(host.owner.id() as i32).unwrap();
+        let parent = native::process(std::process::id() as i32).unwrap();
+        watch_with(
+            root.clone(),
+            root,
+            (parent.pid, parent.birth),
+            parent.pid,
+            &mut host,
+        )
+        .unwrap();
+        assert!(host.owner_killed);
+        // SIGKILL completion is observed, never inferred from a fixed sleep. The
+        // enclosing smoke job supplies its hang backstop.
+        for process in &host.descendants {
+            loop {
+                match native::process(process.pid) {
+                    Ok(now) if now.birth != process.birth => break,
+                    Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            || error.raw_os_error() == Some(libc::ESRCH) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("cleanup observation unavailable: {error}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture, invoked only by the detached-descendant host smoke"]
+    fn detached_fixture() {
+        assert_eq!(
+            std::env::var("RESOURCE_DETACHED_FIXTURE").as_deref(),
+            Ok("1")
+        );
+        use std::os::unix::process::CommandExt;
+        assert!(unsafe { libc::setsid() } > 0);
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::inherit())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // The controller retains the pipe writer outside this entire tree.
+        // Killing this fixture cannot make cat exit through EOF.
+        println!("DETACHED_READY {} {}", std::process::id(), child.id());
+        io::stdout().flush().unwrap();
+        let _ = child.wait();
+    }
+
+    fn healthy() -> Resources {
+        Resources {
+            total: 64 * GIB,
+            available: 32 * GIB,
+            pressure: 1,
+            swap: 0,
+            disk: 30 * GIB,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Unavailable {
+        Resources,
+        Processes,
+        Footprint,
+        Control,
+    }
+
+    struct Fixture {
+        readings: std::collections::VecDeque<io::Result<Resources>>,
+        unavailable: Option<Unavailable>,
+        rounds: usize,
+        ready: bool,
+        pauses: usize,
+        stopped: Vec<(Vec<i32>, i32)>,
+        parent_exited: bool,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                readings: [Ok(healthy()), Ok(healthy())].into(),
+                unavailable: None,
+                rounds: 0,
+                ready: false,
+                pauses: 0,
+                stopped: vec![],
+                parent_exited: false,
+            }
+        }
+
+        fn run(&mut self) -> io::Result<()> {
+            watch_with(p(10, 1, 100), p(10, 1, 100), (1, 1), 99, self)
+        }
+    }
+
+    impl WatchIo for Fixture {
+        fn resources(&mut self) -> io::Result<Resources> {
+            if self.rounds > 0 && matches!(self.unavailable, Some(Unavailable::Resources)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            self.readings
+                .pop_front()
+                .expect("unexpected resource sample")
+        }
+
+        fn processes(&mut self) -> io::Result<BTreeMap<i32, Process>> {
+            self.rounds += 1;
+            // A changed loop must fail deterministically rather than hang the test.
+            assert!(self.rounds <= 2, "watchdog ignored the terminal event");
+            if matches!(self.unavailable, Some(Unavailable::Processes)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let mut rows = BTreeMap::from([
+                (1, p(1, 0, 1)),
+                (10, p(10, 1, 100)),
+                (11, p(11, 10, 101)),
+                (20, p(20, 1, 200)),
+                (99, p(99, 10, 999)),
+            ]);
+            if self.parent_exited {
+                rows.remove(&1);
+            }
+            Ok(rows)
+        }
+
+        fn footprint(&mut self, _: &Process) -> io::Result<u64> {
+            if matches!(self.unavailable, Some(Unavailable::Footprint)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(GIB)
+        }
+
+        fn control_closed(&mut self) -> io::Result<bool> {
+            if matches!(self.unavailable, Some(Unavailable::Control)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(self.rounds == 2)
+        }
+
+        fn ready(&mut self) -> io::Result<()> {
+            self.ready = true;
+            Ok(())
+        }
+
+        fn pause(&mut self) {
+            self.pauses += 1;
+        }
+
+        fn stop(&mut self, tree: &mut Tree, excluded: i32) {
+            self.stopped
+                .push((tree.0.keys().copied().collect(), excluded));
+        }
+    }
+
+    #[test]
+    fn unavailable_startup_telemetry_never_releases_launch() {
+        let mut host = Fixture::new();
+        host.readings = [Err(io::ErrorKind::PermissionDenied.into())].into();
+        assert_eq!(
+            host.run().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!host.ready);
+        assert!(host.stopped.is_empty());
+    }
+
+    #[test]
+    fn resource_pressure_prevents_launch_and_stops_an_active_tree() {
+        let mut pressure = healthy();
+        pressure.pressure = 2;
+        let mut host = Fixture::new();
+        host.readings = [Ok(pressure)].into();
+        assert!(host.run().is_err());
+        assert!(!host.ready);
+        assert!(host.stopped.is_empty());
+
+        let mut pressure = healthy();
+        pressure.pressure = 2;
+        let mut host = Fixture::new();
+        host.readings = [Ok(healthy()), Ok(pressure)].into();
+        host.run().unwrap();
+        assert!(host.ready);
+        assert_eq!(host.stopped, [(vec![10, 11], 99)]);
+        assert_eq!(host.pauses, 0);
+    }
+
+    #[test]
+    fn lost_telemetry_stops_the_owned_tree_without_touching_siblings() {
+        for unavailable in [
+            Unavailable::Resources,
+            Unavailable::Processes,
+            Unavailable::Footprint,
+            Unavailable::Control,
+        ] {
+            let mut host = Fixture::new();
+            host.unavailable = Some(unavailable);
+            assert!(host.run().is_err());
+            assert!(host.ready);
+            let owned = if matches!(unavailable, Unavailable::Processes) {
+                vec![10]
+            } else {
+                vec![10, 11]
+            };
+            assert_eq!(host.stopped, [(owned, 99)]);
+            assert_eq!(host.pauses, 0);
+        }
+    }
+
+    #[test]
+    fn healthy_work_continues_until_control_closes_then_only_children_stop() {
+        let mut host = Fixture::new();
+        host.run().unwrap();
+        assert!(host.ready);
+        assert_eq!(host.pauses, 1);
+        assert_eq!(host.stopped, [(vec![11], 10)]);
+    }
+
+    #[test]
+    fn losing_the_launcher_stops_the_whole_owned_tree() {
+        let mut host = Fixture::new();
+        host.parent_exited = true;
+        host.run().unwrap();
+        assert!(host.ready);
+        assert_eq!(host.stopped, [(vec![10, 11], 99)]);
+        assert_eq!(host.pauses, 0);
     }
 }

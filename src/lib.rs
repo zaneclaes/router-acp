@@ -33,6 +33,7 @@ pub mod planner_adopt;
 pub mod planner_capacity;
 pub mod planner_client;
 pub mod planner_guard;
+pub mod planner_handoff;
 pub mod planner_input;
 pub mod planner_preempt;
 pub mod planner_release;

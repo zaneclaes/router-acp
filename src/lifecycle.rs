@@ -43,6 +43,12 @@ fn restore(
     session.cwd = cwd.clone();
     session.coordinator |= meta_marks_coordinator(meta);
     session.host_coordinator |= meta_marks_coordinator(meta);
+    // A fresh automatic parent ranks current candidates. A historical model
+    // choice is not an explicit selection, including pre-role checkpoints.
+    if session.coordinator && !session.pin_user_pick {
+        session.candidate_override = None;
+        session.candidate_override_source = None;
+    }
     {
         let mut sessions = shared.sessions.lock().unwrap();
         if let Some(live) = sessions.get_mut(sid) {

@@ -10,6 +10,64 @@ use crate::planner_skills::PlannerRole;
 use crate::planner_workflow::{self, RunStatus, WorkerIdentity};
 use crate::session::Shared;
 
+/// Evidence of the wake loop's actual decision, not a reconstruction from
+/// delivery counters. A pending wake may legitimately wait for a tool or turn.
+#[derive(Clone, serde::Serialize)]
+pub struct DeliveryObservation {
+    owner_pid: u32,
+    owner_started_at_ms: u64,
+    at: i64,
+    eligible_since: Option<i64>,
+    reason: String,
+    wake: Option<String>,
+}
+
+impl DeliveryObservation {
+    fn next(previous: Option<&Self>, reason: &str, eligible: Option<&str>, now: i64) -> Self {
+        let (owner_pid, owner_started_at_ms) = planner_workflow::process_identity();
+        Self {
+            owner_pid,
+            owner_started_at_ms,
+            at: now,
+            eligible_since: eligible.filter(|_| reason != "active-turn-boundary").map(|key| {
+                previous
+                    .filter(|old| old.wake.as_deref() == Some(key))
+                    .and_then(|old| old.eligible_since)
+                    .unwrap_or(now)
+            }),
+            reason: reason.into(),
+            wake: eligible.map(str::to_string),
+        }
+    }
+}
+
+fn observe_delivery(shared: &Shared, sid: &str, reason: &str, eligible: Option<&str>) {
+    let now = chrono::Utc::now().timestamp();
+    let observation = crate::planner_guard::with_runtime(shared, sid, |rt| {
+        let old = rt.wake_delivery_observation.as_ref();
+        let next = DeliveryObservation::next(old, reason, eligible, now);
+        if old.is_some_and(|old| {
+            old.reason == next.reason && old.wake == next.wake && now - old.at < 30
+        }) {
+            return None;
+        }
+        rt.wake_delivery_observation = Some(next.clone());
+        Some(next)
+    });
+    if let Some(observation) = observation {
+        shared.state.lock().unwrap().log(
+            sid,
+            &crate::state::LogEntry {
+                kind: "planner_wake_observation".into(),
+                role: "router".into(),
+                summary: reason.into(),
+                detail: Some(serde_json::to_value(observation).expect("scalar wake observation")),
+                ..Default::default()
+            },
+        );
+    }
+}
+
 pub(crate) struct PromptActivity {
     shared: Arc<Shared>,
     sid: String,
@@ -32,6 +90,7 @@ impl PromptActivity {
                 // A cancel ends the turn it interrupted, not the run: once that
                 // turn is over, wakes resume with a fresh turn.
                 if s.prompt_activity != 0
+                    || s.parent_handoff.cutting_over
                     || s.pinning
                     || s.pin.is_none()
                     || s.capturing_summary.is_some()
@@ -158,26 +217,33 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> tokio::task::JoinHandle<()> {
                 heartbeat(&shared, &sid, &run, now);
                 crate::planner_capacity::spawn_tick(&shared, &sid, now);
                 parked_notice(&shared, &sid, &run, now);
+                if crate::planner_handoff::tick(&shared, &sid, &run) {
+                    observe_delivery(&shared, &sid, "context-handoff", None);
+                    continue;
+                }
                 let queued_input = run.parent_queue.first().is_some_and(|input| {
                     run.wakes
                         .get(&format!("input:{}", input.input_id))
                         .is_some_and(|wake| wake.retry_after <= chrono::Utc::now().timestamp())
                 });
                 if !run.parent_queue.is_empty() && !queued_input {
+                    observe_delivery(&shared, &sid, "input-backoff", None);
                     continue;
                 }
                 // Planner wakes never give up: an undelivered or unanswered
                 // wake is retried on a capped backoff, not dropped.
                 if run.status != RunStatus::Running
                     || !run.approval_waits.is_empty()
-                    || (!queued_input && !run.wakes.values().any(|w| !w.acknowledged))
+                    || (!queued_input && run.pending_wakes().next().is_none())
                 {
+                    observe_delivery(&shared, &sid, "run-or-approval-gate", None);
                     continue;
                 }
                 let Some(activity) = PromptActivity::idle(&shared, &sid) else {
                     steer_pending(&shared, &sid, &run);
                     continue;
                 };
+                observe_delivery(&shared, &sid, "idle-dispatch-started", None);
                 // Agent corrections, like wakes, must yield to live operator
                 // input. Only an actual operator request owns a protected turn.
                 let router_owned = run
@@ -299,10 +365,9 @@ fn finish_deferred_custody(shared: &Arc<Shared>, sid: &str, run: &planner_workfl
 /// job, a release transition or a monitor correction only at its next turn
 /// boundary (2026-10-18: three staging smoke jobs failed and two corrections
 /// queued while the parent rewrote CONTINUE; nothing reached it for 25 minutes).
-/// Steer one pending item per tick into the running turn with
-/// `_session/steering`, exactly as operator input is steered, once per item per
-/// turn. The durable wake or queued input is still delivered and acknowledged at
-/// the boundary; the steer only lets the parent act on it now. An operator turn
+/// Deliver automatic items only at a router-owned parked boundary, once per
+/// item per turn. Active adapter turns retain their items for normal delivery;
+/// `_session/steering` is reserved for explicitly interrupting input. An operator turn
 /// is never steered into (`router_turn_in_flight` is false for it), and an item
 /// a delivery already claims is left to that delivery.
 /// At most one steer per session per `STEER_INTERVAL_SECS`, and only the urgent
@@ -328,11 +393,22 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let command_turn = !crate::planner_preempt::router_turn_in_flight(shared, sid)
         && crate::planner_guard::with_runtime(shared, sid, |rt| rt.command_turn);
     if !(crate::planner_preempt::router_turn_in_flight(shared, sid) || command_turn) {
+        observe_delivery(shared, sid, "protected-turn", None);
         return;
     }
     let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
-    let Some((key, text)) = pending_steer(&run.parent_queue, &run.wakes, &steered, &run.works)
+    let parked = shared.background_interrupts.lock().unwrap().contains_key(sid);
+    // The model has ended its turn while the client still owns a terminal.
+    // Ordinary results can reach that boundary without interrupting work.
+    // Use the run's normal pending filter, including dormant custody exclusions.
+    let pending = parked.then(|| run.pending_wakes()
+        .map(|(id, wake)| (id.clone(), wake.clone())).collect());
+    let Some((key, text)) = pending_steer_at_boundary(
+        &run.parent_queue, pending.as_ref().unwrap_or(&run.wakes), &steered, &run.works,
+        parked.then(|| chrono::Utc::now().timestamp()),
+    )
     else {
+        observe_delivery(shared, sid, "no-pending-steer", None);
         return;
     };
     let queued = key
@@ -345,34 +421,24 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let interrupt =
         queued.is_some_and(|input| crate::external_message::interrupt_of(&input.request));
     if !interrupt && crate::planner_watchdog::tools_in_flight(shared, sid) {
+        observe_delivery(shared, sid, "tools-in-flight", None);
         return;
     }
-    // Inside the operator's `/implement` turn only the deployment obligation
-    // and idle worker capacity are steered; the fallback below cancels
-    // router-owned turns only. A parent can spend its whole run inside that one
-    // turn, so a capacity wake that waited for its boundary kept every slot
-    // empty (2026-11-06: 0 children for an hour while it polled production).
-    // A queued input is addressed to the parent, so it reaches that turn at its
-    // next tool boundary too: a monitor's correction waited over three hours
-    // inside one `/implement` turn (2026-11-10) until resent as an interrupt.
-    if command_turn
-        && !interrupt
-        && !key.starts_with("capacity:")
-        && !key.starts_with("input:")
-        && !((environment_wake(&key) || key.starts_with("release:"))
-            && failed_environment(&run.observations))
-        && !(key.starts_with("audit:release:") && crate::planner_guard::urgent_audit(run))
-    {
+    // Adapter steering can cancel a tool that starts after our last update.
+    // Only a router-owned parked boundary is atomic with automatic delivery.
+    // Active turns retain the durable item for their normal next delivery.
+    if !interrupt && !parked {
+        observe_delivery(shared, sid, "active-turn-boundary", Some(&key));
         return;
     }
     let release_audit = key.starts_with("audit:release:");
-    if release_audit && !crate::planner_guard::urgent_audit(run) {
-        return;
-    }
     let ownership = run
         .wakes
         .get(&key)
         .is_some_and(|wake| ownership_handoff(&key, wake, &run.works));
+    let ordinary = !key.starts_with("input:") && !ownership && !release_audit
+        && !key.starts_with("release:") && !key.starts_with("capacity:")
+        && !key.starts_with("observation:ci-job-failures");
     let claimed = crate::planner_guard::with_runtime(shared, sid, |rt| {
         if interrupt && !rt.steering {
             rt.steering = true;
@@ -382,8 +448,10 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         claim_steer(rt, std::time::Instant::now())
     });
     if !claimed {
+        observe_delivery(shared, sid, "steer-in-flight-or-backoff", Some(&key));
         return;
     }
+    observe_delivery(shared, sid, "steer-attempt", Some(&key));
     let deliveries = run.wakes.get(&key).map_or(0, |w| w.deliveries);
     // Inputs are steered once by id; a wake is recorded with its content (`steer_mark`).
     let mark = match run.wakes.get(&key) {
@@ -401,9 +469,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let shared = shared.clone();
     let sid = sid.to_string();
     tokio::spawn(async move {
-        // Native priority steering can abort an edit and report it to the model
-        // as a user refusal. Automatic wakes wait for tool completion; direct
-        // operator input and `--interrupt` keep their interruption authority.
+        // Recheck foreground work before waking a parked model; the atomic
+        // parked channel below also protects a turn that resumes after this check.
         if !interrupt && crate::planner_watchdog::tools_in_flight(&shared, &sid) {
             crate::planner_guard::with_runtime(&shared, &sid, |rt| {
                 rt.steering = false;
@@ -412,7 +479,13 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             return;
         }
         let blocks = vec![ContentBlock::from(text.clone())];
-        let injected = crate::planner_preempt::steer(&shared, &sid, &blocks).await;
+        let injected = if interrupt {
+            crate::planner_preempt::steer_interrupting(&shared, &sid, &blocks).await
+        } else {
+            // If the parked wait settled after selection, do not fall through
+            // to adapter steering or cancellation of the newly active turn.
+            crate::planner_preempt::wake_background(&shared, &sid, &blocks, Some((&key, ordinary)))
+        };
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
             rt.steering = false;
             if injected && (rt.router_turn || rt.command_turn) {
@@ -457,7 +530,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     first,
                 );
             }
-        } else if (key.starts_with("input:") || ownership || release_audit)
+        } else if interrupt
             && crate::planner_guard::with_runtime(&shared, &sid, |rt| {
                 preempt_allowed(
                     &rt.turn_cancels,
@@ -468,13 +541,11 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                 )
             })
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
-            && (interrupt || !crate::planner_watchdog::tools_in_flight(&shared, &sid))
             && planner_workflow::load(&shared, &sid)
                 .ok()
                 .flatten()
                 .filter(|current| {
                     current.status == RunStatus::Running
-                        && (!release_audit || crate::planner_guard::urgent_audit(current))
                         && current.approval_waits.is_empty()
                         && current
                             .parent_queue
@@ -491,9 +562,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                 })
                 .is_some_and(|(pending, _)| pending == key)
         {
-            // Native adapters need not implement `_session/steering`. Use the
-            // existing cancellation/queued-delivery lifecycle instead of
-            // stranding a correction, ownership handoff or release audit behind a router-owned turn. Recheck
+            // Only explicitly interrupting input may use cancellation when
+            // the adapter declines steering. Recheck
             // after the request: withdrawal, acknowledgment, a live delivery or
             // queued operator input may have superseded this correction.
             crate::planner_guard::with_runtime(&shared, &sid, |rt| {
@@ -504,14 +574,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             shared.state.lock().unwrap().log(
                 &sid,
                 &crate::state::LogEntry {
-                    kind: if release_audit {
-                        "planner_audit_preempt"
-                    } else if ownership {
-                        "planner_handoff_preempt"
-                    } else {
-                        "planner_input_preempt"
-                    }
-                    .into(),
+                    kind: "planner_input_preempt".into(),
                     role: "router".into(),
                     summary: format!(
                         "Queued parent item {key}: steering declined; router turn ended={ended}"
@@ -523,10 +586,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     });
 }
 
-/// One queued item may cancel a router-owned turn again only after this long,
-/// and no item may cancel within the shorter window after any other did.
+/// One explicitly interrupting input may cancel again only after this long.
 const CANCEL_SAME_ITEM_SECS: u64 = 15 * 60;
-const CANCEL_ANY_ITEM_SECS: u64 = 5 * 60;
 
 /// Whether a queued item whose steering was declined may cancel the running
 /// router-owned turn now. A cancel exists to get the item delivered at the next
@@ -549,16 +610,16 @@ pub(crate) fn preempt_allowed(
     interrupt: bool,
     now: std::time::Instant,
 ) -> bool {
+    if !interrupt {
+        return false;
+    }
     let since = |at: &std::time::Instant| now.saturating_duration_since(*at).as_secs();
     if let Some((at, delivered_then)) = cancels.get(key)
         && (deliveries > *delivered_then || since(at) < CANCEL_SAME_ITEM_SECS)
     {
         return false;
     }
-    interrupt
-        || !cancels
-            .values()
-            .any(|(at, _)| since(at) < CANCEL_ANY_ITEM_SECS)
+    true
 }
 
 fn ownership_handoff(
@@ -588,6 +649,16 @@ pub(crate) fn pending_steer(
     wakes: &std::collections::BTreeMap<String, planner_workflow::Wake>,
     steered: &std::collections::HashSet<String>,
     works: &std::collections::BTreeMap<String, planner_workflow::Work>,
+) -> Option<(String, String)> {
+    pending_steer_at_boundary(queue, wakes, steered, works, None)
+}
+
+fn pending_steer_at_boundary(
+    queue: &[planner_workflow::QueuedParentInput],
+    wakes: &std::collections::BTreeMap<String, planner_workflow::Wake>,
+    steered: &std::collections::HashSet<String>,
+    works: &std::collections::BTreeMap<String, planner_workflow::Work>,
+    parked_at: Option<i64>,
 ) -> Option<(String, String)> {
     fn claimed(wake: &planner_workflow::Wake, id: &str) -> bool {
         wake.claim_pid != 0
@@ -657,7 +728,11 @@ pub(crate) fn pending_steer(
         .iter()
         .filter(|(id, w)| {
             !w.acknowledged
-                && (id.starts_with("release:")
+                // Input delivery has its own authority and deduplication above.
+                // Never reinterpret a skipped input as an ordinary parked wake.
+                && !id.starts_with("input:")
+                && (parked_at.is_some_and(|now| w.retry_after <= now)
+                    || id.starts_with("release:")
                     || id.starts_with("audit:release:")
                     || id.starts_with("observation:ci-job-failures")
                     || id.starts_with("capacity:")
@@ -666,7 +741,9 @@ pub(crate) fn pending_steer(
                 && !claimed(w, id)
         })
         .min_by_key(|(id, wake)| {
-            if ownership_handoff(id, wake, works) {
+            if parked_at.is_some() {
+                delivery_priority(id, works.get(&wake.work_id).map(|work| work.status))
+            } else if ownership_handoff(id, wake, works) {
                 1
             } else {
                 wake_priority(id)
@@ -871,7 +948,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         || crate::planner_capacity::human_hold(run).is_some()
         || !run.approval_waits.is_empty()
         || !run.parent_queue.is_empty()
-        || run.wakes.values().any(|w| !w.acknowledged)
+        || run.pending_wakes().next().is_some()
         // Capacity wakes own an idle parent while the host lists unheld
         // candidates or cannot answer; the heartbeat stays for "no work".
         || crate::planner_capacity::supersedes_heartbeat(shared, run, now * 1000)
@@ -916,7 +993,7 @@ pub fn heartbeat(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         idle / 60
     );
     let _ = planner_workflow::mutate(shared, sid, |run| {
-        if run.wakes.values().any(|w| !w.acknowledged) {
+        if run.pending_wakes().next().is_some() {
             return Ok(());
         }
         run.idle_heartbeats += 1;
@@ -1083,11 +1160,12 @@ fn inert_line(
         .join(" and ");
     format!(
         "\n[Router check] This is router text, not operator input. Your last {inert} router-owned turns \
-         ended without a single tool call while {failed} is failed. This run never pauses to wait for \
-         the operator: only `/shutdown` or the operator cancelling a turn stops it, and neither has \
-         happened. A refused, cancelled or interrupted tool call (including \"The user doesn't want to \
-         take this action right now\") is tool evidence, and an operator question is answered in the \
-         same turn while the run continues. Take {failed}'s next repair or release action in this turn."
+         ended without a single tool call while {failed} is failed. This running planner never pauses \
+         solely because a tool was refused, cancelled or interrupted (including \"The user doesn't \
+         want to take this action right now\"). A client cancellation ends that turn; it does not \
+         shut down the planner run, its workers or subsequent wakes. Do not infer a global stop \
+         instruction from a tool result. Honor actual operator instructions; answer operator questions \
+         while continuing the authorized run. Take {failed}'s next repair or release action in this turn."
     )
 }
 
@@ -1203,7 +1281,10 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         }
         // Keep every durable wake, but actionable release/review transitions
         // lead repetitive capacity reminders. Operator input always wins.
-        let mut ordered = run.wakes.keys().cloned().collect::<Vec<_>>();
+        let mut ordered = run
+            .pending_wakes()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
         ordered.sort_by_key(|id| {
             delivery_priority(
                 id,
@@ -1214,7 +1295,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         });
         for id in ordered {
             let wake = run.wakes.get_mut(&id).expect("listed above");
-            if wake.acknowledged || wake.retry_after > now {
+            if wake.retry_after > now {
                 continue;
             }
             if wake.claim_pid != 0 {
@@ -1232,7 +1313,7 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
             wake.claim_pid = pid;
             wake.claim_started_at_ms = started;
             wake.deliveries += 1;
-            wake.retry_after = now + crate::planner_guard::wake_retry_secs(wake.deliveries);
+            wake.retry_after = now + crate::planner_guard::planner_wake_retry_secs(wake.deliveries);
             ids.push(id.clone());
             if ids.len() == 32 {
                 break;
@@ -1267,11 +1348,6 @@ async fn deliver(shared: &Arc<Shared>, sid: &str) -> Result<(), String> {
         inert_line(inert, &run.observations)
     );
     let mut blocks = vec![ContentBlock::from(text)];
-    if let Some(execution) = planner_workflow::execution_context(&run) {
-        blocks.push(ContentBlock::from(format!(
-            "[Recorded human execution request]\n{execution}\nThis router-owned wake continues that admitted request; it is not a new operator instruction. The original invocation remains in force within its scope, subject to later human restrictions, current holds and required gates. Receipt acknowledgment does not revoke it."
-        )));
-    }
     blocks.extend(planner_workflow::parent_input_blocks(
         shared, sid, &input_ids,
     )?);
@@ -1464,6 +1540,29 @@ mod steer_tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
 
+    #[test]
+    fn deferred_wakes_do_not_inherit_an_older_delivery_deadline() {
+        let eligible = DeliveryObservation::next(None, "steer-attempt", Some("capacity:a"), 100);
+        let retry = DeliveryObservation::next(
+            Some(&eligible),
+            "steer-in-flight-or-backoff",
+            Some("capacity:a"),
+            200,
+        );
+        assert_eq!(retry.eligible_since, Some(100));
+        let waiting = DeliveryObservation::next(Some(&retry), "tools-in-flight", None, 300);
+        assert_eq!(waiting.eligible_since, None);
+        let boundary = DeliveryObservation::next(Some(&retry), "active-turn-boundary", Some("capacity:a"), 300);
+        assert_eq!(boundary.eligible_since, None, "queued active-turn work has no delivery deadline");
+        assert_eq!(boundary.wake.as_deref(), Some("capacity:a"), "retain the deferred item's identity for recovery evidence");
+        let resumed =
+            DeliveryObservation::next(Some(&waiting), "steer-attempt", Some("capacity:a"), 400);
+        assert_eq!(resumed.eligible_since, Some(400));
+        let replacement =
+            DeliveryObservation::next(Some(&resumed), "steer-attempt", Some("capacity:b"), 500);
+        assert_eq!(replacement.eligible_since, Some(500));
+    }
+
     #[tokio::test]
     async fn shutdown_retains_queued_input_without_claiming_or_delivering_it() {
         use crate::config::Config;
@@ -1533,6 +1632,54 @@ mod steer_tests {
             Ok(())
         })
         .unwrap();
+        let running = planner_workflow::load(&shared, sid).unwrap().unwrap();
+        crate::planner_preempt::begin_router_turn(&shared, sid);
+        crate::planner_watchdog::note_update(
+            &shared,
+            sid,
+            &json!({"update": {
+                "sessionUpdate": "tool_call", "toolCallId": "proof", "status": "in_progress"
+            }}),
+        );
+        steer_pending(&shared, sid, &running);
+        assert!(crate::planner_guard::with_runtime(&shared, sid, |rt| rt
+            .wake_delivery_observation
+            .as_ref()
+            .unwrap()
+            .eligible_since
+            .is_none()));
+        crate::planner_watchdog::note_update(
+            &shared,
+            sid,
+            &json!({"update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "proof", "status": "completed"
+            }}),
+        );
+        // A parked boundary, unlike an active turn, is eligible for automatic delivery.
+        let (parked, _receiver) = tokio::sync::oneshot::channel();
+        shared.background_interrupts.lock().unwrap().insert(sid.into(), parked);
+        // Keep this test on the synchronous delivery decision; an outstanding
+        // attempt defers retry, but the actionable correction stays visible.
+        crate::planner_guard::with_runtime(&shared, sid, |rt| {
+            rt.steering = true;
+        });
+        steer_pending(&shared, sid, &running);
+        assert!(crate::planner_guard::with_runtime(&shared, sid, |rt| rt
+            .wake_delivery_observation
+            .as_ref()
+            .unwrap()
+            .eligible_since
+            .is_some()));
+        crate::planner_guard::with_runtime(&shared, sid, |rt| {
+            rt.steered.insert("input:correction".into());
+        });
+        steer_pending(&shared, sid, &running);
+        assert!(crate::planner_guard::with_runtime(&shared, sid, |rt| rt
+            .wake_delivery_observation
+            .as_ref()
+            .unwrap()
+            .eligible_since
+            .is_none()));
         let (claimed, announcement) = claim_queued_input(&shared, sid, &input).unwrap();
         assert!(announcement);
         assert_eq!(claimed.wakes["input:correction"].deliveries, 1);
@@ -1558,7 +1705,7 @@ mod steer_tests {
         let mut cancels = std::collections::HashMap::new();
         let after = |secs: u64| start + Duration::from_secs(secs);
         let handoff = "smokescreen-deterministic-v3:ff346996";
-        assert!(preempt_allowed(&cancels, handoff, 0, false, start));
+        assert!(!preempt_allowed(&cancels, handoff, 0, false, start));
         cancels.insert(handoff.to_string(), (start, 0));
         // The loop that happened: the same undelivered item a minute later, and again.
         assert!(!preempt_allowed(&cancels, handoff, 0, false, after(60)));
@@ -1569,8 +1716,8 @@ mod steer_tests {
             false,
             after(CANCEL_SAME_ITEM_SECS - 1)
         ));
-        // Still undelivered after the window: one more cancel may help.
-        assert!(preempt_allowed(
+        // Automatic work has no cancellation authority, however long it waits.
+        assert!(!preempt_allowed(
             &cancels,
             handoff,
             0,
@@ -1580,12 +1727,12 @@ mod steer_tests {
         // A second worker's handoff may not take over the cancelling at once.
         let other = "lead-magnets-receipt401:671e23df";
         assert!(!preempt_allowed(&cancels, other, 0, false, after(60)));
-        assert!(preempt_allowed(
+        assert!(!preempt_allowed(
             &cancels,
             other,
             0,
             false,
-            after(CANCEL_ANY_ITEM_SECS)
+            after(CANCEL_SAME_ITEM_SECS)
         ));
         // An interrupting input still cancels once, then waits like any item.
         let input = "input:monitor-fix";
@@ -1609,7 +1756,8 @@ mod steer_tests {
         assert!(!preempt_allowed(&cancels, audit, 4, false, much_later));
         assert!(!preempt_allowed(&cancels, audit, 4, true, much_later));
         // Not delivered since the cancel: the window alone decides.
-        assert!(preempt_allowed(&cancels, audit, 3, false, much_later));
+        assert!(!preempt_allowed(&cancels, audit, 3, false, much_later));
+        assert!(preempt_allowed(&cancels, audit, 3, true, much_later));
     }
 
     #[test]
@@ -2075,6 +2223,13 @@ mod steer_tests {
             key, "observation:ci-job-failures:staging",
             "an operator prompt is never steered by the router loop"
         );
+        wakes.insert("input:typed".into(), wake("queued operator input"));
+        assert_eq!(
+            pending_steer_at_boundary(&operator, &wakes, &HashSet::new(), &BTreeMap::new(), Some(100))
+                .unwrap().0,
+            "observation:ci-job-failures:staging",
+            "parking must not reinterpret human input as an ordinary wake"
+        );
     }
 
     #[test]
@@ -2089,6 +2244,20 @@ mod steer_tests {
             pending_steer(&[], &wakes, &HashSet::new()).is_none(),
             "routine wakes, including a branch build observation, wait for the boundary"
         );
+        let work = BTreeMap::new();
+        let parked = |wakes: &BTreeMap<String, planner_workflow::Wake>, marks: &HashSet<String>| {
+            pending_steer_at_boundary(&[], wakes, marks, &work, Some(100))
+        };
+        let (id, _) = parked(&wakes, &HashSet::new()).expect("parked model receives ordinary CI result");
+        assert_eq!(id, "observation:ci:dashboard-r1");
+        wakes.get_mut(&id).unwrap().retry_after = 101;
+        assert_eq!(parked(&wakes, &HashSet::new()).unwrap().0, "audit:2");
+        let marks = HashSet::from([steer_mark("audit:2", "defect")]);
+        assert!(parked(&wakes, &marks).is_none(), "backoff and already-steered work stay pending");
+        wakes.get_mut(&id).unwrap().retry_after = 0;
+        wakes.get_mut(&id).unwrap().claim_pid = std::process::id();
+        wakes.get_mut(&id).unwrap().claim_started_at_ms = planner_workflow::process_identity().1;
+        assert!(parked(&wakes, &marks).is_none(), "a live owner keeps ordinary wake custody");
         let mut done = wake("round passed");
         done.acknowledged = true;
         wakes.insert("release:r".to_string(), done);
@@ -2120,8 +2289,14 @@ mod steer_tests {
         let first = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43"))]);
         let (key, _) = pending_steer(&[], &first, &HashSet::new()).expect("first failures steer");
         let steered = HashSet::from([super::steer_mark(&key, "job failures: web 01a1efee-6e43")]);
-        assert!(pending_steer(&[], &first, &steered).is_none(), "an unchanged wake steered twice");
-        let rearmed = BTreeMap::from([(id.clone(), wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"))]);
+        assert!(
+            pending_steer(&[], &first, &steered).is_none(),
+            "an unchanged wake steered twice"
+        );
+        let rearmed = BTreeMap::from([(
+            id.clone(),
+            wake("job failures: web 01a1efee-6e43; win 01a1efee-6e46"),
+        )]);
         assert_eq!(
             pending_steer(&[], &rearmed, &steered).map(|(k, _)| k),
             Some(id),
@@ -2145,7 +2320,14 @@ mod steer_tests {
             pending_steer(&[], &wakes, &HashSet::new()).expect("capacity must reach busy parent");
         assert_eq!(id, "capacity:1");
         assert!(text.starts_with("[Router steer] This is router text, not operator input."));
-        assert!(pending_steer(&[], &wakes, &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])).is_none());
+        assert!(
+            pending_steer(
+                &[],
+                &wakes,
+                &HashSet::from([super::steer_mark(&id, "admissible work with free slots")])
+            )
+            .is_none()
+        );
         wakes.insert("release:ready".to_string(), wake("release transition"));
         assert_eq!(
             pending_steer(&[], &wakes, &HashSet::new()).unwrap().0,

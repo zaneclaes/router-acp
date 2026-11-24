@@ -379,6 +379,12 @@ The migration templates for these artifacts are `templates/chordzy/policy.md` an
 
 The explicit `plan` and `implement` entrypoints execute once under their owning role.
 The role marker prevents an internal invocation from being parsed as a second user command.
+The router preserves an explicitly invoked repository entrypoint's contract in the
+parent command, with its source identity, duties and restrictions. It must not infer
+that a repository's `implement` is worker-only and discard its parent scope. Role
+selection still determines which duties the parent or assigned worker performs;
+the recommendations below describe splitting repository responsibilities, not
+permission to drop an invoked contract during transport.
 
 Chordzy `implement` must become bounded implementation work.
 It must retain assigned plan reading, exact path ownership, focused checks, migration rehearsal, branch evidence, status notes, and `COMMIT PATHS READY`.

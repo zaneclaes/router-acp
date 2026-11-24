@@ -104,13 +104,42 @@ pub fn preempted(shared: &Shared, sid: &str) -> bool {
         .is_some_and(|rt| rt.preempted)
 }
 
-/// Steer operator input into the running router-owned turn. `true` when the
-/// downstream took it.
+/// Deliver an automatic wake without cancelling managed work. `true` when
+/// the downstream or parked turn took it.
 pub async fn steer(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool {
+    steer_with_background_policy(shared, sid, prompt, true).await
+}
+
+/// Operator input and explicitly interrupting messages retain cancellation
+/// authority over a turn's managed terminals.
+pub async fn steer_interrupting(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool {
+    steer_with_background_policy(shared, sid, prompt, false).await
+}
+
+/// Resume only a parked model, retaining its managed terminals. If the wait
+/// ended in the meantime, leave ordinary work queued for the next boundary.
+pub(crate) fn wake_background(shared: &Shared, sid: &str, prompt: &[ContentBlock], wake: Option<(&str, bool)>) -> bool {
+    shared.background_interrupts.lock().unwrap().remove(sid)
+        .is_some_and(|interrupt| interrupt.send(
+            crate::session::BackgroundInterrupt::Wake(prompt.to_vec(), wake.map(|(key, ordinary)| (key.to_string(), ordinary)))
+        ).is_ok())
+}
+
+async fn steer_with_background_policy(
+    shared: &Shared,
+    sid: &str,
+    prompt: &[ContentBlock],
+    preserve_backgrounds: bool,
+) -> bool {
     // A managed wait has no active downstream prompt to steer. Use the same
     // interrupt channel as native client input so urgent planner wakes and
     // queued corrections can resume it instead of waiting for the watcher.
-    let parked = shared.background_interrupts.lock().unwrap().remove(sid);
+    if preserve_backgrounds && wake_background(shared, sid, prompt, None) {
+        return true;
+    }
+    let parked = if preserve_backgrounds { None } else {
+        shared.background_interrupts.lock().unwrap().remove(sid)
+    };
     if let Some(interrupt) = parked
         && interrupt
             .send(crate::session::BackgroundInterrupt::Steer(prompt.to_vec()))

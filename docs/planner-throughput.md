@@ -8,6 +8,12 @@ An explicit `implement` in a new session may also adopt a paused run after every
 attempt ended and its owner stopped. Ordinary session loading never resumes it.
 No API grants deployment authority.
 
+For a work census, use `planner_workflow` with `action: "status"` and
+`works_only: true`. Follow `next_offset` until it is null. This pages only visible
+matching work records, without repeating run-wide input, wake, release and capacity
+histories. Use `work_id` for one work's full scope and handoff; normal status retains
+the run-wide view. Worker queries remain restricted to their own assignment.
+
 Adoption and explicit implementation after a completed drain mark unfinished allocated works
 `reconciliation.required`. The affected assignment cannot dispatch before this custody pass;
 independent admissions, capacity wakes and release/audit wakes continue. Source ownership,
@@ -18,6 +24,12 @@ restored workspace HEAD, and evidence paths. It requires an ended/dead attempt, 
 specs, fences the old child and invalidates stale acceptance. Dispatch and artifacts check the
 source ancestry again. Both fresh and continued prompts include current scope and custody.
 Never treat a checkpoint note or copied files as an updated assignment.
+
+For unfinished work, a disposed or abandoned release is historical membership.
+The parent can reconcile custody after the old attempt ends if the WorkSpec is
+unchanged and the preserved revision is still the exact clean worktree HEAD and
+origin branch tip. Any membership in an open or failed round blocks this path.
+Reconciliation leaves release checkpoints and proof receipts intact.
 
 Parent `retire {key, work_id, reason, evidence}` is a terminal disposition for obsolete work,
 not successful integration. It requires an ended attempt, no frozen release membership and a
@@ -68,6 +80,15 @@ checkpoint, durable human/repair input provenance (including withdrawal), and
 reviewed source dependency maps, admitted plan paths, artifact revisions and the
 existing verified `execution_context`. The latter is derived from the original
 human implementation command and durable command ledger, never caller evidence.
+`selected_works` contains the existing durable Work records for only the selected IDs,
+including their artifact checks, unresolved scope, integration proof recipes and accepted
+review. This lets repository policy distinguish outstanding requirements from completed
+evidence. These records come from router state, never a caller-supplied completion assertion;
+they do not themselves qualify a plan or satisfy any of its outstanding proofs.
+For an older live owner, the installed CLI's `state-query v1 planner-works` reads these
+same existing records without restarting that owner. The host supplies the session,
+minimum observed ledger revision and selected work IDs; absent work or older state refuses.
+The host must still match artifact revisions to its original selection request.
 It must explicitly return
 `verified_action: release-selection-check`. An active repair hold must be checked
 even if the caller omitted it; an older/unavailable host fails closed.

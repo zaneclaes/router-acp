@@ -122,6 +122,9 @@ pub struct CapacityState {
     pub audit: Option<crate::planner_guard::AuditSnapshot>,
     #[serde(default)]
     pub last_audit_wake_at: i64,
+    /// Audit findings already delivered in full to the current parent context.
+    #[serde(default)]
+    pub audit_delivered: Option<crate::planner_guard::AuditDelivered>,
     /// The parent turn-end gate's backoff.
     #[serde(default)]
     pub gate: crate::planner_guard::GateState,
@@ -660,12 +663,17 @@ pub async fn tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     // Custody fences the affected assignment, not the entire queue. Keep its
     // recovery wake without starving independent capacity or release/audit wakes.
     // Admission and dispatch still enforce source ownership and dependencies.
-    if run.works.iter().any(|(id, work)| {
-        work.reconciliation.required && !run.wakes.contains_key(&format!("recovery:{id}"))
-    }) {
+    let needs_wake = |work: &planner_workflow::Work| {
+        work.reconciliation.required && !work.status.dormant_disposition()
+    };
+    if run
+        .works
+        .iter()
+        .any(|(id, work)| needs_wake(work) && !run.wakes.contains_key(&format!("recovery:{id}")))
+    {
         let _ = planner_workflow::mutate(shared, sid, |current| {
             for (id, work) in &current.works {
-                if work.reconciliation.required {
+                if needs_wake(work) {
                     current.wakes.entry(format!("recovery:{id}")).or_insert_with(|| Wake {
                         work_id: id.clone(),
                         reason: "Parent reconciliation required before resuming this adopted assignment: review current scope, source and CONTINUE, then record planner_workflow reconcile. Independent admissions and releases continue under their normal ownership, dependency and evidence gates.".into(),
@@ -1132,7 +1140,7 @@ pub(crate) fn waiting_on_build(run: &PlannerRun, work: &planner_workflow::Work, 
 }
 
 /// A `waiting` handoff that names this work's exact build (`ci:<work>@<revision>`) whose observation has not
-/// failed or passed: Pending, or Unknown because the observer could not read it. Unlike `waiting_on_build`, this
+/// failed or passed: Pending, Unknown, or an observation of a different revision. Unlike `waiting_on_build`, this
 /// does not need a fresh audit: a stale or failed read must not turn a parked worker into a repeated failure
 /// (2026-11-09: engraver-release-v2 and r9409 were suspended while their full builds 9433/9435 ran, after reads
 /// recorded Unknown).
@@ -1141,24 +1149,23 @@ pub(crate) fn parked_on_own_build(run: &PlannerRun, work: &planner_workflow::Wor
     let Some(handoff) = work.handoff.as_ref().filter(|h| h.kind == "waiting") else {
         return false;
     };
-    let named = |revision: &str| {
-        handoff
-            .message
-            .split_whitespace()
-            .any(|word| word == format!("{id}@{revision}"))
+    let prefix = format!("{id}@");
+    let Some(revision) = handoff.message.split_whitespace().find_map(|word| {
+        word.strip_prefix(&prefix)
+            .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) else {
+        return false;
     };
     match run.observations.get(&id) {
-        Some(observation) => {
+        Some(observation) if observation.revision == revision => {
             matches!(
                 observation.state,
                 crate::planner_guard::ObservationState::Pending
                     | crate::planner_guard::ObservationState::Unknown
-            ) && named(&observation.revision)
+            )
         }
-        None => handoff
-            .message
-            .split_whitespace()
-            .any(|word| word.starts_with(&format!("{id}@"))),
+        // A previous build's terminal result says nothing about this wait.
+        _ => true,
     }
 }
 
@@ -1195,7 +1202,10 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
             continue;
         }
         let prerequisite = recovery_prerequisite(run, work);
-        if prerequisite.is_none() && waiting_on_build(run, work, now) {
+        if prerequisite.is_none()
+            && waiting_on_build(run, work, now)
+            && !state.is_some_and(suspended_for_repeats)
+        {
             continue;
         }
         // A worker parked on its own exact build is waiting, not failing: while the observer cannot see that build
@@ -1204,7 +1214,7 @@ async fn resume_workers(shared: &Arc<Shared>, sid: &str, run: &PlannerRun, now: 
         // A provider-side start failure is retried with backoff but never counted toward suspension, and a
         // suspension it caused earlier is lifted.
         let transient = prerequisite.is_none() && transient_start_failure(work.reason.as_deref());
-        let rearm = transient && state.is_some_and(suspended_for_repeats);
+        let rearm = (transient || parked) && state.is_some_and(suspended_for_repeats);
         let fingerprint = failure_fingerprint(work, &prerequisite);
         let changed = state.is_none_or(|s| s.failure_fingerprint.as_ref() != Some(&fingerprint));
         if changed || rearm || state.is_some_and(|s| s.due_at.is_none() && s.suspended.is_none()) {
@@ -1352,7 +1362,7 @@ fn inflight_wake(
         let due = !inflight.is_empty()
             && idle >= timing.wake_after_secs as i64
             && now - run.capacity.last_inflight_wake_at >= timing.inflight_wake_secs as i64
-            && !run.wakes.values().any(|w| !w.acknowledged);
+            && run.pending_wakes().next().is_none();
         due.then_some(inflight)
     };
     let Some(run) = planner_workflow::load(shared, sid).ok().flatten() else {

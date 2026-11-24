@@ -29,6 +29,8 @@ pub struct SessionConfig {
     preclass_done: bool,
     preclass_profile: Option<crate::classifier::TaskProfile>,
     required_mcp_capabilities: Vec<String>,
+    #[serde(default)]
+    required_prompt_caps: crate::candidate::RequiredCaps,
     injected_tickets: Vec<String>,
     task_class: Option<TaskClass>,
     task_complexity: f64,
@@ -65,6 +67,7 @@ impl SessionConfig {
             preclass_done: s.preclass_done,
             preclass_profile: s.preclass_profile.clone(),
             required_mcp_capabilities: s.required_mcp_capabilities.clone(),
+            required_prompt_caps: s.required_prompt_caps,
             injected_tickets: s.injected_tickets.iter().cloned().collect(),
             task_class: s.task_class,
             task_complexity: s.task_complexity,
@@ -77,6 +80,7 @@ impl SessionConfig {
     }
 
     pub fn apply(self, s: &mut RouterSession) {
+        s.required_prompt_caps = self.required_prompt_caps;
         s.strategy = self.strategy;
         s.candidate_override = self.candidate.and_then(|c| CandidateId::parse(&c));
         s.pin_user_pick = self.candidate_user_pick;
@@ -131,6 +135,19 @@ pub fn response_meta(shared: &Arc<Shared>, sid: &str) -> Meta {
         "coordinator": s.coordinator,
     })).unwrap_or_default();
     Meta::from_iter([("router_acp".to_string(), value)])
+}
+
+/// Prepare the same typed session snapshot used by checkpointing, with the
+/// verified standby's candidate before the live route is committed.
+pub(crate) fn retarget_config(
+    shared: &Shared, sid: &str, persisted: &mut crate::state::PersistedSession,
+    candidate: &CandidateId, user_pick: bool,
+) -> Result<(), String> {
+    let mut config = shared.with_session(sid, |s| SessionConfig::capture(s)).ok_or("parent session missing")?;
+    config.candidate = Some(candidate.to_string());
+    config.candidate_user_pick = user_pick;
+    persisted.session_config = Some(serde_json::to_value(config).map_err(|e| e.to_string())?);
+    Ok(())
 }
 
 /// Conversation record kinds the resume digest carries. Streaming updates,
@@ -304,6 +321,7 @@ pub fn restore_continued_config(
     persisted: &crate::state::PersistedSession,
 ) -> Result<(), AcpError> {
     restore_config(s, persisted)?;
+    s.required_prompt_caps = crate::candidate::RequiredCaps::default();
     if !s.pin_user_pick {
         s.candidate_override = None;
         s.candidate_override_source = None;
