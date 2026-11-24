@@ -286,7 +286,7 @@ async fn status_execution_context_is_unpaginated_and_requires_human_admission() 
             &f.shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 1000,
                 work_id: None,
             },
@@ -319,7 +319,7 @@ async fn execution_context_distinguishes_resumed_run_from_shutdown_checkpoint() 
     }).unwrap();
     let paused = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
     let read = || planner_workflow::operate(&f.shared, SID, None,
-        Operation::Status { offset: 0, work_id: None });
+        Operation::Status { works_only: false, offset: 0, work_id: None });
     let before: serde_json::Value = serde_json::from_str(&read().await.unwrap()).unwrap();
     assert_eq!(before["execution"]["run_status"], "paused");
     let mut resume = PromptRequest::new(SID, vec![ContentBlock::from("/implement")]);
@@ -3502,7 +3502,7 @@ async fn repair_dispatch_discovers_related_accepted_source_without_selecting_it(
             &f.shared,
             SID,
             Some(&actor),
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: Some("repair".into()),
             },
@@ -3517,7 +3517,7 @@ async fn repair_dispatch_discovers_related_accepted_source_without_selecting_it(
             &f.shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: None,
             },
@@ -3564,7 +3564,7 @@ async fn repair_dispatch_discovers_related_accepted_source_without_selecting_it(
 #[tokio::test]
 async fn an_attempt_that_handed_off_reads_as_that_handoff() {
     let fixture = fixture(|_| {});
-    let query = || Operation::Status {
+    let query = || Operation::Status { works_only: false,
         offset: 0,
         work_id: Some("work-1".into()),
     };
@@ -3607,7 +3607,7 @@ async fn an_attempt_that_handed_off_reads_as_that_handoff() {
             &fixture.shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: None,
             },
@@ -4811,7 +4811,7 @@ async fn stale_dormant_recovery_is_hidden_without_hiding_changed_prerequisites()
             shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: None,
             },
@@ -5086,7 +5086,7 @@ async fn idle_parent_below_its_limit_gets_capacity_wakes_that_never_give_up() {
             shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: None,
             },
@@ -6010,7 +6010,7 @@ async fn targeted_status_keeps_worker_visibility_and_reports_outstanding_integra
     let shared = &fixture.shared;
     finished_work(shared).await;
     admit(shared, work("work-2"));
-    let query = |id: &str| Operation::Status {
+    let query = |id: &str| Operation::Status { works_only: false,
         offset: 0,
         work_id: Some(id.into()),
     };
@@ -6034,6 +6034,42 @@ async fn targeted_status_keeps_worker_visibility_and_reports_outstanding_integra
     )
     .unwrap();
     assert!(status["works"].as_array().unwrap().is_empty());
+
+    // A census must enumerate later works without paging through unrelated run
+    // history. Reuse this workflow fixture and the real status boundary.
+    for n in 3..=40 {
+        admit(shared, work(&format!("work-{n}")));
+    }
+    let expected: std::collections::BTreeSet<_> =
+        (1..=40).map(|n| format!("work-{n}")).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 0;
+    loop {
+        let query = serde_json::from_value(serde_json::json!({
+            "action": "status", "works_only": true, "offset": offset
+        })).unwrap();
+        let page: serde_json::Value = serde_json::from_str(
+            &planner_workflow::operate(shared, SID, None, query).await.unwrap()
+        ).unwrap();
+        for field in ["inputs", "wakes", "capacity", "releases", "checkpoint"] {
+            assert!(page.get(field).is_none(), "work census repeated {field} history");
+        }
+        for row in page["works"].as_array().unwrap() {
+            assert!(seen.insert(row["work_id"].as_str().unwrap().to_string()));
+        }
+        let Some(next) = page["next_offset"].as_u64() else { break; };
+        assert!(next > offset && next < expected.len() as u64);
+        offset = next;
+    }
+    assert_eq!(seen, expected);
+    let restricted: serde_json::Value = serde_json::from_str(
+        &planner_workflow::operate(shared, SID, Some(&identity), Operation::Status {
+            offset: 0, work_id: None, works_only: true,
+        }).await.unwrap()
+    ).unwrap();
+    assert_eq!(restricted["matched_works"], 1);
+    assert_eq!(restricted["works"][0]["work_id"], "work-2");
+    assert!(restricted["next_offset"].is_null());
 }
 
 // ---------------------------------------------------------------------------
@@ -7382,7 +7418,7 @@ async fn resume_note_is_stored_with_the_run_and_carried_by_adoption() {
             &f.shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: None,
             },
@@ -8752,7 +8788,7 @@ async fn status_json(shared: &Arc<Shared>) -> serde_json::Value {
             shared,
             SID,
             None,
-            Operation::Status {
+            Operation::Status { works_only: false,
                 offset: 0,
                 work_id: None,
             },
@@ -11541,7 +11577,7 @@ async fn an_adoption_interrupted_after_its_claim_resumes_losslessly() {
         &f.shared,
         SID,
         None,
-        Operation::Status {
+        Operation::Status { works_only: false,
             offset: 0,
             work_id: None,
         },

@@ -573,6 +573,8 @@ pub enum Operation {
         offset: usize,
         #[serde(default)]
         work_id: Option<String>,
+        #[serde(default)]
+        works_only: bool,
     },
     Admit {
         key: String,
@@ -1657,6 +1659,7 @@ pub fn tool_definition() -> Value {
             "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete","record-continuation"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
             "release_id":{"type":"string"}, "checkpoint":{"type":"object"},
+            "works_only":{"type":"boolean", "description":"Status: read paged work records without repeating run-wide histories. Follow next_offset until null; matched_works counts only visible matching works."},
             "plan_id":{"type":"string"}, "detail":{"type":"string"},
             "key":{"type":"string"}, "work":{"type":"object"}, "work_id":{"type":"string"}, "attempt_id":{"type":"string"},
             "artifact":{"type":"object"}, "revision":{"type":"string"}, "accepted":{"type":"boolean"}, "evidence":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"object","additionalProperties":{"type":"string"}}]},
@@ -1800,6 +1803,7 @@ async fn operate_once(
     if let Operation::Status {
         offset,
         ref work_id,
+        works_only,
     } = operation
     {
         let visible = |id: &str| {
@@ -1820,6 +1824,14 @@ async fn operate_once(
                 "unresolved":work.artifact.as_ref().map(|a| &a.unresolved),
                 "integration_requirements":work.artifact.as_ref().map(|a| &a.integration_requirements),"integration":work.integration,
                 "reason":work.reason.as_ref().map(|s| s.chars().take(500).collect::<String>())})).collect::<Vec<_>>();
+        if works_only {
+            let next = offset.saturating_add(works.len());
+            return serde_json::to_string(&json!({
+                "revision": run.revision, "works": works, "offset": offset,
+                "next_offset": (next < matched_works).then_some(next),
+                "matched_works": matched_works,
+            })).map_err(|e| e.to_string());
+        }
         let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id))
                 && work_id.as_ref().is_none_or(|wanted| input.owner.as_ref() == Some(wanted)))
             .skip(offset).take(32).map(|(id, input)| json!({"input_id":id,"origin":input.origin,"replayed_from":input.replayed_from,"owner":input.owner,"acknowledged":input.acknowledged && crate::planner_input::withdrawal(&run, id).is_none(),"withdrawn":crate::planner_input::withdrawal(&run, id),

@@ -16124,7 +16124,7 @@ async fn hot_parent_handoff_reranks_after_standby_was_prewarmed() {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let status = router_acp::planner_workflow::operate(&shared, &sid, None,
-                    router_acp::planner_workflow::Operation::Status { offset: 0, work_id: None }).await.unwrap();
+                    router_acp::planner_workflow::Operation::Status { works_only: false, offset: 0, work_id: None }).await.unwrap();
                 let status: serde_json::Value = serde_json::from_str(&status).unwrap();
                 if status["handoff"]["prepared"] == true { break; }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -16169,7 +16169,7 @@ async fn parent_handoff_incompatible_permission_mode_keeps_original_parent() {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let status = router_acp::planner_workflow::operate(&shared, &sid, None,
-                    router_acp::planner_workflow::Operation::Status { offset: 0, work_id: None }).await.unwrap();
+                    router_acp::planner_workflow::Operation::Status { works_only: false, offset: 0, work_id: None }).await.unwrap();
                 let status: serde_json::Value = serde_json::from_str(&status).unwrap();
                 if status["handoff"]["last_error"].is_string() { break; }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -16314,7 +16314,7 @@ async fn planner_handoff_failed_checkpoint_keeps_the_parent_usable() {
                     &shared,
                     &sid,
                     None,
-                    router_acp::planner_workflow::Operation::Status {
+                    router_acp::planner_workflow::Operation::Status { works_only: false,
                         offset: 0,
                         work_id: None,
                     },
@@ -16399,7 +16399,7 @@ async fn planner_handoff_opportunity_requires_a_new_observed_revision() {
                     &shared,
                     &sid,
                     None,
-                    Operation::Status {
+                    Operation::Status { works_only: false,
                         offset: 0,
                         work_id: None,
                     },

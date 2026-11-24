@@ -8,6 +8,12 @@ An explicit `implement` in a new session may also adopt a paused run after every
 attempt ended and its owner stopped. Ordinary session loading never resumes it.
 No API grants deployment authority.
 
+For a work census, use `planner_workflow` with `action: "status"` and
+`works_only: true`. Follow `next_offset` until it is null. This pages only visible
+matching work records, without repeating run-wide input, wake, release and capacity
+histories. Use `work_id` for one work's full scope and handoff; normal status retains
+the run-wide view. Worker queries remain restricted to their own assignment.
+
 Adoption and explicit implementation after a completed drain mark unfinished allocated works
 `reconciliation.required`. The affected assignment cannot dispatch before this custody pass;
 independent admissions, capacity wakes and release/audit wakes continue. Source ownership,
