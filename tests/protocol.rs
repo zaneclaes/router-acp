@@ -1853,6 +1853,39 @@ async fn opus_1m_catalog_routes_when_selector_offers_bare_opus() {
 }
 
 #[tokio::test]
+async fn named_skill_preference_can_fall_back_outside_the_route() {
+    let state = temp_state_file("named-skill-fallback");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nrouter: auto\n\
+         skill_routing:\n  - pattern: review-test\n    candidates: ['*absent*']\nagents:\n{}",
+        state.display(),
+        agent_yaml("mock", &[("available", 2)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let strict = new_session(&cx).await?.session_id.0.to_string();
+        let error = prompt_text(&cx, &strict, "[router: skill=review-test]\nReview.")
+            .await
+            .unwrap_err();
+        assert!(format!("{error}").contains("has no available model"));
+
+        let soft = new_session(&cx).await?.session_id.0.to_string();
+        let response = prompt_text(
+            &cx,
+            &soft,
+            "[router: skill=review-test, prefer=absent|missing]\nReview.",
+        )
+        .await?;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(agent_text(&observed, &soft).contains("echo:available:Review."));
+        let meta = routing_meta_for(&observed, &soft).expect("routing disclosure");
+        assert!(meta.to_string().contains("preferred skill model unavailable"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn static_unrouteable_error_names_selector_miss() {
     let state = temp_state_file("opus-selector-miss");
     let yaml = format!(

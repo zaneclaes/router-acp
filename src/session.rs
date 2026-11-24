@@ -234,6 +234,7 @@ pub struct RouterSession {
     /// Soft preference from `[router: prefer=...]`: tried first at pin time,
     /// but falls through to the normal strategy ranking if unavailable.
     pub preferred_candidate: Option<CandidateId>,
+    named_skill_preference: Option<NamedSkillPreference>,
     pub pin: Option<PinInfo>,
     pub pinning: bool,
     /// Per-session activity fence. Idle planner wakes never race a client turn.
@@ -503,6 +504,7 @@ impl RouterSession {
             native_effort_options: Vec::new(),
             version_request: None,
             preferred_candidate: None,
+            named_skill_preference: None,
             pin: None,
             pinning: false,
             prompt_activity: 0,
@@ -609,6 +611,7 @@ impl RouterSession {
             native_effort_options: Vec::new(),
             version_request: None,
             preferred_candidate: None,
+            named_skill_preference: None,
             pin: None,
             pinning: false,
             prompt_activity: 0,
@@ -3910,7 +3913,7 @@ pub fn close_live_delegates_for(shared: &Arc<Shared>, router_sid: &str) {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PromptDirectives {
     pub candidate: Option<CandidateId>,
-    pub prefer: Option<CandidateId>,
+    pub prefer: Vec<CandidateId>,
     /// `[router: switch=agent/model]` — switch a pinned session to this
     /// candidate mid-conversation (summarize + re-pin). Pre-pin it behaves
     /// like `candidate=`.
@@ -3943,7 +3946,9 @@ pub fn parse_prompt_directives(
         remaining = stripped;
         let into = merged.get_or_insert_with(PromptDirectives::default);
         into.candidate = next.candidate.or(into.candidate.take());
-        into.prefer = next.prefer.or(into.prefer.take());
+        if !next.prefer.is_empty() {
+            into.prefer = next.prefer;
+        }
         into.switch = next.switch.or(into.switch.take());
         into.strategy = next.strategy.or(into.strategy.take());
         into.exclude.extend(next.exclude);
@@ -4145,9 +4150,14 @@ fn parse_one_prompt_directive(
                 })?);
             }
             "prefer" => {
-                directives.prefer = Some(candidate_reference(value).ok_or_else(|| {
-                    format!("directive prefer `{value}` must name a model: `agent/model-id`, `provider/family` or `family`")
-                })?);
+                directives.prefer = value
+                    .split('|')
+                    .map(|reference| {
+                        candidate_reference(reference.trim()).ok_or_else(|| {
+                            format!("directive prefer `{reference}` must name a model: `agent/model-id`, `provider/family` or `family`")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
             }
             "switch" => {
                 directives.switch = Some(candidate_reference(value).ok_or_else(|| {
@@ -5308,6 +5318,20 @@ fn plan_route(
                     exhausted.join(", ")
                 ))
             }
+        });
+    }
+
+    if override_.is_none()
+        && let Some(preference) = shared
+            .with_session(router_sid, |s| s.named_skill_preference.clone())
+            .flatten()
+    {
+        return Ok(RoutePlan {
+            ranked: preference.rank(&shared.runtime_config(), &pool),
+            strategy_kind: strategy,
+            picked,
+            cordon_redirect,
+            cordons,
         });
     }
 
@@ -11271,7 +11295,6 @@ fn prepare_parent_prompt_inner(
             // Shorthand (`claude/haiku`, `haiku`) names the family's pinned or newest model.
             let canonical = |id: CandidateId| shared.cfg.canonical_candidate(&id);
             directives.candidate = directives.candidate.map(canonical);
-            directives.prefer = directives.prefer.map(canonical);
             directives.switch = directives.switch.map(canonical);
             // `candidate=claude/opus` names that agent's account seats.
             directives.candidate = directives.candidate.map(|id| shared.seat_for(&id));
@@ -11280,13 +11303,28 @@ fn prepare_parent_prompt_inner(
             req = PromptRequest::new(req.session_id.clone(), stripped).meta(req.meta.clone());
             // Fail a bad skill route before other directive writes. The commit
             // runs after `candidate=`, so this route's order replaces that pick.
+            let route_error =
+                |msg| AcpError::invalid_params().data(format!("invalid routing directive: {msg}"));
+            let skill_preference = match directives.skill.as_deref() {
+                Some(pattern)
+                    if !directives.prefer.is_empty() || !directives.exclude.is_empty() =>
+                {
+                    let route = lookup_skill_route(&shared.cfg.skill_routing, pattern)
+                        .map_err(route_error)?;
+                    Some(NamedSkillPreference {
+                        route: route.clone(),
+                        prefer: directives.prefer.clone(),
+                        exclude: directives.exclude.clone(),
+                    })
+                }
+                _ => None,
+            };
             let named_skill = match directives.skill.as_deref() {
-                Some(pattern) => Some(
-                    resolve_named_skill_route(&shared, &router_sid, pattern).map_err(|msg| {
-                        AcpError::invalid_params().data(format!("invalid routing directive: {msg}"))
-                    })?,
+                Some(pattern) if skill_preference.is_none() => Some(
+                    resolve_named_skill_route(&shared, &router_sid, pattern)
+                        .map_err(route_error)?,
                 ),
-                None => None,
+                _ => None,
             };
             let pinned_now = shared
                 .with_session(&router_sid, |s| s.pin.is_some() || s.pinning)
@@ -11360,8 +11398,8 @@ fn prepare_parent_prompt_inner(
             // routing directives only shape the still-unmade routing decision.
             let has_pre_pin_directives = directives.strategy.is_some()
                 || directives.candidate.is_some()
-                || directives.prefer.is_some()
-                || !directives.exclude.is_empty()
+                || (skill_preference.is_none()
+                    && (!directives.prefer.is_empty() || !directives.exclude.is_empty()))
                 || directives.label.is_some();
             let applied = shared
                 .with_session(&router_sid, |s| {
@@ -11386,10 +11424,19 @@ fn prepare_parent_prompt_inner(
                             s.candidate_override = Some(candidate);
                             s.candidate_override_source = Some(OverrideSource::UserPick);
                         }
-                        if let Some(prefer) = directives.prefer.clone() {
-                            s.preferred_candidate = Some(prefer);
+                        if let Some(preference) = skill_preference.clone() {
+                            // Choose at pin time from the live eligible pool. The skill's
+                            // exclusions are best-effort and belong only to this ranking.
+                            s.candidate_override = None;
+                            s.candidate_override_source = None;
+                            s.preferred_candidate = None;
+                            s.named_skill_preference = Some(preference);
+                        } else {
+                            if let Some(prefer) = directives.prefer.first() {
+                                s.preferred_candidate = Some(canonical(prefer.clone()));
+                            }
+                            s.excluded.extend(directives.exclude.clone());
                         }
-                        s.excluded.extend(directives.exclude.clone());
                         if directives.label.is_some() {
                             s.run_label = directives.label.clone();
                         }
@@ -11812,6 +11859,81 @@ fn detect_prompt_skill_route<'a>(
     }
 }
 
+#[derive(Debug, Clone)]
+struct NamedSkillPreference {
+    route: SkillRoute,
+    prefer: Vec<CandidateId>,
+    exclude: Vec<String>,
+}
+
+impl NamedSkillPreference {
+    fn rank(&self, config: &Config, pool: &[CandidateView]) -> Vec<RankedCandidate> {
+        let preferred: Vec<Vec<CandidateId>> = self
+            .prefer
+            .iter()
+            .map(|reference| {
+                let text = if reference.agent.is_empty() {
+                    reference.model.clone()
+                } else {
+                    reference.to_string()
+                };
+                let mut candidates = config.resolve_reference(&text);
+                if candidates.is_empty() {
+                    candidates.push(reference.clone());
+                }
+                candidates
+            })
+            .collect();
+
+        let mut ranked: Vec<_> = pool
+            .iter()
+            .map(|view| {
+                let preference = preferred
+                    .iter()
+                    .position(|models| models.contains(&view.id));
+                let pattern = self
+                    .route
+                    .candidates
+                    .iter()
+                    .position(|pat| view_matches(pat, view));
+                let tier = if view_excluded(view, &self.exclude) {
+                    3
+                } else if pattern.is_none() {
+                    2
+                } else if preference.is_none() {
+                    1
+                } else {
+                    0
+                };
+                let position = match (tier, self.route.selection) {
+                    (0, _) => preference.unwrap_or_default(),
+                    (1, RouteSelection::FirstMatch) => pattern.unwrap_or_default(),
+                    _ => 0,
+                };
+                (tier, position, view)
+            })
+            .collect();
+        ranked.sort_by(|(a_tier, a_pos, a), (b_tier, b_pos, b)| {
+            (a_tier, a_pos)
+                .cmp(&(b_tier, b_pos))
+                .then_with(|| (b.quality + b.preference).total_cmp(&(a.quality + a.preference)))
+                .then_with(|| a.config_index.cmp(&b.config_index))
+        });
+        ranked
+            .into_iter()
+            .map(|(tier, position, view)| RankedCandidate {
+                candidate: view.id.clone(),
+                score: view.quality + view.preference,
+                weights: json!({ "skill": self.route.pattern, "tier": tier, "position": position }),
+                reason: format!("steered by skill `{}` routing", self.route.pattern),
+                note: (!self.prefer.is_empty() && (tier != 0 || position != 0)).then(|| {
+                    "preferred skill model unavailable; using the next eligible model".into()
+                }),
+            })
+            .collect()
+    }
+}
+
 /// The seat a `[router: skill=…]` directive will pin, resolved before any
 /// session write. `pattern` on the result is the configured spelling.
 #[derive(Debug)]
@@ -11869,7 +11991,10 @@ fn resolve_named_skill_route(
 /// a skill override, replacing a same-prompt `candidate=` user pick.
 fn commit_named_skill_route(shared: &Arc<Shared>, router_sid: &str, pin: NamedSkillPin) {
     let current = shared
-        .with_session(router_sid, |s| s.pin.as_ref().map(|p| p.candidate.clone()))
+        .with_session(router_sid, |s| {
+            s.named_skill_preference = None;
+            s.pin.as_ref().map(|p| p.candidate.clone())
+        })
         .flatten();
     let pattern = pin.pattern;
     let target = pin.target;
@@ -12867,7 +12992,7 @@ mod directive_tests {
             "[router: prefer=codex/gpt-5.5, switch=claude/opus[1m]]\ngo".to_string(),
         )];
         let (dir, stripped) = parse_prompt_directives(&prompt).unwrap().unwrap();
-        assert_eq!(dir.prefer.unwrap().to_string(), "codex/gpt-5.5");
+        assert_eq!(dir.prefer[0].to_string(), "codex/gpt-5.5");
         assert_eq!(dir.switch.unwrap().to_string(), "claude/opus[1m]");
         assert_eq!(text(&stripped), "go");
     }
@@ -12882,6 +13007,44 @@ mod directive_tests {
         let out = text(&stripped);
         assert_eq!(out, "Review the diff.");
         assert!(!out.contains("[router:"), "directive stripped: {out}");
+    }
+
+    #[test]
+    fn named_skill_preferences_rank_available_seats_and_keep_a_fallback() {
+        use crate::candidate::CodingTier;
+        use crate::strategies::test_util::view;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = skill_route_shared(dir.path());
+        let route = lookup_skill_route(&shared.cfg.skill_routing, "review-gate").unwrap();
+        let prompt = vec![ContentBlock::from(
+            "[router: skill=review-gate, prefer=claude@seat/opus|grok/grok-4.7, exclude=claude*]\ngo"
+                .to_string(),
+        )];
+        let (directives, _) = parse_prompt_directives(&prompt).unwrap().unwrap();
+        let preference = NamedSkillPreference {
+            route: route.clone(),
+            prefer: directives.prefer,
+            exclude: directives.exclude,
+        };
+        let opus = view("claude@seat", "opus", 3, 0, 0.9, CodingTier::High, 1.0);
+        let grok = view("grok", "grok-4.7", 2, 1, 0.8, CodingTier::High, 1.0);
+        let other = view("other", "model", 1, 2, 0.7, CodingTier::High, 1.0);
+        let pool = [opus, grok, other];
+        let ranked = preference.rank(&shared.cfg, &pool);
+        assert_eq!(ranked[0].candidate, pool[1].id);
+        assert!(ranked[0].note.is_some());
+        assert_eq!(ranked[1].candidate, pool[2].id);
+        assert_eq!(ranked[2].candidate, pool[0].id);
+
+        let mut preference = preference;
+        preference.exclude.clear();
+        let ranked = preference.rank(&shared.cfg, &pool);
+        assert_eq!(ranked[0].candidate, pool[0].id);
+        assert!(ranked[0].note.is_none());
+        let ranked = preference.rank(&shared.cfg, &pool[2..]);
+        assert_eq!(ranked[0].candidate, pool[2].id);
+        assert!(ranked[0].note.is_some());
     }
 
     #[test]
