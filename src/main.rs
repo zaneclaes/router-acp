@@ -1253,15 +1253,16 @@ async fn run() -> anyhow::Result<()> {
                 router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
             let (command, data) = match query {
                 StateQueryV1::PlannerWorks { session, min_revision, work } => {
-                    let (revision, document) = store.planner_run(&session)?
-                        .ok_or("planner run is absent")?;
+                    let (revision, document) = store.planner_run(&session)
+                        .map_err(anyhow::Error::msg)?
+                        .ok_or_else(|| anyhow::anyhow!("planner run is absent"))?;
                     if revision < min_revision {
-                        return Err("planner state predates the host request".into());
+                        return Err(anyhow::anyhow!("planner state predates the host request"));
                     }
                     let mut selected = serde_json::Map::new();
                     for id in work {
                         let value = document.get("works").and_then(|works| works.get(&id))
-                            .ok_or("selected planner work is absent")?;
+                            .ok_or_else(|| anyhow::anyhow!("selected planner work is absent"))?;
                         selected.insert(id, value.clone());
                     }
                     ("planner_works", serde_json::json!({
