@@ -13248,6 +13248,87 @@ async fn model_at_capacity_reply_cordons_and_moves_pick_to_nearest_quality() {
 }
 
 #[tokio::test]
+async fn strict_pinned_model_tries_another_account_before_or_after_prompt_failure() {
+    for initial_cordon in [false, true] {
+        let mut claude = agent_yaml("claude", &[("sonnet", 2), ("opus", 4)], &[]);
+        claude.push_str(
+            r#"    accounts:
+      - name: work
+        env: [{ name: MOCK_NAME, value: "claude@work" }, { name: MOCK_FAIL_PROMPT_MSG, value: "rate limit" }]
+      - name: personal
+        env: [{ name: MOCK_NAME, value: "claude@personal" }]
+"#,
+        );
+        let yaml = format!(
+            "state_file: {}\nrouter: auto\ndelegation: {{ enabled: false }}\n\
+             failover: {{ same_model_only_for_pins: true }}\nagents:\n{claude}",
+            temp_state_file("strict-account-pick").display(),
+        );
+        run_test_shared(yaml, async |cx, observed, shared| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            cx.send_request(SetSessionConfigOptionRequest::new(
+                sid.clone(),
+                "router.candidate".to_string(),
+                SessionConfigOptionValue::value_id("claude@work/sonnet"),
+            ))
+            .block_task()
+            .await?;
+            if initial_cordon {
+                shared.headroom.lock().unwrap().cordon(
+                    "claude@work",
+                    Some(Duration::from_secs(3600)),
+                    "account unavailable",
+                );
+            }
+            let response = prompt_text(&cx, &sid, "Fix the login bug").await?;
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            let text = agent_text(&observed, &sid);
+            assert!(text.contains("claude@personal/sonnet"), "{text}");
+            assert!(text.contains("echo:sonnet:Fix the login bug"), "{text}");
+            assert!(!text.contains("echo:opus:"), "{text}");
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn strict_pinned_model_refuses_other_models_on_initial_cordon_or_capacity_failure() {
+    for initial_cordon in [false, true] {
+        let yaml = capacity_failover_yaml(
+            "strict-pick-unavailable",
+            "{ same_model_only_for_pins: true }",
+        );
+        run_test_shared(yaml, async |cx, observed, shared| {
+            init(&cx).await?;
+            let sid = new_session(&cx).await?.session_id.0.to_string();
+            if initial_cordon {
+                shared.headroom.lock().unwrap().cordon(
+                    "a",
+                    Some(Duration::from_secs(3600)),
+                    "account unavailable",
+                );
+            }
+            let err = prompt_text(&cx, &sid, "[router: candidate=a/m1]\nstart")
+                .await
+                .expect_err("the strict pin must fail when no account is available");
+            assert!(
+                format!("{err:?}").contains("pinned model `a/m1` unavailable"),
+                "{err:?}"
+            );
+            let text = agent_text(&observed, &sid);
+            assert!(
+                !text.contains("echo:m2:") && !text.contains("echo:m3:"),
+                "{text}"
+            );
+            Ok(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn model_at_capacity_reply_passes_through_when_disabled() {
     let yaml = capacity_failover_yaml("capacity-off", "{ on_model_capacity: false }");
     run_test(yaml, async |cx, observed| {
