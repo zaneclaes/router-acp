@@ -1072,7 +1072,6 @@ See [`examples/router-full.yaml`](examples/router-full.yaml) for a complete anno
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `failover.same_model_only_for_pins` | `false` | Keep an explicit model pick on that model. Try another eligible account or return an availability error. |
 | `failover.enabled` | `true` | Fail a pinned session over to the next best candidate on limit/outage (including hot continuation after partial text or tool output; never on client cancellation). |
 | `failover.respawn_cooldown_secs` | `30` | Minimum interval between respawn attempts of a dead downstream process. |
 | `failover.max_attempts` | `3` | Candidates tried per prompt (initial + failovers). |
