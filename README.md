@@ -607,7 +607,8 @@ call. Each child includes its chronological log, parsed routing, token and
 context totals, and response-complete state. Only `delegate_task`,
 `delegate_followup`, and `agent_response` retain `detail` there. A host that
 polls passes `--log-limit <n>`: each child then carries its task and its newest
-`n` rows, without streaming bookkeeping, and a replaced child only its task.
+`n` rows, without `detail` or streaming bookkeeping, and a replaced child only
+its task; a planner worker's work is its `work_id`.
 `--whole-log <child>` returns one child's log whole, and `--live-only` leaves
 replaced children out.
 

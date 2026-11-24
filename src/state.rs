@@ -3159,6 +3159,8 @@ impl StateFile {
         const COLUMNS: &str = "ts, kind, role, summary,
                     CASE WHEN kind IN ('delegate_task', 'delegate_followup', 'agent_response')
                          THEN detail END AS detail";
+        // A bounded log shows activity; a task's detail alone is its whole prompt.
+        const BRIEF: &str = "ts, kind, role, summary, NULL AS detail";
         let row = |row: &rusqlite::Row| {
             let detail: Option<String> = row.get("detail")?;
             Ok(DelegateLog {
@@ -3183,7 +3185,7 @@ impl StateFile {
         let task: Option<(i64, DelegateLog)> = self
             .conn
             .prepare_cached(&format!(
-                "SELECT id, {COLUMNS} FROM session_log \
+                "SELECT id, {BRIEF} FROM session_log \
                  WHERE router_session_id = ?1 AND kind = 'delegate_task' ORDER BY id LIMIT 1"
             ))?
             .query_row([child], |found| Ok((found.get("id")?, row(found)?)))
@@ -3191,7 +3193,7 @@ impl StateFile {
         let mut recent = self
             .conn
             .prepare_cached(&format!(
-                "SELECT id, {COLUMNS} FROM session_log WHERE router_session_id = ?1 \
+                "SELECT id, {BRIEF} FROM session_log WHERE router_session_id = ?1 \
                  AND kind NOT IN ('session_update', 'llm_request', 'llm_response') \
                  ORDER BY id DESC LIMIT ?2"
             ))?
