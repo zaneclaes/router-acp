@@ -6817,6 +6817,14 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
         run.execution_input_id = Some("human".into());
         run.commands.insert("human".into());
         run.works.get_mut("work-1").unwrap().spec.external_id = Some("Docs/Plans/REPAIR.md".into());
+        run.works
+            .get_mut("work-1")
+            .unwrap()
+            .artifact
+            .as_mut()
+            .unwrap()
+            .integration_requirements
+            .insert("production-read".into(), "Read the deployed result".into());
         run.inputs.insert("repair-hold:fixture:date".into(), hold);
         Ok(())
     })
@@ -6895,6 +6903,15 @@ async fn release_attestation_is_taken_only_from_the_configured_host() {
         sent["artifact_revisions"]["work-1"],
         checkpoint.works["work-1"]
     );
+    assert_eq!(
+        sent["selected_works"]["work-1"]["artifact"]["integration_requirements"]["production-read"],
+        "Read the deployed result"
+    );
+    assert_eq!(
+        sent["selected_works"]["work-1"]["review"]["revision"],
+        checkpoint.works["work-1"]
+    );
+    assert!(sent["selected_works"]["waiting"].is_null());
     let saved = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
     assert_eq!(saved.releases["held"].stage(), Stage::Selected);
     assert!(saved.works["work-1"].integration.is_none());

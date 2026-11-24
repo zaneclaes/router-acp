@@ -2528,6 +2528,8 @@ async fn operate_once(
                             work.spec.external_id.as_ref().map(|plan| (id, plan))).collect::<BTreeMap<_, _>>(),
                         "artifact_revisions":run.works.iter().filter_map(|(id, work)|
                             work.artifact.as_ref().map(|artifact| (id, &artifact.revision))).collect::<BTreeMap<_, _>>(),
+                        "selected_works":checkpoint.works.keys().filter_map(|id|
+                            run.works.get(id).map(|work| (id, work))).collect::<BTreeMap<_, _>>(),
                         "source_dependencies":run.works.iter().map(|(id, work)|
                             (id, &work.spec.ready_dependencies)).collect::<BTreeMap<_, _>>()
                     }),

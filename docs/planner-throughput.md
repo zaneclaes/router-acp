@@ -80,6 +80,11 @@ checkpoint, durable human/repair input provenance (including withdrawal), and
 reviewed source dependency maps, admitted plan paths, artifact revisions and the
 existing verified `execution_context`. The latter is derived from the original
 human implementation command and durable command ledger, never caller evidence.
+`selected_works` contains the existing durable Work records for only the selected IDs,
+including their artifact checks, unresolved scope, integration proof recipes and accepted
+review. This lets repository policy distinguish outstanding requirements from completed
+evidence. These records come from router state, never a caller-supplied completion assertion;
+they do not themselves qualify a plan or satisfy any of its outstanding proofs.
 It must explicitly return
 `verified_action: release-selection-check`. An active repair hold must be checked
 even if the caller omitted it; an older/unavailable host fails closed.
