@@ -116,6 +116,13 @@ delivery failures. The loop refreshes unchanged decisions every 30 seconds;
 missing or stale observations mean eligibility is unknown. Wake bodies and
 operator messages are excluded from this evidence.
 
+A model parked on a managed background terminal can receive due ordinary worker
+and observation wakes through the existing terminal-preserving continuation.
+Active model turns retain urgent-only steering. Backoff, live delivery custody,
+dormant recovery exclusions and per-turn deduplication still apply. If the terminal
+finishes before delivery, an ordinary wake remains queued for the next boundary;
+it does not interrupt the newly active model or restart the terminal.
+
 ### Worker command resource protection
 
 Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource

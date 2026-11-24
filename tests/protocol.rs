@@ -1163,18 +1163,18 @@ async fn user_steer_interrupts_turn_parked_on_managed_background() {
 }
 
 #[tokio::test]
-async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
+async fn ordinary_planner_wake_preserves_managed_work_and_collects_its_completion() {
     let state = temp_state_file("planner-managed-steer");
+    let log = temp_log("planner-managed-steer");
+    let repo = planner_wire_repository();
     // SAFETY: every helper-enabled test uses the same executable.
     unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
-    let yaml = format!(
-        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
-        state.display(),
-        agent_yaml("mock", &[("m1", 1)], &[])
-    );
+    let yaml = planner_wire_yaml(&state, &log);
     run_test_shared(yaml, async |cx, observed, shared| {
         init_with_terminals(&cx).await?;
-        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let sid = cx.send_request(NewSessionRequest::new(repo.path().join("repo")))
+            .block_task().await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "/implement authorized test").await?;
         let pending = park_on_managed_background(&cx, &observed, &sid).await?;
         while !shared
             .background_interrupts
@@ -1184,18 +1184,18 @@ async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
         {
             tokio::task::yield_now().await;
         }
-        assert!(
-            router_acp::planner_preempt::steer(
-                &shared,
-                &sid,
-                &[ContentBlock::from(
-                    "[Router audit] eligible work needs reconciliation"
-                )]
-            )
-            .await
-        );
+        router_acp::planner_preempt::begin_router_turn(&shared, &sid);
+        router_acp::planner_workflow::mutate(&shared, &sid, |run| {
+            run.wakes.insert("worker:finished".into(), router_acp::planner_workflow::Wake {
+                work_id: "worker".into(),
+                reason: "worker result ready for reconciliation".into(),
+                ..Default::default()
+            });
+            Ok(())
+        }).unwrap();
+        wait_for_mock_prompt(&log, "worker result ready for reconciliation").await;
         while !agent_text(&observed, &sid)
-            .contains("[Router audit] eligible work needs reconciliation")
+            .contains("worker result ready for reconciliation")
         {
             tokio::task::yield_now().await;
         }
@@ -1209,7 +1209,7 @@ async fn planner_steer_preserves_managed_work_and_collects_its_completion() {
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(
             agent_text(&observed, &sid)
-                .contains("[Router audit] eligible work needs reconciliation")
+                .contains("worker result ready for reconciliation")
         );
         assert!(agent_text(&observed, &sid).contains("watch-fired"));
         let observed = observed.lock().unwrap();

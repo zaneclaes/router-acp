@@ -398,7 +398,16 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     }
     let steered = crate::planner_guard::with_runtime(shared, sid, |rt| rt.steered.clone());
-    let Some((key, text)) = pending_steer(&run.parent_queue, &run.wakes, &steered, &run.works)
+    let parked = shared.background_interrupts.lock().unwrap().contains_key(sid);
+    // The model has ended its turn while the client still owns a terminal.
+    // Ordinary results can reach that boundary without interrupting work.
+    // Use the run's normal pending filter, including dormant custody exclusions.
+    let pending = parked.then(|| run.pending_wakes()
+        .map(|(id, wake)| (id.clone(), wake.clone())).collect());
+    let Some((key, text)) = pending_steer_at_boundary(
+        &run.parent_queue, pending.as_ref().unwrap_or(&run.wakes), &steered, &run.works,
+        parked.then(|| chrono::Utc::now().timestamp()),
+    )
     else {
         observe_delivery(shared, sid, "no-pending-steer", None);
         return;
@@ -425,6 +434,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     // next tool boundary too: a monitor's correction waited over three hours
     // inside one `/implement` turn (2026-11-10) until resent as an interrupt.
     if command_turn
+        && !parked
         && !interrupt
         && !key.starts_with("capacity:")
         && !key.starts_with("input:")
@@ -436,7 +446,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         return;
     }
     let release_audit = key.starts_with("audit:release:");
-    if release_audit && !crate::planner_guard::urgent_audit(run) {
+    if release_audit && !parked && !crate::planner_guard::urgent_audit(run) {
         observe_delivery(shared, sid, "audit-not-urgent", None);
         return;
     }
@@ -487,6 +497,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         let blocks = vec![ContentBlock::from(text.clone())];
         let injected = if interrupt {
             crate::planner_preempt::steer_interrupting(&shared, &sid, &blocks).await
+        } else if parked {
+            crate::planner_preempt::wake_background(&shared, &sid, &blocks)
         } else {
             crate::planner_preempt::steer(&shared, &sid, &blocks).await
         };
@@ -534,7 +546,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     first,
                 );
             }
-        } else if (key.starts_with("input:") || ownership || release_audit)
+        } else if !parked && (key.starts_with("input:") || ownership || release_audit)
             && crate::planner_guard::with_runtime(&shared, &sid, |rt| {
                 preempt_allowed(
                     &rt.turn_cancels,
@@ -666,6 +678,16 @@ pub(crate) fn pending_steer(
     steered: &std::collections::HashSet<String>,
     works: &std::collections::BTreeMap<String, planner_workflow::Work>,
 ) -> Option<(String, String)> {
+    pending_steer_at_boundary(queue, wakes, steered, works, None)
+}
+
+fn pending_steer_at_boundary(
+    queue: &[planner_workflow::QueuedParentInput],
+    wakes: &std::collections::BTreeMap<String, planner_workflow::Wake>,
+    steered: &std::collections::HashSet<String>,
+    works: &std::collections::BTreeMap<String, planner_workflow::Work>,
+    parked_at: Option<i64>,
+) -> Option<(String, String)> {
     fn claimed(wake: &planner_workflow::Wake, id: &str) -> bool {
         wake.claim_pid != 0
             && planner_workflow::owner_alive(&planner_workflow::Attempt {
@@ -734,7 +756,8 @@ pub(crate) fn pending_steer(
         .iter()
         .filter(|(id, w)| {
             !w.acknowledged
-                && (id.starts_with("release:")
+                && (parked_at.is_some_and(|now| w.retry_after <= now)
+                    || id.starts_with("release:")
                     || id.starts_with("audit:release:")
                     || id.starts_with("observation:ci-job-failures")
                     || id.starts_with("capacity:")
@@ -743,7 +766,9 @@ pub(crate) fn pending_steer(
                 && !claimed(w, id)
         })
         .min_by_key(|(id, wake)| {
-            if ownership_handoff(id, wake, works) {
+            if parked_at.is_some() {
+                delivery_priority(id, works.get(&wake.work_id).map(|work| work.status))
+            } else if ownership_handoff(id, wake, works) {
                 1
             } else {
                 wake_priority(id)
@@ -2229,6 +2254,20 @@ mod steer_tests {
             pending_steer(&[], &wakes, &HashSet::new()).is_none(),
             "routine wakes, including a branch build observation, wait for the boundary"
         );
+        let work = BTreeMap::new();
+        let parked = |wakes: &BTreeMap<String, planner_workflow::Wake>, marks: &HashSet<String>| {
+            pending_steer_at_boundary(&[], wakes, marks, &work, Some(100))
+        };
+        let (id, _) = parked(&wakes, &HashSet::new()).expect("parked model receives ordinary CI result");
+        assert_eq!(id, "observation:ci:dashboard-r1");
+        wakes.get_mut(&id).unwrap().retry_after = 101;
+        assert_eq!(parked(&wakes, &HashSet::new()).unwrap().0, "audit:2");
+        let marks = HashSet::from([steer_mark("audit:2", "defect")]);
+        assert!(parked(&wakes, &marks).is_none(), "backoff and already-steered work stay pending");
+        wakes.get_mut(&id).unwrap().retry_after = 0;
+        wakes.get_mut(&id).unwrap().claim_pid = std::process::id();
+        wakes.get_mut(&id).unwrap().claim_started_at_ms = planner_workflow::process_identity().1;
+        assert!(parked(&wakes, &marks).is_none(), "a live owner keeps ordinary wake custody");
         let mut done = wake("round passed");
         done.acknowledged = true;
         wakes.insert("release:r".to_string(), done);
