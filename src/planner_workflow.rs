@@ -728,8 +728,9 @@ pub fn save(shared: &Shared, sid: &str, run: &mut PlannerRun) -> Result<(), Stri
     Ok(())
 }
 
-/// Longest reason kept on a wake that was acknowledged.
-const SETTLED_WAKE_REASON: usize = 160;
+/// Longest reason kept on a wake that was acknowledged: enough to say why it
+/// was sent, without the census or evidence its message listed.
+const SETTLED_WAKE_REASON: usize = 1_000;
 
 /// An acknowledged wake stays as the record that its id was delivered, which
 /// is what stops it being issued again. Its message was already delivered, and
