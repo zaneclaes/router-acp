@@ -6564,7 +6564,7 @@ pub enum BackgroundInterrupt {
     Cancel,
     Steer(Vec<ContentBlock>),
     /// A router wake delivers work without cancelling existing operations.
-    Wake(Vec<ContentBlock>),
+    Wake(Vec<ContentBlock>, Option<(String, bool)>),
 }
 
 /// How a turn's wait on its managed terminals ended.
@@ -6575,7 +6575,7 @@ enum BackgroundWait {
     /// agent with this prompt.
     Steered(Vec<ContentBlock>),
     /// An automatic wake arrived; keep the terminals owned for recollection.
-    Woken(Vec<ContentBlock>),
+    Woken(Vec<ContentBlock>, Option<(String, bool)>),
     /// The client cancelled the turn. The terminals were stopped.
     Cancelled,
 }
@@ -6594,9 +6594,27 @@ async fn wait_for_managed_backgrounds(
     if terminal_ids.is_empty() {
         return Ok(None);
     }
+    let wait_id = uuid::Uuid::new_v4().to_string();
+    // Lifecycle metadata only: never retain terminal commands, output or prompts.
+    let record = |phase: &str, terminal: Option<&str>, wake: Option<&(String, bool)>| {
+        let (owner_pid, owner_started_at_ms) = crate::planner_workflow::process_identity();
+        shared.state.lock().unwrap().log(router_sid, &crate::state::LogEntry {
+            kind: "managed_background_wait".into(),
+            role: "router".into(),
+            summary: phase.into(),
+            detail: Some(serde_json::json!({
+                "owner_pid": owner_pid, "owner_started_at_ms": owner_started_at_ms,
+                "wait_id": wait_id, "phase": phase, "terminals": terminal_ids,
+                "terminal": terminal, "wake": wake.map(|w| &w.0),
+                "ordinary": wake.is_some_and(|w| w.1),
+            })),
+            ..Default::default()
+        });
+    };
     let upstream = match shared.upstream() {
         Some(upstream) => upstream,
         None => {
+            record("unavailable", None, None);
             shared.managed_backgrounds.lock().unwrap()
                 .entry(router_sid.to_string()).or_default().extend(terminal_ids);
             return Err(AcpError::internal_error());
@@ -6608,6 +6626,7 @@ async fn wait_for_managed_backgrounds(
         .lock()
         .unwrap()
         .insert(router_sid.to_string(), interrupt_tx);
+    record("parked", None, None);
     // A cancel that landed after the downstream turn ended but before the
     // interrupt was registered still stops the wait.
     let cancelled_early = shared
@@ -6667,7 +6686,7 @@ async fn wait_for_managed_backgrounds(
             result = waited => result,
             interrupt = interrupt_rx => Ok(match interrupt {
                 Ok(BackgroundInterrupt::Steer(prompt)) => BackgroundWait::Steered(prompt),
-                Ok(BackgroundInterrupt::Wake(prompt)) => BackgroundWait::Woken(prompt),
+                Ok(BackgroundInterrupt::Wake(prompt, wake)) => BackgroundWait::Woken(prompt, wake),
                 Ok(BackgroundInterrupt::Cancel) | Err(_) => BackgroundWait::Cancelled,
             }),
             () = async {
@@ -6684,6 +6703,7 @@ async fn wait_for_managed_backgrounds(
         .unwrap()
         .remove(router_sid);
     if let Ok(BackgroundWait::Steered(_) | BackgroundWait::Cancelled) = &outcome {
+        record("interrupted", None, None);
         // An interrupted wait owns its terminals: nothing would collect them,
         // and a watcher left running would keep polling for hours.
         for terminal_id in &terminal_ids {
@@ -6697,6 +6717,7 @@ async fn wait_for_managed_backgrounds(
             // Keep it owned so the next turn can collect it without restarting it.
             shared.managed_backgrounds.lock().unwrap()
                 .entry(router_sid.to_string()).or_default().extend(terminal_ids.iter().cloned());
+            record("unavailable", None, None);
             return Err(error);
         }
     };
@@ -6711,9 +6732,10 @@ async fn wait_for_managed_backgrounds(
                 .entry(router_sid.to_string())
                 .or_default()
                 .extend(terminal_ids.iter().filter(|id| *id != &completed).cloned());
+            record("completed", Some(&completed), None);
             BackgroundWait::Completed(report, completed)
         }
-        BackgroundWait::Woken(prompt) => {
+        BackgroundWait::Woken(prompt, wake) => {
             shared
                 .managed_backgrounds
                 .lock()
@@ -6721,6 +6743,7 @@ async fn wait_for_managed_backgrounds(
                 .entry(router_sid.to_string())
                 .or_default()
                 .extend(terminal_ids.iter().cloned());
+            record("woken", None, wake.as_ref());
             let mut blocks = vec![ContentBlock::from(format!(
                 "[router-acp managed background continues]\nAutomatic router input arrived while \
                  terminal(s) {} remain owned and running. Handle the input; do not restart those \
@@ -7602,7 +7625,7 @@ async fn run_primary_turn_inner(
                         attempt = 0;
                         continue;
                     }
-                    Ok(Some(BackgroundWait::Steered(prompt) | BackgroundWait::Woken(prompt))) => {
+                    Ok(Some(BackgroundWait::Steered(prompt) | BackgroundWait::Woken(prompt, _))) => {
                         background_completion = Some(prompt);
                         continuing = false;
                         attempt = 0;

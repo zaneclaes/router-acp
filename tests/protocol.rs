@@ -1212,6 +1212,25 @@ async fn ordinary_planner_wake_preserves_managed_work_and_collects_its_completio
                 .contains("worker result ready for reconciliation")
         );
         assert!(agent_text(&observed, &sid).contains("watch-fired"));
+        // The monitor consumes this public lifecycle evidence, not model prose.
+        let lifecycle: Vec<_> = shared.state.lock().unwrap().log_for_all(&sid).unwrap()
+            .into_iter().filter(|e| e.kind == "managed_background_wait")
+            .map(|e| e.detail.expect("lifecycle metadata")).collect();
+        let wake = lifecycle.iter().position(|e| e["phase"] == "woken"
+            && e["wake"] == "worker:finished").expect("ordinary wake receipt");
+        let receipt = &lifecycle[wake];
+        assert_eq!(receipt["ordinary"], true);
+        assert!(lifecycle[..wake].iter().any(|e| e["phase"] == "parked"
+            && e["wait_id"] == receipt["wait_id"] && e["terminals"] == receipt["terminals"]));
+        let completed = lifecycle[wake + 1..].iter().find(|e| e["phase"] == "completed")
+            .expect("same operation is collected after the wake");
+        assert!(receipt["terminals"].as_array().unwrap().contains(&completed["terminal"]));
+        assert!(lifecycle[wake + 1..].iter().take_while(|e| e["phase"] != "completed")
+            .any(|e| e["phase"] == "parked" && e["wait_id"] == completed["wait_id"]
+                && e["terminals"].as_array().unwrap().contains(&completed["terminal"])));
+        assert_eq!(receipt["owner_pid"], completed["owner_pid"]);
+        assert_eq!(receipt["owner_started_at_ms"], completed["owner_started_at_ms"]);
+        assert!(receipt["owner_pid"].as_u64().unwrap() > 0);
         let observed = observed.lock().unwrap();
         assert_eq!(observed.terminal_creates.len(), 1);
         assert!(observed.terminal_kills.is_empty());

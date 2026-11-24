@@ -454,6 +454,9 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         .wakes
         .get(&key)
         .is_some_and(|wake| ownership_handoff(&key, wake, &run.works));
+    let ordinary = !key.starts_with("input:") && !ownership && !release_audit
+        && !key.starts_with("release:") && !key.starts_with("capacity:")
+        && !key.starts_with("observation:ci-job-failures");
     let claimed = crate::planner_guard::with_runtime(shared, sid, |rt| {
         if interrupt && !rt.steering {
             rt.steering = true;
@@ -498,7 +501,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         let injected = if interrupt {
             crate::planner_preempt::steer_interrupting(&shared, &sid, &blocks).await
         } else if parked {
-            crate::planner_preempt::wake_background(&shared, &sid, &blocks)
+            crate::planner_preempt::wake_background(&shared, &sid, &blocks, Some((&key, ordinary)))
         } else {
             crate::planner_preempt::steer(&shared, &sid, &blocks).await
         };

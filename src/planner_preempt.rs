@@ -118,10 +118,10 @@ pub async fn steer_interrupting(shared: &Shared, sid: &str, prompt: &[ContentBlo
 
 /// Resume only a parked model, retaining its managed terminals. If the wait
 /// ended in the meantime, leave ordinary work queued for the next boundary.
-pub(crate) fn wake_background(shared: &Shared, sid: &str, prompt: &[ContentBlock]) -> bool {
+pub(crate) fn wake_background(shared: &Shared, sid: &str, prompt: &[ContentBlock], wake: Option<(&str, bool)>) -> bool {
     shared.background_interrupts.lock().unwrap().remove(sid)
         .is_some_and(|interrupt| interrupt.send(
-            crate::session::BackgroundInterrupt::Wake(prompt.to_vec())
+            crate::session::BackgroundInterrupt::Wake(prompt.to_vec(), wake.map(|(key, ordinary)| (key.to_string(), ordinary)))
         ).is_ok())
 }
 
@@ -134,7 +134,7 @@ async fn steer_with_background_policy(
     // A managed wait has no active downstream prompt to steer. Use the same
     // interrupt channel as native client input so urgent planner wakes and
     // queued corrections can resume it instead of waiting for the watcher.
-    if preserve_backgrounds && wake_background(shared, sid, prompt) {
+    if preserve_backgrounds && wake_background(shared, sid, prompt, None) {
         return true;
     }
     let parked = if preserve_backgrounds { None } else {

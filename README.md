@@ -123,6 +123,13 @@ dormant recovery exclusions and per-turn deduplication still apply. If the termi
 finishes before delivery, an ordinary wake remains queued for the next boundary;
 it does not interrupt the newly active model or restart the terminal.
 
+`managed_background_wait` session-log events expose the owning process, wait
+identity, terminal identities and parked/woken/completed/interrupted/unavailable
+phases. An automatic woken event carries the delivered wake identity; a later
+wait or completion of the same terminal establishes retained custody. Commands,
+terminal output and prompts are excluded. Missing events or a different owner
+cannot establish continuity.
+
 ### Worker command resource protection
 
 Router commands (`serve`, `prompt` and `usage-monitor`) do not run a resource
