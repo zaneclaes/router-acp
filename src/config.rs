@@ -758,6 +758,10 @@ impl Default for PreClassifierConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailoverConfig {
+    /// An explicit pick can move between accounts, but cannot change models
+    /// when the selected seat fails or is unavailable.
+    #[serde(default)]
+    pub same_model_only_for_pins: bool,
     /// Fail over a pinned session to the next best candidate when the
     /// pinned model is rate-limited, down or cordoned. Partial output and
     /// tool statuses transfer as a continuation. Never fails over on cancel.
@@ -814,6 +818,7 @@ fn default_failover_attempts() -> u32 {
 impl Default for FailoverConfig {
     fn default() -> Self {
         Self {
+            same_model_only_for_pins: false,
             enabled: true,
             respawn_cooldown_secs: default_respawn_cooldown_secs(),
             max_attempts: default_failover_attempts(),
