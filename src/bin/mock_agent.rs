@@ -1213,8 +1213,9 @@ fn finish_prompt(
     cx: &ConnectionTo<ClientRole>,
     responder: Responder<PromptResponse>,
 ) -> Result<(), AcpError> {
-    // A prompt opening with `NO_REPLY` ends the turn normally with no text.
-    if text.lines().next().map(str::trim) == Some("NO_REPLY") {
+    // A prompt with a `NO_REPLY` line ends the turn normally with no text. The router may
+    // put its own context ahead of the human's message, so it need not be the first line.
+    if text.lines().any(|line| line.trim() == "NO_REPLY") {
         return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }
     if let Ok(text) = std::env::var("MOCK_REPLY_TEXT") {
