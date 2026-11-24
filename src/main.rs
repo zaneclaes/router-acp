@@ -443,6 +443,16 @@ enum StateQueryV1 {
     Delegates {
         #[arg(long, required = true, num_args = 1..)]
         session: Vec<String>,
+        /// Return each child's task and at most this many of its newest log
+        /// rows, without streaming bookkeeping. Every row without it.
+        #[arg(long)]
+        log_limit: Option<usize>,
+        /// A child whose log is returned whole despite --log-limit. Repeatable.
+        #[arg(long)]
+        whole_log: Vec<String>,
+        /// Leave out children a later session of the same work replaced.
+        #[arg(long)]
+        live_only: bool,
     },
     /// Selected session log rows. Pass --kind to select one log kind.
     Logs {
@@ -1252,8 +1262,13 @@ async fn run() -> anyhow::Result<()> {
             let store =
                 router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
             let (command, data) = match query {
-                StateQueryV1::PlannerWorks { session, min_revision, work } => {
-                    let (revision, document) = store.planner_run(&session)
+                StateQueryV1::PlannerWorks {
+                    session,
+                    min_revision,
+                    work,
+                } => {
+                    let (revision, document) = store
+                        .planner_run(&session)
                         .map_err(anyhow::Error::msg)?
                         .ok_or_else(|| anyhow::anyhow!("planner run is absent"))?;
                     if revision < min_revision {
@@ -1261,13 +1276,18 @@ async fn run() -> anyhow::Result<()> {
                     }
                     let mut selected = serde_json::Map::new();
                     for id in work {
-                        let value = document.get("works").and_then(|works| works.get(&id))
+                        let value = document
+                            .get("works")
+                            .and_then(|works| works.get(&id))
                             .ok_or_else(|| anyhow::anyhow!("selected planner work is absent"))?;
                         selected.insert(id, value.clone());
                     }
-                    ("planner_works", serde_json::json!({
-                        "session_id": session, "run_revision": revision, "selected_works": selected,
-                    }))
+                    (
+                        "planner_works",
+                        serde_json::json!({
+                            "session_id": session, "run_revision": revision, "selected_works": selected,
+                        }),
+                    )
                 }
                 StateQueryV1::Session {
                     session,
@@ -1287,9 +1307,21 @@ async fn run() -> anyhow::Result<()> {
                     "title",
                     serde_json::json!({"session_id": session, "title": store.session_metadata(&session).and_then(|record| record.session.title)}),
                 ),
-                StateQueryV1::Delegates { session } => (
+                StateQueryV1::Delegates {
+                    session,
+                    log_limit,
+                    whole_log,
+                    live_only,
+                } => (
                     "delegates",
-                    serde_json::json!({"children": store.delegate_children(&session)?}),
+                    serde_json::json!({"children": store.delegate_children(
+                        &session,
+                        &router_acp::state::DelegateLogs {
+                            recent: log_limit,
+                            whole: whole_log,
+                            live_only,
+                        },
+                    )?}),
                 ),
                 StateQueryV1::Logs {
                     session,

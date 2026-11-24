@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use crate::config::PlannerPhase;
 use crate::planner_skills::{PlannerRole, ResolvedPlanner, ResolvedSkill, content_hash};
 use crate::session::Shared;
+use crate::state::StateStore;
 
 pub const TOOL_NAME: &str = "planner_workflow";
 
@@ -672,55 +673,114 @@ pub struct WorkerIdentity {
 }
 
 pub fn load(shared: &Shared, sid: &str) -> Result<Option<PlannerRun>, String> {
-    shared
-        .state
-        .lock()
-        .unwrap()
-        .planner_run(sid)?
-        .map(|(revision, value)| {
-            let mut run: PlannerRun = serde_json::from_value(value).map_err(|e| e.to_string())?;
-            run.revision = revision;
-            Ok(run)
-        })
-        .transpose()
+    load_cached(&shared.state.lock().unwrap(), sid).map(|run| run.map(|run| (*run).clone()))
+}
+
+/// The stored run. Every one-second tick loads it several times, and a long
+/// run's document is tens of megabytes: it is parsed once per revision.
+fn load_cached(state: &StateStore, sid: &str) -> Result<Option<Arc<PlannerRun>>, String> {
+    let Some(revision) = state.planner_revision(sid)? else {
+        return Ok(None);
+    };
+    if let Some(run) = state.cached_planner_run(sid, revision) {
+        return Ok(Some(run));
+    }
+    let Some((revision, value)) = state.planner_run(sid)? else {
+        return Ok(None);
+    };
+    let mut run: PlannerRun = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    run.revision = revision;
+    let run = Arc::new(run);
+    state.cache_planner_run(sid, run.clone());
+    Ok(Some(run))
 }
 
 pub fn save(shared: &Shared, sid: &str, run: &mut PlannerRun) -> Result<(), String> {
     let state = shared.state.lock().unwrap();
-    let previous = state.planner_run(sid)?;
     let mut events = Vec::new();
     if shared.cfg.delegation.lifecycle_hook.is_some() {
+        // A run whose stored revision moved on fails its save below, so the
+        // document it was loaded from is what this save replaces.
+        let previous = load_cached(&state, sid)?;
         for (wake_id, wake) in &run.wakes {
             if previous
                 .as_ref()
-                .and_then(|(_, v)| v.get("wakes"))
-                .and_then(|w| w.get(wake_id))
-                .is_none()
+                .is_none_or(|previous| !previous.wakes.contains_key(wake_id))
             {
                 events.push(wake_event(sid, run, wake_id, wake).to_string());
             }
         }
         // A work that reached `integrated` in this save: the router no longer
         // needs its workspace, so the host may give it back.
-        let previous_works = previous.as_ref().and_then(|(_, v)| v.get("works"));
         for (work_id, work) in &run.works {
-            let was_integrated = previous_works
-                .and_then(|w| w.get(work_id))
-                .and_then(|w| w.get("status"))
-                .and_then(Value::as_str)
-                == Some("integrated");
+            let was_integrated = previous
+                .as_ref()
+                .and_then(|previous| previous.works.get(work_id))
+                .is_some_and(|work| work.status == WorkStatus::Integrated);
             if work.status == WorkStatus::Integrated && !was_integrated {
                 events.push(work_finished_event(sid, work_id, work).to_string());
             }
         }
     }
-    run.revision = state.save_planner_run_with_wakes(
-        sid,
-        run.revision,
-        &serde_json::to_value(&run).map_err(|e| e.to_string())?,
-        &events,
-    )?;
+    compact_settled_wakes(&mut run.wakes);
+    run.revision = state.save_planner_run_with_wakes(sid, run.revision, run, &events)?;
+    state.cache_planner_run(sid, Arc::new(run.clone()));
     Ok(())
+}
+
+/// Longest reason kept on a wake that was acknowledged.
+const SETTLED_WAKE_REASON: usize = 160;
+
+/// An acknowledged wake stays as the record that its id was delivered, which
+/// is what stops it being issued again. Its message was already delivered, and
+/// kept whole those messages became most of a long run's document, rewritten
+/// on every save. The adoption handoff is still read after acknowledgment.
+fn compact_settled_wakes(wakes: &mut BTreeMap<String, Wake>) {
+    for (id, wake) in wakes {
+        if !wake.acknowledged || wake.claim_pid != 0 || id == "adoption:handoff" {
+            continue;
+        }
+        // An already compacted reason is one mark longer than the limit.
+        if let Some((end, _)) = wake.reason.char_indices().nth(SETTLED_WAKE_REASON)
+            && wake.reason[end..].chars().nth(1).is_some()
+        {
+            wake.reason.truncate(end);
+            wake.reason.push('…');
+        }
+    }
+}
+
+#[cfg(test)]
+mod settled_wake_tests {
+    use super::*;
+
+    #[test]
+    fn only_settled_wakes_lose_their_message_and_none_lose_their_id() {
+        let wake = |acknowledged, claim_pid| Wake {
+            reason: "é".repeat(5_000),
+            acknowledged,
+            claim_pid,
+            ..Default::default()
+        };
+        let mut wakes = BTreeMap::from([
+            ("audit:done".to_string(), wake(true, 0)),
+            ("audit:pending".to_string(), wake(false, 0)),
+            ("audit:delivering".to_string(), wake(true, 7)),
+            ("adoption:handoff".to_string(), wake(true, 0)),
+        ]);
+        let ids: Vec<String> = wakes.keys().cloned().collect();
+        compact_settled_wakes(&mut wakes);
+        let compacted = wakes.clone();
+        compact_settled_wakes(&mut wakes);
+
+        assert_eq!(wakes.keys().cloned().collect::<Vec<_>>(), ids);
+        let length = |id: &str| wakes[id].reason.chars().count();
+        assert_eq!(length("audit:done"), SETTLED_WAKE_REASON + 1);
+        assert_eq!(wakes["audit:done"].reason, compacted["audit:done"].reason);
+        for id in ["audit:pending", "audit:delivering", "adoption:handoff"] {
+            assert_eq!(length(id), 5_000, "{id}");
+        }
+    }
 }
 
 fn wake_event(sid: &str, run: &PlannerRun, wake_id: &str, wake: &Wake) -> Value {
@@ -1830,7 +1890,8 @@ async fn operate_once(
                 "revision": run.revision, "works": works, "offset": offset,
                 "next_offset": (next < matched_works).then_some(next),
                 "matched_works": matched_works,
-            })).map_err(|e| e.to_string());
+            }))
+            .map_err(|e| e.to_string());
         }
         let inputs = run.inputs.iter().filter(|(_, input)| actor.is_none_or(|a| input.owner.as_deref() == Some(&a.work_id))
                 && work_id.as_ref().is_none_or(|wanted| input.owner.as_ref() == Some(wanted)))

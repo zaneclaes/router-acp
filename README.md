@@ -605,7 +605,11 @@ Every command prints one JSON object with `version: 1`, `command`, and `data`.
 `delegates` accepts one or more parent ids and returns every child panel in one
 call. Each child includes its chronological log, parsed routing, token and
 context totals, and response-complete state. Only `delegate_task`,
-`delegate_followup`, and `agent_response` retain `detail` there.
+`delegate_followup`, and `agent_response` retain `detail` there. A host that
+polls passes `--log-limit <n>`: each child then carries its task and its newest
+`n` rows, without streaming bookkeeping, and a replaced child only its task.
+`--whole-log <child>` returns one child's log whole, and `--live-only` leaves
+replaced children out.
 
 `logs` and `transcript` include each row's Unix-second `ts`. `analytics`
 returns the relay-compatible `sessions` and daily UTC token buckets grouped by
