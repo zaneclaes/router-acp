@@ -47,8 +47,7 @@ use crate::headroom::HeadroomTracker;
 use crate::relay;
 use crate::state::{PersistedSession, StateStore};
 use crate::strategies::{
-    CandidateView, OverrideSource, RankedCandidate, RouteContext, RouterStrategy, StaticStrategy,
-    make_strategy,
+    CandidateView, OverrideSource, RankedCandidate, RouteContext, make_strategy,
 };
 
 /// Status of one `(agent, model)` candidate.
@@ -1568,13 +1567,7 @@ impl Shared {
             }
             // An explicit-only candidate stays out of the pool unless it IS
             // the explicitly named candidate.
-            if !c.auto_eligible
-                && !admit.is_some_and(|pick| {
-                    pick == &c.id
-                        || (self.cfg.failover.same_model_only_for_pins
-                            && same_pinned_model(pick, &c.id))
-                })
-            {
+            if !c.auto_eligible && admit != Some(&c.id) {
                 continue;
             }
             let Some(target) = targets.get(&c.process_key) else {
@@ -5106,9 +5099,6 @@ fn plan_route(
         .clone()
         .filter(|_| matches!(override_source, Some(OverrideSource::UserPick)))
         .or(resumed_pick);
-    let strict_pick = human_pick
-        .as_ref()
-        .filter(|_| shared.cfg.failover.same_model_only_for_pins);
     // A failover must not keep re-selecting the failed candidate even when
     // it was explicitly pinned via router.candidate.
     let override_ = override_.filter(|o| !exclude.contains(o));
@@ -5144,11 +5134,11 @@ fn plan_route(
     // A human picks a model; the account seat is only where it runs. Losing
     // the seat moves the pick to the same model on another account instead
     // of handing the turn to the strategy's score.
-    let override_ = match (override_, human_pick.as_ref()) {
+    let override_ = match (override_, human_pick) {
         (None, Some(pick))
-            if exclude.contains(pick) || seat_unavailable(shared, pick).is_some() =>
+            if exclude.contains(&pick) || seat_unavailable(shared, &pick).is_some() =>
         {
-            carry_human_pick(shared, router_sid, pick, profile.class, &required, exclude)
+            carry_human_pick(shared, router_sid, &pick, profile.class, &required, exclude)
         }
         (override_, _) => override_,
     };
@@ -5163,9 +5153,7 @@ fn plan_route(
     let user_pick = matches!(override_source, Some(OverrideSource::UserPick));
     let override_ =
         override_.filter(|cand| !coordinator || user_pick || shared.in_planning_pool(cand));
-    let auto_effort = (override_.is_none() && strict_pick.is_none())
-        .then_some(effort_request)
-        .flatten();
+    let auto_effort = override_.is_none().then_some(effort_request).flatten();
     // Dropping the override (failover exclude, cordon redirect) drops its
     // provenance with it.
     let override_source = override_source.filter(|_| override_.is_some());
@@ -5218,17 +5206,14 @@ fn plan_route(
                 .find(|agent| agent.name == candidate.agent)
                 .and_then(crate::accounts::provider)
         });
-    let mut pool = shared.eligible_views_core(
+    let mut pool = shared.eligible_views_filtered(
         &required,
         profile.class,
-        strict_pick.or(picked.as_ref()),
+        picked.as_ref(),
         false,
         &selection_exclusions,
-        None,
-        strict_pick.is_none(),
         |view| {
-            strict_pick.is_none_or(|pick| same_pinned_model(pick, &view.id))
-                && coordinator_admits(view)
+            coordinator_admits(view)
                 && auto_effort.is_none_or(|effort| {
                     let scores = shared.scores_for(router_sid, &view.id);
                     scores.effort_levels.contains(&effort)
@@ -5248,43 +5233,6 @@ fn plan_route(
     );
     if let Some(min) = larger_context_than {
         pool = prefer_larger_context(shared, router_sid, pool, min);
-    }
-    if let Some(pick) = strict_pick {
-        if pool.is_empty() {
-            return Err(AcpError::internal_error().data(format!(
-                "pinned model `{pick}` unavailable: no eligible account seat"
-            )));
-        }
-        let preferred = override_.filter(|candidate| pool.iter().any(|view| &view.id == candidate));
-        ctx.explicit_candidate = preferred.or_else(|| {
-            pool.iter()
-                .min_by_key(|view| {
-                    let priority = agents
-                        .iter()
-                        .find(|agent| agent.name == view.id.agent)
-                        .and_then(|agent| agent.account_priority)
-                        .unwrap_or(u32::MAX);
-                    (priority, view.config_index)
-                })
-                .map(|view| view.id.clone())
-        });
-        ctx.explicit_source = Some(OverrideSource::UserPick);
-        // Only seats for this model remain. Walk them if the preferred seat
-        // cannot open or verify its downstream session.
-        let strategy = StaticStrategy::new(crate::config::StaticRouterConfig {
-            candidate: None,
-            allow_fallback: true,
-        });
-        let ranked = strategy
-            .rank(&ctx, &pool)
-            .map_err(|err| AcpError::internal_error().data(err.to_string()))?;
-        return Ok(RoutePlan {
-            ranked,
-            strategy_kind: StrategyKind::Static,
-            picked: Some(pick.clone()),
-            cordon_redirect,
-            cordons,
-        });
     }
     if pool.is_empty() {
         return Err(if coordinator {
@@ -5600,15 +5548,7 @@ async fn pin_ranked(
                             downstream_sid: opened.downstream_sid.clone(),
                             available_modes: available_modes.clone(),
                         });
-                        s.pin_user_pick = picked.as_ref().is_some_and(|pick| {
-                            pick == &candidate
-                                || (shared.cfg.failover.same_model_only_for_pins
-                                    && same_pinned_model(pick, &candidate))
-                        });
-                        if shared.cfg.failover.same_model_only_for_pins && s.pin_user_pick {
-                            s.candidate_override = Some(candidate.clone());
-                            s.candidate_override_source = Some(OverrideSource::UserPick);
-                        }
+                        s.pin_user_pick = picked.as_ref() == Some(&candidate);
                         // Each pin opens a fresh downstream session. Queue its
                         // delegation instruction only if that session actually
                         // received the router tools.
@@ -7699,7 +7639,6 @@ async fn run_primary_turn_inner(
 
                 if matches!(class, FailureClass::ModelAtCapacity)
                     && shared.cfg.failover.on_model_capacity
-                    && !shared.cfg.failover.same_model_only_for_pins
                 {
                     adopt_capacity_substitute(&shared, &router_sid, &candidate);
                 }
@@ -7788,14 +7727,6 @@ async fn run_primary_turn_inner(
                             &router_sid,
                             format!("router-acp · no fallback candidate available — {pin_err}"),
                         );
-                        if shared.cfg.failover.same_model_only_for_pins
-                            && shared
-                                .with_session(&router_sid, |s| human_pick(s, &candidate))
-                                .unwrap_or(false)
-                        {
-                            flush_pending_disclosure(&shared, &router_sid);
-                            return Err(pin_err);
-                        }
                         // Keep the bounded wait, but retry routing when another
                         // seat recovers. Availability is only a wake hint: the
                         // ordinary selector still owns every pool/effort rule.
@@ -8141,7 +8072,6 @@ fn carry_human_pick(
                 ),
             );
         }
-        None if shared.cfg.failover.same_model_only_for_pins => {}
         None => {
             if recovers {
                 shared.with_session(router_sid, |s| {
@@ -8165,11 +8095,6 @@ fn carry_human_pick(
         }
     }
     seat
-}
-
-fn same_pinned_model(pick: &CandidateId, candidate: &CandidateId) -> bool {
-    pick.model == candidate.model
-        && pick.agent.split('@').next() == candidate.agent.split('@').next()
 }
 
 /// Why `candidate`'s account cannot spend on it now, if it cannot.
