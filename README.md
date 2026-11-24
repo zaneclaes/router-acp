@@ -597,6 +597,7 @@ router-acp state-query --config ~/.config/router-acp/router.yaml v1 analytics --
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 health
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 delegation-report
 router-acp state-query --config ~/.config/router-acp/router.yaml v1 transcript --session rtr-…
+router-acp state-query --config ~/.config/router-acp/router.yaml v1 planner-works --session rtr-… --min-revision 42 --work work-a work-b
 ```
 
 Every command prints one JSON object with `version: 1`, `command`, and `data`.

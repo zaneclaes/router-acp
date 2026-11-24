@@ -85,6 +85,10 @@ including their artifact checks, unresolved scope, integration proof recipes and
 review. This lets repository policy distinguish outstanding requirements from completed
 evidence. These records come from router state, never a caller-supplied completion assertion;
 they do not themselves qualify a plan or satisfy any of its outstanding proofs.
+For an older live owner, the installed CLI's `state-query v1 planner-works` reads these
+same existing records without restarting that owner. The host supplies the session,
+minimum observed ledger revision and selected work IDs; absent work or older state refuses.
+The host must still match artifact revisions to its original selection request.
 It must explicitly return
 `verified_action: release-selection-check`. An active repair hold must be checked
 even if the caller omitted it; an older/unavailable host fails closed.

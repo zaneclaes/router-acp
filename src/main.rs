@@ -409,6 +409,15 @@ enum StateQueryCommand {
 
 #[derive(Subcommand)]
 enum StateQueryV1 {
+    /// Selected durable work records, without resuming or interrupting the owner.
+    PlannerWorks {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        min_revision: u64,
+        #[arg(long, required = true, num_args = 1..)]
+        work: Vec<String>,
+    },
     /// Session metadata, including its title when one exists. Look it up by
     /// router session id, or by the provider's own session id with
     /// --downstream (optionally narrowed by --agent).
@@ -1243,6 +1252,22 @@ async fn run() -> anyhow::Result<()> {
             let store =
                 router_acp::state::StateStore::open_readonly(&cfg.state_file, cfg.retention())?;
             let (command, data) = match query {
+                StateQueryV1::PlannerWorks { session, min_revision, work } => {
+                    let (revision, document) = store.planner_run(&session)?
+                        .ok_or("planner run is absent")?;
+                    if revision < min_revision {
+                        return Err("planner state predates the host request".into());
+                    }
+                    let mut selected = serde_json::Map::new();
+                    for id in work {
+                        let value = document.get("works").and_then(|works| works.get(&id))
+                            .ok_or("selected planner work is absent")?;
+                        selected.insert(id, value.clone());
+                    }
+                    ("planner_works", serde_json::json!({
+                        "session_id": session, "run_revision": revision, "selected_works": selected,
+                    }))
+                }
                 StateQueryV1::Session {
                     session,
                     downstream,
