@@ -847,6 +847,10 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   for in-flight tools to finish so adapter interruption cannot masquerade as a user refusing an edit;
   direct operator input keeps its interruption authority. Recovery clears audit urgency;
   withdrawing the host's urgency clears it too; ordinary audits retain their idle cadence.
+  Cancelling a parent turn ends that turn while its planner run, workers and later wakes continue.
+  Recovery prompts distinguish this from shutting down the run and do not treat a cancelled tool's
+  message as an operator stop instruction. Client cancellations are recorded as `client_turn_cancel`
+  in session logs, separately from router preemption, without recording prompt or tool bodies.
 
   The parent capacity census and host work snapshots use the same fresh exact-head CI wait
   as automatic recovery. A parked owner is shown as waiting for CI, not awaiting retry;

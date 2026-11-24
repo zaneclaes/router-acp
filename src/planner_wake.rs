@@ -1188,11 +1188,12 @@ fn inert_line(
         .join(" and ");
     format!(
         "\n[Router check] This is router text, not operator input. Your last {inert} router-owned turns \
-         ended without a single tool call while {failed} is failed. This run never pauses to wait for \
-         the operator: only `/shutdown` or the operator cancelling a turn stops it, and neither has \
-         happened. A refused, cancelled or interrupted tool call (including \"The user doesn't want to \
-         take this action right now\") is tool evidence, and an operator question is answered in the \
-         same turn while the run continues. Take {failed}'s next repair or release action in this turn."
+         ended without a single tool call while {failed} is failed. This running planner never pauses \
+         solely because a tool was refused, cancelled or interrupted (including \"The user doesn't \
+         want to take this action right now\"). A client cancellation ends that turn; it does not \
+         shut down the planner run, its workers or subsequent wakes. Do not infer a global stop \
+         instruction from a tool result. Honor actual operator instructions; answer operator questions \
+         while continuing the authorized run. Take {failed}'s next repair or release action in this turn."
     )
 }
 

@@ -12292,6 +12292,20 @@ fn on_cancel(shared: Arc<Shared>, notif: CancelNotification) -> Result<(), AcpEr
     let planner = crate::planner_workflow::load(&shared, &router_sid)
         .map_err(|e| AcpError::internal_error().data(e))?
         .is_some();
+    shared.state.lock().unwrap().log(
+        &router_sid,
+        &crate::state::LogEntry {
+            kind: "client_turn_cancel".into(),
+            role: "client".into(),
+            summary: if planner {
+                "Client cancelled the current turn; planner run and workers continue"
+            } else {
+                "Client cancelled the current turn and its delegates"
+            }
+            .into(),
+            ..Default::default()
+        },
+    );
     let (pin, delegates) = shared
         .with_session(&router_sid, |s| {
             s.cancelled = true;
