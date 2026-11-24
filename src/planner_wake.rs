@@ -29,7 +29,7 @@ impl DeliveryObservation {
             owner_pid,
             owner_started_at_ms,
             at: now,
-            eligible_since: eligible.map(|key| {
+            eligible_since: eligible.filter(|_| reason != "active-turn-boundary").map(|key| {
                 previous
                     .filter(|old| old.wake.as_deref() == Some(key))
                     .and_then(|old| old.eligible_since)
@@ -428,7 +428,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     // Only a router-owned parked boundary is atomic with automatic delivery.
     // Active turns retain the durable item for their normal next delivery.
     if !interrupt && !parked {
-        observe_delivery(shared, sid, "active-turn-boundary", None);
+        observe_delivery(shared, sid, "active-turn-boundary", Some(&key));
         return;
     }
     let release_audit = key.starts_with("audit:release:");
@@ -1552,6 +1552,9 @@ mod steer_tests {
         assert_eq!(retry.eligible_since, Some(100));
         let waiting = DeliveryObservation::next(Some(&retry), "tools-in-flight", None, 300);
         assert_eq!(waiting.eligible_since, None);
+        let boundary = DeliveryObservation::next(Some(&retry), "active-turn-boundary", Some("capacity:a"), 300);
+        assert_eq!(boundary.eligible_since, None, "queued active-turn work has no delivery deadline");
+        assert_eq!(boundary.wake.as_deref(), Some("capacity:a"), "retain the deferred item's identity for recovery evidence");
         let resumed =
             DeliveryObservation::next(Some(&waiting), "steer-attempt", Some("capacity:a"), 400);
         assert_eq!(resumed.eligible_since, Some(400));
