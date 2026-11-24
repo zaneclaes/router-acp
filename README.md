@@ -1463,7 +1463,9 @@ assignments. Parent and worker roles still determine which duties each performs.
 Uninvoked repository skills and agent-origin command claims grant no scope, and
 ordinary follow-up turns do not replay the entrypoint body.
 Audit freshness starts when the host answers, so time spent collecting observations
-does not immediately expire a pending CI wait. Recovery prompts use the repository's
+or recovering workers before the audit does not immediately expire a pending CI wait.
+The answer uses its current clock, independently of the capacity tick's scheduling time.
+Recovery prompts use the repository's
 exact CI handoff instead of asking workers to poll within a turn; failed, changed,
 missing or genuinely stale observations retain normal recovery.
 See [durable planner progress](docs/planner-throughput.md).
