@@ -474,15 +474,18 @@ pub async fn audit_tick(shared: &Arc<Shared>, sid: &str, now: i64) {
     if !due {
         return;
     }
+    let started = std::time::Instant::now();
     let Some(answer) = audit(shared, sid, &run, now_ms, false, None).await else {
         return;
     };
     // Freshness begins at the answer. A slow host must not return a snapshot
     // already stale enough to restart workers parked on its pending CI result.
-    // The caller's scheduling clock can precede worker recovery and task queuing.
-    // Adding only this host call's duration to it still backdates the answer.
-    // Keep whole-second resolution for consumers comparing their tick clocks.
-    let answered_at_ms = chrono::Utc::now().timestamp().saturating_mul(1000);
+    // Preserve the caller's logical clock (including monotonic host duration),
+    // but do not let a delayed capacity tick backdate a real host response.
+    // The tick may have awaited worker recovery before entering this call.
+    let answered_at_ms = now_ms
+        .saturating_add((started.elapsed().as_secs() as i64).saturating_mul(1000))
+        .max(chrono::Utc::now().timestamp().saturating_mul(1000));
     let observations = answer
         .as_ref()
         .ok()

@@ -1464,7 +1464,7 @@ Uninvoked repository skills and agent-origin command claims grant no scope, and
 ordinary follow-up turns do not replay the entrypoint body.
 Audit freshness starts when the host answers, so time spent collecting observations
 or recovering workers before the audit does not immediately expire a pending CI wait.
-The answer uses its current clock, independently of the capacity tick's scheduling time.
+The answer preserves the scheduling clock but is never dated before the current response time.
 Recovery prompts use the repository's
 exact CI handoff instead of asking workers to poll within a turn; failed, changed,
 missing or genuinely stale observations retain normal recovery.
