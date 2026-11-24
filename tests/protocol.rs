@@ -17103,16 +17103,15 @@ async fn model_shorthand_preempts_router_owned_turn_and_resumes_its_wake_on_the_
     .await;
 }
 
-/// The operator's `/implement` is one long turn (live: 43 minutes admitting 50
-/// workers). A failed staging build observed during it reaches the parent in
-/// that turn; ordinary wakes still wait for its end and nothing cancels it.
+/// Audit and environment findings survive an active implementation command
+/// and reach its next boundary without interrupting the command.
 #[tokio::test]
-async fn failed_environment_is_steered_into_the_running_implement_command_turn() {
+async fn failed_environment_waits_for_implement_command_boundary() {
     audit_or_failure_reaches_implement_command(false).await;
 }
 
 #[tokio::test]
-async fn host_urgent_audit_is_steered_into_the_running_implement_command_turn() {
+async fn host_urgent_audit_waits_for_implement_command_boundary() {
     audit_or_failure_reaches_implement_command(true).await;
 }
 
@@ -17159,7 +17158,7 @@ async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
                         Ok(())
                     })
                     .unwrap();
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    wait_for_wake_boundary(&shared, &sid, "no-pending-steer").await;
                     assert!(
                         !read_log(&log)
                             .iter()
@@ -17195,28 +17194,17 @@ async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
                         Ok(())
                     })
                     .unwrap();
-                    for _ in 0..200 {
-                        if read_log(&log).iter().any(|e| e["event"] == "steer") {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                    wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
                     let events = read_log(&log);
-                    let steer = events
-                        .iter()
-                        .find(|e| e["event"] == "steer")
-                        .expect("the failed environment reached the running command turn");
-                    let params = steer["params"].to_string();
-                    assert!(params.contains("STAGING-FAILED-FIXTURE"), "{params}");
-                    assert!(!params.contains("ROUTINE-CHILD-WAKE"));
                     assert!(
-                        !events.iter().any(|e| e["event"] == "cancel"),
+                        !events.iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                         "never cancelled"
                     );
                     std::fs::write(&release, "").unwrap();
                 }
             );
             answer?;
+            wait_for_mock_prompt(&log, "STAGING-FAILED-FIXTURE").await;
             Ok(())
         },
     )
@@ -17224,10 +17212,9 @@ async fn audit_or_failure_reaches_implement_command(host_urgent: bool) {
     let _ = std::fs::remove_file(&release);
 }
 
-/// Idle worker capacity reaches the operator's long `/implement` turn too
-/// (2026-11-06: 0 children for an hour of one turn polling production).
+/// Capacity remains pending until the implementation command reaches a boundary.
 #[tokio::test]
-async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
+async fn capacity_wake_waits_for_implement_command_boundary() {
     use router_acp::planner_workflow::{self as workflow, Wake};
     let state = temp_state_file("command-turn-capacity");
     let log = temp_log("command-turn-capacity");
@@ -17270,30 +17257,16 @@ async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
                         Ok(())
                     })
                     .unwrap();
-                    let steered = || {
-                        read_log(&log).iter().any(|e| {
-                            e["event"] == "steer"
-                                && e["params"].to_string().contains("CAPACITY-FIXTURE")
-                        })
-                    };
-                    for _ in 0..200 {
-                        if steered() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                    wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
                     assert!(
-                        steered(),
-                        "the capacity wake reached the running command turn"
-                    );
-                    assert!(
-                        !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                        !read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                         "never cancelled"
                     );
                     std::fs::write(&release, "").unwrap();
                 }
             );
             answer?;
+            wait_for_mock_prompt(&log, "CAPACITY-FIXTURE").await;
             Ok(())
         },
     )
@@ -17301,11 +17274,9 @@ async fn capacity_wake_is_steered_into_the_running_implement_command_turn() {
     let _ = std::fs::remove_file(&release);
 }
 
-/// A queued input reaches the operator's long `/implement` turn at a tool
-/// boundary, without `--interrupt` and without a cancel (2026-11-10: a monitor
-/// correction waited over three hours inside one turn).
+/// Noninterrupting queued input follows the implementation command's boundary.
 #[tokio::test]
-async fn queued_input_is_steered_into_the_running_implement_command_turn() {
+async fn queued_input_waits_for_implement_command_boundary() {
     use router_acp::planner_workflow::{self as workflow, Wake};
     let state = temp_state_file("command-turn-input");
     let log = temp_log("command-turn-input");
@@ -17361,27 +17332,16 @@ async fn queued_input_is_steered_into_the_running_implement_command_turn() {
                         Ok(())
                     })
                     .unwrap();
-                    let steered = || {
-                        read_log(&log).iter().any(|e| {
-                            e["event"] == "steer"
-                                && e["params"].to_string().contains("MONITOR-INPUT-FIXTURE")
-                        })
-                    };
-                    for _ in 0..200 {
-                        if steered() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    assert!(steered(), "the queued input reached the running command turn");
+                    wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
                     assert!(
-                        !read_log(&log).iter().any(|e| e["event"] == "cancel"),
+                        !read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                         "never cancelled"
                     );
                     std::fs::write(&release, "").unwrap();
                 }
             );
             answer?;
+            wait_for_mock_prompt(&log, "MONITOR-INPUT-FIXTURE").await;
             Ok(())
         },
     )
@@ -17668,10 +17628,9 @@ async fn operator_input_cancels_a_router_owned_turn_and_runs_next_when_steering_
     let _ = std::fs::remove_file(&release);
 }
 
-/// An adapter may not implement mid-turn steering. An already queued agent
-/// correction must still reach the parent without waiting for an unbounded wake.
+/// An ordinary agent correction stays durable until the active turn ends.
 #[tokio::test]
-async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
+async fn queued_agent_input_waits_for_router_turn_boundary() {
     let state = temp_state_file("agent-input-declined-steer");
     let log = temp_log("agent-input-declined-steer");
     let release = std::env::temp_dir().join(format!("release-{}", uuid::Uuid::new_v4().simple()));
@@ -17693,19 +17652,22 @@ async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
                 )
                 .unwrap();
             }
+            wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
+            assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
+            assert!(!router_acp::planner_workflow::load(&shared, &sid).unwrap().unwrap()
+                .inputs["agent-declined-steer"].acknowledged);
+            std::fs::write(&release, "").unwrap();
             tokio::time::timeout(
                 Duration::from_secs(8),
                 wait_for_mock_prompt(&log, "queued-fix-activated"),
             )
             .await
-            .expect("declined steering must not strand the queued agent input");
+            .expect("the ended turn must deliver the queued agent input");
             let events = read_log(&log);
             let wake = mock_prompts(&log, WAKE_MARKER)[0];
             let correction = mock_prompts(&log, "queued-fix-activated")[0];
-            let cancel = events.iter().position(|e| e["event"] == "cancel").unwrap();
-            assert!(wake < cancel && cancel < correction);
-            assert!(!release.exists());
-            std::fs::write(&release, "").unwrap();
+            assert!(wake < correction);
+            assert!(!events.iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
             for _ in 0..100 {
                 let run = router_acp::planner_workflow::load(&shared, &sid)
                     .unwrap()
@@ -17713,9 +17675,7 @@ async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
                 if run.inputs["agent-declined-steer"]
                     .delivered_to
                     .contains(&sid)
-                    && mock_prompts(&log, WAKE_MARKER)
-                        .iter()
-                        .any(|i| *i > correction)
+                    && run.parent_queue.is_empty()
                 {
                     break;
                 }
@@ -17731,11 +17691,6 @@ async fn queued_agent_input_preempts_router_work_when_steering_is_declined() {
             );
             assert!(run.parent_queue.is_empty());
             assert!(agent_text(&observed, &sid).contains("queued-fix-activated"));
-            assert!(
-                mock_prompts(&log, WAKE_MARKER)
-                    .iter()
-                    .any(|i| *i > correction)
-            );
             Ok(())
         },
     )
@@ -17821,6 +17776,19 @@ async fn host_urgent_audit_waits_for_the_active_edit_to_finish() {
     urgent_parent_wake_respects_operator_turn(true, true, true).await;
 }
 
+async fn wait_for_wake_boundary(shared: &router_acp::session::Shared, sid: &str, decision: &str) {
+    // Hang backstop only: observe an actual wake-loop decision, never grade elapsed time.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let observed = shared.planner_runtime.lock().unwrap().get(sid)
+                .and_then(|rt| rt.wake_delivery_observation.as_ref())
+                .is_some_and(|observation| serde_json::to_value(observation).unwrap()["reason"] == decision);
+            if observed { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("wake loop must observe the pending delivery boundary");
+}
+
 async fn urgent_parent_wake_respects_operator_turn(
     release_audit: bool,
     protect_tool: bool,
@@ -17890,23 +17858,28 @@ async fn urgent_parent_wake_respects_operator_turn(
                 Ok(())
             }).unwrap();
             if protect_tool && !operator_turn {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                wait_for_wake_boundary(&shared, &sid, "tools-in-flight").await;
                 assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
                     "automatic steering must not interrupt an in-flight edit");
                 std::fs::write(&tool_release, "").unwrap();
                 wait_for_mock_event(&log, "completed_edit").await;
             }
             if let Some(operator) = operator {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                wait_for_wake_boundary(&shared, &sid, "protected-turn").await;
                 assert!(mock_prompts(&log, "OWNERSHIP-FIX").is_empty());
                 assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
                 std::fs::write(&hold, "").unwrap();
                 operator.await.unwrap()?;
+            } else {
+                wait_for_wake_boundary(&shared, &sid, "active-turn-boundary").await;
+                assert!(!read_log(&log).iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"),
+                    "even a tool-free active turn cannot safely receive an automatic adapter steer");
+                std::fs::write(&release, "").unwrap();
             }
             tokio::time::timeout(Duration::from_secs(8), wait_for_mock_prompt(&log, "OWNERSHIP-FIX"))
-                .await.expect("ownership handoff must reach the parent instead of waiting behind unrelated router work");
+                .await.expect("the pending handoff must reach the parent at its next turn boundary");
             let events = read_log(&log);
-            assert_eq!(events.iter().any(|e| e["event"] == "cancel"), !operator_turn);
+            assert!(!events.iter().any(|e| e["event"] == "cancel" || e["event"] == "steer"));
             let run = workflow::load(&shared, &sid).unwrap().unwrap();
             if !release_audit {
                 assert!(!run.wakes[wake_id].acknowledged, "delivery is not reconciliation");

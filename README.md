@@ -118,7 +118,9 @@ operator messages are excluded from this evidence.
 
 A model parked on a managed background terminal can receive due ordinary worker
 and observation wakes through the existing terminal-preserving continuation.
-Active model turns retain urgent-only steering. Backoff, live delivery custody,
+Automatic wakes wait for a parked or ended model turn; adapter steering can
+cancel tools that start after the router's latest tool update. Explicit operator
+input and interrupting messages retain steering authority. Backoff, live delivery custody,
 dormant recovery exclusions and per-turn deduplication still apply. If the terminal
 finishes before delivery, an ordinary wake remains queued for the next boundary;
 it does not interrupt the newly active model or restart the terminal.
@@ -827,8 +829,8 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   outstanding checks remain preserved; no acceptance or completion is inferred.
 
   An ended planner worker's current `ownership_requested` or `reassignment_required` handoff
-  reaches a busy router-owned parent through urgent steering. If the adapter declines steering,
-  the router ends its own turn and delivers the durable handoff next. Operator turns, approval
+  reaches a busy router-owned parent at its next parked or ended turn boundary.
+  Automatic delivery never cancels the active model turn. Operator turns, approval
   waits, acknowledged or already-claimed deliveries and superseded attempts stay protected.
   While staging or production has a failed build, audit findings use that same urgent path.
   Repository audits may set `blocks_acknowledgement: true` for an actionable duty.
@@ -843,8 +845,8 @@ Some hosts run their own multi-agent workflow on top of the router: a parent on 
   Continuous parent activity cannot hide changed findings behind routine branch wakes.
   A changed urgent audit supersedes an unclaimed obsolete audit wake, even if that wake
   was never acknowledged. The earlier evidence stays recorded; a claimed delivery stays protected.
-  Unchanged delivered findings do not repeatedly interrupt active work. Automatic steering waits
-  for in-flight tools to finish so adapter interruption cannot masquerade as a user refusing an edit;
+  Unchanged delivered findings do not repeatedly interrupt active work. Automatic delivery uses
+  the router's parked continuation or the next turn so adapter interruption cannot masquerade as a user refusing an edit;
   direct operator input keeps its interruption authority. Recovery clears audit urgency;
   withdrawing the host's urgency clears it too; ordinary audits retain their idle cadence.
   Cancelling a parent turn ends that turn while its planner run, workers and later wakes continue.

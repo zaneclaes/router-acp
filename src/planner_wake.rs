@@ -365,10 +365,9 @@ fn finish_deferred_custody(shared: &Arc<Shared>, sid: &str, run: &planner_workfl
 /// job, a release transition or a monitor correction only at its next turn
 /// boundary (2026-10-18: three staging smoke jobs failed and two corrections
 /// queued while the parent rewrote CONTINUE; nothing reached it for 25 minutes).
-/// Steer one pending item per tick into the running turn with
-/// `_session/steering`, exactly as operator input is steered, once per item per
-/// turn. The durable wake or queued input is still delivered and acknowledged at
-/// the boundary; the steer only lets the parent act on it now. An operator turn
+/// Deliver automatic items only at a router-owned parked boundary, once per
+/// item per turn. Active adapter turns retain their items for normal delivery;
+/// `_session/steering` is reserved for explicitly interrupting input. An operator turn
 /// is never steered into (`router_turn_in_flight` is false for it), and an item
 /// a delivery already claims is left to that delivery.
 /// At most one steer per session per `STEER_INTERVAL_SECS`, and only the urgent
@@ -425,31 +424,14 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         observe_delivery(shared, sid, "tools-in-flight", None);
         return;
     }
-    // Inside the operator's `/implement` turn only the deployment obligation
-    // and idle worker capacity are steered; the fallback below cancels
-    // router-owned turns only. A parent can spend its whole run inside that one
-    // turn, so a capacity wake that waited for its boundary kept every slot
-    // empty (2026-11-06: 0 children for an hour while it polled production).
-    // A queued input is addressed to the parent, so it reaches that turn at its
-    // next tool boundary too: a monitor's correction waited over three hours
-    // inside one `/implement` turn (2026-11-10) until resent as an interrupt.
-    if command_turn
-        && !parked
-        && !interrupt
-        && !key.starts_with("capacity:")
-        && !key.starts_with("input:")
-        && !((environment_wake(&key) || key.starts_with("release:"))
-            && failed_environment(&run.observations))
-        && !(key.starts_with("audit:release:") && crate::planner_guard::urgent_audit(run))
-    {
-        observe_delivery(shared, sid, "command-turn-gate", None);
+    // Adapter steering can cancel a tool that starts after our last update.
+    // Only a router-owned parked boundary is atomic with automatic delivery.
+    // Active turns retain the durable item for their normal next delivery.
+    if !interrupt && !parked {
+        observe_delivery(shared, sid, "active-turn-boundary", None);
         return;
     }
     let release_audit = key.starts_with("audit:release:");
-    if release_audit && !parked && !crate::planner_guard::urgent_audit(run) {
-        observe_delivery(shared, sid, "audit-not-urgent", None);
-        return;
-    }
     let ownership = run
         .wakes
         .get(&key)
@@ -487,9 +469,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     let shared = shared.clone();
     let sid = sid.to_string();
     tokio::spawn(async move {
-        // Native priority steering can abort an edit and report it to the model
-        // as a user refusal. Automatic wakes wait for tool completion; direct
-        // operator input and `--interrupt` keep their interruption authority.
+        // Recheck foreground work before waking a parked model; the atomic
+        // parked channel below also protects a turn that resumes after this check.
         if !interrupt && crate::planner_watchdog::tools_in_flight(&shared, &sid) {
             crate::planner_guard::with_runtime(&shared, &sid, |rt| {
                 rt.steering = false;
@@ -500,10 +481,10 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
         let blocks = vec![ContentBlock::from(text.clone())];
         let injected = if interrupt {
             crate::planner_preempt::steer_interrupting(&shared, &sid, &blocks).await
-        } else if parked {
-            crate::planner_preempt::wake_background(&shared, &sid, &blocks, Some((&key, ordinary)))
         } else {
-            crate::planner_preempt::steer(&shared, &sid, &blocks).await
+            // If the parked wait settled after selection, do not fall through
+            // to adapter steering or cancellation of the newly active turn.
+            crate::planner_preempt::wake_background(&shared, &sid, &blocks, Some((&key, ordinary)))
         };
         crate::planner_guard::with_runtime(&shared, &sid, |rt| {
             rt.steering = false;
@@ -549,7 +530,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                     first,
                 );
             }
-        } else if !parked && (key.starts_with("input:") || ownership || release_audit)
+        } else if interrupt
             && crate::planner_guard::with_runtime(&shared, &sid, |rt| {
                 preempt_allowed(
                     &rt.turn_cancels,
@@ -560,13 +541,11 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                 )
             })
             && crate::planner_preempt::router_turn_in_flight(&shared, &sid)
-            && (interrupt || !crate::planner_watchdog::tools_in_flight(&shared, &sid))
             && planner_workflow::load(&shared, &sid)
                 .ok()
                 .flatten()
                 .filter(|current| {
                     current.status == RunStatus::Running
-                        && (!release_audit || crate::planner_guard::urgent_audit(current))
                         && current.approval_waits.is_empty()
                         && current
                             .parent_queue
@@ -583,9 +562,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
                 })
                 .is_some_and(|(pending, _)| pending == key)
         {
-            // Native adapters need not implement `_session/steering`. Use the
-            // existing cancellation/queued-delivery lifecycle instead of
-            // stranding a correction, ownership handoff or release audit behind a router-owned turn. Recheck
+            // Only explicitly interrupting input may use cancellation when
+            // the adapter declines steering. Recheck
             // after the request: withdrawal, acknowledgment, a live delivery or
             // queued operator input may have superseded this correction.
             crate::planner_guard::with_runtime(&shared, &sid, |rt| {
@@ -596,14 +574,7 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
             shared.state.lock().unwrap().log(
                 &sid,
                 &crate::state::LogEntry {
-                    kind: if release_audit {
-                        "planner_audit_preempt"
-                    } else if ownership {
-                        "planner_handoff_preempt"
-                    } else {
-                        "planner_input_preempt"
-                    }
-                    .into(),
+                    kind: "planner_input_preempt".into(),
                     role: "router".into(),
                     summary: format!(
                         "Queued parent item {key}: steering declined; router turn ended={ended}"
@@ -615,10 +586,8 @@ fn steer_pending(shared: &Arc<Shared>, sid: &str, run: &planner_workflow::Planne
     });
 }
 
-/// One queued item may cancel a router-owned turn again only after this long,
-/// and no item may cancel within the shorter window after any other did.
+/// One explicitly interrupting input may cancel again only after this long.
 const CANCEL_SAME_ITEM_SECS: u64 = 15 * 60;
-const CANCEL_ANY_ITEM_SECS: u64 = 5 * 60;
 
 /// Whether a queued item whose steering was declined may cancel the running
 /// router-owned turn now. A cancel exists to get the item delivered at the next
@@ -641,16 +610,16 @@ pub(crate) fn preempt_allowed(
     interrupt: bool,
     now: std::time::Instant,
 ) -> bool {
+    if !interrupt {
+        return false;
+    }
     let since = |at: &std::time::Instant| now.saturating_duration_since(*at).as_secs();
     if let Some((at, delivered_then)) = cancels.get(key)
         && (deliveries > *delivered_then || since(at) < CANCEL_SAME_ITEM_SECS)
     {
         return false;
     }
-    interrupt
-        || !cancels
-            .values()
-            .any(|(at, _)| since(at) < CANCEL_ANY_ITEM_SECS)
+    true
 }
 
 fn ownership_handoff(
@@ -1680,6 +1649,9 @@ mod steer_tests {
                 "sessionUpdate": "tool_call_update", "toolCallId": "proof", "status": "completed"
             }}),
         );
+        // A parked boundary, unlike an active turn, is eligible for automatic delivery.
+        let (parked, _receiver) = tokio::sync::oneshot::channel();
+        shared.background_interrupts.lock().unwrap().insert(sid.into(), parked);
         // Keep this test on the synchronous delivery decision; an outstanding
         // attempt defers retry, but the actionable correction stays visible.
         crate::planner_guard::with_runtime(&shared, sid, |rt| {
@@ -1727,7 +1699,7 @@ mod steer_tests {
         let mut cancels = std::collections::HashMap::new();
         let after = |secs: u64| start + Duration::from_secs(secs);
         let handoff = "smokescreen-deterministic-v3:ff346996";
-        assert!(preempt_allowed(&cancels, handoff, 0, false, start));
+        assert!(!preempt_allowed(&cancels, handoff, 0, false, start));
         cancels.insert(handoff.to_string(), (start, 0));
         // The loop that happened: the same undelivered item a minute later, and again.
         assert!(!preempt_allowed(&cancels, handoff, 0, false, after(60)));
@@ -1738,8 +1710,8 @@ mod steer_tests {
             false,
             after(CANCEL_SAME_ITEM_SECS - 1)
         ));
-        // Still undelivered after the window: one more cancel may help.
-        assert!(preempt_allowed(
+        // Automatic work has no cancellation authority, however long it waits.
+        assert!(!preempt_allowed(
             &cancels,
             handoff,
             0,
@@ -1749,12 +1721,12 @@ mod steer_tests {
         // A second worker's handoff may not take over the cancelling at once.
         let other = "lead-magnets-receipt401:671e23df";
         assert!(!preempt_allowed(&cancels, other, 0, false, after(60)));
-        assert!(preempt_allowed(
+        assert!(!preempt_allowed(
             &cancels,
             other,
             0,
             false,
-            after(CANCEL_ANY_ITEM_SECS)
+            after(CANCEL_SAME_ITEM_SECS)
         ));
         // An interrupting input still cancels once, then waits like any item.
         let input = "input:monitor-fix";
@@ -1778,7 +1750,8 @@ mod steer_tests {
         assert!(!preempt_allowed(&cancels, audit, 4, false, much_later));
         assert!(!preempt_allowed(&cancels, audit, 4, true, much_later));
         // Not delivered since the cancel: the window alone decides.
-        assert!(preempt_allowed(&cancels, audit, 3, false, much_later));
+        assert!(!preempt_allowed(&cancels, audit, 3, false, much_later));
+        assert!(preempt_allowed(&cancels, audit, 3, true, much_later));
     }
 
     #[test]
