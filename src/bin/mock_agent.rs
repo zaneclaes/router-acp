@@ -1214,8 +1214,11 @@ fn finish_prompt(
     responder: Responder<PromptResponse>,
 ) -> Result<(), AcpError> {
     // A prompt with a `NO_REPLY` line ends the turn normally with no text. The router may
-    // put its own context ahead of the human's message, so it need not be the first line.
-    if text.lines().any(|line| line.trim() == "NO_REPLY") {
+    // put its own context ahead of the human's message, so it need not be the first line. A
+    // wake quotes the message it is about and is answered.
+    if text.lines().any(|line| line.trim() == "NO_REPLY")
+        && !text.contains("[Router-owned child wake]")
+    {
         return responder.respond(PromptResponse::new(StopReason::EndTurn));
     }
     if let Ok(text) = std::env::var("MOCK_REPLY_TEXT") {
