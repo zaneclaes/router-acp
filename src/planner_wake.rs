@@ -728,6 +728,9 @@ fn pending_steer_at_boundary(
         .iter()
         .filter(|(id, w)| {
             !w.acknowledged
+                // Input delivery has its own authority and deduplication above.
+                // Never reinterpret a skipped input as an ordinary parked wake.
+                && !id.starts_with("input:")
                 && (parked_at.is_some_and(|now| w.retry_after <= now)
                     || id.starts_with("release:")
                     || id.starts_with("audit:release:")
@@ -2216,6 +2219,13 @@ mod steer_tests {
         assert_eq!(
             key, "observation:ci-job-failures:staging",
             "an operator prompt is never steered by the router loop"
+        );
+        wakes.insert("input:typed".into(), wake("queued operator input"));
+        assert_eq!(
+            pending_steer_at_boundary(&operator, &wakes, &HashSet::new(), &BTreeMap::new(), Some(100))
+                .unwrap().0,
+            "observation:ci-job-failures:staging",
+            "parking must not reinterpret human input as an ordinary wake"
         );
     }
 
