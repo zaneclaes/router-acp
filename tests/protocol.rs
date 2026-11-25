@@ -19614,3 +19614,75 @@ async fn a_turn_that_ended_at_a_network_error_continues_on_its_own_pin() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_worker_the_network_interrupted_continues_in_its_own_session() {
+    // The cheap worker's first prompt fails like a lost network; no provider
+    // answers. The worker is held, then prompted again in the same sub-session
+    // with a continuation, and the delegation succeeds on the same model.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let state = temp_state_file("pause-worker");
+    let log = temp_log("pause-worker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let cheap = agent_yaml(
+        "cheap",
+        &[("haiku", 1)],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_SESSION_MODES", "default,bypassPermissions"),
+            ("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable: connection failed"),
+            ("MOCK_FAIL_PROMPT_TIMES", "1"),
+        ],
+    )
+    .replace(
+        "    models:\n",
+        "    mode_map: { auto: bypassPermissions }\n    models:\n",
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 2 }}\n\
+         failover: {{ connectivity_probes: ['{address}'] }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        cheap,
+        agent_yaml("fancy", &[("opus", 3)], &[])
+    );
+    let log_for_test = log.clone();
+    run_test_shared(yaml, async move |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let turn = prompt_text(&cx, &sid, "hard integration work\nDELEGATE:fix button color");
+        tokio::pin!(turn);
+        tokio::select! {
+            early = &mut turn => panic!("the delegation ended instead of waiting: {early:?}"),
+            _ = until("offline", || shared.pause.is_offline()) => {}
+        }
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), turn)
+            .await
+            .expect("the worker continues once a provider answers")?;
+        drop(listener);
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("delegate:[delegated to cheap/haiku]"),
+            "the delegation succeeded on the same model: {text}"
+        );
+        assert!(!text.contains("failed"), "{text}");
+        let events = read_log(&log_for_test);
+        let sessions = events.iter().filter(|e| e["event"] == "session_new").count();
+        assert_eq!(sessions, 1, "the same sub-session continued: {events:?}");
+        let prompts: Vec<_> = events.iter().filter(|e| e["event"] == "prompt").collect();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert!(
+            prompts[1]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("network connection was lost")),
+            "{prompts:?}"
+        );
+        assert!(shared.headroom.lock().unwrap().model_outage("cheap", "haiku").is_none());
+        Ok(())
+    })
+    .await;
+}
