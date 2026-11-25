@@ -197,10 +197,14 @@ impl ClassifyInput {
         for block in prompt {
             match block {
                 ContentBlock::Text(t) => {
+                    let body = strip_host_notes(&t.text);
+                    if body.is_empty() {
+                        continue;
+                    }
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(&t.text);
+                    text.push_str(&body);
                 }
                 ContentBlock::ResourceLink(link) => {
                     resource_count += 1;
@@ -237,6 +241,36 @@ impl ClassifyInput {
             cwd_languages,
         }
     }
+}
+
+/// `text` without its host-note paragraphs. A host such as Kory Code appends
+/// standing instructions to a first prompt as blank-line-separated paragraphs
+/// that open with a known host tag, e.g. `[kory-code] Diagrams: ...`.
+/// They describe the session, not the task, so scoring them inflates the
+/// heuristic class and complexity of a trivial ask.
+fn strip_host_notes(text: &str) -> String {
+    text.split("\n\n")
+        .filter(|para| !is_host_note(para))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string()
+}
+
+/// Bracketed tags that mark a host's standing-instruction paragraphs. Only
+/// these are stripped: task text can open with its own tag (`[bug] ...`,
+/// `[planner-handoff] ...`) and must still be scored.
+const HOST_NOTE_TAGS: &[&str] = &["kory-code"];
+
+/// A paragraph that opens with `[<host tag>] `, a tag in [`HOST_NOTE_TAGS`].
+fn is_host_note(para: &str) -> bool {
+    let Some(rest) = para.trim_start().strip_prefix('[') else {
+        return false;
+    };
+    let Some((tag, after)) = rest.split_once(']') else {
+        return false;
+    };
+    HOST_NOTE_TAGS.contains(&tag) && after.starts_with(char::is_whitespace)
 }
 
 /// Pull filename-looking tokens (`foo/bar.rs`, `baz.py`) out of prompt text.
@@ -554,6 +588,94 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    /// The standing notes Kory Code appended to every first prompt on
+    /// 2026-11-25, copied verbatim from a live session.
+    const KORY_CODE_NOTES: &str =
+        include_str!("../tests/fixtures/kory-code-first-prompt-notes.txt");
+
+    fn classify_prompt(text: &str) -> TaskProfile {
+        let input = ClassifyInput::from_prompt(&[ContentBlock::from(text.to_string())], Vec::new());
+        classify_heuristic(&rules(), &input)
+    }
+
+    #[test]
+    fn host_notes_do_not_change_the_score_of_a_measured_prompt() {
+        // Measured on the pinned router before this fix (phase-directive
+        // sessions, static classifier): typo 0.00 -> 0.69 and BugFix ->
+        // UiTweak, rename 0.02 -> 0.69, RLS design 0.82 -> 0.99.
+        for task in [
+            "Fix the typo \"recieve\" -> \"receive\" in the docstring of hickory-ui/backend/app/services/email.py.",
+            "Rename the label \"Cancle\" to \"Cancel\" on the delete dialog button.",
+            "Design and implement cross-tenant row-level security for every hickory-ui Postgres table: \
+             a migration that enables RLS with per-brand policies, a session GUC set from the request auth \
+             context, backfill for tables missing tenant ids, and an observe-mode rollout so we can verify \
+             no endpoint breaks before enforcing. Coordinate with the data-platform canonical-resolution \
+             writers that run as a separate DB role.",
+        ] {
+            let bare = classify_prompt(task);
+            let noted = classify_prompt(&format!("{task}\n\n{KORY_CODE_NOTES}"));
+            assert_eq!(noted.class, bare.class, "{task}");
+            assert_eq!(noted.complexity, bare.complexity, "{task}");
+        }
+        assert!(
+            classify_prompt(&format!("Fix the typo in README.md.\n\n{KORY_CODE_NOTES}")).complexity
+                < 0.2
+        );
+    }
+
+    #[test]
+    fn host_note_stripping_keeps_task_paragraphs() {
+        let input = ClassifyInput::from_prompt(
+            &[
+                ContentBlock::from(
+                    "[WIP] fix the login page\n\nsee [ab] below\n\n[x] checked item\n\n\
+                     [kory-code] Diagrams: use mermaid.\n\n[router: phase=planning]\nplan it"
+                        .to_string(),
+                ),
+                ContentBlock::from("[kory-code] Mocks: one responsive page.".to_string()),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            input.text,
+            "[WIP] fix the login page\n\nsee [ab] below\n\n[x] checked item\n\n[router: phase=planning]\nplan it"
+        );
+        let notes_only = ClassifyInput::from_prompt(
+            &[ContentBlock::from(KORY_CODE_NOTES.to_string())],
+            Vec::new(),
+        );
+        assert_eq!(notes_only.text, "");
+        assert!(
+            notes_only.mentioned_paths.is_empty(),
+            "{:?}",
+            notes_only.mentioned_paths
+        );
+    }
+
+    #[test]
+    fn task_paragraphs_with_their_own_tag_are_kept_and_scored() {
+        for task in [
+            "[bug] login fails for SSO users after the tenant migration; trace the regression across the auth service and the migration",
+            "[feat] add row-level security to every tenant table with an observe-mode rollout",
+            "[backend] refactor the resolver",
+            "[planner-handoff] continue the epic: reconcile the children's results and ship the remaining work",
+        ] {
+            let input =
+                ClassifyInput::from_prompt(&[ContentBlock::from(task.to_string())], Vec::new());
+            assert_eq!(input.text, task, "a task-tagged prompt must not be emptied");
+            let noted = ClassifyInput::from_prompt(
+                &[ContentBlock::from(format!("{task}\n\n{KORY_CODE_NOTES}"))],
+                Vec::new(),
+            );
+            assert_eq!(noted.text, task);
+            assert_eq!(
+                classify_heuristic(&rules(), &noted).complexity,
+                classify_text(task).complexity,
+                "{task}"
+            );
+        }
     }
 
     #[test]
