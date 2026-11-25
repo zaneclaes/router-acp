@@ -7794,6 +7794,13 @@ async fn run_primary_turn_inner(
                 let local_failure = crate::limits::is_local_adapter_failure(
                     &crate::limits::error_text(&err).to_lowercase(),
                 );
+                // Waiting cures a provider, not a local adapter that keeps
+                // dying or a refusal a person must clear. Those keep the
+                // failover budget, so they end instead of being held forever.
+                let waiting_helps = !local_failure
+                    && !crate::limits::needs_a_person(
+                        &crate::limits::error_text(&err).to_lowercase(),
+                    );
                 // The network is gone: every model would fail the same way, so
                 // nothing is cordoned and nothing moves. The turn waits and
                 // continues on its own pin, outside the failover budget.
@@ -7834,7 +7841,11 @@ async fn run_primary_turn_inner(
                 // repeat nor loop: with pausing on it spends no attempt. Any
                 // number of seats can reach their caps under one turn.
                 let capped = shared.cfg.failover.pause
-                    && (already_unavailable || matches!(class, FailureClass::RateLimited { .. }));
+                    && (matches!(class, FailureClass::RateLimited { .. })
+                        || matches!(
+                            notice_reason,
+                            crate::notice::Reason::AccountLimit | crate::notice::Reason::Reserve
+                        ));
                 if capped {
                     iteration = iteration.min(1);
                 }
@@ -8057,8 +8068,10 @@ async fn run_primary_turn_inner(
                             .await
                             {
                                 Ok(PinOutcome::Pinned) => {
-                                    attempt = 0;
-                                    iteration = 0;
+                                    if guard.is_some() && waiting_helps {
+                                        attempt = 0;
+                                        iteration = 0;
+                                    }
                                     continue 'attempts;
                                 }
                                 Ok(PinOutcome::Cancelled) => {
@@ -8103,8 +8116,10 @@ async fn run_primary_turn_inner(
                             {
                                 Ok(PinOutcome::Pinned) => {
                                     end_hold(&shared, &router_sid, &mut guard);
-                                    attempt = 0;
-                                    iteration = 0;
+                                    if waiting_helps {
+                                        attempt = 0;
+                                        iteration = 0;
+                                    }
                                     continue 'attempts;
                                 }
                                 Ok(PinOutcome::Cancelled) => {

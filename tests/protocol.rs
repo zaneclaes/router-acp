@@ -1735,7 +1735,7 @@ async fn auth_pending_agent_becomes_routeable_after_authenticate() {
 #[tokio::test]
 async fn native_account_priorities_drain_in_order_despite_sibling_headroom() {
     let yaml = format!(
-        "state_file: {}\ndelegation: {{enabled: false}}\nrouter: auto\nagents:\n{}\n    accounts:\n      - {{name: first, priority: 0}}\n      - {{name: second, priority: 1}}\n      - {{name: third, priority: 2}}\n",
+        "state_file: {}\ndelegation: {{enabled: false}}\nfailover: {{ pause: false }}\nrouter: auto\nagents:\n{}\n    accounts:\n      - {{name: first, priority: 0}}\n      - {{name: second, priority: 1}}\n      - {{name: third, priority: 2}}\n",
         temp_state_file("account-priority").display(),
         agent_yaml("claude", &[("sonnet", 2)], &[]).trim_end()
     );
@@ -9658,7 +9658,10 @@ async fn full_reserve_disables_unknown_usage_even_for_an_explicit_pick() {
 #[tokio::test]
 async fn account_priority_drains_first_then_second_then_third_without_bypassing_cordons() {
     for availability in [true, false] {
-        let yaml = ordered_accounts_yaml("account-priority", availability);
+        let yaml = format!(
+            "failover: {{ pause: false }}\n{}",
+            ordered_accounts_yaml("account-priority", availability)
+        );
         run_test_shared(yaml, async |cx, _observed, shared| {
             init(&cx).await?;
             shared.headroom.lock().unwrap().set_polled_availability(
@@ -9962,7 +9965,7 @@ async fn all_usage_cordoned_returns_unavailable_without_prompting_any_model() {
     let state = temp_state_file("all-cordoned");
     let log = temp_log("all-cordoned");
     let yaml = format!(
-        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\nagents:\n{}{}",
+        "state_file: {}\ndelegation: {{enabled: false}}\nfailover: {{ pause: false }}\ncordon: {{enabled: false}}\nagents:\n{}{}",
         state.display(),
         agent_yaml(
             "a",
@@ -12656,11 +12659,14 @@ async fn coordinator_honors_a_pre_pin_model_chip() {
 async fn coordinator_failover_fails_visibly_instead_of_leaving_the_planning_pool() {
     // The only planning candidate is rate-limited. A normal session would
     // fail over to work/opus; a coordinator errors instead.
-    let yaml = coordinator_yaml(
-        "coord-failover",
-        PLANNING_PRECLASS,
-        "",
-        &[("MOCK_FAIL_PROMPT_MSG", "rate limit")],
+    let yaml = format!(
+        "failover: {{ pause: false }}\n{}",
+        coordinator_yaml(
+            "coord-failover",
+            PLANNING_PRECLASS,
+            "",
+            &[("MOCK_FAIL_PROMPT_MSG", "rate limit")],
+        )
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
@@ -13504,7 +13510,7 @@ async fn transport_error_as_text_recovers_the_human_pick_with_hot_context() {
         let yaml = format!(
             "state_file: {}\ndelegation: {{ enabled: false }}\n\
              auto_upgrade: {{ enabled: false }}\n\
-             failover: {{ enabled: {enabled}, respawn_cooldown_secs: 0, max_attempts: 2, \
+             failover: {{ enabled: {enabled}, pause: false, respawn_cooldown_secs: 0, max_attempts: 2, \
              outage_cordon_secs: 1 }}\n\
              llm_proxy: {{ enabled: true, listen: '127.0.0.1:0' }}\nagents:\n{}\
              \x20   llm_proxy:\n      base_url_env: OPENAI_BASE_URL\n\
