@@ -19705,10 +19705,15 @@ async fn a_worker_the_network_interrupted_continues_in_its_own_session() {
         );
         assert!(!text.contains("failed"), "{text}");
         let events = read_log(&log_for_test);
-        let sessions = events.iter().filter(|e| e["event"] == "session_new").count();
-        assert_eq!(sessions, 1, "the same sub-session continued: {events:?}");
-        let prompts: Vec<_> = events.iter().filter(|e| e["event"] == "prompt").collect();
-        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        // The first session is the router's startup probe; the delegate is the next one.
+        let opened: Vec<_> = events.iter().filter(|e| e["event"] == "session_new").collect();
+        assert_eq!(opened.len(), 2, "no second delegate session: {opened:?}");
+        let delegate = &opened[1]["sessionId"];
+        let prompts: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "prompt" && &e["sessionId"] == delegate)
+            .collect();
+        assert_eq!(prompts.len(), 2, "the same sub-session continued: {prompts:?}");
         assert!(
             prompts[1]["text"]
                 .as_str()
