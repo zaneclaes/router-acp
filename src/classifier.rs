@@ -245,7 +245,7 @@ impl ClassifyInput {
 
 /// `text` without its host-note paragraphs. A host such as Kory Code appends
 /// standing instructions to a first prompt as blank-line-separated paragraphs
-/// that open with a lowercase bracketed tag, e.g. `[kory-code] Diagrams: ...`.
+/// that open with a known host tag, e.g. `[kory-code] Diagrams: ...`.
 /// They describe the session, not the task, so scoring them inflates the
 /// heuristic class and complexity of a trivial ask.
 fn strip_host_notes(text: &str) -> String {
@@ -257,9 +257,12 @@ fn strip_host_notes(text: &str) -> String {
         .to_string()
 }
 
-/// A paragraph that opens with `[tag] ` where `tag` is lowercase kebab-case
-/// of at least three characters. Router directives (`[router: ...]`) carry a
-/// colon and never match.
+/// Bracketed tags that mark a host's standing-instruction paragraphs. Only
+/// these are stripped: task text can open with its own tag (`[bug] ...`,
+/// `[planner-handoff] ...`) and must still be scored.
+const HOST_NOTE_TAGS: &[&str] = &["kory-code"];
+
+/// A paragraph that opens with `[<host tag>] `, a tag in [`HOST_NOTE_TAGS`].
 fn is_host_note(para: &str) -> bool {
     let Some(rest) = para.trim_start().strip_prefix('[') else {
         return false;
@@ -267,12 +270,7 @@ fn is_host_note(para: &str) -> bool {
     let Some((tag, after)) = rest.split_once(']') else {
         return false;
     };
-    tag.len() >= 3
-        && tag.starts_with(|c: char| c.is_ascii_lowercase())
-        && tag
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && after.starts_with(char::is_whitespace)
+    HOST_NOTE_TAGS.contains(&tag) && after.starts_with(char::is_whitespace)
 }
 
 /// Pull filename-looking tokens (`foo/bar.rs`, `baz.py`) out of prompt text.
@@ -654,6 +652,30 @@ mod tests {
             "{:?}",
             notes_only.mentioned_paths
         );
+    }
+
+    #[test]
+    fn task_paragraphs_with_their_own_tag_are_kept_and_scored() {
+        for task in [
+            "[bug] login fails for SSO users after the tenant migration; trace the regression across the auth service and the migration",
+            "[feat] add row-level security to every tenant table with an observe-mode rollout",
+            "[backend] refactor the resolver",
+            "[planner-handoff] continue the epic: reconcile the children's results and ship the remaining work",
+        ] {
+            let input =
+                ClassifyInput::from_prompt(&[ContentBlock::from(task.to_string())], Vec::new());
+            assert_eq!(input.text, task, "a task-tagged prompt must not be emptied");
+            let noted = ClassifyInput::from_prompt(
+                &[ContentBlock::from(format!("{task}\n\n{KORY_CODE_NOTES}"))],
+                Vec::new(),
+            );
+            assert_eq!(noted.text, task);
+            assert_eq!(
+                classify_heuristic(&rules(), &noted).complexity,
+                classify_text(task).complexity,
+                "{task}"
+            );
+        }
     }
 
     #[test]
