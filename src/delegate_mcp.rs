@@ -1485,14 +1485,22 @@ fn candidate_delegate_effort(
 /// (cost shedding; an empty result is the caller's "do the subtask yourself"
 /// error), same agent first. Reaching a same- or higher-tier model, or
 /// another agent, takes `delegation.candidate_hints: exact`.
+///
+/// `planner_pools` limits a planner session's helpers to the planning and
+/// implementation pools *before* the same-agent preference: the planner
+/// strategy never ranks outside them, so preferring Sonnet and Haiku siblings
+/// of an Opus parent left it nothing to rank while a cheaper pool member on
+/// another agent was available.
 fn scope_delegate_pool(
     pool: Vec<CandidateView>,
     parent_cost: u32,
     parent_agent: &str,
+    planner_pools: Option<&crate::config::PlannerRouterConfig>,
 ) -> Vec<CandidateView> {
     let cheaper: Vec<CandidateView> = pool
         .iter()
         .filter(|v| v.cost_rank < parent_cost)
+        .filter(|v| planner_pools.is_none_or(|cfg| cfg.in_any_pool(&v.id)))
         .cloned()
         .collect();
     // A main-session model switch changes the natural worker family too:
@@ -1509,6 +1517,18 @@ fn scope_delegate_pool(
     } else {
         same_agent
     }
+}
+
+/// A planner parent with no cheaper pool member has nothing to shed cost to.
+/// This is not an outage: a parent once read the strategy's "check account
+/// limits" text here as broken worker dispatch and stopped dispatching.
+fn no_cheaper_pool_member(parent: &CandidateId) -> String {
+    format!(
+        "no helper is available for a plain delegate_task: no model cheaper than `{parent}` is \
+         routeable inside routers.planner's planning and implementation pools. Do this subtask in \
+         your own session. This is not evidence of an account limit or a dispatch outage: planner \
+         work (delegate_task with work_id) is routed separately over the implementation pool."
+    )
 }
 
 /// Synthesize a delegate turn's cost from configured `pricing` when the
@@ -1761,11 +1781,17 @@ async fn run_delegate_task_inner(
         _ if args.planner_identity.is_some() => {
             shared.eligible_views(&RequiredCaps::default(), profile.class)
         }
-        _ => scope_delegate_pool(
-            shared.eligible_views(&RequiredCaps::default(), profile.class),
-            parent_cost,
-            &pin.candidate.agent,
-        ),
+        _ => {
+            let eligible = shared.eligible_views(&RequiredCaps::default(), profile.class);
+            let planner_pools =
+                (strategy == StrategyKind::Planner).then_some(&shared.cfg.routers.planner);
+            let scoped =
+                scope_delegate_pool(eligible, parent_cost, &pin.candidate.agent, planner_pools);
+            if scoped.is_empty() && planner_pools.is_some() {
+                return Err(no_cheaper_pool_member(&pin.candidate));
+            }
+            scoped
+        }
     };
     if args.planner_identity.is_some() {
         let run =
@@ -4101,11 +4127,51 @@ mod tests {
 
     #[test]
     fn ordinary_delegation_is_strictly_cheaper() {
-        let scoped = scope_delegate_pool(pool3(), 5, "claude");
+        let scoped = scope_delegate_pool(pool3(), 5, "claude", None);
         assert!(scoped.iter().all(|v| v.cost_rank < 5));
         assert_eq!(scoped.len(), 2);
         // Parent already cheapest → empty pool → the caller's error path.
-        assert!(scope_delegate_pool(pool3(), 1, "claude").is_empty());
+        assert!(scope_delegate_pool(pool3(), 1, "claude", None).is_empty());
+    }
+
+    fn planner_pools() -> crate::config::PlannerRouterConfig {
+        crate::config::PlannerRouterConfig {
+            planning_candidates: vec!["*astra*".into(), "*opus*".into()],
+            implementation_candidates: vec!["*opus*".into(), "*sol*".into(), "*grok*".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_planner_parents_helper_never_leaves_the_planner_pools() {
+        // Opus parent; only Haiku and Sonnet are cheaper and neither is in a
+        // pool. Without the pools they are scoped in and the strategy then
+        // refused every one of them as "no planning candidate is routeable".
+        let scoped = scope_delegate_pool(pool3(), 4, "claude", None);
+        assert_eq!(scoped.len(), 2);
+        assert!(scope_delegate_pool(pool3(), 4, "claude", Some(&planner_pools())).is_empty());
+        let text = no_cheaper_pool_member(&CandidateId::new("claude", "opus"));
+        assert!(text.contains("claude/opus"), "{text}");
+        assert!(text.contains("not evidence of an account limit"), "{text}");
+        assert!(text.contains("work_id"), "{text}");
+    }
+
+    #[test]
+    fn a_planner_parents_helper_reaches_a_cheaper_pool_member_past_its_siblings() {
+        let mut pool = pool3();
+        let mut grok = pool3().remove(0);
+        grok.id = CandidateId::new("grok", "grok-4.7");
+        grok.cost_rank = 3;
+        pool.push(grok);
+        // The same-agent preference ignores it without the pools...
+        let unscoped = scope_delegate_pool(pool.clone(), 4, "claude", None);
+        assert!(unscoped.iter().all(|view| view.id.agent == "claude"));
+        // ...and the planner strategy can rank what is scoped with them.
+        let scoped = scope_delegate_pool(pool.clone(), 4, "claude", Some(&planner_pools()));
+        let ids: Vec<String> = scoped.iter().map(|view| view.id.to_string()).collect();
+        assert_eq!(ids, vec!["grok/grok-4.7"]);
+        // A pool member that is not cheaper stays out.
+        assert!(scope_delegate_pool(pool, 3, "claude", Some(&planner_pools())).is_empty());
     }
 
     #[test]

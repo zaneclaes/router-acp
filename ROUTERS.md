@@ -802,7 +802,9 @@ credentials, and incomplete coverage fails closed.
 - **Delegation reuses the session's router** over a pool restricted to
   candidates strictly cheaper than the pinned one (a static session
   delegates with `auto` semantics, since "the configured candidate" is never
-  in the cheaper pool). With `delegation.inject_prompt: true`, an ordinary
+  in the cheaper pool). In a planner session a plain helper must also be in the
+  planning or implementation pool; when none is cheaper the call says so and the
+  parent does the subtask itself. With `delegation.inject_prompt: true`, an ordinary
   downstream session gets one scoped instruction only when that cheaper-worker
   tool was actually attached; model switches re-establish it. With
   `delegation.candidate_hints: exact` a parent may instead name any eligible

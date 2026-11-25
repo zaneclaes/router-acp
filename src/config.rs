@@ -1531,6 +1531,17 @@ pub struct PlannerRouterConfig {
     pub stuck_turn_cancel_secs: u64,
 }
 
+impl PlannerRouterConfig {
+    /// Whether the planner strategy could ever rank this candidate.
+    pub fn in_any_pool(&self, candidate: &CandidateId) -> bool {
+        let key = candidate.to_string();
+        self.planning_candidates
+            .iter()
+            .chain(&self.implementation_candidates)
+            .any(|pattern| crate::candidate::glob_match(pattern, &key))
+    }
+}
+
 impl Default for PlannerRouterConfig {
     fn default() -> Self {
         Self {
