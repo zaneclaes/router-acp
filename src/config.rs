@@ -785,6 +785,15 @@ pub struct FailoverConfig {
     /// within this many seconds. A longer wait fails the turn as before.
     #[serde(default = "default_max_wait_secs")]
     pub max_wait_secs: u64,
+    /// Hold a turn open while the network is gone or no candidate is
+    /// routeable, and continue it when that ends (`crate::pause`). Off: the
+    /// turn fails as soon as `max_wait_secs` cannot cover the wait.
+    #[serde(default = "default_true")]
+    pub pause: bool,
+    /// `host:port` addresses that decide whether the network is gone: it is
+    /// when none accepts a connection. Empty uses the configured providers.
+    #[serde(default)]
+    pub connectivity_probes: Vec<String>,
 }
 
 fn default_outage_cordon_secs() -> u64 {
@@ -817,6 +826,8 @@ impl Default for FailoverConfig {
             capacity_cordon_secs: default_capacity_cordon_secs(),
             outage_cordon_secs: default_outage_cordon_secs(),
             max_wait_secs: default_max_wait_secs(),
+            pause: true,
+            connectivity_probes: Vec::new(),
         }
     }
 }

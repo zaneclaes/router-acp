@@ -304,6 +304,28 @@ impl HeadroomTracker {
         );
     }
 
+    /// The network was gone for `lost_for`: outage cordons and quarantine
+    /// strikes recorded in that time describe the network, not the models.
+    /// `outage` is how long an outage cordon lasts, which dates each one.
+    pub fn forgive_outages(&mut self, lost_for: Duration, outage: Duration) {
+        let cutoff = SystemTime::now()
+            .checked_sub(lost_for)
+            .and_then(|at| at.checked_add(outage));
+        if let Some(cutoff) = cutoff {
+            self.model_outages.retain(|_, c| c.resets_at < cutoff);
+        }
+        let since = Instant::now().checked_sub(lost_for);
+        for failures in self.candidates.values_mut() {
+            let before = failures.pre_prompt_failures.len();
+            failures
+                .pre_prompt_failures
+                .retain(|at| since.is_some_and(|since| *at < since));
+            if failures.pre_prompt_failures.len() != before {
+                failures.quarantined_until = None;
+            }
+        }
+    }
+
     /// The active provider outage for `model` under `lineage`, if any.
     pub fn model_outage(&self, lineage: &str, model: &str) -> Option<&UsageCordon> {
         self.model_outages
