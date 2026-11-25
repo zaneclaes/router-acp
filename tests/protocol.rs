@@ -6399,7 +6399,7 @@ async fn invalid_directive_fails_loudly_and_post_pin_is_ignored() {
         // Valid prompt pins the session…
         prompt_text(&cx, &sid, "hello").await?;
         // …and a later directive is stripped + ignored with a notice.
-        let resp = prompt_text(&cx, &sid, "[router: candidate=mock/m1]\nfollow-up").await?;
+        let resp = prompt_text(&cx, &sid, "[router: prefer=mock/m1]\nfollow-up").await?;
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         let text = agent_text(&observed, &sid);
         assert!(
@@ -6407,6 +6407,40 @@ async fn invalid_directive_fails_loudly_and_post_pin_is_ignored() {
             "got: {text}"
         );
         assert!(text.contains("echo:m1:follow-up"), "got: {text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn restating_the_pinned_candidate_is_silent_and_another_model_keeps_the_note() {
+    let state = temp_state_file("directive-restate");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml("cheap", &[("haiku", 1)], &[]),
+        agent_yaml("fancy", &[("opus", 3)], &[])
+    );
+    run_test(yaml, async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "[router: candidate=cheap/haiku]\nhello").await?;
+        // A host restating the pin on every prompt is a no-op, not a conflict.
+        prompt_text(&cx, &sid, "[router: candidate=cheap/haiku]\nfollow-up").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("echo:haiku:follow-up"), "pin kept: {text}");
+        assert!(
+            !text.contains("routing directive ignored"),
+            "a restated pin must stay silent: {text}"
+        );
+        // A different model still cannot change the pin, and says so.
+        prompt_text(&cx, &sid, "[router: candidate=fancy/opus]\nanother").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("routing directive ignored (session already pinned"),
+            "a different model keeps the note: {text}"
+        );
+        assert!(text.contains("echo:haiku:another"), "pin unchanged: {text}");
         Ok(())
     })
     .await;

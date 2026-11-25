@@ -3987,6 +3987,34 @@ pub struct PromptDirectives {
     pub skill: Option<String>,
 }
 
+/// True when the only pre-pin directive is a `candidate=` that names the
+/// model the session is already pinned to (see `names_pinned_model`). Hosts
+/// restate the pin so a fresh conversation pins to it; on a live pin that is
+/// a no-op, not a conflict, so the "routing directive ignored" note stays
+/// silent. The pin is unchanged either way.
+fn restates_pin(shared: &Shared, router_sid: &str, directives: &PromptDirectives) -> bool {
+    let only_candidate = directives.strategy.is_none()
+        && directives.prefer.is_empty()
+        && directives.exclude.is_empty()
+        && directives.label.is_none();
+    let Some(candidate) = directives.candidate.as_ref().filter(|_| only_candidate) else {
+        return false;
+    };
+    shared
+        .with_session(router_sid, |s| {
+            s.pin
+                .as_ref()
+                .is_some_and(|pin| names_pinned_model(&pin.candidate, candidate))
+        })
+        .unwrap_or(false)
+}
+
+/// Same model and same agent, ignoring the `@account` seat on both sides.
+fn names_pinned_model(pin: &CandidateId, candidate: &CandidateId) -> bool {
+    let base = |agent: &str| agent.split('@').next().unwrap_or(agent).to_string();
+    pin.model == candidate.model && base(&pin.agent) == base(&candidate.agent)
+}
+
 /// Parse (and strip) every active routing directive in the prompt. Several tags
 /// (`[router: candidate=…] [router: effort=…]`) merge as if they were one
 /// comma-separated tag: a later key overrides an earlier one, and `exclude`
@@ -11667,7 +11695,7 @@ fn prepare_parent_prompt_inner(
                     ?directives,
                     "routing directives applied from prompt"
                 );
-            } else if has_pre_pin_directives {
+            } else if has_pre_pin_directives && !restates_pin(&shared, &router_sid, &directives) {
                 notify_user(
                     &shared,
                     &router_sid,
@@ -13001,6 +13029,26 @@ mod prompt_framing_tests {
 #[cfg(test)]
 mod directive_tests {
     use super::*;
+
+    #[test]
+    fn a_candidate_restating_the_pinned_model_ignores_the_account_seat() {
+        let pin = CandidateId::new("claude@03b9b881", "claude-fable-5-2[1m]");
+        let same_model_other_seat = CandidateId::new("claude@7c1d0e22", "claude-fable-5-2[1m]");
+        assert!(names_pinned_model(&pin, &same_model_other_seat));
+        assert!(names_pinned_model(
+            &pin,
+            &CandidateId::new("claude", "claude-fable-5-2[1m]")
+        ));
+        assert!(!names_pinned_model(
+            &pin,
+            &CandidateId::new("claude", "claude-fable-5-2")
+        ));
+        assert!(!names_pinned_model(&pin, &CandidateId::new("claude", "opus[1m]")));
+        assert!(!names_pinned_model(
+            &pin,
+            &CandidateId::new("codex", "claude-fable-5-2[1m]")
+        ));
+    }
 
     fn text(blocks: &[ContentBlock]) -> String {
         blocks
