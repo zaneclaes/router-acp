@@ -1500,7 +1500,7 @@ The adapter accepted `session/set_config_option` but still reports another model
 The agent is configured with `model_selection: config-option` but the adapter exposes no model selector. Switch to `spawn-config` with a per-model process template, or declare exactly the adapter's default model.
 
 **Notice: "routing directive ignored (session already pinned)".**
-`router.strategy`/`router.candidate`/`prefer`/`exclude` only shape the *initial* routing decision, so they're ignored after the first prompt. To change models mid-session use `[router: switch=agent/model]`, which summarizes the work and re-pins onto a fresh downstream — or open a new session.
+`router.strategy`/`router.candidate`/`prefer`/`exclude` only shape the *initial* routing decision, so they're ignored after the first prompt. A `candidate=` that names the model the session is already pinned to (same agent and model, any account seat) is a no-op and prints nothing. To change models mid-session use `[router: switch=agent/model]`, which summarizes the work and re-pins onto a fresh downstream — or open a new session.
 
 **Candidate keeps being skipped.**
 It may be quarantined after repeated pre-prompt failures (see `headroom.quarantine_*`), or its agent's headroom hit 0 after a rate-limit error; both recover with time. Check the disclosure line/`_meta.router_acp` for the note explaining tier or fallback decisions.
