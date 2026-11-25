@@ -3356,7 +3356,8 @@ async fn operator_turn_planner_tool_permissions_are_allowed_without_relay() {
 fn planner_helper_yaml(name: &str, grok_cost: u32) -> String {
     format!(
         "state_file: {}\ndelegation: {{ enabled: true }}\nauto_upgrade: {{ enabled: false }}\n\
-         router: planner\nrouters:\n  planner:\n    planning_candidates: [\"*opus*\"]\n    \
+         router: planner\nrouters:\n  planner:\n    floor_complexity: 0.0\n    \
+         planning_candidates: [\"*opus*\"]\n    \
          implementation_candidates: [\"*opus*\", \"*grok*\"]\nagents:\n{}{}",
         temp_state_file(name).display(),
         agent_yaml("plan", &[("sonnet", 1), ("opus", 4)], &[]),
@@ -3387,7 +3388,7 @@ async fn a_planner_helper_without_a_cheaper_pool_member_is_not_an_outage() {
         let sid = new_session(&cx).await?.session_id.0.to_string();
         prompt_text(&cx, &sid, "hard integration work\nDELEGATE:read a file").await?;
         let text = agent_text(&observed, &sid);
-        assert!(text.contains("no helper is available"), "{text}");
+        assert!(text.contains("no model cheaper than `plan/opus`"), "{text}");
         assert!(!text.contains("check account limits"), "{text}");
         Ok(())
     })
