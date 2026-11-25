@@ -7913,6 +7913,15 @@ async fn historical_release_membership_allows_only_exact_ended_custody_reconcili
         })
         .unwrap();
     }
+    // A failed round that another round replaced is history, so it stays in
+    // place for the reconciliation below.
+    planner_workflow::mutate(&f.shared, SID, |run| {
+        let mut replaced = release(Stage::Failed, &released);
+        replaced.superseded_by = Some("abandoned".into());
+        run.releases.insert("replaced".into(), replaced);
+        Ok(())
+    })
+    .unwrap();
 
     let mut changed_spec = spec.clone();
     changed_spec.scope.push_str("; additional work");
@@ -8082,6 +8091,88 @@ async fn obsolete_worker_retirement_is_verified_terminal_and_not_integration() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn only_an_active_release_membership_blocks_retirement() {
+    use router_acp::planner_release::{Checkpoint, Release, Stage};
+
+    let temp = tempfile::tempdir().unwrap();
+    let called = temp.path().join("called");
+    let f = fixture(|cfg| {
+        cfg.routers.planner.integrate_check = Some(PlannerHostConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "cat > '{}'; echo '{{\"verified_action\":\"retire\"}}'",
+                    called.display()
+                ),
+            ],
+            timeout_ms: 5_000,
+        });
+    });
+    let revision = "a".repeat(40);
+    let cases = [
+        ("selected", Stage::Selected, None, false),
+        ("deployed", Stage::StagingPassed, None, false),
+        ("failed", Stage::Failed, None, false),
+        ("replaced", Stage::Failed, Some("next"), true),
+        ("abandoned", Stage::Abandoned, None, true),
+        ("disposed", Stage::Disposed, None, true),
+    ];
+    for (name, stage, superseded_by, retires) in cases {
+        let _ = std::fs::remove_file(&called);
+        admit(&f.shared, work(name));
+        let release_id = format!("round-{name}");
+        planner_workflow::mutate(&f.shared, SID, |run| {
+            let works = BTreeMap::from([(name.to_string(), revision.clone())]);
+            run.releases.insert(
+                release_id.clone(),
+                Release {
+                    candidate: revision.clone(),
+                    works: works.clone(),
+                    checkpoints: vec![Checkpoint {
+                        stage,
+                        revision: revision.clone(),
+                        works,
+                        replaces: None,
+                        evidence: BTreeMap::from([("fixture".into(), "receipt.md".into())]),
+                    }],
+                    superseded_by: superseded_by.map(Into::into),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let before = planner_workflow::load(&f.shared, SID)
+            .unwrap()
+            .unwrap()
+            .releases;
+        let result = planner_workflow::operate(
+            &f.shared,
+            SID,
+            None,
+            Operation::Retire {
+                key: format!("retire-{name}"),
+                work_id: name.into(),
+                reason: "another assignment owns this scope".into(),
+                evidence: BTreeMap::from([("parent-takeover".into(), "evidence.md".into())]),
+            },
+        )
+        .await;
+        // Repository policy still decides every retirement the router allows.
+        assert_eq!(called.exists(), retires, "{name}: host check");
+        let run = planner_workflow::load(&f.shared, SID).unwrap().unwrap();
+        if retires {
+            result.unwrap();
+            assert_eq!(run.works[name].status, WorkStatus::Retired, "{name}");
+        } else {
+            assert!(result.unwrap_err().contains(&release_id), "{name}");
+            assert_eq!(run.works[name].status, WorkStatus::Admitted, "{name}");
+        }
+        assert_eq!(before, run.releases, "{name}: release receipts");
+    }
 }
 
 #[tokio::test]

@@ -241,6 +241,15 @@ pub struct WorkSpec {
     pub completion_contract_version: Option<u32>,
 }
 
+/// The release that still holds this work, if any. Disposed, abandoned and
+/// replaced rounds are history: they keep their receipts but hold nothing.
+fn active_membership<'a>(run: &'a PlannerRun, work_id: &str) -> Option<&'a str> {
+    run.releases
+        .iter()
+        .find(|(_, release)| release.active() && release.works.contains_key(work_id))
+        .map(|(id, _)| id.as_str())
+}
+
 fn validate_work_spec(work: &WorkSpec) -> Result<(), String> {
     if work
         .completion_contract_version
@@ -2002,16 +2011,22 @@ async fn operate_once(
                 return Err("retire requires a configured host to verify obsolete scope and parent takeover".into());
             }
             let work = run.works.get(&work_id).ok_or("unknown work identity")?;
-            if reason.trim().is_empty()
-                || evidence.is_empty()
-                || work.attempt.as_ref().is_some_and(|a| !a.ended)
-                || matches!(work.status, WorkStatus::Integrated | WorkStatus::Finished)
-                || run
-                    .releases
-                    .values()
-                    .any(|release| release.works.contains_key(&work_id))
-            {
-                return Err("retire requires an ended obsolete assignment, parent takeover evidence and no frozen release membership".into());
+            if reason.trim().is_empty() || evidence.is_empty() {
+                return Err("retire requires a reason and parent takeover evidence".into());
+            }
+            if work.attempt.as_ref().is_some_and(|a| !a.ended) {
+                return Err("retire requires the obsolete assignment's attempt to end first".into());
+            }
+            if matches!(work.status, WorkStatus::Integrated | WorkStatus::Finished) {
+                return Err(format!(
+                    "retire cannot dispose of {:?} work; its completion is already recorded",
+                    work.status
+                ));
+            }
+            if let Some(release) = active_membership(&run, &work_id) {
+                return Err(format!(
+                    "retire requires no active release membership; release {release} still carries {work_id}"
+                ));
             }
             let mut check = value.clone();
             check["assignment"] = serde_json::to_value(work).map_err(|e| e.to_string())?;
@@ -2103,7 +2118,7 @@ async fn operate_once(
                     release
                         .works
                         .get(&work.work_id)
-                        .map(|revision| (release.stage(), revision))
+                        .map(|revision| (release.active(), revision))
                 })
                 .collect();
             let historical_custody = !terminal_correction && !memberships.is_empty();
@@ -2114,13 +2129,7 @@ async fn operate_once(
                         | WorkStatus::Integrated
                         | WorkStatus::Watching
                         | WorkStatus::Retired
-                ) || memberships.iter().any(|(stage, _)| {
-                    !matches!(
-                        stage,
-                        crate::planner_release::Stage::Disposed
-                            | crate::planner_release::Stage::Abandoned
-                    )
-                }))
+                ) || memberships.iter().any(|(active, _)| *active))
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
             }
