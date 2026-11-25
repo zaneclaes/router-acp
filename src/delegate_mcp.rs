@@ -4186,7 +4186,7 @@ mod tests {
         codex[2].cost_rank = 5;
         pool.extend(codex);
 
-        let scoped = scope_delegate_pool(pool, 5, "codex");
+        let scoped = scope_delegate_pool(pool, 5, "codex", None);
         let ids: Vec<String> = scoped.into_iter().map(|view| view.id.to_string()).collect();
         assert_eq!(ids, vec!["codex/luna", "codex/terra"]);
     }
