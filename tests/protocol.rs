@@ -3353,6 +3353,48 @@ async fn operator_turn_planner_tool_permissions_are_allowed_without_relay() {
     .await;
 }
 
+fn planner_helper_yaml(name: &str, grok_cost: u32) -> String {
+    format!(
+        "state_file: {}\ndelegation: {{ enabled: true }}\nauto_upgrade: {{ enabled: false }}\n\
+         router: planner\nrouters:\n  planner:\n    floor_complexity: 0.0\n    \
+         planning_candidates: [\"*opus*\"]\n    \
+         implementation_candidates: [\"*opus*\", \"*grok*\"]\nagents:\n{}{}",
+        temp_state_file(name).display(),
+        agent_yaml("plan", &[("sonnet", 1), ("opus", 4)], &[]),
+        agent_yaml("work", &[("grok-4.7", grok_cost)], &[]),
+    )
+}
+
+#[tokio::test]
+async fn a_planner_helper_reaches_a_cheaper_pool_member_past_its_siblings() {
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test(planner_helper_yaml("planner-helper", 2), async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hard integration work\nDELEGATE:read a file").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("delegated to work/grok-4.7"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_planner_helper_without_a_cheaper_pool_member_is_not_an_outage() {
+    // Opus parent; Sonnet is cheaper but in no pool, and grok costs the same.
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    run_test(planner_helper_yaml("planner-no-helper", 4), async |cx, observed| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "hard integration work\nDELEGATE:read a file").await?;
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("no model cheaper than `plan/opus`"), "{text}");
+        assert!(!text.contains("check account limits"), "{text}");
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn delegate_task_routes_to_lower_cost_candidate() {
     let state = temp_state_file("delegate");

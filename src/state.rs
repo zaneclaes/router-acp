@@ -19,8 +19,9 @@
 //! WAL. Writes never prune inline.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
@@ -214,7 +215,11 @@ pub struct StateStore {
     legacy: StateFile,
     /// Shards this process has opened, by tag. Opened lazily, kept open.
     shards: RefCell<BTreeMap<ShardTag, StateFile>>,
+    /// Parsed planner runs, newest use first, valid only at their own revision.
+    planner_runs: RefCell<VecDeque<(String, Arc<crate::planner_workflow::PlannerRun>)>>,
 }
+
+const CACHED_PLANNER_RUNS: usize = 4;
 
 impl std::fmt::Debug for StateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -280,6 +285,7 @@ impl StateStore {
             readonly,
             legacy,
             shards: RefCell::default(),
+            planner_runs: RefCell::default(),
         }
     }
 
@@ -410,6 +416,7 @@ impl StateStore {
     pub fn delegate_children(
         &self,
         parent_session_ids: &[String],
+        logs: &DelegateLogs,
     ) -> rusqlite::Result<Vec<DelegateSession>> {
         let mut by_home: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for id in parent_session_ids {
@@ -421,7 +428,9 @@ impl StateStore {
         }
         let mut children = Vec::new();
         for ids in by_home.values() {
-            if let Some(found) = self.with_file(&ids[0], |file| file.delegate_children(ids))? {
+            if let Some(found) =
+                self.with_file(&ids[0], |file| file.delegate_children(ids, logs))?
+            {
                 children.extend(found?);
             }
         }
@@ -637,6 +646,9 @@ impl StateStore {
     }
 
     pub fn remove(&self, router_session_id: &str) -> Option<PersistedSession> {
+        self.planner_runs
+            .borrow_mut()
+            .retain(|(id, _)| id != router_session_id);
         self.with_file(router_session_id, |file| file.remove(router_session_id))
             .ok()
             .flatten()
@@ -649,6 +661,37 @@ impl StateStore {
         self.with_file(sid, |file| file.planner_run(sid))
             .map_err(|error| error.to_string())?
             .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    /// The stored revision of `sid`'s planner run, without reading its document.
+    pub fn planner_revision(&self, sid: &str) -> Result<Option<u64>, String> {
+        self.with_file(sid, |file| file.planner_revision(sid))
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Err(missing_shard(sid).to_string()))
+    }
+
+    pub(crate) fn cached_planner_run(
+        &self,
+        sid: &str,
+        revision: u64,
+    ) -> Option<Arc<crate::planner_workflow::PlannerRun>> {
+        self.planner_runs
+            .borrow()
+            .iter()
+            .find(|(id, run)| id == sid && run.revision == revision)
+            .map(|(_, run)| run.clone())
+    }
+
+    /// Keep the parsed run of the few sessions in use.
+    pub(crate) fn cache_planner_run(
+        &self,
+        sid: &str,
+        run: Arc<crate::planner_workflow::PlannerRun>,
+    ) {
+        let mut runs = self.planner_runs.borrow_mut();
+        runs.retain(|(id, _)| id != sid);
+        runs.push_front((sid.to_string(), run));
+        runs.truncate(CACHED_PLANNER_RUNS);
     }
 
     /// One `send-input` document of a session without a planner run
@@ -724,7 +767,7 @@ impl StateStore {
         &self,
         sid: &str,
         expected: u64,
-        document: &serde_json::Value,
+        document: &impl serde::Serialize,
         events: &[String],
     ) -> Result<u64, String> {
         let revision = expected + 1;
@@ -1145,6 +1188,18 @@ pub struct SessionRecord {
     pub router_session_id: String,
     #[serde(flatten)]
     pub session: PersistedSession,
+}
+
+/// How much of each delegate's log a `delegates` read returns. The default is
+/// every row of every delegate.
+#[derive(Debug, Clone, Default)]
+pub struct DelegateLogs {
+    /// The newest rows per delegate besides its task, or all of them.
+    pub recent: Option<usize>,
+    /// Delegates whose log is returned whole despite `recent`.
+    pub whole: Vec<String>,
+    /// Leave out sessions a later one replaced.
+    pub live_only: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1774,6 +1829,18 @@ impl StateFile {
             .map_err(|error| error.to_string())
     }
 
+    fn planner_revision(&self, sid: &str) -> Result<Option<u64>, String> {
+        self.conn
+            .query_row(
+                "SELECT revision FROM planner_runs WHERE session_id = ?1",
+                [sid],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|revision| revision.map(|revision| revision as u64))
+            .map_err(|error| error.to_string())
+    }
+
     fn planner_run(&self, sid: &str) -> Result<Option<(u64, serde_json::Value)>, String> {
         self.conn
             .query_row(
@@ -1806,7 +1873,7 @@ impl StateFile {
         &self,
         sid: &str,
         expected: u64,
-        document: &serde_json::Value,
+        document: &impl serde::Serialize,
         save_id: &str,
     ) -> Result<u64, String> {
         let document = serde_json::to_string(document).map_err(|error| error.to_string())?;
@@ -3083,9 +3150,108 @@ impl StateFile {
 
 /// Per-file halves of the `StateStore` reads that fan out across files.
 impl StateFile {
+    /// The log rows a delegate panel carries, oldest first.
+    fn delegate_log(
+        &self,
+        child: &str,
+        limit: Option<usize>,
+    ) -> rusqlite::Result<Vec<DelegateLog>> {
+        const COLUMNS: &str = "ts, kind, role, summary,
+                    CASE WHEN kind IN ('delegate_task', 'delegate_followup', 'agent_response')
+                         THEN detail END AS detail";
+        // A bounded log shows activity; a task's detail alone is its whole prompt.
+        const BRIEF: &str = "ts, kind, role, summary, NULL AS detail";
+        let row = |row: &rusqlite::Row| {
+            let detail: Option<String> = row.get("detail")?;
+            Ok(DelegateLog {
+                ts: iso_timestamp(row.get("ts")?),
+                kind: row.get("kind")?,
+                role: row.get("role")?,
+                summary: row.get("summary")?,
+                detail: detail.and_then(|detail| serde_json::from_str(&detail).ok()),
+            })
+        };
+        let Some(limit) = limit else {
+            return self
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT {COLUMNS} FROM session_log WHERE router_session_id = ?1 ORDER BY id"
+                ))?
+                .query_map([child], row)?
+                .collect();
+        };
+        // The task names the planner work. Streaming bookkeeping rows say nothing about what a
+        // delegate is doing and outnumber every other kind, so they are not recent activity.
+        let task: Option<(i64, DelegateLog)> = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT id, {BRIEF} FROM session_log \
+                 WHERE router_session_id = ?1 AND kind = 'delegate_task' ORDER BY id LIMIT 1"
+            ))?
+            .query_row([child], |found| Ok((found.get("id")?, row(found)?)))
+            .optional()?;
+        let mut recent = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT id, {BRIEF} FROM session_log WHERE router_session_id = ?1 \
+                 AND kind NOT IN ('session_update', 'llm_request', 'llm_response') \
+                 ORDER BY id DESC LIMIT ?2"
+            ))?
+            .query_map(params![child, limit as i64], |found| {
+                Ok((found.get::<_, i64>("id")?, row(found)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        recent.reverse();
+        let older_task =
+            task.filter(|(id, _)| recent.first().is_none_or(|(oldest, _)| id < oldest));
+        Ok(older_task
+            .into_iter()
+            .chain(recent)
+            .map(|(_, log)| log)
+            .collect())
+    }
+
+    /// The planner work a delegate was started for, from its task row.
+    fn delegate_work_id(&self, child: &str) -> rusqlite::Result<Option<String>> {
+        let detail: Option<Option<String>> = self
+            .conn
+            .prepare_cached(
+                "SELECT detail FROM session_log \
+                 WHERE router_session_id = ?1 AND kind = 'delegate_task' ORDER BY id LIMIT 1",
+            )?
+            .query_row([child], |row| row.get(0))
+            .optional()?;
+        Ok(detail
+            .flatten()
+            .and_then(|detail| serde_json::from_str::<serde_json::Value>(&detail).ok())
+            .and_then(|detail| Some(detail.get("work_id")?.as_str()?.to_string())))
+    }
+
+    /// Each planner work's `(attempt open, status)` for `parent`, without parsing its run.
+    fn planner_work_states(
+        &self,
+        parent: &str,
+    ) -> rusqlite::Result<std::collections::HashMap<String, (bool, Option<String>)>> {
+        self.conn
+            .prepare_cached(
+                "SELECT work.key, json_extract(work.value, '$.attempt.ended'),
+                        json_extract(work.value, '$.status')
+                 FROM planner_runs, json_each(planner_runs.document, '$.works') AS work
+                 WHERE planner_runs.session_id = ?1",
+            )?
+            .query_map([parent], |row| {
+                Ok((
+                    row.get(0)?,
+                    (row.get::<_, Option<bool>>(1)? == Some(false), row.get(2)?),
+                ))
+            })?
+            .collect()
+    }
+
     fn delegate_children(
         &self,
         parent_session_ids: &[String],
+        logs: &DelegateLogs,
     ) -> rusqlite::Result<Vec<DelegateSession>> {
         let mut parent_ids = parent_session_ids.to_vec();
         parent_ids.sort();
@@ -3113,94 +3279,59 @@ impl StateFile {
             return Ok(Vec::new());
         }
 
-        let child_ids: Vec<_> = children
-            .iter()
-            .map(|child| child.router_session_id.clone())
-            .collect();
-        let placeholders = std::iter::repeat_n("?", child_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT router_session_id, ts, kind, role, summary,
-                    CASE WHEN kind IN ('delegate_task', 'delegate_followup', 'agent_response')
-                         THEN detail END AS detail
-             FROM session_log WHERE router_session_id IN ({placeholders}) ORDER BY router_session_id, id"
-        );
-        let mut logs = self.conn.prepare(&sql)?;
-        let mut logs_by_child: std::collections::HashMap<String, Vec<DelegateLog>> =
-            std::collections::HashMap::new();
-        for row in logs.query_map(rusqlite::params_from_iter(child_ids.iter()), |row| {
-            let detail: Option<String> = row.get("detail")?;
-            Ok((
-                row.get::<_, String>("router_session_id")?,
-                DelegateLog {
-                    ts: iso_timestamp(row.get("ts")?),
-                    kind: row.get("kind")?,
-                    role: row.get("role")?,
-                    summary: row.get("summary")?,
-                    detail: detail.and_then(|detail| serde_json::from_str(&detail).ok()),
-                },
-            ))
-        })? {
-            let (session_id, log) = row?;
-            logs_by_child.entry(session_id).or_default().push(log);
-        }
-
         // A planner worker's lifecycle is the durable work record, not a guess
         // from log recency: its latest session runs while the attempt is open,
         // then reads as the work's status; earlier sessions have ended.
-        let work_of = |log: &[DelegateLog]| {
-            log.iter()
-                .find(|entry| entry.kind == "delegate_task")
-                .and_then(|entry| entry.detail.as_ref()?.get("work_id")?.as_str())
-                .map(str::to_string)
-        };
+        let mut work_ids = std::collections::HashMap::new();
         let mut latest_for_work = std::collections::HashMap::new();
         for child in &children {
-            if let Some(work_id) = logs_by_child
-                .get(&child.router_session_id)
-                .and_then(|log| work_of(log))
-            {
+            if let Some(work_id) = self.delegate_work_id(&child.router_session_id)? {
                 latest_for_work.insert(
-                    (child.session.parent_session_id.clone(), work_id),
+                    (child.session.parent_session_id.clone(), work_id.clone()),
                     child.router_session_id.clone(),
                 );
+                work_ids.insert(child.router_session_id.clone(), work_id);
             }
         }
         let mut runs = std::collections::HashMap::new();
         for parent in &parent_ids {
-            if let Ok(Some((_, run))) = self.planner_run(parent) {
-                runs.insert(parent.clone(), run);
+            if let Ok(works) = self.planner_work_states(parent) {
+                runs.insert(parent.clone(), works);
             }
         }
         let lifecycle = |child: &SessionRecord, work_id: &str| {
-            let work = runs
+            let (open, status) = runs
                 .get(child.session.parent_session_id.as_deref()?)?
-                .get("works")?
                 .get(work_id)?;
             let latest = latest_for_work
                 .get(&(child.session.parent_session_id.clone(), work_id.to_string()))
                 == Some(&child.router_session_id);
-            let open = work
-                .get("attempt")
-                .and_then(|a| a.get("ended"))
-                .and_then(serde_json::Value::as_bool)
-                == Some(false);
-            Some(match (latest, open) {
-                (false, _) => "ended".to_string(),
-                (true, true) => "running".to_string(),
-                (true, false) => work.get("status")?.as_str()?.to_string(),
-            })
+            match (latest, open) {
+                (false, _) => Some("ended".to_string()),
+                (true, true) => Some("running".to_string()),
+                (true, false) => status.clone(),
+            }
         };
 
-        Ok(children
-            .into_iter()
-            .map(|child| {
-                let log = logs_by_child
-                    .remove(&child.router_session_id)
-                    .unwrap_or_default();
-                let work_id = work_of(&log);
-                let state = work_id.as_deref().and_then(|id| lifecycle(&child, id));
+        let mut panels = Vec::new();
+        for child in children {
+            let work_id = work_ids.remove(&child.router_session_id);
+            let state = work_id.as_deref().and_then(|id| lifecycle(&child, id));
+            let ended = state.as_deref() == Some("ended");
+            let whole = logs.whole.contains(&child.router_session_id);
+            if logs.live_only && ended && !whole {
+                continue;
+            }
+            let log = self.delegate_log(
+                &child.router_session_id,
+                match logs.recent {
+                    Some(_) if whole => None,
+                    // A replaced session is history: its task is enough to list it.
+                    Some(_) if ended => Some(0),
+                    limit => limit,
+                },
+            )?;
+            panels.push({
                 DelegateSession {
                     work_id,
                     state,
@@ -3222,8 +3353,9 @@ impl StateFile {
                     has_response: log.iter().any(|entry| entry.kind == "agent_response"),
                     log,
                 }
-            })
-            .collect())
+            });
+        }
+        Ok(panels)
     }
 
     fn selected_logs(
@@ -4487,7 +4619,10 @@ mod tests {
             both
         );
         let kids = s
-            .delegate_children(&[parent.clone(), "rtr-legacy".into()])
+            .delegate_children(
+                &[parent.clone(), "rtr-legacy".into()],
+                &DelegateLogs::default(),
+            )
             .unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].id, child);
@@ -4538,7 +4673,9 @@ mod tests {
         s.save_planner_run_with_wakes(&parent, 0, &run, &[])
             .unwrap();
 
-        let kids = s.delegate_children(std::slice::from_ref(&parent)).unwrap();
+        let kids = s
+            .delegate_children(std::slice::from_ref(&parent), &DelegateLogs::default())
+            .unwrap();
         let state = |id: &str| {
             let kid = kids.iter().find(|k| k.id == id).unwrap();
             (kid.work_id.clone().unwrap(), kid.state.clone().unwrap())
@@ -4562,6 +4699,70 @@ mod tests {
             &serde_json::json!({}),
         );
         assert!(s.last_activity(&live).unwrap().1);
+
+        // A polling host reads each panel's task and newest activity only.
+        for (kind, summary) in [
+            ("tool_call", "one"),
+            ("tool_call", "two"),
+            ("session_update", "streaming"),
+            ("tool_call", "three"),
+            ("llm_request", "streaming"),
+        ] {
+            for child in [&old, &live] {
+                s.log(
+                    child,
+                    &LogEntry {
+                        kind: kind.into(),
+                        role: "agent".into(),
+                        summary: summary.into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let read = |logs: &DelegateLogs| {
+            s.delegate_children(std::slice::from_ref(&parent), logs)
+                .unwrap()
+                .into_iter()
+                .map(|kid| {
+                    let log = kid.log.into_iter().map(|row| row.summary).collect();
+                    (kid.id, (kid.work_id, kid.state, log))
+                })
+                .collect::<BTreeMap<_, (_, _, Vec<String>)>>()
+        };
+        let task = "[router-acp planner role: implement-work]".to_string();
+        let polled = read(&DelegateLogs {
+            recent: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(
+            polled[&live],
+            (
+                Some("alpha".into()),
+                Some("running".into()),
+                vec![task.clone(), "two".into(), "three".into()]
+            )
+        );
+        assert_eq!(
+            polled[&old],
+            (
+                Some("alpha".into()),
+                Some("ended".into()),
+                vec![task.clone()]
+            )
+        );
+        let opened = read(&DelegateLogs {
+            recent: Some(2),
+            whole: vec![old.clone()],
+            live_only: true,
+        });
+        assert_eq!(opened[&old].2.len(), 6);
+        let dock = read(&DelegateLogs {
+            recent: Some(2),
+            whole: Vec::new(),
+            live_only: true,
+        });
+        assert_eq!(dock.keys().collect::<Vec<_>>(), [&live, &done]);
     }
 
     #[test]
@@ -5006,7 +5207,12 @@ mod tests {
 
         assert!(reader.session_metadata(&ghost).is_none());
         assert!(reader.selected_logs(&ghost, 10, None).unwrap().is_empty());
-        assert!(reader.delegate_children(&[ghost]).unwrap().is_empty());
+        assert!(
+            reader
+                .delegate_children(&[ghost], &DelegateLogs::default())
+                .unwrap()
+                .is_empty()
+        );
         assert!(!dir.path().join("shards").exists());
     }
 

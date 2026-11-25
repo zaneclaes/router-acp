@@ -132,7 +132,7 @@ fn report(sid: &str, id: &str, input: &SessionInput) -> SessionInputStatus {
 
 /// Whether the session's input goes through its planner run instead.
 pub fn planner_session(store: &StateStore, sid: &str) -> Result<bool, String> {
-    Ok(store.planner_run(sid)?.is_some())
+    Ok(store.planner_revision(sid)?.is_some())
 }
 
 fn load(store: &StateStore, sid: &str, id: &str) -> Result<Option<SessionInput>, String> {
