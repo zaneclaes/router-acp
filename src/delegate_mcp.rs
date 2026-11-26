@@ -888,9 +888,9 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                         if worker.as_ref().is_some_and(|w| w.planner.is_none()) {
                             return responder.respond(text_result("lightweight worker has no planner assignment".into(), true));
                         }
-                        let operation = match serde_json::from_value::<crate::planner_workflow::Operation>(req.arguments) {
+                        let operation = match serde_json::from_value::<crate::planner_workflow::Operation>(req.arguments.clone()) {
                             Ok(operation) => operation,
-                            Err(err) => return responder.respond(text_result(format!("invalid planner_workflow arguments: {err}"), true)),
+                            Err(err) => return responder.respond(text_result(crate::planner_workflow::argument_error(&req.arguments, &err), true)),
                         };
                         let actor = worker.as_ref().and_then(|w| w.planner.clone());
                         return cx.spawn(async move {

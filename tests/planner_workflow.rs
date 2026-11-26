@@ -2108,6 +2108,64 @@ fn planner_status_schema_advertises_offset() {
     );
 }
 
+/// The published per-action fields must be exactly the fields serde accepts:
+/// serde's unknown-field error lists every field of the variant.
+#[test]
+fn planner_action_fields_match_the_operation_variants() {
+    let schema = planner_workflow::tool_definition();
+    let actions: Vec<&str> = schema["inputSchema"]["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    let published: Vec<&str> = planner_workflow::ACTION_FIELDS.iter().map(|(a, _)| *a).collect();
+    assert_eq!(published, actions, "every advertised action has one field signature");
+    for (action, fields) in planner_workflow::ACTION_FIELDS {
+        let error = serde_json::from_value::<Operation>(json!({"action": action, "zz_unknown": 1}))
+            .unwrap_err()
+            .to_string();
+        let expected = error.split_once("expected").map(|(_, rest)| rest).unwrap_or_default();
+        let mut accepted: Vec<&str> = expected.split('`').skip(1).step_by(2).collect();
+        let mut signature: Vec<&str> = fields
+            .split(", ")
+            .map(|f| f.trim_end_matches(['?', '[', ']', '{', '}']))
+            .collect();
+        accepted.sort_unstable();
+        signature.sort_unstable();
+        assert_eq!(signature, accepted, "{action}: {error}");
+        assert!(
+            schema["description"].as_str().unwrap().contains(&format!("{action}({fields})")),
+            "the description publishes {action}"
+        );
+    }
+}
+
+#[test]
+fn planner_argument_errors_name_the_actions_fields() {
+    // The live parent's most frequent rejections: an extra field on
+    // acknowledge-wake and a retire with array evidence.
+    for (arguments, signature) in [
+        (
+            json!({"action": "acknowledge-wake", "key": "k", "wake_id": "w", "detail": "seen"}),
+            "`acknowledge-wake` takes exactly: key, wake_id",
+        ),
+        (
+            json!({"action": "retire", "key": "k", "work_id": "w", "reason": "r", "evidence": ["x"]}),
+            "`retire` takes exactly: key, work_id, reason, evidence{}",
+        ),
+    ] {
+        let error = serde_json::from_value::<Operation>(arguments.clone()).unwrap_err();
+        let text = planner_workflow::argument_error(&arguments, &error);
+        assert!(text.starts_with("invalid planner_workflow arguments: "), "{text}");
+        assert!(text.contains(signature), "{text}");
+    }
+    let arguments = json!({"action": "promote"});
+    let error = serde_json::from_value::<Operation>(arguments.clone()).unwrap_err();
+    let text = planner_workflow::argument_error(&arguments, &error);
+    assert!(text.contains("review(key, work_id, revision, accepted, evidence[], corrections?)"), "{text}");
+}
+
 #[tokio::test]
 async fn required_checks_and_missing_evidence_block_acceptance_and_integration() {
     let fixture = fixture(|_| {});
