@@ -29,6 +29,7 @@ pub mod mcp_menu;
 pub mod mcp_oauth;
 pub mod native_backgrounds;
 pub mod notice;
+pub mod pause;
 pub mod planner_adopt;
 pub mod planner_capacity;
 pub mod planner_client;

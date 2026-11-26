@@ -1735,7 +1735,7 @@ async fn auth_pending_agent_becomes_routeable_after_authenticate() {
 #[tokio::test]
 async fn native_account_priorities_drain_in_order_despite_sibling_headroom() {
     let yaml = format!(
-        "state_file: {}\ndelegation: {{enabled: false}}\nrouter: auto\nagents:\n{}\n    accounts:\n      - {{name: first, priority: 0}}\n      - {{name: second, priority: 1}}\n      - {{name: third, priority: 2}}\n",
+        "state_file: {}\ndelegation: {{enabled: false}}\nfailover: {{ pause: false }}\nrouter: auto\nagents:\n{}\n    accounts:\n      - {{name: first, priority: 0}}\n      - {{name: second, priority: 1}}\n      - {{name: third, priority: 2}}\n",
         temp_state_file("account-priority").display(),
         agent_yaml("claude", &[("sonnet", 2)], &[]).trim_end()
     );
@@ -9692,7 +9692,10 @@ async fn full_reserve_disables_unknown_usage_even_for_an_explicit_pick() {
 #[tokio::test]
 async fn account_priority_drains_first_then_second_then_third_without_bypassing_cordons() {
     for availability in [true, false] {
-        let yaml = ordered_accounts_yaml("account-priority", availability);
+        let yaml = format!(
+            "failover: {{ pause: false }}\n{}",
+            ordered_accounts_yaml("account-priority", availability)
+        );
         run_test_shared(yaml, async |cx, _observed, shared| {
             init(&cx).await?;
             shared.headroom.lock().unwrap().set_polled_availability(
@@ -9996,7 +9999,7 @@ async fn all_usage_cordoned_returns_unavailable_without_prompting_any_model() {
     let state = temp_state_file("all-cordoned");
     let log = temp_log("all-cordoned");
     let yaml = format!(
-        "state_file: {}\ndelegation: {{enabled: false}}\ncordon: {{enabled: false}}\nagents:\n{}{}",
+        "state_file: {}\ndelegation: {{enabled: false}}\nfailover: {{ pause: false }}\ncordon: {{enabled: false}}\nagents:\n{}{}",
         state.display(),
         agent_yaml(
             "a",
@@ -12690,11 +12693,14 @@ async fn coordinator_honors_a_pre_pin_model_chip() {
 async fn coordinator_failover_fails_visibly_instead_of_leaving_the_planning_pool() {
     // The only planning candidate is rate-limited. A normal session would
     // fail over to work/opus; a coordinator errors instead.
-    let yaml = coordinator_yaml(
-        "coord-failover",
-        PLANNING_PRECLASS,
-        "",
-        &[("MOCK_FAIL_PROMPT_MSG", "rate limit")],
+    let yaml = format!(
+        "failover: {{ pause: false }}\n{}",
+        coordinator_yaml(
+            "coord-failover",
+            PLANNING_PRECLASS,
+            "",
+            &[("MOCK_FAIL_PROMPT_MSG", "rate limit")],
+        )
     );
     run_test(yaml, async |cx, observed| {
         init(&cx).await?;
@@ -13216,7 +13222,10 @@ async fn epic_parent_proceed_handoff_stays_on_the_planning_pool() {
 #[tokio::test]
 async fn epic_parent_reports_when_no_planner_is_eligible() {
     let log = temp_log("epic-parent-no-planner");
-    let yaml = epic_parent_yaml("epic-parent-no-planner", &log);
+    let yaml = format!(
+        "failover: {{ pause: false }}\n{}",
+        epic_parent_yaml("epic-parent-no-planner", &log)
+    );
     run_test_shared(yaml, async |cx, observed, shared| {
         init(&cx).await?;
         cordon_home_accounts(
@@ -13535,7 +13544,7 @@ async fn transport_error_as_text_recovers_the_human_pick_with_hot_context() {
         let yaml = format!(
             "state_file: {}\ndelegation: {{ enabled: false }}\n\
              auto_upgrade: {{ enabled: false }}\n\
-             failover: {{ enabled: {enabled}, respawn_cooldown_secs: 0, max_attempts: 2, \
+             failover: {{ enabled: {enabled}, pause: false, respawn_cooldown_secs: 0, max_attempts: 2, \
              outage_cordon_secs: 1 }}\n\
              llm_proxy: {{ enabled: true, listen: '127.0.0.1:0' }}\nagents:\n{}\
              \x20   llm_proxy:\n      base_url_env: OPENAI_BASE_URL\n\
@@ -19364,5 +19373,355 @@ async fn a_planner_request_waiting_on_state_leaves_the_connection_responsive() {
             Ok(())
         },
     )
+    .await;
+}
+
+/// The `paused` labels published for `sid`, in order (`None` is the resume).
+fn paused_labels(observed: &ObservedHandle, sid: &str) -> Vec<Option<String>> {
+    let mut labels: Vec<Option<String>> = Vec::new();
+    for notification in &observed.lock().unwrap().updates {
+        if notification.session_id.0.as_ref() != sid {
+            continue;
+        }
+        let SessionUpdate::SessionInfoUpdate(update) = &notification.update else {
+            continue;
+        };
+        let Some(router) = update.meta.as_ref().and_then(|meta| meta.get("routerAcp")) else {
+            continue;
+        };
+        let paused = router.get("paused").expect("every activity names paused");
+        let label = paused["label"].as_str().map(str::to_string);
+        if label.is_some() {
+            assert_eq!(router["busy"], true, "a held turn is busy");
+            assert!(paused["since"].as_str().is_some_and(|at| at.contains('T')));
+        }
+        if labels.last() != Some(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn far_cordon() -> router_acp::headroom::UsageCordon {
+    router_acp::headroom::UsageCordon {
+        reason: "weekly limit reached".into(),
+        resets_at: std::time::SystemTime::now() + Duration::from_secs(86_400),
+        resets_at_rfc3339: "2099-01-01T00:00:00Z".into(),
+        soft: false,
+    }
+}
+
+#[tokio::test]
+async fn a_turn_waits_while_every_model_is_capped_and_continues_when_one_returns() {
+    let state = temp_state_file("pause-capped");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons([(CandidateId::new("a", "m1"), far_cordon())].into());
+        let turn = prompt_text(&cx, &sid, "resume me");
+        tokio::pin!(turn);
+        tokio::select! {
+            early = &mut turn => panic!("the turn ended instead of waiting: {early:?}"),
+            _ = until("paused", || shared.pause.is_held(&sid)) => {}
+        }
+        tokio::select! {
+            early = &mut turn => panic!("the wait ended by itself: {early:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+        }
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons(Default::default());
+        let result = tokio::time::timeout(Duration::from_secs(20), turn)
+            .await
+            .expect("the turn continues once a model is back")?;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("echo:m1:"), "{text}");
+        assert!(text.contains("paused: usage cap"), "{text}");
+        assert!(!shared.pause.is_held(&sid));
+        assert_eq!(paused_labels(&observed, &sid).last(), Some(&None));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_cap_reached_mid_session_pauses_under_its_name_and_cancel_ends_it() {
+    let state = temp_state_file("pause-cancel");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nagents:\n{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+    );
+    run_test_shared(yaml, async |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        prompt_text(&cx, &sid, "first").await?;
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons([(CandidateId::new("a", "m1"), far_cordon())].into());
+        let turn = prompt_text(&cx, &sid, "second");
+        tokio::pin!(turn);
+        tokio::select! {
+            early = &mut turn => panic!("the turn ended instead of waiting: {early:?}"),
+            _ = until("published", || {
+                paused_labels(&observed, &sid).last() == Some(&Some("usage cap".into()))
+            }) => {}
+        }
+        cx.send_notification(CancelNotification::new(sid.clone()))?;
+        let result = tokio::time::timeout(Duration::from_secs(10), turn)
+            .await
+            .expect("cancel ends a hold")?;
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
+        assert!(!shared.pause.is_held(&sid));
+        assert_eq!(paused_labels(&observed, &sid).last(), Some(&None));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_pausing_off_an_unroutable_turn_fails_at_once() {
+    let state = temp_state_file("pause-off");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nfailover: {{ pause: false }}\n\
+         agents:\n{}",
+        state.display(),
+        agent_yaml("a", &[("m1", 1)], &[]),
+    );
+    run_test_shared(yaml, async |cx, _observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        shared
+            .headroom
+            .lock()
+            .unwrap()
+            .set_usage_cordons([(CandidateId::new("a", "m1"), far_cordon())].into());
+        assert!(prompt_text(&cx, &sid, "go").await.is_err());
+        assert!(!shared.pause.is_held(&sid));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_request_the_network_refuses_is_held_and_sent_again() {
+    use axum::{Router, http::StatusCode, routing::any};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The address is reserved, then closed: the provider is unreachable.
+    let address = {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        reserved.local_addr().unwrap()
+    };
+    let requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let state = temp_state_file("pause-offline");
+    let log = temp_log("pause-offline");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nauto_upgrade: {{ enabled: false }}\n\
+         failover: {{ connectivity_probes: ['{address}'] }}\n\
+         llm_proxy: {{ enabled: true, listen: '127.0.0.1:0' }}\nagents:\n{}\
+         \x20   llm_proxy:\n      base_url_env: OPENAI_BASE_URL\n\
+         \x20     upstream_base_url: 'http://{address}'\n      protocol: openai\n",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_PROXY_REPLY", "1"),
+                ("MOCK_LOG", &log.display().to_string()),
+            ]
+        ),
+    );
+    let served = requests.clone();
+    let log_for_test = log.clone();
+    run_test_shared(yaml, async move |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let turn = prompt_text(&cx, &sid, "publish the artifact");
+        tokio::pin!(turn);
+        tokio::select! {
+            early = &mut turn => panic!("the turn ended instead of waiting: {early:?}"),
+            _ = until("published", || {
+                paused_labels(&observed, &sid).last() == Some(&Some("offline".into()))
+            }) => {}
+        }
+        assert!(
+            shared.headroom.lock().unwrap().model_outage("a", "m1").is_none(),
+            "a lost network says nothing about the model"
+        );
+        let app = Router::new().fallback(any(move || {
+            let served = served.clone();
+            async move {
+                served.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, "{}")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::time::timeout(Duration::from_secs(30), turn)
+            .await
+            .expect("the held request is sent once the network is back")?;
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("echo:m1:"), "{text}");
+        assert!(!text.contains("unavailable"), "nothing failed: {text}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "sent once");
+        let prompts = read_log(&log_for_test)
+            .into_iter()
+            .filter(|e| e["event"] == "prompt")
+            .count();
+        assert_eq!(prompts, 1, "the adapter never saw the interruption");
+        assert!(!shared.pause.is_offline());
+        assert_eq!(paused_labels(&observed, &sid).last(), Some(&None));
+        server.abort();
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_turn_that_ended_at_a_network_error_continues_on_its_own_pin() {
+    // The adapter reports the failure itself (no proxy): the turn is held and
+    // prompted again on the same model, spending no failover attempt.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let state = temp_state_file("pause-adapter");
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: false }}\nauto_upgrade: {{ enabled: false }}\n\
+         failover: {{ max_attempts: 1, connectivity_probes: ['{address}'] }}\nagents:\n{}{}",
+        state.display(),
+        agent_yaml(
+            "a",
+            &[("m1", 1)],
+            &[
+                ("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable"),
+                ("MOCK_FAIL_PROMPT_TIMES", "1"),
+            ]
+        ),
+        agent_yaml("b", &[("m2", 2)], &[]),
+    );
+    run_test_shared(yaml, async move |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let turn = prompt_text(&cx, &sid, "[router: candidate=a/m1]\nkeep going");
+        tokio::pin!(turn);
+        tokio::select! {
+            early = &mut turn => panic!("the turn ended instead of waiting: {early:?}"),
+            _ = until("offline", || shared.pause.is_held(&sid)) => {}
+        }
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), turn)
+            .await
+            .expect("continues when a provider answers")?;
+        drop(listener);
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(text.contains("paused: offline"), "{text}");
+        assert!(text.contains("resumed after"), "{text}");
+        assert!(text.contains("echo:m1:"), "same model: {text}");
+        assert!(!text.contains("echo:m2:"), "nothing moved: {text}");
+        assert!(shared.headroom.lock().unwrap().model_outage("a", "m1").is_none());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_worker_the_network_interrupted_continues_in_its_own_session() {
+    // The cheap worker's first prompt fails like a lost network; no provider
+    // answers. The worker is held, then prompted again in the same sub-session
+    // with a continuation, and the delegation succeeds on the same model.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let state = temp_state_file("pause-worker");
+    let log = temp_log("pause-worker");
+    unsafe { std::env::set_var("ROUTER_ACP_HELPER_EXE", router_exe()) };
+    let cheap = agent_yaml(
+        "cheap",
+        &[("haiku", 1)],
+        &[
+            ("MOCK_LOG", &log.display().to_string()),
+            ("MOCK_SESSION_MODES", "default,bypassPermissions"),
+            ("MOCK_FAIL_PROMPT_MSG", "503 Service Unavailable: connection failed"),
+            ("MOCK_FAIL_PROMPT_TIMES", "1"),
+        ],
+    )
+    .replace(
+        "    models:\n",
+        "    mode_map: { auto: bypassPermissions }\n    models:\n",
+    );
+    let yaml = format!(
+        "state_file: {}\ndelegation: {{ enabled: true, max_concurrent: 2 }}\n\
+         failover: {{ connectivity_probes: ['{address}'] }}\n\
+         routers:\n  auto: {{ cost_quality_tradeoff: 0 }}\nagents:\n{}{}",
+        state.display(),
+        cheap,
+        agent_yaml("fancy", &[("opus", 3)], &[])
+    );
+    let log_for_test = log.clone();
+    run_test_shared(yaml, async move |cx, observed, shared| {
+        init(&cx).await?;
+        let sid = new_session(&cx).await?.session_id.0.to_string();
+        let turn = prompt_text(&cx, &sid, "hard integration work\nDELEGATE:fix button color");
+        tokio::pin!(turn);
+        tokio::select! {
+            early = &mut turn => panic!("the delegation ended instead of waiting: {early:?}"),
+            _ = until("offline", || shared.pause.is_offline()) => {}
+        }
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), turn)
+            .await
+            .expect("the worker continues once a provider answers")?;
+        drop(listener);
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        let text = agent_text(&observed, &sid);
+        assert!(
+            text.contains("delegate:[delegated to cheap/haiku]"),
+            "the delegation succeeded on the same model: {text}"
+        );
+        assert!(!text.contains("failed"), "{text}");
+        let events = read_log(&log_for_test);
+        // The first session is the router's startup probe; the delegate is the next one.
+        let opened: Vec<_> = events.iter().filter(|e| e["event"] == "session_new").collect();
+        assert_eq!(opened.len(), 2, "no second delegate session: {opened:?}");
+        let delegate = &opened[1]["sessionId"];
+        let prompts: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "prompt" && &e["sessionId"] == delegate)
+            .collect();
+        assert_eq!(prompts.len(), 2, "the same sub-session continued: {prompts:?}");
+        assert!(
+            prompts[1]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("network connection was lost")),
+            "{prompts:?}"
+        );
+        assert!(shared.headroom.lock().unwrap().model_outage("cheap", "haiku").is_none());
+        Ok(())
+    })
     .await;
 }

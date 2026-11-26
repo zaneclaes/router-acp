@@ -888,9 +888,9 @@ async fn serve_mcp_connection(shared: Arc<Shared>, stream: UnixStream) -> Result
                         if worker.as_ref().is_some_and(|w| w.planner.is_none()) {
                             return responder.respond(text_result("lightweight worker has no planner assignment".into(), true));
                         }
-                        let operation = match serde_json::from_value::<crate::planner_workflow::Operation>(req.arguments) {
+                        let operation = match serde_json::from_value::<crate::planner_workflow::Operation>(req.arguments.clone()) {
                             Ok(operation) => operation,
-                            Err(err) => return responder.respond(text_result(format!("invalid planner_workflow arguments: {err}"), true)),
+                            Err(err) => return responder.respond(text_result(crate::planner_workflow::argument_error(&req.arguments, &err), true)),
                         };
                         let actor = worker.as_ref().and_then(|w| w.planner.clone());
                         return cx.spawn(async move {
@@ -1829,6 +1829,44 @@ async fn run_delegate_task_inner(
         ));
     }
     if pool.is_empty() {
+        // A planner worker, or any worker already under way, waits for a model
+        // like its parent does; a fresh optional delegation is refused as before.
+        let waits = shared.cfg.failover.pause
+            && (args.planner_identity.is_some() || !args.resume.history.is_empty());
+        let reason = waits
+            .then(|| {
+                crate::pause::unroutable_reason(shared, |id| match &hinted {
+                    Some(hinted) if exact => id == hinted,
+                    _ => true,
+                })
+                .or_else(|| {
+                    (!args.resume.failed_candidates.is_empty())
+                        .then_some(crate::pause::Reason::Outage)
+                })
+            })
+            .flatten();
+        if let Some(reason) = reason {
+            drop(_permit);
+            let identity = args.planner_identity.clone();
+            let sid = args
+                .resume
+                .history
+                .last()
+                .cloned()
+                .unwrap_or_else(|| router_sid.to_string());
+            let guard = crate::pause::Guard::begin(shared, &[&sid], reason);
+            let back = crate::pause::until_routable(shared, &guard, profile.class, || {
+                worker_stopped(shared, router_sid, identity.as_ref())
+            })
+            .await;
+            drop(guard);
+            if !back {
+                return Err("parent session was cancelled".to_string());
+            }
+            // Every account was tried before the wait; all may serve after it.
+            args.resume.failed_candidates.clear();
+            return Box::pin(run_delegate_task_inner(shared, router_sid, args)).await;
+        }
         return Err("no eligible candidate is available for delegation".to_string());
     }
 
@@ -2333,7 +2371,8 @@ async fn run_delegate_task_inner(
                     prompt,
                     &candidate,
                     router_sid,
-                    args.planner_identity.as_ref().map(|_| router_sid),
+                    args.planner_identity.as_ref(),
+                    &capture,
                 )
                 .await;
                 if result.is_ok() {
@@ -2702,7 +2741,8 @@ async fn gate_turns(
             prompt,
             gate.candidate,
             gate.parent_sid,
-            gate.planner.map(|_| gate.parent_sid),
+            gate.planner,
+            gate.capture,
         )
         .await?;
     }
@@ -2769,11 +2809,108 @@ fn parent_turn_stops_delegate(parent_cancelled: Option<bool>, planner_worker: bo
     parent_cancelled.is_none_or(|cancelled| cancelled && !planner_worker)
 }
 
+/// Whether a held worker should stop waiting: its parent closed, or its own
+/// run or assignment stopped.
+fn worker_stopped(
+    shared: &Shared,
+    parent_sid: &str,
+    identity: Option<&crate::planner_workflow::WorkerIdentity>,
+) -> bool {
+    parent_stops_delegate(shared, parent_sid, identity.is_some())
+        || identity.is_some_and(|identity| {
+            crate::planner_workflow::load(shared, parent_sid)
+                .ok()
+                .flatten()
+                .is_none_or(|run| {
+                    run.status != crate::planner_workflow::RunStatus::Running
+                        || run.works.get(&identity.work_id).is_none_or(|work| {
+                            work.paused
+                                || work.attempt.as_ref().is_some_and(|attempt| {
+                                    attempt.id != identity.attempt_id || attempt.ended
+                                })
+                        })
+                })
+        })
+}
+
+/// One delegate turn. A turn the network took is held, then continued in the
+/// same sub-session (`crate::pause`): the worker keeps its context, its slot
+/// and its attempt.
+#[allow(clippy::too_many_arguments)]
+async fn prompt_unless_stalled(
+    shared: &Arc<Shared>,
+    conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    sub_sid: &str,
+    prompt: PromptRequest,
+    candidate: &CandidateId,
+    parent_sid: &str,
+    planner: Option<&crate::planner_workflow::WorkerIdentity>,
+    capture: &Mutex<String>,
+) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
+    let _turn = DelegateTurn::begin(shared, sub_sid);
+    let mut next = prompt.clone();
+    loop {
+        let from = capture.lock().unwrap().len();
+        let result = prompt_once(
+            shared,
+            conn,
+            sub_sid,
+            next,
+            candidate,
+            parent_sid,
+            planner.map(|_| parent_sid),
+        )
+        .await;
+        let lost = match &result {
+            Ok(resp) if resp.stop_reason != StopReason::Cancelled => {
+                let lost = shared.cfg.failover.pause
+                    && (shared.llm_proxy.lost_a_request(sub_sid) || shared.pause.is_offline());
+                let mut text = capture.lock().unwrap();
+                let start = text
+                    .get(from..)
+                    .filter(|_| lost)
+                    .and_then(crate::pause::transport_error_reply);
+                if let Some(start) = start {
+                    text.truncate(from + start);
+                }
+                start.is_some()
+            }
+            Ok(_) => false,
+            Err(err) => crate::pause::confirm_offline_after(shared, err).await,
+        };
+        if !lost {
+            return result;
+        }
+        if !worker_stopped(shared, parent_sid, planner)
+            && crate::pause::confirm_offline(shared).await
+            && !crate::pause::until_online(shared, &[sub_sid], &[parent_sid], || {
+                worker_stopped(shared, parent_sid, planner)
+            })
+            .await
+        {
+            return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ));
+        }
+        // The network may already be back by the time its error is read: a
+        // turn it ended is continued either way, but never in a tight loop.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if worker_stopped(shared, parent_sid, planner) {
+            return Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ));
+        }
+        let mut blocks = prompt.prompt.clone();
+        blocks.push(ContentBlock::from(crate::pause::CONTINUE.to_string()));
+        next = PromptRequest::new(prompt.session_id.clone(), blocks).meta(prompt.meta.clone());
+    }
+}
+
 /// Send one delegate prompt and wait for its reply, unless the sub-session
 /// goes silent past the stall limits. Then the turn is cancelled and fails
 /// with the reason, so its planner attempt ends and wakes the parent instead
 /// of reading as running indefinitely.
-async fn prompt_unless_stalled(
+async fn prompt_once(
     shared: &Arc<Shared>,
     conn: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
     sub_sid: &str,
@@ -2782,7 +2919,6 @@ async fn prompt_unless_stalled(
     parent_sid: &str,
     planner_parent: Option<&str>,
 ) -> Result<agent_client_protocol::schema::v1::PromptResponse, AcpError> {
-    let _turn = DelegateTurn::begin(shared, sub_sid);
     let downstream_sid = prompt.session_id.clone();
     let unavailable = |reason: String| {
         AcpError::internal_error().data(json!({
@@ -2952,7 +3088,12 @@ async fn prompt_unless_stalled_inner(
             .unwrap()
             .last_activity(sub_sid)
             .unwrap_or((started, false));
-        let quiet = chrono::Utc::now().timestamp() - last.max(started);
+        // A request the proxy holds is waiting on the network, not stalled.
+        if shared.pause.is_held(sub_sid) {
+            continue;
+        }
+        let held = shared.pause.last_ended(sub_sid).unwrap_or(started);
+        let quiet = chrono::Utc::now().timestamp() - last.max(started).max(held);
         if quiet
             < if open {
                 STALL_OPEN_TOOL_SECS
@@ -3609,7 +3750,8 @@ async fn run_delegate_followup_inner(
         prompt,
         &candidate,
         router_sid,
-        args.planner_identity.as_ref().map(|_| router_sid),
+        args.planner_identity.as_ref(),
+        &capture,
     )
     .await;
     if result.is_ok() {

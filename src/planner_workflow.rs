@@ -241,6 +241,15 @@ pub struct WorkSpec {
     pub completion_contract_version: Option<u32>,
 }
 
+/// The release that still holds this work, if any. Disposed, abandoned and
+/// replaced rounds are history: they keep their receipts but hold nothing.
+fn active_membership<'a>(run: &'a PlannerRun, work_id: &str) -> Option<&'a str> {
+    run.releases
+        .iter()
+        .find(|(_, release)| release.active() && release.works.contains_key(work_id))
+        .map(|(id, _)| id.as_str())
+}
+
 fn validate_work_spec(work: &WorkSpec) -> Result<(), String> {
     if work
         .completion_contract_version
@@ -1714,8 +1723,54 @@ pub fn input_blocks(
     Ok((blocks, delivered))
 }
 
+/// Each action's accepted top-level fields: `?` optional, `[]` an array of
+/// strings, `{}` an object. `Operation` denies every other field, so the flat
+/// input schema alone cannot tell a caller which fields an action takes. A test
+/// compares these names with serde's own field lists.
+pub const ACTION_FIELDS: &[(&str, &str)] = &[
+    ("status", "offset?, work_id?, works_only?"),
+    ("admit", "key, work{}"),
+    ("reconcile", "key, work{}, source_revision, evidence[]"),
+    ("retire", "key, work_id, reason, evidence{}"),
+    ("artifact", "key, work_id, attempt_id, artifact{}"),
+    ("review", "key, work_id, revision, accepted, evidence[], corrections?"),
+    ("finished", "key, work_id, attempt_id, receipt{}"),
+    ("finalize", "key, work_id, receipt{}"),
+    ("integrate", "key, work_id, receipt{}"),
+    ("release", "key, release_id, checkpoint{}"),
+    ("disposition", "key, work_id, status, reason"),
+    ("acknowledge-input", "key, input_id, owner?"),
+    ("acknowledge-wake", "key, wake_id"),
+    ("hold", "key, plan_id, reason, detail"),
+    ("complete", "key, queue_evidence"),
+    ("record-continuation", "key, text"),
+];
+
+fn action_fields_text() -> String {
+    ACTION_FIELDS
+        .iter()
+        .map(|(action, fields)| format!("{action}({fields})"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The argument error names the fields the requested action takes, so a
+/// caller corrects the call once instead of guessing one field at a time.
+pub fn argument_error(arguments: &Value, error: &serde_json::Error) -> String {
+    let action = arguments.get("action").and_then(Value::as_str);
+    match ACTION_FIELDS.iter().find(|(name, _)| Some(*name) == action) {
+        Some((name, fields)) => format!(
+            "invalid planner_workflow arguments: {error}. `{name}` takes exactly: {fields} ([] array of strings, {{}} object, ? optional)"
+        ),
+        None => format!(
+            "invalid planner_workflow arguments: {error}. Fields by action: {}",
+            action_fields_text()
+        ),
+    }
+}
+
 pub fn tool_definition() -> Value {
-    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority.",
+    json!({ "name": TOOL_NAME, "description": "Record durable planner work and revision-bound evidence. Parent actions include review, host-verified finalize, release checkpoints, integrate, disposition and complete. Workers report artifact/finished only for their assignment. Status accepts work_id for a compact targeted view. Works never own files: each worker reconciles its own branch with its base; ready_dependencies binds reviewed source SHAs, while dependencies requires integration. Artifact integration_requirements maps release-owned proof keys to recipes, all required at integration. Reconcile suspended recovery before retrying. Fill free slots with admissible independent work or record a supported hold; when the human has not authorized the work, hold `awaiting-human` with their quoted words instead of starting it. Every mutation requires a unique idempotency key. This tool never grants merge/deploy authority. Each action takes only its own fields ([] array of strings, {} object, ? optional): ".to_owned() + &action_fields_text(),
         "inputSchema": { "type": "object", "properties": {
             "action": {"type":"string", "enum":["status","admit","reconcile","retire","artifact","review","finished","finalize","integrate","release","disposition","acknowledge-input","acknowledge-wake","hold","complete","record-continuation"]},
             "source_revision":{"type":"string", "description":"Full preserved source commit, already carried in the assigned worktree HEAD. Reconcile requires the complete current WorkSpec and parent evidence; it never expands operator authorization."},
@@ -2002,16 +2057,22 @@ async fn operate_once(
                 return Err("retire requires a configured host to verify obsolete scope and parent takeover".into());
             }
             let work = run.works.get(&work_id).ok_or("unknown work identity")?;
-            if reason.trim().is_empty()
-                || evidence.is_empty()
-                || work.attempt.as_ref().is_some_and(|a| !a.ended)
-                || matches!(work.status, WorkStatus::Integrated | WorkStatus::Finished)
-                || run
-                    .releases
-                    .values()
-                    .any(|release| release.works.contains_key(&work_id))
-            {
-                return Err("retire requires an ended obsolete assignment, parent takeover evidence and no frozen release membership".into());
+            if reason.trim().is_empty() || evidence.is_empty() {
+                return Err("retire requires a reason and parent takeover evidence".into());
+            }
+            if work.attempt.as_ref().is_some_and(|a| !a.ended) {
+                return Err("retire requires the obsolete assignment's attempt to end first".into());
+            }
+            if matches!(work.status, WorkStatus::Integrated | WorkStatus::Finished) {
+                return Err(format!(
+                    "retire cannot dispose of {:?} work; its completion is already recorded",
+                    work.status
+                ));
+            }
+            if let Some(release) = active_membership(&run, &work_id) {
+                return Err(format!(
+                    "retire requires no active release membership; release {release} still carries {work_id}"
+                ));
             }
             let mut check = value.clone();
             check["assignment"] = serde_json::to_value(work).map_err(|e| e.to_string())?;
@@ -2103,7 +2164,7 @@ async fn operate_once(
                     release
                         .works
                         .get(&work.work_id)
-                        .map(|revision| (release.stage(), revision))
+                        .map(|revision| (release.active(), revision))
                 })
                 .collect();
             let historical_custody = !terminal_correction && !memberships.is_empty();
@@ -2114,13 +2175,7 @@ async fn operate_once(
                         | WorkStatus::Integrated
                         | WorkStatus::Watching
                         | WorkStatus::Retired
-                ) || memberships.iter().any(|(stage, _)| {
-                    !matches!(
-                        stage,
-                        crate::planner_release::Stage::Disposed
-                            | crate::planner_release::Stage::Abandoned
-                    )
-                }))
+                ) || memberships.iter().any(|(active, _)| *active))
             {
                 return Err("reconcile cannot rewrite finished work or a frozen release; use its owning repair".into());
             }

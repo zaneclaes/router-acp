@@ -7,7 +7,7 @@
 //! prompt); ambiguous traffic passes through unchanged.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -38,6 +38,8 @@ struct ProxyTarget {
 struct ActiveTurn {
     registration_id: u64,
     response_status: Arc<AtomicU16>,
+    /// A request of this turn never got its whole answer from the provider.
+    lost: Arc<AtomicBool>,
     parent_router_sid: String,
     state_sid: String,
     downstream_sid: String,
@@ -289,6 +291,7 @@ impl LlmProxyRuntime {
                 process_key,
                 registration_id: 0,
                 response_status: None,
+                lost: None,
             };
         }
         // A main-session repin can change providers before the new adapter
@@ -316,9 +319,11 @@ impl LlmProxyRuntime {
         }
         let registration_id = self.next_registration.fetch_add(1, Ordering::Relaxed);
         let response_status = Arc::new(AtomicU16::new(0));
+        let lost = Arc::new(AtomicBool::new(false));
         let active = ActiveTurn {
             registration_id,
             response_status: response_status.clone(),
+            lost: lost.clone(),
             parent_router_sid,
             state_sid,
             downstream_sid,
@@ -336,6 +341,7 @@ impl LlmProxyRuntime {
             process_key,
             registration_id,
             response_status: Some(response_status),
+            lost: Some(lost),
         }
     }
 
@@ -359,6 +365,15 @@ impl LlmProxyRuntime {
             .unwrap()
             .get(state_sid)
             .is_some_and(|s| s.thinking_text_is_narration)
+    }
+
+    /// Whether the running turn of `state_sid` lost a request.
+    pub fn lost_a_request(&self, state_sid: &str) -> bool {
+        self.active.lock().unwrap().values().flatten().any(|turn| {
+            turn.state_sid == state_sid
+                && (turn.lost.load(Ordering::Acquire)
+                    || turn.response_status.load(Ordering::Acquire) >= 500)
+        })
     }
 
     pub fn current_model(&self, state_sid: &str) -> Option<String> {
@@ -407,6 +422,7 @@ pub struct LlmTurnGuard {
     process_key: ProcessKey,
     registration_id: u64,
     response_status: Option<Arc<AtomicU16>>,
+    lost: Option<Arc<AtomicBool>>,
 }
 
 impl LlmTurnGuard {
@@ -415,6 +431,18 @@ impl LlmTurnGuard {
             .as_ref()
             .map(|status| status.load(Ordering::Acquire))
             .filter(|status| *status != 0)
+    }
+
+    /// Whether this turn lost a request. An adapter the proxy does not serve
+    /// reports nothing, so only a measured loss of the network counts for it.
+    pub fn lost_a_request(&self, shared: &Shared) -> bool {
+        match &self.lost {
+            Some(lost) => {
+                lost.load(Ordering::Acquire)
+                    || self.last_response_status().is_some_and(|status| status >= 500)
+            }
+            None => shared.pause.is_offline(),
+        }
     }
 }
 
@@ -511,6 +539,31 @@ async fn proxy_with_path(
     proxy_request(state, token, rest, request).await
 }
 
+/// The provider could not be reached. While the network is gone the request is
+/// held here, so its adapter keeps waiting on an open request instead of
+/// failing the turn. True when the network is back and it can be sent again.
+async fn hold_request(state: &ProxyServerState, active: Option<&ActiveTurn>) -> bool {
+    let Some(active) = active else {
+        return crate::pause::confirm_offline(&state.shared).await
+            && crate::pause::until_online(&state.shared, &[], &[], || false).await;
+    };
+    active.lost.store(true, Ordering::Release);
+    crate::pause::confirm_offline(&state.shared).await
+        && crate::pause::until_online(
+            &state.shared,
+            &[&active.state_sid],
+            // The owner of a worker waits on it.
+            &[&active.parent_router_sid],
+            || {
+                state
+                    .shared
+                    .with_session(&active.state_sid, |s| s.cancelled)
+                    .unwrap_or(false)
+            },
+        )
+        .await
+}
+
 async fn proxy_request(
     state: ProxyServerState,
     token: String,
@@ -596,7 +649,17 @@ async fn proxy_request(
     });
     let mut observed = None;
     if let Some(agent) = &managed_agent {
-        match crate::credentials::claude_access(agent).await {
+        let access = loop {
+            let access = crate::credentials::claude_access(agent).await;
+            // A credential that cannot be read is not a rejected one.
+            if matches!(access, Err(crate::credentials::RepairOutcome::Unknown))
+                && hold_request(&state, attributed.as_ref()).await
+            {
+                continue;
+            }
+            break access;
+        };
+        match access {
             Ok(access) => {
                 if set_claude_authorization(&mut outbound_headers, &access.token).is_err() {
                     return credential_error(crate::credentials::RepairOutcome::Unknown);
@@ -629,7 +692,7 @@ async fn proxy_request(
             )
         })
         .flatten();
-    let sent_compressed = compressed.is_some();
+    let mut sent_compressed = compressed.is_some();
     let sent_bytes = compressed
         .as_ref()
         .map_or(outbound_body.len(), |body| body.bytes.len());
@@ -643,6 +706,26 @@ async fn proxy_request(
         encoding,
     );
     let mut first_response = first_request.send().await;
+    while first_response.is_err() && hold_request(&state, attributed.as_ref()).await {
+        // The credential may have expired while the machine was away.
+        if let Some(agent) = &managed_agent
+            && let Ok(access) = crate::credentials::claude_access(agent).await
+            && set_claude_authorization(&mut outbound_headers, &access.token).is_ok()
+        {
+            observed = Some(access.generation);
+        }
+        sent_compressed = false;
+        first_response = build_upstream_request(
+            &state.runtime.client,
+            &parts.method,
+            upstream_url.clone(),
+            &outbound_headers,
+            outbound_body.clone(),
+            None,
+        )
+        .send()
+        .await;
+    }
     if sent_compressed {
         tracing::debug!(
             target: "router_acp::request_compression",
@@ -733,7 +816,12 @@ async fn proxy_request(
         && let Some(agent) = &managed_agent
     {
         drop(upstream);
-        let outcome = crate::credentials::repair(agent, observed.as_deref()).await;
+        let mut outcome = crate::credentials::repair(agent, observed.as_deref()).await;
+        while outcome == crate::credentials::RepairOutcome::Unknown
+            && hold_request(&state, attributed.as_ref()).await
+        {
+            outcome = crate::credentials::repair(agent, observed.as_deref()).await;
+        }
         crate::auth::sync_from_manager(&state.shared, agent);
         if outcome != crate::credentials::RepairOutcome::Repaired {
             record_proxy_result(
@@ -1010,6 +1098,7 @@ async fn proxy_request(
     let shared = state.shared.clone();
     let mut upstream_stream = upstream.bytes_stream();
     let mut completion_guard = CompletionGuard::new(shared, completion, status.as_u16());
+    let lost = attributed.as_ref().map(|active| active.lost.clone());
     let response_stream = async_stream::stream! {
         while let Some(item) = upstream_stream.next().await {
             match item {
@@ -1018,6 +1107,9 @@ async fn proxy_request(
                     yield Ok::<Bytes, std::io::Error>(chunk);
                 }
                 Err(err) => {
+                    if let Some(lost) = &lost {
+                        lost.store(true, Ordering::Release);
+                    }
                     completion_guard.fail(format!("upstream response stream failed: {err}"));
                     yield Err(std::io::Error::other(err));
                     return;
@@ -2995,6 +3087,7 @@ agents:
         ActiveTurn {
             registration_id: 1,
             response_status: Arc::new(AtomicU16::new(0)),
+            lost: Arc::new(AtomicBool::new(false)),
             parent_router_sid: "r1".to_string(),
             state_sid: "r1".to_string(),
             downstream_sid: "d1".to_string(),

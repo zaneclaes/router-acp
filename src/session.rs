@@ -748,6 +748,8 @@ pub struct Shared {
     /// In-process planner state by parent session: turn ends for the
     /// turn-end gate, child sessions and an active shutdown drain.
     pub planner_runtime: Mutex<HashMap<String, crate::planner_guard::SessionRuntime>>,
+    /// Turns held open until the network or a model is back.
+    pub pause: crate::pause::PauseState,
     /// Last downstream progress per router or delegate session id, for the
     /// stuck-turn watchdog and the folded-result settle
     /// (`crate::planner_watchdog`).
@@ -903,6 +905,7 @@ impl Shared {
             delegate_effort: Mutex::new(HashMap::new()),
             planner_deliveries: Mutex::default(),
             planner_runtime: Mutex::default(),
+            pause: crate::pause::PauseState::default(),
             turn_progress: Mutex::default(),
             planner_child_routes: Mutex::default(),
             planner_child_targets: Mutex::default(),
@@ -4484,8 +4487,9 @@ fn publish_session_activity(shared: &Arc<Shared>, router_sid: &str, busy: bool) 
     republish_session_title(shared, router_sid);
 }
 
-/// Re-send the title with the current busy state, e.g. after the pin moved.
-fn republish_session_title(shared: &Arc<Shared>, router_sid: &str) {
+/// Re-send the title with the current busy and paused state, e.g. after the
+/// pin moved. A held turn is busy: it continues by itself.
+pub(crate) fn republish_session_title(shared: &Arc<Shared>, router_sid: &str) {
     let busy = shared
         .with_session(router_sid, |s| s.activity_busy)
         .unwrap_or(false);
@@ -4493,7 +4497,11 @@ fn republish_session_title(shared: &Arc<Shared>, router_sid: &str) {
         return;
     };
     let mut meta = serde_json::Map::new();
-    meta.insert("routerAcp".into(), json!({ "busy": busy }));
+    let paused = shared.pause.published(router_sid);
+    meta.insert(
+        "routerAcp".into(),
+        json!({ "busy": busy || !paused.is_null(), "paused": paused }),
+    );
     let _ = cx.send_notification(SessionNotification::new(
         router_sid.to_string(),
         SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title).meta(meta)),
@@ -5095,9 +5103,12 @@ async fn pin_session(
     let cwd_langs = cwd_language_fingerprint(&shared.rules, &cwd);
     let typed = shared
         .with_session(router_sid, |s| s.planner_command_text.take())
-        .flatten()
+        .flatten();
+    let typed_blocks = typed
+        .clone()
         .map(|text| vec![ContentBlock::from(text)]);
-    let input = ClassifyInput::from_prompt(typed.as_deref().unwrap_or(prompt), cwd_langs);
+    let input =
+        ClassifyInput::from_prompt(typed_blocks.as_deref().unwrap_or(prompt), cwd_langs);
     let profile = match shared.with_session(router_sid, |s| s.preclass_profile.clone()) {
         Some(Some(profile)) => profile,
         _ => classify(&shared.cfg.classifier, &shared.rules, &input).await,
@@ -5119,7 +5130,15 @@ async fn pin_session(
         &excluded,
         larger_context_than,
         false,
-    )?;
+    )
+    .inspect_err(|_| {
+        // A held turn routes again later, on the same typed text.
+        shared.with_session(router_sid, |s| {
+            if s.planner_command_text.is_none() {
+                s.planner_command_text = typed;
+            }
+        });
+    })?;
 
     note_pinned_versions(shared, router_sid, &mut ranked);
     pin_ranked(
@@ -5396,7 +5415,16 @@ fn plan_route(
     if let Some(min) = larger_context_than {
         pool = prefer_larger_context(shared, router_sid, pool, min);
     }
+    shared.pause.set_unroutable(router_sid, None);
     if pool.is_empty() {
+        // A capability or effort nothing offers is refused, never awaited.
+        if auto_effort.is_none() {
+            let reason = crate::pause::unroutable_reason(shared, |id| {
+                (!coordinator || shared.in_planning_pool(id) || picked.as_ref() == Some(id))
+                    && !is_excluded(id, &excluded_patterns)
+            });
+            shared.pause.set_unroutable(router_sid, reason);
+        }
         return Err(if coordinator {
             AcpError::internal_error().data(format!(
                 "coordinator session: no planning candidate is routeable; refusing to fall back \
@@ -7178,7 +7206,13 @@ async fn run_primary_turn_inner(
     // Managed watcher completions are continuations of the same provider
     // attempt. Give them their own bounded budget so repeated CI waits do not
     // consume failover attempts or hold an upstream prompt forever.
-    'attempts: for _iteration in 1..=(max_iters + 20) {
+    // A hold (`crate::pause`) starts both budgets over: it waited, it did not fail.
+    let mut iteration = 0;
+    'attempts: loop {
+        iteration += 1;
+        if iteration > max_iters + 20 {
+            break;
+        }
         attempt += 1;
         let Some((process_key, down_sid, candidate)) = shared
             .with_session(&router_sid, |s| {
@@ -7581,6 +7615,24 @@ async fn run_primary_turn_inner(
                     return Err(AcpError::internal_error()
                         .data("Provider transport unavailable after HTTP retries"));
                 }
+                // An adapter that gave up on a lost request prints its error
+                // as the reply and ends the turn normally (2026-11-25).
+                let lost = shared.cfg.failover.pause
+                    && _llm_turn.lost_a_request(&shared)
+                    && shared
+                        .with_session(&router_sid, |s| {
+                            let from = s.turn_last_text_start;
+                            let start = from
+                                + crate::pause::transport_error_reply(&s.turn_output[from..])?;
+                            s.turn_output.truncate(start);
+                            Some(())
+                        })
+                        .flatten()
+                        .is_some();
+                if lost {
+                    return Err(AcpError::internal_error()
+                        .data("Provider transport unavailable: the request was lost"));
+                }
             }
             let auth_error = shared
                 .with_session(&router_sid, |s| {
@@ -7770,6 +7822,32 @@ async fn run_primary_turn_inner(
                 let local_failure = crate::limits::is_local_adapter_failure(
                     &crate::limits::error_text(&err).to_lowercase(),
                 );
+                // Waiting cures a provider, not a local adapter that keeps
+                // dying or a refusal a person must clear. Those keep the
+                // failover budget, so they end instead of being held forever.
+                let waiting_helps = !local_failure
+                    && !crate::limits::needs_a_person(
+                        &crate::limits::error_text(&err).to_lowercase(),
+                    );
+                // The network is gone: every model would fail the same way, so
+                // nothing is cordoned and nothing moves. The turn waits and
+                // continues on its own pin, outside the failover budget.
+                let transport = auth_rejected
+                    || (matches!(class, FailureClass::Outage) && !local_failure)
+                    || matches!(&unavailability, Some((crate::notice::Reason::Outage, _)));
+                if transport && !cancelled && crate::pause::confirm_offline(&shared).await {
+                    queue_held_text(&shared, &router_sid);
+                    if partial_work {
+                        continuing = true;
+                        record_interrupted_output(&shared, &router_sid, &candidate);
+                    }
+                    if !hold_offline(&shared, &router_sid, cancellation.as_ref()).await {
+                        return Ok(PromptResponse::new(StopReason::Cancelled));
+                    }
+                    attempt = 0;
+                    iteration = 0;
+                    continue;
+                }
                 let notice_reason = match (&unavailability, &class) {
                     (Some((kind, _)), _) => *kind,
                     _ if auth_rejected => crate::notice::Reason::SignIn,
@@ -7787,12 +7865,24 @@ async fn run_primary_turn_inner(
                 // must not fail over: it takes out the whole seat, and every
                 // other agent is still able to serve the turn.
 
+                // A cordoned seat leaves the pool, so moving off it can neither
+                // repeat nor loop: with pausing on it spends no attempt. Any
+                // number of seats can reach their caps under one turn.
+                let capped = shared.cfg.failover.pause
+                    && (matches!(class, FailureClass::RateLimited { .. })
+                        || matches!(
+                            notice_reason,
+                            crate::notice::Reason::AccountLimit | crate::notice::Reason::Reserve
+                        ));
+                if capped {
+                    iteration = iteration.min(1);
+                }
                 let can_fail_over = shared.cfg.failover.enabled
                     && !cancelled
                     && (already_unavailable
                         || auth_rejected
                         || !matches!(class, FailureClass::Other))
-                    && attempt < max_attempts;
+                    && (attempt < max_attempts || capped);
 
                 // "unavailable" misdescribes an overflow — the model answered,
                 // it just could not hold this turn.
@@ -7863,22 +7953,7 @@ async fn run_primary_turn_inner(
                     .any(|e| e.kind == "agent_response");
                 if partial_work {
                     continuing = true;
-                    let output = shared
-                        .with_session(&router_sid, |s| s.turn_output.clone())
-                        .unwrap_or_default();
-                    if !output.is_empty() {
-                        shared.state.lock().unwrap().log(
-                            &router_sid,
-                            &crate::state::LogEntry {
-                                kind: "agent_response".into(),
-                                role: "agent".into(),
-                                summary: output.clone(),
-                                detail: Some(serde_json::json!({"interrupted": true})),
-                                model: Some(candidate.to_string()),
-                                ..Default::default()
-                            },
-                        );
-                    }
+                    record_interrupted_output(&shared, &router_sid, &candidate);
                 }
                 if overflowed || had_prior_turn || continuing {
                     let mut framed = frame_lookup(&shared, &router_sid);
@@ -7989,6 +8064,7 @@ async fn run_primary_turn_inner(
                         let mut retry_error = pin_err;
                         let mut seen_available = HashSet::new();
                         let mut retry_mark = mark;
+                        let mut guard = begin_hold(&shared, &router_sid);
                         while let Some(until) = retry_wait_until(&shared, &candidate) {
                             if !wait_for_retry(
                                 &shared,
@@ -8019,7 +8095,13 @@ async fn run_primary_turn_inner(
                             )
                             .await
                             {
-                                Ok(PinOutcome::Pinned) => continue 'attempts,
+                                Ok(PinOutcome::Pinned) => {
+                                    if guard.is_some() && waiting_helps {
+                                        attempt = 0;
+                                        iteration = 0;
+                                    }
+                                    continue 'attempts;
+                                }
                                 Ok(PinOutcome::Cancelled) => {
                                     return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
@@ -8036,6 +8118,44 @@ async fn run_primary_turn_inner(
                             }
                         }
                         flush_pending_disclosure(&shared, &router_sid);
+                        // No cordon with a near end: hold for as long as it
+                        // takes, then let the selector choose.
+                        while let Some(held) =
+                            hold_unroutable(&shared, &router_sid, cancellation.as_ref(), &mut guard)
+                                .await
+                        {
+                            if !held {
+                                return Ok(PromptResponse::new(StopReason::Cancelled));
+                            }
+                            let retry_exclude =
+                                candidate_unavailable_reason(&shared, &candidate, false)
+                                    .is_some()
+                                    .then_some(&candidate);
+                            match pin_session(
+                                &shared,
+                                &router_sid,
+                                &req.prompt,
+                                cancellation.as_ref(),
+                                retry_exclude,
+                                true,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(PinOutcome::Pinned) => {
+                                    end_hold(&shared, &router_sid, &mut guard);
+                                    if waiting_helps {
+                                        attempt = 0;
+                                        iteration = 0;
+                                    }
+                                    continue 'attempts;
+                                }
+                                Ok(PinOutcome::Cancelled) => {
+                                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                                }
+                                Err(retry_err) => retry_error = retry_err,
+                            }
+                        }
                         return Err(retry_error);
                     }
                 }
@@ -8043,6 +8163,146 @@ async fn run_primary_turn_inner(
         }
     }
     Err(AcpError::internal_error().data("all failover attempts exhausted for this prompt"))
+}
+
+/// Keep what an interrupted turn already said, for the model that continues it.
+fn record_interrupted_output(shared: &Arc<Shared>, router_sid: &str, candidate: &CandidateId) {
+    let output = shared
+        .with_session(router_sid, |s| s.turn_output.clone())
+        .unwrap_or_default();
+    if output.is_empty() {
+        return;
+    }
+    shared.state.lock().unwrap().log(
+        router_sid,
+        &crate::state::LogEntry {
+            kind: "agent_response".into(),
+            role: "agent".into(),
+            summary: output,
+            detail: Some(serde_json::json!({"interrupted": true})),
+            model: Some(candidate.to_string()),
+            ..Default::default()
+        },
+    );
+}
+
+fn turn_stopped(
+    shared: &Shared,
+    router_sid: &str,
+    cancellation: Option<&RequestCancellation>,
+) -> bool {
+    cancellation.is_some_and(RequestCancellation::is_cancelled)
+        || shared.with_session(router_sid, |s| s.cancelled).unwrap_or(true)
+}
+
+/// Hold a turn until the network is back. False when the client cancelled it.
+async fn hold_offline(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    cancellation: Option<&RequestCancellation>,
+) -> bool {
+    let started = std::time::Instant::now();
+    notify_user(
+        shared,
+        router_sid,
+        "router-acp · paused: offline; continuing when the network is back",
+    );
+    flush_pending_disclosure(shared, router_sid);
+    let online = crate::pause::until_online(shared, &[router_sid], &[], || {
+        turn_stopped(shared, router_sid, cancellation)
+    })
+    .await;
+    if online {
+        notify_user(
+            shared,
+            router_sid,
+            format!(
+                "router-acp · resumed after {}",
+                crate::limits::humanize(started.elapsed())
+            ),
+        );
+        flush_pending_disclosure(shared, router_sid);
+    }
+    online
+}
+
+/// Publish the hold a routing failure calls for, if pausing covers it.
+fn begin_hold(shared: &Arc<Shared>, router_sid: &str) -> Option<crate::pause::Guard> {
+    let reason = hold_reason(shared, router_sid)?;
+    Some(crate::pause::Guard::begin(shared, &[router_sid], reason))
+}
+
+/// Why no candidate is routeable for this session, when that ends by itself.
+/// A signed-out client is asked to sign in, unless a planner run is under way:
+/// there the work waits for the operator instead of failing.
+fn hold_reason(shared: &Arc<Shared>, router_sid: &str) -> Option<crate::pause::Reason> {
+    if !shared.cfg.failover.pause {
+        return None;
+    }
+    shared.pause.unroutable(router_sid).filter(|reason| {
+        *reason != crate::pause::Reason::SignedOut
+            || crate::planner_workflow::load(shared, router_sid)
+                .ok()
+                .flatten()
+                .is_some()
+    })
+}
+
+/// Wait until routing is worth another try. `None` when pausing does not cover
+/// the failure, `Some(false)` when the client cancelled.
+async fn hold_unroutable(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    cancellation: Option<&RequestCancellation>,
+    guard: &mut Option<crate::pause::Guard>,
+) -> Option<bool> {
+    let reason = hold_reason(shared, router_sid)?;
+    if guard.as_ref().is_none_or(|held| held.reason() != reason) {
+        *guard = Some(match guard.take() {
+            Some(held) => held.becomes(reason),
+            None => crate::pause::Guard::begin(shared, &[router_sid], reason),
+        });
+    }
+    let class = shared
+        .with_session(router_sid, |s| s.task_class)
+        .flatten()
+        .unwrap_or(TaskClass::CodingGeneral);
+    let held = guard.as_mut()?;
+    if held.announce() {
+        notify_user(
+            shared,
+            router_sid,
+            format!(
+                "router-acp · paused: {}; continuing when a model is available",
+                reason.label()
+            ),
+        );
+        flush_pending_disclosure(shared, router_sid);
+    }
+    Some(
+        crate::pause::until_routable(shared, held, class, || {
+            turn_stopped(shared, router_sid, cancellation)
+        })
+        .await,
+    )
+}
+
+fn end_hold(
+    shared: &Arc<Shared>,
+    router_sid: &str,
+    guard: &mut Option<crate::pause::Guard>,
+) {
+    if let Some(guard) = guard.take() {
+        notify_user(
+            shared,
+            router_sid,
+            format!(
+                "router-acp · resumed after {}",
+                crate::limits::humanize(guard.elapsed())
+            ),
+        );
+        drop(guard);
+    }
 }
 
 /// Label the lines queued since `mark` as one switch/failover notice from
@@ -10048,16 +10308,35 @@ async fn route_and_pin(
     req: PromptRequest,
     responder: Responder<PromptResponse>,
 ) -> Result<(), AcpError> {
-    let outcome = pin_session(
-        &shared,
-        &router_sid,
-        &req.prompt,
-        Some(&responder.cancellation()),
-        None,
-        false,
-        None,
-    )
-    .await;
+    let cancellation = responder.cancellation();
+    let mut guard = None;
+    let outcome = loop {
+        let outcome = pin_session(
+            &shared,
+            &router_sid,
+            &req.prompt,
+            Some(&cancellation),
+            None,
+            false,
+            None,
+        )
+        .await;
+        let Err(err) = outcome else {
+            break outcome;
+        };
+        if crate::pause::confirm_offline_after(&shared, &err).await {
+            if !hold_offline(&shared, &router_sid, Some(&cancellation)).await {
+                break Ok(PinOutcome::Cancelled);
+            }
+            continue;
+        }
+        match hold_unroutable(&shared, &router_sid, Some(&cancellation), &mut guard).await {
+            Some(true) => {}
+            Some(false) => break Ok(PinOutcome::Cancelled),
+            None => break Err(err),
+        }
+    };
+    end_hold(&shared, &router_sid, &mut guard);
     shared.with_session(&router_sid, |s| s.pinning = false);
     match outcome {
         Ok(PinOutcome::Pinned) => {

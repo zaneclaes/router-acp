@@ -239,6 +239,14 @@ pub fn is_outage_text(lower: &str) -> bool {
         || is_provider_terms_gate_text(lower)
 }
 
+/// A refusal that stays until someone acts: an adapter too old for its
+/// provider, or terms an account has to accept. Waiting never clears it.
+pub fn needs_a_person(lower: &str) -> bool {
+    lower.contains("upgrade required")
+        || lower.contains("status 426")
+        || is_provider_terms_gate_text(lower)
+}
+
 /// Claude can accept OAuth credentials while refusing every model until the
 /// account accepts updated legal terms. This gate affects the whole account.
 pub fn is_provider_terms_gate_text(lower: &str) -> bool {
